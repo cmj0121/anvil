@@ -17,4 +17,3 @@ repos:
     rev: v3.9.6
     hooks:
       - id: prettier
-         - .bendit.yml
