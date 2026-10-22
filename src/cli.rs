@@ -88,6 +88,14 @@ impl Failure {
             message: message.into(),
         }
     }
+
+    /// The command itself failed (exit 1): a target, a check or a write.
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            code: 1,
+            message: message.into(),
+        }
+    }
 }
 
 // Config, inventory and path problems are exit 2 (D2, D5).
@@ -109,12 +117,37 @@ impl From<crate::inventory::UnknownSel> for Failure {
     }
 }
 
-/// Runs the parsed command. Every subcommand is a stub until its unit lands.
+// The editor aborting is a failed command (exit 1); anything else is config.
+impl From<crate::editor::EditorError> for Failure {
+    fn from(err: crate::editor::EditorError) -> Self {
+        let code = match err {
+            crate::editor::EditorError::Aborted(_) => 1,
+            _ => 2,
+        };
+        Failure {
+            code,
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<Format> for crate::document::Format {
+    fn from(format: Format) -> Self {
+        match format {
+            Format::Toml => crate::document::Format::Toml,
+            Format::Yaml => crate::document::Format::Yaml,
+        }
+    }
+}
+
+/// Runs the parsed command. `doctor`, `apply` and `secret` are stubs until
+/// their units land.
 pub fn run(cli: &Cli) -> Result<(), Failure> {
-    Err(Failure::usage(format!(
-        "{}: not implemented",
-        cli.command.name()
-    )))
+    match &cli.command {
+        Command::Inventory => crate::commands::inventory(cli),
+        Command::Config { format } => crate::commands::config(cli, format.map(Into::into)),
+        other => Err(Failure::usage(format!("{}: not implemented", other.name()))),
+    }
 }
 
 #[cfg(test)]

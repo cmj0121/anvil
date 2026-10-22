@@ -1,18 +1,16 @@
 #![forbid(unsafe_code)]
 
 mod cli;
-// The document, facts and transport modules are wired into the subcommands by
-// U4 and U7; the subcommands are stubs until then.
-#[allow(dead_code)]
+mod commands;
 mod config;
-#[allow(dead_code)]
 mod document;
+mod editor;
+// The facts and transport modules are wired into `doctor` and `apply` by U7;
+// those subcommands are stubs until then.
 #[allow(dead_code)]
 mod facts;
-#[allow(dead_code)]
 mod inventory;
 mod logger;
-#[allow(dead_code)]
 mod paths;
 #[allow(dead_code)]
 mod transport;

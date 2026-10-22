@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use crate::document::Format;
 
-const EXTENSIONS: [&str; 3] = ["toml", "yaml", "yml"];
+/// The extensions a document may carry, `.toml` first.
+pub const EXTENSIONS: [&str; 3] = ["toml", "yaml", "yml"];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PathsError {

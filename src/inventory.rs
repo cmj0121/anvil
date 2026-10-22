@@ -29,6 +29,8 @@ pub struct Host {
     pub tags: Vec<String>,
 }
 
+// Target selection is wired into `doctor` and `apply` by U7.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetKind {
     Local,
@@ -39,6 +41,7 @@ pub enum TargetKind {
     },
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub name: String,
@@ -47,12 +50,14 @@ pub struct Target {
 }
 
 /// One `--target SEL`: `local`, or a word that is a host name or a tag.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sel {
     Local,
     Word(String),
 }
 
+#[allow(dead_code)]
 impl Sel {
     pub fn parse(sel: &str) -> Sel {
         if sel == LOCAL {
@@ -152,6 +157,7 @@ impl Inventory {
 
     /// The targets for `sels`, deduplicated: `local` first, then hosts by name.
     /// No selector means every target.
+    #[allow(dead_code)]
     pub fn select(&self, sels: &[Sel]) -> Result<Vec<Target>, UnknownSel> {
         let mut local = sels.is_empty();
         let mut names: Vec<&String> = Vec::new();
