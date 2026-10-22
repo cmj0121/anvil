@@ -25,9 +25,39 @@ fn hostname_runs_on_local_and_the_fake_host() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     // The fake runs the client script on this machine.
     let name = local_hostname();
+    let name = name.trim_end();
     assert_eq!(
         text(&out.stdout),
-        format!("==> local\n{name}==> fake\n{name}")
+        format!(
+            "▶ local\n  $ hostname\n  {name}\n  ✔ ok · 1 step\n\n\
+             ▶ fake\n  $ hostname\n  {name}\n  ✔ ok · 1 step\n\n\
+             2 ok, 0 failed\n"
+        )
+    );
+    assert!(
+        !text(&out.stdout).contains('\x1b'),
+        "no colour off a terminal"
+    );
+}
+
+#[test]
+fn human_output_ends_a_failed_target_with_its_error_and_counts_both() {
+    let sandbox = Sandbox::new("aa");
+    sandbox.with_fake_host();
+    let out = sandbox.anvil(
+        &["apply", "--target", "fake", "--target", "local"],
+        &CONNECT_REFUSED,
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let name = local_hostname();
+    let name = name.trim_end();
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  $ hostname\n  {name}\n  ✔ ok · 1 step\n\n\
+             ▶ fake\n  ✘ {CONNECT_REFUSED_MESSAGE}\n\n\
+             1 ok, 1 failed\n"
+        )
     );
 }
 
@@ -104,13 +134,12 @@ fn a_failing_step_stops_its_target_and_exits_one() {
     );
     let out = sandbox.anvil(&["apply"], &[]);
     assert_eq!(out.status.code(), Some(1));
-    assert_eq!(text(&out.stdout), "==> local\nbefore\n");
-    let stderr = text(&out.stderr);
-    assert!(stderr.contains("local: oops\n"), "{stderr}");
-    assert!(
-        stderr.contains("local: `echo before; echo oops >&2; exit 4` exited with 4\n"),
-        "{stderr}"
+    assert_eq!(
+        text(&out.stdout),
+        "▶ local\n  $ echo before; echo oops >&2; exit 4\n  before\n  ✘ step 1 exited 4\n\n0 ok, 1 failed\n"
     );
+    let stderr = text(&out.stderr);
+    assert!(stderr.starts_with("  local: oops\n"), "{stderr}");
 
     let out = sandbox.anvil(&["--json", "apply"], &[]);
     assert_eq!(out.status.code(), Some(1));

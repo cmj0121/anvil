@@ -107,11 +107,42 @@ reported (abridged above).
 ### `anvil apply`
 
 Runs the config's `[[steps]]` in order on every selected target: each step's `run` is sent to `sh -s` on the target
-(`/bin/sh -s` for `local`). A step that exits non-zero ends that target; the other targets still run. Human output: a
-`==> TARGET` header, then each step's stdout on stdout; each step's stderr and every failure go to stderr, prefixed with
-`TARGET:`. Control characters a host sends (escape sequences, say) are shown as visible `\x1b`-style escapes on
-stderr, and on stdout when it is a terminal; piped stdout and `--json` keep the bytes as they were. Exit 0 when every
-step on every target exited 0, else 1. `--json`:
+(`/bin/sh -s` for `local`). A step that exits non-zero ends that target; the other targets still run. Exit 0 when
+every step on every target exited 0, else 1.
+
+Human output is one block per target, a blank line after each, then a summary:
+
+```text
+▶ local
+  $ hostname
+  mac.local
+  $ uname -sr; echo warn >&2
+  Darwin 25.6.0
+  local: warn
+  ✔ ok · 2 steps
+
+▶ linode1
+  $ hostname
+  linode1
+  $ false
+  ✘ step 2 exited 1
+
+1 ok, 1 failed
+```
+
+- `▶ TARGET` heads the block; each step shows `$ RUN` (a multi-line `run` shows its first line and `…`), then its
+  output lines indented two spaces.
+- A step's stderr lines go to stderr, indented the same way so they interleave in place on a terminal; when stderr is
+  not a terminal each one is prefixed with `TARGET:` (`local: warn` above).
+- The block ends with `✔ ok · N steps`, or `✘ step K exited C` for a failing step, or `✘ ERROR` for a transport error
+  (after the steps that completed before it).
+- Colour (bold cyan header, dim command, yellow stderr, green `✔`, red `✘` and failed count) is used on a stream only
+  when it is a terminal and `NO_COLOR` is unset or empty.
+- Control characters a host sends (escape sequences, say) are shown as visible `\x1b`-style escapes on stderr and in
+  `✘` lines always, and in step output only when stdout is a terminal; off a terminal step output is not escaped, and
+  `--json` keeps the bytes as they were.
+
+`--json`:
 
 ```json
 {

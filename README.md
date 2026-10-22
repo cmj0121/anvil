@@ -109,14 +109,22 @@ linode1
 An unreachable host shows `error` with the reason (for example `cannot connect: ssh: connect to host 203.0.113.10 port
 22: Connection refused`) instead of the facts, and `doctor` exits 1.
 
-`anvil apply` on the same Mac prints each target's step output under a header; a remote host adds its own section:
+`anvil apply` on the same Mac prints a block per target: its `$ command` lines with their output, then `✔ ok` or
+`✘` with the reason, and a summary at the end. Here the remote host refused the connection:
 
 ```text
-==> local
-mac.local
-==> linode1
-linode1
+▶ local
+  $ hostname
+  mac.local
+  ✔ ok · 1 step
+
+▶ linode1
+  ✘ cannot connect: ssh: connect to host 203.0.113.10 port 22: Connection refused
+
+1 ok, 1 failed
 ```
+
+On a terminal the blocks are coloured (set `NO_COLOR` to turn that off).
 
 `--json` prints one document on stdout instead, for agents; `anvil apply --json` on the same Mac, pretty-printed here
 (anvil prints it on one line):

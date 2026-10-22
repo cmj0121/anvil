@@ -5,8 +5,8 @@
 //! error ends the target with only the error. Neither stops the next target.
 //! Step output is printed, never logged.
 
-use std::fmt::Write as _;
-use std::io::IsTerminal;
+use std::ffi::OsStr;
+use std::io::{IsTerminal, Write};
 
 use serde::Serialize;
 
@@ -88,13 +88,17 @@ impl Report {
 pub fn run(cli: &Cli) -> Result<(), Failure> {
     let config = cli.load_config()?;
     let targets = cli.targets()?;
+    let style = Style::detect();
     let mut reports = Vec::with_capacity(targets.len());
     for target in &targets {
         let report = apply_target(target, cli.transport(target), &config.steps);
         if !cli.json {
-            print_human(&report);
+            print_lines(&render(&report, style));
         }
         reports.push(report);
+    }
+    if !cli.json {
+        print_lines(&[Line::Out(render_summary(&reports, style))]);
     }
     let report = Report::new(reports);
     if cli.json {
@@ -167,19 +171,94 @@ fn apply_target(
     }
 }
 
-/// The header and each step's stdout go to stdout; stderr and failures go to
-/// stderr, each line prefixed with the target name. Control characters from
-/// the host are escaped on stderr always and on stdout when it is a terminal
-/// (a pipe gets the step's bytes as they were).
-fn print_human(report: &TargetReport) {
-    let (out, err) = render(report, std::io::stdout().is_terminal());
-    print!("{out}");
-    eprint!("{err}");
+/// Where a rendered line goes, so stdout and stderr interleave in order.
+#[derive(Debug, PartialEq, Eq)]
+enum Line {
+    Out(String),
+    Err(String),
 }
 
-fn render(report: &TargetReport, escape_stdout: bool) -> (String, String) {
-    let mut out = String::new();
-    let mut err = String::new();
+/// What one output stream is attached to.
+#[derive(Debug, Clone, Copy)]
+struct Stream {
+    tty: bool,
+    colour: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Style {
+    out: Stream,
+    err: Stream,
+}
+
+impl Style {
+    /// Colour needs a terminal and an unset or empty `NO_COLOR`.
+    fn new(out_tty: bool, err_tty: bool, no_color: Option<&OsStr>) -> Style {
+        let allowed = no_color.is_none_or(OsStr::is_empty);
+        let stream = |tty: bool| Stream {
+            tty,
+            colour: tty && allowed,
+        };
+        Style {
+            out: stream(out_tty),
+            err: stream(err_tty),
+        }
+    }
+
+    fn detect() -> Style {
+        Style::new(
+            std::io::stdout().is_terminal(),
+            std::io::stderr().is_terminal(),
+            std::env::var_os("NO_COLOR").as_deref(),
+        )
+    }
+}
+
+const BOLD_CYAN: &str = "1;36";
+const DIM: &str = "2";
+const YELLOW: &str = "33";
+const GREEN: &str = "32";
+const RED: &str = "31";
+
+fn paint(colour: bool, code: &str, text: &str) -> String {
+    if colour {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Writes each line to its stream, flushing so a terminal shows them in order.
+fn print_lines(lines: &[Line]) {
+    let mut out = std::io::stdout().lock();
+    let mut err = std::io::stderr().lock();
+    for line in lines {
+        let (stream, text): (&mut dyn Write, _) = match line {
+            Line::Out(text) => (&mut out, text),
+            Line::Err(text) => (&mut err, text),
+        };
+        let _ = stream.write_all(text.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
+/// The step's command as shown in its `$` line: a multi-line script shows its
+/// first line and an ellipsis.
+fn command(run: &str) -> String {
+    let run = run.trim();
+    match run.split_once('\n') {
+        Some((first, _)) => format!("{} …", first.trim_end()),
+        None => run.to_owned(),
+    }
+}
+
+/// One target's block: a `▶ target` header, each step's `$ command` and its
+/// indented output, then `✔ ok · N steps` or `✘ reason`, then a blank line.
+/// Stdout lines go to stdout; stderr lines go to stderr, prefixed with the
+/// target when stderr is not a terminal. Control characters from the host are
+/// escaped on stderr and in failures always, and on stdout only when it is
+/// a terminal.
+fn render(report: &TargetReport, style: Style) -> Vec<Line> {
     let (target, steps, error) = match report {
         TargetReport::Ran { target, steps, .. } => (target, steps, None),
         TargetReport::Failed {
@@ -189,33 +268,76 @@ fn render(report: &TargetReport, escape_stdout: bool) -> (String, String) {
             ..
         } => (target, steps, Some(error)),
     };
-    let _ = writeln!(out, "==> {target}");
-    for step in steps {
-        if escape_stdout {
-            out.push_str(&escape_controls(&step.stdout));
+    let out = style.out.colour;
+    let mut lines = vec![Line::Out(format!(
+        "{}\n",
+        paint(out, BOLD_CYAN, &format!("▶ {target}"))
+    ))];
+    let mut failure = None;
+    for (index, step) in steps.iter().enumerate() {
+        let run = command(&escape_controls(&step.run));
+        lines.push(Line::Out(format!(
+            "  {}\n",
+            paint(out, DIM, &format!("$ {run}"))
+        )));
+        for line in step.stdout.lines() {
+            let line = if style.out.tty {
+                escape_controls(line)
+            } else {
+                line.into()
+            };
+            lines.push(Line::Out(indent(&line)));
+        }
+        let prefix = if style.err.tty {
+            String::new()
         } else {
-            out.push_str(&step.stdout);
-        }
-        if !step.stdout.is_empty() && !step.stdout.ends_with('\n') {
-            out.push('\n');
-        }
+            format!("{target}: ")
+        };
         for line in step.stderr.lines() {
-            let _ = writeln!(err, "{target}: {}", escape_controls(line));
+            let line = format!("{prefix}{}", escape_controls(line));
+            lines.push(Line::Err(format!(
+                "  {}\n",
+                paint(style.err.colour, YELLOW, &line)
+            )));
         }
+        let number = index + 1;
         match step.code {
             Some(0) => {}
-            Some(code) => {
-                let _ = writeln!(err, "{target}: `{}` exited with {code}", step.run);
-            }
-            None => {
-                let _ = writeln!(err, "{target}: `{}` was killed by a signal", step.run);
-            }
+            Some(code) => failure = Some(format!("step {number} exited {code}")),
+            None => failure = Some(format!("step {number} was killed by a signal")),
         }
     }
     if let Some(error) = error {
-        let _ = writeln!(err, "{target}: {}", escape_controls(error));
+        failure = Some(escape_controls(error).into_owned());
     }
-    (out, err)
+    let end = match failure {
+        Some(reason) => paint(out, RED, &format!("✘ {reason}")),
+        None => {
+            let plural = if steps.len() == 1 { "" } else { "s" };
+            paint(out, GREEN, &format!("✔ ok · {} step{plural}", steps.len()))
+        }
+    };
+    lines.push(Line::Out(format!("  {end}\n\n")));
+    lines
+}
+
+fn indent(line: &str) -> String {
+    if line.is_empty() {
+        "\n".to_owned()
+    } else {
+        format!("  {line}\n")
+    }
+}
+
+/// The last line of the human output: `N ok, M failed`.
+fn render_summary(reports: &[TargetReport], style: Style) -> String {
+    let failed = reports.iter().filter(|report| !report.ok()).count();
+    let ok = reports.len() - failed;
+    let colour = style.out.colour && failed > 0;
+    format!(
+        "{ok} ok, {}\n",
+        paint(colour, RED, &format!("{failed} failed"))
+    )
 }
 
 #[cfg(test)]
@@ -322,6 +444,41 @@ mod tests {
             .collect()
     }
 
+    /// Neither stream is a terminal, as under a pipe or in CI.
+    fn piped() -> Style {
+        Style::new(false, false, None)
+    }
+
+    fn terminal() -> Style {
+        Style::new(true, true, None)
+    }
+
+    /// Stdout and stderr as written, interleaved, like a terminal shows them.
+    fn screen(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|line| match line {
+                Line::Out(text) | Line::Err(text) => text.as_str(),
+            })
+            .collect()
+    }
+
+    /// Stdout and stderr apart.
+    fn streams(lines: &[Line]) -> (String, String) {
+        let (mut out, mut err) = (String::new(), String::new());
+        for line in lines {
+            match line {
+                Line::Out(text) => out.push_str(text),
+                Line::Err(text) => err.push_str(text),
+            }
+        }
+        (out, err)
+    }
+
+    fn step(run: &str, code: Option<i32>, stdout: &str, stderr: &str) -> StepReport {
+        StepReport::new(run, code, stdout.to_owned(), stderr.to_owned())
+    }
+
     #[test]
     fn every_step_runs_in_order_and_keeps_its_output() {
         let (report, runs) = apply("t", &["one", "two"], None);
@@ -403,9 +560,10 @@ mod tests {
                 "ok": false,
             })
         );
-        let (out, err) = render(&report, false);
-        assert_eq!(out, "==> box\none-out\n");
-        assert_eq!(err, "box: timed out after 30 s\n");
+        assert_eq!(
+            screen(&render(&report, piped())),
+            "▶ box\n  $ one\n  one-out\n  ✘ timed out after 30 s\n\n"
+        );
     }
 
     #[test]
@@ -425,16 +583,159 @@ mod tests {
     }
 
     #[test]
-    fn human_output_puts_stdout_under_a_header_and_prefixes_stderr() {
-        let (report, _) = apply("box", &["one", "fail"], None);
-        let (out, err) = render(&report, false);
-        assert_eq!(out, "==> box\none-out\npartial\n");
-        assert_eq!(err, "box: boom\nbox: `fail` exited with 3\n");
+    fn an_ok_target_lists_each_step_and_counts_them() {
+        let report = TargetReport::Ran {
+            target: "local".to_owned(),
+            steps: vec![
+                step("hostname", Some(0), "mac.local\n", ""),
+                step(
+                    "uname -sr; echo warn >&2",
+                    Some(0),
+                    "Darwin 25.6.0",
+                    "warn\n",
+                ),
+            ],
+            ok: true,
+        };
+        let lines = render(&report, piped());
+        assert_eq!(
+            screen(&lines),
+            "▶ local\n  $ hostname\n  mac.local\n  $ uname -sr; echo warn >&2\n  Darwin 25.6.0\n  local: warn\n  ✔ ok · 2 steps\n\n"
+        );
+        let (_, err) = streams(&lines);
+        assert_eq!(err, "  local: warn\n", "stderr stays on stderr");
 
-        let (report, _) = apply("box", &["one"], Some(TransportError::HostKey));
-        let (out, err) = render(&report, false);
-        assert_eq!(out, "==> box\n");
-        assert!(err.starts_with("box: host key unknown or changed"), "{err}");
+        let (_, err) = streams(&render(
+            &report,
+            Style::new(false, true, Some(OsStr::new("1"))),
+        ));
+        assert_eq!(err, "  warn\n", "a terminal needs no prefix");
+
+        assert_eq!(
+            screen(&render(&report, terminal())),
+            "\x1b[1;36m▶ local\x1b[0m\n  \x1b[2m$ hostname\x1b[0m\n  mac.local\n  \x1b[2m$ uname -sr; echo warn >&2\x1b[0m\n  Darwin 25.6.0\n  \x1b[33mwarn\x1b[0m\n  \x1b[32m✔ ok · 2 steps\x1b[0m\n\n"
+        );
+    }
+
+    #[test]
+    fn a_failing_step_ends_the_block_with_its_number_and_code() {
+        let (report, _) = apply("box", &["one", "fail"], None);
+        let lines = render(&report, piped());
+        assert_eq!(
+            screen(&lines),
+            "▶ box\n  $ one\n  one-out\n  $ fail\n  partial\n  box: boom\n  ✘ step 2 exited 3\n\n"
+        );
+        assert_eq!(streams(&lines).1, "  box: boom\n");
+        assert_eq!(
+            screen(&render(&report, terminal())),
+            "\x1b[1;36m▶ box\x1b[0m\n  \x1b[2m$ one\x1b[0m\n  one-out\n  \x1b[2m$ fail\x1b[0m\n  partial\n  \x1b[33mboom\x1b[0m\n  \x1b[31m✘ step 2 exited 3\x1b[0m\n\n"
+        );
+
+        let report = TargetReport::Ran {
+            target: "box".to_owned(),
+            steps: vec![step("sleep 9", None, "", "")],
+            ok: false,
+        };
+        assert_eq!(
+            screen(&render(&report, piped())),
+            "▶ box\n  $ sleep 9\n  ✘ step 1 was killed by a signal\n\n"
+        );
+    }
+
+    #[test]
+    fn a_transport_error_shows_the_completed_steps_then_the_error() {
+        let report = TargetReport::Failed {
+            target: "box".to_owned(),
+            steps: vec![step("one", Some(0), "one-out\n", "")],
+            error: "timed out after 30 s".to_owned(),
+            ok: false,
+        };
+        assert_eq!(
+            screen(&render(&report, terminal())),
+            "\x1b[1;36m▶ box\x1b[0m\n  \x1b[2m$ one\x1b[0m\n  one-out\n  \x1b[31m✘ timed out after 30 s\x1b[0m\n\n"
+        );
+
+        let (report, _) = apply("closed", &["one"], Some(TransportError::HostKey));
+        let lines = render(&report, piped());
+        assert_eq!(
+            screen(&lines),
+            format!("▶ closed\n  ✘ {}\n\n", TransportError::HostKey)
+        );
+        assert_eq!(streams(&lines).1, "", "the failure is part of the block");
+    }
+
+    #[test]
+    fn a_target_without_steps_is_ok_with_zero_steps() {
+        let (report, _) = apply("local", &[], None);
+        assert_eq!(
+            screen(&render(&report, piped())),
+            "▶ local\n  ✔ ok · 0 steps\n\n"
+        );
+        assert_eq!(
+            screen(&render(&report, terminal())),
+            "\x1b[1;36m▶ local\x1b[0m\n  \x1b[32m✔ ok · 0 steps\x1b[0m\n\n"
+        );
+        let (report, _) = apply("local", &["one"], None);
+        assert!(screen(&render(&report, piped())).ends_with("  ✔ ok · 1 step\n\n"));
+    }
+
+    #[test]
+    fn a_multi_line_run_shows_its_first_line_and_an_ellipsis() {
+        let report = TargetReport::Ran {
+            target: "local".to_owned(),
+            steps: vec![step(
+                "\n  set -e\n  echo hi\n",
+                Some(0),
+                "hi\n\nthere\n",
+                "",
+            )],
+            ok: true,
+        };
+        assert_eq!(
+            screen(&render(&report, piped())),
+            "▶ local\n  $ set -e …\n  hi\n\n  there\n  ✔ ok · 1 step\n\n"
+        );
+    }
+
+    #[test]
+    fn colour_needs_a_terminal_and_no_no_color() {
+        let style = Style::new(true, true, Some(OsStr::new("1")));
+        assert!(!style.out.colour && !style.err.colour);
+        assert!(style.out.tty && style.err.tty);
+        let style = Style::new(true, true, Some(OsStr::new("")));
+        assert!(
+            style.out.colour && style.err.colour,
+            "empty NO_COLOR is unset"
+        );
+        let style = Style::new(true, false, None);
+        assert!(style.out.colour && !style.err.colour);
+
+        let (report, _) = apply("box", &["one", "fail"], None);
+        let no_color = Style::new(true, true, Some(OsStr::new("1")));
+        let shown = screen(&render(&report, no_color));
+        assert!(!shown.contains('\x1b'), "{shown}");
+        assert_eq!(
+            shown,
+            "▶ box\n  $ one\n  one-out\n  $ fail\n  partial\n  boom\n  ✘ step 2 exited 3\n\n"
+        );
+        assert_eq!(render_summary(&[report], no_color), "0 ok, 1 failed\n");
+    }
+
+    #[test]
+    fn the_summary_counts_targets_and_reddens_failures_only() {
+        let (good, _) = apply("local", &["one"], None);
+        let (bad, _) = apply("box", &["fail"], None);
+        let reports = [good, bad];
+        assert_eq!(render_summary(&reports, piped()), "1 ok, 1 failed\n");
+        assert_eq!(
+            render_summary(&reports, terminal()),
+            "1 ok, \x1b[31m1 failed\x1b[0m\n"
+        );
+        assert_eq!(
+            render_summary(&reports[..1], terminal()),
+            "1 ok, 0 failed\n"
+        );
+        assert_eq!(render_summary(&[], piped()), "0 ok, 0 failed\n");
     }
 
     #[test]
@@ -453,18 +754,16 @@ mod tests {
             .to_string(),
             ok: false,
         };
-        let (out, err) = render(&report, false);
+        let (out, err) = streams(&render(&report, piped()));
         assert_eq!(
-            out, "==> box\nout\x1b]0;title\x07\n",
-            "a pipe gets the bytes"
+            out, "▶ box\n  $ run\n  out\x1b]0;title\x07\n  ✘ cannot connect: ssh: \\x1b[31mred\n\n",
+            "off a terminal stdout is not escaped, the failure is"
         );
+        assert_eq!(err, "  box: err\\x1b[2J\tx\n");
+        let (out, _) = streams(&render(&report, Style::new(true, false, None)));
         assert_eq!(
-            err,
-            "box: err\\x1b[2J\tx\nbox: cannot connect: ssh: \\x1b[31mred\n"
-        );
-        let (out, _) = render(&report, true);
-        assert_eq!(
-            out, "==> box\nout\\x1b]0;title\\x07\n",
+            out,
+            "\x1b[1;36m▶ box\x1b[0m\n  \x1b[2m$ run\x1b[0m\n  out\\x1b]0;title\\x07\n  \x1b[31m✘ cannot connect: ssh: \\x1b[31mred\x1b[0m\n\n",
             "a terminal does not"
         );
 

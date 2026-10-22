@@ -162,7 +162,8 @@ fi
 step "(c) apply prints each target's hostname"
 anvil apply --target local --target arch
 code=$?
-expected=$(printf '==> local\n%s\n==> arch\n%s' "$LOCAL_HOSTNAME" "$REMOTE_HOSTNAME")
+expected=$(printf '▶ local\n  $ hostname\n  %s\n  ✔ ok · 1 step\n\n▶ arch\n  $ hostname\n  %s\n  ✔ ok · 1 step\n\n2 ok, 0 failed' \
+  "$LOCAL_HOSTNAME" "$REMOTE_HOSTNAME")
 if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ]; then
   pass "local $LOCAL_HOSTNAME, arch $REMOTE_HOSTNAME"
 else
@@ -229,7 +230,7 @@ if command -v python3 >/dev/null 2>&1; then
   else
     fail "doctor over the pty: exit $code"
   fi
-  run_env PTY_PASSWORD="$PASSWORD" python3 tests/e2e/pty_login.py --prompts 0 --expect "^$REMOTE_HOSTNAME\$" \
+  run_env PTY_PASSWORD="$PASSWORD" python3 tests/e2e/pty_login.py --prompts 0 --expect "^  $REMOTE_HOSTNAME\$" \
     -- "$ANVIL" --ssh-config "$CFG" apply --target archpw >"$TMP/out" 2>"$TMP/err"
   code=$?
   if [ "$code" -eq 0 ]; then
