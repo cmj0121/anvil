@@ -9,7 +9,7 @@
 //! old blocks anyway. The real controls are the per-user 0700 directory, the
 //! 0600 mode and `create_new` (D9).
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -25,6 +25,26 @@ pub const DEFAULT: &str = "nvim";
 
 /// How often a temp file name may collide before giving up.
 const NAME_ATTEMPTS: u32 = 16;
+
+/// Editors that take vim's flags; in [`Buffer::Sensitive`] mode they get
+/// [`VIM_PRIVATE`] so the buffer leaves no swap, undo, backup or history copy.
+const VIM_FAMILY: [&str; 4] = ["vim", "nvim", "vi", "view"];
+
+/// No swap file (`-n`), no viminfo/shada (`-i NONE`), and no undo or backup
+/// file: set by `--cmd` before the vimrc and again by `-c` after it, so a vimrc
+/// that turns them on does not win.
+const VIM_PRIVATE: [&str; 7] = ["-n", "-i", "NONE", "--cmd", VIM_OPTIONS, "-c", VIM_OPTIONS];
+const VIM_OPTIONS: &str = "set noswapfile noundofile nobackup nowritebackup";
+
+/// What the buffer holds, which decides how much the editor may keep of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Buffer {
+    /// A config document: the editor runs as configured.
+    Document,
+    /// A secret: vim-family editors are told to keep no copies; any other
+    /// editor gets a warning that it might.
+    Sensitive,
+}
 
 #[derive(Debug)]
 pub enum EditorError {
@@ -115,12 +135,35 @@ impl Editor {
 
     /// Opens `initial` in the editor as an `.<ext>` file; `None` when the
     /// editor left it unchanged.
-    pub fn edit(&self, initial: &[u8], ext: &str) -> Result<Option<Vec<u8>>, EditorError> {
+    pub fn edit(
+        &self,
+        initial: &[u8],
+        ext: &str,
+        buffer: Buffer,
+    ) -> Result<Option<Vec<u8>>, EditorError> {
         let dir = private_dir()?;
         let (path, file) = create_temp(&dir, ext)?;
-        let result = self.edit_at(&path, file, initial);
+        let result = self.edit_at(&path, file, initial, buffer);
         scrub(&path);
         result
+    }
+
+    fn is_vim(&self) -> bool {
+        self.program
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| VIM_FAMILY.contains(&name))
+    }
+
+    /// The editor's arguments for `path`: the configured ones, then for a
+    /// sensitive buffer in a vim-family editor [`VIM_PRIVATE`], then the file.
+    pub fn args_for(&self, path: &Path, buffer: Buffer) -> Vec<OsString> {
+        let mut args: Vec<OsString> = self.args.iter().map(OsString::from).collect();
+        if buffer == Buffer::Sensitive && self.is_vim() {
+            args.extend(VIM_PRIVATE.iter().map(OsString::from));
+        }
+        args.push(path.as_os_str().to_owned());
+        args
     }
 
     fn edit_at(
@@ -128,6 +171,7 @@ impl Editor {
         path: &Path,
         mut file: File,
         initial: &[u8],
+        buffer: Buffer,
     ) -> Result<Option<Vec<u8>>, EditorError> {
         let io = |source| EditorError::Io {
             path: path.to_path_buf(),
@@ -137,15 +181,21 @@ impl Editor {
         file.sync_all().map_err(io)?;
         drop(file);
 
+        // Always shown, not a log line: the user must know before typing a secret.
+        if buffer == Buffer::Sensitive && !self.is_vim() {
+            eprintln!("{}", copies_note(&self.program));
+        }
+        let args = self.args_for(path, buffer);
         log::debug!(
-            "spawn {} {} {}",
+            "spawn {} {}",
             self.program.display(),
-            self.args.join(" "),
-            path.display()
+            args.iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ")
         );
         let status = Command::new(&self.program)
-            .args(&self.args)
-            .arg(path)
+            .args(&args)
             .status()
             .map_err(|source| EditorError::Spawn {
                 program: self.program.display().to_string(),
@@ -167,6 +217,16 @@ impl Editor {
     }
 }
 
+/// The one-line note for a sensitive buffer in an editor that was not told to
+/// keep no copies; it names the editor, never the buffer.
+pub fn copies_note(program: &Path) -> String {
+    format!(
+        "note: editor `{}` may keep its own copies of the secret (swap, undo, backup or history files); \
+         only vim, nvim, vi and view are told not to",
+        program.display()
+    )
+}
+
 /// `preference`, else `$VISUAL`, else `$EDITOR`, else the default; blank
 /// values count as unset.
 pub fn command_for(preference: Option<&str>, visual: Option<&str>, editor: Option<&str>) -> String {
@@ -184,7 +244,9 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// The executable `program` names: itself when absolute, else the first
-/// match on `path`. Relative paths with a directory part are refused.
+/// match on `path`. Relative paths with a directory part are refused, and so
+/// are relative `path` entries (`.`, `bin`), which would resolve against the
+/// current directory.
 pub fn find_program(program: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
     if program.is_absolute() {
         return is_executable(program).then(|| program.to_path_buf());
@@ -193,7 +255,7 @@ pub fn find_program(program: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
         return None;
     }
     std::env::split_paths(path?)
-        .filter(|dir| !dir.as_os_str().is_empty())
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(program))
         .find(|candidate| is_executable(candidate))
 }
@@ -331,7 +393,9 @@ mod tests {
     #[test]
     fn unchanged_buffer_is_none_and_the_file_is_gone() {
         let editor = Editor::from_command("true", system_path().as_deref()).unwrap();
-        let result = editor.edit(b"[hosts]\n", "unchanged").unwrap();
+        let result = editor
+            .edit(b"[hosts]\n", "unchanged", Buffer::Document)
+            .unwrap();
         assert_eq!(result, None);
         assert!(edits_in_dir("unchanged").is_empty());
         let dir = private_dir().unwrap();
@@ -341,9 +405,105 @@ mod tests {
     #[test]
     fn failing_editor_aborts_with_its_status() {
         let editor = Editor::from_command("false", system_path().as_deref()).unwrap();
-        let err = editor.edit(b"x", "aborted").unwrap_err();
+        let err = editor.edit(b"x", "aborted", Buffer::Document).unwrap_err();
         assert!(matches!(err, EditorError::Aborted(Some(1))), "{err}");
         assert!(err.to_string().contains("nothing written"));
         assert!(edits_in_dir("aborted").is_empty());
+    }
+
+    fn editor_at(program: &str) -> Editor {
+        Editor {
+            program: PathBuf::from(program),
+            args: vec!["-u".to_owned(), "x".to_owned()],
+        }
+    }
+
+    fn strings(args: Vec<OsString>) -> Vec<String> {
+        args.into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_sensitive_buffer_in_vim_or_nvim_keeps_no_copies() {
+        let file = Path::new("/t/edit-1.txt");
+        let options = "set noswapfile noundofile nobackup nowritebackup";
+        for program in [
+            "/usr/bin/vim",
+            "/opt/homebrew/bin/nvim",
+            "/usr/bin/vi",
+            "/x/view",
+        ] {
+            assert_eq!(
+                strings(editor_at(program).args_for(file, Buffer::Sensitive)),
+                [
+                    "-u",
+                    "x",
+                    "-n",
+                    "-i",
+                    "NONE",
+                    "--cmd",
+                    options,
+                    "-c",
+                    options,
+                    "/t/edit-1.txt"
+                ],
+                "{program}"
+            );
+        }
+    }
+
+    #[test]
+    fn documents_and_other_editors_get_no_extra_args() {
+        let file = Path::new("/t/edit-1.txt");
+        let plain = ["-u", "x", "/t/edit-1.txt"];
+        assert_eq!(
+            strings(editor_at("/usr/bin/nvim").args_for(file, Buffer::Document)),
+            plain
+        );
+        for program in [
+            "/usr/bin/nano",
+            "/usr/local/bin/code",
+            "/x/nvim-qt",
+            "/x/gvim",
+        ] {
+            assert_eq!(
+                strings(editor_at(program).args_for(file, Buffer::Sensitive)),
+                plain,
+                "{program}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_path_entries_are_skipped() {
+        let dir = std::env::temp_dir().join(format!("anvil-path-{}", std::process::id()));
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("anvil-path-probe");
+        fs::write(&tool, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        let program = Path::new("anvil-path-probe");
+        // A relative entry naming the same directory from the cwd is skipped.
+        let relative = pathdiff(&bin, &std::env::current_dir().unwrap());
+        assert!(fs::metadata(relative.join(program)).is_ok());
+        assert_eq!(find_program(program, Some(relative.as_os_str())), None);
+        assert_eq!(
+            find_program(program, Some(bin.as_os_str())),
+            Some(tool.clone())
+        );
+        let mixed = format!("{}:{}", relative.display(), bin.display());
+        assert_eq!(find_program(program, Some(OsStr::new(&mixed))), Some(tool));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `to` relative to `from` (both absolute), via enough `..` to reach `/`.
+    fn pathdiff(to: &Path, from: &Path) -> PathBuf {
+        let mut rel = PathBuf::new();
+        for _ in from.components().skip(1) {
+            rel.push("..");
+        }
+        rel.join(to.strip_prefix("/").unwrap())
     }
 }

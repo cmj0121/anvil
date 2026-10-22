@@ -3,7 +3,10 @@
 #   FAKE_SSH_LOG            append each invocation's argv (space-joined) as one line
 #   FAKE_SSH_CHECK_EXIT     exit code of `-O check` (default 1: no master)
 #   FAKE_SSH_EXIT           exit code of the key (BatchMode) master attempt (default 0)
+#   FAKE_SSH_CHECK_SLEEP    seconds `-O check` sleeps first
+#   FAKE_SSH_SLEEP          seconds the key master attempt sleeps first
 #   FAKE_SSH_STDERR         stderr text of the key master attempt
+#   FAKE_SSH_STDERR_BYTES   bytes of filler the key master attempt writes to stderr
 #   FAKE_SSH_RETRY_EXIT     exit code of the interactive master attempt (default 0)
 #   FAKE_SSH_RETRY_STDERR   stderr text of the interactive master attempt
 #   FAKE_SSH_CLIENT_EXIT    exit code of the client; unset runs the script with sh -s
@@ -25,10 +28,13 @@ done
 
 case "$kind" in
   check)
+    [ -n "${FAKE_SSH_CHECK_SLEEP-}" ] && sleep "$FAKE_SSH_CHECK_SLEEP"
     exit "${FAKE_SSH_CHECK_EXIT-1}"
     ;;
   master)
     if [ "$batch" = yes ]; then
+      [ -n "${FAKE_SSH_SLEEP-}" ] && sleep "$FAKE_SSH_SLEEP"
+      [ -n "${FAKE_SSH_STDERR_BYTES-}" ] && yes | head -c "$FAKE_SSH_STDERR_BYTES" >&2
       [ -n "${FAKE_SSH_STDERR-}" ] && printf '%s\n' "$FAKE_SSH_STDERR" >&2
       exit "${FAKE_SSH_EXIT-0}"
     fi

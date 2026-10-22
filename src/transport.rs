@@ -8,8 +8,10 @@ use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
-use rustix::process::{Pid, Signal, kill_process_group};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+
+use rustix::process::{Pid, Signal, kill_process_group};
 use std::time::{Duration, Instant};
 
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -31,8 +33,8 @@ pub struct Output {
 pub enum TransportError {
     /// The process could not be started.
     Spawn(String),
-    /// The script did not finish within the run timeout.
-    Timeout,
+    /// The process did not finish within this timeout and was killed.
+    Timeout(Duration),
     /// Authentication failed: with `after_prompt` false the key was refused and
     /// no terminal was there for a password; true means the interactive attempt
     /// was refused too.
@@ -54,7 +56,10 @@ impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Spawn(reason) => write!(f, "cannot start the transport: {reason}"),
-            Self::Timeout => write!(f, "timed out after {} s", RUN_TIMEOUT.as_secs()),
+            Self::Timeout(after) if after.subsec_millis() == 0 => {
+                write!(f, "timed out after {} s", after.as_secs())
+            }
+            Self::Timeout(after) => write!(f, "timed out after {} ms", after.as_millis()),
             Self::AuthDenied {
                 after_prompt: false,
             } => {
@@ -130,34 +135,17 @@ pub fn run_with_script(
         .spawn()
         .map_err(|err| TransportError::Spawn(err.to_string()))?;
 
-    // The pipes are the child's; the handles are taken so dropping them closes
-    // anvil's ends. stdout/stderr are drained concurrently so neither blocks the other.
-    let stdin = child.stdin.take().expect("stdin is piped");
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-    let stdout = thread::spawn(move || read_capped(stdout));
-    let stderr = thread::spawn(move || read_capped(stderr));
-
     // A script that exits before reading everything closes the pipe early; that is
     // not an error of the transport, the exit code tells.
+    let stdin = child.stdin.take().expect("stdin is piped");
     let script = script.to_owned();
     thread::spawn(move || {
         let mut stdin = stdin;
         let _ = stdin.write_all(script.as_bytes());
     });
 
-    let status = wait_with_timeout(&mut child, timeout);
-    // Join the readers even on timeout: killing the child closed its pipes.
-    let (stdout, stdout_cut) = stdout.join().unwrap_or_default();
-    let (stderr, stderr_cut) = stderr.join().unwrap_or_default();
-    let status = status?;
-    let output = Output {
-        stdout,
-        stderr,
-        code: status.code(),
-        truncated: stdout_cut || stderr_cut,
-    };
-    if status.success() {
+    let output = collect(child, Some(timeout))?;
+    if output.code == Some(0) {
         Ok(output)
     } else {
         Err(TransportError::Exit {
@@ -168,16 +156,102 @@ pub fn run_with_script(
     }
 }
 
-/// Reads up to [`OUTPUT_CAP`] bytes, then drains the rest; the flag says whether
-/// anything was discarded.
-fn read_capped(mut reader: impl Read) -> (Vec<u8>, bool) {
-    let mut buf = Vec::new();
-    let _ = reader
-        .by_ref()
-        .take(OUTPUT_CAP as u64)
-        .read_to_end(&mut buf);
-    let discarded = std::io::copy(&mut reader, &mut std::io::sink()).unwrap_or(0);
-    (buf, discarded > 0)
+/// Waits for `child` and gathers whatever of its stdout and stderr is piped,
+/// each capped at [`OUTPUT_CAP`]. With a `timeout` the child's process group is
+/// killed when it passes (the caller spawned it with `process_group(0)`) and
+/// the result is [`TransportError::Timeout`]; `None` waits as long as it takes.
+///
+/// After the child is gone the readers get [`READ_GRACE`] to reach EOF: a
+/// process that left the group (`setpgrp`, `setsid`) may still hold the pipes,
+/// so the readers are then abandoned and the output marked truncated.
+pub fn collect(mut child: Child, timeout: Option<Duration>) -> Result<Output, TransportError> {
+    let (done, finished) = mpsc::channel();
+    let streams = [
+        child
+            .stdout
+            .take()
+            .map(|pipe| spawn_reader(pipe, done.clone())),
+        child
+            .stderr
+            .take()
+            .map(|pipe| spawn_reader(pipe, done.clone())),
+    ];
+    drop(done);
+
+    let status = match timeout {
+        Some(timeout) => wait_with_timeout(&mut child, timeout),
+        None => child
+            .wait()
+            .map_err(|err| TransportError::Spawn(err.to_string())),
+    };
+
+    let pending = streams.iter().flatten().count();
+    let deadline = Instant::now() + READ_GRACE;
+    let mut ended = 0;
+    while ended < pending {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match finished.recv_timeout(left) {
+            Ok(()) => ended += 1,
+            Err(_) => break,
+        }
+    }
+    let abandoned = ended < pending;
+    if abandoned {
+        log::debug!("output pipes still open after the child exited; not waiting for them");
+    }
+    let take = |stream: &Option<Arc<Mutex<Captured>>>| {
+        stream.as_ref().map_or_else(Captured::default, |shared| {
+            std::mem::take(&mut *shared.lock().unwrap_or_else(|e| e.into_inner()))
+        })
+    };
+    let stdout = take(&streams[0]);
+    let stderr = take(&streams[1]);
+    let status = status?;
+    Ok(Output {
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        code: status.code(),
+        truncated: stdout.cut || stderr.cut || abandoned,
+    })
+}
+
+/// How long the output readers may take to reach EOF once the child is gone.
+pub const READ_GRACE: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct Captured {
+    bytes: Vec<u8>,
+    /// Whether anything past [`OUTPUT_CAP`] was discarded.
+    cut: bool,
+}
+
+/// Reads `pipe` into a shared buffer up to [`OUTPUT_CAP`] and drains the rest,
+/// so the child never blocks on a full pipe; signals `done` at EOF. The buffer
+/// is shared so a reader that never finishes still leaves what it read.
+fn spawn_reader(
+    mut pipe: impl Read + Send + 'static,
+    done: mpsc::Sender<()>,
+) -> Arc<Mutex<Captured>> {
+    let shared = Arc::new(Mutex::new(Captured::default()));
+    let buffer = Arc::clone(&shared);
+    thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut captured = buffer.lock().unwrap_or_else(|e| e.into_inner());
+                    let room = OUTPUT_CAP.saturating_sub(captured.bytes.len());
+                    captured.bytes.extend_from_slice(&chunk[..n.min(room)]);
+                    captured.cut |= n > room;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        let _ = done.send(());
+    });
+    shared
 }
 
 fn wait_with_timeout(
@@ -192,7 +266,7 @@ fn wait_with_timeout(
                 let _ = kill_process_group(Pid::from_child(child), Signal::KILL);
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(TransportError::Timeout);
+                return Err(TransportError::Timeout(timeout));
             }
             Ok(None) => thread::sleep(Duration::from_millis(10)),
             Err(err) => return Err(TransportError::Spawn(err.to_string())),
@@ -265,7 +339,54 @@ mod tests {
             Duration::from_millis(200),
         )
         .unwrap_err();
-        assert_eq!(err, TransportError::Timeout);
+        assert_eq!(err, TransportError::Timeout(Duration::from_millis(200)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A background process that leaves the script's process group (so the
+    /// group kill misses it) and keeps stdout open. macOS has no `setsid`
+    /// binary, so perl's `setpgrp` does it; without perl the case is skipped.
+    fn escaping_holder() -> Option<&'static str> {
+        crate::editor::find_program(
+            std::path::Path::new("perl"),
+            std::env::var_os("PATH").as_deref(),
+        )
+        .map(|_| "perl -e 'setpgrp; sleep 10' &")
+    }
+
+    #[test]
+    fn a_detached_pipe_holder_does_not_block_a_finished_script() {
+        let Some(holder) = escaping_holder() else {
+            eprintln!("skipped: perl not found");
+            return;
+        };
+        let started = Instant::now();
+        let out = run_with_script(
+            Command::new("/bin/sh").arg("-s"),
+            &format!("{holder}\necho done"),
+            RUN_TIMEOUT,
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(out.stdout, b"done\n");
+        assert!(out.truncated);
+    }
+
+    #[test]
+    fn a_detached_pipe_holder_does_not_extend_the_timeout() {
+        let Some(holder) = escaping_holder() else {
+            eprintln!("skipped: perl not found");
+            return;
+        };
+        let started = Instant::now();
+        let err = run_with_script(
+            Command::new("/bin/sh").arg("-s"),
+            &format!("{holder}\nsleep 30"),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert_eq!(err, TransportError::Timeout(Duration::from_millis(200)));
+        assert_eq!(err.to_string(), "timed out after 200 ms");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -294,7 +415,10 @@ mod tests {
 
     #[test]
     fn error_messages_are_readable() {
-        assert_eq!(TransportError::Timeout.to_string(), "timed out after 30 s");
+        assert_eq!(
+            TransportError::Timeout(RUN_TIMEOUT).to_string(),
+            "timed out after 30 s"
+        );
         assert_eq!(
             TransportError::Exit {
                 code: None,

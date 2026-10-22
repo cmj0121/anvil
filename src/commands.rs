@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use crate::cli::{Cli, Failure};
 use crate::config::Config;
 use crate::document::{self, DocumentError, Format, MAX_BYTES};
-use crate::editor::{self, Editor, EditorError};
+use crate::editor::{self, Buffer, Editor, EditorError};
 use crate::inventory::Inventory;
 use crate::paths;
 use crate::secret::{self, SecretStore};
@@ -114,11 +114,18 @@ pub fn secret(cli: &Cli, name: &str, store: &dyn SecretStore) -> Result<(), Fail
     if !buffer.is_empty() && !buffer.ends_with(b"\n") {
         buffer.push(b'\n');
     }
-    let changed = match editor.edit(&buffer, "txt")? {
+    let changed = match editor.edit(&buffer, "txt", Buffer::Sensitive)? {
         None => false,
         Some(mut edited) => {
             if edited.last() == Some(&b'\n') {
                 edited.pop();
+            }
+            // The read-back stops one byte past the limit, so a longer value
+            // would otherwise be stored cut short.
+            if edited.len() as u64 > MAX_BYTES {
+                return Err(Failure::usage(format!(
+                    "secret {name}: larger than the {MAX_BYTES} byte limit, nothing stored"
+                )));
             }
             if edited.is_empty() {
                 if had_value {
@@ -215,7 +222,7 @@ where
     let mut attempt = 0;
     let parsed = loop {
         attempt += 1;
-        if let Some(text) = editor.edit(&buffer, dest.format.extension())? {
+        if let Some(text) = editor.edit(&buffer, dest.format.extension(), Buffer::Document)? {
             buffer = text;
             edited = true;
         }

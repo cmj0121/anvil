@@ -2,7 +2,11 @@
 //!
 //! Lines look like `<LEVEL> <target>: <message>`; no timestamps. Colour is used
 //! only when stderr is a terminal. The level comes from the `-v` count.
+//! Messages can carry text from a host (ssh errors, a script's stderr), so
+//! their control characters are escaped: a host cannot drive the terminal.
 
+use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
 use std::sync::OnceLock;
 
@@ -42,18 +46,39 @@ impl Logger {
 
     fn write_record(&self, out: &mut dyn Write, record: &Record) -> std::io::Result<()> {
         let level = record.level();
+        let message = record.args().to_string();
+        let message = escape_controls(&message);
         if self.colour {
             writeln!(
                 out,
-                "\x1b[{}m{level}\x1b[0m {}: {}",
+                "\x1b[{}m{level}\x1b[0m {}: {message}",
                 colour_code(level),
                 record.target(),
-                record.args()
             )
         } else {
-            writeln!(out, "{level} {}: {}", record.target(), record.args())
+            writeln!(out, "{level} {}: {message}", record.target())
         }
     }
+}
+
+/// `text` with every control character but `\n` and `\t` shown as a visible
+/// `\xNN` escape (ESC becomes `\x1b`), so text from a host cannot move the
+/// cursor, set the title or emit OSC sequences on the terminal. For human
+/// output only: `--json` is escaped by serde.
+pub fn escape_controls(text: &str) -> Cow<'_, str> {
+    let is_escaped = |c: char| c.is_control() && c != '\n' && c != '\t';
+    if !text.chars().any(is_escaped) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if is_escaped(c) {
+            let _ = write!(out, "\\x{:02x}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
 }
 
 fn colour_code(level: Level) -> u8 {
@@ -152,6 +177,32 @@ mod tests {
         assert_eq!(
             render(&logger, Level::Error, format_args!("boom")),
             "\x1b[31mERROR\x1b[0m anvil: boom\n"
+        );
+    }
+
+    #[test]
+    fn control_characters_but_newline_and_tab_are_escaped() {
+        assert!(matches!(escape_controls("plain\ttext\n"), Cow::Borrowed(_)));
+        assert_eq!(
+            escape_controls("a\x1b]0;pwned\x07b\x1b[2J\r\n\tc\x7f\u{9b}31m"),
+            "a\\x1b]0;pwned\\x07b\\x1b[2J\\x0d\n\tc\\x7f\\x9b31m"
+        );
+        assert_eq!(escape_controls("caf\u{e9} \u{2603}"), "caf\u{e9} \u{2603}");
+    }
+
+    #[test]
+    fn log_messages_are_escaped_but_the_colour_is_not() {
+        let logger = Logger {
+            level: LevelFilter::Error,
+            colour: true,
+        };
+        assert_eq!(
+            render(
+                &logger,
+                Level::Error,
+                format_args!("cannot connect: \x1b[2Jx")
+            ),
+            "\x1b[31mERROR\x1b[0m anvil: cannot connect: \\x1b[2Jx\n"
         );
     }
 }

@@ -6,12 +6,14 @@
 //! Step output is printed, never logged.
 
 use std::fmt::Write as _;
+use std::io::IsTerminal;
 
 use serde::Serialize;
 
 use crate::cli::{Cli, Failure};
 use crate::config::Step;
 use crate::inventory::Target;
+use crate::logger::escape_controls;
 use crate::transport::{Output, Transport, TransportError};
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -166,14 +168,16 @@ fn apply_target(
 }
 
 /// The header and each step's stdout go to stdout; stderr and failures go to
-/// stderr, each line prefixed with the target name.
+/// stderr, each line prefixed with the target name. Control characters from
+/// the host are escaped on stderr always and on stdout when it is a terminal
+/// (a pipe gets the step's bytes as they were).
 fn print_human(report: &TargetReport) {
-    let (out, err) = render(report);
+    let (out, err) = render(report, std::io::stdout().is_terminal());
     print!("{out}");
     eprint!("{err}");
 }
 
-fn render(report: &TargetReport) -> (String, String) {
+fn render(report: &TargetReport, escape_stdout: bool) -> (String, String) {
     let mut out = String::new();
     let mut err = String::new();
     let (target, steps, error) = match report {
@@ -187,12 +191,16 @@ fn render(report: &TargetReport) -> (String, String) {
     };
     let _ = writeln!(out, "==> {target}");
     for step in steps {
-        out.push_str(&step.stdout);
+        if escape_stdout {
+            out.push_str(&escape_controls(&step.stdout));
+        } else {
+            out.push_str(&step.stdout);
+        }
         if !step.stdout.is_empty() && !step.stdout.ends_with('\n') {
             out.push('\n');
         }
         for line in step.stderr.lines() {
-            let _ = writeln!(err, "{target}: {line}");
+            let _ = writeln!(err, "{target}: {}", escape_controls(line));
         }
         match step.code {
             Some(0) => {}
@@ -205,7 +213,7 @@ fn render(report: &TargetReport) -> (String, String) {
         }
     }
     if let Some(error) = error {
-        let _ = writeln!(err, "{target}: {error}");
+        let _ = writeln!(err, "{target}: {}", escape_controls(error));
     }
     (out, err)
 }
@@ -380,7 +388,7 @@ mod tests {
             "box",
             &["one", "two", "three"],
             1,
-            Some(TransportError::Timeout),
+            Some(TransportError::Timeout(crate::transport::RUN_TIMEOUT)),
         );
         assert_eq!(runs, ["one", "two"]);
         assert!(!report.ok());
@@ -395,7 +403,7 @@ mod tests {
                 "ok": false,
             })
         );
-        let (out, err) = render(&report);
+        let (out, err) = render(&report, false);
         assert_eq!(out, "==> box\none-out\n");
         assert_eq!(err, "box: timed out after 30 s\n");
     }
@@ -419,13 +427,55 @@ mod tests {
     #[test]
     fn human_output_puts_stdout_under_a_header_and_prefixes_stderr() {
         let (report, _) = apply("box", &["one", "fail"], None);
-        let (out, err) = render(&report);
+        let (out, err) = render(&report, false);
         assert_eq!(out, "==> box\none-out\npartial\n");
         assert_eq!(err, "box: boom\nbox: `fail` exited with 3\n");
 
         let (report, _) = apply("box", &["one"], Some(TransportError::HostKey));
-        let (out, err) = render(&report);
+        let (out, err) = render(&report, false);
         assert_eq!(out, "==> box\n");
         assert!(err.starts_with("box: host key unknown or changed"), "{err}");
+    }
+
+    #[test]
+    fn host_control_characters_are_escaped_in_human_output_only() {
+        let report = TargetReport::Failed {
+            target: "box".to_owned(),
+            steps: vec![StepReport::new(
+                "run",
+                Some(0),
+                "out\x1b]0;title\x07\n".to_owned(),
+                "err\x1b[2J\tx\n".to_owned(),
+            )],
+            error: TransportError::Connect {
+                stderr: "ssh: \x1b[31mred".to_owned(),
+            }
+            .to_string(),
+            ok: false,
+        };
+        let (out, err) = render(&report, false);
+        assert_eq!(
+            out, "==> box\nout\x1b]0;title\x07\n",
+            "a pipe gets the bytes"
+        );
+        assert_eq!(
+            err,
+            "box: err\\x1b[2J\tx\nbox: cannot connect: ssh: \\x1b[31mred\n"
+        );
+        let (out, _) = render(&report, true);
+        assert_eq!(
+            out, "==> box\nout\\x1b]0;title\\x07\n",
+            "a terminal does not"
+        );
+
+        let value = json(&report);
+        assert_eq!(value["steps"][0]["stdout"], "out\x1b]0;title\x07\n");
+        assert_eq!(value["steps"][0]["stderr"], "err\x1b[2J\tx\n");
+        assert_eq!(value["error"], "cannot connect: ssh: \x1b[31mred");
+        assert!(
+            serde_json::to_string(&report)
+                .unwrap()
+                .contains(r#""stdout":"out\u001b]0;title\u0007\n""#)
+        );
     }
 }

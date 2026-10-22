@@ -74,6 +74,17 @@ impl Drop for Sandbox {
     }
 }
 
+/// The stderr line every `anvil secret` with the fake (non-vim) editor starts with.
+fn copies_note() -> String {
+    format!(
+        "note: editor `{}` may keep its own copies of the secret (swap, undo, backup or history \
+         files); only vim, nvim, vi and view are told not to\n",
+        fixture("fake-editor.sh").display()
+    )
+}
+
+const MAX_BYTES: usize = 1 << 20;
+
 fn assert_no_value(out: &Output) {
     assert!(
         !text(&out.stdout).contains(VALUE),
@@ -150,7 +161,7 @@ fn editor_abort_is_exit_one() {
     assert!(out.stdout.is_empty());
     assert_eq!(
         text(&out.stderr),
-        "ERROR anvil: editor exited with status 4, nothing written\n"
+        copies_note() + "ERROR anvil: editor exited with status 4, nothing written\n"
     );
 }
 
@@ -178,6 +189,48 @@ fn target_is_ignored_with_a_warning() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(
         text(&out.stderr),
-        "WARN anvil::commands: --target is ignored by `secret`\n"
+        "WARN anvil::commands: --target is ignored by `secret`\n".to_owned() + &copies_note()
     );
+}
+
+#[test]
+fn a_non_vim_editor_note_shows_without_v_and_never_the_value() {
+    let sandbox = Sandbox::new("copies");
+    let typed = sandbox.typed();
+    let out = sandbox.anvil(&["secret", "HOST_SUDO"], Some(&typed), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr), copies_note());
+    assert_no_value(&out);
+}
+
+#[test]
+fn a_value_over_the_limit_is_refused_and_not_stored() {
+    let sandbox = Sandbox::new("oversize");
+    let big = sandbox.root.join("big.txt");
+    let value = format!("{VALUE}{}", "x".repeat(MAX_BYTES + 1 - VALUE.len()));
+    fs::write(&big, &value).unwrap();
+    let out = sandbox.anvil(&["--json", "secret", "HOST_SUDO"], Some(&big), None);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty(), "{}", text(&out.stdout));
+    assert_eq!(
+        text(&out.stderr),
+        copies_note()
+            + "ERROR anvil: secret HOST_SUDO: larger than the 1048576 byte limit, nothing stored\n"
+    );
+    assert_no_value(&out);
+}
+
+#[test]
+fn a_value_of_exactly_the_limit_plus_the_editor_newline_is_stored() {
+    let sandbox = Sandbox::new("boundary");
+    let full = sandbox.root.join("full.txt");
+    let value = format!("{VALUE}{}\n", "x".repeat(MAX_BYTES - VALUE.len()));
+    fs::write(&full, &value).unwrap();
+    let out = sandbox.anvil(&["--json", "secret", "HOST_SUDO"], Some(&full), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "{\"name\":\"HOST_SUDO\",\"changed\":true}\n"
+    );
+    assert_no_value(&out);
 }

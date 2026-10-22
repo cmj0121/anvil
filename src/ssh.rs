@@ -6,10 +6,17 @@
 
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use crate::transport::{Output, RUN_TIMEOUT, Transport, TransportError, run_with_script};
+use crate::transport::{Output, RUN_TIMEOUT, Transport, TransportError, collect, run_with_script};
+
+/// Deadline for the BatchMode master attempt (no prompt can be pending).
+pub const KEY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for `ssh -O check`.
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `len(<ctl>) + 1 + 40 + 17` must fit `sun_path` (104 bytes on macOS).
 const CONTROL_PATH_MAX: usize = 103;
@@ -28,6 +35,10 @@ pub struct Ssh {
     pub port: Option<u16>,
     /// `$HOME`; the control directory lives under `<home>/.ssh/anvil`.
     pub home: PathBuf,
+    /// Deadline for the BatchMode master attempt; the interactive retry has none.
+    key_timeout: Duration,
+    /// Deadline for `-O check`.
+    check_timeout: Duration,
     /// Pretends stdin and stderr are a terminal so the retry path can be tested.
     #[cfg(test)]
     force_tty: bool,
@@ -51,6 +62,8 @@ impl Ssh {
             user,
             port,
             home: PathBuf::from(home),
+            key_timeout: KEY_TIMEOUT,
+            check_timeout: CHECK_TIMEOUT,
             #[cfg(test)]
             force_tty: false,
         })
@@ -127,13 +140,17 @@ impl Ssh {
         command
     }
 
+    /// A timed-out or failed check counts as no master.
     fn master_alive(&self, control_dir: &Path) -> bool {
         self.command(&self.check_args(control_dir))
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+            .spawn()
+            .map_err(|err| TransportError::Spawn(err.to_string()))
+            .and_then(|child| collect(child, Some(self.check_timeout)))
+            .is_ok_and(|output| output.code == Some(0))
     }
 
     /// Opens the master: the key attempt, then one interactive attempt when the
@@ -169,21 +186,32 @@ impl Ssh {
     ) -> Result<MasterOutcome, TransportError> {
         // ssh forks into the background after authenticating and points its own
         // stdio at /dev/null, so the pipe closes and the master never holds ours.
-        let output = self
-            .command(&self.master_args(control_dir, batch))
+        let mut command = self.command(&self.master_args(control_dir, batch));
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
+            .stderr(Stdio::piped());
+        // The key attempt runs in its own process group under a deadline. The
+        // interactive retry stays in anvil's group, which owns the terminal ssh
+        // prompts on, and has no deadline: a person is typing (D3).
+        let timeout = if batch {
+            command.process_group(0);
+            Some(self.key_timeout)
+        } else {
+            None
+        };
+        let child = command
+            .spawn()
             .map_err(|err| TransportError::Spawn(err.to_string()))?;
+        let output = collect(child, timeout)?;
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.success() {
+        if output.code == Some(0) {
             return Ok(MasterOutcome::Connected);
         }
         if is_host_key_failure(&stderr) {
             return Err(TransportError::HostKey);
         }
-        if output.status.code() == Some(255) && stderr.contains("Permission denied") {
+        if output.code == Some(255) && stderr.contains("Permission denied") {
             return Ok(MasterOutcome::Denied);
         }
         Err(TransportError::Connect {
@@ -308,6 +336,8 @@ mod tests {
             user: Some("me".to_owned()),
             port: Some(2222),
             home: PathBuf::from("/tmp/h"),
+            key_timeout: KEY_TIMEOUT,
+            check_timeout: CHECK_TIMEOUT,
             force_tty: false,
         }
     }
@@ -529,6 +559,8 @@ mod tests {
             user: None,
             port: None,
             home: home.to_owned(),
+            key_timeout: KEY_TIMEOUT,
+            check_timeout: CHECK_TIMEOUT,
             force_tty: false,
         }
     }
@@ -787,6 +819,71 @@ mod tests {
             ssh.run("true").unwrap_err(),
             TransportError::Exit { code: Some(3), .. }
         ));
+    }
+
+    #[test]
+    fn a_hung_key_attempt_is_killed_at_its_deadline() {
+        let home = temp_home();
+        let (ssh, log) = fake_with(&home, &[("FAKE_SSH_SLEEP", "30")]);
+        let ssh = Ssh {
+            key_timeout: Duration::from_millis(200),
+            ..ssh
+        };
+        let started = std::time::Instant::now();
+        let err = ssh.run("true").unwrap_err();
+        assert_eq!(err, TransportError::Timeout(Duration::from_millis(200)));
+        // Well under the fake's 30 s sleep; generous because macOS scans a freshly
+        // written script on its first exec, which is slow under a loaded suite.
+        assert!(started.elapsed() < Duration::from_secs(15));
+        let calls = invocations(&log);
+        assert!(
+            calls.len() <= 2,
+            "check, key; no retry or client: {calls:?}"
+        );
+        assert!(calls.iter().all(|c| !c.ends_with("sh -s")), "{calls:?}");
+    }
+
+    #[test]
+    fn a_hung_check_counts_as_no_master() {
+        let home = temp_home();
+        let (ssh, log) = fake_with(
+            &home,
+            &[("FAKE_SSH_CHECK_SLEEP", "30"), ("FAKE_SSH_CHECK_EXIT", "0")],
+        );
+        let ssh = Ssh {
+            check_timeout: Duration::from_millis(200),
+            ..ssh
+        };
+        let started = std::time::Instant::now();
+        let out = ssh.run("echo hi").unwrap();
+        assert_eq!(out.stdout, b"hi\n");
+        // Well under the fake's 30 s sleep; generous because macOS scans a freshly
+        // written script on its first exec, which is slow under a loaded suite.
+        assert!(started.elapsed() < Duration::from_secs(15));
+        // The check may be killed before the fake logs it (macOS scans a freshly
+        // written script on its first exec), so only the later calls are certain.
+        let calls = invocations(&log);
+        let master = calls.iter().position(|c| c.contains(" -M ")).unwrap();
+        assert_eq!(calls.len(), master + 2, "{calls:?}");
+        assert!(calls[master + 1].ends_with("sh -s"), "{calls:?}");
+    }
+
+    #[test]
+    fn master_stderr_is_capped() {
+        let home = temp_home();
+        let (ssh, _) = fake_with(
+            &home,
+            &[
+                ("FAKE_SSH_EXIT", "255"),
+                ("FAKE_SSH_STDERR_BYTES", "3000000"),
+            ],
+        );
+        match ssh.run("true").unwrap_err() {
+            TransportError::Connect { stderr } => {
+                assert_eq!(stderr.len(), crate::transport::OUTPUT_CAP);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

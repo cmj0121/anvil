@@ -27,8 +27,8 @@ Every flag is global: it may come before or after the command.
 | `-h`, `--help`      | help                                                                                           |
 | `-V`, `--version`   | version                                                                                        |
 
-The JSON examples below are pretty-printed; anvil prints each document on one line. An unknown `--target` is a
-usage error (exit 2). `inventory`, `config` and `secret` ignore `--target` with a warning.
+The JSON examples below are pretty-printed; anvil prints each document on one line. An unknown `--target` is a usage
+error (exit 2). `inventory`, `config` and `secret` ignore `--target` with a warning.
 Targets run one after another, `local` first, then hosts sorted by name; a failing target does not stop the others.
 
 ## Commands
@@ -109,7 +109,9 @@ reported (abridged above).
 Runs the config's `[[steps]]` in order on every selected target: each step's `run` is sent to `sh -s` on the target
 (`/bin/sh -s` for `local`). A step that exits non-zero ends that target; the other targets still run. Human output: a
 `==> TARGET` header, then each step's stdout on stdout; each step's stderr and every failure go to stderr, prefixed with
-`TARGET:`. Exit 0 when every step on every target exited 0, else 1. `--json`:
+`TARGET:`. Control characters a host sends (escape sequences, say) are shown as visible `\x1b`-style escapes on
+stderr, and on stdout when it is a terminal; piped stdout and `--json` keep the bytes as they were. Exit 0 when every
+step on every target exited 0, else 1. `--json`:
 
 ```json
 {
@@ -141,7 +143,14 @@ Opens the secret's current value (empty when unset) in the editor as a plain-tex
 stripped; an empty buffer deletes the secret, anything else is stored; an unchanged buffer writes nothing. `NAME` must
 match `[A-Z][A-Z0-9_]*` (else exit 2). Storage is the macOS login keychain: a generic password with service `anvil` and
 account `NAME`. The value never appears on argv, in the environment, in logs or in any output. Reading the current value
-may raise one keychain access prompt per rebuild of the binary (an unsigned binary has no stable identity).
+may raise one keychain access prompt per rebuild of the binary (an unsigned binary has no stable identity). A value
+larger than 1 MiB is refused (exit 2) and nothing is stored.
+
+When the editor is `vim`, `nvim`, `vi` or `view`, anvil adds
+`-n -i NONE --cmd "set noswapfile noundofile nobackup nowritebackup"` and the same `set` again with `-c` (after your
+vimrc), so the editor keeps no swap, undo, backup or viminfo/shada copy of the value. With any other editor anvil always
+prints a one-line `note:` on stderr that the editor may keep its own copies; check its settings, or set
+`[anvil].editor = "nvim"`.
 
 Human output: `secret NAME: updated` or `secret NAME: unchanged`. `--json`:
 
@@ -152,11 +161,11 @@ Human output: `secret NAME: updated` or `secret NAME: unchanged`. `--json`:
 ### The editor
 
 `[anvil].editor`, else `$VISUAL`, else `$EDITOR`, else `nvim`; split on whitespace into argv (never run through a shell);
-the program must be absolute or on `PATH` (else exit 2). The buffer lives in `edit-<random>.<ext>` (mode 0600, created
-with `create_new`) inside `<temp dir>/anvil-<uid>/` (mode 0700, refused when owned by someone else or open to others).
-Afterwards the file is overwritten with zeros and removed; on APFS the zeroing is best effort only (copy-on-write), the
-real control is the private directory and file mode. An editor that exits non-zero aborts the command: nothing is
-written, exit 1.
+the program must be absolute or on `PATH` (else exit 2); relative `PATH` entries such as `.` are skipped. The buffer
+lives in `edit-<random>.<ext>` (mode 0600, created with `create_new`) inside `<temp dir>/anvil-<uid>/` (mode 0700,
+refused when owned by someone else or open to others). Afterwards the file is overwritten with zeros and removed; on
+APFS the zeroing is best effort only (copy-on-write), the real control is the private directory and file mode. An editor
+that exits non-zero aborts the command: nothing is written, exit 1.
 
 ## Exit codes
 
@@ -170,7 +179,7 @@ written, exit 1.
 - **1**: `doctor`/`apply`: a target or a check failed. `inventory`/`config`/`secret`: the editor exited non-zero
   (aborted), a file write failed or the keychain refused.
 - **2**: a bad flag or argument, an unknown `--target`, an invalid or ambiguous file, no `$HOME`, editor not found, an
-  invalid buffer after three attempts.
+  invalid buffer after three attempts, or a secret larger than 1 MiB.
 
 ## Files and formats
 
@@ -233,16 +242,20 @@ from `--ssh-config`; `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE` and `DISPLAY` are remo
   is detached from anvil, so it never holds anvil's output open. A live master (`ssh -O check`) is reused, by the same
   run and by later runs within 60 s of idle.
 - **Unreachable hosts.** When the master cannot reach the host at all (refused, timed out, no route), the target fails
-  with `cannot connect:` and ssh's first error line; `apply` then reports no steps for it.
+  with `cannot connect: <ssh's first error line>`; `apply` then reports no steps for it.
 - **Key first.** The master is tried with `BatchMode=yes`. When the server denies it and anvil's stdin and stderr are a
   terminal, there is exactly one interactive retry without `BatchMode`, where ssh itself asks for the passphrase, PIN or
-  password on the terminal; anvil never reads, stores or passes a password. Without a terminal the target fails with
-  `key auth failed; run interactively for password sign-in`. A refused interactive attempt reports `authentication
-failed after the interactive attempt`.
+  password on the terminal; anvil never reads, stores or passes a password. The key attempt is killed after 30 s and
+  each `ssh -O check` after 10 s (a check that times out counts as no master); the interactive retry has no anvil
+  timeout, since a person is typing. Without a terminal the target fails with
+  `key auth failed; run interactively for password sign-in`. A refused interactive attempt reports
+  `authentication failed after the interactive attempt`.
 - **Host keys are never auto-accepted.** An unknown or changed host key fails the target with
   ``host key unknown or changed; run `ssh <host>` once to verify the fingerprint``.
 - **Scripts** run as clients of the master (`-o ControlMaster=no -o BatchMode=yes ... sh -s`), with the script on stdin
-  and a 30 s timeout; a client never prompts. Each stream is kept up to 1 MiB.
+  and a 30 s timeout; a client never prompts. Each stream is kept up to 1 MiB. A background process that leaves the
+  script's process group and keeps its output open is given 1 s after the script ends; then anvil stops reading and
+  reports what it has.
 - **Control directory** `~/.ssh/anvil`: created with mode 0700 (and `~/.ssh` 0700 if missing); refused when owned by
   another user, open to group or others, when `~/.ssh` is group- or world-writable, when `$HOME` contains `%`, or when a
   socket path would not fit macOS' 104-byte `sun_path` — that is, a `$HOME` longer than 34 bytes.
@@ -251,8 +264,9 @@ failed after the interactive attempt`.
 
 Logs go to stderr as `LEVEL target: message`; `--json` output on stdout stays a single document. The default shows
 errors only; `-v` adds warnings, `-vv` info, `-vvv` debug, which includes the argv of every `ssh` and editor spawn. A
-fatal error is the last line before a non-zero exit. Secret values, probe output and file contents are never logged at
-any level. There are no log files and no `RUST_LOG`.
+fatal error is the last line before a non-zero exit. Control characters in a message (ssh's or a host's text) are shown
+as `\x1b`-style escapes; `doctor`'s human output escapes them too. Secret values, probe output and file contents are
+never logged at any level. There are no log files and no `RUST_LOG`.
 
 ## Deviations from #2/#3
 

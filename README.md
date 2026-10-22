@@ -160,6 +160,12 @@ Logs go to stderr only, so `--json` output stays parseable. The default shows er
   inside a per-user 0700 directory under the system temp dir; afterwards it is overwritten with zeros and removed. The
   zeroing is best effort only: APFS is copy-on-write, so the old blocks may survive. The real protection is the private
   directory and the file mode.
+- **Editor copies of a secret.** For `anvil secret`, `vim`, `nvim`, `vi` and `view` are started with swap, undo,
+  backup and viminfo/shada files turned off. Any other editor may keep its own copies of the value (swap, backup,
+  history) outside anvil's private directory; anvil says so on stderr every time.
+- **Host output is defanged.** Control characters a host sends in its stderr or errors are shown as visible
+  `\x1b`-style escapes, so a host cannot drive your terminal; step stdout is escaped only when it goes to a terminal,
+  and `--json` is untouched.
 - **Keychain prompts.** `anvil secret` reads the stored value, and macOS may ask once for keychain access after every
   rebuild, because the unsigned binary has no stable identity. `anvil doctor` only checks that the item exists and never
   prompts.

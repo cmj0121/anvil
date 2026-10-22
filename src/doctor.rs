@@ -16,6 +16,7 @@ use crate::cli::{Cli, Failure};
 use crate::editor::{self, Editor, EditorError};
 use crate::facts::{self, Facts, PROBE};
 use crate::inventory::{Target, TargetKind};
+use crate::logger::escape_controls;
 use crate::secret::SecretStore;
 use crate::transport::{Transport, TransportError};
 
@@ -203,6 +204,8 @@ pub fn describe(target: &Target) -> String {
     }
 }
 
+/// The human report. Facts and errors come from the host, so control
+/// characters are escaped: a host cannot drive the terminal.
 fn render(report: &Report) -> String {
     let yes_no = |ok: bool| if ok { "ok" } else { "missing" };
     let local = &report.local;
@@ -248,7 +251,7 @@ fn render(report: &Report) -> String {
             let _ = writeln!(out, "  {:<15} {error}", "error");
         }
     }
-    out
+    escape_controls(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -504,5 +507,33 @@ mod tests {
             ..host("b")
         };
         assert_eq!(describe(&bare), "ssh box");
+    }
+
+    #[test]
+    fn host_text_is_escaped_in_human_output_but_not_in_json() {
+        let store = Memory::default();
+        let targets = vec![
+            check_target(
+                &host("evil"),
+                fake(Ok("hostname=b\x1b]0;x\x07ox\nanvil-probe-end=1\n")),
+            ),
+            check_target(
+                &host("down"),
+                fake(Err(TransportError::Connect {
+                    stderr: "ssh: \x1b[2Jgone".to_owned(),
+                })),
+            ),
+        ];
+        let report = Report::new(healthy_local(&store, &[]), targets);
+        let text = render(&report);
+        assert!(!text.contains('\x1b') && !text.contains('\x07'), "{text}");
+        // Facts::parse already drops control characters from values.
+        assert!(text.contains("hostname        b]0;xox\n"), "{text}");
+        assert!(text.contains("cannot connect: ssh: \\x1b[2Jgone"), "{text}");
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            value["targets"][1]["error"],
+            "cannot connect: ssh: \x1b[2Jgone"
+        );
     }
 }
