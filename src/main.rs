@@ -1,7 +1,12 @@
 #![forbid(unsafe_code)]
 
 mod cli;
+// Used once U7 wires `doctor` and `apply`; the subcommands are stubs until then.
+#[allow(dead_code)]
+mod facts;
 mod logger;
+#[allow(dead_code)]
+mod transport;
 
 use std::process::ExitCode;
 
