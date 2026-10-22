@@ -1,5 +1,6 @@
 # sshd on Arch for the anvil e2e (D6): `key` signs in with the authorized key
 # passed as AUTHORIZED_KEY at start, `pw` only with the password `pw-secret`.
+# inetutils provides `hostname`, the config placeholder step `apply` runs.
 # BASE defaults to the official amd64 image; tests/e2e.sh passes the pinned
 # digest and picks an Arch Linux ARM build on arm64 hosts, where sshd's seccomp
 # sandbox cannot start under emulation.
@@ -9,7 +10,7 @@ FROM ${BASE}
 # pacman's own seccomp sandbox has the same problem under emulation.
 RUN sed -i 's/^#\?DisableSandbox/DisableSandbox/' /etc/pacman.conf \
     && (grep -q '^DisableSandbox' /etc/pacman.conf || echo 'DisableSandbox' >> /etc/pacman.conf) \
-    && pacman -Sy --noconfirm --needed filesystem openssh \
+    && pacman -Sy --noconfirm --needed filesystem openssh inetutils \
     && pacman -Scc --noconfirm \
     && ssh-keygen -A \
     && useradd -m -s /bin/bash -p '*' key \
