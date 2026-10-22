@@ -12,6 +12,7 @@ mod facts;
 mod inventory;
 mod logger;
 mod paths;
+mod secret;
 mod ssh;
 #[allow(dead_code)]
 mod transport;

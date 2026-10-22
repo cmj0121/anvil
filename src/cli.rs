@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use crate::facts::{Facts, PROBE};
+use crate::secret::{Keychain, SecretStore};
 use crate::ssh::Ssh;
 use crate::transport::Transport;
 
@@ -35,8 +36,33 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SEL")]
     pub target: Vec<String>,
 
+    /// Test aid, debug builds only: `memory` keeps secrets in this process
+    /// instead of the keychain.
+    #[cfg(debug_assertions)]
+    #[arg(long, global = true, value_enum, value_name = "STORE", hide = true)]
+    pub secret_store: Option<SecretStoreKind>,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+impl Cli {
+    /// The secret store: the keychain, or `Memory` when a debug build was
+    /// started with `--secret-store memory`.
+    pub fn secret_store(&self) -> Box<dyn SecretStore> {
+        #[cfg(debug_assertions)]
+        if self.secret_store == Some(SecretStoreKind::Memory) {
+            return Box::new(crate::secret::Memory::default());
+        }
+        Box::new(Keychain)
+    }
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SecretStoreKind {
+    Keychain,
+    Memory,
 }
 
 #[derive(Debug, Subcommand)]
@@ -147,6 +173,13 @@ impl From<crate::editor::EditorError> for Failure {
     }
 }
 
+// The keychain refusing an operation is a failed command (exit 1).
+impl From<crate::secret::SecretError> for Failure {
+    fn from(err: crate::secret::SecretError) -> Self {
+        Failure::failed(err.to_string())
+    }
+}
+
 impl From<Format> for crate::document::Format {
     fn from(format: Format) -> Self {
         match format {
@@ -156,12 +189,12 @@ impl From<Format> for crate::document::Format {
     }
 }
 
-/// Runs the parsed command. `doctor`, `apply` and `secret` are stubs until
-/// their units land.
+/// Runs the parsed command. `doctor` and `apply` are stubs until U7 lands.
 pub fn run(cli: &Cli) -> Result<(), Failure> {
     match &cli.command {
         Command::Inventory => crate::commands::inventory(cli),
         Command::Config { format } => crate::commands::config(cli, format.map(Into::into)),
+        Command::Secret { name } => crate::commands::secret(cli, name, cli.secret_store().as_ref()),
         Command::Probe { host, user, port } => probe(cli, host, user.clone(), *port),
         other => Err(Failure::usage(format!("{}: not implemented", other.name()))),
     }

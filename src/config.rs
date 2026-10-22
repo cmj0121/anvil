@@ -60,7 +60,7 @@ impl Config {
     /// Checks the D2 rules; the error names the field.
     pub fn validate(&self, path: &Path) -> Result<(), DocumentError> {
         for (i, name) in self.anvil.secrets.iter().enumerate() {
-            if !is_secret_name(name) {
+            if !crate::secret::is_name(name) {
                 return Err(DocumentError::invalid(
                     path,
                     format!("anvil.secrets[{i}] `{name}`: must match [A-Z][A-Z0-9_]*"),
@@ -86,13 +86,6 @@ impl Config {
         }
         Ok(())
     }
-}
-
-/// `[A-Z][A-Z0-9_]*`
-fn is_secret_name(s: &str) -> bool {
-    let mut chars = s.chars();
-    chars.next().is_some_and(|c| c.is_ascii_uppercase())
-        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 #[cfg(test)]

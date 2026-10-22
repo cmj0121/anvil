@@ -1,9 +1,14 @@
-//! `anvil inventory` and `anvil config`: the document flow of D9.
+//! `anvil inventory`, `anvil config` and `anvil secret`: the editor flows of
+//! D9 and D10.
 //!
 //! Load the current document (any format, missing → defaults), show it in the
 //! target format, parse and validate what comes back (re-opening up to three
 //! times on an error), then write `NAME.<ext>.tmp` 0600 and rename it over
 //! `NAME.<ext>`; any `NAME.*` in another format is removed afterwards.
+//!
+//! A secret is shown as plain text, the trailing newline is stripped and the
+//! result is stored; an empty buffer deletes the secret. The value is never
+//! printed or logged.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -19,6 +24,7 @@ use crate::document::{self, DocumentError, Format, MAX_BYTES};
 use crate::editor::{self, Editor, EditorError};
 use crate::inventory::Inventory;
 use crate::paths;
+use crate::secret::{self, SecretStore};
 
 /// How often an invalid buffer is re-opened before the command gives up.
 const ATTEMPTS: u32 = 3;
@@ -82,6 +88,61 @@ pub fn config(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
         },
     )?;
     report(cli, &outcome)
+}
+
+/// What `--json` prints for `secret`: the name and whether the store changed.
+#[derive(Debug, Serialize)]
+struct SecretOutcome<'a> {
+    name: &'a str,
+    changed: bool,
+}
+
+/// `anvil secret NAME`: `get` → edit as `.txt` → strip one trailing newline →
+/// empty deletes, anything else is stored. An unchanged buffer writes nothing.
+pub fn secret(cli: &Cli, name: &str, store: &dyn SecretStore) -> Result<(), Failure> {
+    warn_target(cli);
+    if !secret::is_name(name) {
+        return Err(Failure::usage(format!(
+            "secret `{name}`: must match [A-Z][A-Z0-9_]*"
+        )));
+    }
+    let config = load_config(cli)?;
+    let editor = Editor::resolve(config.anvil.editor.as_deref())?;
+    let current = store.get(name)?;
+    let had_value = current.is_some();
+    let mut buffer = current.unwrap_or_default();
+    if !buffer.is_empty() && !buffer.ends_with(b"\n") {
+        buffer.push(b'\n');
+    }
+    let changed = match editor.edit(&buffer, "txt")? {
+        None => false,
+        Some(mut edited) => {
+            if edited.last() == Some(&b'\n') {
+                edited.pop();
+            }
+            if edited.is_empty() {
+                if had_value {
+                    store.delete(name)?;
+                    log::info!("secret {name}: deleted");
+                }
+                had_value
+            } else {
+                store.set(name, &edited)?;
+                log::info!("secret {name}: stored");
+                true
+            }
+        }
+    };
+    if cli.json {
+        let json = serde_json::to_string(&SecretOutcome { name, changed })
+            .map_err(|err| Failure::usage(format!("cannot encode JSON: {err}")))?;
+        println!("{json}");
+    } else if changed {
+        println!("secret {name}: updated");
+    } else {
+        println!("secret {name}: unchanged");
+    }
+    Ok(())
 }
 
 fn warn_target(cli: &Cli) {
@@ -274,4 +335,134 @@ fn report(cli: &Cli, outcome: &Outcome) -> Result<(), Failure> {
         println!("{}: unchanged", outcome.path.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+    use crate::secret::Memory;
+
+    /// A config naming a scripted editor: `script` runs with the temp file as
+    /// `$1` and must write it itself (an empty script leaves it unchanged).
+    struct Scripted {
+        dir: PathBuf,
+        config: PathBuf,
+    }
+
+    impl Scripted {
+        fn new(tag: &str, script: &str) -> Scripted {
+            let dir =
+                std::env::temp_dir().join(format!("anvil-secret-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let editor = dir.join("editor.sh");
+            fs::write(&editor, format!("#!/bin/sh\nset -eu\n{script}\n")).unwrap();
+            fs::set_permissions(&editor, fs::Permissions::from_mode(0o700)).unwrap();
+            let config = dir.join("config.toml");
+            fs::write(
+                &config,
+                format!("[anvil]\neditor = \"{}\"\n", editor.display()),
+            )
+            .unwrap();
+            Scripted { dir, config }
+        }
+
+        fn run(&self, name: &str, store: &dyn SecretStore) -> Result<(), Failure> {
+            let config = self.config.to_str().unwrap();
+            let cli = Cli::try_parse_from(["anvil", "--config", config, "secret", name]).unwrap();
+            secret(&cli, name, store)
+        }
+    }
+
+    impl Drop for Scripted {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    use clap::Parser;
+
+    #[test]
+    fn an_edit_stores_the_value_without_its_trailing_newline() {
+        let scripted = Scripted::new("store", "printf 'hunter2\\n' > \"$1\"");
+        let store = Memory::default();
+        scripted.run("HOST_SUDO", &store).unwrap();
+        assert!(store.exists("HOST_SUDO").unwrap());
+        assert_eq!(store.get("HOST_SUDO").unwrap().unwrap(), b"hunter2");
+    }
+
+    #[test]
+    fn the_current_value_is_offered_and_an_empty_edit_deletes() {
+        let scripted = Scripted::new("delete", "cp \"$1\" \"$(dirname \"$0\")/seen\"; : > \"$1\"");
+        let store = Memory::default();
+        store.set("HOST_SUDO", b"old").unwrap();
+        scripted.run("HOST_SUDO", &store).unwrap();
+        assert_eq!(fs::read(scripted.dir.join("seen")).unwrap(), b"old\n");
+        assert!(!store.exists("HOST_SUDO").unwrap());
+    }
+
+    #[test]
+    fn an_unchanged_buffer_writes_nothing() {
+        let scripted = Scripted::new("unchanged", "");
+        let store = Memory::default();
+        store.set("HOST_SUDO", b"keep").unwrap();
+        scripted.run("HOST_SUDO", &store).unwrap();
+        assert_eq!(store.get("HOST_SUDO").unwrap().unwrap(), b"keep");
+        scripted.run("OTHER", &store).unwrap();
+        assert!(!store.exists("OTHER").unwrap());
+    }
+
+    #[test]
+    fn an_aborting_editor_is_exit_one_and_writes_nothing() {
+        let scripted = Scripted::new("abort", "printf 'leak\\n' > \"$1\"; exit 3");
+        let store = Memory::default();
+        let failure = scripted.run("HOST_SUDO", &store).unwrap_err();
+        assert_eq!(failure.code, 1);
+        assert!(!failure.message.contains("leak"));
+        assert!(!store.exists("HOST_SUDO").unwrap());
+    }
+
+    #[test]
+    fn an_invalid_name_is_usage_before_the_editor_runs() {
+        let scripted = Scripted::new(
+            "badname",
+            "printf 'x' > \"$1\"; touch \"$(dirname \"$0\")/ran\"",
+        );
+        let store = Memory::default();
+        for bad in ["host_sudo", "1X", "A-B"] {
+            let failure = scripted.run(bad, &store).unwrap_err();
+            assert_eq!(failure.code, 2, "{bad}");
+            assert!(
+                failure.message.contains("[A-Z][A-Z0-9_]*"),
+                "{}",
+                failure.message
+            );
+        }
+        assert!(!scripted.dir.join("ran").exists());
+    }
+
+    /// D11: no log call site in the secret flow mentions a value.
+    #[test]
+    fn log_calls_never_mention_a_value() {
+        for (file, source) in [
+            ("commands.rs", include_str!("commands.rs")),
+            ("secret.rs", include_str!("secret.rs")),
+        ] {
+            for (i, line) in source.lines().enumerate() {
+                if line.contains("log::") {
+                    let lower = line.to_ascii_lowercase();
+                    assert!(
+                        !lower.contains("value")
+                            && !lower.contains("edited")
+                            && !lower.contains("buffer"),
+                        "{file}:{}: {line}",
+                        i + 1
+                    );
+                }
+            }
+        }
+    }
 }
