@@ -109,9 +109,12 @@ pub enum SecretStoreKind {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Edit the inventory in the editor
-    Inventory,
-    /// Edit the config in the editor; --format converts it first
+    /// Edit the inventory in the editor; --format converts this file
+    Inventory {
+        #[arg(long, value_enum, value_name = "FORMAT")]
+        format: Option<Format>,
+    },
+    /// Edit the config in the editor; --format converts this file
     Config {
         #[arg(long, value_enum, value_name = "FORMAT")]
         format: Option<Format>,
@@ -130,7 +133,7 @@ pub enum Command {
 impl Command {
     pub fn name(&self) -> &'static str {
         match self {
-            Command::Inventory => "inventory",
+            Command::Inventory { .. } => "inventory",
             Command::Config { .. } => "config",
             Command::Doctor => "doctor",
             Command::Apply => "apply",
@@ -222,7 +225,7 @@ impl From<Format> for crate::document::Format {
 /// Runs the parsed command.
 pub fn run(cli: &Cli) -> Result<(), Failure> {
     match &cli.command {
-        Command::Inventory => crate::commands::inventory(cli),
+        Command::Inventory { format } => crate::commands::inventory(cli, format.map(Into::into)),
         Command::Config { format } => crate::commands::config(cli, format.map(Into::into)),
         Command::Doctor => crate::doctor::run(cli, cli.secret_store().as_ref()),
         Command::Apply => crate::apply::run(cli),
@@ -240,7 +243,16 @@ mod tests {
 
     #[test]
     fn parses_the_five_subcommands() {
-        assert!(matches!(parse(&["inventory"]).command, Command::Inventory));
+        assert!(matches!(
+            parse(&["inventory"]).command,
+            Command::Inventory { format: None }
+        ));
+        assert!(matches!(
+            parse(&["inventory", "--format", "toml"]).command,
+            Command::Inventory {
+                format: Some(Format::Toml)
+            }
+        ));
         assert!(matches!(
             parse(&["config"]).command,
             Command::Config { format: None }
@@ -295,6 +307,17 @@ mod tests {
         assert!(Cli::try_parse_from(["anvil", "frobnicate"]).is_err());
         assert!(Cli::try_parse_from(["anvil", "secret"]).is_err());
         assert!(Cli::try_parse_from(["anvil", "config", "--format", "ini"]).is_err());
+        for args in [
+            ["secret", "--format", "yaml", "X"].as_slice(),
+            ["doctor", "--format", "yaml"].as_slice(),
+            ["apply", "--format", "yaml"].as_slice(),
+            ["--format", "yaml", "inventory"].as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("anvil").chain(args.iter().copied())).is_err(),
+                "{args:?}"
+            );
+        }
         assert!(Cli::try_parse_from(["anvil", "__probe", "--host", "box"]).is_err());
     }
 

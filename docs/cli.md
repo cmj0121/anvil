@@ -5,8 +5,8 @@ The contract of the MVP ([#3](https://github.com/mini-poc/anvil/issues/3)), foll
 
 ```text
 anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [--target SEL]... <COMMAND>
-  inventory                      edit the inventory in the editor
-  config [--format toml|yaml]    edit the config; --format converts it first
+  inventory [--format toml|yaml] edit the inventory; --format converts this file
+  config [--format toml|yaml]    edit the config; --format converts this file
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
   secret <NAME>                  edit one secret in the editor
@@ -33,13 +33,20 @@ Targets run one after another, `local` first, then hosts sorted by name; a faili
 
 ## Commands
 
-### `anvil inventory`
+### `anvil inventory [--format toml|yaml]`
 
-Opens the inventory in the editor, in the format `[anvil].format` names (default TOML), converted from whatever format
-the current file has. On save the buffer is parsed and validated; an invalid buffer prints the error (file, host and
-field) and is re-opened with your text, up to three attempts, after which nothing is written and the exit is 2. A valid
-buffer is written atomically (`inventory.<ext>.tmp`, mode 0600, renamed over `inventory.<ext>`), and an inventory file
-in another format is removed. A missing inventory opens as an empty document.
+Opens the inventory in the editor. Without `--format` an existing inventory opens in its own format and is written back
+in that format, whatever `[anvil].format` says; a missing inventory opens as an empty document in `[anvil].format`
+(default TOML). With `--format X` the inventory is converted, opened in X and on save written as `inventory.<X ext>`
+(`.toml` or `.yaml`); its files in the other formats are removed and the config is not touched.
+
+On save the buffer is parsed and validated; an invalid buffer prints the error (file, host and field) and is re-opened
+with your text, up to three attempts, after which nothing is written and the exit is 2. A valid buffer is written
+atomically (`inventory.<ext>.tmp`, mode 0600, renamed over `inventory.<ext>`). A buffer left unchanged writes nothing,
+on the first run too, unless `--format` is converting an existing file.
+
+With `--inventory PATH` the file is written in the format of PATH's extension; a `--format` naming the other format is
+a usage error (exit 2).
 
 Human output: `wrote PATH` or `PATH: unchanged`. `--json`:
 
@@ -49,8 +56,9 @@ Human output: `wrote PATH` or `PATH: unchanged`. `--json`:
 
 ### `anvil config [--format toml|yaml]`
 
-Like `inventory`, for the config. With `--format` the current config is converted, opened in the new format with
-`[anvil].format` set to it, and on save written as `config.<new ext>`; the old file is deleted. When `[anvil].editor`
+Like `inventory`, for the config, with `--config PATH` in place of `--inventory PATH`. `--format X` converts the config
+only: it opens in X, is saved as `config.<X ext>` and the old file is removed; the inventory and `[anvil].format` stay
+as they are (edit `format` like any other key). When `[anvil].editor`
 names a program that cannot be found, `config` falls back to `$VISUAL`, `$EDITOR`, `nvim` with a warning, so a typo
 there cannot lock you out. Output and `--json` as for `inventory`.
 
@@ -209,16 +217,19 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 - **0**: for `doctor`, a `missing` secret or an unresolved editor is only a warning.
 - **1**: `doctor`/`apply`: a target or a check failed. `inventory`/`config`/`secret`: the editor exited non-zero
   (aborted), a file write failed or the keychain refused.
-- **2**: a bad flag or argument, an unknown `--target`, an invalid or ambiguous file, no `$HOME`, editor not found, an
-  invalid buffer after three attempts, or a secret larger than 1 MiB.
+- **2**: a bad flag or argument (including `--format` against an explicit path of the other format), an unknown
+  `--target`, an invalid or ambiguous file, no `$HOME`, editor not found, an invalid buffer after three attempts, or a
+  secret larger than 1 MiB.
 
 ## Files and formats
 
 Directory: `$XDG_CONFIG_HOME/anvil/`, else `~/.config/anvil/`. Two documents, `inventory` and `config`, each as
 `NAME.toml`, `NAME.yaml` or `NAME.yml`; the format follows the extension. More than one file for the same name is
-ambiguous (exit 2); `--inventory` / `--config` take an explicit path (any other extension is exit 2). A missing file is
-an empty document: the inventory holds only `local`, the config has the defaults below. Both formats map onto the same
-schema; unknown keys are refused, and any violation is exit 2 naming the file, host and field.
+ambiguous (exit 2); `--inventory` / `--config` take an explicit path (any other extension is exit 2). Each file keeps
+its own format: `anvil inventory` and `anvil config` write an existing file back in its format, create a missing one in
+`[anvil].format`, and convert only with `--format`, which only these two commands accept (elsewhere it is exit 2). A
+missing file is an empty document: the inventory holds only `local`, the config has the defaults below. Both formats
+map onto the same schema; unknown keys are refused, and any violation is exit 2 naming the file, host and field.
 
 ### Inventory
 
@@ -247,7 +258,7 @@ tag `local`; defining it is an error, as is a host name equal to a tag.
 ```toml
 [anvil]
 editor = "nvim"            # optional; see The editor
-format = "toml"            # "toml" | "yaml": what `anvil inventory` and `anvil config` write; default "toml"
+format = "toml"            # "toml" | "yaml": the format a missing inventory or config is created in; default "toml"
 secrets = ["HOST_SUDO"]    # names doctor checks, [A-Z][A-Z0-9_]*; default []
 
 [[steps]]
@@ -301,8 +312,9 @@ never logged at any level. There are no log files and no `RUST_LOG`.
 
 ## Deviations from #2/#3
 
-- The config key is `format` (`[anvil].format`), not `inventory_format`: it sets the format both `anvil inventory` and
-  `anvil config` write.
+- The config key is `format` (`[anvil].format`), not `inventory_format`: it sets the format a missing inventory or
+  config is created in; an existing file keeps its own format, and `--format` on `anvil inventory` or `anvil config`
+  converts that one file.
 - `tags` stays in the inventory schema and `--target` accepts a tag, although tags are out of scope in #3.
 - Exit 1 also means a failed command on the target-less commands: an aborted editor, a failed write or a keychain
   refusal for `inventory`, `config` and `secret`.

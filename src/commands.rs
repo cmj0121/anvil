@@ -1,10 +1,12 @@
 //! `anvil inventory`, `anvil config` and `anvil secret`: the editor flows of
-//! D9 and D10.
+//! D9, D10 and D13.
 //!
-//! Load the current document (any format, missing → defaults), show it in the
-//! target format, parse and validate what comes back (re-opening up to three
-//! times on an error), then write `NAME.<ext>.tmp` 0600 and rename it over
-//! `NAME.<ext>`; any `NAME.*` in another format is removed afterwards.
+//! Load the current document (any format, missing → defaults), show it in its
+//! own format (`--format` converts it, a missing file uses `[anvil].format`),
+//! parse and validate what comes back (re-opening up to three times on an
+//! error), then write `NAME.<ext>.tmp` 0600 and rename it over `NAME.<ext>`;
+//! any `NAME.*` in another format is removed afterwards. An unchanged buffer
+//! writes nothing.
 //!
 //! A secret is shown as plain text, the trailing newline is stripped and the
 //! result is stored; an empty buffer deletes the secret. The value is never
@@ -44,13 +46,19 @@ struct Destination {
     discovered: bool,
 }
 
-pub fn inventory(cli: &Cli) -> Result<(), Failure> {
+pub fn inventory(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
     warn_target(cli);
     let config = cli.load_config()?;
     let editor = Editor::resolve(config.anvil.editor.as_deref())?;
     let current = paths::locate(cli.inventory.as_deref(), "inventory")?;
+    let dest = destination(
+        cli.inventory.as_deref(),
+        current.as_deref(),
+        "inventory",
+        format,
+        config.anvil.format,
+    )?;
     let inventory = Inventory::load(current.as_deref())?;
-    let dest = destination(cli.inventory.as_deref(), "inventory", config.anvil.format)?;
     let outcome = edit_document(
         &editor,
         "inventory",
@@ -58,7 +66,6 @@ pub fn inventory(cli: &Cli) -> Result<(), Failure> {
         current.as_deref(),
         &dest,
         Inventory::validate,
-        |_| false,
     )?;
     report(cli, &outcome)
 }
@@ -66,12 +73,15 @@ pub fn inventory(cli: &Cli) -> Result<(), Failure> {
 pub fn config(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
     warn_target(cli);
     let current = paths::locate(cli.config.as_deref(), "config")?;
-    let mut config = Config::load(current.as_deref())?;
+    let config = Config::load(current.as_deref())?;
+    let dest = destination(
+        cli.config.as_deref(),
+        current.as_deref(),
+        "config",
+        format,
+        config.anvil.format,
+    )?;
     let editor = lenient_editor(config.anvil.editor.as_deref())?;
-    if let Some(format) = format {
-        config.anvil.format = format;
-    }
-    let dest = destination(cli.config.as_deref(), "config", config.anvil.format)?;
     let outcome = edit_document(
         &editor,
         "config",
@@ -79,13 +89,6 @@ pub fn config(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
         current.as_deref(),
         &dest,
         Config::validate,
-        |parsed| {
-            let forced = format.is_some_and(|format| parsed.anvil.format != format);
-            if let Some(format) = format {
-                parsed.anvil.format = format;
-            }
-            forced
-        },
     )?;
     report(cli, &outcome)
 }
@@ -174,37 +177,55 @@ fn lenient_editor(preference: Option<&str>) -> Result<Editor, Failure> {
     }
 }
 
-/// An explicit path is written as is, in its extension's format; otherwise
-/// the document is `NAME.<ext>` in the config directory, in `format`.
+/// Where document `name` is written (D13). An explicit path keeps its
+/// extension's format, and a different `--format` is a usage error. Otherwise
+/// `--format` names the format; without it an existing file keeps its own path
+/// and format, and a missing one is created in `default` (`[anvil].format`).
 fn destination(
     explicit: Option<&Path>,
+    current: Option<&Path>,
     name: &str,
-    format: Format,
+    requested: Option<Format>,
+    default: Format,
 ) -> Result<Destination, Failure> {
-    match explicit {
-        Some(path) => {
-            let format = Format::from_extension(path).ok_or_else(|| {
-                Failure::from(paths::PathsError::UnknownExtension {
-                    path: path.to_path_buf(),
-                })
-            })?;
-            Ok(Destination {
+    if let Some(path) = explicit {
+        let format = Format::from_extension(path).ok_or_else(|| {
+            Failure::from(paths::PathsError::UnknownExtension {
                 path: path.to_path_buf(),
-                format,
-                discovered: false,
             })
+        })?;
+        if let Some(requested) = requested.filter(|&requested| requested != format) {
+            return Err(Failure::usage(format!(
+                "--format {requested} conflicts with --{name} {}, a {format} file: \
+                 drop --format or pass a .{requested} path",
+                path.display()
+            )));
         }
-        None => Ok(Destination {
-            path: paths::config_dir()?.join(format!("{name}.{}", format.extension())),
+        return Ok(Destination {
+            path: path.to_path_buf(),
             format,
-            discovered: true,
-        }),
+            discovered: false,
+        });
     }
+    let existing = current.and_then(|path| Some((path, Format::from_extension(path)?)));
+    let (path, format) = match (requested, existing) {
+        (None, Some((path, format))) => (path.to_path_buf(), format),
+        (requested, _) => {
+            let format = requested.unwrap_or(default);
+            let path = paths::config_dir()?.join(format!("{name}.{}", format.extension()));
+            (path, format)
+        }
+    };
+    Ok(Destination {
+        path,
+        format,
+        discovered: true,
+    })
 }
 
 /// Shows `value` in the editor until it parses and validates (or `ATTEMPTS`
-/// runs out), then writes it. `fix` adjusts the parsed value before writing
-/// and returns whether it changed anything.
+/// runs out), then writes it. Nothing is written when the buffer came back
+/// unchanged and the file already sits at `dest` (or does not exist yet).
 fn edit_document<T>(
     editor: &Editor,
     name: &str,
@@ -212,7 +233,6 @@ fn edit_document<T>(
     current: Option<&Path>,
     dest: &Destination,
     validate: impl Fn(&T, &Path) -> Result<(), DocumentError>,
-    fix: impl Fn(&mut T) -> bool,
 ) -> Result<Outcome, Failure>
 where
     T: Serialize + DeserializeOwned,
@@ -220,14 +240,14 @@ where
     let mut buffer = document::to_string(&value, dest.format)?.into_bytes();
     let mut edited = false;
     let mut attempt = 0;
-    let parsed = loop {
+    loop {
         attempt += 1;
         if let Some(text) = editor.edit(&buffer, dest.format.extension(), Buffer::Document)? {
             buffer = text;
             edited = true;
         }
-        match parse(&buffer, dest, &validate) {
-            Ok(parsed) => break parsed,
+        match parse::<T>(&buffer, dest, &validate) {
+            Ok(_) => break,
             Err(err) if attempt < ATTEMPTS => eprintln!("{err}"),
             Err(err) => {
                 eprintln!("{err}");
@@ -236,14 +256,9 @@ where
                 )));
             }
         }
-    };
-    let mut parsed = parsed;
-    if fix(&mut parsed) {
-        buffer = document::to_string(&parsed, dest.format)?.into_bytes();
-        edited = true;
     }
 
-    let changed = edited || current != Some(dest.path.as_path());
+    let changed = edited || current.is_some_and(|current| current != dest.path);
     if changed {
         write_atomic(&dest.path, &buffer)?;
         if dest.discovered {

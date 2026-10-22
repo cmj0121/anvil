@@ -25,6 +25,7 @@ make build                 # builds target/release/anvil
 ```sh
 anvil inventory            # add your hosts (opens $EDITOR, default nvim)
 anvil config               # edit the preferences and the steps
+anvil inventory --format=yaml   # convert the inventory to YAML (optional)
 anvil secret HOST_SUDO     # store a secret in the macOS keychain
 anvil doctor               # local checks + every target's facts and reachability
 anvil apply                # run the config's steps on every target
@@ -55,15 +56,18 @@ tags = ["linode", "arch"] # optional; select hosts with --target
 ```toml
 [anvil]
 editor = "nvim"            # optional; else $VISUAL, $EDITOR, nvim
-format = "toml"            # the format `anvil inventory` and `anvil config` write: toml | yaml
+format = "toml"            # the format a new inventory or config is created in: toml | yaml
 secrets = ["HOST_SUDO"]    # names `doctor` checks in the keychain; default []
 
 [[steps]]
 run = "hostname"           # placeholder: a POSIX sh script run on every target
 ```
 
-Both files may be YAML instead (`inventory.yaml`, `config.yml`, …) with the same schema; `anvil config --format=yaml`
-converts the config, opens it in the new format and removes the old file on save.
+Both files may be YAML instead (`inventory.yaml`, `config.yml`, …) with the same schema, and each keeps its own format:
+`anvil inventory` and `anvil config` open an existing file in its format and write it back in that format.
+`--format=yaml` (or `toml`) converts that one file: it opens in the new format, is saved as `NAME.<format ext>` and
+the old file is removed; the other file and `[anvil].format` stay as they are. Leaving the editor without a change
+writes nothing, not even on the first run.
 
 ## Output
 

@@ -182,12 +182,12 @@ else
   printf '%s\n' "$expected"
 fi
 
-step "(h) config --format=yaml converts config.toml, doctor still works"
+step "(h) config --format=yaml converts config.toml only, doctor still works"
 anvil config --format=yaml --json
 code=$?
 if [ "$code" -eq 0 ] && grep -qx "{\"path\":\"$XDG/anvil/config.yaml\",\"changed\":true}" "$TMP/out" \
   && [ -f "$XDG/anvil/config.yaml" ] && [ ! -e "$XDG/anvil/config.toml" ] \
-  && grep -q 'format: yaml' "$XDG/anvil/config.yaml"; then
+  && grep -q 'format: toml' "$XDG/anvil/config.yaml" && [ -f "$XDG/anvil/inventory.toml" ]; then
   anvil doctor --json --target local --target arch
   code=$?
   if [ "$code" -eq 0 ] && grep -q '"ok":true}$' "$TMP/out"; then
