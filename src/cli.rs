@@ -4,6 +4,10 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
+use crate::facts::{Facts, PROBE};
+use crate::ssh::Ssh;
+use crate::transport::Transport;
+
 #[derive(Debug, Parser)]
 #[command(name = "anvil", version, about, propagate_version = true)]
 pub struct Cli {
@@ -53,6 +57,17 @@ pub enum Command {
         /// Secret name
         name: String,
     },
+    /// Debug aid for the container smoke: run the probe over ssh and print the
+    /// facts (removed in U8).
+    #[command(name = "__probe", hide = true)]
+    Probe {
+        #[arg(long, value_name = "HOST")]
+        host: String,
+        #[arg(long, value_name = "USER")]
+        user: Option<String>,
+        #[arg(long, value_name = "PORT")]
+        port: Option<u16>,
+    },
 }
 
 impl Command {
@@ -63,6 +78,7 @@ impl Command {
             Command::Doctor => "doctor",
             Command::Apply => "apply",
             Command::Secret { .. } => "secret",
+            Command::Probe { .. } => "__probe",
         }
     }
 }
@@ -146,8 +162,30 @@ pub fn run(cli: &Cli) -> Result<(), Failure> {
     match &cli.command {
         Command::Inventory => crate::commands::inventory(cli),
         Command::Config { format } => crate::commands::config(cli, format.map(Into::into)),
+        Command::Probe { host, user, port } => probe(cli, host, user.clone(), *port),
         other => Err(Failure::usage(format!("{}: not implemented", other.name()))),
     }
+}
+
+/// Runs the probe on `host` over [`Ssh`] and prints the facts: JSON with
+/// `--json`, `key=value` lines otherwise. A transport failure is exit 1.
+fn probe(cli: &Cli, host: &str, user: Option<String>, port: Option<u16>) -> Result<(), Failure> {
+    let ssh = Ssh::new(cli.ssh_config.clone(), host, user, port)
+        .map_err(|err| Failure::failed(err.to_string()))?;
+    let output = ssh
+        .run(PROBE)
+        .map_err(|err| Failure::failed(format!("{host}: {err}")))?;
+    let facts =
+        Facts::parse(&output.stdout).map_err(|err| Failure::failed(format!("{host}: {err}")))?;
+    if cli.json {
+        let json = serde_json::to_string(&facts).map_err(|err| Failure::failed(err.to_string()))?;
+        println!("{json}");
+    } else {
+        for (key, value) in &facts.0 {
+            println!("{key}={value}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -177,6 +215,27 @@ mod tests {
             Command::Secret { name } => assert_eq!(name, "HOST_SUDO"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn hidden_probe_takes_host_user_and_port() {
+        match parse(&["__probe", "--host", "box", "--user", "me", "--port", "2222"]).command {
+            Command::Probe { host, user, port } => {
+                assert_eq!(host, "box");
+                assert_eq!(user.as_deref(), Some("me"));
+                assert_eq!(port, Some(2222));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            parse(&["__probe", "--host", "box"]).command,
+            Command::Probe {
+                user: None,
+                port: None,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["anvil", "__probe"]).is_err());
     }
 
     #[test]

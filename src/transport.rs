@@ -33,8 +33,10 @@ pub enum TransportError {
     Spawn(String),
     /// The script did not finish within the run timeout.
     Timeout,
-    /// Key authentication failed and no terminal is available for a password.
-    AuthDenied,
+    /// Authentication failed: with `after_prompt` false the key was refused and
+    /// no terminal was there for a password; true means the interactive attempt
+    /// was refused too.
+    AuthDenied { after_prompt: bool },
     /// The host key is unknown or has changed; nothing is accepted automatically.
     HostKey,
     /// The script ran and exited non-zero.
@@ -46,8 +48,13 @@ impl fmt::Display for TransportError {
         match self {
             Self::Spawn(reason) => write!(f, "cannot start the transport: {reason}"),
             Self::Timeout => write!(f, "timed out after {} s", RUN_TIMEOUT.as_secs()),
-            Self::AuthDenied => {
+            Self::AuthDenied {
+                after_prompt: false,
+            } => {
                 write!(f, "key auth failed; run interactively for password sign-in")
+            }
+            Self::AuthDenied { after_prompt: true } => {
+                write!(f, "authentication failed after the interactive attempt")
             }
             Self::HostKey => write!(
                 f,

@@ -33,6 +33,10 @@ fn help_lists_the_subcommands_and_common_flags() {
     ] {
         assert!(stdout.contains(word), "help lacks {word}:\n{stdout}");
     }
+    assert!(
+        !stdout.contains("__probe"),
+        "debug aid is hidden:\n{stdout}"
+    );
     assert!(out.stderr.is_empty());
 }
 

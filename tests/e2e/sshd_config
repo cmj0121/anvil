@@ -1,0 +1,13 @@
+# sshd for the anvil e2e container: key or password, nothing else.
+Port 22
+ListenAddress 0.0.0.0
+HostKey /etc/ssh/ssh_host_ed25519_key
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication yes
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+UsePAM no
+PermitRootLogin no
+LogLevel VERBOSE
+PerSourcePenalties no
