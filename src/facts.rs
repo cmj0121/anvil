@@ -11,7 +11,8 @@ pub const PROBE: &str = include_str!("probe.sh");
 const END_MARKER: &str = "anvil-probe-end=1";
 const MAX_OUTPUT: usize = 64 * 1024;
 const MAX_VALUE: usize = 256;
-const KNOWN_KEYS: &[&str] = &[
+/// The keys the probe prints, in its order.
+pub const KEYS: &[&str] = &[
     "hostname",
     "os",
     "kernel",
@@ -60,7 +61,7 @@ impl Facts {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            if !KNOWN_KEYS.contains(&key) {
+            if !KEYS.contains(&key) {
                 continue;
             }
             facts.insert(key.to_owned(), clean_value(value));

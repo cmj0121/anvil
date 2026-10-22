@@ -84,6 +84,11 @@ pub struct Editor {
 }
 
 impl Editor {
+    /// The program as found on disk.
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
     /// The editor from `preference` (`[anvil].editor`), else `$VISUAL`, else
     /// `$EDITOR`, else `nvim`, checked against the process `PATH`.
     pub fn resolve(preference: Option<&str>) -> Result<Editor, EditorError> {
@@ -180,7 +185,7 @@ fn is_executable(path: &Path) -> bool {
 
 /// The executable `program` names: itself when absolute, else the first
 /// match on `path`. Relative paths with a directory part are refused.
-fn find_program(program: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
+pub fn find_program(program: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
     if program.is_absolute() {
         return is_executable(program).then(|| program.to_path_buf());
     }

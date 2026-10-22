@@ -6,9 +6,7 @@
 //! raises the keychain's ACL dialog; `get` does read the data and may prompt
 //! once per binary. Values never appear in errors, logs or output.
 
-use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Mutex;
 
 /// The keychain service every anvil secret is filed under.
 pub const SERVICE: &str = "anvil";
@@ -50,9 +48,7 @@ impl fmt::Display for SecretError {
 impl std::error::Error for SecretError {}
 
 pub trait SecretStore {
-    /// Whether `name` is stored, without reading its value (used by `doctor`
-    /// from U7 on).
-    #[allow(dead_code)]
+    /// Whether `name` is stored, without reading its value (used by `doctor`).
     fn exists(&self, name: &str) -> Result<bool, SecretError>;
     /// The stored value, `None` when absent.
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>, SecretError>;
@@ -153,19 +149,22 @@ impl SecretStore for Keychain {
 }
 
 /// An in-process store for tests and the debug-only `--secret-store memory`.
+#[cfg(any(test, debug_assertions))]
 #[derive(Debug, Default)]
 pub struct Memory {
-    items: Mutex<BTreeMap<String, Vec<u8>>>,
+    items: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
 }
 
+#[cfg(any(test, debug_assertions))]
 impl Memory {
-    fn items(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Vec<u8>>> {
+    fn items(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, Vec<u8>>> {
         self.items
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
+#[cfg(any(test, debug_assertions))]
 impl SecretStore for Memory {
     fn exists(&self, name: &str) -> Result<bool, SecretError> {
         Ok(self.items().contains_key(name))

@@ -1,20 +1,18 @@
 #![forbid(unsafe_code)]
 
+mod apply;
 mod cli;
 mod commands;
 mod config;
+mod doctor;
 mod document;
 mod editor;
-// The facts and transport modules are wired into `doctor` and `apply` by U7;
-// those subcommands are stubs until then.
-#[allow(dead_code)]
 mod facts;
 mod inventory;
 mod logger;
 mod paths;
 mod secret;
 mod ssh;
-#[allow(dead_code)]
 mod transport;
 
 use std::process::ExitCode;

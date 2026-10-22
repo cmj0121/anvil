@@ -39,8 +39,15 @@ pub enum TransportError {
     AuthDenied { after_prompt: bool },
     /// The host key is unknown or has changed; nothing is accepted automatically.
     HostKey,
-    /// The script ran and exited non-zero.
-    Exit { code: Option<i32>, stderr: String },
+    /// The ssh master could not reach the host (refused, timed out, no route):
+    /// ssh's stderr, lossy UTF-8. Only the master reports this; never a client.
+    Connect { stderr: String },
+    /// The script ran and exited non-zero; its output is kept (lossy UTF-8).
+    Exit {
+        code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    },
 }
 
 impl fmt::Display for TransportError {
@@ -60,7 +67,14 @@ impl fmt::Display for TransportError {
                 f,
                 "host key unknown or changed; run `ssh <host>` once to verify the fingerprint"
             ),
-            Self::Exit { code, stderr } => {
+            Self::Connect { stderr } => {
+                f.write_str("cannot connect")?;
+                match stderr.lines().map(str::trim).find(|line| !line.is_empty()) {
+                    Some(line) => write!(f, ": {line}"),
+                    None => Ok(()),
+                }
+            }
+            Self::Exit { code, stderr, .. } => {
                 match code {
                     Some(code) => write!(f, "script exited with {code}")?,
                     None => write!(f, "script was killed by a signal")?,
@@ -148,6 +162,7 @@ pub fn run_with_script(
     } else {
         Err(TransportError::Exit {
             code: output.code,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
@@ -217,12 +232,13 @@ mod tests {
     }
 
     #[test]
-    fn non_zero_exit_is_an_error_with_stderr() {
-        let err = Local.run("echo nope >&2; exit 3").unwrap_err();
+    fn non_zero_exit_is_an_error_with_its_output() {
+        let err = Local.run("echo out; echo nope >&2; exit 3").unwrap_err();
         assert_eq!(
             err,
             TransportError::Exit {
                 code: Some(3),
+                stdout: "out\n".to_owned(),
                 stderr: "nope\n".to_owned()
             }
         );
@@ -282,10 +298,26 @@ mod tests {
         assert_eq!(
             TransportError::Exit {
                 code: None,
+                stdout: String::new(),
                 stderr: String::new()
             }
             .to_string(),
             "script was killed by a signal"
+        );
+        assert_eq!(
+            TransportError::Connect {
+                stderr: "\n  ssh: connect to host box port 1: Connection refused  \nmore\n"
+                    .to_owned()
+            }
+            .to_string(),
+            "cannot connect: ssh: connect to host box port 1: Connection refused"
+        );
+        assert_eq!(
+            TransportError::Connect {
+                stderr: String::new()
+            }
+            .to_string(),
+            "cannot connect"
         );
     }
 }

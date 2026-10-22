@@ -4,10 +4,13 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
+use crate::config::Config;
 use crate::facts::{Facts, PROBE};
+use crate::inventory::{Inventory, Sel, Target, TargetKind};
+use crate::paths;
 use crate::secret::{Keychain, SecretStore};
 use crate::ssh::Ssh;
-use crate::transport::Transport;
+use crate::transport::{Local, Transport, TransportError};
 
 #[derive(Debug, Parser)]
 #[command(name = "anvil", version, about, propagate_version = true)]
@@ -42,6 +45,11 @@ pub struct Cli {
     #[arg(long, global = true, value_enum, value_name = "STORE", hide = true)]
     pub secret_store: Option<SecretStoreKind>,
 
+    /// Test aid, debug builds only: the ssh program to run instead of `ssh`.
+    #[cfg(debug_assertions)]
+    #[arg(long, global = true, value_name = "PATH", hide = true)]
+    pub ssh_program: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -55,6 +63,41 @@ impl Cli {
             return Box::new(crate::secret::Memory::default());
         }
         Box::new(Keychain)
+    }
+
+    /// The ssh program: `ssh` on `PATH`, or the debug-only `--ssh-program`.
+    pub fn ssh_program(&self) -> PathBuf {
+        #[cfg(debug_assertions)]
+        if let Some(program) = &self.ssh_program {
+            return program.clone();
+        }
+        PathBuf::from("ssh")
+    }
+
+    /// The config: `--config`, else the discovered file, else the defaults.
+    pub fn load_config(&self) -> Result<Config, Failure> {
+        let path = paths::locate(self.config.as_deref(), "config")?;
+        Ok(Config::load(path.as_deref())?)
+    }
+
+    /// The targets `--target` selects from the inventory (all when none).
+    pub fn targets(&self) -> Result<Vec<Target>, Failure> {
+        let path = paths::locate(self.inventory.as_deref(), "inventory")?;
+        let inventory = Inventory::load(path.as_deref())?;
+        let sels: Vec<Sel> = self.target.iter().map(|sel| Sel::parse(sel)).collect();
+        Ok(inventory.select(&sels)?)
+    }
+
+    /// The transport for `target`: [`Local`] for `local`, [`Ssh`] otherwise.
+    pub fn transport(&self, target: &Target) -> Result<Box<dyn Transport>, TransportError> {
+        match &target.kind {
+            TargetKind::Local => Ok(Box::new(Local)),
+            TargetKind::Ssh { host, user, port } => {
+                let mut ssh = Ssh::new(self.ssh_config.clone(), host, user.clone(), *port)?;
+                ssh.program = self.ssh_program();
+                Ok(Box::new(ssh))
+            }
+        }
     }
 }
 
@@ -189,22 +232,24 @@ impl From<Format> for crate::document::Format {
     }
 }
 
-/// Runs the parsed command. `doctor` and `apply` are stubs until U7 lands.
+/// Runs the parsed command.
 pub fn run(cli: &Cli) -> Result<(), Failure> {
     match &cli.command {
         Command::Inventory => crate::commands::inventory(cli),
         Command::Config { format } => crate::commands::config(cli, format.map(Into::into)),
+        Command::Doctor => crate::doctor::run(cli, cli.secret_store().as_ref()),
+        Command::Apply => crate::apply::run(cli),
         Command::Secret { name } => crate::commands::secret(cli, name, cli.secret_store().as_ref()),
         Command::Probe { host, user, port } => probe(cli, host, user.clone(), *port),
-        other => Err(Failure::usage(format!("{}: not implemented", other.name()))),
     }
 }
 
 /// Runs the probe on `host` over [`Ssh`] and prints the facts: JSON with
 /// `--json`, `key=value` lines otherwise. A transport failure is exit 1.
 fn probe(cli: &Cli, host: &str, user: Option<String>, port: Option<u16>) -> Result<(), Failure> {
-    let ssh = Ssh::new(cli.ssh_config.clone(), host, user, port)
+    let mut ssh = Ssh::new(cli.ssh_config.clone(), host, user, port)
         .map_err(|err| Failure::failed(err.to_string()))?;
+    ssh.program = cli.ssh_program();
     let output = ssh
         .run(PROBE)
         .map_err(|err| Failure::failed(format!("{host}: {err}")))?;
@@ -310,9 +355,33 @@ mod tests {
     }
 
     #[test]
-    fn stubs_fail_with_usage_exit() {
-        let failure = run(&parse(&["doctor"])).unwrap_err();
-        assert_eq!(failure.code, 2);
-        assert_eq!(failure.message, "doctor: not implemented");
+    fn local_target_gets_the_local_transport_and_hosts_get_ssh() {
+        let cli = parse(&["apply"]);
+        let local = Target {
+            name: "local".to_owned(),
+            kind: TargetKind::Local,
+            tags: vec!["local".to_owned()],
+        };
+        assert_eq!(cli.transport(&local).unwrap().name(), "local");
+        let host = Target {
+            name: "box".to_owned(),
+            kind: TargetKind::Ssh {
+                host: "203.0.113.10".to_owned(),
+                user: None,
+                port: None,
+            },
+            tags: vec![],
+        };
+        assert_eq!(cli.transport(&host).unwrap().name(), "203.0.113.10");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn hidden_ssh_program_overrides_ssh() {
+        assert_eq!(parse(&["doctor"]).ssh_program(), PathBuf::from("ssh"));
+        assert_eq!(
+            parse(&["doctor", "--ssh-program", "/x/fake-ssh"]).ssh_program(),
+            PathBuf::from("/x/fake-ssh")
+        );
     }
 }

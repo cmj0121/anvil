@@ -186,8 +186,7 @@ impl Ssh {
         if output.status.code() == Some(255) && stderr.contains("Permission denied") {
             return Ok(MasterOutcome::Denied);
         }
-        Err(TransportError::Exit {
-            code: output.status.code(),
+        Err(TransportError::Connect {
             stderr: stderr.into_owned(),
         })
     }
@@ -208,16 +207,10 @@ impl Transport for Ssh {
         if !self.master_alive(&control_dir) {
             self.open_master(&control_dir)?;
         }
+        // Auth happened in the master; any client exit, 255 included, is the
+        // script's (a nested ssh, say) and keeps its output.
         let mut command = self.command(&self.client_args(&control_dir));
-        match run_with_script(&mut command, script, RUN_TIMEOUT) {
-            Err(TransportError::Exit {
-                code: Some(255),
-                stderr,
-            }) if stderr.contains("Permission denied") => Err(TransportError::AuthDenied {
-                after_prompt: false,
-            }),
-            result => result,
-        }
+        run_with_script(&mut command, script, RUN_TIMEOUT)
     }
 }
 
@@ -708,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn master_255_without_permission_denied_is_an_exit_error_with_no_retry() {
+    fn master_255_without_permission_denied_is_a_connect_error_with_no_retry() {
         let home = temp_home();
         let (ssh, log) = fake_with(
             &home,
@@ -723,10 +716,13 @@ mod tests {
         let err = ssh.run("true").unwrap_err();
         assert_eq!(
             err,
-            TransportError::Exit {
-                code: Some(255),
+            TransportError::Connect {
                 stderr: "ssh: connect to host box port 22: Connection refused\n".to_owned()
             }
+        );
+        assert_eq!(
+            err.to_string(),
+            "cannot connect: ssh: connect to host box port 22: Connection refused"
         );
         assert_eq!(invocations(&log).len(), 2);
     }
@@ -751,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn client_255_with_permission_denied_is_auth_denied_other_255_is_exit() {
+    fn any_client_exit_is_exit_even_255_with_permission_denied() {
         let home = temp_home();
         let (ssh, _) = fake_with(
             &home,
@@ -760,32 +756,28 @@ mod tests {
                 ("FAKE_SSH_CLIENT_EXIT", "255"),
                 (
                     "FAKE_SSH_CLIENT_STDERR",
-                    "me@box: Permission denied (publickey).",
+                    "me@inner: Permission denied (publickey).",
                 ),
             ],
         );
         assert_eq!(
             ssh.run("true").unwrap_err(),
-            TransportError::AuthDenied {
-                after_prompt: false
+            TransportError::Exit {
+                code: Some(255),
+                stdout: String::new(),
+                stderr: "me@inner: Permission denied (publickey).\n".to_owned(),
             }
         );
 
-        let (ssh, _) = fake_with(
-            &home,
-            &[
-                ("FAKE_SSH_CHECK_EXIT", "0"),
-                ("FAKE_SSH_CLIENT_EXIT", "255"),
-                ("FAKE_SSH_CLIENT_STDERR", "Connection closed by remote host"),
-            ],
-        );
-        assert!(matches!(
-            ssh.run("true").unwrap_err(),
+        let (ssh, _) = fake_with(&home, &[("FAKE_SSH_CHECK_EXIT", "0")]);
+        assert_eq!(
+            ssh.run("echo kept; exit 255").unwrap_err(),
             TransportError::Exit {
                 code: Some(255),
-                ..
+                stdout: "kept\n".to_owned(),
+                stderr: String::new(),
             }
-        ));
+        );
 
         let (ssh, _) = fake_with(
             &home,

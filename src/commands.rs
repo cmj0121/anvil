@@ -46,7 +46,7 @@ struct Destination {
 
 pub fn inventory(cli: &Cli) -> Result<(), Failure> {
     warn_target(cli);
-    let config = load_config(cli)?;
+    let config = cli.load_config()?;
     let editor = Editor::resolve(config.anvil.editor.as_deref())?;
     let current = paths::locate(cli.inventory.as_deref(), "inventory")?;
     let inventory = Inventory::load(current.as_deref())?;
@@ -106,7 +106,7 @@ pub fn secret(cli: &Cli, name: &str, store: &dyn SecretStore) -> Result<(), Fail
             "secret `{name}`: must match [A-Z][A-Z0-9_]*"
         )));
     }
-    let config = load_config(cli)?;
+    let config = cli.load_config()?;
     let editor = Editor::resolve(config.anvil.editor.as_deref())?;
     let current = store.get(name)?;
     let had_value = current.is_some();
@@ -165,11 +165,6 @@ fn lenient_editor(preference: Option<&str>) -> Result<Editor, Failure> {
         }
         other => Ok(other?),
     }
-}
-
-fn load_config(cli: &Cli) -> Result<Config, Failure> {
-    let path = paths::locate(cli.config.as_deref(), "config")?;
-    Ok(Config::load(path.as_deref())?)
 }
 
 /// An explicit path is written as is, in its extension's format; otherwise
