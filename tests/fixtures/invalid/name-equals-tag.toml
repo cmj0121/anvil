@@ -1,0 +1,7 @@
+[hosts.linode1]
+host = "203.0.113.10"
+tags = ["arch"]
+
+[hosts.pi]
+host = "pi.local"
+tags = ["linode1"]

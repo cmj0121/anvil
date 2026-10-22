@@ -90,6 +90,25 @@ impl Failure {
     }
 }
 
+// Config, inventory and path problems are exit 2 (D2, D5).
+impl From<crate::document::DocumentError> for Failure {
+    fn from(err: crate::document::DocumentError) -> Self {
+        Failure::usage(err.to_string())
+    }
+}
+
+impl From<crate::paths::PathsError> for Failure {
+    fn from(err: crate::paths::PathsError) -> Self {
+        Failure::usage(err.to_string())
+    }
+}
+
+impl From<crate::inventory::UnknownSel> for Failure {
+    fn from(err: crate::inventory::UnknownSel) -> Self {
+        Failure::usage(err.to_string())
+    }
+}
+
 /// Runs the parsed command. Every subcommand is a stub until its unit lands.
 pub fn run(cli: &Cli) -> Result<(), Failure> {
     Err(Failure::usage(format!(
