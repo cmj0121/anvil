@@ -1,0 +1,460 @@
+//! `anvil inventory`, `anvil config` and `anvil secret`: their editor
+//! flows.
+//!
+//! Load the current document (any format, missing → defaults), show it in its
+//! own format (`--format` converts it, a missing file uses `[anvil].format`),
+//! parse and validate what comes back (re-opening up to three times on an
+//! error), then write `NAME.<ext>.tmp` 0600 and rename it over `NAME.<ext>`;
+//! any `NAME.*` in another format is removed afterwards. An unchanged buffer
+//! writes nothing.
+//!
+//! A secret is shown as plain text, the trailing newline is stripped and the
+//! result is stored; an empty buffer deletes the secret. The value is never
+//! printed or logged.
+
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::cli::{Cli, Failure, print_json};
+use crate::config::Config;
+use crate::document::{self, DocumentError, Format, MAX_BYTES};
+use crate::editor::{Buffer, Editor, Fallback};
+use crate::inventory::Inventory;
+use crate::paths::{self, DocPath};
+use crate::secret::{self, SecretStore};
+
+/// How often an invalid buffer is re-opened before the command gives up.
+const ATTEMPTS: u32 = 3;
+
+/// What `--json` prints: the file written and whether it changed.
+#[derive(Debug, Serialize)]
+struct Outcome {
+    path: PathBuf,
+    changed: bool,
+}
+
+/// Where the edited document ends up and the format it is shown in.
+struct Destination {
+    path: PathBuf,
+    format: Format,
+    /// `true` when the path was discovered, so stale sibling formats go away.
+    discovered: bool,
+}
+
+pub fn inventory(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
+    warn_target(cli);
+    let config = cli.load_config()?;
+    let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict)?;
+    let current = paths::locate(cli.inventory.as_deref(), "inventory")?;
+    let explicit = current.as_ref().filter(|_| cli.inventory.is_some());
+    let dest = destination(
+        explicit,
+        current.as_ref(),
+        "inventory",
+        format,
+        config.anvil.format,
+    )?;
+    let inventory = Inventory::load(current.as_ref())?;
+    let outcome = edit_document(
+        &editor,
+        "inventory",
+        inventory,
+        current.as_ref(),
+        &dest,
+        Inventory::validate,
+    )?;
+    report(cli, &outcome)
+}
+
+pub fn config(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
+    warn_target(cli);
+    let current = paths::locate(cli.config.as_deref(), "config")?;
+    let config = Config::load(current.as_ref())?;
+    let explicit = current.as_ref().filter(|_| cli.config.is_some());
+    let dest = destination(
+        explicit,
+        current.as_ref(),
+        "config",
+        format,
+        config.anvil.format,
+    )?;
+    let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Lenient)?;
+    let outcome = edit_document(
+        &editor,
+        "config",
+        config,
+        current.as_ref(),
+        &dest,
+        Config::validate,
+    )?;
+    report(cli, &outcome)
+}
+
+/// What `--json` prints for `secret`: the name and whether the store changed.
+#[derive(Debug, Serialize)]
+struct SecretOutcome<'a> {
+    name: &'a str,
+    changed: bool,
+}
+
+/// `anvil secret NAME`: `get` → edit as `.txt` → strip one trailing newline →
+/// empty deletes, anything else is stored. An unchanged buffer writes nothing.
+pub fn secret(cli: &Cli, name: &str, store: &dyn SecretStore) -> Result<(), Failure> {
+    warn_target(cli);
+    if !secret::is_name(name) {
+        return Err(Failure::usage(format!(
+            "secret `{name}`: {}",
+            secret::NAME_RULE
+        )));
+    }
+    let config = cli.load_config()?;
+    let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict)?;
+    let current = store.get(name)?;
+    let had_value = current.is_some();
+    let mut buffer = current.unwrap_or_default();
+    if !buffer.is_empty() && !buffer.ends_with(b"\n") {
+        buffer.push(b'\n');
+    }
+    let changed = match editor.edit(&buffer, "txt", Buffer::Sensitive)? {
+        None => false,
+        Some(mut edited) => {
+            if edited.last() == Some(&b'\n') {
+                edited.pop();
+            }
+            // The read-back stops one byte past the limit, so a longer value
+            // would otherwise be stored cut short.
+            if edited.len() as u64 > MAX_BYTES {
+                return Err(Failure::usage(format!(
+                    "secret {name}: larger than the {MAX_BYTES} byte limit, nothing stored"
+                )));
+            }
+            if edited.is_empty() {
+                if had_value {
+                    store.delete(name)?;
+                    log::info!("secret {name}: deleted");
+                }
+                had_value
+            } else {
+                store.set(name, &edited)?;
+                log::info!("secret {name}: stored");
+                true
+            }
+        }
+    };
+    if cli.json {
+        print_json(&SecretOutcome { name, changed }, Failure::usage)?;
+    } else if changed {
+        println!("secret {name}: updated");
+    } else {
+        println!("secret {name}: unchanged");
+    }
+    Ok(())
+}
+
+fn warn_target(cli: &Cli) {
+    if !cli.target.is_empty() {
+        log::warn!("--target is ignored by `{}`", cli.command.name());
+    }
+}
+
+/// Where document `name` is written. An explicit path keeps its
+/// extension's format, and a different `--format` is a usage error. Otherwise
+/// `--format` names the format; without it an existing file keeps its own path
+/// and format, and a missing one is created in `default` (`[anvil].format`).
+fn destination(
+    explicit: Option<&DocPath>,
+    current: Option<&DocPath>,
+    name: &str,
+    requested: Option<Format>,
+    default: Format,
+) -> Result<Destination, Failure> {
+    if let Some(doc) = explicit {
+        if let Some(requested) = requested.filter(|&requested| requested != doc.format) {
+            return Err(Failure::usage(format!(
+                "--format {requested} conflicts with --{name} {}, a {} file: \
+                 drop --format or pass a .{requested} path",
+                doc.path.display(),
+                doc.format
+            )));
+        }
+        return Ok(Destination {
+            path: doc.path.clone(),
+            format: doc.format,
+            discovered: false,
+        });
+    }
+    let (path, format) = match (requested, current) {
+        (None, Some(doc)) => (doc.path.clone(), doc.format),
+        (requested, _) => {
+            let format = requested.unwrap_or(default);
+            let path = paths::config_dir()?.join(format!("{name}.{}", format.extension()));
+            (path, format)
+        }
+    };
+    Ok(Destination {
+        path,
+        format,
+        discovered: true,
+    })
+}
+
+/// Shows `value` in the editor until it parses and validates (or `ATTEMPTS`
+/// runs out), then writes it. Nothing is written when the buffer came back
+/// unchanged and the file already sits at `dest` (or does not exist yet). A
+/// first buffer left unchanged in the file's own format and path is the file
+/// as loaded, so it is not parsed again; a conversion or a new file is.
+fn edit_document<T>(
+    editor: &Editor,
+    name: &str,
+    value: T,
+    current: Option<&DocPath>,
+    dest: &Destination,
+    validate: impl Fn(&T, &Path) -> Result<(), DocumentError>,
+) -> Result<Outcome, Failure>
+where
+    T: Serialize + DeserializeOwned,
+{
+    let mut buffer = document::to_string(&value, dest.format)?.into_bytes();
+    let in_place = current.is_some_and(|current| current.path == dest.path);
+    let mut edited = false;
+    for attempt in 1..=ATTEMPTS {
+        match editor.edit(&buffer, dest.format.extension(), Buffer::Document)? {
+            Some(text) => {
+                buffer = text;
+                edited = true;
+            }
+            None if attempt == 1 && in_place => break,
+            None => {}
+        }
+        let Err(err) = parse::<T>(&buffer, dest, &validate) else {
+            break;
+        };
+        eprintln!("{err}");
+        if attempt == ATTEMPTS {
+            return Err(Failure::usage(format!(
+                "{name}: still invalid after {ATTEMPTS} attempts, nothing written"
+            )));
+        }
+    }
+
+    let changed = edited || (current.is_some() && !in_place);
+    if changed {
+        write_atomic(&dest.path, &buffer)?;
+        if dest.discovered {
+            remove_siblings(&dest.path, name)?;
+        }
+    }
+    Ok(Outcome {
+        path: dest.path.clone(),
+        changed,
+    })
+}
+
+/// Parses `buffer` as `dest`'s format and checks it with `validate`.
+fn parse<T: DeserializeOwned>(
+    buffer: &[u8],
+    dest: &Destination,
+    validate: impl Fn(&T, &Path) -> Result<(), DocumentError>,
+) -> Result<(), DocumentError> {
+    let path = &dest.path;
+    let value: T = document::parse_text(buffer, path, dest.format, |err| DocumentError::Parse {
+        path: path.clone(),
+        format: dest.format,
+        message: err.to_string(),
+    })?;
+    validate(&value, path)
+}
+
+/// Writes a fresh `<path>.tmp` 0600 and renames it over `path`. A stale
+/// `.tmp` (or a symlink planted there) is removed first, never reused.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
+    let io = |source: std::io::Error| Failure::failed(format!("{}: {source}", path.display()));
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(io)?;
+    }
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| Failure::usage(format!("{}: not a file name", path.display())))?;
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    match fs::remove_file(&tmp) {
+        Ok(()) => log::info!("removed stale {}", tmp.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(io(err)),
+    }
+    let written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.map_err(io)
+}
+
+/// Removes `NAME.{toml,yaml,yml}` next to `path` other than `path` itself.
+fn remove_siblings(path: &Path, name: &str) -> Result<(), Failure> {
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    for ext in paths::EXTENSIONS {
+        let sibling = dir.join(format!("{name}.{ext}"));
+        if sibling != path && sibling.is_file() {
+            log::info!("removing {}", sibling.display());
+            fs::remove_file(&sibling)
+                .map_err(|err| Failure::failed(format!("{}: {err}", sibling.display())))?;
+        }
+    }
+    Ok(())
+}
+
+fn report(cli: &Cli, outcome: &Outcome) -> Result<(), Failure> {
+    if cli.json {
+        print_json(outcome, Failure::usage)?;
+    } else if outcome.changed {
+        println!("wrote {}", outcome.path.display());
+    } else {
+        println!("{}: unchanged", outcome.path.display());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+    use crate::secret::Memory;
+    use crate::test_util::temp_dir;
+
+    /// A config naming a scripted editor: `script` runs with the temp file as
+    /// `$1` and must write it itself (an empty script leaves it unchanged).
+    struct Scripted {
+        dir: PathBuf,
+        config: PathBuf,
+    }
+
+    impl Scripted {
+        fn new(tag: &str, script: &str) -> Scripted {
+            let dir = temp_dir(&format!("secret-{tag}"));
+            let editor = dir.join("editor.sh");
+            fs::write(&editor, format!("#!/bin/sh\nset -eu\n{script}\n")).unwrap();
+            fs::set_permissions(&editor, fs::Permissions::from_mode(0o700)).unwrap();
+            let config = dir.join("config.toml");
+            fs::write(
+                &config,
+                format!("[anvil]\neditor = \"{}\"\n", editor.display()),
+            )
+            .unwrap();
+            Scripted { dir, config }
+        }
+
+        fn run(&self, name: &str, store: &dyn SecretStore) -> Result<(), Failure> {
+            let config = self.config.to_str().unwrap();
+            let cli = Cli::try_parse_from(["anvil", "--config", config, "secret", name]).unwrap();
+            secret(&cli, name, store)
+        }
+    }
+
+    impl Drop for Scripted {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    use clap::Parser;
+
+    #[test]
+    fn an_edit_stores_the_value_without_its_trailing_newline() {
+        let scripted = Scripted::new("store", "printf 'hunter2\\n' > \"$1\"");
+        let store = Memory::default();
+        scripted.run("HOST_SUDO", &store).unwrap();
+        assert!(store.exists("HOST_SUDO").unwrap());
+        assert_eq!(store.get("HOST_SUDO").unwrap().unwrap(), b"hunter2");
+    }
+
+    #[test]
+    fn the_current_value_is_offered_and_an_empty_edit_deletes() {
+        let scripted = Scripted::new("delete", "cp \"$1\" \"$(dirname \"$0\")/seen\"; : > \"$1\"");
+        let store = Memory::default();
+        store.set("HOST_SUDO", b"old").unwrap();
+        scripted.run("HOST_SUDO", &store).unwrap();
+        assert_eq!(fs::read(scripted.dir.join("seen")).unwrap(), b"old\n");
+        assert!(!store.exists("HOST_SUDO").unwrap());
+    }
+
+    #[test]
+    fn an_unchanged_buffer_writes_nothing() {
+        let scripted = Scripted::new("unchanged", "");
+        let store = Memory::default();
+        store.set("HOST_SUDO", b"keep").unwrap();
+        scripted.run("HOST_SUDO", &store).unwrap();
+        assert_eq!(store.get("HOST_SUDO").unwrap().unwrap(), b"keep");
+        scripted.run("OTHER", &store).unwrap();
+        assert!(!store.exists("OTHER").unwrap());
+    }
+
+    #[test]
+    fn an_aborting_editor_is_exit_one_and_writes_nothing() {
+        let scripted = Scripted::new("abort", "printf 'leak\\n' > \"$1\"; exit 3");
+        let store = Memory::default();
+        let failure = scripted.run("HOST_SUDO", &store).unwrap_err();
+        assert_eq!(failure.code, 1);
+        assert!(!failure.message.contains("leak"));
+        assert!(!store.exists("HOST_SUDO").unwrap());
+    }
+
+    #[test]
+    fn an_invalid_name_is_usage_before_the_editor_runs() {
+        let scripted = Scripted::new(
+            "badname",
+            "printf 'x' > \"$1\"; touch \"$(dirname \"$0\")/ran\"",
+        );
+        let store = Memory::default();
+        for bad in ["host_sudo", "1X", "A-B"] {
+            let failure = scripted.run(bad, &store).unwrap_err();
+            assert_eq!(failure.code, 2, "{bad}");
+            assert!(
+                failure.message.contains("[A-Z][A-Z0-9_]*"),
+                "{}",
+                failure.message
+            );
+        }
+        assert!(!scripted.dir.join("ran").exists());
+    }
+
+    /// No log call site in the secret flow mentions a value.
+    #[test]
+    fn log_calls_never_mention_a_value() {
+        for (file, source) in [
+            ("commands.rs", include_str!("commands.rs")),
+            ("secret.rs", include_str!("secret.rs")),
+        ] {
+            for (i, line) in source.lines().enumerate() {
+                if line.contains("log::") {
+                    let lower = line.to_ascii_lowercase();
+                    assert!(
+                        !lower.contains("value")
+                            && !lower.contains("edited")
+                            && !lower.contains("buffer"),
+                        "{file}:{}: {line}",
+                        i + 1
+                    );
+                }
+            }
+        }
+    }
+}

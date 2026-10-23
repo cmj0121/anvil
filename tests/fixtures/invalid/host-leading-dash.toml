@@ -1,0 +1,2 @@
+[hosts.evil]
+host = "-oProxyCommand=evil"

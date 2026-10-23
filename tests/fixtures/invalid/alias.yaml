@@ -1,0 +1,4 @@
+hosts:
+  web: &base
+    host: web.example.net
+  mirror: *base

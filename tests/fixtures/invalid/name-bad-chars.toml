@@ -1,0 +1,2 @@
+[hosts."bad name"]
+host = "web.example.net"
