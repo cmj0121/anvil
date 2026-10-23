@@ -1,14 +1,17 @@
-//! Command line per the CLI contract (D5).
+//! Command line per the CLI contract.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand};
+use serde::Serialize;
 
 use crate::config::Config;
+use crate::document::Format;
 use crate::inventory::{Inventory, Sel, Target, TargetKind};
 use crate::paths;
 use crate::secret::{Keychain, SecretStore};
-use crate::ssh::Ssh;
+use crate::ssh::{self, Ssh, SshSettings};
 use crate::transport::{Local, Transport, TransportError};
 
 #[derive(Debug, Parser)]
@@ -73,16 +76,27 @@ impl Cli {
         PathBuf::from("ssh")
     }
 
+    /// How ssh runs: [`Cli::ssh_program`], a password prompt only when stdin
+    /// and stderr are both terminals, and the production deadlines.
+    fn ssh_settings(&self) -> SshSettings {
+        SshSettings {
+            program: self.ssh_program(),
+            can_prompt: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+            key_timeout: ssh::KEY_TIMEOUT,
+            check_timeout: ssh::CHECK_TIMEOUT,
+        }
+    }
+
     /// The config: `--config`, else the discovered file, else the defaults.
     pub fn load_config(&self) -> Result<Config, Failure> {
         let path = paths::locate(self.config.as_deref(), "config")?;
-        Ok(Config::load(path.as_deref())?)
+        Ok(Config::load(path.as_ref())?)
     }
 
     /// The targets `--target` selects from the inventory (all when none).
     pub fn targets(&self) -> Result<Vec<Target>, Failure> {
         let path = paths::locate(self.inventory.as_deref(), "inventory")?;
-        let inventory = Inventory::load(path.as_deref())?;
+        let inventory = Inventory::load(path.as_ref())?;
         let sels: Vec<Sel> = self.target.iter().map(|sel| Sel::parse(sel)).collect();
         Ok(inventory.select(&sels)?)
     }
@@ -91,17 +105,19 @@ impl Cli {
     pub fn transport(&self, target: &Target) -> Result<Box<dyn Transport>, TransportError> {
         match &target.kind {
             TargetKind::Local => Ok(Box::new(Local)),
-            TargetKind::Ssh { host, user, port } => {
-                let mut ssh = Ssh::new(self.ssh_config.clone(), host, user.clone(), *port)?;
-                ssh.program = self.ssh_program();
-                Ok(Box::new(ssh))
-            }
+            TargetKind::Ssh { host, user, port } => Ok(Box::new(Ssh::new(
+                self.ssh_settings(),
+                self.ssh_config.clone(),
+                host,
+                user.clone(),
+                *port,
+            )?)),
         }
     }
 }
 
 #[cfg(debug_assertions)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum SecretStoreKind {
     Keychain,
     Memory,
@@ -142,12 +158,6 @@ impl Command {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Format {
-    Toml,
-    Yaml,
-}
-
 /// A fatal error: logged once at `Error`, then the process exits with `code`
 /// (1 when a target or check failed, 2 for usage or config).
 #[derive(Debug)]
@@ -173,7 +183,7 @@ impl Failure {
     }
 }
 
-// Config, inventory and path problems are exit 2 (D2, D5).
+// Config, inventory and path problems are exit 2.
 impl From<crate::document::DocumentError> for Failure {
     fn from(err: crate::document::DocumentError) -> Self {
         Failure::usage(err.to_string())
@@ -213,20 +223,20 @@ impl From<crate::secret::SecretError> for Failure {
     }
 }
 
-impl From<Format> for crate::document::Format {
-    fn from(format: Format) -> Self {
-        match format {
-            Format::Toml => crate::document::Format::Toml,
-            Format::Yaml => crate::document::Format::Yaml,
-        }
-    }
+/// Prints `value` as one line of JSON on stdout; an encoding error becomes
+/// `on_err("cannot encode JSON: …")`.
+pub fn print_json(value: &impl Serialize, on_err: fn(String) -> Failure) -> Result<(), Failure> {
+    let json =
+        serde_json::to_string(value).map_err(|err| on_err(format!("cannot encode JSON: {err}")))?;
+    println!("{json}");
+    Ok(())
 }
 
 /// Runs the parsed command.
 pub fn run(cli: &Cli) -> Result<(), Failure> {
     match &cli.command {
-        Command::Inventory { format } => crate::commands::inventory(cli, format.map(Into::into)),
-        Command::Config { format } => crate::commands::config(cli, format.map(Into::into)),
+        Command::Inventory { format } => crate::commands::inventory(cli, *format),
+        Command::Config { format } => crate::commands::config(cli, *format),
         Command::Doctor => crate::doctor::run(cli, cli.secret_store().as_ref()),
         Command::Apply => crate::apply::run(cli),
         Command::Secret { name } => crate::commands::secret(cli, name, cli.secret_store().as_ref()),
@@ -318,7 +328,6 @@ mod tests {
                 "{args:?}"
             );
         }
-        assert!(Cli::try_parse_from(["anvil", "__probe", "--host", "box"]).is_err());
     }
 
     #[test]
@@ -327,7 +336,6 @@ mod tests {
         let local = Target {
             name: "local".to_owned(),
             kind: TargetKind::Local,
-            tags: vec!["local".to_owned()],
         };
         assert_eq!(cli.transport(&local).unwrap().name(), "local");
         let host = Target {
@@ -337,7 +345,6 @@ mod tests {
                 user: None,
                 port: None,
             },
-            tags: vec![],
         };
         assert_eq!(cli.transport(&host).unwrap().name(), "203.0.113.10");
     }

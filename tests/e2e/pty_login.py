@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a command on a pseudo-terminal and answer ssh's password prompt (D6).
+"""Run a command on a pseudo-terminal and answer ssh's password prompt.
 
     pty_login.py --prompts N --expect REGEX -- COMMAND [ARG...]
 

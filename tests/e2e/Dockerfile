@@ -1,4 +1,4 @@
-# sshd on Arch for the anvil e2e (D6): `key` signs in with the authorized key
+# sshd on Arch for the anvil e2e: `key` signs in with the authorized key
 # passed as AUTHORIZED_KEY at start, `pw` only with the password `pw-secret`.
 # inetutils provides `hostname`, the config placeholder step `apply` runs.
 # BASE defaults to the official amd64 image; tests/e2e.sh passes the pinned

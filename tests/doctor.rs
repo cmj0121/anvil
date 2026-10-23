@@ -1,4 +1,4 @@
-//! `anvil doctor` on the built binary (D5, D10, U7): local checks, the local
+//! `anvil doctor` on the built binary: local checks, the local
 //! facts and a fake-ssh host, human and `--json`.
 
 // `--secret-store` and `--ssh-program` only exist in debug builds.

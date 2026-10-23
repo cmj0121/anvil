@@ -1,4 +1,4 @@
-//! The editor flow (D9): resolve the editor command and hand a buffer to it
+//! The editor flow: resolve the editor command and hand a buffer to it
 //! through a private temp file.
 //!
 //! The file lives in `<temp_dir>/anvil-<uid>/`, a 0700 directory that must be
@@ -7,18 +7,19 @@
 //! effort only: an editor that writes a new file and renames it over the old
 //! one leaves the original inode un-zeroed, and the filesystem (APFS) may keep
 //! old blocks anyway. The real controls are the per-user 0700 directory, the
-//! 0600 mode and `create_new` (D9).
+//! 0600 mode and `create_new`.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::document::MAX_BYTES;
+use crate::document;
+use crate::paths::{self, PrivateDirError};
 
 /// The editor when neither the config nor the environment names one.
 pub const DEFAULT: &str = "nvim";
@@ -95,6 +96,16 @@ impl fmt::Display for EditorError {
 
 impl std::error::Error for EditorError {}
 
+/// What [`Editor::resolve`] does when the configured editor cannot be found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fallback {
+    /// Fail.
+    Strict,
+    /// Warn and use `$VISUAL`, `$EDITOR` or the default instead: a typo in
+    /// `[anvil].editor` must not lock the user out of `anvil config`.
+    Lenient,
+}
+
 /// A resolved editor: the program as found on disk and its fixed arguments;
 /// the file to edit is appended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,12 +121,29 @@ impl Editor {
     }
 
     /// The editor from `preference` (`[anvil].editor`), else `$VISUAL`, else
-    /// `$EDITOR`, else `nvim`, checked against the process `PATH`.
-    pub fn resolve(preference: Option<&str>) -> Result<Editor, EditorError> {
+    /// `$EDITOR`, else `nvim`, checked against the process `PATH`. When the
+    /// preferred program cannot be found, `fallback` decides.
+    pub fn resolve(preference: Option<&str>, fallback: Fallback) -> Result<Editor, EditorError> {
         let visual = std::env::var("VISUAL").ok();
         let editor = std::env::var("EDITOR").ok();
-        let command = command_for(preference, visual.as_deref(), editor.as_deref());
-        Editor::from_command(&command, std::env::var_os("PATH").as_deref())
+        let path = std::env::var_os("PATH");
+        let resolve = |preference| {
+            let command = command_for(preference, visual.as_deref(), editor.as_deref());
+            Editor::from_command(&command, path.as_deref())
+        };
+        match resolve(preference) {
+            Err(err @ (EditorError::NotFound(_) | EditorError::Empty))
+                if fallback == Fallback::Lenient && preference.is_some() =>
+            {
+                // Logged under the commands' target, as `anvil config` always has.
+                log::warn!(
+                    target: "anvil::commands",
+                    "{err}; falling back to $VISUAL, $EDITOR or `{DEFAULT}`"
+                );
+                resolve(None)
+            }
+            other => other,
+        }
     }
 
     /// Splits `command` on whitespace; the program must be absolute or found
@@ -125,7 +153,7 @@ impl Editor {
         let Some(program) = words.next() else {
             return Err(EditorError::Empty);
         };
-        let program = find_program(Path::new(program), path)
+        let program = paths::find_program(Path::new(program), path)
             .ok_or_else(|| EditorError::NotFound(program.to_string()))?;
         Ok(Editor {
             program,
@@ -207,12 +235,7 @@ impl Editor {
 
         // Bounded read: an oversize buffer comes back truncated to one byte
         // past the limit, which the caller rejects as too large.
-        let mut edited = Vec::new();
-        File::open(path)
-            .map_err(io)?
-            .take(MAX_BYTES + 1)
-            .read_to_end(&mut edited)
-            .map_err(io)?;
+        let edited = document::read_capped(path).map_err(io)?;
         Ok((edited != initial).then_some(edited))
     }
 }
@@ -239,27 +262,6 @@ pub fn command_for(preference: Option<&str>, visual: Option<&str>, editor: Optio
         .to_string()
 }
 
-fn is_executable(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.mode() & 0o111 != 0)
-}
-
-/// The executable `program` names: itself when absolute, else the first
-/// match on `path`. Relative paths with a directory part are refused, and so
-/// are relative `path` entries (`.`, `bin`), which would resolve against the
-/// current directory.
-pub fn find_program(program: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
-    if program.is_absolute() {
-        return is_executable(program).then(|| program.to_path_buf());
-    }
-    if program.components().count() != 1 {
-        return None;
-    }
-    std::env::split_paths(path?)
-        .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(program))
-        .find(|candidate| is_executable(candidate))
-}
-
 /// `<temp_dir>/anvil-<uid>/`, created 0700; refused unless it is a directory
 /// we own that group and others cannot reach.
 fn private_dir() -> Result<PathBuf, EditorError> {
@@ -274,21 +276,14 @@ fn private_dir() -> Result<PathBuf, EditorError> {
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
         Err(err) => return Err(io(err)),
     }
-    let meta = fs::symlink_metadata(&dir).map_err(io)?;
-    let unsafe_dir = |reason| EditorError::UnsafeDir {
-        path: dir.clone(),
-        reason,
+    let reason = match paths::check_private_dir(&dir, uid) {
+        Ok(()) => return Ok(dir),
+        Err(PrivateDirError::Io(source)) => return Err(io(source)),
+        Err(PrivateDirError::NotDir) => "not a directory",
+        Err(PrivateDirError::Owner(_)) => "owned by another user",
+        Err(PrivateDirError::Mode(_)) => "accessible to group or others",
     };
-    if !meta.is_dir() {
-        return Err(unsafe_dir("not a directory"));
-    }
-    if meta.uid() != uid {
-        return Err(unsafe_dir("owned by another user"));
-    }
-    if meta.mode() & 0o077 != 0 {
-        return Err(unsafe_dir("accessible to group or others"));
-    }
-    Ok(dir)
+    Err(EditorError::UnsafeDir { path: dir, reason })
 }
 
 /// A fresh `edit-<random>.<ext>` in `dir`, 0600, that did not exist before.
@@ -343,6 +338,7 @@ fn scrub(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
 
     fn system_path() -> Option<std::ffi::OsString> {
         std::env::var_os("PATH")
@@ -473,37 +469,5 @@ mod tests {
                 "{program}"
             );
         }
-    }
-
-    #[test]
-    fn relative_path_entries_are_skipped() {
-        let dir = std::env::temp_dir().join(format!("anvil-path-{}", std::process::id()));
-        let bin = dir.join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        let tool = bin.join("anvil-path-probe");
-        fs::write(&tool, "#!/bin/sh\n").unwrap();
-        fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-
-        let program = Path::new("anvil-path-probe");
-        // A relative entry naming the same directory from the cwd is skipped.
-        let relative = pathdiff(&bin, &std::env::current_dir().unwrap());
-        assert!(fs::metadata(relative.join(program)).is_ok());
-        assert_eq!(find_program(program, Some(relative.as_os_str())), None);
-        assert_eq!(
-            find_program(program, Some(bin.as_os_str())),
-            Some(tool.clone())
-        );
-        let mixed = format!("{}:{}", relative.display(), bin.display());
-        assert_eq!(find_program(program, Some(OsStr::new(&mixed))), Some(tool));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// `to` relative to `from` (both absolute), via enough `..` to reach `/`.
-    fn pathdiff(to: &Path, from: &Path) -> PathBuf {
-        let mut rel = PathBuf::new();
-        for _ in from.components().skip(1) {
-            rel.push("..");
-        }
-        rel.join(to.strip_prefix("/").unwrap())
     }
 }

@@ -1,9 +1,12 @@
-//! A sandbox for `doctor` and `apply` on the built binary: its own config
-//! directory, `$HOME` and temp dir, the in-process secret store and
-//! `fake-ssh.sh` as the ssh program (both debug-only flags).
+//! A sandbox for the built binary: its own config directory, `$HOME` and temp
+//! dir, `fake-editor.sh` as `$EDITOR` and, by default, the in-process secret
+//! store and `fake-ssh.sh` as the ssh program (both debug-only flags).
 //!
 //! The root sits directly under `/tmp` so `$HOME/.ssh/anvil/%C` stays within
-//! the ControlPath length limit (D3).
+//! the ControlPath length limit.
+
+// Each test crate uses only some of these helpers.
+#![allow(dead_code)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,6 +39,8 @@ pub fn keys(value: &serde_json::Value) -> Vec<&str> {
 
 pub struct Sandbox {
     root: PathBuf,
+    debug_flags: bool,
+    record: bool,
 }
 
 impl Sandbox {
@@ -47,11 +52,48 @@ impl Sandbox {
         for sub in ["x/anvil", "h", "t"] {
             fs::create_dir_all(root.join(sub)).unwrap();
         }
-        Sandbox { root }
+        Sandbox {
+            root,
+            debug_flags: true,
+            record: false,
+        }
+    }
+
+    /// Runs anvil without `--secret-store` and `--ssh-program`, which only
+    /// exist in debug builds.
+    pub fn without_debug_flags(mut self) -> Sandbox {
+        self.debug_flags = false;
+        self
+    }
+
+    /// Has the fake editor record each call under [`Sandbox::record`].
+    pub fn recording(mut self) -> Sandbox {
+        fs::create_dir_all(self.root.join("record")).unwrap();
+        self.record = true;
+        self
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// `$XDG_CONFIG_HOME/anvil`.
+    pub fn config_dir(&self) -> PathBuf {
+        self.root.join("x/anvil")
+    }
+
+    /// `$TMPDIR`.
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.root.join("t")
+    }
+
+    /// A file the fake editor wrote for `name` (`editor.count`, `editor.in.1`, …).
+    pub fn record(&self, name: &str) -> PathBuf {
+        self.root.join("record").join(name)
     }
 
     pub fn write_config(&self, name: &str, body: &str) {
-        fs::write(self.root.join("x/anvil").join(name), body).unwrap();
+        fs::write(self.config_dir().join(name), body).unwrap();
     }
 
     /// One inventory host, `fake`, reached through `fake-ssh.sh`.
@@ -59,25 +101,42 @@ impl Sandbox {
         self.write_config("inventory.toml", "[hosts.fake]\nhost = \"fakehost\"\n");
     }
 
-    /// Runs anvil; `vars` are `FAKE_SSH_*` knobs the fake reads from its env.
+    /// Runs anvil; `vars` are `FAKE_SSH_*` and `FAKE_EDITOR_*` knobs the fakes
+    /// read from their env.
     pub fn anvil(&self, args: &[&str], vars: &[(&str, &str)]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_anvil"));
+        command.args(args);
+        if self.debug_flags {
+            command
+                .args(["--secret-store", "memory", "--ssh-program"])
+                .arg(fixture("fake-ssh.sh"));
+        }
         command
-            .args(args)
-            .args(["--secret-store", "memory", "--ssh-program"])
-            .arg(fixture("fake-ssh.sh"))
             .env("XDG_CONFIG_HOME", self.root.join("x"))
             .env("HOME", self.root.join("h"))
-            .env("TMPDIR", self.root.join("t"))
+            .env("TMPDIR", self.tmp_dir())
             .env("EDITOR", fixture("fake-editor.sh"))
             .env_remove("VISUAL");
         for (key, _) in std::env::vars() {
-            if key.starts_with("FAKE_SSH_") {
+            if key.starts_with("FAKE_SSH_") || key.starts_with("FAKE_EDITOR_") {
                 command.env_remove(key);
             }
         }
+        if self.record {
+            command.env("FAKE_EDITOR_RECORD", self.record("editor"));
+        }
         command.envs(vars.iter().copied());
         command.output().expect("spawn anvil")
+    }
+
+    /// Runs anvil with the fake editor copying `content` over the buffer, or
+    /// exiting with `exit` without touching it.
+    pub fn edit(&self, args: &[&str], content: Option<&Path>, exit: Option<&str>) -> Output {
+        let content = content.map(|path| path.to_str().unwrap());
+        let mut vars = Vec::new();
+        vars.extend(content.map(|path| ("FAKE_EDITOR_CONTENT", path)));
+        vars.extend(exit.map(|code| ("FAKE_EDITOR_EXIT", code)));
+        self.anvil(args, &vars)
     }
 }
 

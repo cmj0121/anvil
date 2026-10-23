@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fake ssh for the unit tests (D6). Driven by env vars set on the child:
+# Fake ssh for the unit tests. Driven by env vars set on the child:
 #   FAKE_SSH_LOG            append each invocation's argv (space-joined) as one line
 #   FAKE_SSH_CHECK_EXIT     exit code of `-O check` (default 1: no master)
 #   FAKE_SSH_EXIT           exit code of the key (BatchMode) master attempt (default 0)

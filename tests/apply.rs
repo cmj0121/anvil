@@ -1,4 +1,4 @@
-//! `anvil apply` on the built binary (D5, D7, U7): the config's steps on the
+//! `anvil apply` on the built binary: the config's steps on the
 //! local target and a fake-ssh host, human and `--json`.
 
 // `--secret-store` and `--ssh-program` only exist in debug builds.

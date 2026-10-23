@@ -1,5 +1,5 @@
-//! `anvil inventory`, `anvil config` and `anvil secret`: the editor flows of
-//! D9, D10 and D13.
+//! `anvil inventory`, `anvil config` and `anvil secret`: their editor
+//! flows.
 //!
 //! Load the current document (any format, missing → defaults), show it in its
 //! own format (`--format` converts it, a missing file uses `[anvil].format`),
@@ -20,12 +20,12 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::cli::{Cli, Failure};
+use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
 use crate::document::{self, DocumentError, Format, MAX_BYTES};
-use crate::editor::{self, Buffer, Editor, EditorError};
+use crate::editor::{Buffer, Editor, Fallback};
 use crate::inventory::Inventory;
-use crate::paths;
+use crate::paths::{self, DocPath};
 use crate::secret::{self, SecretStore};
 
 /// How often an invalid buffer is re-opened before the command gives up.
@@ -49,21 +49,22 @@ struct Destination {
 pub fn inventory(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
     warn_target(cli);
     let config = cli.load_config()?;
-    let editor = Editor::resolve(config.anvil.editor.as_deref())?;
+    let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict)?;
     let current = paths::locate(cli.inventory.as_deref(), "inventory")?;
+    let explicit = current.as_ref().filter(|_| cli.inventory.is_some());
     let dest = destination(
-        cli.inventory.as_deref(),
-        current.as_deref(),
+        explicit,
+        current.as_ref(),
         "inventory",
         format,
         config.anvil.format,
     )?;
-    let inventory = Inventory::load(current.as_deref())?;
+    let inventory = Inventory::load(current.as_ref())?;
     let outcome = edit_document(
         &editor,
         "inventory",
         inventory,
-        current.as_deref(),
+        current.as_ref(),
         &dest,
         Inventory::validate,
     )?;
@@ -73,20 +74,21 @@ pub fn inventory(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
 pub fn config(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
     warn_target(cli);
     let current = paths::locate(cli.config.as_deref(), "config")?;
-    let config = Config::load(current.as_deref())?;
+    let config = Config::load(current.as_ref())?;
+    let explicit = current.as_ref().filter(|_| cli.config.is_some());
     let dest = destination(
-        cli.config.as_deref(),
-        current.as_deref(),
+        explicit,
+        current.as_ref(),
         "config",
         format,
         config.anvil.format,
     )?;
-    let editor = lenient_editor(config.anvil.editor.as_deref())?;
+    let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Lenient)?;
     let outcome = edit_document(
         &editor,
         "config",
         config,
-        current.as_deref(),
+        current.as_ref(),
         &dest,
         Config::validate,
     )?;
@@ -106,11 +108,12 @@ pub fn secret(cli: &Cli, name: &str, store: &dyn SecretStore) -> Result<(), Fail
     warn_target(cli);
     if !secret::is_name(name) {
         return Err(Failure::usage(format!(
-            "secret `{name}`: must match [A-Z][A-Z0-9_]*"
+            "secret `{name}`: {}",
+            secret::NAME_RULE
         )));
     }
     let config = cli.load_config()?;
-    let editor = Editor::resolve(config.anvil.editor.as_deref())?;
+    let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict)?;
     let current = store.get(name)?;
     let had_value = current.is_some();
     let mut buffer = current.unwrap_or_default();
@@ -144,9 +147,7 @@ pub fn secret(cli: &Cli, name: &str, store: &dyn SecretStore) -> Result<(), Fail
         }
     };
     if cli.json {
-        let json = serde_json::to_string(&SecretOutcome { name, changed })
-            .map_err(|err| Failure::usage(format!("cannot encode JSON: {err}")))?;
-        println!("{json}");
+        print_json(&SecretOutcome { name, changed }, Failure::usage)?;
     } else if changed {
         println!("secret {name}: updated");
     } else {
@@ -161,55 +162,34 @@ fn warn_target(cli: &Cli) {
     }
 }
 
-/// The configured editor, falling back to the environment's when the
-/// configured program cannot be found: a typo in `[anvil].editor` must not lock
-/// the user out of `anvil config`.
-fn lenient_editor(preference: Option<&str>) -> Result<Editor, Failure> {
-    match Editor::resolve(preference) {
-        Err(err @ (EditorError::NotFound(_) | EditorError::Empty)) if preference.is_some() => {
-            log::warn!(
-                "{err}; falling back to $VISUAL, $EDITOR or `{}`",
-                editor::DEFAULT
-            );
-            Ok(Editor::resolve(None)?)
-        }
-        other => Ok(other?),
-    }
-}
-
-/// Where document `name` is written (D13). An explicit path keeps its
+/// Where document `name` is written. An explicit path keeps its
 /// extension's format, and a different `--format` is a usage error. Otherwise
 /// `--format` names the format; without it an existing file keeps its own path
 /// and format, and a missing one is created in `default` (`[anvil].format`).
 fn destination(
-    explicit: Option<&Path>,
-    current: Option<&Path>,
+    explicit: Option<&DocPath>,
+    current: Option<&DocPath>,
     name: &str,
     requested: Option<Format>,
     default: Format,
 ) -> Result<Destination, Failure> {
-    if let Some(path) = explicit {
-        let format = Format::from_extension(path).ok_or_else(|| {
-            Failure::from(paths::PathsError::UnknownExtension {
-                path: path.to_path_buf(),
-            })
-        })?;
-        if let Some(requested) = requested.filter(|&requested| requested != format) {
+    if let Some(doc) = explicit {
+        if let Some(requested) = requested.filter(|&requested| requested != doc.format) {
             return Err(Failure::usage(format!(
-                "--format {requested} conflicts with --{name} {}, a {format} file: \
+                "--format {requested} conflicts with --{name} {}, a {} file: \
                  drop --format or pass a .{requested} path",
-                path.display()
+                doc.path.display(),
+                doc.format
             )));
         }
         return Ok(Destination {
-            path: path.to_path_buf(),
-            format,
+            path: doc.path.clone(),
+            format: doc.format,
             discovered: false,
         });
     }
-    let existing = current.and_then(|path| Some((path, Format::from_extension(path)?)));
-    let (path, format) = match (requested, existing) {
-        (None, Some((path, format))) => (path.to_path_buf(), format),
+    let (path, format) = match (requested, current) {
+        (None, Some(doc)) => (doc.path.clone(), doc.format),
         (requested, _) => {
             let format = requested.unwrap_or(default);
             let path = paths::config_dir()?.join(format!("{name}.{}", format.extension()));
@@ -225,12 +205,14 @@ fn destination(
 
 /// Shows `value` in the editor until it parses and validates (or `ATTEMPTS`
 /// runs out), then writes it. Nothing is written when the buffer came back
-/// unchanged and the file already sits at `dest` (or does not exist yet).
+/// unchanged and the file already sits at `dest` (or does not exist yet). A
+/// first buffer left unchanged in the file's own format and path is the file
+/// as loaded, so it is not parsed again; a conversion or a new file is.
 fn edit_document<T>(
     editor: &Editor,
     name: &str,
     value: T,
-    current: Option<&Path>,
+    current: Option<&DocPath>,
     dest: &Destination,
     validate: impl Fn(&T, &Path) -> Result<(), DocumentError>,
 ) -> Result<Outcome, Failure>
@@ -238,27 +220,29 @@ where
     T: Serialize + DeserializeOwned,
 {
     let mut buffer = document::to_string(&value, dest.format)?.into_bytes();
+    let in_place = current.is_some_and(|current| current.path == dest.path);
     let mut edited = false;
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        if let Some(text) = editor.edit(&buffer, dest.format.extension(), Buffer::Document)? {
-            buffer = text;
-            edited = true;
-        }
-        match parse::<T>(&buffer, dest, &validate) {
-            Ok(_) => break,
-            Err(err) if attempt < ATTEMPTS => eprintln!("{err}"),
-            Err(err) => {
-                eprintln!("{err}");
-                return Err(Failure::usage(format!(
-                    "{name}: still invalid after {ATTEMPTS} attempts, nothing written"
-                )));
+    for attempt in 1..=ATTEMPTS {
+        match editor.edit(&buffer, dest.format.extension(), Buffer::Document)? {
+            Some(text) => {
+                buffer = text;
+                edited = true;
             }
+            None if attempt == 1 && in_place => break,
+            None => {}
+        }
+        let Err(err) = parse::<T>(&buffer, dest, &validate) else {
+            break;
+        };
+        eprintln!("{err}");
+        if attempt == ATTEMPTS {
+            return Err(Failure::usage(format!(
+                "{name}: still invalid after {ATTEMPTS} attempts, nothing written"
+            )));
         }
     }
 
-    let changed = edited || current.is_some_and(|current| current != dest.path);
+    let changed = edited || (current.is_some() && !in_place);
     if changed {
         write_atomic(&dest.path, &buffer)?;
         if dest.discovered {
@@ -271,24 +255,19 @@ where
     })
 }
 
+/// Parses `buffer` as `dest`'s format and checks it with `validate`.
 fn parse<T: DeserializeOwned>(
     buffer: &[u8],
     dest: &Destination,
     validate: impl Fn(&T, &Path) -> Result<(), DocumentError>,
-) -> Result<T, DocumentError> {
+) -> Result<(), DocumentError> {
     let path = &dest.path;
-    if buffer.len() as u64 > MAX_BYTES {
-        return Err(DocumentError::TooLarge { path: path.clone() });
-    }
-    let parse_error = |message: String| DocumentError::Parse {
+    let value: T = document::parse_text(buffer, path, dest.format, |err| DocumentError::Parse {
         path: path.clone(),
         format: dest.format,
-        message,
-    };
-    let text = std::str::from_utf8(buffer).map_err(|err| parse_error(err.to_string()))?;
-    let value: T = document::from_str(text, dest.format).map_err(parse_error)?;
-    validate(&value, path)?;
-    Ok(value)
+        message: err.to_string(),
+    })?;
+    validate(&value, path)
 }
 
 /// Writes a fresh `<path>.tmp` 0600 and renames it over `path`. A stale
@@ -343,9 +322,7 @@ fn remove_siblings(path: &Path, name: &str) -> Result<(), Failure> {
 
 fn report(cli: &Cli, outcome: &Outcome) -> Result<(), Failure> {
     if cli.json {
-        let json = serde_json::to_string(outcome)
-            .map_err(|err| Failure::usage(format!("cannot encode JSON: {err}")))?;
-        println!("{json}");
+        print_json(outcome, Failure::usage)?;
     } else if outcome.changed {
         println!("wrote {}", outcome.path.display());
     } else {
@@ -361,6 +338,7 @@ mod tests {
 
     use super::*;
     use crate::secret::Memory;
+    use crate::test_util::temp_dir;
 
     /// A config naming a scripted editor: `script` runs with the temp file as
     /// `$1` and must write it itself (an empty script leaves it unchanged).
@@ -371,10 +349,7 @@ mod tests {
 
     impl Scripted {
         fn new(tag: &str, script: &str) -> Scripted {
-            let dir =
-                std::env::temp_dir().join(format!("anvil-secret-{tag}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).unwrap();
+            let dir = temp_dir(&format!("secret-{tag}"));
             let editor = dir.join("editor.sh");
             fs::write(&editor, format!("#!/bin/sh\nset -eu\n{script}\n")).unwrap();
             fs::set_permissions(&editor, fs::Permissions::from_mode(0o700)).unwrap();
@@ -461,7 +436,7 @@ mod tests {
         assert!(!scripted.dir.join("ran").exists());
     }
 
-    /// D11: no log call site in the secret flow mentions a value.
+    /// No log call site in the secret flow mentions a value.
     #[test]
     fn log_calls_never_mention_a_value() {
         for (file, source) in [

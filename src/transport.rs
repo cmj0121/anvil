@@ -1,4 +1,4 @@
-//! Transport contract (D7) and the local implementation.
+//! Transport contract and the local implementation.
 //!
 //! A transport runs one shell script on a target: the script goes on the child's
 //! stdin, which is then closed, so a script that reads stdin gets EOF.
@@ -44,12 +44,6 @@ pub enum TransportError {
     /// The ssh master could not reach the host (refused, timed out, no route):
     /// ssh's stderr, lossy UTF-8. Only the master reports this; never a client.
     Connect { stderr: String },
-    /// The script ran and exited non-zero; its output is kept (lossy UTF-8).
-    Exit {
-        code: Option<i32>,
-        stdout: String,
-        stderr: String,
-    },
 }
 
 impl fmt::Display for TransportError {
@@ -79,17 +73,6 @@ impl fmt::Display for TransportError {
                     None => Ok(()),
                 }
             }
-            Self::Exit { code, stderr, .. } => {
-                match code {
-                    Some(code) => write!(f, "script exited with {code}")?,
-                    None => write!(f, "script was killed by a signal")?,
-                }
-                let stderr = stderr.trim();
-                if !stderr.is_empty() {
-                    write!(f, ": {stderr}")?;
-                }
-                Ok(())
-            }
         }
     }
 }
@@ -98,6 +81,8 @@ impl std::error::Error for TransportError {}
 
 pub trait Transport {
     fn name(&self) -> &str;
+    /// Runs `script`; a script that ran to completion is `Ok` whatever its
+    /// exit code, which the caller judges.
     fn run(&self, script: &str) -> Result<Output, TransportError>;
 }
 
@@ -119,7 +104,6 @@ impl Transport for Local {
 
 /// Spawns `command` with piped stdio, writes the script to stdin, closes it and
 /// collects the output within `timeout`. On timeout the child is killed.
-/// A non-zero exit is reported as [`TransportError::Exit`].
 pub fn run_with_script(
     command: &mut Command,
     script: &str,
@@ -144,16 +128,14 @@ pub fn run_with_script(
         let _ = stdin.write_all(script.as_bytes());
     });
 
-    let output = collect(child, Some(timeout))?;
-    if output.code == Some(0) {
-        Ok(output)
-    } else {
-        Err(TransportError::Exit {
-            code: output.code,
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
-    }
+    collect(child, Some(timeout))
+}
+
+/// `bytes` as a `String`, without a copy when they are valid UTF-8; invalid
+/// sequences become U+FFFD.
+pub fn into_string(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
 }
 
 /// Waits for `child` and gathers whatever of its stdout and stderr is piped,
@@ -306,17 +288,17 @@ mod tests {
     }
 
     #[test]
-    fn non_zero_exit_is_an_error_with_its_output() {
-        let err = Local.run("echo out; echo nope >&2; exit 3").unwrap_err();
-        assert_eq!(
-            err,
-            TransportError::Exit {
-                code: Some(3),
-                stdout: "out\n".to_owned(),
-                stderr: "nope\n".to_owned()
-            }
-        );
-        assert_eq!(err.to_string(), "script exited with 3: nope");
+    fn non_zero_exit_is_output_with_its_code() {
+        let out = Local.run("echo out; echo nope >&2; exit 3").unwrap();
+        assert_eq!(out.code, Some(3));
+        assert_eq!(out.stdout, b"out\n");
+        assert_eq!(out.stderr, b"nope\n");
+    }
+
+    #[test]
+    fn into_string_keeps_valid_utf8_and_replaces_the_rest() {
+        assert_eq!(into_string(b"caf\xc3\xa9".to_vec()), "caf\u{e9}");
+        assert_eq!(into_string(b"Dar\xffwin".to_vec()), "Dar\u{fffd}win");
     }
 
     #[test]
@@ -347,7 +329,7 @@ mod tests {
     /// group kill misses it) and keeps stdout open. macOS has no `setsid`
     /// binary, so perl's `setpgrp` does it; without perl the case is skipped.
     fn escaping_holder() -> Option<&'static str> {
-        crate::editor::find_program(
+        crate::paths::find_program(
             std::path::Path::new("perl"),
             std::env::var_os("PATH").as_deref(),
         )
@@ -418,15 +400,6 @@ mod tests {
         assert_eq!(
             TransportError::Timeout(RUN_TIMEOUT).to_string(),
             "timed out after 30 s"
-        );
-        assert_eq!(
-            TransportError::Exit {
-                code: None,
-                stdout: String::new(),
-                stderr: String::new()
-            }
-            .to_string(),
-            "script was killed by a signal"
         );
         assert_eq!(
             TransportError::Connect {

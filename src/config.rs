@@ -1,10 +1,12 @@
-//! The config document (D2): `[anvil]` preferences and the `[[steps]]` placeholder.
+//! The config document: `[anvil]` preferences and the `[[steps]]` that
+//! `anvil apply` runs.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::document::{self, DocumentError, Format};
+use crate::paths::DocPath;
 
 /// Longest `run` script, in bytes.
 pub const MAX_RUN_BYTES: usize = 4 << 10;
@@ -44,26 +46,17 @@ pub struct Step {
 
 impl Config {
     /// Loads and validates the config; `None` or a missing file is the defaults.
-    pub fn load(path: Option<&Path>) -> Result<Config, DocumentError> {
-        let Some(path) = path else {
-            return Ok(Config::default());
-        };
-        let config: Config = match document::load(path) {
-            Ok(config) => config,
-            Err(err) if err.is_not_found() => Config::default(),
-            Err(err) => return Err(err),
-        };
-        config.validate(path)?;
-        Ok(config)
+    pub fn load(doc: Option<&DocPath>) -> Result<Config, DocumentError> {
+        document::load_or_default(doc, Config::validate)
     }
 
-    /// Checks the D2 rules; the error names the field.
+    /// Checks the schema rules; the error names the field.
     pub fn validate(&self, path: &Path) -> Result<(), DocumentError> {
         for (i, name) in self.anvil.secrets.iter().enumerate() {
             if !crate::secret::is_name(name) {
                 return Err(DocumentError::invalid(
                     path,
-                    format!("anvil.secrets[{i}] `{name}`: must match [A-Z][A-Z0-9_]*"),
+                    format!("anvil.secrets[{i}] `{name}`: {}", crate::secret::NAME_RULE),
                 ));
             }
         }
@@ -90,20 +83,13 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-
-    fn fixture(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures")
-            .join(name)
-    }
+    use crate::test_util::fixture_doc;
 
     #[test]
     fn missing_config_is_the_defaults() {
-        for path in [None, Some(fixture("nonexistent.yaml"))] {
-            let config = Config::load(path.as_deref()).unwrap();
+        for path in [None, Some(fixture_doc("nonexistent.yaml"))] {
+            let config = Config::load(path.as_ref()).unwrap();
             assert_eq!(config, Config::default());
             assert_eq!(
                 config.steps,
@@ -119,8 +105,8 @@ mod tests {
 
     #[test]
     fn toml_and_yaml_configs_are_equal() {
-        let toml = Config::load(Some(&fixture("config.toml"))).unwrap();
-        let yaml = Config::load(Some(&fixture("config.yaml"))).unwrap();
+        let toml = Config::load(Some(&fixture_doc("config.toml"))).unwrap();
+        let yaml = Config::load(Some(&fixture_doc("config.yaml"))).unwrap();
         assert_eq!(toml, yaml);
         assert_eq!(toml.anvil.editor.as_deref(), Some("nvim"));
         assert_eq!(toml.anvil.format, Format::Yaml);
@@ -150,7 +136,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_both_formats() {
-        let config = Config::load(Some(&fixture("config.toml"))).unwrap();
+        let config = Config::load(Some(&fixture_doc("config.toml"))).unwrap();
         for format in [Format::Toml, Format::Yaml] {
             let text = document::to_string(&config, format).unwrap();
             let back: Config = document::from_str(&text, format).unwrap();
@@ -168,7 +154,7 @@ mod tests {
             ("invalid/config-empty-run.yaml", "steps[1].run"),
             ("invalid/config-blank-run.toml", "steps[0].run"),
         ] {
-            let err = Config::load(Some(&fixture(file))).unwrap_err();
+            let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
             let message = err.to_string();
             assert!(
                 matches!(err, DocumentError::Invalid { .. }),
@@ -200,7 +186,7 @@ mod tests {
             .is_ok()
         );
 
-        let err = Config::load(Some(&fixture("invalid/config-unknown-key.toml"))).unwrap_err();
+        let err = Config::load(Some(&fixture_doc("invalid/config-unknown-key.toml"))).unwrap_err();
         assert!(matches!(err, DocumentError::Parse { .. }), "{err}");
         assert!(err.to_string().contains("inventory_format"), "{err}");
         let err =

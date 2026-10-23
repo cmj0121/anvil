@@ -1,4 +1,4 @@
-//! Stderr logger behind the `log` facade (D11).
+//! Stderr logger behind the `log` facade.
 //!
 //! Lines look like `<LEVEL> <target>: <message>`; no timestamps. Colour is used
 //! only when stderr is a terminal. The level comes from the `-v` count.
@@ -48,16 +48,8 @@ impl Logger {
         let level = record.level();
         let message = record.args().to_string();
         let message = escape_controls(&message);
-        if self.colour {
-            writeln!(
-                out,
-                "\x1b[{}m{level}\x1b[0m {}: {message}",
-                colour_code(level),
-                record.target(),
-            )
-        } else {
-            writeln!(out, "{level} {}: {message}", record.target())
-        }
+        let level = paint(self.colour, colour_code(level), level.as_str());
+        writeln!(out, "{level} {}: {message}", record.target())
     }
 }
 
@@ -66,7 +58,6 @@ impl Logger {
 /// cursor, set the title or emit OSC sequences on the terminal. For human
 /// output only: `--json` is escaped by serde.
 pub fn escape_controls(text: &str) -> Cow<'_, str> {
-    let is_escaped = |c: char| c.is_control() && c != '\n' && c != '\t';
     if !text.chars().any(is_escaped) {
         return Cow::Borrowed(text);
     }
@@ -81,12 +72,33 @@ pub fn escape_controls(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn colour_code(level: Level) -> u8 {
+pub const BOLD_CYAN: &str = "1;36";
+pub const CYAN: &str = "36";
+pub const DIM: &str = "2";
+pub const YELLOW: &str = "33";
+pub const GREEN: &str = "32";
+pub const RED: &str = "31";
+
+/// `text` in the SGR colour `code` when `colour` is on, else as it is.
+pub fn paint(colour: bool, code: &str, text: &str) -> String {
+    if colour {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Whether [`escape_controls`] rewrites `c`: every control but `\n` and `\t`.
+pub fn is_escaped(c: char) -> bool {
+    c.is_control() && c != '\n' && c != '\t'
+}
+
+fn colour_code(level: Level) -> &'static str {
     match level {
-        Level::Error => 31,
-        Level::Warn => 33,
-        Level::Info => 32,
-        Level::Debug | Level::Trace => 36,
+        Level::Error => RED,
+        Level::Warn => YELLOW,
+        Level::Info => GREEN,
+        Level::Debug | Level::Trace => CYAN,
     }
 }
 

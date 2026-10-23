@@ -1,4 +1,4 @@
-//! Probe script and the parser for its `key=value` output (D4).
+//! Probe script and the parser for its `key=value` output.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -183,33 +183,35 @@ mod tests {
     fn probe_is_posix_sh_and_ends_with_the_marker() {
         assert!(PROBE.starts_with("#!/bin/sh\n"));
         let lines: Vec<&str> = PROBE.lines().collect();
-        assert_eq!(
-            lines[lines.len() - 2],
-            "echo \"anvil-probe-end=1\" </dev/null"
-        );
+        assert_eq!(lines[lines.len() - 3], "  echo \"anvil-probe-end=1\"");
         assert_eq!(lines[lines.len() - 1], "exit 0");
     }
 
+    /// Every command reads /dev/null: the body is one `{ …; } </dev/null`
+    /// group, so nothing in it can read the rest of the script from stdin.
     #[test]
-    fn every_probe_command_reads_dev_null() {
-        const NO_COMMAND: &[&str] = &["fi", "else", "done", "for", "exit"];
-        for (n, line) in PROBE.lines().enumerate() {
-            let text = line.trim();
-            let Some(first) = text.split_whitespace().next() else {
-                continue;
-            };
-            if first.starts_with('#') || NO_COMMAND.contains(&first) {
-                continue;
-            }
-            let is_assignment = first.contains('=') && !text.contains("$(");
-            if is_assignment {
-                continue;
-            }
-            assert!(
-                text.contains("</dev/null"),
-                "probe.sh line {}: `{line}` does not read </dev/null",
-                n + 1
-            );
-        }
+    fn the_probe_body_is_one_group_reading_dev_null() {
+        let body: Vec<&str> = PROBE
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert_eq!(body[0], "{", "{PROBE}");
+        assert_eq!(&body[body.len() - 2..], ["} </dev/null", "exit 0"]);
+        assert!(
+            body[1..body.len() - 2]
+                .iter()
+                .all(|line| line.starts_with("  ")),
+            "everything between the braces is inside the group"
+        );
+    }
+
+    #[test]
+    fn the_probe_prints_every_key_locally() {
+        let out = crate::transport::Transport::run(&crate::transport::Local, PROBE).unwrap();
+        assert_eq!(out.code, Some(0));
+        let facts = Facts::parse(&out.stdout).unwrap();
+        let mut keys = KEYS.to_vec();
+        keys.sort_unstable();
+        assert_eq!(facts.0.keys().map(String::as_str).collect::<Vec<_>>(), keys);
     }
 }

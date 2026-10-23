@@ -1,4 +1,4 @@
-//! TOML and YAML documents (D2, D8): one loader and one writer for both formats.
+//! TOML and YAML documents: one loader and one writer for both formats.
 //!
 //! Every file is capped at 1 MiB before it is parsed. YAML goes through
 //! `yaml_options()`, which refuses anchors, aliases, merge keys, duplicate keys,
@@ -12,10 +12,14 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::paths::DocPath;
+
 /// Largest document anvil reads, in bytes.
 pub const MAX_BYTES: u64 = 1 << 20;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, serde::Deserialize, clap::ValueEnum,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
     #[default]
@@ -57,15 +61,12 @@ pub enum DocumentError {
     TooLarge {
         path: PathBuf,
     },
-    UnknownExtension {
-        path: PathBuf,
-    },
     Parse {
         path: PathBuf,
         format: Format,
         message: String,
     },
-    /// A document that parsed but breaks a D2 rule; `message` names the
+    /// A document that parsed but breaks a schema rule; `message` names the
     /// offending host and field.
     Invalid {
         path: PathBuf,
@@ -101,11 +102,6 @@ impl fmt::Display for DocumentError {
                 "{}: larger than the {MAX_BYTES} byte limit",
                 path.display()
             ),
-            DocumentError::UnknownExtension { path } => write!(
-                f,
-                "{}: unknown extension, expected .toml, .yaml or .yml",
-                path.display()
-            ),
             DocumentError::Parse {
                 path,
                 format,
@@ -123,29 +119,62 @@ impl fmt::Display for DocumentError {
 
 impl std::error::Error for DocumentError {}
 
-/// Reads and parses `path`; the format comes from its extension.
-pub fn load<T: DeserializeOwned>(path: &Path) -> Result<T, DocumentError> {
-    let format = Format::from_extension(path).ok_or_else(|| DocumentError::UnknownExtension {
-        path: path.to_path_buf(),
-    })?;
+/// Reads and parses `doc` in its format.
+pub fn load<T: DeserializeOwned>(doc: &DocPath) -> Result<T, DocumentError> {
+    let path = doc.path.as_path();
     let read = |source| DocumentError::Read {
         path: path.to_path_buf(),
         source,
     };
+    let bytes = read_capped(path).map_err(read)?;
+    parse_text(&bytes, path, doc.format, |err| {
+        read(io::Error::new(io::ErrorKind::InvalidData, err))
+    })
+}
+
+/// [`load`]s `doc` and checks it with `validate`; `None` or a missing file is
+/// `T::default()`, which is checked too.
+pub fn load_or_default<T: DeserializeOwned + Default>(
+    doc: Option<&DocPath>,
+    validate: impl Fn(&T, &Path) -> Result<(), DocumentError>,
+) -> Result<T, DocumentError> {
+    let Some(doc) = doc else {
+        return Ok(T::default());
+    };
+    let value = match load(doc) {
+        Ok(value) => value,
+        Err(err) if err.is_not_found() => T::default(),
+        Err(err) => return Err(err),
+    };
+    validate(&value, &doc.path)?;
+    Ok(value)
+}
+
+/// The first `MAX_BYTES + 1` bytes of `path`: one byte past the limit, so a
+/// caller can tell an oversize file from one that just fits.
+pub fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    fs::File::open(path)
-        .map_err(read)?
+    fs::File::open(path)?
         .take(MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(read)?;
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Parses `bytes` read from `path` as `format`: refused past [`MAX_BYTES`],
+/// then decoded as UTF-8 (`utf8` maps that error), then parsed.
+pub fn parse_text<T: DeserializeOwned>(
+    bytes: &[u8],
+    path: &Path,
+    format: Format,
+    utf8: impl FnOnce(std::str::Utf8Error) -> DocumentError,
+) -> Result<T, DocumentError> {
     if bytes.len() as u64 > MAX_BYTES {
         return Err(DocumentError::TooLarge {
             path: path.to_path_buf(),
         });
     }
-    let text = String::from_utf8(bytes)
-        .map_err(|err| read(io::Error::new(io::ErrorKind::InvalidData, err)))?;
-    from_str(&text, format).map_err(|message| DocumentError::Parse {
+    let text = std::str::from_utf8(bytes).map_err(utf8)?;
+    from_str(text, format).map_err(|message| DocumentError::Parse {
         path: path.to_path_buf(),
         format,
         message,
@@ -217,16 +246,13 @@ mod tests {
         assert_eq!(Format::from_extension(Path::new("inventory")), None);
     }
 
-    #[test]
-    fn unknown_extension_is_refused_before_reading() {
-        let err = load::<Doc>(Path::new("/nonexistent/inventory.json")).unwrap_err();
-        assert!(matches!(err, DocumentError::UnknownExtension { .. }));
-        assert!(err.to_string().contains("inventory.json"));
+    fn doc(path: &Path) -> DocPath {
+        crate::paths::explicit(path).unwrap()
     }
 
     #[test]
     fn missing_file_is_not_found() {
-        let err = load::<Doc>(Path::new("/nonexistent/inventory.toml")).unwrap_err();
+        let err = load::<Doc>(&doc(Path::new("/nonexistent/inventory.toml"))).unwrap_err();
         assert!(err.is_not_found());
     }
 
@@ -272,8 +298,7 @@ mod tests {
 
     #[test]
     fn oversized_file_is_refused_in_both_formats() {
-        let dir = std::env::temp_dir().join(format!("anvil-document-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_util::temp_dir("document");
         for name in ["big.toml", "big.yaml"] {
             let path = dir.join(name);
             let mut text = String::from("# padding\n");
@@ -283,7 +308,7 @@ mod tests {
                 );
             }
             fs::write(&path, text).unwrap();
-            let err = load::<Doc>(&path).unwrap_err();
+            let err = load::<Doc>(&doc(&path)).unwrap_err();
             assert!(matches!(err, DocumentError::TooLarge { .. }), "{err}");
             assert!(err.to_string().contains(name));
         }

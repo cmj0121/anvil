@@ -1,4 +1,4 @@
-//! `anvil doctor` (D5, D10): local checks, then every selected target's
+//! `anvil doctor`: local checks, then every selected target's
 //! reachability and facts, one target at a time.
 //!
 //! A missing secret is a warning; a secret the store cannot answer for, a
@@ -12,13 +12,14 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::cli::{Cli, Failure};
-use crate::editor::{self, Editor, EditorError};
+use crate::cli::{Cli, Failure, print_json};
+use crate::editor::{Editor, EditorError, Fallback};
 use crate::facts::{self, Facts, PROBE};
 use crate::inventory::{Target, TargetKind};
 use crate::logger::escape_controls;
+use crate::paths;
 use crate::secret::SecretStore;
-use crate::transport::{Transport, TransportError};
+use crate::transport::{Output, Transport, TransportError};
 
 const SH: &str = "/bin/sh";
 
@@ -30,15 +31,32 @@ pub enum SecretStatus {
     Error,
 }
 
+impl SecretStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            SecretStatus::Ok => "ok",
+            SecretStatus::Missing => "missing",
+            SecretStatus::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct LocalReport {
     ssh: bool,
     sh: bool,
-    /// The resolved editor program, `None` when it cannot be resolved.
-    editor: Option<PathBuf>,
+    /// The resolved editor program, or why it cannot be resolved; JSON shows
+    /// the path or `null`.
+    #[serde(serialize_with = "path_or_null")]
+    editor: Result<PathBuf, String>,
     secrets: BTreeMap<String, SecretStatus>,
-    #[serde(skip)]
-    editor_error: Option<String>,
+}
+
+fn path_or_null<S: serde::Serializer>(
+    editor: &Result<PathBuf, String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    editor.as_ref().ok().serialize(serializer)
 }
 
 impl LocalReport {
@@ -79,7 +97,7 @@ pub fn run(cli: &Cli, store: &dyn SecretStore) -> Result<(), Failure> {
     let targets = cli.targets()?;
     let local = local_checks(
         &cli.ssh_program(),
-        Editor::resolve(config.anvil.editor.as_deref()),
+        Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict),
         &config.anvil.secrets,
         store,
     );
@@ -89,9 +107,7 @@ pub fn run(cli: &Cli, store: &dyn SecretStore) -> Result<(), Failure> {
         .collect();
     let report = Report::new(local, targets);
     if cli.json {
-        let json = serde_json::to_string(&report)
-            .map_err(|err| Failure::failed(format!("cannot encode JSON: {err}")))?;
-        println!("{json}");
+        print_json(&report, Failure::failed)?;
     } else {
         print!("{}", render(&report));
     }
@@ -109,27 +125,25 @@ fn local_checks(
     store: &dyn SecretStore,
 ) -> LocalReport {
     let path = std::env::var_os("PATH");
-    let ssh = editor::find_program(ssh_program, path.as_deref()).is_some();
-    let sh = editor::find_program(Path::new(SH), None).is_some();
+    let ssh = paths::find_program(ssh_program, path.as_deref()).is_some();
+    let sh = paths::find_program(Path::new(SH), None).is_some();
     if !ssh {
         log::error!("{}: not found", ssh_program.display());
     }
     if !sh {
         log::error!("{SH}: not found");
     }
-    let (editor, editor_error) = match editor {
-        Ok(editor) => (Some(editor.program().to_path_buf()), None),
-        Err(err) => {
+    let editor = editor
+        .map(|editor| editor.program().to_path_buf())
+        .map_err(|err| {
             log::warn!("{err}");
-            (None, Some(err.to_string()))
-        }
-    };
+            err.to_string()
+        });
     LocalReport {
         ssh,
         sh,
         editor,
         secrets: check_secrets(secrets, store),
-        editor_error,
     }
 }
 
@@ -165,7 +179,10 @@ fn check_target(
             transport.run(PROBE)
         })
         .map_err(|err| err.to_string())
-        .and_then(|output| Facts::parse(&output.stdout).map_err(|err| err.to_string()));
+        .and_then(|output| match output.code {
+            Some(0) => Facts::parse(&output.stdout).map_err(|err| err.to_string()),
+            _ => Err(exit_message(&output)),
+        });
     let (facts, error) = match result {
         Ok(facts) => {
             log::info!("doctor {}: connectable", target.name);
@@ -183,6 +200,22 @@ fn check_target(
         error,
         transport: describe(target),
     }
+}
+
+/// Why a probe that ran to the end failed: `script exited with N: <stderr>`,
+/// or `script was killed by a signal`.
+fn exit_message(output: &Output) -> String {
+    let mut message = match output.code {
+        Some(code) => format!("script exited with {code}"),
+        None => "script was killed by a signal".to_owned(),
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        message.push_str(": ");
+        message.push_str(stderr);
+    }
+    message
 }
 
 /// `local`, or `ssh [user@]host[:port]`.
@@ -212,26 +245,21 @@ fn render(report: &Report) -> String {
     let mut out = String::from("local checks\n");
     let _ = writeln!(out, "  {:<15} {}", "ssh", yes_no(local.ssh));
     let _ = writeln!(out, "  {:<15} {}", "sh", yes_no(local.sh));
-    match (&local.editor, &local.editor_error) {
-        (Some(path), _) => {
+    match &local.editor {
+        Ok(path) => {
             let _ = writeln!(out, "  {:<15} {}", "editor", path.display());
         }
-        (None, error) => {
-            let _ = writeln!(
-                out,
-                "  {:<15} error: {}",
-                "editor",
-                error.as_deref().unwrap_or("unresolved")
-            );
+        Err(error) => {
+            let _ = writeln!(out, "  {:<15} error: {error}", "editor");
         }
     }
     for (name, status) in &local.secrets {
-        let status = match status {
-            SecretStatus::Ok => "ok",
-            SecretStatus::Missing => "missing",
-            SecretStatus::Error => "error",
-        };
-        let _ = writeln!(out, "  {:<15} {status}", format!("secret {name}"));
+        let _ = writeln!(
+            out,
+            "  {:<15} {}",
+            format!("secret {name}"),
+            status.as_str()
+        );
     }
     for target in &report.targets {
         let _ = writeln!(out, "\n{}", target.target);
@@ -258,10 +286,27 @@ fn render(report: &Report) -> String {
 mod tests {
     use super::*;
     use crate::secret::{Memory, SecretError};
-    use crate::transport::Output;
+    use crate::test_util::{json, keys};
 
     /// Answers every script with fixed output, or fails, without a process.
     struct Fake(Result<&'static str, TransportError>);
+
+    /// Answers every script with this exit and stderr.
+    struct Exits(Option<i32>, &'static str);
+
+    impl Transport for Exits {
+        fn name(&self) -> &str {
+            "exits"
+        }
+
+        fn run(&self, _script: &str) -> Result<Output, TransportError> {
+            Ok(Output {
+                stderr: self.1.as_bytes().to_vec(),
+                code: self.0,
+                ..Output::default()
+            })
+        }
+    }
 
     impl Transport for Fake {
         fn name(&self) -> &str {
@@ -310,7 +355,6 @@ mod tests {
                 user: Some("cmj".to_owned()),
                 port: Some(2222),
             },
-            tags: vec![],
         }
     }
 
@@ -328,19 +372,6 @@ mod tests {
             &secrets,
             store,
         )
-    }
-
-    fn json(value: &impl Serialize) -> serde_json::Value {
-        serde_json::to_value(value).unwrap()
-    }
-
-    fn keys(value: &serde_json::Value) -> Vec<&str> {
-        value
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect()
     }
 
     #[test]
@@ -378,6 +409,23 @@ mod tests {
         assert_eq!(
             report.error.as_deref(),
             Some("probe output has no end marker")
+        );
+    }
+
+    #[test]
+    fn a_probe_exiting_non_zero_is_unreachable_with_its_stderr() {
+        let report = check_target(&host("box"), Ok(Box::new(Exits(Some(255), " nope \n"))));
+        assert!(!report.connectable);
+        assert_eq!(
+            report.error.as_deref(),
+            Some("script exited with 255: nope")
+        );
+        let report = check_target(&host("box"), Ok(Box::new(Exits(Some(3), ""))));
+        assert_eq!(report.error.as_deref(), Some("script exited with 3"));
+        let report = check_target(&host("box"), Ok(Box::new(Exits(None, ""))));
+        assert_eq!(
+            report.error.as_deref(),
+            Some("script was killed by a signal")
         );
     }
 
@@ -495,7 +543,6 @@ mod tests {
         let local = Target {
             name: "local".to_owned(),
             kind: TargetKind::Local,
-            tags: vec!["local".to_owned()],
         };
         assert_eq!(describe(&local), "local");
         let bare = Target {

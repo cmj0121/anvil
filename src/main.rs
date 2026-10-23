@@ -13,6 +13,8 @@ mod logger;
 mod paths;
 mod secret;
 mod ssh;
+#[cfg(test)]
+mod test_util;
 mod transport;
 
 use std::process::ExitCode;

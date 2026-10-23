@@ -1,68 +1,24 @@
-//! `anvil inventory` and `anvil config` driven by the fake editor (D9, D13).
+//! `anvil inventory` and `anvil config` driven by the fake editor.
 //!
 //! Every test gets its own root holding `$XDG_CONFIG_HOME`, `$HOME` and
 //! `$TMPDIR`, so neither the real `~/.config/anvil` nor the real temp dir is
 //! touched.
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::path::PathBuf;
 
-fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name)
-}
+use common::{Sandbox, fixture, text};
 
-fn text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-struct Sandbox {
-    root: PathBuf,
+/// A sandbox whose fake editor records each call; no debug-only flags, so
+/// these tests also run against a release build.
+fn sandbox() -> Sandbox {
+    Sandbox::new("ae").without_debug_flags().recording()
 }
 
 impl Sandbox {
-    fn new(name: &str) -> Sandbox {
-        let root = std::env::temp_dir().join(format!("anvil-edit-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        for sub in ["xdg", "home", "tmp", "record"] {
-            fs::create_dir_all(root.join(sub)).unwrap();
-        }
-        Sandbox { root }
-    }
-
-    fn config_dir(&self) -> PathBuf {
-        self.root.join("xdg/anvil")
-    }
-
-    fn record(&self, name: &str) -> PathBuf {
-        self.root.join("record").join(name)
-    }
-
-    /// Runs anvil with the fake editor; `content` is what the editor "types".
-    fn anvil(&self, args: &[&str], content: Option<&Path>, exit: Option<&str>) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_anvil"));
-        command
-            .args(args)
-            .env("XDG_CONFIG_HOME", self.root.join("xdg"))
-            .env("HOME", self.root.join("home"))
-            .env("TMPDIR", self.root.join("tmp"))
-            .env("EDITOR", fixture("fake-editor.sh"))
-            .env("FAKE_EDITOR_RECORD", self.record("editor"))
-            .env_remove("VISUAL")
-            .env_remove("FAKE_EDITOR_CONTENT")
-            .env_remove("FAKE_EDITOR_EXIT");
-        if let Some(content) = content {
-            command.env("FAKE_EDITOR_CONTENT", content);
-        }
-        if let Some(exit) = exit {
-            command.env("FAKE_EDITOR_EXIT", exit);
-        }
-        command.output().expect("spawn anvil")
-    }
-
     /// How many times the editor ran since the last `reset_record`.
     fn calls(&self) -> usize {
         fs::read_to_string(self.record("editor.count"))
@@ -75,15 +31,14 @@ impl Sandbox {
     }
 
     fn reset_record(&self) {
-        let _ = fs::remove_dir_all(self.root.join("record"));
-        fs::create_dir_all(self.root.join("record")).unwrap();
+        let _ = fs::remove_dir_all(self.root().join("record"));
+        fs::create_dir_all(self.root().join("record")).unwrap();
     }
 
     /// Every `edit-*` file left in anvil's private temp directory.
     fn leftovers(&self) -> Vec<PathBuf> {
-        let tmp = self.root.join("tmp");
         let mut found = Vec::new();
-        for dir in fs::read_dir(&tmp).unwrap() {
+        for dir in fs::read_dir(self.tmp_dir()).unwrap() {
             let dir = dir.unwrap().path();
             assert!(
                 dir.file_name()
@@ -120,18 +75,20 @@ impl Sandbox {
         names.sort();
         names
     }
-}
 
-impl Drop for Sandbox {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+    /// Writes `NAME` into the config directory.
+    fn put(&self, name: &str, content: &str) -> PathBuf {
+        fs::create_dir_all(self.config_dir()).unwrap();
+        let path = self.config_dir().join(name);
+        fs::write(&path, content).unwrap();
+        path
     }
 }
 
 #[test]
 fn inventory_writes_a_valid_file_atomically() {
-    let sb = Sandbox::new("valid");
-    let out = sb.anvil(&["inventory"], Some(&fixture("inventory.toml")), None);
+    let sb = sandbox();
+    let out = sb.edit(&["inventory"], Some(&fixture("inventory.toml")), None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let path = sb.config_dir().join("inventory.toml");
     assert_eq!(text(&out.stdout), format!("wrote {}\n", path.display()));
@@ -161,13 +118,13 @@ fn inventory_writes_a_valid_file_atomically() {
 
 #[test]
 fn invalid_content_is_refused_after_three_attempts() {
-    let sb = Sandbox::new("invalid");
+    let sb = sandbox();
     let original = "[hosts.pi]\nhost = \"pi.local\"\n";
     fs::create_dir_all(sb.config_dir()).unwrap();
     fs::write(sb.config_dir().join("inventory.toml"), original).unwrap();
 
     let invalid = fixture("invalid/host-leading-dash.toml");
-    let out = sb.anvil(&["inventory"], Some(&invalid), None);
+    let out = sb.edit(&["inventory"], Some(&invalid), None);
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
     let stderr = text(&out.stderr);
@@ -193,15 +150,15 @@ fn invalid_content_is_refused_after_three_attempts() {
 
 #[test]
 fn a_fix_on_the_second_attempt_is_written() {
-    let sb = Sandbox::new("second");
-    let content = sb.root.join("content.toml");
+    let sb = sandbox();
+    let content = sb.root().join("content.toml");
     fs::copy(
         fixture("invalid/port-zero.toml"),
         content.with_extension("toml.1"),
     )
     .unwrap();
     fs::copy(fixture("inventory.toml"), &content).unwrap();
-    let out = sb.anvil(&["inventory"], Some(&content), None);
+    let out = sb.edit(&["inventory"], Some(&content), None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(sb.calls(), 2);
     assert!(text(&out.stderr).contains("port"));
@@ -211,23 +168,13 @@ fn a_fix_on_the_second_attempt_is_written() {
 const CONFIG_TOML: &str = "[anvil]\nformat = \"toml\"\n\n[[steps]]\nrun = \"uname\"\n";
 const INVENTORY_TOML: &str = "[hosts.pi]\nhost = \"pi.local\"\n";
 
-impl Sandbox {
-    /// Writes `NAME` into the config directory.
-    fn put(&self, name: &str, content: &str) -> PathBuf {
-        fs::create_dir_all(self.config_dir()).unwrap();
-        let path = self.config_dir().join(name);
-        fs::write(&path, content).unwrap();
-        path
-    }
-}
-
 #[test]
 fn inventory_format_yaml_converts_only_the_inventory() {
-    let sb = Sandbox::new("inv-yaml");
+    let sb = sandbox();
     sb.put("config.toml", CONFIG_TOML);
     sb.put("inventory.toml", INVENTORY_TOML);
 
-    let out = sb.anvil(&["inventory", "--format=yaml"], None, None);
+    let out = sb.edit(&["inventory", "--format=yaml"], None, None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let yaml_path = sb.config_dir().join("inventory.yaml");
     assert_eq!(
@@ -248,11 +195,11 @@ fn inventory_format_yaml_converts_only_the_inventory() {
 
 #[test]
 fn config_format_yaml_leaves_the_inventory_and_the_format_key() {
-    let sb = Sandbox::new("cfg-yaml");
+    let sb = sandbox();
     sb.put("config.toml", CONFIG_TOML);
     sb.put("inventory.toml", INVENTORY_TOML);
 
-    let out = sb.anvil(&["config", "--format", "yaml"], None, None);
+    let out = sb.edit(&["config", "--format", "yaml"], None, None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let yaml_path = sb.config_dir().join("config.yaml");
     assert_eq!(
@@ -270,7 +217,7 @@ fn config_format_yaml_leaves_the_inventory_and_the_format_key() {
     );
 
     sb.reset_record();
-    let out = sb.anvil(&["inventory"], None, None);
+    let out = sb.edit(&["inventory"], None, None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(
         sb.seen(1),
@@ -282,10 +229,10 @@ fn config_format_yaml_leaves_the_inventory_and_the_format_key() {
 
 #[test]
 fn an_edit_of_the_format_key_is_kept() {
-    let sb = Sandbox::new("format-key");
-    let content = sb.root.join("content.yaml");
+    let sb = sandbox();
+    let content = sb.root().join("content.yaml");
     fs::write(&content, "anvil:\n  format: toml\n").unwrap();
-    let out = sb.anvil(&["config", "--format", "yaml"], Some(&content), None);
+    let out = sb.edit(&["config", "--format", "yaml"], Some(&content), None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(sb.files(), ["config.yaml"]);
     assert_eq!(
@@ -296,14 +243,14 @@ fn an_edit_of_the_format_key_is_kept() {
 
 #[test]
 fn a_yaml_inventory_stays_yaml_without_format() {
-    let sb = Sandbox::new("stays-yaml");
+    let sb = sandbox();
     sb.put("config.toml", CONFIG_TOML);
     let original = "hosts:\n  pi:\n    host: pi.local\n";
     let path = sb.put("inventory.yaml", original);
 
-    let content = sb.root.join("content.yaml");
+    let content = sb.root().join("content.yaml");
     fs::write(&content, "hosts:\n  pi:\n    host: pi.lan\n").unwrap();
-    let out = sb.anvil(&["inventory"], Some(&content), None);
+    let out = sb.edit(&["inventory"], Some(&content), None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), format!("wrote {}\n", path.display()));
     assert_eq!(sb.seen(1), original, "opened as the YAML on disk");
@@ -318,9 +265,9 @@ fn a_yaml_inventory_stays_yaml_without_format() {
 
 #[test]
 fn a_missing_inventory_is_created_in_the_configured_format() {
-    let sb = Sandbox::new("created-yaml");
+    let sb = sandbox();
     sb.put("config.toml", "[anvil]\nformat = \"yaml\"\n");
-    let out = sb.anvil(&["inventory"], Some(&fixture("inventory.yaml")), None);
+    let out = sb.edit(&["inventory"], Some(&fixture("inventory.yaml")), None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(sb.seen(1), "hosts: {}\n");
     assert_eq!(sb.files(), ["config.toml", "inventory.yaml"]);
@@ -328,13 +275,13 @@ fn a_missing_inventory_is_created_in_the_configured_format() {
 
 #[test]
 fn format_is_a_usage_error_outside_inventory_and_config() {
-    let sb = Sandbox::new("format-elsewhere");
+    let sb = sandbox();
     for args in [
         ["secret", "--format", "yaml", "X"].as_slice(),
         ["doctor", "--format", "yaml"].as_slice(),
         ["apply", "--format", "yaml"].as_slice(),
     ] {
-        let out = sb.anvil(args, None, None);
+        let out = sb.edit(args, None, None);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert!(text(&out.stderr).contains("--format"), "{args:?}");
     }
@@ -343,9 +290,9 @@ fn format_is_a_usage_error_outside_inventory_and_config() {
 
 #[test]
 fn an_explicit_path_with_another_format_is_a_usage_error() {
-    let sb = Sandbox::new("explicit-format");
-    let inv = sb.root.join("inv.toml");
-    let out = sb.anvil(
+    let sb = sandbox();
+    let inv = sb.root().join("inv.toml");
+    let out = sb.edit(
         &[
             "--inventory",
             inv.to_str().unwrap(),
@@ -365,8 +312,8 @@ fn an_explicit_path_with_another_format_is_a_usage_error() {
         "{}",
         text(&out.stderr)
     );
-    let cfg = sb.root.join("cfg.yml");
-    let out = sb.anvil(
+    let cfg = sb.root().join("cfg.yml");
+    let out = sb.edit(
         &["--config", cfg.to_str().unwrap(), "config", "--format=toml"],
         None,
         None,
@@ -380,7 +327,7 @@ fn an_explicit_path_with_another_format_is_a_usage_error() {
     assert_eq!(sb.calls(), 0);
     assert!(!inv.exists() && !cfg.exists());
 
-    let out = sb.anvil(
+    let out = sb.edit(
         &["--config", cfg.to_str().unwrap(), "config", "--format=yaml"],
         Some(&fixture("config.yaml")),
         None,
@@ -391,8 +338,8 @@ fn an_explicit_path_with_another_format_is_a_usage_error() {
 
 #[test]
 fn a_first_run_left_unchanged_writes_nothing() {
-    let sb = Sandbox::new("first-run");
-    let out = sb.anvil(&["inventory"], None, None);
+    let sb = sandbox();
+    let out = sb.edit(&["inventory"], None, None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let path = sb.config_dir().join("inventory.toml");
     assert_eq!(
@@ -401,7 +348,7 @@ fn a_first_run_left_unchanged_writes_nothing() {
     );
     assert!(sb.files().is_empty());
 
-    let out = sb.anvil(&["--json", "config"], None, None);
+    let out = sb.edit(&["--json", "config"], None, None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let path = sb.config_dir().join("config.toml");
@@ -415,8 +362,8 @@ fn a_first_run_left_unchanged_writes_nothing() {
 
 #[test]
 fn editor_exit_non_zero_writes_nothing_and_exits_one() {
-    let sb = Sandbox::new("abort");
-    let out = sb.anvil(&["inventory"], Some(&fixture("inventory.toml")), Some("3"));
+    let sb = sandbox();
+    let out = sb.edit(&["inventory"], Some(&fixture("inventory.toml")), Some("3"));
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     assert_eq!(
@@ -431,9 +378,9 @@ fn editor_exit_non_zero_writes_nothing_and_exits_one() {
 
 #[test]
 fn json_reports_path_and_changed() {
-    let sb = Sandbox::new("json");
+    let sb = sandbox();
     let path = sb.config_dir().join("inventory.toml");
-    let out = sb.anvil(
+    let out = sb.edit(
         &["--json", "inventory"],
         Some(&fixture("inventory.toml")),
         None,
@@ -446,7 +393,7 @@ fn json_reports_path_and_changed() {
     );
 
     let before = fs::metadata(&path).unwrap().modified().unwrap();
-    let out = sb.anvil(&["inventory", "--json"], None, None);
+    let out = sb.edit(&["inventory", "--json"], None, None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
@@ -458,9 +405,9 @@ fn json_reports_path_and_changed() {
 
 #[test]
 fn explicit_path_is_written_in_its_own_format() {
-    let sb = Sandbox::new("explicit");
-    let path = sb.root.join("inv.yml");
-    let out = sb.anvil(
+    let sb = sandbox();
+    let path = sb.root().join("inv.yml");
+    let out = sb.edit(
         &["--inventory", path.to_str().unwrap(), "inventory"],
         Some(&fixture("inventory.yml")),
         None,
@@ -473,8 +420,8 @@ fn explicit_path_is_written_in_its_own_format() {
 
 #[test]
 fn target_is_ignored_with_a_warning() {
-    let sb = Sandbox::new("target");
-    let out = sb.anvil(&["-v", "--target", "local", "inventory"], None, None);
+    let sb = sandbox();
+    let out = sb.edit(&["-v", "--target", "local", "inventory"], None, None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(
         text(&out.stderr).contains("WARN anvil::commands: --target is ignored by `inventory`"),
@@ -485,14 +432,14 @@ fn target_is_ignored_with_a_warning() {
 
 #[test]
 fn a_missing_configured_editor_fails_inventory_but_config_falls_back() {
-    let sb = Sandbox::new("editor");
+    let sb = sandbox();
     fs::create_dir_all(sb.config_dir()).unwrap();
     fs::write(
         sb.config_dir().join("config.toml"),
         "[anvil]\neditor = \"anvil-no-such-editor\"\n",
     )
     .unwrap();
-    let out = sb.anvil(&["inventory"], None, None);
+    let out = sb.edit(&["inventory"], None, None);
     assert_eq!(out.status.code(), Some(2));
     assert!(
         text(&out.stderr).contains("editor `anvil-no-such-editor`"),
@@ -501,7 +448,7 @@ fn a_missing_configured_editor_fails_inventory_but_config_falls_back() {
     );
     assert_eq!(sb.calls(), 0);
 
-    let out = sb.anvil(&["-v", "config"], None, None);
+    let out = sb.edit(&["-v", "config"], None, None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let stderr = text(&out.stderr);
     assert!(
@@ -514,13 +461,13 @@ fn a_missing_configured_editor_fails_inventory_but_config_falls_back() {
 
 #[test]
 fn a_stale_tmp_file_is_replaced_and_the_result_is_0600() {
-    let sb = Sandbox::new("stale");
+    let sb = sandbox();
     fs::create_dir_all(sb.config_dir()).unwrap();
     let tmp = sb.config_dir().join("inventory.toml.tmp");
     fs::write(&tmp, "stale").unwrap();
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
 
-    let out = sb.anvil(&["inventory"], Some(&fixture("inventory.toml")), None);
+    let out = sb.edit(&["inventory"], Some(&fixture("inventory.toml")), None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let path = sb.config_dir().join("inventory.toml");
     assert_eq!(
@@ -532,4 +479,35 @@ fn a_stale_tmp_file_is_replaced_and_the_result_is_0600() {
         fs::read_to_string(fixture("inventory.toml")).unwrap()
     );
     assert_eq!(sb.files(), ["inventory.toml"], "no .tmp left behind");
+}
+
+#[test]
+fn an_unchanged_conversion_past_the_size_limit_is_refused() {
+    let sb = sandbox();
+    // Inline tags are 4 bytes each in TOML and a line each in YAML, so the
+    // file fits the 1 MiB limit and its YAML rendering does not.
+    let mut toml = String::from("[hosts.h]\nhost = \"a\"\ntags = [");
+    while toml.len() < 1_040_000 {
+        toml.push_str("\"t\",");
+    }
+    toml.push_str("]\n");
+    assert!(toml.len() < 1 << 20);
+    let path = sb.put("inventory.toml", &toml);
+
+    let out = sb.edit(&["inventory", "--format", "yaml"], None, None);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(out.stdout.is_empty());
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("larger than the 1048576 byte limit"),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .ends_with("ERROR anvil: inventory: still invalid after 3 attempts, nothing written\n"),
+        "{stderr}"
+    );
+    assert_eq!(sb.calls(), 3);
+    assert_eq!(sb.files(), ["inventory.toml"]);
+    assert_eq!(fs::read_to_string(&path).unwrap(), toml);
 }

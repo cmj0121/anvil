@@ -1,5 +1,5 @@
 #!/bin/sh
-# End-to-end checks against an Arch sshd container (D6), through the real
+# End-to-end checks against an Arch sshd container, through the real
 # commands: a temp XDG_CONFIG_HOME holds the inventory (the container as `arch`
 # for the key user and `archpw` for the password user, `closed` on a closed
 # port) and a config with
@@ -31,7 +31,7 @@ esac
 NAME="anvil-e2e-$$"
 # The container's test-only password for the `pw` user (tests/e2e/Dockerfile).
 PASSWORD=pw-secret
-# Short: the control socket path must fit sun_path (D3), and macOS' $TMPDIR is long.
+# Short: the control socket path must fit sun_path, and macOS' $TMPDIR is long.
 TMP=$(mktemp -d /tmp/anvil-e2e.XXXXXX) || exit 1
 HOME_DIR="$TMP/home"
 XDG="$TMP/xdg"
@@ -60,8 +60,10 @@ fail() {
 }
 
 step "build image and binary"
-docker build -q --platform "$PLATFORM" --build-arg "BASE=$BASE" -t "$IMAGE" tests/e2e >/dev/null || exit 1
+docker build -q --platform "$PLATFORM" --build-arg "BASE=$BASE" -t "$IMAGE" tests/e2e >/dev/null &
+image=$!
 cargo build --quiet || exit 1
+wait "$image" || exit 1
 ANVIL=$(pwd)/target/debug/anvil
 FAKE_EDITOR=$(pwd)/tests/fixtures/fake-editor.sh
 
@@ -74,13 +76,13 @@ PORT=$(docker port "$NAME" 22/tcp | head -n1 | sed 's/.*://')
 REMOTE_HOSTNAME=$(docker inspect -f '{{.Config.Hostname}}' "$NAME")
 LOCAL_HOSTNAME=$(hostname)
 
+# The scan that finds sshd up is also the known_hosts entry.
 i=0
-until ssh-keyscan -T 2 -p "$PORT" 127.0.0.1 2>/dev/null | grep -q ssh-ed25519; do
+until ssh-keyscan -T 2 -p "$PORT" 127.0.0.1 2>/dev/null | grep ssh-ed25519 >"$KNOWN"; do
   i=$((i + 1))
   [ "$i" -lt 60 ] || { echo "sshd did not come up"; docker logs "$NAME"; exit 1; }
   sleep 1
 done
-ssh-keyscan -T 2 -p "$PORT" 127.0.0.1 2>/dev/null | grep ssh-ed25519 >"$KNOWN"
 : >"$EMPTY_KNOWN"
 
 mkdir -p "$HOME_DIR" "$XDG/anvil"
@@ -176,7 +178,7 @@ step_json() { printf '{"run":"hostname","code":0,"stdout":"%s\\n","stderr":""}' 
 expected=$(printf '{"targets":[{"target":"local","steps":[%s],"ok":true},{"target":"arch","steps":[%s],"ok":true}],"ok":true}' \
   "$(step_json "$LOCAL_HOSTNAME")" "$(step_json "$REMOTE_HOSTNAME")")
 if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ]; then
-  pass "apply --json shape (D5)"
+  pass "apply --json shape"
 else
   fail "exit $code, expected:"
   printf '%s\n' "$expected"
@@ -200,7 +202,7 @@ else
   ls -l "$XDG/anvil"
 fi
 
-step "(d) password user without a tty gets the D3 message, exit 1"
+step "(d) password user without a tty gets the "run interactively" message, exit 1"
 anvil doctor --target archpw
 code=$?
 if [ "$code" -eq 1 ] \

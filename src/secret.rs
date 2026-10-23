@@ -1,4 +1,4 @@
-//! Secret storage (D10): a store trait, the macOS keychain behind it and an
+//! Secret storage: a store trait, the macOS keychain behind it and an
 //! in-memory store for tests.
 //!
 //! A secret is a generic password in the default keychain, service `anvil`,
@@ -58,6 +58,9 @@ pub trait SecretStore {
     fn delete(&self, name: &str) -> Result<(), SecretError>;
 }
 
+/// What [`is_name`] requires, as error messages state it.
+pub const NAME_RULE: &str = "must match [A-Z][A-Z0-9_]*";
+
 /// `[A-Z][A-Z0-9_]*`: the rule shared with `[anvil].secrets` in the config.
 pub fn is_name(s: &str) -> bool {
     let mut chars = s.chars();
@@ -66,7 +69,7 @@ pub fn is_name(s: &str) -> bool {
 }
 
 /// The default keychain of the current user (macOS only).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Keychain;
 
 #[cfg(target_os = "macos")]

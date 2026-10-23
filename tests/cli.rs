@@ -1,19 +1,14 @@
-//! Exit codes and the stdout/stderr split of the built binary (D5, D11).
+//! Exit codes and the stdout/stderr split of the built binary.
 
-use std::process::{Command, Output};
+mod common;
+
+use std::process::Output;
+
+use common::{Sandbox, text};
 
 /// Runs anvil with an empty config directory, so the user's files never count.
 fn anvil(args: &[&str]) -> Output {
-    let empty = std::env::temp_dir().join(format!("anvil-cli-{}", std::process::id()));
-    Command::new(env!("CARGO_BIN_EXE_anvil"))
-        .args(args)
-        .env("XDG_CONFIG_HOME", empty)
-        .output()
-        .expect("spawn anvil")
-}
-
-fn text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+    Sandbox::new("ac").without_debug_flags().anvil(args, &[])
 }
 
 #[test]

@@ -1,12 +1,13 @@
-//! The inventory document and target selection (D2, D5).
+//! The inventory document and target selection.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::document::{self, DocumentError};
+use crate::paths::DocPath;
 
 /// The implicit target: the machine anvil runs on.
 pub const LOCAL: &str = "local";
@@ -43,7 +44,6 @@ pub enum TargetKind {
 pub struct Target {
     pub name: String,
     pub kind: TargetKind,
-    pub tags: Vec<String>,
 }
 
 /// One `--target SEL`: `local`, or a word that is a host name or a tag.
@@ -80,20 +80,11 @@ impl std::error::Error for UnknownSel {}
 
 impl Inventory {
     /// Loads and validates the inventory; `None` is the empty document.
-    pub fn load(path: Option<&Path>) -> Result<Inventory, DocumentError> {
-        let Some(path) = path else {
-            return Ok(Inventory::default());
-        };
-        let inventory: Inventory = match document::load(path) {
-            Ok(inventory) => inventory,
-            Err(err) if err.is_not_found() => Inventory::default(),
-            Err(err) => return Err(err),
-        };
-        inventory.validate(path)?;
-        Ok(inventory)
+    pub fn load(doc: Option<&DocPath>) -> Result<Inventory, DocumentError> {
+        document::load_or_default(doc, Inventory::validate)
     }
 
-    /// Checks every D2 rule; the error names the host and the field.
+    /// Checks every schema rule; the error names the host and the field.
     pub fn validate(&self, path: &Path) -> Result<(), DocumentError> {
         let fail = |name: &str, field: &str, what: &str| {
             Err(DocumentError::invalid(
@@ -154,25 +145,25 @@ impl Inventory {
     /// No selector means every target.
     pub fn select(&self, sels: &[Sel]) -> Result<Vec<Target>, UnknownSel> {
         let mut local = sels.is_empty();
-        let mut names: Vec<&String> = Vec::new();
+        let mut names: BTreeSet<&str> = BTreeSet::new();
         for sel in sels {
             match sel {
                 Sel::Local => local = true,
                 Sel::Word(word) => {
                     if self.hosts.contains_key(word) {
-                        names.push(word);
+                        names.insert(word);
                         continue;
                     }
-                    let tagged: Vec<&String> = self
-                        .hosts
-                        .iter()
-                        .filter(|(_, host)| host.tags.contains(word))
-                        .map(|(name, _)| name)
-                        .collect();
-                    if tagged.is_empty() {
+                    let mut matched = false;
+                    for (name, host) in &self.hosts {
+                        if host.tags.contains(word) {
+                            names.insert(name);
+                            matched = true;
+                        }
+                    }
+                    if !matched {
                         return Err(UnknownSel(word.clone()));
                     }
-                    names.extend(tagged);
                 }
             }
         }
@@ -181,11 +172,10 @@ impl Inventory {
             targets.push(Target {
                 name: LOCAL.to_string(),
                 kind: TargetKind::Local,
-                tags: vec![LOCAL.to_string()],
             });
         }
         for (name, host) in &self.hosts {
-            if sels.is_empty() || names.contains(&name) {
+            if sels.is_empty() || names.contains(name.as_str()) {
                 targets.push(Target {
                     name: name.clone(),
                     kind: TargetKind::Ssh {
@@ -193,7 +183,6 @@ impl Inventory {
                         user: host.user.clone(),
                         port: host.port.map(|port| port as u16),
                     },
-                    tags: host.tags.clone(),
                 });
             }
         }
@@ -222,15 +211,8 @@ fn is_user(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-
-    fn fixture(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures")
-            .join(name)
-    }
+    use crate::test_util::fixture_doc;
 
     fn sels(words: &[&str]) -> Vec<Sel> {
         words.iter().map(|w| Sel::parse(w)).collect()
@@ -242,9 +224,9 @@ mod tests {
 
     #[test]
     fn toml_yaml_and_yml_yield_identical_targets() {
-        let toml = Inventory::load(Some(&fixture("inventory.toml"))).unwrap();
-        let yaml = Inventory::load(Some(&fixture("inventory.yaml"))).unwrap();
-        let yml = Inventory::load(Some(&fixture("inventory.yml"))).unwrap();
+        let toml = Inventory::load(Some(&fixture_doc("inventory.toml"))).unwrap();
+        let yaml = Inventory::load(Some(&fixture_doc("inventory.yaml"))).unwrap();
+        let yml = Inventory::load(Some(&fixture_doc("inventory.yml"))).unwrap();
         assert_eq!(toml, yaml);
         assert_eq!(toml, yml);
         let targets = toml.select(&[]).unwrap();
@@ -271,19 +253,18 @@ mod tests {
 
     #[test]
     fn missing_or_absent_file_is_only_local() {
-        for path in [None, Some(fixture("nonexistent.toml"))] {
-            let inventory = Inventory::load(path.as_deref()).unwrap();
+        for path in [None, Some(fixture_doc("nonexistent.toml"))] {
+            let inventory = Inventory::load(path.as_ref()).unwrap();
             assert!(inventory.hosts.is_empty());
             let targets = inventory.select(&[]).unwrap();
             assert_eq!(names(&targets), ["local"]);
             assert_eq!(targets[0].kind, TargetKind::Local);
-            assert_eq!(targets[0].tags, ["local"]);
         }
     }
 
     #[test]
     fn round_trips_through_both_formats() {
-        let inventory = Inventory::load(Some(&fixture("inventory.toml"))).unwrap();
+        let inventory = Inventory::load(Some(&fixture_doc("inventory.toml"))).unwrap();
         for format in [document::Format::Toml, document::Format::Yaml] {
             let text = document::to_string(&inventory, format).unwrap();
             let back: Inventory = document::from_str(&text, format).unwrap();
@@ -307,7 +288,7 @@ mod tests {
             ("invalid/tag-local.toml", "web", "tags"),
         ];
         for (file, host, field) in cases {
-            let err = Inventory::load(Some(&fixture(file))).unwrap_err();
+            let err = Inventory::load(Some(&fixture_doc(file))).unwrap_err();
             let message = err.to_string();
             assert!(
                 matches!(err, DocumentError::Invalid { .. }),
@@ -328,7 +309,7 @@ mod tests {
             ("invalid/unknown-key.toml", "colour"),
             ("invalid/unknown-key.yaml", "colour"),
         ] {
-            let err = Inventory::load(Some(&fixture(file))).unwrap_err();
+            let err = Inventory::load(Some(&fixture_doc(file))).unwrap_err();
             let message = err.to_string();
             assert!(
                 matches!(err, DocumentError::Parse { .. }),
@@ -347,7 +328,7 @@ mod tests {
             "invalid/duplicate-key.yaml",
             "invalid/two-documents.yaml",
         ] {
-            let err = Inventory::load(Some(&fixture(file))).unwrap_err();
+            let err = Inventory::load(Some(&fixture_doc(file))).unwrap_err();
             assert!(matches!(err, DocumentError::Parse { .. }), "{file}: {err}");
             assert!(err.to_string().contains(file), "{file}: {err}");
         }
@@ -355,7 +336,7 @@ mod tests {
 
     #[test]
     fn select_by_name_tag_local_union_and_default() {
-        let inventory = Inventory::load(Some(&fixture("inventory.toml"))).unwrap();
+        let inventory = Inventory::load(Some(&fixture_doc("inventory.toml"))).unwrap();
         let pick = |words: &[&str]| names(&inventory.select(&sels(words)).unwrap()).join(",");
         assert_eq!(pick(&[]), "local,linode1,mac,pi");
         assert_eq!(pick(&["local"]), "local");
@@ -368,7 +349,7 @@ mod tests {
 
     #[test]
     fn unknown_selector_is_an_error() {
-        let inventory = Inventory::load(Some(&fixture("inventory.toml"))).unwrap();
+        let inventory = Inventory::load(Some(&fixture_doc("inventory.toml"))).unwrap();
         let err = inventory.select(&sels(&["mac", "nope"])).unwrap_err();
         assert_eq!(err, UnknownSel("nope".into()));
         assert!(err.to_string().contains("`nope`"));

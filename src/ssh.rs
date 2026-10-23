@@ -1,9 +1,10 @@
-//! SSH transport (D3): one ControlMaster per target, clients over its socket.
+//! SSH transport: one ControlMaster per target, clients over its socket.
 //!
 //! Every invocation is an argv array on the configured `program`, never a shell
 //! string. The master authenticates once (key first, a password prompt only when
 //! anvil has a terminal); clients run `sh -s` over the socket in BatchMode.
 
+use std::cell::OnceCell;
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::process::CommandExt;
@@ -11,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::transport::{Output, RUN_TIMEOUT, Transport, TransportError, collect, run_with_script};
+use crate::paths::{self, PrivateDirError};
+use crate::transport::{
+    Output, RUN_TIMEOUT, Transport, TransportError, collect, into_string, run_with_script,
+};
 
 /// Deadline for the BatchMode master attempt (no prompt can be pending).
 pub const KEY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -26,6 +30,19 @@ const CONTROL_SUFFIX_LEN: usize = 17;
 /// Environment the ssh child never inherits: nothing may answer a prompt for us.
 const DROPPED_ENV: [&str; 3] = ["SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "DISPLAY"];
 
+/// How every ssh transport of a run behaves, decided once by the caller.
+#[derive(Debug, Clone)]
+pub struct SshSettings {
+    /// The ssh client to run.
+    pub program: PathBuf,
+    /// Whether ssh may prompt: stdin and stderr are both terminals.
+    pub can_prompt: bool,
+    /// Deadline for the BatchMode master attempt; the interactive retry has none.
+    pub key_timeout: Duration,
+    /// Deadline for `-O check`.
+    pub check_timeout: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct Ssh {
     pub program: PathBuf,
@@ -35,18 +52,17 @@ pub struct Ssh {
     pub port: Option<u16>,
     /// `$HOME`; the control directory lives under `<home>/.ssh/anvil`.
     pub home: PathBuf,
-    /// Deadline for the BatchMode master attempt; the interactive retry has none.
+    can_prompt: bool,
     key_timeout: Duration,
-    /// Deadline for `-O check`.
     check_timeout: Duration,
-    /// Pretends stdin and stderr are a terminal so the retry path can be tested.
-    #[cfg(test)]
-    force_tty: bool,
+    /// The checked control directory, once the first run has found it.
+    control_dir: OnceCell<PathBuf>,
 }
 
 impl Ssh {
-    /// An ssh transport using the `ssh` on `PATH` and the process's `$HOME`.
+    /// An ssh transport per `settings`, under the process's `$HOME`.
     pub fn new(
+        settings: SshSettings,
         ssh_config: Option<PathBuf>,
         host: impl Into<String>,
         user: Option<String>,
@@ -56,17 +72,26 @@ impl Ssh {
             .filter(|home| !home.is_empty())
             .ok_or_else(|| TransportError::Spawn("HOME is not set".to_owned()))?;
         Ok(Self {
-            program: PathBuf::from("ssh"),
+            program: settings.program,
             ssh_config,
             host: host.into(),
             user,
             port,
             home: PathBuf::from(home),
-            key_timeout: KEY_TIMEOUT,
-            check_timeout: CHECK_TIMEOUT,
-            #[cfg(test)]
-            force_tty: false,
+            can_prompt: settings.can_prompt,
+            key_timeout: settings.key_timeout,
+            check_timeout: settings.check_timeout,
+            control_dir: OnceCell::new(),
         })
+    }
+
+    /// The control directory, checked on first use and then reused.
+    fn control_dir(&self) -> Result<&Path, TransportError> {
+        if let Some(dir) = self.control_dir.get() {
+            return Ok(dir);
+        }
+        let dir = control_dir(&self.home, rustix::process::getuid().as_raw())?;
+        Ok(self.control_dir.get_or_init(|| dir))
     }
 
     /// The options shared by every invocation, without the trailing `-- <host>`.
@@ -158,7 +183,7 @@ impl Ssh {
     fn open_master(&self, control_dir: &Path) -> Result<(), TransportError> {
         match self.master_attempt(control_dir, true)? {
             MasterOutcome::Connected => Ok(()),
-            MasterOutcome::Denied if self.can_prompt() => {
+            MasterOutcome::Denied if self.can_prompt => {
                 match self.master_attempt(control_dir, false)? {
                     MasterOutcome::Connected => Ok(()),
                     MasterOutcome::Denied => Err(TransportError::AuthDenied { after_prompt: true }),
@@ -168,15 +193,6 @@ impl Ssh {
                 after_prompt: false,
             }),
         }
-    }
-
-    /// Whether ssh could prompt: stdin and stderr are both terminals.
-    fn can_prompt(&self) -> bool {
-        #[cfg(test)]
-        if self.force_tty {
-            return true;
-        }
-        rustix::termios::isatty(std::io::stdin()) && rustix::termios::isatty(std::io::stderr())
     }
 
     fn master_attempt(
@@ -193,7 +209,7 @@ impl Ssh {
             .stderr(Stdio::piped());
         // The key attempt runs in its own process group under a deadline. The
         // interactive retry stays in anvil's group, which owns the terminal ssh
-        // prompts on, and has no deadline: a person is typing (D3).
+        // prompts on, and has no deadline: a person is typing.
         let timeout = if batch {
             command.process_group(0);
             Some(self.key_timeout)
@@ -204,19 +220,17 @@ impl Ssh {
             .spawn()
             .map_err(|err| TransportError::Spawn(err.to_string()))?;
         let output = collect(child, timeout)?;
-        let stderr = String::from_utf8_lossy(&output.stderr);
         if output.code == Some(0) {
             return Ok(MasterOutcome::Connected);
         }
+        let stderr = into_string(output.stderr);
         if is_host_key_failure(&stderr) {
             return Err(TransportError::HostKey);
         }
         if output.code == Some(255) && stderr.contains("Permission denied") {
             return Ok(MasterOutcome::Denied);
         }
-        Err(TransportError::Connect {
-            stderr: stderr.into_owned(),
-        })
+        Err(TransportError::Connect { stderr })
     }
 }
 
@@ -231,13 +245,13 @@ impl Transport for Ssh {
     }
 
     fn run(&self, script: &str) -> Result<Output, TransportError> {
-        let control_dir = control_dir(&self.home, rustix::process::getuid().as_raw())?;
-        if !self.master_alive(&control_dir) {
-            self.open_master(&control_dir)?;
+        let control_dir = self.control_dir()?;
+        if !self.master_alive(control_dir) {
+            self.open_master(control_dir)?;
         }
         // Auth happened in the master; any client exit, 255 included, is the
-        // script's (a nested ssh, say) and keeps its output.
-        let mut command = self.command(&self.client_args(&control_dir));
+        // script's (a nested ssh, say) and comes back as its output.
+        let mut command = self.command(&self.client_args(control_dir));
         run_with_script(&mut command, script, RUN_TIMEOUT)
     }
 }
@@ -277,29 +291,20 @@ pub fn control_dir(home: &Path, uid: u32) -> Result<PathBuf, TransportError> {
     }
 
     ensure_private_dir(&control)?;
-    let meta = fs::symlink_metadata(&control)
-        .map_err(|err| TransportError::Spawn(format!("{}: {err}", control.display())))?;
-    if !meta.is_dir() {
-        return Err(TransportError::Spawn(format!(
-            "{} is not a directory",
-            control.display()
-        )));
+    let shown = control.display();
+    match paths::check_private_dir(&control, uid) {
+        Ok(()) => Ok(control),
+        Err(PrivateDirError::Io(err)) => Err(TransportError::Spawn(format!("{shown}: {err}"))),
+        Err(PrivateDirError::NotDir) => {
+            Err(TransportError::Spawn(format!("{shown} is not a directory")))
+        }
+        Err(PrivateDirError::Owner(owner)) => Err(TransportError::Spawn(format!(
+            "{shown} is owned by uid {owner}, not {uid}"
+        ))),
+        Err(PrivateDirError::Mode(mode)) => Err(TransportError::Spawn(format!(
+            "{shown} is accessible to others (mode {mode:04o}); expected 0700"
+        ))),
     }
-    if meta.uid() != uid {
-        return Err(TransportError::Spawn(format!(
-            "{} is owned by uid {}, not {uid}",
-            control.display(),
-            meta.uid()
-        )));
-    }
-    let mode = meta.mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(TransportError::Spawn(format!(
-            "{} is accessible to others (mode {mode:04o}); expected 0700",
-            control.display()
-        )));
-    }
-    Ok(control)
 }
 
 fn ensure_private_dir(dir: &Path) -> Result<(), TransportError> {
@@ -322,8 +327,8 @@ fn mode_of(path: &Path) -> Result<u32, TransportError> {
 mod tests {
     use super::*;
     use crate::facts::{Facts, PROBE};
+    use crate::test_util::temp_dir;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const CONTROL: &str = "/tmp/h/.ssh/anvil";
     const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-ssh.sh");
@@ -336,9 +341,10 @@ mod tests {
             user: Some("me".to_owned()),
             port: Some(2222),
             home: PathBuf::from("/tmp/h"),
+            can_prompt: false,
             key_timeout: KEY_TIMEOUT,
             check_timeout: CHECK_TIMEOUT,
-            force_tty: false,
+            control_dir: OnceCell::new(),
         }
     }
 
@@ -466,15 +472,7 @@ mod tests {
     // --- control directory -------------------------------------------------
 
     fn temp_home() -> PathBuf {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = PathBuf::from("/tmp").join(format!(
-            "anvil-ssh-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        temp_dir("ssh")
     }
 
     fn uid() -> u32 {
@@ -559,9 +557,10 @@ mod tests {
             user: None,
             port: None,
             home: home.to_owned(),
+            can_prompt: false,
             key_timeout: KEY_TIMEOUT,
             check_timeout: CHECK_TIMEOUT,
-            force_tty: false,
+            control_dir: OnceCell::new(),
         }
     }
 
@@ -682,7 +681,7 @@ mod tests {
             ],
         );
         let ssh = Ssh {
-            force_tty: true,
+            can_prompt: true,
             ..ssh
         };
         // The retry (FAKE_SSH_RETRY_EXIT unset) succeeds, so the client runs.
@@ -720,7 +719,7 @@ mod tests {
             ],
         );
         let ssh = Ssh {
-            force_tty: true,
+            can_prompt: true,
             ..ssh
         };
         let err = ssh.run("true").unwrap_err();
@@ -779,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn any_client_exit_is_exit_even_255_with_permission_denied() {
+    fn any_client_exit_is_output_even_255_with_permission_denied() {
         let home = temp_home();
         let (ssh, _) = fake_with(
             &home,
@@ -792,33 +791,34 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(
-            ssh.run("true").unwrap_err(),
-            TransportError::Exit {
-                code: Some(255),
-                stdout: String::new(),
-                stderr: "me@inner: Permission denied (publickey).\n".to_owned(),
-            }
-        );
+        let out = ssh.run("true").unwrap();
+        assert_eq!(out.code, Some(255));
+        assert_eq!(out.stdout, b"");
+        assert_eq!(out.stderr, b"me@inner: Permission denied (publickey).\n");
 
         let (ssh, _) = fake_with(&home, &[("FAKE_SSH_CHECK_EXIT", "0")]);
-        assert_eq!(
-            ssh.run("echo kept; exit 255").unwrap_err(),
-            TransportError::Exit {
-                code: Some(255),
-                stdout: "kept\n".to_owned(),
-                stderr: String::new(),
-            }
-        );
+        let out = ssh.run("echo kept; exit 255").unwrap();
+        assert_eq!(out.code, Some(255));
+        assert_eq!(out.stdout, b"kept\n");
+        assert_eq!(out.stderr, b"");
 
         let (ssh, _) = fake_with(
             &home,
             &[("FAKE_SSH_CHECK_EXIT", "0"), ("FAKE_SSH_CLIENT_EXIT", "3")],
         );
-        assert!(matches!(
-            ssh.run("true").unwrap_err(),
-            TransportError::Exit { code: Some(3), .. }
-        ));
+        assert_eq!(ssh.run("true").unwrap().code, Some(3));
+    }
+
+    #[test]
+    fn the_master_is_checked_before_every_client() {
+        let home = temp_home();
+        let (ssh, log) = fake_with(&home, &[("FAKE_SSH_CHECK_EXIT", "0")]);
+        ssh.run("true").unwrap();
+        ssh.run("true").unwrap();
+        let calls = invocations(&log);
+        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert!(calls[2].ends_with("-O check -- box"), "{}", calls[2]);
+        assert!(calls[3].ends_with("sh -s"), "{}", calls[3]);
     }
 
     #[test]
