@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde::Serialize;
 
-use crate::paths::{self, DocPath};
+use crate::paths::DocPath;
 
 pub fn json(value: &impl Serialize) -> serde_json::Value {
     serde_json::to_value(value).unwrap()
@@ -30,7 +30,7 @@ pub fn fixture(name: &str) -> PathBuf {
 
 /// [`fixture`] with the format its extension names.
 pub fn fixture_doc(name: &str) -> DocPath {
-    paths::explicit(&fixture(name)).unwrap()
+    DocPath::from_extension(&fixture(name)).unwrap()
 }
 
 /// A fresh, empty `/tmp/anvil-<tag>-<pid>-<n>`. Directly under `/tmp` so a

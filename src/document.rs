@@ -37,11 +37,19 @@ impl Format {
         }
     }
 
-    /// The extension anvil writes for this format.
+    /// The extension of this format's edit view (the editor's temp file).
     pub fn extension(self) -> &'static str {
         match self {
             Format::Toml => "toml",
             Format::Yaml => "yaml",
+        }
+    }
+
+    /// The other format.
+    pub fn other(self) -> Format {
+        match self {
+            Format::Toml => Format::Yaml,
+            Format::Yaml => Format::Toml,
         }
     }
 }
@@ -247,7 +255,7 @@ mod tests {
     }
 
     fn doc(path: &Path) -> DocPath {
-        crate::paths::explicit(path).unwrap()
+        DocPath::from_extension(path).unwrap()
     }
 
     #[test]

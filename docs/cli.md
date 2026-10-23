@@ -5,8 +5,8 @@ The contract of the MVP ([#3](https://github.com/mini-poc/anvil/issues/3)), foll
 
 ```text
 anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [--target SEL]... <COMMAND>
-  inventory [--format toml|yaml] edit the inventory; --format converts this file
-  config [--format toml|yaml]    edit the config; --format converts this file
+  inventory [--format toml|yaml] edit the inventory; --format picks the edit view, saved as TOML
+  config [--format toml|yaml]    edit the config; --format picks the edit view, saved as TOML
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
   secret <NAME>                  edit one secret in the editor
@@ -19,8 +19,8 @@ Every flag is global: it may come before or after the command.
 | Flag                | Effect                                                                                         |
 | ------------------- | ---------------------------------------------------------------------------------------------- |
 | `-v`, `--verbose`   | more logs on stderr; repeat: `-v` warnings, `-vv` info, `-vvv` debug (see [Logging](#logging)) |
-| `--inventory PATH`  | use this inventory file instead of the discovered one; the format comes from the extension     |
-| `--config PATH`     | use this config file instead of the discovered one; the format comes from the extension        |
+| `--inventory PATH`  | use this inventory file instead of the discovered one; PATH must end in `.toml` (else exit 2)  |
+| `--config PATH`     | use this config file instead of the discovered one; PATH must end in `.toml` (else exit 2)     |
 | `--ssh-config PATH` | passed to every `ssh` as `-F PATH`                                                             |
 | `--json`            | print exactly one JSON document on stdout instead of human output                              |
 | `--target SEL`      | `local`, a host name or a tag; repeat to take the union; none means `local` plus every host    |
@@ -35,18 +35,19 @@ Targets run one after another, `local` first, then hosts sorted by name; a faili
 
 ### `anvil inventory [--format toml|yaml]`
 
-Opens the inventory in the editor. Without `--format` an existing inventory opens in its own format and is written back
-in that format, whatever `[anvil].format` says; a missing inventory opens as an empty document in `[anvil].format`
-(default TOML). With `--format X` the inventory is converted, opened in X and on save written as `inventory.<X ext>`
-(`.toml` or `.yaml`); its files in the other formats are removed and the config is not touched.
+Opens the inventory in the editor, shown in the edit format: `--format X` for this edit only, else `[anvil].format`
+(default TOML). A missing inventory opens as an empty document. The inventory is always stored as `inventory.toml`;
+`--format` never changes `[anvil].format` and never touches the config.
 
-On save the buffer is parsed and validated; an invalid buffer prints the error (file, host and field) and is re-opened
-with your text, up to three attempts, after which nothing is written and the exit is 2. A valid buffer is written
-atomically (`inventory.<ext>.tmp`, mode 0600, renamed over `inventory.<ext>`). A buffer left unchanged writes nothing,
-on the first run too, unless `--format` is converting an existing file.
+On save the buffer is parsed in the edit format and validated; an invalid buffer prints the error (file, host and
+field) and is re-opened with your text, up to three attempts, after which nothing is written and the exit is 2. A
+valid buffer is written as TOML atomically (`inventory.toml.tmp`, mode 0600, renamed over `inventory.toml`); a legacy
+`inventory.yaml` or `inventory.yml` in the config directory is then removed. A buffer left unchanged writes nothing,
+whatever the edit format, when the inventory already is `inventory.toml` or does not exist yet. A legacy YAML inventory
+is migrated even then: it is written as `inventory.toml` and the YAML file is removed.
 
-With `--inventory PATH` the file is written in the format of PATH's extension; a `--format` naming the other format is
-a usage error (exit 2).
+With `--inventory PATH` (which must end in `.toml`) the file at PATH is read and written, in any edit format; no
+legacy file is looked for or removed.
 
 Human output: `wrote PATH` or `PATH: unchanged`. `--json`:
 
@@ -56,9 +57,9 @@ Human output: `wrote PATH` or `PATH: unchanged`. `--json`:
 
 ### `anvil config [--format toml|yaml]`
 
-Like `inventory`, for the config, with `--config PATH` in place of `--inventory PATH`. `--format X` converts the config
-only: it opens in X, is saved as `config.<X ext>` and the old file is removed; the inventory and `[anvil].format` stay
-as they are (edit `format` like any other key). When `[anvil].editor`
+Like `inventory`, for the config, with `--config PATH` in place of `--inventory PATH`: it is stored as `config.toml`,
+and a legacy `config.yaml` or `config.yml` is migrated by the next save. `--format X` only picks the edit view; the
+inventory and `[anvil].format` stay as they are (edit `format` like any other key). When `[anvil].editor`
 names a program that cannot be found, `config` falls back to `$VISUAL`, `$EDITOR`, `nvim` with a warning, so a typo
 there cannot lock you out. Output and `--json` as for `inventory`.
 
@@ -217,18 +218,19 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 - **0**: for `doctor`, a `missing` secret or an unresolved editor is only a warning.
 - **1**: `doctor`/`apply`: a target or a check failed. `inventory`/`config`/`secret`: the editor exited non-zero
   (aborted), a file write failed or the keychain refused.
-- **2**: a bad flag or argument (including `--format` against an explicit path of the other format), an unknown
+- **2**: a bad flag or argument (including an `--inventory` or `--config` path not ending in `.toml`), an unknown
   `--target`, an invalid or ambiguous file, no `$HOME`, editor not found, an invalid buffer after three attempts, or a
   secret larger than 1 MiB.
 
 ## Files and formats
 
-Directory: `$XDG_CONFIG_HOME/anvil/`, else `~/.config/anvil/`. Two documents, `inventory` and `config`, each as
-`NAME.toml`, `NAME.yaml` or `NAME.yml`; the format follows the extension. More than one file for the same name is
-ambiguous (exit 2); `--inventory` / `--config` take an explicit path (any other extension is exit 2). Each file keeps
-its own format: `anvil inventory` and `anvil config` write an existing file back in its format, create a missing one in
-`[anvil].format`, and convert only with `--format`, which only these two commands accept (elsewhere it is exit 2). A
-missing file is an empty document: the inventory holds only `local`, the config has the defaults below. Both formats
+Directory: `$XDG_CONFIG_HOME/anvil/`, else `~/.config/anvil/`. Two documents, `inventory` and `config`, each stored as
+`NAME.toml`, the only on-disk format. YAML is an editing view: `anvil inventory` and `anvil config` show the document
+in `--format` or `[anvil].format` and save it as TOML; only these two commands accept `--format` (elsewhere it is
+exit 2). A legacy `NAME.yaml` or `NAME.yml` from an older anvil is still read by every command and is replaced by
+`NAME.toml` on the next `anvil inventory` / `anvil config`. More than one file for the same name is ambiguous (exit 2).
+`--inventory` / `--config` take an explicit path, which must end in `.toml` (anything else is exit 2 naming the path).
+A missing file is an empty document: the inventory holds only `local`, the config has the defaults below. Both formats
 map onto the same schema; unknown keys are refused, and any violation is exit 2 naming the file, host and field.
 
 ### Inventory
@@ -240,6 +242,8 @@ user = "cmj"              # optional: [A-Za-z0-9._-]+, not starting with '-'
 port = 22                 # optional: 1..=65535
 tags = ["linode", "arch"] # optional: [A-Za-z0-9_-]+
 ```
+
+The same inventory in the YAML edit view:
 
 ```yaml
 hosts:
@@ -258,7 +262,7 @@ tag `local`; defining it is an error, as is a host name equal to a tag.
 ```toml
 [anvil]
 editor = "nvim"            # optional; see The editor
-format = "toml"            # "toml" | "yaml": the format a missing inventory or config is created in; default "toml"
+format = "toml"            # "toml" | "yaml": the edit view of inventory and config; default "toml"
 secrets = ["HOST_SUDO"]    # names doctor checks, [A-Z][A-Z0-9_]*; default []
 
 [[steps]]
@@ -270,8 +274,11 @@ Without any `[[steps]]` the config runs one step, `hostname`.
 ### Limits and refusals
 
 Every file is capped at 1 MiB, checked before parsing. YAML refuses anchors and aliases, merge keys (`<<`), duplicate
-keys, unsupported tags and more than one document. `anvil inventory` and `anvil config` rewrite the file from the parsed
-document, so comments are not preserved.
+keys, unsupported tags and more than one document, in a legacy file and in the YAML edit view alike. `anvil inventory`
+and `anvil config` open the parsed document, not the file's text, so comments are not preserved once you save. The
+1 MiB cap also holds for the edit view and the stored TOML: when the document rendered in the edit format is over
+1 MiB, `anvil inventory` / `anvil config` exit 2 before starting the editor (naming the other `--format` when that view
+fits), and when a YAML edit's TOML form would be over 1 MiB, nothing is written and the exit is 2.
 
 ## SSH behaviour
 
@@ -312,9 +319,10 @@ never logged at any level. There are no log files and no `RUST_LOG`.
 
 ## Deviations from #2/#3
 
-- The config key is `format` (`[anvil].format`), not `inventory_format`: it sets the format a missing inventory or
-  config is created in; an existing file keeps its own format, and `--format` on `anvil inventory` or `anvil config`
-  converts that one file.
+- The inventory and config are stored as TOML only ([#4](https://github.com/mini-poc/anvil/issues/4)); YAML is an
+  editing view. The config key is `format` (`[anvil].format`), not `inventory_format`: it picks the format
+  `anvil inventory` and `anvil config` open in, and `--format` overrides it for one edit; neither changes how anything
+  is stored. Legacy YAML files are still read and are migrated to TOML by the next edit.
 - `tags` stays in the inventory schema and `--target` accepts a tag, although tags are out of scope in #3.
 - Exit 1 also means a failed command on the target-less commands: an aborted editor, a failed write or a keychain
   refusal for `inventory`, `config` and `secret`.

@@ -184,18 +184,25 @@ else
   printf '%s\n' "$expected"
 fi
 
-step "(h) config --format=yaml converts config.toml only, doctor still works"
+step "(h) config --format=yaml edits in YAML, config.toml stays TOML, doctor still works"
 anvil config --format=yaml --json
 code=$?
-if [ "$code" -eq 0 ] && grep -qx "{\"path\":\"$XDG/anvil/config.yaml\",\"changed\":true}" "$TMP/out" \
-  && [ -f "$XDG/anvil/config.yaml" ] && [ ! -e "$XDG/anvil/config.toml" ] \
-  && grep -q 'format: toml' "$XDG/anvil/config.yaml" && [ -f "$XDG/anvil/inventory.toml" ]; then
+if [ "$code" -eq 0 ] && grep -qx "{\"path\":\"$XDG/anvil/config.toml\",\"changed\":false}" "$TMP/out" \
+  && [ ! -e "$XDG/anvil/config.yaml" ]; then
+  printf '# edited as YAML\nanvil:\n  format: toml\n  secrets: []\nsteps:\n  - run: hostname\n' >"$TMP/config.yaml"
+  run_env FAKE_EDITOR_CONTENT="$TMP/config.yaml" "$ANVIL" --ssh-config "$CFG" config --format=yaml --json \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+  code=$?
+fi
+if [ "$code" -eq 0 ] && grep -qx "{\"path\":\"$XDG/anvil/config.toml\",\"changed\":true}" "$TMP/out" \
+  && [ ! -e "$XDG/anvil/config.yaml" ] && grep -qx 'format = "toml"' "$XDG/anvil/config.toml" \
+  && grep -qx 'run = "hostname"' "$XDG/anvil/config.toml" && [ -f "$XDG/anvil/inventory.toml" ]; then
   anvil doctor --json --target local --target arch
   code=$?
   if [ "$code" -eq 0 ] && grep -q '"ok":true}$' "$TMP/out"; then
-    pass "config.yaml written, config.toml removed, doctor ok"
+    pass "unchanged edit wrote nothing, YAML edit saved as config.toml, doctor ok"
   else
-    fail "doctor after the conversion: exit $code"
+    fail "doctor after the YAML edit: exit $code"
   fi
 else
   fail "config --format=yaml: exit $code"

@@ -25,7 +25,7 @@ make build                 # builds target/release/anvil
 ```sh
 anvil inventory            # add your hosts (opens $EDITOR, default nvim)
 anvil config               # edit the preferences and the steps
-anvil inventory --format=yaml   # convert the inventory to YAML (optional)
+anvil inventory --format=yaml   # edit it as YAML this once; it is still saved as TOML
 anvil secret HOST_SUDO     # store a secret in the macOS keychain
 anvil doctor               # local checks + every target's facts and reachability
 anvil apply                # run the config's steps on every target
@@ -56,18 +56,20 @@ tags = ["linode", "arch"] # optional; select hosts with --target
 ```toml
 [anvil]
 editor = "nvim"            # optional; else $VISUAL, $EDITOR, nvim
-format = "toml"            # the format a new inventory or config is created in: toml | yaml
+format = "toml"            # the format anvil inventory/config open in: toml | yaml
 secrets = ["HOST_SUDO"]    # names `doctor` checks in the keychain; default []
 
 [[steps]]
 run = "hostname"           # placeholder: a POSIX sh script run on every target
 ```
 
-Both files may be YAML instead (`inventory.yaml`, `config.yml`, …) with the same schema, and each keeps its own format:
-`anvil inventory` and `anvil config` open an existing file in its format and write it back in that format.
-`--format=yaml` (or `toml`) converts that one file: it opens in the new format, is saved as `NAME.<format ext>` and
-the old file is removed; the other file and `[anvil].format` stay as they are. Leaving the editor without a change
-writes nothing, not even on the first run.
+Both files are stored as TOML only. YAML is an editing view: `anvil inventory` and `anvil config` open the document
+in `[anvil].format` (default `toml`), or in the format `--format=yaml|toml` names for that one edit, then parse what you
+save in that format, validate it and write `NAME.toml`. `--format` never changes `[anvil].format`. Leaving the editor
+without a change over an existing `NAME.toml` writes nothing, whatever the edit format, and so does the first run.
+
+An `inventory.yaml` or `config.yml` from an older anvil is still read by every command; the next `anvil inventory` or
+`anvil config` saves it as `NAME.toml` and removes the YAML file, even when you leave the editor without a change.
 
 ## Output
 

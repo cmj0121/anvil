@@ -1,12 +1,14 @@
 //! `anvil inventory`, `anvil config` and `anvil secret`: their editor
 //! flows.
 //!
-//! Load the current document (any format, missing → defaults), show it in its
-//! own format (`--format` converts it, a missing file uses `[anvil].format`),
-//! parse and validate what comes back (re-opening up to three times on an
-//! error), then write `NAME.<ext>.tmp` 0600 and rename it over `NAME.<ext>`;
-//! any `NAME.*` in another format is removed afterwards. An unchanged buffer
-//! writes nothing.
+//! TOML is the only stored format. Load the current document (`NAME.toml`, or
+//! a legacy `NAME.yaml` / `NAME.yml`; missing → defaults), show it in the edit
+//! format (`--format`, else `[anvil].format`), parse and validate what comes
+//! back in that format (re-opening up to three times on an error), then write
+//! `NAME.toml.tmp` 0600 and rename it over `NAME.toml`; a legacy YAML file in
+//! the config directory is removed afterwards. An unchanged buffer over an
+//! existing `NAME.toml` writes nothing; over a legacy YAML file it still
+//! migrates it.
 //!
 //! A secret is shown as plain text, the trailing newline is stripped and the
 //! result is stored; an empty buffer deletes the secret. The value is never
@@ -38,12 +40,11 @@ struct Outcome {
     changed: bool,
 }
 
-/// Where the edited document ends up and the format it is shown in.
+/// Where the edited document ends up (always TOML) and the format it is
+/// shown in.
 struct Destination {
     path: PathBuf,
     format: Format,
-    /// `true` when the path was discovered, so stale sibling formats go away.
-    discovered: bool,
 }
 
 pub fn inventory(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
@@ -51,13 +52,10 @@ pub fn inventory(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
     let config = cli.load_config()?;
     let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict)?;
     let current = paths::locate(cli.inventory.as_deref(), "inventory")?;
-    let explicit = current.as_ref().filter(|_| cli.inventory.is_some());
     let dest = destination(
-        explicit,
-        current.as_ref(),
+        cli.inventory.as_deref(),
         "inventory",
-        format,
-        config.anvil.format,
+        format.unwrap_or(config.anvil.format),
     )?;
     let inventory = Inventory::load(current.as_ref())?;
     let outcome = edit_document(
@@ -75,13 +73,10 @@ pub fn config(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
     warn_target(cli);
     let current = paths::locate(cli.config.as_deref(), "config")?;
     let config = Config::load(current.as_ref())?;
-    let explicit = current.as_ref().filter(|_| cli.config.is_some());
     let dest = destination(
-        explicit,
-        current.as_ref(),
+        cli.config.as_deref(),
         "config",
-        format,
-        config.anvil.format,
+        format.unwrap_or(config.anvil.format),
     )?;
     let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Lenient)?;
     let outcome = edit_document(
@@ -162,52 +157,27 @@ fn warn_target(cli: &Cli) {
     }
 }
 
-/// Where document `name` is written. An explicit path keeps its
-/// extension's format, and a different `--format` is a usage error. Otherwise
-/// `--format` names the format; without it an existing file keeps its own path
-/// and format, and a missing one is created in `default` (`[anvil].format`).
+/// Where document `name` is written: the explicit `.toml` path (already
+/// checked by [`paths::locate`]), else `NAME.toml` in the config directory.
+/// `format` is only how it is shown.
 fn destination(
-    explicit: Option<&DocPath>,
-    current: Option<&DocPath>,
+    explicit: Option<&Path>,
     name: &str,
-    requested: Option<Format>,
-    default: Format,
+    format: Format,
 ) -> Result<Destination, Failure> {
-    if let Some(doc) = explicit {
-        if let Some(requested) = requested.filter(|&requested| requested != doc.format) {
-            return Err(Failure::usage(format!(
-                "--format {requested} conflicts with --{name} {}, a {} file: \
-                 drop --format or pass a .{requested} path",
-                doc.path.display(),
-                doc.format
-            )));
-        }
-        return Ok(Destination {
-            path: doc.path.clone(),
-            format: doc.format,
-            discovered: false,
-        });
-    }
-    let (path, format) = match (requested, current) {
-        (None, Some(doc)) => (doc.path.clone(), doc.format),
-        (requested, _) => {
-            let format = requested.unwrap_or(default);
-            let path = paths::config_dir()?.join(format!("{name}.{}", format.extension()));
-            (path, format)
-        }
+    let path = match explicit {
+        Some(path) => path.to_path_buf(),
+        None => paths::config_dir()?.join(format!("{name}.{}", Format::Toml.extension())),
     };
-    Ok(Destination {
-        path,
-        format,
-        discovered: true,
-    })
+    Ok(Destination { path, format })
 }
 
 /// Shows `value` in the editor until it parses and validates (or `ATTEMPTS`
-/// runs out), then writes it. Nothing is written when the buffer came back
-/// unchanged and the file already sits at `dest` (or does not exist yet). A
-/// first buffer left unchanged in the file's own format and path is the file
-/// as loaded, so it is not parsed again; a conversion or a new file is.
+/// runs out), then writes it as TOML. Nothing is written when the buffer came
+/// back unchanged and the file already is `dest` (or does not exist yet); a
+/// first buffer left unchanged there is the file as loaded, so it is not
+/// parsed again. A legacy YAML source is written even when unchanged, and
+/// removed once `dest` is written.
 fn edit_document<T>(
     editor: &Editor,
     name: &str,
@@ -220,8 +190,13 @@ where
     T: Serialize + DeserializeOwned,
 {
     let mut buffer = document::to_string(&value, dest.format)?.into_bytes();
+    if buffer.len() as u64 > MAX_BYTES {
+        return Err(oversize_view(&value, dest)?);
+    }
     let in_place = current.is_some_and(|current| current.path == dest.path);
+    let legacy = current.filter(|current| current.path != dest.path);
     let mut edited = false;
+    let mut parsed = value;
     for attempt in 1..=ATTEMPTS {
         match editor.edit(&buffer, dest.format.extension(), Buffer::Document)? {
             Some(text) => {
@@ -231,22 +206,43 @@ where
             None if attempt == 1 && in_place => break,
             None => {}
         }
-        let Err(err) = parse::<T>(&buffer, dest, &validate) else {
-            break;
-        };
-        eprintln!("{err}");
-        if attempt == ATTEMPTS {
-            return Err(Failure::usage(format!(
-                "{name}: still invalid after {ATTEMPTS} attempts, nothing written"
-            )));
+        match parse::<T>(&buffer, dest, &validate) {
+            Ok(value) => {
+                parsed = value;
+                break;
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                if attempt == ATTEMPTS {
+                    return Err(Failure::usage(format!(
+                        "{name}: still invalid after {ATTEMPTS} attempts, nothing written"
+                    )));
+                }
+            }
         }
     }
 
-    let changed = edited || (current.is_some() && !in_place);
+    let changed = edited || legacy.is_some();
     if changed {
-        write_atomic(&dest.path, &buffer)?;
-        if dest.discovered {
-            remove_siblings(&dest.path, name)?;
+        let toml = match dest.format {
+            Format::Toml => buffer,
+            Format::Yaml => {
+                let toml = document::to_string(&parsed, Format::Toml)?.into_bytes();
+                if toml.len() as u64 > MAX_BYTES {
+                    return Err(Failure::usage(format!(
+                        "{}: the TOML form would be larger than the {MAX_BYTES} byte limit; \
+                         nothing written",
+                        dest.path.display()
+                    )));
+                }
+                toml
+            }
+        };
+        write_atomic(&dest.path, &toml)?;
+        if let Some(legacy) = legacy {
+            log::info!("removing {}", legacy.path.display());
+            fs::remove_file(&legacy.path)
+                .map_err(|err| Failure::failed(format!("{}: {err}", legacy.path.display())))?;
         }
     }
     Ok(Outcome {
@@ -255,19 +251,37 @@ where
     })
 }
 
-/// Parses `buffer` as `dest`'s format and checks it with `validate`.
+/// The refusal for a document whose edit view is past [`MAX_BYTES`]: it
+/// names the other format when that view would fit.
+fn oversize_view<T: Serialize>(value: &T, dest: &Destination) -> Result<Failure, Failure> {
+    let other = dest.format.other();
+    let fits = document::to_string(value, other)?.len() as u64 <= MAX_BYTES;
+    let hint = if fits {
+        format!("; edit with --format {other}")
+    } else {
+        String::new()
+    };
+    Ok(Failure::usage(format!(
+        "the {} view of {} is larger than the {MAX_BYTES} byte limit{hint}",
+        dest.format,
+        dest.path.display()
+    )))
+}
+
+/// Parses `buffer` in `dest`'s edit format and checks it with `validate`.
 fn parse<T: DeserializeOwned>(
     buffer: &[u8],
     dest: &Destination,
     validate: impl Fn(&T, &Path) -> Result<(), DocumentError>,
-) -> Result<(), DocumentError> {
+) -> Result<T, DocumentError> {
     let path = &dest.path;
     let value: T = document::parse_text(buffer, path, dest.format, |err| DocumentError::Parse {
         path: path.clone(),
         format: dest.format,
         message: err.to_string(),
     })?;
-    validate(&value, path)
+    validate(&value, path)?;
+    Ok(value)
 }
 
 /// Writes a fresh `<path>.tmp` 0600 and renames it over `path`. A stale
@@ -302,22 +316,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
         let _ = fs::remove_file(&tmp);
     }
     written.map_err(io)
-}
-
-/// Removes `NAME.{toml,yaml,yml}` next to `path` other than `path` itself.
-fn remove_siblings(path: &Path, name: &str) -> Result<(), Failure> {
-    let Some(dir) = path.parent() else {
-        return Ok(());
-    };
-    for ext in paths::EXTENSIONS {
-        let sibling = dir.join(format!("{name}.{ext}"));
-        if sibling != path && sibling.is_file() {
-            log::info!("removing {}", sibling.display());
-            fs::remove_file(&sibling)
-                .map_err(|err| Failure::failed(format!("{}: {err}", sibling.display())))?;
-        }
-    }
-    Ok(())
 }
 
 fn report(cli: &Cli, outcome: &Outcome) -> Result<(), Failure> {
