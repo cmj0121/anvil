@@ -15,12 +15,12 @@ use zeroize::Zeroizing;
 use crate::config::Backend;
 use crate::logger::escape_controls;
 
-// Shared by the age and sops stores, which are not wired up yet.
-#[cfg_attr(not(test), allow(dead_code))]
+mod age;
 mod file_store;
 mod keychain;
 #[cfg(any(test, debug_assertions))]
 mod memory;
+mod prompt;
 
 pub use keychain::Keychain;
 #[cfg(any(test, debug_assertions))]
@@ -65,19 +65,19 @@ pub enum SecretError {
         message: Option<String>,
     },
     /// Opening needs a passphrase and there is no terminal to ask on.
-    #[cfg_attr(not(test), allow(dead_code))]
     Locked,
     /// A file store holds UTF-8 text only.
-    #[cfg_attr(not(test), allow(dead_code))]
     NotText { name: String },
     /// The store file cannot be read, written or understood.
-    #[cfg_attr(not(test), allow(dead_code))]
     Store { path: PathBuf, message: String },
     /// A decrypted store holds a key that is not a secret name.
-    #[cfg_attr(not(test), allow(dead_code))]
     BadName { name: String },
+    /// age refused to unlock the identity at `path`, or to decrypt or
+    /// encrypt the store at `path`.
+    Age { path: PathBuf, message: String },
+    /// The passphrase prompt was cancelled.
+    Cancelled,
     /// Another anvil holds the lock on the store file at `path`.
-    #[cfg_attr(not(test), allow(dead_code))]
     Busy { path: PathBuf },
 }
 
@@ -113,6 +113,10 @@ impl fmt::Display for SecretError {
             SecretError::BadName { name } => {
                 write!(f, "secret store key `{}`: {NAME_RULE}", shown_name(name))
             }
+            SecretError::Age { path, message } => {
+                write!(f, "{}: age: {message}", path.display())
+            }
+            SecretError::Cancelled => f.write_str("cancelled"),
             SecretError::Busy { path } => {
                 write!(f, "another anvil is using {}", path.display())
             }
@@ -149,13 +153,15 @@ pub trait Vault {
     fn commit(self: Box<Self>) -> Result<(), SecretError>;
 }
 
-/// The store `secrets` selects. age and sops are not available yet.
+/// The store `secrets` selects. sops is not available yet.
 pub fn from_config(secrets: &Backend) -> Result<Box<dyn Store>, SecretError> {
     match secrets {
         Backend::Keychain { service } => Ok(Box::new(Keychain {
             service: service.clone(),
         })),
-        Backend::Age { .. } => Err(SecretError::Unimplemented(BackendKind::Age)),
+        Backend::Age { path, identity } => {
+            Ok(Box::new(age::AgeStore::new(path.clone(), identity.clone())))
+        }
         Backend::Sops { .. } => Err(SecretError::Unimplemented(BackendKind::Sops)),
     }
 }
@@ -191,11 +197,13 @@ mod tests {
     use super::*;
 
     /// The sources of this module, for the checks that read code.
-    const SOURCES: [(&str, &str); 4] = [
+    const SOURCES: [(&str, &str); 6] = [
         ("secret/mod.rs", include_str!("mod.rs")),
         ("secret/keychain.rs", include_str!("keychain.rs")),
         ("secret/memory.rs", include_str!("memory.rs")),
         ("secret/file_store.rs", include_str!("file_store.rs")),
+        ("secret/age.rs", include_str!("age.rs")),
+        ("secret/prompt.rs", include_str!("prompt.rs")),
     ];
 
     #[test]
@@ -263,29 +271,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(store.kind(), BackendKind::Keychain);
-        for (backend, kind) in [
-            (
-                Backend::Age {
-                    path: "/s".into(),
-                    identity: "/i".into(),
-                },
-                "age",
-            ),
-            (
-                Backend::Sops {
-                    path: "/s".into(),
-                    age_key_file: None,
-                    program: None,
-                },
-                "sops",
-            ),
-        ] {
-            let err = from_config(&backend).err().unwrap();
-            assert_eq!(
-                err.to_string(),
-                format!("secrets backend {kind}: not implemented yet")
-            );
-        }
+        let store = from_config(&Backend::Age {
+            path: "/s".into(),
+            identity: "/i".into(),
+        })
+        .unwrap();
+        assert_eq!(store.kind(), BackendKind::Age);
+        let err = from_config(&Backend::Sops {
+            path: "/s".into(),
+            age_key_file: None,
+            program: None,
+        })
+        .err()
+        .unwrap();
+        assert_eq!(err.to_string(), "secrets backend sops: not implemented yet");
     }
 
     /// Secrets come from the stores only, never from the environment.

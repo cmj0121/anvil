@@ -129,31 +129,21 @@ fn an_invalid_name_exits_two() {
 }
 
 #[test]
-fn an_age_or_sops_backend_is_not_implemented_yet() {
-    for backend in ["age", "sops"] {
-        let sandbox = Sandbox::new("as").without_debug_flags();
-        sandbox.write_config(
-            "config.toml",
-            &format!(
-                "[secrets]\nbackend = \"{backend}\"\n\n[secrets.{backend}]\n\
-                 path = \"/s\"\n{}",
-                if backend == "age" {
-                    "identity = \"/i\"\n"
-                } else {
-                    ""
-                }
-            ),
+fn a_sops_backend_is_not_implemented_yet() {
+    let sandbox = Sandbox::new("as").without_debug_flags();
+    sandbox.write_config(
+        "config.toml",
+        "[secrets]\nbackend = \"sops\"\n\n[secrets.sops]\npath = \"/s\"\n",
+    );
+    let typed = typed(&sandbox);
+    for args in [["secret", "HOST_SUDO"].as_slice(), ["doctor"].as_slice()] {
+        let out = sandbox.edit(args, Some(&typed), None);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(
+            text(&out.stderr),
+            "ERROR anvil: secrets backend sops: not implemented yet\n",
+            "{args:?}"
         );
-        let typed = typed(&sandbox);
-        for args in [["secret", "HOST_SUDO"].as_slice(), ["doctor"].as_slice()] {
-            let out = sandbox.edit(args, Some(&typed), None);
-            assert_eq!(out.status.code(), Some(1), "{args:?}");
-            assert_eq!(
-                text(&out.stderr),
-                format!("ERROR anvil: secrets backend {backend}: not implemented yet\n"),
-                "{args:?}"
-            );
-        }
     }
 }
 
