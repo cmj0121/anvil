@@ -3,7 +3,7 @@
 # commands: a temp XDG_CONFIG_HOME holds the inventory (the container as `arch`
 # for the key user and `archpw` for the password user, `closed` on a closed
 # port) and a config with
-# `[anvil].secrets = []`, so the keychain is never touched.
+# no secret names, so the keychain is never touched.
 # Never touches the real ~/.ssh or a real host. The isolation rests on `-F` with
 # a temp ssh config setting UserKnownHostsFile, IdentityFile and IdentitiesOnly
 # yes: ssh resolves `~` from the passwd entry, not from $HOME, so the temp HOME
@@ -112,7 +112,6 @@ INV
 cat >"$XDG/anvil/config.toml" <<CONF
 [anvil]
 format = "toml"
-secrets = []
 
 [[steps]]
 run = "hostname"
@@ -189,7 +188,7 @@ anvil config --format=yaml --json
 code=$?
 if [ "$code" -eq 0 ] && grep -qx "{\"path\":\"$XDG/anvil/config.toml\",\"changed\":false}" "$TMP/out" \
   && [ ! -e "$XDG/anvil/config.yaml" ]; then
-  printf '# edited as YAML\nanvil:\n  format: toml\n  secrets: []\nsteps:\n  - run: hostname\n' >"$TMP/config.yaml"
+  printf '# edited as YAML\nanvil:\n  format: toml\nsteps:\n  - run: hostname\n' >"$TMP/config.yaml"
   run_env FAKE_EDITOR_CONTENT="$TMP/config.yaml" "$ANVIL" --ssh-config "$CFG" config --format=yaml --json \
     </dev/null >"$TMP/out" 2>"$TMP/err"
   code=$?

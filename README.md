@@ -57,7 +57,10 @@ tags = ["linode", "arch"] # optional; select hosts with --target
 [anvil]
 editor = "nvim"            # optional; else $VISUAL, $EDITOR, nvim
 format = "toml"            # the format anvil inventory/config open in: toml | yaml
-secrets = ["HOST_SUDO"]    # names `doctor` checks in the keychain; default []
+
+[secrets]
+backend = "keychain"       # keychain (macOS) | age | sops; see docs/cli.md
+names = ["HOST_SUDO"]      # names `doctor` checks; default []
 
 [[steps]]
 run = "hostname"           # placeholder: a POSIX sh script run on every target
@@ -95,8 +98,8 @@ local
   sudo            binary
 ```
 
-With `secrets = ["HOST_SUDO"]` the local checks gain a line `secret HOST_SUDO ok` (or `missing`, a warning only), and
-every inventory host gets a section of the same shape (values illustrative):
+With `names = ["HOST_SUDO"]` under `[secrets]` the local checks gain a line `secret HOST_SUDO ok` (or `missing`, a
+warning only), and every inventory host gets a section of the same shape (values illustrative):
 
 ```text
 linode1

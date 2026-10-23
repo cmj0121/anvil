@@ -1,14 +1,15 @@
 //! Secret storage: a store trait, the macOS keychain behind it and an
 //! in-memory store for tests.
 //!
-//! A secret is a generic password in the default keychain, service `anvil`,
-//! account = the secret name. `exists` asks for attributes only, so it never
-//! raises the keychain's ACL dialog; `get` does read the data and may prompt
-//! once per binary. Values never appear in errors, logs or output.
+//! A secret is a generic password in the default keychain, service `anvil`
+//! (or `[secrets.keychain].service`), account = the secret name. `exists`
+//! asks for attributes only, so it never raises the keychain's ACL dialog;
+//! `get` does read the data and may prompt once per binary. Values never
+//! appear in errors, logs or output.
 
 use std::fmt;
 
-/// The keychain service every anvil secret is filed under.
+/// The keychain service anvil secrets are filed under by default.
 pub const SERVICE: &str = "anvil";
 
 #[derive(Debug)]
@@ -61,16 +62,20 @@ pub trait SecretStore {
 /// What [`is_name`] requires, as error messages state it.
 pub const NAME_RULE: &str = "must match [A-Z][A-Z0-9_]*";
 
-/// `[A-Z][A-Z0-9_]*`: the rule shared with `[anvil].secrets` in the config.
+/// `[A-Z][A-Z0-9_]*`: the rule shared with `[secrets].names` in the config.
 pub fn is_name(s: &str) -> bool {
     let mut chars = s.chars();
     chars.next().is_some_and(|c| c.is_ascii_uppercase())
         && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// The default keychain of the current user (macOS only).
+/// The default keychain of the current user (macOS only), items filed under
+/// `service`.
 #[derive(Debug)]
-pub struct Keychain;
+pub struct Keychain {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub service: String,
+}
 
 #[cfg(target_os = "macos")]
 mod keychain {
@@ -78,7 +83,7 @@ mod keychain {
     use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
     use security_framework::passwords;
 
-    use super::{Keychain, SERVICE, SecretError, SecretStore};
+    use super::{Keychain, SecretError, SecretStore};
 
     /// `errSecItemNotFound`
     const NOT_FOUND: i32 = -25300;
@@ -97,7 +102,7 @@ mod keychain {
             // Attributes only: reading the data would raise the ACL dialog.
             let found = ItemSearchOptions::new()
                 .class(ItemClass::generic_password())
-                .service(SERVICE)
+                .service(&self.service)
                 .account(name)
                 .load_attributes(true)
                 .limit(Limit::Max(1))
@@ -110,7 +115,7 @@ mod keychain {
         }
 
         fn get(&self, name: &str) -> Result<Option<Vec<u8>>, SecretError> {
-            match passwords::get_generic_password(SERVICE, name) {
+            match passwords::get_generic_password(&self.service, name) {
                 Ok(value) => Ok(Some(value)),
                 Err(err) if err.code() == NOT_FOUND => Ok(None),
                 Err(err) => Err(keychain_error("read", name)(err)),
@@ -118,12 +123,12 @@ mod keychain {
         }
 
         fn set(&self, name: &str, value: &[u8]) -> Result<(), SecretError> {
-            passwords::set_generic_password(SERVICE, name, value)
+            passwords::set_generic_password(&self.service, name, value)
                 .map_err(keychain_error("write", name))
         }
 
         fn delete(&self, name: &str) -> Result<(), SecretError> {
-            match passwords::delete_generic_password(SERVICE, name) {
+            match passwords::delete_generic_password(&self.service, name) {
                 Ok(()) => Ok(()),
                 Err(err) if err.code() == NOT_FOUND => Ok(()),
                 Err(err) => Err(keychain_error("delete", name)(err)),
@@ -248,7 +253,9 @@ mod tests {
     #[ignore = "writes to the login keychain; run by hand"]
     fn keychain_round_trip() {
         let name = format!("ANVIL_TEST_{}", std::process::id());
-        let store = Keychain;
+        let store = Keychain {
+            service: SERVICE.to_string(),
+        };
         assert!(!store.exists(&name).unwrap());
         assert_eq!(store.get(&name).unwrap(), None);
 

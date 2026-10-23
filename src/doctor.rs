@@ -98,7 +98,7 @@ pub fn run(cli: &Cli, store: &dyn SecretStore) -> Result<(), Failure> {
     let local = local_checks(
         &cli.ssh_program(),
         Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict),
-        &config.anvil.secrets,
+        config.names(),
         store,
     );
     let targets = targets

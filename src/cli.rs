@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand};
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::config::{Backend, Config};
 use crate::document::Format;
 use crate::inventory::{Inventory, Sel, Target, TargetKind};
 use crate::paths;
@@ -57,14 +57,22 @@ pub struct Cli {
 }
 
 impl Cli {
-    /// The secret store: the keychain, or `Memory` when a debug build was
-    /// started with `--secret-store memory`.
-    pub fn secret_store(&self) -> Box<dyn SecretStore> {
+    /// The secret store the config selects, or `Memory` when a debug build
+    /// was started with `--secret-store memory`. Only the keychain is
+    /// available so far; age and sops fail as not implemented yet (exit 1).
+    pub fn secret_store(&self) -> Result<Box<dyn SecretStore>, Failure> {
         #[cfg(debug_assertions)]
         if self.secret_store == Some(SecretStoreKind::Memory) {
-            return Box::new(crate::secret::Memory::default());
+            return Ok(Box::new(crate::secret::Memory::default()));
         }
-        Box::new(Keychain)
+        let backend = match self.load_config()?.backend().map_err(Failure::usage)? {
+            Backend::Keychain { service } => return Ok(Box::new(Keychain { service })),
+            Backend::Age { .. } => "age",
+            Backend::Sops { .. } => "sops",
+        };
+        Err(Failure::failed(format!(
+            "secrets backend {backend}: not implemented yet"
+        )))
     }
 
     /// The ssh program: `ssh` on `PATH`, or the debug-only `--ssh-program`.
@@ -237,9 +245,11 @@ pub fn run(cli: &Cli) -> Result<(), Failure> {
     match &cli.command {
         Command::Inventory { format } => crate::commands::inventory(cli, *format),
         Command::Config { format } => crate::commands::config(cli, *format),
-        Command::Doctor => crate::doctor::run(cli, cli.secret_store().as_ref()),
+        Command::Doctor => crate::doctor::run(cli, cli.secret_store()?.as_ref()),
         Command::Apply => crate::apply::run(cli),
-        Command::Secret { name } => crate::commands::secret(cli, name, cli.secret_store().as_ref()),
+        Command::Secret { name } => {
+            crate::commands::secret(cli, name, cli.secret_store()?.as_ref())
+        }
     }
 }
 

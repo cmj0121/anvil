@@ -305,11 +305,154 @@ fn a_legacy_yml_config_is_migrated_by_an_unchanged_edit() {
     );
     assert_eq!(sb.files(), ["config.toml"]);
     let written = fs::read_to_string(&path).unwrap();
-    assert!(written.contains("secrets = [\"HOST_SUDO\"]"), "{written}");
+    let names = if cfg!(target_os = "macos") {
+        "[secrets]\nbackend = \"keychain\"\nnames = [\"HOST_SUDO\"]\n"
+    } else {
+        "secrets = [\"HOST_SUDO\"]"
+    };
+    assert!(written.contains(names), "{written}");
     assert!(written.contains("run = \"uname\""), "{written}");
     assert_eq!(
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_secret_names_move_to_the_secrets_table_on_an_unchanged_save() {
+    let sb = sandbox();
+    let path = sb.put(
+        "config.toml",
+        "[anvil]\nsecrets = [\"HOST_SUDO\"]\n\n[[steps]]\nrun = \"uname\"\n",
+    );
+    let out = sb.edit(&["--json", "config"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        common::json(&out),
+        serde_json::json!({"path": path.display().to_string(), "changed": true})
+    );
+    assert!(
+        sb.seen(1).contains("names = [\"HOST_SUDO\"]"),
+        "{}",
+        sb.seen(1)
+    );
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "[anvil]\nformat = \"toml\"\n\n[secrets]\nbackend = \"keychain\"\n\
+         names = [\"HOST_SUDO\"]\n\n[[steps]]\nrun = \"uname\"\n"
+    );
+
+    let out = sb.edit(&["--json", "config"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(common::json(&out)["changed"], false);
+}
+
+#[test]
+fn legacy_names_into_an_existing_secrets_table_and_yaml_view() {
+    let sb = sandbox();
+    let path = sb.put(
+        "config.toml",
+        "[anvil]\nsecrets = [\"API\"]\n\n[secrets]\nbackend = \"age\"\n\n\
+         [secrets.age]\npath = \"~/s.age\"\nidentity = \"/id.txt\"\n",
+    );
+    let out = sb.edit(&["config", "--format", "yaml"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let written = fs::read_to_string(&path).unwrap();
+    assert!(!written.contains("[anvil]\nsecrets"), "{written}");
+    assert!(
+        written.contains("[secrets]\nbackend = \"age\"\nnames = [\"API\"]\n"),
+        "{written}"
+    );
+    assert!(
+        written.contains("path = \"~/s.age\""),
+        "kept unexpanded: {written}"
+    );
+}
+
+#[test]
+fn a_legacy_key_typed_into_the_toml_view_is_saved_as_secrets_names() {
+    let sb = sandbox();
+    let content = sb.root().join("content.toml");
+    fs::write(
+        &content,
+        "[anvil]\nsecrets = [\"API\"]\n\n[secrets]\nbackend = \"age\"\n\n\
+         [secrets.age]\npath = \"/s.age\"\nidentity = \"/id.txt\"\n",
+    )
+    .unwrap();
+    let out = sb.edit(&["config"], Some(&content), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let written = fs::read_to_string(sb.config_dir().join("config.toml")).unwrap();
+    assert_eq!(
+        written,
+        "[anvil]\nformat = \"toml\"\n\n[secrets]\nbackend = \"age\"\nnames = [\"API\"]\n\n\
+         [secrets.age]\npath = \"/s.age\"\nidentity = \"/id.txt\"\n\n[[steps]]\nrun = \"hostname\"\n"
+    );
+}
+
+#[test]
+fn a_typed_buffer_keeps_its_comments_when_only_the_loaded_file_was_migrated() {
+    let sb = sandbox();
+    let path = sb.put(
+        "config.toml",
+        "[anvil]\nsecrets = [\"API\"]\n\n[secrets]\nbackend = \"age\"\n\n\
+         [secrets.age]\npath = \"/s.age\"\nidentity = \"/id.txt\"\n",
+    );
+    let content = sb.root().join("content.toml");
+    let typed = "# the age store\n[secrets]\nbackend = \"age\"\nnames = [\"API\"]  # required\n\n\
+                 [secrets.age]\npath = \"/s.age\"\nidentity = \"/id.txt\"\n";
+    fs::write(&content, typed).unwrap();
+    let out = sb.edit(&["config"], Some(&content), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(fs::read_to_string(&path).unwrap(), typed);
+}
+
+#[test]
+fn secrets_table_errors_exit_two_naming_the_key() {
+    for (body, key) in [
+        (
+            "[anvil]\nsecrets = [\"A\"]\n\n[secrets]\nbackend = \"age\"\nnames = [\"A\"]\n\n\
+             [secrets.age]\npath = \"/a\"\nidentity = \"/i\"\n",
+            "secrets.names and anvil.secrets",
+        ),
+        (
+            "[secrets]\nbackend = \"vault\"\n",
+            "secrets.backend `vault`",
+        ),
+        ("[secrets]\nbackend = \"sops\"\n", "secrets.sops: required"),
+        ("[secrets]\nnames = []\n", "backend"),
+        (
+            "[secrets]\nbackend = \"age\"\n\n[secrets.age]\npath = \"a.age\"\nidentity = \"/i\"\n",
+            "secrets.age.path `a.age`",
+        ),
+    ] {
+        let sb = sandbox();
+        let path = sb.put("config.toml", body);
+        for command in ["config", "inventory"] {
+            let out = sb.edit(&[command], None, None);
+            assert_eq!(out.status.code(), Some(2), "{body}: {}", text(&out.stderr));
+            assert!(
+                text(&out.stderr).contains(key),
+                "{body}: {}",
+                text(&out.stderr)
+            );
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), body);
+        assert_eq!(sb.calls(), 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_keychain_backend_off_macos_exits_two() {
+    let sb = sandbox();
+    sb.put("config.toml", "[secrets]\nbackend = \"keychain\"\n");
+    let out = sb.edit(&["config"], None, None);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr).contains("secrets.backend `keychain`"),
+        "{}",
+        text(&out.stderr)
     );
 }
 

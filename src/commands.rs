@@ -64,6 +64,7 @@ pub fn inventory(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
         inventory,
         current.as_ref(),
         &dest,
+        |_: &mut Inventory| false,
         Inventory::validate,
     )?;
     report(cli, &outcome)
@@ -85,6 +86,7 @@ pub fn config(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
         config,
         current.as_ref(),
         &dest,
+        Config::migrate,
         Config::validate,
     )?;
     report(cli, &outcome)
@@ -176,19 +178,25 @@ fn destination(
 /// runs out), then writes it as TOML. Nothing is written when the buffer came
 /// back unchanged and the file already is `dest` (or does not exist yet); a
 /// first buffer left unchanged there is the file as loaded, so it is not
-/// parsed again. A legacy YAML source is written even when unchanged, and
-/// removed once `dest` is written.
+/// parsed again. `migrate` moves legacy keys, in the loaded document and in
+/// the saved one: a loaded document it changed is written even when
+/// unchanged, and a saved one it changed is written from the parsed value
+/// rather than as typed. A legacy YAML source is written as well, and removed
+/// once `dest` is written.
 fn edit_document<T>(
     editor: &Editor,
     name: &str,
-    value: T,
+    mut value: T,
     current: Option<&DocPath>,
     dest: &Destination,
+    migrate: impl Fn(&mut T) -> bool,
     validate: impl Fn(&T, &Path) -> Result<(), DocumentError>,
 ) -> Result<Outcome, Failure>
 where
     T: Serialize + DeserializeOwned,
 {
+    let migrated_on_load = migrate(&mut value);
+    let mut migrated = false;
     let mut buffer = document::to_string(&value, dest.format)?.into_bytes();
     if buffer.len() as u64 > MAX_BYTES {
         return Err(oversize_view(&value, dest)?);
@@ -207,7 +215,8 @@ where
             None => {}
         }
         match parse::<T>(&buffer, dest, &validate) {
-            Ok(value) => {
+            Ok(mut value) => {
+                migrated = migrate(&mut value);
                 parsed = value;
                 break;
             }
@@ -222,11 +231,11 @@ where
         }
     }
 
-    let changed = edited || legacy.is_some();
+    let changed = edited || legacy.is_some() || migrated_on_load || migrated;
     if changed {
         let toml = match dest.format {
-            Format::Toml => buffer,
-            Format::Yaml => {
+            Format::Toml if !migrated => buffer,
+            _ => {
                 let toml = document::to_string(&parsed, Format::Toml)?.into_bytes();
                 if toml.len() as u64 > MAX_BYTES {
                     return Err(Failure::usage(format!(

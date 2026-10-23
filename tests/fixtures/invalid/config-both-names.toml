@@ -1,0 +1,10 @@
+[anvil]
+secrets = ["HOST_SUDO"]
+
+[secrets]
+backend = "age"
+names = ["HOST_SUDO"]
+
+[secrets.age]
+path = "/a"
+identity = "/b"

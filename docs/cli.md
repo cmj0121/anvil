@@ -70,7 +70,7 @@ Local checks, then every selected target's facts:
 - `ssh`: the ssh program is on `PATH`; `sh`: `/bin/sh` exists. Either missing fails doctor (exit 1).
 - `editor`: the editor `anvil inventory` would use, as an absolute path; when none resolves it is `null` and a warning,
   not a failure.
-- `secrets`: each name in `[anvil].secrets` is looked up in the keychain by its attributes only (never its value, so no
+- `secrets`: each name in `[secrets].names` is looked up in the keychain by its attributes only (never its value, so no
   keychain prompt): `ok`, `missing` (a warning, still exit 0, with a hint to run `anvil secret NAME`) or `error` (exit
   1).
 - each target: the facts probe (a POSIX sh script) runs over the target's transport. `connectable: true` with the facts,
@@ -181,10 +181,10 @@ the step was killed by a signal.
 
 Opens the secret's current value (empty when unset) in the editor as a plain-text file. On save one trailing newline is
 stripped; an empty buffer deletes the secret, anything else is stored; an unchanged buffer writes nothing. `NAME` must
-match `[A-Z][A-Z0-9_]*` (else exit 2). Storage is the macOS login keychain: a generic password with service `anvil` and
-account `NAME`. The value never appears on argv, in the environment, in logs or in any output. Reading the current value
-may raise one keychain access prompt per rebuild of the binary (an unsigned binary has no stable identity). A value
-larger than 1 MiB is refused (exit 2) and nothing is stored.
+match `[A-Z][A-Z0-9_]*` (else exit 2). Storage is the macOS login keychain: a generic password with service `anvil`
+(or `[secrets.keychain].service`) and account `NAME`. The value never appears on argv, in the environment, in logs or in
+any output. Reading the current value may raise one keychain access prompt per rebuild of the binary (an unsigned
+binary has no stable identity). A value larger than 1 MiB is refused (exit 2) and nothing is stored.
 
 When the editor is `vim`, `nvim`, `vi` or `view`, anvil adds
 `-n -i NONE --cmd "set noswapfile noundofile nobackup nowritebackup"` and the same `set` again with `-c` (after your
@@ -263,13 +263,35 @@ tag `local`; defining it is an error, as is a host name equal to a tag.
 [anvil]
 editor = "nvim"            # optional; see The editor
 format = "toml"            # "toml" | "yaml": the edit view of inventory and config; default "toml"
-secrets = ["HOST_SUDO"]    # names doctor checks, [A-Z][A-Z0-9_]*; default []
+
+[secrets]
+backend = "keychain"       # keychain | age | sops; required when [secrets] is present
+names = ["HOST_SUDO"]      # names doctor checks, [A-Z][A-Z0-9_]*; default []
+
+[secrets.keychain]         # optional; macOS only
+service = "anvil"          # default "anvil"
+
+[secrets.age]              # required when backend = "age"
+path = "~/.config/anvil/secrets.age"
+identity = "~/.config/anvil/age-identity.txt"
+
+[secrets.sops]             # required when backend = "sops"
+path = "~/.config/anvil/secrets.sops.json"
+age_key_file = "~/.config/sops/age/keys.txt"   # optional
+program = "/opt/homebrew/bin/sops"             # optional; default sops on PATH
 
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
 ```
 
 Without any `[[steps]]` the config runs one step, `hostname`.
+
+Without `[secrets]` the backend is the keychain on macOS (and unsupported elsewhere). Only the selected backend's section
+is required and checked: a missing section, an unknown backend or `keychain` off macOS is a config error (exit 2). A
+path may start with `~/`, which is `$HOME`; after that it must be absolute. The age and sops backends are not
+implemented yet: `secret` and `doctor` fail with exit 1 when one is selected. The legacy `[anvil].secrets` is still read
+as `[secrets].names` (setting both is exit 2); `anvil config` moves it to `[secrets].names` on the next save, adding
+`backend = "keychain"` when there is no `[secrets]` yet (off macOS such a config is left as it is).
 
 ### Limits and refusals
 
@@ -326,7 +348,7 @@ never logged at any level. There are no log files and no `RUST_LOG`.
 - `tags` stays in the inventory schema and `--target` accepts a tag, although tags are out of scope in #3.
 - Exit 1 also means a failed command on the target-less commands: an aborted editor, a failed write or a keychain
   refusal for `inventory`, `config` and `secret`.
-- `[anvil].secrets` defaults to `[]`, so a fresh install passes `doctor`.
+- `[secrets].names` defaults to `[]`, so a fresh install passes `doctor`.
 - `doctor`'s `editor` is the resolved absolute path of the editor, or `null` when none resolves.
 - A step that exits non-zero keeps its stdout and stderr in `apply`'s report, and so do the steps completed before a
   transport error.
