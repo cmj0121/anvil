@@ -1,9 +1,10 @@
 //! Where the inventory and config live.
 //!
 //! The directory is `$XDG_CONFIG_HOME/anvil`, else `$HOME/.config/anvil`. A
-//! document `NAME` is `NAME.toml`, `NAME.yaml` or `NAME.yml`; more than one of
-//! them present is ambiguous. `--inventory PATH` / `--config PATH` bypass the
-//! lookup, but the extension must still name a known format.
+//! document `NAME` is stored as `NAME.toml`; a legacy `NAME.yaml` or
+//! `NAME.yml` is still found (and migrated by the next edit), and more than one
+//! of them present is ambiguous. `--inventory PATH` / `--config PATH` bypass
+//! the lookup and must end in `.toml`.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -14,14 +15,15 @@ use std::path::{Path, PathBuf};
 
 use crate::document::Format;
 
-/// The extensions a document may carry, `.toml` first.
+/// The names discover() looks for: `.toml` first; `.yaml` and `.yml` are
+/// legacy names it still finds.
 pub const EXTENSIONS: [&str; 3] = ["toml", "yaml", "yml"];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PathsError {
     NoHome,
     Ambiguous { name: String, paths: Vec<PathBuf> },
-    UnknownExtension { path: PathBuf },
+    NotToml { path: PathBuf },
 }
 
 impl fmt::Display for PathsError {
@@ -38,9 +40,9 @@ impl fmt::Display for PathsError {
                     paths.join(" and ")
                 )
             }
-            PathsError::UnknownExtension { path } => write!(
+            PathsError::NotToml { path } => write!(
                 f,
-                "{}: unknown extension, expected .toml, .yaml or .yml",
+                "{}: must end in .toml, the only format anvil stores",
                 path.display()
             ),
         }
@@ -79,13 +81,23 @@ pub struct DocPath {
     pub format: Format,
 }
 
+impl DocPath {
+    /// `path` with the format its extension names, if any.
+    pub fn from_extension(path: &Path) -> Option<DocPath> {
+        Format::from_extension(path).map(|format| DocPath {
+            path: path.to_path_buf(),
+            format,
+        })
+    }
+}
+
 /// The document `name` in `dir`, if exactly one `name.{toml,yaml,yml}` exists.
 pub fn discover(dir: &Path, name: &str) -> Result<Option<DocPath>, PathsError> {
     let mut present: Vec<DocPath> = EXTENSIONS
         .iter()
         .map(|ext| dir.join(format!("{name}.{ext}")))
         .filter(|path| path.is_file())
-        .filter_map(|path| explicit(&path).ok())
+        .filter_map(|path| DocPath::from_extension(&path))
         .collect();
     match present.len() {
         0 => Ok(None),
@@ -97,17 +109,18 @@ pub fn discover(dir: &Path, name: &str) -> Result<Option<DocPath>, PathsError> {
     }
 }
 
-/// An explicit `--inventory` / `--config` path: accepted when its extension
-/// names a format. The file itself may be absent (an empty document).
+/// An explicit `--inventory` / `--config` path: accepted when it ends in
+/// `.toml`. The file itself may be absent (an empty document).
 pub fn explicit(path: &Path) -> Result<DocPath, PathsError> {
-    match Format::from_extension(path) {
-        Some(format) => Ok(DocPath {
+    if Format::from_extension(path) == Some(Format::Toml) {
+        Ok(DocPath {
             path: path.to_path_buf(),
-            format,
-        }),
-        None => Err(PathsError::UnknownExtension {
+            format: Format::Toml,
+        })
+    } else {
+        Err(PathsError::NotToml {
             path: path.to_path_buf(),
-        }),
+        })
     }
 }
 
@@ -231,18 +244,19 @@ mod tests {
     }
 
     #[test]
-    fn explicit_path_needs_a_known_extension() {
+    fn explicit_path_must_end_in_toml() {
         assert_eq!(
-            explicit(Path::new("/x/inv.yml")).unwrap(),
+            explicit(Path::new("/x/inv.toml")).unwrap(),
             DocPath {
-                path: PathBuf::from("/x/inv.yml"),
-                format: Format::Yaml
+                path: PathBuf::from("/x/inv.toml"),
+                format: Format::Toml
             }
         );
-        let err = explicit(Path::new("/x/inv.json")).unwrap_err();
-        assert!(matches!(err, PathsError::UnknownExtension { .. }));
-        assert!(err.to_string().contains("inv.json"));
-        assert!(explicit(Path::new("/x/inv")).is_err());
+        for bad in ["/x/inv.yml", "/x/inv.yaml", "/x/inv.json", "/x/inv"] {
+            let err = explicit(Path::new(bad)).unwrap_err();
+            assert!(matches!(err, PathsError::NotToml { .. }), "{bad}");
+            assert!(err.to_string().contains(bad), "{err}");
+        }
     }
 
     #[test]

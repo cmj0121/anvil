@@ -21,11 +21,11 @@ pub struct Cli {
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count, global = true)]
     pub verbose: u8,
 
-    /// Inventory file (default ~/.config/anvil/inventory.{toml,yaml})
+    /// Inventory file, must end in .toml (default ~/.config/anvil/inventory.toml)
     #[arg(long, global = true, value_name = "PATH")]
     pub inventory: Option<PathBuf>,
 
-    /// Config file (default ~/.config/anvil/config.{toml,yaml})
+    /// Config file, must end in .toml (default ~/.config/anvil/config.toml)
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
@@ -125,12 +125,12 @@ pub enum SecretStoreKind {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Edit the inventory in the editor; --format converts this file
+    /// Edit the inventory in the editor; --format picks the edit view, saved as TOML
     Inventory {
         #[arg(long, value_enum, value_name = "FORMAT")]
         format: Option<Format>,
     },
-    /// Edit the config in the editor; --format converts this file
+    /// Edit the config in the editor; --format picks the edit view, saved as TOML
     Config {
         #[arg(long, value_enum, value_name = "FORMAT")]
         format: Option<Format>,
@@ -296,7 +296,7 @@ mod tests {
             "--inventory",
             "inv.toml",
             "--config",
-            "cfg.yaml",
+            "cfg.toml",
             "--ssh-config",
             "ssh_config",
             "--target",
@@ -306,7 +306,7 @@ mod tests {
         ]);
         assert!(cli.json);
         assert_eq!(cli.inventory, Some(PathBuf::from("inv.toml")));
-        assert_eq!(cli.config, Some(PathBuf::from("cfg.yaml")));
+        assert_eq!(cli.config, Some(PathBuf::from("cfg.toml")));
         assert_eq!(cli.ssh_config, Some(PathBuf::from("ssh_config")));
         assert_eq!(cli.target, ["local", "mac"]);
     }
