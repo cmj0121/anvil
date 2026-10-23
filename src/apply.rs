@@ -389,7 +389,7 @@ mod tests {
                     stdout: b"partial\n".to_vec(),
                     stderr: b"boom\n".to_vec(),
                     code: Some(3),
-                    truncated: false,
+                    ..Output::default()
                 },
                 other => Output {
                     stdout: format!("{other}-out\n").into_bytes(),

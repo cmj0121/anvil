@@ -13,6 +13,7 @@ use std::thread;
 
 use rustix::process::{Pid, Signal, kill_process_group};
 use std::time::{Duration, Instant};
+use zeroize::Zeroize;
 
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Most bytes kept per stream; the rest is read and discarded so the child never
@@ -25,8 +26,12 @@ pub struct Output {
     pub stderr: Vec<u8>,
     /// Exit code; `None` when the child was killed by a signal.
     pub code: Option<i32>,
-    /// Whether stdout or stderr exceeded [`OUTPUT_CAP`] and was cut.
+    /// Whether stdout or stderr exceeded its cap and was cut, or the readers
+    /// were abandoned.
     pub truncated: bool,
+    /// Whether the readers were abandoned: a process that left the group still
+    /// held the pipes after the child exited, so the output may be incomplete.
+    pub abandoned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,25 +143,37 @@ pub fn into_string(bytes: Vec<u8>) -> String {
         .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
 }
 
+/// [`collect_capped`] with both streams capped at [`OUTPUT_CAP`].
+pub fn collect(child: Child, timeout: Option<Duration>) -> Result<Output, TransportError> {
+    collect_capped(child, timeout, [OUTPUT_CAP, OUTPUT_CAP])
+}
+
 /// Waits for `child` and gathers whatever of its stdout and stderr is piped,
-/// each capped at [`OUTPUT_CAP`]. With a `timeout` the child's process group is
-/// killed when it passes (the caller spawned it with `process_group(0)`) and
-/// the result is [`TransportError::Timeout`]; `None` waits as long as it takes.
+/// capped at `caps` (stdout, stderr) bytes. With a `timeout` the child's
+/// process group is killed when it passes (the caller spawned it with
+/// `process_group(0)`) and the result is [`TransportError::Timeout`]; `None`
+/// waits as long as it takes.
 ///
 /// After the child is gone the readers get [`READ_GRACE`] to reach EOF: a
 /// process that left the group (`setpgrp`, `setsid`) may still hold the pipes,
-/// so the readers are then abandoned and the output marked truncated.
-pub fn collect(mut child: Child, timeout: Option<Duration>) -> Result<Output, TransportError> {
+/// so the readers are then abandoned, the output marked truncated and
+/// abandoned, and whatever arrives later discarded. On an error the output
+/// read so far is zeroed before it is dropped.
+pub fn collect_capped(
+    mut child: Child,
+    timeout: Option<Duration>,
+    [stdout_cap, stderr_cap]: [usize; 2],
+) -> Result<Output, TransportError> {
     let (done, finished) = mpsc::channel();
     let streams = [
         child
             .stdout
             .take()
-            .map(|pipe| spawn_reader(pipe, done.clone())),
+            .map(|pipe| spawn_reader(pipe, stdout_cap, done.clone())),
         child
             .stderr
             .take()
-            .map(|pipe| spawn_reader(pipe, done.clone())),
+            .map(|pipe| spawn_reader(pipe, stderr_cap, done.clone())),
     ];
     drop(done);
 
@@ -186,14 +203,22 @@ pub fn collect(mut child: Child, timeout: Option<Duration>) -> Result<Output, Tr
             std::mem::take(&mut *shared.lock().unwrap_or_else(|e| e.into_inner()))
         })
     };
-    let stdout = take(&streams[0]);
-    let stderr = take(&streams[1]);
-    let status = status?;
+    let mut stdout = take(&streams[0]);
+    let mut stderr = take(&streams[1]);
+    let status = match status {
+        Ok(status) => status,
+        Err(err) => {
+            stdout.bytes.zeroize();
+            stderr.bytes.zeroize();
+            return Err(err);
+        }
+    };
     Ok(Output {
         stdout: stdout.bytes,
         stderr: stderr.bytes,
         code: status.code(),
         truncated: stdout.cut || stderr.cut || abandoned,
+        abandoned,
     })
 }
 
@@ -203,18 +228,26 @@ pub const READ_GRACE: Duration = Duration::from_secs(1);
 #[derive(Default)]
 struct Captured {
     bytes: Vec<u8>,
-    /// Whether anything past [`OUTPUT_CAP`] was discarded.
+    /// Whether anything past the cap was discarded.
     cut: bool,
 }
 
-/// Reads `pipe` into a shared buffer up to [`OUTPUT_CAP`] and drains the rest,
+/// Reads `pipe` into a shared buffer up to `cap` bytes and drains the rest,
 /// so the child never blocks on a full pipe; signals `done` at EOF. The buffer
-/// is shared so a reader that never finishes still leaves what it read.
+/// is shared so a reader that never finishes still leaves what it read; once
+/// the buffer is taken, the reader discards the rest. The buffer is reserved
+/// at its full size up front and never moves, and the read chunk is zeroed at
+/// the end, so output that is a secret leaves no copy behind once the buffer
+/// is zeroed.
 fn spawn_reader(
     mut pipe: impl Read + Send + 'static,
+    cap: usize,
     done: mpsc::Sender<()>,
 ) -> Arc<Mutex<Captured>> {
-    let shared = Arc::new(Mutex::new(Captured::default()));
+    let shared = Arc::new(Mutex::new(Captured {
+        bytes: Vec::with_capacity(cap),
+        cut: false,
+    }));
     let buffer = Arc::clone(&shared);
     thread::spawn(move || {
         let mut chunk = [0u8; 8192];
@@ -223,7 +256,10 @@ fn spawn_reader(
                 Ok(0) => break,
                 Ok(n) => {
                     let mut captured = buffer.lock().unwrap_or_else(|e| e.into_inner());
-                    let room = OUTPUT_CAP.saturating_sub(captured.bytes.len());
+                    // A taken buffer is replaced by an empty one with no room.
+                    let room = cap
+                        .min(captured.bytes.capacity())
+                        .saturating_sub(captured.bytes.len());
                     captured.bytes.extend_from_slice(&chunk[..n.min(room)]);
                     captured.cut |= n > room;
                 }
@@ -231,6 +267,7 @@ fn spawn_reader(
                 Err(_) => break,
             }
         }
+        chunk.zeroize();
         let _ = done.send(());
     });
     shared
@@ -276,7 +313,24 @@ mod tests {
         let out = Local.run("yes | head -c 3000000").unwrap();
         assert_eq!(out.stdout.len(), OUTPUT_CAP);
         assert!(out.truncated);
+        assert!(!out.abandoned);
         assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn each_stream_has_its_own_cap() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "echo 0123456789abc; echo 0123456789 >&2"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = collect_capped(child, Some(RUN_TIMEOUT), [10, 4]).unwrap();
+        assert_eq!(out.stdout, b"0123456789");
+        assert_eq!(out.stderr, b"0123");
+        assert!(out.truncated);
+        assert!(!out.abandoned);
     }
 
     #[test]
@@ -352,6 +406,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(out.stdout, b"done\n");
         assert!(out.truncated);
+        assert!(out.abandoned);
     }
 
     #[test]
