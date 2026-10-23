@@ -6,7 +6,7 @@
 //! of them present is ambiguous. `--inventory PATH` / `--config PATH` bypass
 //! the lookup and must end in `.toml`.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -57,6 +57,14 @@ pub fn config_dir() -> Result<PathBuf, PathsError> {
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
+}
+
+/// The variables of this process whose names `keep` accepts, for a child
+/// started with a cleared environment.
+pub fn env_subset(keep: impl Fn(&str) -> bool) -> Vec<(OsString, OsString)> {
+    std::env::vars_os()
+        .filter(|(name, _)| name.to_str().is_some_and(&keep))
+        .collect()
 }
 
 /// The config directory for the given `$XDG_CONFIG_HOME` and `$HOME` values;

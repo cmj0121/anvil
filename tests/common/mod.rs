@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -90,6 +91,15 @@ impl Sandbox {
     /// A file the fake editor wrote for `name` (`editor.count`, `editor.in.1`, …).
     pub fn record(&self, name: &str) -> PathBuf {
         self.root.join("record").join(name)
+    }
+
+    /// The fixture sops age key, copied to a private `<root>/sops-key.txt`
+    /// as a key file must be.
+    pub fn sops_key(&self) -> PathBuf {
+        let key = self.root.join("sops-key.txt");
+        fs::copy(fixture("sops/age-key.txt"), &key).unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        key
     }
 
     pub fn write_config(&self, name: &str, body: &str) {

@@ -263,6 +263,46 @@ else
   fail "exit $code"
 fi
 
+step "(j) a secret round trip through a sops store (anvil and sops run on this host)"
+if command -v sops >/dev/null 2>&1; then
+  SOPS_XDG="$TMP/xdg-sops"
+  SOPS_STORE="$TMP/sops/secrets.json"
+  mkdir -p "$SOPS_XDG/anvil" "$TMP/sops"
+  cp tests/fixtures/sops/.sops.yaml "$TMP/sops/"
+  cp tests/fixtures/sops/age-key.txt "$TMP/sops-key.txt"
+  chmod 600 "$TMP/sops-key.txt"
+  cat >"$SOPS_XDG/anvil/config.toml" <<CONF
+[secrets]
+backend = "sops"
+names = ["HOST_SUDO"]
+
+[secrets.sops]
+path = "$SOPS_STORE"
+age_key_file = "$TMP/sops-key.txt"
+CONF
+  printf 'e2e-s3cr3t\n' >"$TMP/typed"
+  run_env XDG_CONFIG_HOME="$SOPS_XDG" FAKE_EDITOR_CONTENT="$TMP/typed" "$ANVIL" secret HOST_SUDO \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qx 'secret HOST_SUDO: updated' "$TMP/out" \
+    && grep -q 'ENC\[AES256_GCM' "$SOPS_STORE" && ! grep -q 'e2e-s3cr3t' "$SOPS_STORE"; then
+    run_env XDG_CONFIG_HOME="$SOPS_XDG" "$ANVIL" doctor --json --target local \
+      </dev/null >"$TMP/out" 2>"$TMP/err"
+    code=$?
+    if [ "$code" -eq 0 ] && grep -q '"secrets":{"HOST_SUDO":"ok"}' "$TMP/out" \
+      && ! grep -q 'e2e-s3cr3t' "$TMP/out" "$TMP/err"; then
+      pass "stored encrypted, doctor finds it"
+    else
+      fail "doctor on the sops store: exit $code"
+    fi
+  else
+    fail "secret into the sops store: exit $code"
+  fi
+else
+  rm -f "$TMP/out" "$TMP/err"
+  fail "sops not found on PATH: install sops (e.g. \`brew install sops\`) to run this check"
+fi
+
 if [ "$fails" -eq 0 ]; then
   echo "e2e: all checks passed"
 else

@@ -21,10 +21,12 @@ mod keychain;
 #[cfg(any(test, debug_assertions))]
 mod memory;
 mod prompt;
+mod sops;
 
 pub use keychain::Keychain;
 #[cfg(any(test, debug_assertions))]
 pub use memory::Memory;
+pub use sops::Sops;
 
 /// The keychain service anvil secrets are filed under by default.
 pub const SERVICE: &str = "anvil";
@@ -55,8 +57,6 @@ pub enum SecretError {
     /// No keychain on this platform.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     Unsupported,
-    /// The selected backend cannot be used by this build yet.
-    Unimplemented(BackendKind),
     /// The keychain refused `op` on `name` with an OSStatus `code`.
     Keychain {
         op: &'static str,
@@ -77,6 +77,8 @@ pub enum SecretError {
     Age { path: PathBuf, message: String },
     /// The passphrase prompt was cancelled.
     Cancelled,
+    /// sops cannot be run or failed.
+    Sops { message: String },
     /// Another anvil holds the lock on the store file at `path`.
     Busy { path: PathBuf },
 }
@@ -85,9 +87,6 @@ impl fmt::Display for SecretError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SecretError::Unsupported => f.write_str("secrets need the macOS keychain"),
-            SecretError::Unimplemented(kind) => {
-                write!(f, "secrets backend {kind}: not implemented yet")
-            }
             SecretError::Keychain {
                 op,
                 name,
@@ -117,6 +116,7 @@ impl fmt::Display for SecretError {
                 write!(f, "{}: age: {message}", path.display())
             }
             SecretError::Cancelled => f.write_str("cancelled"),
+            SecretError::Sops { message } => write!(f, "sops {message}"),
             SecretError::Busy { path } => {
                 write!(f, "another anvil is using {}", path.display())
             }
@@ -153,7 +153,7 @@ pub trait Vault {
     fn commit(self: Box<Self>) -> Result<(), SecretError>;
 }
 
-/// The store `secrets` selects. sops is not available yet.
+/// The store `secrets` selects.
 pub fn from_config(secrets: &Backend) -> Result<Box<dyn Store>, SecretError> {
     match secrets {
         Backend::Keychain { service } => Ok(Box::new(Keychain {
@@ -162,7 +162,17 @@ pub fn from_config(secrets: &Backend) -> Result<Box<dyn Store>, SecretError> {
         Backend::Age { path, identity } => {
             Ok(Box::new(age::AgeStore::new(path.clone(), identity.clone())))
         }
-        Backend::Sops { .. } => Err(SecretError::Unimplemented(BackendKind::Sops)),
+        Backend::Sops {
+            path,
+            age_key_file,
+            config,
+            program,
+        } => Ok(Box::new(Sops::new(
+            path.clone(),
+            age_key_file.clone(),
+            config.clone(),
+            program.clone(),
+        ))),
     }
 }
 
@@ -197,13 +207,14 @@ mod tests {
     use super::*;
 
     /// The sources of this module, for the checks that read code.
-    const SOURCES: [(&str, &str); 6] = [
+    const SOURCES: [(&str, &str); 7] = [
         ("secret/mod.rs", include_str!("mod.rs")),
         ("secret/keychain.rs", include_str!("keychain.rs")),
         ("secret/memory.rs", include_str!("memory.rs")),
         ("secret/file_store.rs", include_str!("file_store.rs")),
         ("secret/age.rs", include_str!("age.rs")),
         ("secret/prompt.rs", include_str!("prompt.rs")),
+        ("secret/sops.rs", include_str!("sops.rs")),
     ];
 
     #[test]
@@ -277,14 +288,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(store.kind(), BackendKind::Age);
-        let err = from_config(&Backend::Sops {
+        let store = from_config(&Backend::Sops {
             path: "/s".into(),
             age_key_file: None,
+            config: "/.sops.yaml".into(),
             program: None,
         })
-        .err()
         .unwrap();
-        assert_eq!(err.to_string(), "secrets backend sops: not implemented yet");
+        assert_eq!(store.kind(), BackendKind::Sops);
     }
 
     /// Secrets come from the stores only, never from the environment.

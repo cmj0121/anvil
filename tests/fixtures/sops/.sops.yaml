@@ -1,0 +1,3 @@
+# Encrypts the sops test stores to the throwaway key in age-key.txt.
+creation_rules:
+  - age: age13kmd7wjzqxvp02q2dpgdn5cmmyzpwe2t5wla2899m9epk466wcxsjs9va6

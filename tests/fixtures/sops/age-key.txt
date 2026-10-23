@@ -1,0 +1,3 @@
+# A throwaway age key for the sops tests only; it protects nothing.
+# public key: age13kmd7wjzqxvp02q2dpgdn5cmmyzpwe2t5wla2899m9epk466wcxsjs9va6
+AGE-SECRET-KEY-1EQV4RR3FHECCCGGA39RFNPJYFJNYPNVEPP4GM70QHVZUQ85STGHSEYNCLA

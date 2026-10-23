@@ -84,6 +84,9 @@ pub struct SopsSection {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub age_key_file: Option<String>,
+    /// The `.sops.yaml` sops is given; default `.sops.yaml` beside `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<String>,
 }
@@ -101,6 +104,9 @@ pub enum Backend {
     Sops {
         path: PathBuf,
         age_key_file: Option<PathBuf>,
+        /// Always set: `.sops.yaml` beside the store unless the config names
+        /// one, so sops never searches for its own.
+        config: PathBuf,
         /// `None`: `sops` on `PATH`.
         program: Option<PathBuf>,
     },
@@ -117,12 +123,16 @@ impl Backend {
                 ("secrets.age.identity", identity.as_path()),
             ],
             Backend::Sops {
-                path, age_key_file, ..
+                path,
+                age_key_file,
+                config,
+                ..
             } => {
                 let mut files = vec![("secrets.sops.path", path.as_path())];
                 if let Some(key_file) = age_key_file {
                     files.push(("secrets.sops.age_key_file", key_file.as_path()));
                 }
+                files.push(("secrets.sops.config", config.as_path()));
                 files
             }
         }
@@ -258,13 +268,19 @@ impl Config {
             }
             "sops" => {
                 let sops = secrets.sops.as_ref().ok_or_else(|| missing("sops"))?;
+                let store = path("path", &sops.path)?;
+                let config = match sops.config.as_deref() {
+                    Some(config) => path("config", config)?,
+                    None => store.parent().unwrap_or(Path::new("/")).join(".sops.yaml"),
+                };
                 let backend = Backend::Sops {
-                    path: path("path", &sops.path)?,
+                    path: store,
                     age_key_file: sops
                         .age_key_file
                         .as_deref()
                         .map(|v| path("age_key_file", v))
                         .transpose()?,
+                    config,
                     program: sops
                         .program
                         .as_deref()
@@ -497,13 +513,15 @@ mod tests {
 
         let config = parse(
             "[secrets]\nbackend = \"sops\"\n\n[secrets.sops]\n\
-             path = \"~/s.json\"\nage_key_file = \"~/k.txt\"\nprogram = \"/opt/sops\"\n",
+             path = \"~/s.json\"\nage_key_file = \"~/k.txt\"\nconfig = \"~/sops.yaml\"\n\
+             program = \"/opt/sops\"\n",
         );
         assert_eq!(
             config.backend_for(home(), true).unwrap(),
             Backend::Sops {
                 path: "/home/u/s.json".into(),
                 age_key_file: Some("/home/u/k.txt".into()),
+                config: "/home/u/sops.yaml".into(),
                 program: Some("/opt/sops".into()),
             }
         );
@@ -513,6 +531,7 @@ mod tests {
             Backend::Sops {
                 path: "/s.json".into(),
                 age_key_file: None,
+                config: "/.sops.yaml".into(),
                 program: None,
             }
         );
@@ -533,6 +552,11 @@ mod tests {
                 "path = \"/s\"\nage_key_file = \"keys.txt\"",
                 home(),
                 "secrets.sops.age_key_file",
+            ),
+            (
+                "path = \"/s\"\nconfig = \".sops.yaml\"",
+                home(),
+                "secrets.sops.config `.sops.yaml`",
             ),
             ("path = \"~/s.json\"", None, "$HOME is not set"),
             (
@@ -565,6 +589,14 @@ mod tests {
                 "[secrets.sops]\npath = \"~/k.txt\"\nage_key_file = \"/home/u/./k.txt\"",
                 "secrets.sops.path and secrets.sops.age_key_file",
             ),
+            (
+                "[secrets.sops]\npath = \"/s/c.yaml\"\nconfig = \"/s/c.yaml\"",
+                "secrets.sops.path and secrets.sops.config",
+            ),
+            (
+                "[secrets.sops]\npath = \"/s/.sops.yaml\"",
+                "secrets.sops.path and secrets.sops.config",
+            ),
         ] {
             let backend = section["[secrets.".len()..].split(']').next().unwrap();
             let config = parse(&format!(
@@ -575,14 +607,14 @@ mod tests {
             assert!(err.contains("name the same file"), "{err}");
         }
         let config = parse(
-            "[secrets]\nbackend = \"sops\"\n\n[secrets.sops]\npath = \"/s/k.txt\"\n\
-             age_key_file = \"/s/k.txt\"\n",
+            "[secrets]\nbackend = \"sops\"\n\n[secrets.sops]\npath = \"/s/c.yaml\"\n\
+             config = \"/s/c.yaml\"\n",
         );
         let err = config.validate(Path::new("config.toml")).unwrap_err();
         assert!(matches!(err, DocumentError::Invalid { .. }), "{err}");
         assert!(
             err.to_string().contains(
-                "secrets.sops.path and secrets.sops.age_key_file: name the same file `/s/k.txt`"
+                "secrets.sops.path and secrets.sops.config: name the same file `/s/c.yaml`"
             ),
             "{err}"
         );

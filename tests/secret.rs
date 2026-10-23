@@ -10,6 +10,7 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Output;
 
@@ -128,23 +129,145 @@ fn an_invalid_name_exits_two() {
     );
 }
 
-#[test]
-fn a_sops_backend_is_not_implemented_yet() {
+/// Whether `sops` is on `PATH` the way anvil looks for it: an executable
+/// file in an absolute directory. The sops tests skip without it.
+fn have_sops() -> bool {
+    let found = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path)
+            .filter(|dir| dir.is_absolute())
+            .any(|dir| {
+                fs::metadata(dir.join("sops"))
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            })
+    });
+    if !found {
+        eprintln!("skip: sops not found on PATH");
+    }
+    found
+}
+
+/// A sops store under the sandbox, encrypted to the fixture age key.
+fn sops_sandbox() -> Sandbox {
     let sandbox = Sandbox::new("as").without_debug_flags();
+    let store = sandbox.root().join("store");
+    fs::create_dir_all(&store).unwrap();
+    fs::copy(fixture("sops/.sops.yaml"), store.join(".sops.yaml")).unwrap();
     sandbox.write_config(
         "config.toml",
-        "[secrets]\nbackend = \"sops\"\n\n[secrets.sops]\npath = \"/s\"\n",
+        &format!(
+            "[secrets]\nbackend = \"sops\"\nnames = [\"HOST_SUDO\"]\n\n[secrets.sops]\n\
+             path = \"{}\"\nage_key_file = \"{}\"\n",
+            store.join("secrets.json").display(),
+            sandbox.sops_key().display()
+        ),
     );
+    sandbox
+}
+
+#[test]
+fn a_secret_round_trips_through_a_sops_store() {
+    if !have_sops() {
+        return;
+    }
+    let sandbox = sops_sandbox();
+    let out = sandbox.anvil(&["--json", "doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        json_secrets(&out),
+        serde_json::json!({"HOST_SUDO": "missing"})
+    );
+
     let typed = typed(&sandbox);
-    for args in [["secret", "HOST_SUDO"].as_slice(), ["doctor"].as_slice()] {
+    let out = sandbox.edit(&["secret", "HOST_SUDO"], Some(&typed), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "secret HOST_SUDO: updated\n");
+    assert_no_value(&out);
+    let store = sandbox.root().join("store/secrets.json");
+    let ciphertext = fs::read_to_string(&store).unwrap();
+    assert!(ciphertext.contains("ENC[AES256_GCM"), "{ciphertext}");
+    assert!(!ciphertext.contains(VALUE));
+
+    // The fake editor records the buffer it opened: the stored value.
+    let sandbox = sandbox.recording();
+    let out = sandbox.edit(&["secret", "HOST_SUDO"], Some(&typed), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "secret HOST_SUDO: unchanged\n");
+    assert_eq!(
+        fs::read_to_string(sandbox.record("editor.in.1")).unwrap(),
+        format!("{VALUE}\n")
+    );
+
+    let out = sandbox.anvil(&["--json", "doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(json_secrets(&out), serde_json::json!({"HOST_SUDO": "ok"}));
+    assert_no_value(&out);
+}
+
+#[test]
+fn a_sops_failure_stops_the_command_before_the_editor() {
+    if !have_sops() {
+        return;
+    }
+    let sandbox = sops_sandbox().recording();
+    fs::write(sandbox.root().join("store/secrets.json"), "{}").unwrap();
+    let typed = typed(&sandbox);
+    let out = sandbox.edit(&["secret", "HOST_SUDO"], Some(&typed), None);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        text(&out.stderr),
+        format!(
+            "ERROR anvil: sops decrypt: {} is not a sops file\n",
+            sandbox.root().join("store/secrets.json").display()
+        )
+    );
+    assert!(!sandbox.record("editor.count").exists());
+    assert_eq!(
+        fs::read_to_string(sandbox.root().join("store/secrets.json")).unwrap(),
+        "{}"
+    );
+}
+
+#[test]
+fn a_value_edited_into_a_sops_store_is_never_quoted() {
+    if !have_sops() {
+        return;
+    }
+    let sandbox = sops_sandbox();
+    let typed = typed(&sandbox);
+    let out = sandbox.edit(&["secret", "HOST_SUDO"], Some(&typed), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+
+    // sops' own stderr quotes a hand-edited value.
+    let store = sandbox.root().join("store/secrets.json");
+    let ciphertext = fs::read_to_string(&store).unwrap();
+    let start = ciphertext.find("ENC[").unwrap();
+    let end = start + ciphertext[start..].find(']').unwrap() + 1;
+    fs::write(
+        &store,
+        format!("{}{VALUE}{}", &ciphertext[..start], &ciphertext[end..]),
+    )
+    .unwrap();
+    for args in [
+        ["-vvv", "secret", "HOST_SUDO"].as_slice(),
+        ["-vvv", "--json", "doctor"].as_slice(),
+    ] {
         let out = sandbox.edit(args, Some(&typed), None);
         assert_eq!(out.status.code(), Some(1), "{args:?}");
-        assert_eq!(
-            text(&out.stderr),
-            "ERROR anvil: secrets backend sops: not implemented yet\n",
-            "{args:?}"
+        assert!(
+            text(&out.stderr).contains(&format!(
+                "sops decrypt: {} is damaged or was edited by hand\n",
+                store.display()
+            )),
+            "{}",
+            text(&out.stderr)
         );
+        assert_no_value(&out);
     }
+}
+
+fn json_secrets(out: &Output) -> serde_json::Value {
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    value["local"]["secrets"].clone()
 }
 
 #[test]
