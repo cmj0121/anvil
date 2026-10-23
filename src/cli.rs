@@ -6,11 +6,11 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand};
 use serde::Serialize;
 
-use crate::config::{Backend, Config};
+use crate::config::Config;
 use crate::document::Format;
 use crate::inventory::{Inventory, Sel, Target, TargetKind};
 use crate::paths;
-use crate::secret::{Keychain, SecretStore};
+use crate::secret::{self, Store};
 use crate::ssh::{self, Ssh, SshSettings};
 use crate::transport::{Local, Transport, TransportError};
 
@@ -57,22 +57,15 @@ pub struct Cli {
 }
 
 impl Cli {
-    /// The secret store the config selects, or `Memory` when a debug build
-    /// was started with `--secret-store memory`. Only the keychain is
-    /// available so far; age and sops fail as not implemented yet (exit 1).
-    pub fn secret_store(&self) -> Result<Box<dyn SecretStore>, Failure> {
+    /// The secret store `config` selects, or `Memory` when a debug build was
+    /// started with `--secret-store memory`. Nothing is opened yet.
+    pub fn secret_store(&self, config: &Config) -> Result<Box<dyn Store>, Failure> {
         #[cfg(debug_assertions)]
         if self.secret_store == Some(SecretStoreKind::Memory) {
-            return Ok(Box::new(crate::secret::Memory::default()));
+            return Ok(Box::new(secret::Memory::default()));
         }
-        let backend = match self.load_config()?.backend().map_err(Failure::usage)? {
-            Backend::Keychain { service } => return Ok(Box::new(Keychain { service })),
-            Backend::Age { .. } => "age",
-            Backend::Sops { .. } => "sops",
-        };
-        Err(Failure::failed(format!(
-            "secrets backend {backend}: not implemented yet"
-        )))
+        let backend = config.backend().map_err(Failure::usage)?;
+        Ok(secret::from_config(&backend)?)
     }
 
     /// The ssh program: `ssh` on `PATH`, or the debug-only `--ssh-program`.
@@ -224,7 +217,7 @@ impl From<crate::editor::EditorError> for Failure {
     }
 }
 
-// The keychain refusing an operation is a failed command (exit 1).
+// A store refusing an operation is a failed command (exit 1).
 impl From<crate::secret::SecretError> for Failure {
     fn from(err: crate::secret::SecretError) -> Self {
         Failure::failed(err.to_string())
@@ -245,10 +238,16 @@ pub fn run(cli: &Cli) -> Result<(), Failure> {
     match &cli.command {
         Command::Inventory { format } => crate::commands::inventory(cli, *format),
         Command::Config { format } => crate::commands::config(cli, *format),
-        Command::Doctor => crate::doctor::run(cli, cli.secret_store()?.as_ref()),
+        Command::Doctor => {
+            let config = cli.load_config()?;
+            let store = cli.secret_store(&config)?;
+            crate::doctor::run(cli, &config, store.as_ref())
+        }
         Command::Apply => crate::apply::run(cli),
         Command::Secret { name } => {
-            crate::commands::secret(cli, name, cli.secret_store()?.as_ref())
+            let config = cli.load_config()?;
+            let store = cli.secret_store(&config)?;
+            crate::commands::secret(cli, &config, name, store.as_ref())
         }
     }
 }

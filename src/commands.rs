@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use zeroize::Zeroizing;
 
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
@@ -28,7 +29,7 @@ use crate::document::{self, DocumentError, Format, MAX_BYTES};
 use crate::editor::{Buffer, Editor, Fallback};
 use crate::inventory::Inventory;
 use crate::paths::{self, DocPath};
-use crate::secret::{self, SecretStore};
+use crate::secret::{self, Store};
 
 /// How often an invalid buffer is re-opened before the command gives up.
 const ATTEMPTS: u32 = 3;
@@ -99,9 +100,10 @@ struct SecretOutcome<'a> {
     changed: bool,
 }
 
-/// `anvil secret NAME`: `get` → edit as `.txt` → strip one trailing newline →
-/// empty deletes, anything else is stored. An unchanged buffer writes nothing.
-pub fn secret(cli: &Cli, name: &str, store: &dyn SecretStore) -> Result<(), Failure> {
+/// `anvil secret NAME`: open the store → `get` → edit as `.txt` → strip one
+/// trailing newline → empty deletes, anything else is stored → commit. An
+/// unchanged buffer writes nothing.
+pub fn secret(cli: &Cli, config: &Config, name: &str, store: &dyn Store) -> Result<(), Failure> {
     warn_target(cli);
     if !secret::is_name(name) {
         return Err(Failure::usage(format!(
@@ -109,17 +111,22 @@ pub fn secret(cli: &Cli, name: &str, store: &dyn SecretStore) -> Result<(), Fail
             secret::NAME_RULE
         )));
     }
-    let config = cli.load_config()?;
+    log::debug!("opening the {} secret store", store.kind());
+    let mut vault = store.open()?;
     let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict)?;
-    let current = store.get(name)?;
+    let current = vault.get(name)?;
     let had_value = current.is_some();
-    let mut buffer = current.unwrap_or_default();
+    let current = current.unwrap_or_default();
+    // Sized for the newline up front, so no unzeroized copy is left behind.
+    let mut buffer = Zeroizing::new(Vec::with_capacity(current.len() + 1));
+    buffer.extend_from_slice(&current);
     if !buffer.is_empty() && !buffer.ends_with(b"\n") {
         buffer.push(b'\n');
     }
-    let changed = match editor.edit(&buffer, "txt", Buffer::Sensitive)? {
-        None => false,
-        Some(mut edited) => {
+    let action = match editor.edit(&buffer, "txt", Buffer::Sensitive)? {
+        None => None,
+        Some(edited) => {
+            let mut edited = Zeroizing::new(edited);
             if edited.last() == Some(&b'\n') {
                 edited.pop();
             }
@@ -132,17 +139,20 @@ pub fn secret(cli: &Cli, name: &str, store: &dyn SecretStore) -> Result<(), Fail
             }
             if edited.is_empty() {
                 if had_value {
-                    store.delete(name)?;
-                    log::info!("secret {name}: deleted");
+                    vault.delete(name)?;
                 }
-                had_value
+                had_value.then_some("deleted")
             } else {
-                store.set(name, &edited)?;
-                log::info!("secret {name}: stored");
-                true
+                vault.set(name, &edited)?;
+                Some("stored")
             }
         }
     };
+    vault.commit()?;
+    if let Some(action) = action {
+        log::info!("secret {name}: {action}");
+    }
+    let changed = action.is_some();
     if cli.json {
         print_json(&SecretOutcome { name, changed }, Failure::usage)?;
     } else if changed {
@@ -344,7 +354,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-    use crate::secret::Memory;
+    use crate::secret::{BackendKind, Memory, SecretError, Vault};
     use crate::test_util::temp_dir;
 
     /// A config naming a scripted editor: `script` runs with the temp file as
@@ -369,10 +379,10 @@ mod tests {
             Scripted { dir, config }
         }
 
-        fn run(&self, name: &str, store: &dyn SecretStore) -> Result<(), Failure> {
+        fn run(&self, name: &str, store: &dyn Store) -> Result<(), Failure> {
             let config = self.config.to_str().unwrap();
             let cli = Cli::try_parse_from(["anvil", "--config", config, "secret", name]).unwrap();
-            secret(&cli, name, store)
+            secret(&cli, &cli.load_config().unwrap(), name, store)
         }
     }
 
@@ -384,34 +394,55 @@ mod tests {
 
     use clap::Parser;
 
+    /// The value stored under `name`, read through a fresh vault.
+    fn stored(store: &Memory, name: &str) -> Option<Vec<u8>> {
+        store.open().unwrap().get(name).unwrap().map(|v| v.to_vec())
+    }
+
+    fn put(store: &Memory, name: &str, value: &[u8]) {
+        store.open().unwrap().set(name, value).unwrap();
+    }
+
+    /// A store that cannot be opened, like a locked age identity.
+    struct Locked;
+
+    impl Store for Locked {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Age
+        }
+
+        fn open(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
+            Err(SecretError::Locked)
+        }
+    }
+
     #[test]
     fn an_edit_stores_the_value_without_its_trailing_newline() {
         let scripted = Scripted::new("store", "printf 'hunter2\\n' > \"$1\"");
         let store = Memory::default();
         scripted.run("HOST_SUDO", &store).unwrap();
-        assert!(store.exists("HOST_SUDO").unwrap());
-        assert_eq!(store.get("HOST_SUDO").unwrap().unwrap(), b"hunter2");
+        assert_eq!(stored(&store, "HOST_SUDO").unwrap(), b"hunter2");
     }
 
     #[test]
     fn the_current_value_is_offered_and_an_empty_edit_deletes() {
         let scripted = Scripted::new("delete", "cp \"$1\" \"$(dirname \"$0\")/seen\"; : > \"$1\"");
         let store = Memory::default();
-        store.set("HOST_SUDO", b"old").unwrap();
+        put(&store, "HOST_SUDO", b"old");
         scripted.run("HOST_SUDO", &store).unwrap();
         assert_eq!(fs::read(scripted.dir.join("seen")).unwrap(), b"old\n");
-        assert!(!store.exists("HOST_SUDO").unwrap());
+        assert_eq!(stored(&store, "HOST_SUDO"), None);
     }
 
     #[test]
     fn an_unchanged_buffer_writes_nothing() {
         let scripted = Scripted::new("unchanged", "");
         let store = Memory::default();
-        store.set("HOST_SUDO", b"keep").unwrap();
+        put(&store, "HOST_SUDO", b"keep");
         scripted.run("HOST_SUDO", &store).unwrap();
-        assert_eq!(store.get("HOST_SUDO").unwrap().unwrap(), b"keep");
+        assert_eq!(stored(&store, "HOST_SUDO").unwrap(), b"keep");
         scripted.run("OTHER", &store).unwrap();
-        assert!(!store.exists("OTHER").unwrap());
+        assert_eq!(stored(&store, "OTHER"), None);
     }
 
     #[test]
@@ -421,7 +452,22 @@ mod tests {
         let failure = scripted.run("HOST_SUDO", &store).unwrap_err();
         assert_eq!(failure.code, 1);
         assert!(!failure.message.contains("leak"));
-        assert!(!store.exists("HOST_SUDO").unwrap());
+        assert_eq!(stored(&store, "HOST_SUDO"), None);
+    }
+
+    #[test]
+    fn a_store_that_cannot_open_stops_before_the_editor_runs() {
+        let scripted = Scripted::new(
+            "locked",
+            "printf 'x' > \"$1\"; touch \"$(dirname \"$0\")/ran\"",
+        );
+        let failure = scripted.run("HOST_SUDO", &Locked).unwrap_err();
+        assert_eq!(failure.code, 1);
+        assert_eq!(
+            failure.message,
+            "the secret store is locked: run in a terminal to unlock"
+        );
+        assert!(!scripted.dir.join("ran").exists());
     }
 
     #[test]
@@ -448,7 +494,10 @@ mod tests {
     fn log_calls_never_mention_a_value() {
         for (file, source) in [
             ("commands.rs", include_str!("commands.rs")),
-            ("secret.rs", include_str!("secret.rs")),
+            ("secret/mod.rs", include_str!("secret/mod.rs")),
+            ("secret/keychain.rs", include_str!("secret/keychain.rs")),
+            ("secret/memory.rs", include_str!("secret/memory.rs")),
+            ("secret/file_store.rs", include_str!("secret/file_store.rs")),
         ] {
             for (i, line) in source.lines().enumerate() {
                 if line.contains("log::") {
