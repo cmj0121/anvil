@@ -10,6 +10,7 @@ mod editor;
 mod facts;
 mod inventory;
 mod logger;
+mod options;
 mod paths;
 mod secret;
 mod ssh;

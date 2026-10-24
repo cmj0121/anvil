@@ -8,6 +8,7 @@
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
@@ -15,15 +16,16 @@ use crate::cli::{Cli, Failure, print_json};
 use crate::config::Step;
 use crate::inventory::Target;
 use crate::logger::{BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, is_escaped, paint};
+use crate::options::Options;
 use crate::transport::{Output, Transport, TransportError, into_string};
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct StepReport {
-    run: String,
+    pub run: String,
     /// `None` when the script was killed by a signal.
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 impl StepReport {
@@ -54,48 +56,150 @@ pub enum TargetReport {
         error: String,
         ok: bool,
     },
+    /// The cancel flag ended the target; `steps` holds the ones that ran
+    /// before it. `ok` is always false.
+    Cancelled {
+        target: String,
+        steps: Vec<StepReport>,
+        ok: bool,
+    },
 }
 
 impl TargetReport {
-    fn ok(&self) -> bool {
+    pub fn ok(&self) -> bool {
         match self {
-            TargetReport::Ran { ok, .. } | TargetReport::Failed { ok, .. } => *ok,
+            TargetReport::Ran { ok, .. }
+            | TargetReport::Failed { ok, .. }
+            | TargetReport::Cancelled { ok, .. } => *ok,
         }
     }
+
+    pub fn target(&self) -> &str {
+        match self {
+            TargetReport::Ran { target, .. }
+            | TargetReport::Failed { target, .. }
+            | TargetReport::Cancelled { target, .. } => target,
+        }
+    }
+
+    pub fn steps(&self) -> &[StepReport] {
+        match self {
+            TargetReport::Ran { steps, .. }
+            | TargetReport::Failed { steps, .. }
+            | TargetReport::Cancelled { steps, .. } => steps,
+        }
+    }
+
+    /// Why the target failed: its error, `cancelled`, else the last step
+    /// that exited non-zero or was killed; `None` when every step passed.
+    pub fn failure(&self) -> Option<String> {
+        match self {
+            TargetReport::Failed { error, .. } => return Some(error.clone()),
+            TargetReport::Cancelled { .. } => return Some("cancelled".to_owned()),
+            TargetReport::Ran { .. } => {}
+        }
+        let (index, step) = self
+            .steps()
+            .iter()
+            .enumerate()
+            .rfind(|(_, step)| step.code != Some(0))?;
+        let number = index + 1;
+        Some(match step.code {
+            Some(code) => format!("step {number} exited {code}"),
+            None => format!("step {number} was killed by a signal"),
+        })
+    }
+}
+
+/// The end of a passed target's block: `ok · N step(s)`.
+pub fn ok_text(steps: usize) -> String {
+    let plural = if steps == 1 { "" } else { "s" };
+    format!("ok · {steps} step{plural}")
 }
 
 #[derive(Debug, Serialize)]
 pub struct Report {
-    targets: Vec<TargetReport>,
-    ok: bool,
+    pub targets: Vec<TargetReport>,
+    pub ok: bool,
 }
 
-pub fn run(cli: &Cli) -> Result<(), Failure> {
-    let config = cli.load_config()?;
-    let targets = cli.targets()?;
-    let style = Style::detect();
-    // Human output is printed as each target ends; only `--json` keeps them.
-    let mut reports = Vec::new();
-    let mut failed = 0;
-    for target in &targets {
-        let report = apply_target(target, cli.transport(target), &config.steps);
-        if !report.ok() {
-            failed += 1;
-        }
-        if cli.json {
-            reports.push(report);
-        } else {
-            print_lines(&render(&report, style), style);
-        }
+impl Report {
+    /// How many targets succeeded and how many failed.
+    pub fn counts(&self) -> (usize, usize) {
+        let ok = self.targets.iter().filter(|t| t.ok()).count();
+        (ok, self.targets.len() - ok)
     }
-    if cli.json {
-        let report = Report {
-            targets: reports,
-            ok: failed == 0,
+}
+
+/// What [`run_targets`] reports as it goes: a target about to run, and its
+/// report once it ends.
+#[allow(dead_code, reason = "read by the TUI")]
+pub enum Progress<'a> {
+    Start(&'a Target),
+    Done(&'a TargetReport),
+}
+
+/// Loads config + targets, applies each in order. Before each target and each
+/// step, `cancel` is checked; once set, the current target ends as Cancelled
+/// (keeping its completed steps) and every later target is Cancelled with no steps.
+pub fn run_targets(
+    opts: &Options,
+    cancel: &AtomicBool,
+    on: &mut dyn FnMut(Progress<'_>),
+) -> Result<Report, Failure> {
+    let config = opts.load_config()?;
+    let targets = opts.targets()?;
+    Ok(apply_targets(
+        &targets,
+        |target| opts.transport(target),
+        &config.steps,
+        cancel,
+        on,
+    ))
+}
+
+fn apply_targets(
+    targets: &[Target],
+    transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError>,
+    steps: &[Step],
+    cancel: &AtomicBool,
+    on: &mut dyn FnMut(Progress<'_>),
+) -> Report {
+    let mut reports = Vec::with_capacity(targets.len());
+    for target in targets {
+        on(Progress::Start(target));
+        let report = if cancel.load(Ordering::Relaxed) {
+            cancelled(target, Vec::new())
+        } else {
+            apply_target(target, transport(target), steps, cancel)
         };
+        on(Progress::Done(&report));
+        reports.push(report);
+    }
+    let ok = reports.iter().all(TargetReport::ok);
+    Report {
+        targets: reports,
+        ok,
+    }
+}
+
+/// `anvil apply`: prints each target's block as it ends (or one JSON
+/// document), then the summary.
+pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
+    let style = Style::detect();
+    let cancel = AtomicBool::new(false);
+    let report = run_targets(opts, &cancel, &mut |progress| {
+        if let Progress::Done(report) = progress
+            && !cli.json
+        {
+            print_lines(&render(report, style), style);
+        }
+    })?;
+    let (ok, failed) = report.counts();
+    if cli.json {
         print_json(&report, Failure::failed)?;
     } else {
-        let summary = render_summary(targets.len() - failed, failed, style);
+        let summary = render_summary(ok, failed, style);
         let mut out = std::io::stdout().lock();
         let _ = out.write_all(summary.as_bytes());
         let _ = out.flush();
@@ -105,8 +209,17 @@ pub fn run(cli: &Cli) -> Result<(), Failure> {
     } else {
         Err(Failure::failed(format!(
             "apply: {failed} of {} targets failed",
-            targets.len()
+            report.targets.len()
         )))
+    }
+}
+
+fn cancelled(target: &Target, steps: Vec<StepReport>) -> TargetReport {
+    log::info!("apply {}: cancelled", target.name);
+    TargetReport::Cancelled {
+        target: target.name.clone(),
+        steps,
+        ok: false,
     }
 }
 
@@ -114,6 +227,7 @@ fn apply_target(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
     steps: &[Step],
+    cancel: &AtomicBool,
 ) -> TargetReport {
     log::info!("apply {}: start", target.name);
     let failed = |steps: Vec<StepReport>, error: TransportError| {
@@ -133,6 +247,9 @@ fn apply_target(
     let mut reports = Vec::with_capacity(steps.len());
     let mut ok = true;
     for step in steps {
+        if cancel.load(Ordering::Relaxed) {
+            return cancelled(target, reports);
+        }
         let output = match transport.run(&step.run) {
             Ok(output) => output,
             Err(err) => return failed(reports, err),
@@ -282,15 +399,7 @@ fn command(run: &str) -> String {
 /// escaped on stderr and in failures always, and on stdout only when it is
 /// a terminal.
 fn render(report: &TargetReport, style: Style) -> Vec<Line> {
-    let (target, steps, error) = match report {
-        TargetReport::Ran { target, steps, .. } => (target, steps, None),
-        TargetReport::Failed {
-            target,
-            steps,
-            error,
-            ..
-        } => (target, steps, Some(error)),
-    };
+    let (target, steps) = (report.target(), report.steps());
     let mut lines = vec![Line {
         lead: "",
         ..Line::out(format!("▶ {target}"), Escape::Never, Some(BOLD_CYAN))
@@ -300,8 +409,7 @@ fn render(report: &TargetReport, style: Style) -> Vec<Line> {
     } else {
         format!("{target}: ")
     };
-    let mut failure = None;
-    for (index, step) in steps.iter().enumerate() {
+    for step in steps {
         lines.push(Line::out(
             format!("$ {}", command(&step.run)),
             Escape::Always,
@@ -319,23 +427,14 @@ fn render(report: &TargetReport, style: Style) -> Vec<Line> {
                 ..Line::out(format!("{prefix}{line}"), Escape::Always, Some(YELLOW))
             });
         }
-        let number = index + 1;
-        match step.code {
-            Some(0) => {}
-            Some(code) => failure = Some(format!("step {number} exited {code}")),
-            None => failure = Some(format!("step {number} was killed by a signal")),
-        }
     }
-    if let Some(error) = error {
-        failure = Some(error.clone());
-    }
-    let end = match failure {
+    let end = match report.failure() {
         Some(reason) => Line::out(format!("✘ {reason}"), Escape::Always, Some(RED)),
-        None => {
-            let plural = if steps.len() == 1 { "" } else { "s" };
-            let text = format!("✔ ok · {} step{plural}", steps.len());
-            Line::out(text, Escape::Never, Some(GREEN))
-        }
+        None => Line::out(
+            format!("✔ {}", ok_text(steps.len())),
+            Escape::Never,
+            Some(GREEN),
+        ),
     };
     lines.push(Line { end: "\n\n", ..end });
     lines
@@ -437,7 +536,12 @@ mod tests {
             fail_with,
             succeed,
         };
-        let report = apply_target(&target(name), Ok(Box::new(fake)), &steps(runs));
+        let report = apply_target(
+            &target(name),
+            Ok(Box::new(fake)),
+            &steps(runs),
+            &AtomicBool::new(false),
+        );
         let runs = log.borrow().clone();
         (report, runs)
     }
@@ -535,6 +639,7 @@ mod tests {
             &target("box"),
             Err(TransportError::Spawn("HOME is not set".to_owned())),
             &steps(&["one"]),
+            &AtomicBool::new(false),
         );
         assert_eq!(
             json(&report),
@@ -780,5 +885,132 @@ mod tests {
             screen(&report, piped()),
             "▶ local\n  $ \\x0d echo a\\x0d …\n  ✔ ok · 1 step\n\n"
         );
+    }
+
+    /// Like [`Fake`], but running `stop` sets the shared cancel flag.
+    struct Stopper {
+        log: Rc<RefCell<Vec<String>>>,
+        cancel: Rc<AtomicBool>,
+    }
+
+    impl Transport for Stopper {
+        fn name(&self) -> &str {
+            "stopper"
+        }
+
+        fn run(&self, script: &str) -> Result<Output, TransportError> {
+            self.log.borrow_mut().push(script.to_owned());
+            if script == "stop" {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            Ok(Output {
+                stdout: format!("{script}-out\n").into_bytes(),
+                code: Some(0),
+                ..Output::default()
+            })
+        }
+    }
+
+    /// Applies `runs` to each of `names` over [`Stopper`], with the cancel
+    /// flag starting at `cancelled`; returns the report, the scripts run and
+    /// the progress events as `start NAME` / `done NAME`.
+    fn apply_all(
+        names: &[&str],
+        runs: &[&str],
+        cancelled: bool,
+    ) -> (Report, Vec<String>, Vec<String>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let cancel = Rc::new(AtomicBool::new(cancelled));
+        let targets: Vec<Target> = names.iter().map(|name| target(name)).collect();
+        let mut events = Vec::new();
+        let report = apply_targets(
+            &targets,
+            |_| {
+                Ok(Box::new(Stopper {
+                    log: Rc::clone(&log),
+                    cancel: Rc::clone(&cancel),
+                }))
+            },
+            &steps(runs),
+            &cancel,
+            &mut |progress| {
+                events.push(match progress {
+                    Progress::Start(target) => format!("start {}", target.name),
+                    Progress::Done(report) => {
+                        format!("done {}", json(report)["target"].as_str().unwrap())
+                    }
+                })
+            },
+        );
+        let runs = log.borrow().clone();
+        (report, runs, events)
+    }
+
+    #[test]
+    fn progress_fires_start_then_done_per_target_in_order() {
+        let (report, runs, events) = apply_all(&["a", "b"], &["one"], false);
+        assert_eq!(runs, ["one", "one"]);
+        assert_eq!(events, ["start a", "done a", "start b", "done b"]);
+        assert!(report.ok);
+        assert_eq!(report.counts(), (2, 0));
+    }
+
+    #[test]
+    fn cancel_between_steps_keeps_the_completed_steps_and_cancels_the_rest() {
+        let (report, runs, events) = apply_all(&["a", "b"], &["one", "stop", "three"], false);
+        assert_eq!(runs, ["one", "stop"], "no step runs once the flag is set");
+        assert!(!report.ok);
+        assert_eq!(report.counts(), (0, 2));
+        assert_eq!(
+            json(&report.targets[0]),
+            serde_json::json!({
+                "target": "a",
+                "steps": [
+                    {"run": "one", "code": 0, "stdout": "one-out\n", "stderr": ""},
+                    {"run": "stop", "code": 0, "stdout": "stop-out\n", "stderr": ""},
+                ],
+                "ok": false,
+            })
+        );
+        assert_eq!(
+            report.targets[1],
+            TargetReport::Cancelled {
+                target: "b".to_owned(),
+                steps: vec![],
+                ok: false,
+            }
+        );
+        assert_eq!(events, ["start a", "done a", "start b", "done b"]);
+        assert_eq!(
+            screen(&report.targets[0], piped()),
+            "▶ a\n  $ one\n  one-out\n  $ stop\n  stop-out\n  ✘ cancelled\n\n"
+        );
+    }
+
+    #[test]
+    fn cancel_before_the_first_target_runs_nothing() {
+        let (report, runs, _) = apply_all(&["a", "b"], &["one"], true);
+        assert!(runs.is_empty());
+        for (target, name) in report.targets.iter().zip(["a", "b"]) {
+            assert_eq!(
+                json(target),
+                serde_json::json!({"target": name, "steps": [], "ok": false})
+            );
+        }
+        assert_eq!(
+            screen(&report.targets[1], piped()),
+            "▶ b\n  ✘ cancelled\n\n"
+        );
+    }
+
+    #[test]
+    fn a_failed_target_counts_as_failed() {
+        let (good, _) = apply("a", &["one"], None);
+        let (bad, _) = apply("b", &["fail"], None);
+        let report = Report {
+            targets: vec![good, bad],
+            ok: false,
+        };
+        assert_eq!(report.counts(), (1, 1));
     }
 }
