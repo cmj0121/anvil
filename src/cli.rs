@@ -140,11 +140,44 @@ pub enum Command {
     Doctor,
     /// Run the config's steps on every target
     Apply,
-    /// Edit one secret in the editor
+    /// Edit one secret in the editor, or move every secret to another backend
     Secret {
         /// Secret name
-        name: String,
+        #[arg(required_unless_present_any = ["migrate", "to"])]
+        name: Option<String>,
+
+        /// Copy every secret to the --to backend, verify, then select it in the config
+        #[arg(long, conflicts_with = "name", requires = "to")]
+        migrate: bool,
+
+        /// The backend --migrate moves the secrets to
+        #[arg(
+            long,
+            value_enum,
+            value_name = "BACKEND",
+            requires = "migrate",
+            conflicts_with = "name"
+        )]
+        to: Option<BackendName>,
     },
+}
+
+/// A backend `--migrate` can move secrets to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum BackendName {
+    Keychain,
+    Age,
+    Sops,
+}
+
+impl BackendName {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendName::Keychain => "keychain",
+            BackendName::Age => "age",
+            BackendName::Sops => "sops",
+        }
+    }
 }
 
 impl Command {
@@ -244,9 +277,11 @@ pub fn run(cli: &Cli) -> Result<(), Failure> {
             crate::doctor::run(cli, &config, store.as_ref())
         }
         Command::Apply => crate::apply::run(cli),
-        Command::Secret { name } => {
+        Command::Secret { to: Some(to), .. } => crate::commands::migrate(cli, *to),
+        Command::Secret { name, .. } => {
             let config = cli.load_config()?;
             let store = cli.secret_store(&config)?;
+            let name = name.as_deref().unwrap_or_default();
             crate::commands::secret(cli, &config, name, store.as_ref())
         }
     }
@@ -285,7 +320,21 @@ mod tests {
         assert!(matches!(parse(&["doctor"]).command, Command::Doctor));
         assert!(matches!(parse(&["apply"]).command, Command::Apply));
         match parse(&["secret", "HOST_SUDO"]).command {
-            Command::Secret { name } => assert_eq!(name, "HOST_SUDO"),
+            Command::Secret {
+                name, migrate, to, ..
+            } => {
+                assert_eq!(name.as_deref(), Some("HOST_SUDO"));
+                assert!(!migrate);
+                assert_eq!(to, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&["secret", "--migrate", "--to", "age"]).command {
+            Command::Secret { name, migrate, to } => {
+                assert_eq!(name, None);
+                assert!(migrate);
+                assert_eq!(to, Some(BackendName::Age));
+            }
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -331,6 +380,12 @@ mod tests {
             ["doctor", "--format", "yaml"].as_slice(),
             ["apply", "--format", "yaml"].as_slice(),
             ["--format", "yaml", "inventory"].as_slice(),
+            ["secret", "--migrate"].as_slice(),
+            ["secret", "--migrate", "--to", "age", "HOST_SUDO"].as_slice(),
+            ["secret", "--to", "age"].as_slice(),
+            ["secret", "--to", "age", "HOST_SUDO"].as_slice(),
+            ["secret", "--migrate", "--to", "memory"].as_slice(),
+            ["secret", "--migrate", "--to", "vault"].as_slice(),
         ] {
             assert!(
                 Cli::try_parse_from(std::iter::once("anvil").chain(args.iter().copied())).is_err(),

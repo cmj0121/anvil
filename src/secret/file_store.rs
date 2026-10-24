@@ -17,9 +17,9 @@
 //! A vault holds an exclusive advisory lock on `<store>.lock` (0600, beside
 //! the store, left in place) from `open` until it is committed or dropped,
 //! so a second anvil on the same store fails at once instead of losing the
-//! first one's changes. A vault opened before its directory exists takes
-//! the lock when it commits, and then refuses to write over a store
-//! another anvil created meanwhile.
+//! first one's changes. A vault opened before its directory exists, or
+//! created by `empty`, takes the lock when it commits; the first then
+//! refuses to write over a store another anvil created meanwhile.
 
 use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
@@ -116,7 +116,7 @@ impl<'a, C: Codec> FileVault<'a, C> {
     /// Reads and decrypts `path`, whose ciphertext may be at most `limit`
     /// bytes; an absent file is an empty vault.
     pub fn open(path: &'a Path, limit: u64, codec: C) -> Result<Self, SecretError> {
-        let mut vault = FileVault::new(path, limit, codec);
+        let mut vault = FileVault::new(path, limit, codec, false);
         let dir = vault.dir()?;
         if dir.exists() {
             vault.check_dir(dir)?;
@@ -151,13 +151,20 @@ impl<'a, C: Codec> FileVault<'a, C> {
         Ok(vault)
     }
 
-    fn new(path: &'a Path, limit: u64, codec: C) -> Self {
+    /// An empty vault for `path` that is written on commit even when
+    /// nothing is set, replacing whatever the file held without reading it;
+    /// what it writes may be at most `limit` bytes, as for `open`.
+    pub fn empty(path: &'a Path, limit: u64, codec: C) -> Self {
+        FileVault::new(path, limit, codec, true)
+    }
+
+    fn new(path: &'a Path, limit: u64, codec: C, dirty: bool) -> Self {
         FileVault {
             path,
             codec,
             limit,
             items: BTreeMap::new(),
-            dirty: false,
+            dirty,
             lock: None,
             absent: false,
         }
@@ -245,6 +252,7 @@ impl<'a, C: Codec> FileVault<'a, C> {
     /// directory is created 0700 when missing and checked either way; the lock
     /// is taken when the vault does not hold it yet; and a store file that
     /// appeared since `open` found none is refused rather than overwritten.
+    /// A replacing vault overwrites whatever is there.
     fn prepare(&mut self) -> Result<(), SecretError> {
         let dir = self.dir()?;
         if !dir.exists() {
@@ -471,6 +479,27 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_vault_replaces_the_store_unread() {
+        let root = temp_dir("file-store-empty");
+        let path = root.join("secrets.x");
+        fs::write(&path, "junk that does not decrypt").unwrap();
+        let codec = Xor::default();
+        assert!(FileVault::open(&path, LIMIT, codec.clone()).is_err());
+
+        let vault: Box<dyn Vault> = Box::new(FileVault::empty(&path, LIMIT, codec.clone()));
+        assert!(vault.names().unwrap().is_empty());
+        vault.commit().unwrap();
+        assert_eq!(codec.encrypted.get(), 1, "written though nothing was set");
+        assert!(open(&path, &codec).names().unwrap().is_empty());
+
+        let mut vault: Box<dyn Vault> = Box::new(FileVault::empty(&path, LIMIT, codec.clone()));
+        vault.set("HOST_SUDO", VALUE.as_bytes()).unwrap();
+        vault.commit().unwrap();
+        assert_eq!(open(&path, &codec).names().unwrap(), ["HOST_SUDO"]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn values_round_trip_and_only_ciphertext_reaches_the_disk() {
         let root = temp_dir("file-store-round-trip");
         let path = root.join("secrets.x");
@@ -646,6 +675,12 @@ mod tests {
         let err = FileVault::open(&path, LIMIT, codec.clone()).err().unwrap();
         assert_eq!(err.to_string(), busy);
 
+        // A replacing vault takes the lock when it commits, and writes nothing without it.
+        let mut replacing: Box<dyn Vault> = Box::new(FileVault::empty(&path, LIMIT, codec.clone()));
+        replacing.set("HOST_SUDO", b"theirs").unwrap();
+        assert_eq!(replacing.commit().unwrap_err().to_string(), busy);
+        assert!(!path.exists());
+
         first.set("HOST_SUDO", VALUE.as_bytes()).unwrap();
         first.commit().unwrap();
         let vault = open(&path, &codec);
@@ -715,19 +750,22 @@ mod tests {
         let before = fs::read(&path).unwrap();
         assert_eq!(before.len(), 64);
 
-        let mut vault: Box<dyn Vault> =
-            Box::new(FileVault::open(&path, 64, codec.clone()).unwrap());
-        vault.set("A", format!("{fits}x").as_bytes()).unwrap();
-        assert_eq!(
-            vault.commit().unwrap_err().to_string(),
-            format!(
-                "{}: the store would be too large to open again: its ciphertext is over the \
-                 64 byte limit, nothing written",
-                path.display()
-            )
-        );
-        assert_eq!(fs::read(&path).unwrap(), before);
-        assert_eq!(files(&root), [path.clone(), lock_of(&path)]);
+        for mut vault in [
+            Box::new(FileVault::open(&path, 64, codec.clone()).unwrap()) as Box<dyn Vault>,
+            Box::new(FileVault::empty(&path, 64, codec.clone())),
+        ] {
+            vault.set("A", format!("{fits}x").as_bytes()).unwrap();
+            assert_eq!(
+                vault.commit().unwrap_err().to_string(),
+                format!(
+                    "{}: the store would be too large to open again: its ciphertext is over the \
+                     64 byte limit, nothing written",
+                    path.display()
+                )
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert_eq!(files(&root), [path.clone(), lock_of(&path)]);
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -760,6 +798,7 @@ mod tests {
         let codec = Xor::default();
         // Opened before the directory exists, so without the lock.
         let mut late = open(&path, &codec);
+        let mut replacing: Box<dyn Vault> = Box::new(FileVault::empty(&path, LIMIT, codec.clone()));
         let mut first = open(&path, &codec);
         first.set("HOST_SUDO", VALUE.as_bytes()).unwrap();
         first.commit().unwrap();
@@ -775,6 +814,10 @@ mod tests {
         );
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(codec.encrypted.get(), 1, "refused before encrypting");
+
+        replacing.set("API_KEY", b"k").unwrap();
+        replacing.commit().unwrap();
+        assert_eq!(open(&path, &codec).names().unwrap(), ["API_KEY"]);
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -784,14 +827,19 @@ mod tests {
         let dir = root.join("late");
         let path = dir.join("secrets.x");
         let codec = Xor::default();
-        let mut vault = open(&path, &codec);
-        fs::create_dir_all(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
-        vault.set("HOST_SUDO", VALUE.as_bytes()).unwrap();
-        let err = vault.commit().unwrap_err().to_string();
-        assert!(err.contains("mode 777 lets others write to it"), "{err}");
-        assert_eq!(codec.encrypted.get(), 0, "nothing was encrypted");
-        assert!(files(&dir).is_empty());
+        for mut vault in [
+            open(&path, &codec),
+            Box::new(FileVault::empty(&path, LIMIT, codec.clone())) as Box<dyn Vault>,
+        ] {
+            fs::create_dir_all(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+            vault.set("HOST_SUDO", VALUE.as_bytes()).unwrap();
+            let err = vault.commit().unwrap_err().to_string();
+            assert!(err.contains("mode 777 lets others write to it"), "{err}");
+            assert_eq!(codec.encrypted.get(), 0, "nothing was encrypted");
+            assert!(files(&dir).is_empty());
+            fs::remove_dir_all(&dir).unwrap();
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 }

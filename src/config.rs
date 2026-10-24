@@ -231,68 +231,40 @@ impl Config {
     }
 
     fn backend_for(&self, home: Option<&OsStr>, macos: bool) -> Result<Backend, String> {
-        let Some(secrets) = &self.secrets else {
-            return Ok(Backend::Keychain {
+        match &self.secrets {
+            Some(secrets) => resolve(Some(secrets), &secrets.backend, home, macos),
+            None => Ok(Backend::Keychain {
                 service: SERVICE.to_string(),
-            });
-        };
-        let backend = secrets.backend.as_str();
-        let missing = |section: &str| {
-            format!("secrets.{section}: required when secrets.backend = \"{backend}\"")
-        };
-        let path =
-            |key: &str, value: &str| expand(&format!("secrets.{backend}.{key}"), value, home);
-        match backend {
-            "keychain" if !macos => Err(
-                "secrets.backend `keychain`: the keychain is only available on macOS".to_string(),
-            ),
-            "keychain" => {
-                let service = secrets
-                    .keychain
-                    .as_ref()
-                    .and_then(|k| k.service.clone())
-                    .unwrap_or_else(|| SERVICE.to_string());
-                if service.trim().is_empty() {
-                    return Err("secrets.keychain.service: is empty or blank".to_string());
-                }
-                Ok(Backend::Keychain { service })
-            }
-            "age" => {
-                let age = secrets.age.as_ref().ok_or_else(|| missing("age"))?;
-                let backend = Backend::Age {
-                    path: path("path", &age.path)?,
-                    identity: path("identity", &age.identity)?,
-                };
-                check_apart(&backend)?;
-                Ok(backend)
-            }
-            "sops" => {
-                let sops = secrets.sops.as_ref().ok_or_else(|| missing("sops"))?;
-                let store = path("path", &sops.path)?;
-                let config = match sops.config.as_deref() {
-                    Some(config) => path("config", config)?,
-                    None => store.parent().unwrap_or(Path::new("/")).join(".sops.yaml"),
-                };
-                let backend = Backend::Sops {
-                    path: store,
-                    age_key_file: sops
-                        .age_key_file
-                        .as_deref()
-                        .map(|v| path("age_key_file", v))
-                        .transpose()?,
-                    config,
-                    program: sops
-                        .program
-                        .as_deref()
-                        .map(|v| path("program", v))
-                        .transpose()?,
-                };
-                check_apart(&backend)?;
-                Ok(backend)
-            }
-            other => Err(format!(
-                "secrets.backend `{other}`: must be one of keychain, age, sops"
-            )),
+            }),
+        }
+    }
+
+    /// The selected backend's name, `keychain` without `[secrets]`.
+    pub fn backend_name(&self) -> &str {
+        self.secrets
+            .as_ref()
+            .map_or("keychain", |secrets| secrets.backend.as_str())
+    }
+
+    /// Backend `name` as this config would select it, with the same checks
+    /// as [`Config::backend`]: its section must be present and valid.
+    pub fn backend_named(&self, name: &str) -> Result<Backend, String> {
+        resolve(
+            self.secrets.as_ref(),
+            name,
+            std::env::var_os("HOME").as_deref(),
+            MACOS,
+        )
+    }
+
+    /// Selects `backend`, moving the legacy `[anvil].secrets` to
+    /// `[secrets].names` on the way.
+    pub fn set_backend(&mut self, backend: &str) {
+        let names = self.anvil.secrets.take();
+        let secrets = self.secrets.get_or_insert_with(|| Secrets::new(backend));
+        secrets.backend = backend.to_string();
+        if names.is_some() {
+            secrets.names = names;
         }
     }
 
@@ -310,15 +282,88 @@ impl Config {
         }
         let names = self.anvil.secrets.take();
         self.secrets
-            .get_or_insert_with(|| Secrets {
-                backend: "keychain".to_string(),
-                names: None,
-                keychain: None,
-                age: None,
-                sops: None,
-            })
+            .get_or_insert_with(|| Secrets::new("keychain"))
             .names = names;
         true
+    }
+}
+
+impl Secrets {
+    fn new(backend: &str) -> Secrets {
+        Secrets {
+            backend: backend.to_string(),
+            names: None,
+            keychain: None,
+            age: None,
+            sops: None,
+        }
+    }
+}
+
+/// `backend` built from the sections of `secrets`; the error names the key.
+fn resolve(
+    secrets: Option<&Secrets>,
+    backend: &str,
+    home: Option<&OsStr>,
+    macos: bool,
+) -> Result<Backend, String> {
+    let missing =
+        |section: &str| format!("secrets.{section}: required when secrets.backend = \"{backend}\"");
+    let path = |key: &str, value: &str| expand(&format!("secrets.{backend}.{key}"), value, home);
+    match backend {
+        "keychain" if !macos => {
+            Err("secrets.backend `keychain`: the keychain is only available on macOS".to_string())
+        }
+        "keychain" => {
+            let service = secrets
+                .and_then(|s| s.keychain.as_ref())
+                .and_then(|k| k.service.clone())
+                .unwrap_or_else(|| SERVICE.to_string());
+            if service.trim().is_empty() {
+                return Err("secrets.keychain.service: is empty or blank".to_string());
+            }
+            Ok(Backend::Keychain { service })
+        }
+        "age" => {
+            let age = secrets
+                .and_then(|s| s.age.as_ref())
+                .ok_or_else(|| missing("age"))?;
+            let backend = Backend::Age {
+                path: path("path", &age.path)?,
+                identity: path("identity", &age.identity)?,
+            };
+            check_apart(&backend)?;
+            Ok(backend)
+        }
+        "sops" => {
+            let sops = secrets
+                .and_then(|s| s.sops.as_ref())
+                .ok_or_else(|| missing("sops"))?;
+            let store = path("path", &sops.path)?;
+            let config = match sops.config.as_deref() {
+                Some(config) => path("config", config)?,
+                None => store.parent().unwrap_or(Path::new("/")).join(".sops.yaml"),
+            };
+            let backend = Backend::Sops {
+                path: store,
+                age_key_file: sops
+                    .age_key_file
+                    .as_deref()
+                    .map(|v| path("age_key_file", v))
+                    .transpose()?,
+                config,
+                program: sops
+                    .program
+                    .as_deref()
+                    .map(|v| path("program", v))
+                    .transpose()?,
+            };
+            check_apart(&backend)?;
+            Ok(backend)
+        }
+        other => Err(format!(
+            "secrets.backend `{other}`: must be one of keychain, age, sops"
+        )),
     }
 }
 
@@ -700,6 +745,59 @@ mod tests {
         assert!(config.migrate_for(false), "an existing backend is kept");
         assert_eq!(config.secrets.as_ref().unwrap().backend, "sops");
         assert_eq!(config.names(), ["API"]);
+    }
+
+    #[test]
+    fn a_named_backend_needs_its_section_like_the_selected_one() {
+        let config = parse(
+            "[secrets]\nbackend = \"sops\"\n\n[secrets.sops]\npath = \"/s\"\n\n\
+             [secrets.age]\npath = \"~/a\"\nidentity = \"/i\"\n",
+        );
+        let secrets = config.secrets.as_ref();
+        assert_eq!(
+            resolve(secrets, "age", home(), true).unwrap(),
+            Backend::Age {
+                path: "/home/u/a".into(),
+                identity: "/i".into(),
+            }
+        );
+        assert_eq!(
+            resolve(secrets, "keychain", home(), true).unwrap(),
+            Backend::Keychain {
+                service: "anvil".into()
+            }
+        );
+        let err = resolve(secrets, "keychain", home(), false).unwrap_err();
+        assert!(err.contains("macOS"), "{err}");
+        let err = resolve(None, "sops", home(), true).unwrap_err();
+        assert!(err.contains("secrets.sops: required"), "{err}");
+        let config = parse(
+            "[secrets]\nbackend = \"age\"\n\n[secrets.age]\npath = \"rel\"\nidentity = \"/i\"\n",
+        );
+        let err = resolve(config.secrets.as_ref(), "age", home(), true).unwrap_err();
+        assert!(err.contains("secrets.age.path `rel`"), "{err}");
+    }
+
+    #[test]
+    fn setting_the_backend_moves_the_legacy_names() {
+        let mut config = parse(
+            "[anvil]\nsecrets = [\"API\"]\n\n[secrets]\nbackend = \"sops\"\n\n\
+             [secrets.sops]\npath = \"/s\"\n\n[secrets.age]\npath = \"/a\"\nidentity = \"/i\"\n",
+        );
+        config.set_backend("age");
+        assert_eq!(config.anvil.secrets, None);
+        assert_eq!(config.names(), ["API"]);
+        let secrets = config.secrets.as_ref().unwrap();
+        assert_eq!(secrets.backend, "age");
+        assert!(secrets.sops.is_some(), "other sections are kept");
+
+        let mut config = parse("[secrets]\nbackend = \"age\"\nnames = [\"A\"]\n");
+        config.set_backend("sops");
+        assert_eq!(config.names(), ["A"]);
+
+        let mut config = Config::default();
+        config.set_backend("keychain");
+        assert_eq!(config.secrets.unwrap().backend, "keychain");
     }
 
     #[test]

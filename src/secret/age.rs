@@ -124,14 +124,9 @@ impl AgeStore {
             }
         })
     }
-}
 
-impl Store for AgeStore {
-    fn kind(&self) -> BackendKind {
-        BackendKind::Age
-    }
-
-    fn open(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
+    /// The identity's keys and recipients, unlocked.
+    fn codec(&self) -> Result<AgeCodec<'_>, SecretError> {
         let identity = self.load_identity()?;
         let recipients = identity
             .to_recipients()
@@ -142,12 +137,33 @@ impl Store for AgeStore {
         if identities.is_empty() {
             return Err(self.identity_error("holds no age identity"));
         }
-        let codec = AgeCodec {
+        Ok(AgeCodec {
             path: &self.path,
             identities,
             recipients,
-        };
-        Ok(Box::new(FileVault::open(&self.path, STORE_LIMIT, codec)?))
+        })
+    }
+}
+
+impl Store for AgeStore {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Age
+    }
+
+    fn open(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
+        Ok(Box::new(FileVault::open(
+            &self.path,
+            STORE_LIMIT,
+            self.codec()?,
+        )?))
+    }
+
+    fn replace(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
+        Ok(Box::new(FileVault::empty(
+            &self.path,
+            STORE_LIMIT,
+            self.codec()?,
+        )))
     }
 }
 
@@ -433,6 +449,32 @@ mod tests {
     }
 
     #[test]
+    fn replace_skips_the_old_store_but_still_unlocks_the_identity() {
+        let root = temp_dir("age-replace");
+        let identity = root.join("key.age");
+        passphrase_identity(&identity);
+        let path = root.join("secrets.age");
+        fs::write(&path, "not an age file").unwrap();
+        let (mut store, asked) = store_with(path.clone(), identity, right);
+        assert!(store.open().is_err(), "the junk does not decrypt");
+
+        let vault = store.replace().unwrap();
+        assert!(vault.names().unwrap().is_empty());
+        vault.commit().unwrap();
+        assert!(armored(&path), "an empty store is written over the junk");
+        assert!(store.open().unwrap().names().unwrap().is_empty());
+        assert_eq!(asked.load(Ordering::Relaxed), 3);
+
+        store.tty = || false;
+        assert!(matches!(
+            store.replace().err().unwrap(),
+            SecretError::Locked
+        ));
+        assert_eq!(asked.load(Ordering::Relaxed), 3);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn a_failed_prompt_is_reported_without_the_passphrase() {
         let root = temp_dir("age-prompt");
         let identity = root.join("key.age");
@@ -589,7 +631,7 @@ mod tests {
             700_000
         );
 
-        let mut vault = store.open().unwrap();
+        let mut vault = store.replace().unwrap();
         vault
             .set("HOST_SUDO", "x".repeat(800_000).as_bytes())
             .unwrap();

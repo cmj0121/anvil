@@ -20,6 +20,7 @@ mod file_store;
 mod keychain;
 #[cfg(any(test, debug_assertions))]
 mod memory;
+pub mod migrate;
 mod prompt;
 mod sops;
 
@@ -134,6 +135,14 @@ pub trait Store {
     /// passphrase without a terminal to ask on fails with
     /// [`SecretError::Locked`], having prompted nothing.
     fn open(&self) -> Result<Box<dyn Vault + '_>, SecretError>;
+    /// An empty vault whose commit replaces the whole store, for a store
+    /// that is about to be overwritten: a file store does not read its file
+    /// (it still needs its key, so a passphrase is asked for as in `open`).
+    /// Write-through stores open as usual; deleting what is there is up to
+    /// the caller.
+    fn replace(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
+        self.open()
+    }
 }
 
 /// An opened store. Names are sorted. Values are bytes at the API; file
@@ -207,7 +216,7 @@ mod tests {
     use super::*;
 
     /// The sources of this module, for the checks that read code.
-    const SOURCES: [(&str, &str); 7] = [
+    const SOURCES: [(&str, &str); 8] = [
         ("secret/mod.rs", include_str!("mod.rs")),
         ("secret/keychain.rs", include_str!("keychain.rs")),
         ("secret/memory.rs", include_str!("memory.rs")),
@@ -215,6 +224,7 @@ mod tests {
         ("secret/age.rs", include_str!("age.rs")),
         ("secret/prompt.rs", include_str!("prompt.rs")),
         ("secret/sops.rs", include_str!("sops.rs")),
+        ("secret/migrate.rs", include_str!("migrate.rs")),
     ];
 
     #[test]

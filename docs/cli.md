@@ -10,6 +10,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
   secret <NAME>                  edit one secret in the editor
+  secret --migrate --to BACKEND  move every secret to keychain, age or sops and select it
 ```
 
 ## Common flags
@@ -196,6 +197,25 @@ Human output: `secret NAME: updated` or `secret NAME: unchanged`. `--json`:
 
 ```json
 { "name": "HOST_SUDO", "changed": true }
+```
+
+### `anvil secret --migrate --to keychain|age|sops`
+
+Copies every secret of the current backend (for the keychain, every item under its service) into the target, replacing
+whatever the target held (an age or sops file is rewritten without being decrypted, so one that no longer opens is
+replaced too; stale keychain items in the service are deleted), re-opens the target and checks every name and value,
+then rewrites config.toml with `[secrets].backend` set to the target and a legacy `[anvil].secrets` moved to
+`[secrets].names`. That rewrite goes through the same save as `anvil config`, so comments and layout in config.toml are
+not kept. The old store is left as it was. An age identity with a passphrase is asked for again when the target is
+re-opened. `NAME` cannot be given with `--migrate`; the target's config section must exist, and the target must differ
+from the current backend (exit 2 otherwise). A failure before the config write leaves config.toml unchanged and names
+the failed step (exit 1); a keychain target that fails part way lists the names already written. Values never appear in
+any output.
+
+Human output: `migrated N secrets from X to Y`. `--json`:
+
+```json
+{ "from": "age", "to": "sops", "count": 2 }
 ```
 
 ### The editor

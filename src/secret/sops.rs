@@ -112,19 +112,14 @@ impl Sops {
             },
         })
     }
-}
 
-impl Store for Sops {
-    fn kind(&self) -> BackendKind {
-        BackendKind::Sops
-    }
-
-    fn open(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
+    /// How sops is run for this store.
+    fn runner(&self) -> Result<Runner<'_>, SecretError> {
         let dir = self.path.parent().ok_or_else(|| SecretError::Store {
             path: self.path.clone(),
             message: "not a file path".to_string(),
         })?;
-        let runner = Runner {
+        Ok(Runner {
             program: self.program()?,
             store: &self.path,
             config: &self.config,
@@ -133,12 +128,29 @@ impl Store for Sops {
             env: &self.env,
             age_key_file: self.age_key_file.as_deref(),
             timeout: self.timeout,
-        };
+        })
+    }
+}
+
+impl Store for Sops {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Sops
+    }
+
+    fn open(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
         Ok(Box::new(FileVault::open(
             &self.path,
             CIPHERTEXT_LIMIT as u64,
-            runner,
+            self.runner()?,
         )?))
+    }
+
+    fn replace(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
+        Ok(Box::new(FileVault::empty(
+            &self.path,
+            CIPHERTEXT_LIMIT as u64,
+            self.runner()?,
+        )))
     }
 }
 
