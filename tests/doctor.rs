@@ -78,6 +78,22 @@ fn a_missing_secret_is_reported_and_still_exits_zero() {
 }
 
 #[test]
+fn doctor_checks_the_names_of_the_secrets_table() {
+    let sandbox = Sandbox::new("ad");
+    sandbox.write_config(
+        "config.toml",
+        "[secrets]\nbackend = \"age\"\nnames = [\"API_KEY\"]\n\n\
+         [secrets.age]\npath = \"~/s.age\"\nidentity = \"~/id.txt\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        json(&out)["local"]["secrets"],
+        serde_json::json!({"API_KEY": "missing"})
+    );
+}
+
+#[test]
 fn a_reachable_fake_host_is_connectable() {
     let sandbox = Sandbox::new("ad");
     sandbox.with_fake_host();

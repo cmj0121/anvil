@@ -1,9 +1,16 @@
 anvil:
   editor: nvim
   format: yaml
-  secrets:
+secrets:
+  backend: age
+  names:
     - HOST_SUDO
     - API_KEY_2
+  keychain:
+    service: anvil-test
+  age:
+    path: /etc/anvil/secrets.age
+    identity: /etc/anvil/age-identity.txt
 steps:
   - run: hostname
   - run: uname -a

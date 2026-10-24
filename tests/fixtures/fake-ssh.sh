@@ -1,5 +1,6 @@
 #!/bin/sh
-# Fake ssh for the unit tests. Driven by env vars set on the child:
+# Fake ssh for the tests. Driven by env vars set on the child, or sourced from
+# `<home>/fake-ssh.env` when present, for a ControlPath of `<home>/.ssh/anvil/%C`:
 #   FAKE_SSH_LOG            append each invocation's argv (space-joined) as one line
 #   FAKE_SSH_CHECK_EXIT     exit code of `-O check` (default 1: no master)
 #   FAKE_SSH_EXIT           exit code of the key (BatchMode) master attempt (default 0)
@@ -11,6 +12,18 @@
 #   FAKE_SSH_RETRY_STDERR   stderr text of the interactive master attempt
 #   FAKE_SSH_CLIENT_EXIT    exit code of the client; unset runs the script with sh -s
 #   FAKE_SSH_CLIENT_STDERR  stderr text of the client when FAKE_SSH_CLIENT_EXIT is set
+for arg in "$@"; do
+  case "$arg" in
+    ControlPath=*/.ssh/anvil/*)
+      control=${arg#ControlPath=}
+      knobs=${control%/.ssh/anvil/*}/fake-ssh.env
+      if [ -f "$knobs" ]; then
+        . "$knobs"
+      fi
+      ;;
+  esac
+done
+
 if [ -n "${FAKE_SSH_LOG-}" ]; then
   printf '%s\n' "$*" >>"$FAKE_SSH_LOG"
 fi

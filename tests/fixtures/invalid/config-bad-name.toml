@@ -1,0 +1,7 @@
+[secrets]
+backend = "age"
+names = ["HOST_SUDO", "host_sudo"]
+
+[secrets.age]
+path = "/a"
+identity = "/b"

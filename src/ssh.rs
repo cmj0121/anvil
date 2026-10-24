@@ -327,7 +327,7 @@ fn mode_of(path: &Path) -> Result<u32, TransportError> {
 mod tests {
     use super::*;
     use crate::facts::{Facts, PROBE};
-    use crate::test_util::temp_dir;
+    use crate::test_util::{temp_dir, write_knobs};
     use std::os::unix::fs::PermissionsExt;
 
     const CONTROL: &str = "/tmp/h/.ssh/anvil";
@@ -564,24 +564,17 @@ mod tests {
         }
     }
 
-    /// The fake reads its knobs from the child env and tests cannot set the
-    /// process env, so a wrapper script exports them and execs the fake.
+    /// The fake reads its knobs from the child env, which tests cannot set,
+    /// or from `<home>/fake-ssh.env`. The fake is run as committed: an
+    /// executable written by a test can fail to start while another test's
+    /// fork still holds it open for writing.
     fn fake_with(home: &Path, vars: &[(&str, &str)]) -> (Ssh, PathBuf) {
         let log = home.join("argv.log");
         let _ = fs::remove_file(&log);
-        let mut body = format!("#!/bin/sh\nexport FAKE_SSH_LOG='{}'\n", log.display());
-        for (key, value) in vars {
-            body.push_str(&format!("export {key}='{value}'\n"));
-        }
-        body.push_str(&format!("exec '{FAKE}' \"$@\"\n"));
-        let script = home.join("ssh-wrapper.sh");
-        fs::write(&script, body).unwrap();
-        chmod(&script, 0o700);
-        let ssh = Ssh {
-            program: script,
-            ..fake(home)
-        };
-        (ssh, log)
+        let shown = log.display().to_string();
+        let knobs = [&[("FAKE_SSH_LOG", shown.as_str())][..], vars].concat();
+        write_knobs(&home.join("fake-ssh.env"), &knobs);
+        (fake(home), log)
     }
 
     fn invocations(log: &Path) -> Vec<String> {

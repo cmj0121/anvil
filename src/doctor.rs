@@ -1,10 +1,12 @@
 //! `anvil doctor`: local checks, then every selected target's
 //! reachability and facts, one target at a time.
 //!
-//! A missing secret is a warning; a secret the store cannot answer for, a
-//! missing `ssh` or `/bin/sh`, or an unreachable target fails the command
-//! (exit 1). An unresolvable editor is reported but does not fail it: neither
-//! `doctor` nor `apply` needs one.
+//! The secret store is opened before anything else, so a store that cannot
+//! be opened is known before any target is probed. A missing secret is a
+//! warning; a store that cannot answer or is locked, a missing `ssh` or
+//! `/bin/sh`, or an unreachable target fails the command (exit 1). An
+//! unresolvable editor is reported but does not fail it: neither `doctor`
+//! nor `apply` needs one.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -13,12 +15,13 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::cli::{Cli, Failure, print_json};
+use crate::config::Config;
 use crate::editor::{Editor, EditorError, Fallback};
 use crate::facts::{self, Facts, PROBE};
 use crate::inventory::{Target, TargetKind};
 use crate::logger::escape_controls;
 use crate::paths;
-use crate::secret::SecretStore;
+use crate::secret::{SecretError, Store};
 use crate::transport::{Output, Transport, TransportError};
 
 const SH: &str = "/bin/sh";
@@ -29,6 +32,8 @@ pub enum SecretStatus {
     Ok,
     Missing,
     Error,
+    /// The store needs a passphrase and there was no terminal to ask on.
+    Locked,
 }
 
 impl SecretStatus {
@@ -37,6 +42,7 @@ impl SecretStatus {
             SecretStatus::Ok => "ok",
             SecretStatus::Missing => "missing",
             SecretStatus::Error => "error",
+            SecretStatus::Locked => "locked",
         }
     }
 }
@@ -61,7 +67,12 @@ fn path_or_null<S: serde::Serializer>(
 
 impl LocalReport {
     fn ok(&self) -> bool {
-        self.ssh && self.sh && !self.secrets.values().any(|s| *s == SecretStatus::Error)
+        self.ssh
+            && self.sh
+            && !self
+                .secrets
+                .values()
+                .any(|s| matches!(s, SecretStatus::Error | SecretStatus::Locked))
     }
 }
 
@@ -92,14 +103,13 @@ impl Report {
     }
 }
 
-pub fn run(cli: &Cli, store: &dyn SecretStore) -> Result<(), Failure> {
-    let config = cli.load_config()?;
+pub fn run(cli: &Cli, config: &Config, store: &dyn Store) -> Result<(), Failure> {
+    let secrets = check_secrets(config.names(), store);
     let targets = cli.targets()?;
     let local = local_checks(
         &cli.ssh_program(),
         Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict),
-        &config.anvil.secrets,
-        store,
+        secrets,
     );
     let targets = targets
         .iter()
@@ -121,8 +131,7 @@ pub fn run(cli: &Cli, store: &dyn SecretStore) -> Result<(), Failure> {
 fn local_checks(
     ssh_program: &Path,
     editor: Result<Editor, EditorError>,
-    secrets: &[String],
-    store: &dyn SecretStore,
+    secrets: BTreeMap<String, SecretStatus>,
 ) -> LocalReport {
     let path = std::env::var_os("PATH");
     let ssh = paths::find_program(ssh_program, path.as_deref()).is_some();
@@ -143,25 +152,38 @@ fn local_checks(
         ssh,
         sh,
         editor,
-        secrets: check_secrets(secrets, store),
+        secrets,
     }
 }
 
-/// `exists` only: attributes, never the stored data.
-fn check_secrets(names: &[String], store: &dyn SecretStore) -> BTreeMap<String, SecretStatus> {
+/// Opens the store and checks `names` against the names it holds; the
+/// keychain answers from attributes, never the stored data. Nothing is opened
+/// when no name is required. A store that cannot be opened reports every
+/// name `locked` or `error`.
+fn check_secrets(names: &[String], store: &dyn Store) -> BTreeMap<String, SecretStatus> {
+    if names.is_empty() {
+        return BTreeMap::new();
+    }
+    log::debug!("opening the {} secret store", store.kind());
+    let stored = match store.open().and_then(|vault| vault.names()) {
+        Ok(stored) => stored,
+        Err(err) => {
+            log::error!("{err}");
+            let status = match err {
+                SecretError::Locked => SecretStatus::Locked,
+                _ => SecretStatus::Error,
+            };
+            return names.iter().map(|name| (name.clone(), status)).collect();
+        }
+    };
     names
         .iter()
         .map(|name| {
-            let status = match store.exists(name) {
-                Ok(true) => SecretStatus::Ok,
-                Ok(false) => {
-                    log::warn!("secret {name}: missing; set it with `anvil secret {name}`");
-                    SecretStatus::Missing
-                }
-                Err(err) => {
-                    log::error!("{err}");
-                    SecretStatus::Error
-                }
+            let status = if stored.binary_search(name).is_ok() {
+                SecretStatus::Ok
+            } else {
+                log::warn!("secret {name}: missing; set it with `anvil secret {name}`");
+                SecretStatus::Missing
             };
             (name.clone(), status)
         })
@@ -254,9 +276,13 @@ fn render(report: &Report) -> String {
         }
     }
     for (name, status) in &local.secrets {
+        let reason = match status {
+            SecretStatus::Locked => ": run in a terminal to unlock",
+            _ => "",
+        };
         let _ = writeln!(
             out,
-            "  {:<15} {}",
+            "  {:<15} {}{reason}",
             format!("secret {name}"),
             status.as_str()
         );
@@ -285,8 +311,9 @@ fn render(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secret::{Memory, SecretError};
-    use crate::test_util::{json, keys};
+
+    use crate::secret::Memory;
+    use crate::test_util::{Unopenable, json, keys};
 
     /// Answers every script with fixed output, or fails, without a process.
     struct Fake(Result<&'static str, TransportError>);
@@ -322,26 +349,12 @@ mod tests {
         }
     }
 
-    /// A store that cannot answer, like a locked or missing keychain.
-    struct Broken;
-
-    impl SecretStore for Broken {
-        fn exists(&self, name: &str) -> Result<bool, SecretError> {
-            Err(SecretError::Keychain {
-                op: "exists",
-                name: name.to_owned(),
-                code: -25308,
-                message: None,
-            })
-        }
-        fn get(&self, _: &str) -> Result<Option<Vec<u8>>, SecretError> {
-            unreachable!("doctor never reads a secret")
-        }
-        fn set(&self, _: &str, _: &[u8]) -> Result<(), SecretError> {
-            unreachable!()
-        }
-        fn delete(&self, _: &str) -> Result<(), SecretError> {
-            unreachable!()
+    fn keychain_refusal() -> SecretError {
+        SecretError::Keychain {
+            op: "search",
+            name: "anvil".to_owned(),
+            code: -25308,
+            message: None,
         }
     }
 
@@ -364,13 +377,12 @@ mod tests {
         Ok(Box::new(Fake(result)))
     }
 
-    fn healthy_local(store: &dyn SecretStore, secrets: &[&str]) -> LocalReport {
+    fn healthy_local(store: &dyn Store, secrets: &[&str]) -> LocalReport {
         let secrets: Vec<String> = secrets.iter().map(|s| s.to_string()).collect();
         local_checks(
             Path::new(SH),
             Editor::from_command(SH, None),
-            &secrets,
-            store,
+            check_secrets(&secrets, store),
         )
     }
 
@@ -462,12 +474,10 @@ mod tests {
 
     #[test]
     fn unresolvable_editor_is_null_and_does_not_fail() {
-        let store = Memory::default();
         let local = local_checks(
             Path::new(SH),
             Editor::from_command("anvil-no-such-editor", None),
-            &[],
-            &store,
+            BTreeMap::new(),
         );
         assert!(local.ok());
         assert_eq!(json(&local)["editor"], serde_json::Value::Null);
@@ -480,12 +490,10 @@ mod tests {
 
     #[test]
     fn missing_ssh_fails_the_local_checks() {
-        let store = Memory::default();
         let local = local_checks(
             Path::new("/nonexistent/ssh"),
             Editor::from_command(SH, None),
-            &[],
-            &store,
+            BTreeMap::new(),
         );
         assert!(!local.ssh);
         assert!(!local.ok());
@@ -494,7 +502,7 @@ mod tests {
     #[test]
     fn secrets_ok_missing_and_error() {
         let store = Memory::default();
-        store.set("HOST_SUDO", b"x").unwrap();
+        store.open().unwrap().set("HOST_SUDO", b"x").unwrap();
         let local = healthy_local(&store, &["HOST_SUDO", "OTHER"]);
         assert!(local.ok(), "missing is only a warning");
         assert_eq!(
@@ -502,12 +510,63 @@ mod tests {
             serde_json::json!({"HOST_SUDO": "ok", "OTHER": "missing"})
         );
 
-        let local = healthy_local(&Broken, &["HOST_SUDO"]);
+        let local = healthy_local(&Unopenable::new(keychain_refusal), &["HOST_SUDO"]);
         assert!(!local.ok(), "a store error fails doctor");
         assert_eq!(
             json(&local)["secrets"],
             serde_json::json!({"HOST_SUDO": "error"})
         );
+    }
+
+    #[test]
+    fn a_locked_store_reports_every_name_locked_and_fails() {
+        let store = Unopenable::new(|| SecretError::Locked);
+        let local = healthy_local(&store, &["HOST_SUDO", "API_KEY"]);
+        assert!(local.ssh && local.sh && local.editor.is_ok());
+        assert!(!local.ok(), "a locked store fails doctor");
+        assert_eq!(
+            json(&local)["secrets"],
+            serde_json::json!({"API_KEY": "locked", "HOST_SUDO": "locked"})
+        );
+        let text = render(&Report::new(local, vec![]));
+        assert!(
+            text.contains("  secret HOST_SUDO locked: run in a terminal to unlock\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn no_required_name_opens_nothing() {
+        let store = Unopenable::new(|| SecretError::Locked);
+        assert!(healthy_local(&store, &[]).ok());
+        assert_eq!(store.opened.get(), 0);
+    }
+
+    #[test]
+    fn the_store_is_opened_before_the_targets_are_loaded() {
+        let dir = crate::test_util::temp_dir("doctor-order");
+        let inventory = dir.join("inventory.toml");
+        std::fs::write(&inventory, "not = [valid").unwrap();
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "anvil",
+            "--inventory",
+            inventory.to_str().unwrap(),
+            "doctor",
+        ])
+        .unwrap();
+        let config = Config {
+            secrets: None,
+            anvil: crate::config::AnvilPrefs {
+                secrets: Some(vec!["HOST_SUDO".to_owned()]),
+                ..Default::default()
+            },
+            steps: vec![],
+        };
+        let store = Unopenable::new(|| SecretError::Locked);
+        let failure = run(&cli, &config, &store).unwrap_err();
+        assert_eq!(failure.code, 2, "{}", failure.message);
+        assert_eq!(store.opened.get(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

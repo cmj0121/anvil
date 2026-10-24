@@ -6,7 +6,7 @@
 //! of them present is ambiguous. `--inventory PATH` / `--config PATH` bypass
 //! the lookup and must end in `.toml`.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -57,6 +57,14 @@ pub fn config_dir() -> Result<PathBuf, PathsError> {
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
+}
+
+/// The variables of this process whose names `keep` accepts, for a child
+/// started with a cleared environment.
+pub fn env_subset(keep: impl Fn(&str) -> bool) -> Vec<(OsString, OsString)> {
+    std::env::vars_os()
+        .filter(|(name, _)| name.to_str().is_some_and(&keep))
+        .collect()
 }
 
 /// The config directory for the given `$XDG_CONFIG_HOME` and `$HOME` values;
@@ -159,6 +167,16 @@ pub fn check_private_dir(dir: &Path, uid: u32) -> Result<(), PrivateDirError> {
         return Err(PrivateDirError::Mode(mode));
     }
     Ok(())
+}
+
+/// Whether `a` and `b` name the same file: when both exist, by device and
+/// inode (so a symlink, a hard link or `..` cannot hide it), else as
+/// written.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => a == b,
+    }
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -302,5 +320,25 @@ mod tests {
             rel.push("..");
         }
         rel.join(to.strip_prefix("/").unwrap())
+    }
+
+    #[test]
+    fn same_file_sees_through_links_hard_links_and_dots() {
+        let root = crate::test_util::temp_dir("paths-same");
+        let file = root.join("key.txt");
+        fs::write(&file, "k").unwrap();
+        std::os::unix::fs::symlink(&file, root.join("link.txt")).unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        assert!(same_file(&file, &root.join("link.txt")));
+        assert!(same_file(&file, &root.join("sub/../key.txt")));
+        fs::hard_link(&file, root.join("hard.txt")).unwrap();
+        assert!(same_file(&file, &root.join("hard.txt")));
+        fs::write(root.join("copy.txt"), "k").unwrap();
+        assert!(!same_file(&file, &root.join("copy.txt")));
+        assert!(same_file(&root.join("absent"), &root.join("absent")));
+        assert!(same_file(&root.join("./absent"), &root.join("absent")));
+        assert!(!same_file(&file, &root.join("absent")));
+        assert!(!same_file(&root.join("a"), &root.join("b")));
+        fs::remove_dir_all(&root).unwrap();
     }
 }
