@@ -59,6 +59,7 @@ pub enum SecretError {
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     Unsupported,
     /// The keychain refused `op` on `name` with an OSStatus `code`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Keychain {
         op: &'static str,
         name: String,
