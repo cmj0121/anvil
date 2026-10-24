@@ -250,6 +250,26 @@ else
   echo "skip (no python3)"
 fi
 
+step "(k) anvil tui: doctor on the password user, ssh's prompt handed over from the worker"
+# pty_tui.py needs os.login_tty: python3 3.11 or newer.
+if python3 -c 'import os; os.login_tty' 2>/dev/null; then
+  # A HOME of its own, so the master (e) left behind does not answer for archpw.
+  mkdir -p "$TMP/home-tui"
+  before=$(docker logs "$NAME" 2>&1 | grep -c 'Accepted password for pw')
+  run_env HOME="$TMP/home-tui" PTY_PASSWORD="$PASSWORD" python3 tests/fixtures/pty_tui.py --prompts 1 \
+    --wait '\[x\] archpw' --send d --wait 'connectable +yes' --wait 'distro +arch' --send q \
+    -- "$ANVIL" --ssh-config "$CFG" tui --target archpw >"$TMP/out" 2>"$TMP/err"
+  code=$?
+  after=$(docker logs "$NAME" 2>&1 | grep -c 'Accepted password for pw')
+  if [ "$code" -eq 0 ] && [ "$after" -eq $((before + 1)) ]; then
+    pass "password typed at ssh's prompt, archpw connectable, terminal restored"
+  else
+    fail "tui doctor over the pty: exit $code, $((after - before)) password sign-ins"
+  fi
+else
+  echo "skip (no python3 with os.login_tty, 3.11 or newer)"
+fi
+
 step "(f) unknown host key is refused with the ssh hint"
 sed "s|UserKnownHostsFile .*|UserKnownHostsFile $EMPTY_KNOWN|" "$CFG" >"$CFG.unknown"
 mv "$CFG.unknown" "$CFG"

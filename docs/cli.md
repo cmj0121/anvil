@@ -11,25 +11,27 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   apply                          run the config's steps on every target
   secret <NAME>                  edit one secret in the editor
   secret --migrate --to BACKEND  move every secret to keychain, age or sops and select it
+  tui                            run every command and browse the results in a terminal UI
 ```
 
 ## Common flags
 
 Every flag is global: it may come before or after the command.
 
-| Flag                | Effect                                                                                         |
-| ------------------- | ---------------------------------------------------------------------------------------------- |
-| `-v`, `--verbose`   | more logs on stderr; repeat: `-v` warnings, `-vv` info, `-vvv` debug (see [Logging](#logging)) |
-| `--inventory PATH`  | use this inventory file instead of the discovered one; PATH must end in `.toml` (else exit 2)  |
-| `--config PATH`     | use this config file instead of the discovered one; PATH must end in `.toml` (else exit 2)     |
-| `--ssh-config PATH` | passed to every `ssh` as `-F PATH`                                                             |
-| `--json`            | print exactly one JSON document on stdout instead of human output                              |
-| `--target SEL`      | `local`, a host name or a tag; repeat to take the union; none means `local` plus every host    |
-| `-h`, `--help`      | help                                                                                           |
-| `-V`, `--version`   | version                                                                                        |
+| Flag                | Effect                                                                                                |
+| ------------------- | ----------------------------------------------------------------------------------------------------- |
+| `-v`, `--verbose`   | more logs on stderr (`tui`: Log pane); `-v` warnings, `-vv` info, `-vvv` debug ([Logging](#logging))  |
+| `--inventory PATH`  | this inventory file, not the discovered one; must end in `.toml` (else exit 2; see [tui](#anvil-tui)) |
+| `--config PATH`     | use this config file instead of the discovered one; PATH must end in `.toml` (else exit 2)            |
+| `--ssh-config PATH` | passed to every `ssh` as `-F PATH`                                                                    |
+| `--json`            | print exactly one JSON document on stdout instead of human output                                     |
+| `--target SEL`      | `local`, a host name or a tag; repeat to take the union; none means `local` plus every host           |
+| `-h`, `--help`      | help                                                                                                  |
+| `-V`, `--version`   | version                                                                                               |
 
 The JSON examples below are pretty-printed; anvil prints each document on one line. An unknown `--target` is a usage
-error (exit 2). `inventory`, `config` and `secret` ignore `--target` with a warning.
+error (exit 2; for `tui` only when the inventory loads). `inventory`, `config` and `secret` ignore `--target` with a
+warning.
 Targets run one after another, `local` first, then hosts sorted by name; a failing target does not stop the others.
 
 ## Commands
@@ -232,6 +234,81 @@ Human output: `migrated N secrets from X to Y` (`1 secret` for one). `--json`:
 { "from": "age", "to": "sops", "count": 2 }
 ```
 
+### `anvil tui`
+
+Runs every command above in one terminal UI and keeps their results for browsing. It starts only when asked: bare
+`anvil` still prints the help, so a script or an agent never lands in a TUI. stdin and stdout must be a terminal (else
+exit 2, `anvil tui needs a terminal`), and `--json` is refused (exit 2, `anvil tui: --json is not available`), although
+`anvil tui --help` lists it among the global flags. The global flags are the starting state: `--target` preselects rows,
+`-v` sets the Log pane level, and `--inventory`, `--config` and `--ssh-config` the paths. An inventory that does not
+load (any load error: unreadable, such as permission denied or a directory, invalid or ambiguous, an `--inventory`
+path not ending in `.toml`, or no `$HOME`) is not exit 2: the TUI starts and shows the error in the Inventory pane, in
+place of Targets and Tags; `o` changes the path and `r` reloads it. An unknown `--target` is exit 2, as for any command,
+but only when the inventory loads. Quitting exits 0.
+
+The screen has Targets (`[x] name  detail`, `local` first) and Tags on the left, the Results pane on the right, and a
+status bar with the key hints or the last notice, the edit format, the `-v` level and `N ok, M failed` for the shown
+result. Apply results read like the CLI's blocks (`▶ name`, `$ command`, its output, `✔ ok · N steps`, `✘ reason` or
+`⊘ cancelled`), doctor results like its human output; a spinner marks the running target. Host and config text is
+escaped as in the CLI, and a secret value is never drawn.
+
+| Key          | Action                                                 | CLI equivalent                            |
+| ------------ | ------------------------------------------------------ | ----------------------------------------- |
+| `↑↓` / `jk`  | move in Targets; scroll in Results                     | —                                         |
+| `Space`      | select the target or tag under the cursor              | `--target SEL`                            |
+| `Tab`        | cycle focus: Targets, Results, Log (when shown)        | —                                         |
+| `d`          | doctor on the selection                                | `anvil doctor`                            |
+| `a`          | apply on the selection                                 | `anvil apply`                             |
+| `Esc`        | cancel the run; close an overlay                       | —                                         |
+| `i`          | edit the inventory, then reload it                     | `anvil inventory`                         |
+| `c`          | edit the config, then reload the inventory             | `anvil config`                            |
+| `f`          | cycle the edit format: default, `toml`, `yaml`         | `--format toml\|yaml`                     |
+| `s`          | prompt for NAME, then edit that secret                 | `anvil secret NAME`                       |
+| `m`          | choose keychain, age or sops, then migrate             | `anvil secret --migrate --to BACKEND`     |
+| `o`          | edit the paths; empty is the default, `~` is `$HOME`   | `--inventory`, `--config`, `--ssh-config` |
+| `+` / `-`    | log level 0 to 3                                       | `-v`, `-vv`, `-vvv`                       |
+| `l`          | show or hide the Log pane (8 rows)                     | the log on stderr                         |
+| `[` / `]`    | previous / next result                                 | —                                         |
+| `r`          | reload the inventory                                   | —                                         |
+| `?`          | help                                                   | `--help`                                  |
+| `q` / Ctrl-C | quit; while running, cancel and quit once the run ends | —                                         |
+
+With nothing selected, `d` and `a` run on every target, as the CLI does without `--target`. `f` starts at
+`[anvil].format` and its choice holds for the session. In the `o` overlay `Tab` or `↑↓` moves between the fields, Enter
+applies the three paths (a leading `~/` or a bare `~` is `$HOME`) and reloads the inventory, and `Esc` discards them.
+`s` refuses a NAME that does not match `[A-Z][A-Z0-9_]*` and shows the rule. In a text field (the `s` NAME prompt,
+the `o` paths) `q` is typed into the field; Ctrl-C still quits. `anvil tui --version` prints `anvil-tui VERSION`.
+
+- **One run at a time.** While doctor or apply runs, `d`, `a`, `i`, `c`, `s`, `m` and `o` are refused with
+  `busy: <run> is running (Esc cancels)` on the status bar. A run keeps the selection and paths it started with.
+- **Esc cancels between steps.** apply checks before each target and each step: the running step finishes, and the rest
+  of that target and every later target end as `⊘ cancelled`. A remote step is never killed. doctor cannot be cancelled;
+  its probes are bounded by the [ssh timeouts](#ssh-behaviour).
+- **Handoff.** The editor (`i`, `c`, `s`), the migration (`m`, so its age passphrase prompt works), ssh's interactive
+  retry (a password, passphrase or PIN, see [SSH behaviour](#ssh-behaviour)) and the
+  [age passphrase prompt](#the-passphrase-prompt) get the real terminal: the TUI leaves its screen, the program runs as
+  it would in the CLI, then the TUI comes back and shows the outcome. ssh's prompt comes from a doctor or apply run;
+  while it waits the TUI reads no keys, so `Esc` takes effect only once the TUI is back. Ctrl-C at such a prompt goes to
+  ssh or the editor, never to anvil: ssh stops and the target fails with its error, an editor handles Ctrl-C its own
+  way. The TUI then shows `interrupted at a prompt` (also a WARN line in the log, whatever the level). At the age
+  prompt Ctrl-C cancels, as in the CLI.
+- **An invalid edit.** The parse error is printed on the real terminal and the editor reopens, up to three attempts as
+  in the CLI. After the last one the TUI shows only `inventory: still invalid after 3 attempts, nothing written` (or
+  `config: …`); the parse error was on the terminal while the editor had it, and is gone once the TUI redraws.
+- **Session-only history.** Every result stays in memory until you quit, browsable with `[` and `]`; nothing is written
+  to disk. Edit results are text only: `wrote PATH`, `PATH: unchanged`, `secret NAME: updated` (or `unchanged`),
+  `migrated N secrets from X to Y`, or the error.
+- **A reload keeps the selection.** `r`, `o` and the reload after `i` or `c` keep every selected target and tag by
+  name. A selected name no longer in the inventory is unselected, with the notice
+  `no longer in the inventory, unselected: NAME, …` on the status bar.
+- **Logs** go to the Log pane, never to stderr, at the level `-v` starts with and `+` and `-` change.
+- **Signals.** Only SIGINT restores the terminal. SIGTERM, SIGHUP or a `kill -TSTP` end or stop anvil without
+  restoring it, which can leave the terminal in raw mode; run `reset` to fix it.
+
+The TUI is the cargo feature `tui` (ratatui, crossterm and signal-hook), on by default. `cargo build
+--no-default-features` (or `cargo install --path . --no-default-features`) builds the CLI without it and without those
+crates; that binary has no `tui` command.
+
 ### The editor
 
 `[anvil].editor`, else `$VISUAL`, else `$EDITOR`, else `nvim`; split on whitespace into argv (never run through a shell);
@@ -254,8 +331,12 @@ that exits non-zero aborts the command: nothing is written, exit 1.
   `inventory`/`config`/`secret`: the editor exited non-zero (aborted), a file write failed, or the secret store failed,
   is locked or its passphrase prompt was cancelled.
 - **2**: a bad flag or argument (including an `--inventory` or `--config` path not ending in `.toml`), an unknown
-  `--target`, an invalid or ambiguous file, no `$HOME`, editor not found, an invalid buffer after three attempts, or a
-  secret larger than 1 MiB.
+  `--target`, an invalid, unreadable or ambiguous file, no `$HOME`, editor not found, an invalid buffer after three
+  attempts, or a secret larger than 1 MiB. For `tui`, see below.
+- **`tui`**: 0 on quit, whatever the results. 2 when stdin or stdout is not a terminal, for `--json`, or for an unknown
+  `--target` (checked only when the inventory loads); an inventory that does not load (any load error, including an
+  `--inventory` path not ending in `.toml`) is shown in the Inventory pane instead. 1 when the terminal cannot be set up
+  (`cannot handle SIGINT: …`, `cannot enter the terminal: …`) or fails while the TUI runs (`terminal: …`).
 
 ## Files and formats
 
@@ -503,11 +584,12 @@ from `--ssh-config`; `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE` and `DISPLAY` are remo
 
 ## Logging
 
-Logs go to stderr as `LEVEL target: message`; `--json` output on stdout stays a single document. The default shows
-errors only; `-v` adds warnings, `-vv` info, `-vvv` debug, which includes the argv of every `ssh` and editor spawn. A
-fatal error is the last line before a non-zero exit. Control characters in a message (ssh's or a host's text) are shown
-as `\x1b`-style escapes; `doctor`'s human output escapes them too. Secret values, probe output and file contents are
-never logged at any level. There are no log files and no `RUST_LOG`.
+Logs go to stderr as `LEVEL target: message` (in `anvil tui`, to its [Log pane](#anvil-tui) instead); `--json` output
+on stdout stays a single document. The default shows errors only; `-v` adds warnings, `-vv` info, `-vvv` debug, which
+includes the argv of every `ssh` and editor spawn. A fatal error is the last line before a non-zero exit. Control
+characters in a message (ssh's or a host's text) are shown as `\x1b`-style escapes; `doctor`'s human output escapes them
+too. Secret values, probe output and file contents are never logged at any level. There are no log files and no
+`RUST_LOG`.
 
 ## Deviations from #2/#3
 
