@@ -77,7 +77,7 @@ impl LocalReport {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TargetReport {
     pub target: String,
     pub connectable: bool,
@@ -106,7 +106,10 @@ impl Report {
 
 /// What [`check`] reports as it goes: a target about to be probed, and its
 /// report once probed.
-#[allow(dead_code, reason = "read by the TUI")]
+#[cfg_attr(
+    not(any(test, feature = "tui")),
+    expect(dead_code, reason = "read by the TUI")
+)]
 pub enum Progress<'a> {
     Start(&'a Target),
     Done(&'a TargetReport),

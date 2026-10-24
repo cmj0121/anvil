@@ -4,22 +4,28 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use super::app::{App, Overlay, Pane};
+use super::app::{App, Overlay, Pane, RunResult, Running};
+use crate::doctor::{self, SecretStatus};
 use crate::logger::escape_controls;
+use crate::{apply, apply::TargetReport};
 
 const LEFT_WIDTH: u16 = 28;
 const LOG_ROWS: u16 = 8;
+const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const HELP: &[(&str, &str)] = &[
     ("↑↓ / j k", "move"),
     ("Space", "select a target or tag"),
     ("Tab", "cycle focus"),
+    ("d", "doctor"),
+    ("a", "apply"),
+    ("Esc", "cancel a run / close"),
+    ("[ ]", "previous / next result"),
     ("?", "this help"),
-    ("Esc", "close this help"),
     ("q / Ctrl-C", "quit"),
 ];
 
@@ -105,10 +111,138 @@ fn line(text: String, under_cursor: bool) -> Line<'static> {
 }
 
 fn draw_results(app: &App, f: &mut Frame, area: Rect) {
-    let results = Paragraph::new("No results yet.")
+    let mut lines = match app.shown_result() {
+        None => vec![Line::from("No results yet.")],
+        Some(RunResult::Apply { targets, error, .. }) => {
+            let mut lines: Vec<Line> = targets.iter().flat_map(apply_block).collect();
+            lines.extend(run_error(error.as_deref()));
+            lines
+        }
+        Some(RunResult::Doctor {
+            local,
+            targets,
+            error,
+            ..
+        }) => {
+            let mut lines = local.as_ref().map(local_block).unwrap_or_default();
+            lines.extend(targets.iter().flat_map(doctor_block));
+            lines.extend(run_error(error.as_deref()));
+            lines
+        }
+        Some(RunResult::Edit { what, outcome }) => {
+            let text = match outcome {
+                Ok(text) => format!("{what}: {text}"),
+                Err(err) => format!("{what}: ✘ {err}"),
+            };
+            vec![Line::from(escape_controls(&text).into_owned())]
+        }
+    };
+    // The running result is the newest one.
+    if let Some(running) = &app.running
+        && app.shown == Some(app.results.len() - 1)
+    {
+        lines.push(spinner(running));
+    }
+    let results = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
         .scroll((app.scroll, 0))
         .block(block("Results", app.focus == Pane::Results));
     f.render_widget(results, area);
+}
+
+fn spinner(running: &Running) -> Line<'static> {
+    let glyph = SPINNER[usize::from(running.tick) % SPINNER.len()];
+    let what = running.current.as_deref().unwrap_or(running.kind.as_str());
+    Line::from(format!("{glyph} {}", escape_controls(what))).style(Color::Cyan)
+}
+
+fn text(text: &str) -> String {
+    escape_controls(text).into_owned()
+}
+
+/// Like the CLI's block: `▶ target`, each step's `$ command` and indented
+/// output, then `✔ ok · N steps`, `✘ reason` or `⊘ cancelled`.
+fn apply_block(report: &TargetReport) -> Vec<Line<'static>> {
+    let steps = report.steps();
+    let bold = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let mut lines = vec![Line::from(format!("▶ {}", text(report.target()))).style(bold)];
+    for step in steps {
+        let command = format!("  $ {}", text(&apply::command(&step.run)));
+        lines.push(Line::from(command).style(Modifier::DIM));
+        lines.extend(
+            step.stdout
+                .lines()
+                .map(|l| Line::from(format!("    {}", text(l)))),
+        );
+        lines.extend(
+            step.stderr
+                .lines()
+                .map(|l| Line::from(format!("    {}", text(l))).style(Color::Yellow)),
+        );
+    }
+    let end = if let TargetReport::Cancelled { .. } = report {
+        Line::from("  ⊘ cancelled").style(Color::Red)
+    } else {
+        match report.failure() {
+            Some(reason) => Line::from(format!("  ✘ {}", text(&reason))).style(Color::Red),
+            None => Line::from(format!("  ✔ {}", apply::ok_text(steps.len()))).style(Color::Green),
+        }
+    };
+    lines.extend([end, Line::default()]);
+    lines
+}
+
+fn row(key: &str, value: &str) -> Line<'static> {
+    Line::from(format!("  {key:<15} {}", text(value)))
+}
+
+/// The local checks, as the CLI prints them.
+fn local_block(local: &doctor::LocalReport) -> Vec<Line<'static>> {
+    let yes_no = |ok: bool| if ok { "ok" } else { "missing" };
+    let mut lines = vec![
+        Line::from("local checks").style(Modifier::BOLD),
+        row("ssh", yes_no(local.ssh)),
+        row("sh", yes_no(local.sh)),
+        match &local.editor {
+            Ok(path) => row("editor", &path.display().to_string()),
+            Err(error) => row("editor", &format!("error: {error}")),
+        },
+    ];
+    for (name, status) in &local.secrets {
+        let reason = match status {
+            SecretStatus::Locked => ": not unlocked",
+            _ => "",
+        };
+        lines.push(row(
+            &format!("secret {}", text(name)),
+            &format!("{}{reason}", status.as_str()),
+        ));
+    }
+    lines.push(Line::default());
+    lines
+}
+
+/// One target: how it is reached, whether it is connectable, its facts
+/// and its error.
+fn doctor_block(report: &doctor::TargetReport) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(text(&report.target)).style(Modifier::BOLD),
+        row("transport", &report.transport),
+        row("connectable", if report.connectable { "yes" } else { "no" }),
+    ];
+    for (key, value) in report.facts.iter().flat_map(doctor::fact_rows) {
+        lines.push(row(key, &value));
+    }
+    if let Some(error) = &report.error {
+        lines.push(row("error", error).style(Color::Red));
+    }
+    lines.push(Line::default());
+    lines
+}
+
+/// A failure that ended the whole run: config, inventory, or a panic.
+fn run_error(error: Option<&str>) -> Option<Line<'static>> {
+    error.map(|error| Line::from(format!("✘ {}", text(error))).style(Color::Red))
 }
 
 fn draw_log(app: &App, f: &mut Frame, area: Rect) {
@@ -130,10 +264,11 @@ fn status_line(app: &App) -> String {
     let format = app
         .edit_format
         .map_or_else(|| "default".to_owned(), |format| format.to_string());
-    let mut status = format!(
-        " ↑↓ move · Space select · Tab focus · ? help · q quit │ format {format} │ -v {}",
-        app.opts.verbose
+    let lead = app.notice.as_deref().map_or_else(
+        || "d doctor · a apply · [ ] results · ? help · q quit".to_owned(),
+        |notice| escape_controls(notice).into_owned(),
     );
+    let mut status = format!(" {lead} │ format {format} │ -v {}", app.opts.verbose);
     if let Some((ok, failed)) = app.shown_result().and_then(|r| r.counts()) {
         status.push_str(&format!(" │ {ok} ok, {failed} failed"));
     }
@@ -162,8 +297,11 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::tui::app::tests::{app, opts};
-    use crate::tui::app::{LogLine, RunResult};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use crate::tui::app::tests::{app, cancelled, local_report, opts, probed, ran, step};
+    use crate::tui::app::{LogLine, RunKind, RunResult, Running};
 
     fn render(app: &App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -196,7 +334,7 @@ mod tests {
                 "│[ ] dev                   ││                                                  │",
                 "│[ ] home                  ││                                                  │",
                 "└──────────────────────────┘└──────────────────────────────────────────────────┘",
-                " ↑↓ move · Space select · Tab focus · ? help · q quit │ format default │ -v 0",
+                " d doctor · a apply · [ ] results · ? help · q quit │ format default │ -v 0",
             ]
         );
     }
@@ -205,16 +343,19 @@ mod tests {
     fn the_help_overlay_lists_the_keys() {
         let mut app = app();
         app.overlay = Some(Overlay::Help);
-        let screen = render(&app, 80, 12);
+        let screen = render(&app, 80, 15);
         assert_eq!(
-            screen[2..10],
+            screen[2..13],
             [
                 "│[ ] mac  me@10.0.0.┌Help──────────────────────────────────┐                   │",
                 "│[ ] pi  pi.lan     │ ↑↓ / j k    move                     │                   │",
                 "└───────────────────│ Space       select a target or tag   │                   │",
                 "┌Tags───────────────│ Tab         cycle focus              │                   │",
-                "│[ ] dev            │ ?           this help                │                   │",
-                "│[ ] home           │ Esc         close this help          │                   │",
+                "│[ ] dev            │ d           doctor                   │                   │",
+                "│[ ] home           │ a           apply                    │                   │",
+                "│                   │ Esc         cancel a run / close     │                   │",
+                "│                   │ [ ]         previous / next result   │                   │",
+                "│                   │ ?           this help                │                   │",
                 "│                   │ q / Ctrl-C  quit                     │                   │",
                 "│                   └──────────────────────────────────────┘                   │",
             ]
@@ -259,7 +400,202 @@ mod tests {
         let screen = render(&app, 100, 10);
         assert_eq!(
             screen[9],
-            " ↑↓ move · Space select · Tab focus · ? help · q quit │ format yaml │ -v 2 │ 0 ok, 0 failed"
+            " d doctor · a apply · [ ] results · ? help · q quit │ format yaml │ -v 2 │ 0 ok, 0 failed"
+        );
+    }
+
+    /// The Results pane's inner rows of an 80-column screen.
+    fn results(app: &App, height: u16) -> Vec<String> {
+        render(app, 80, height)[1..usize::from(height) - 2]
+            .iter()
+            .map(|row| {
+                let inner: String = row.chars().skip(29).collect();
+                inner.trim_end_matches(['│', ' ']).to_owned()
+            })
+            .collect()
+    }
+
+    fn show(app: &mut App, result: RunResult) {
+        app.results.push(result);
+        app.shown = Some(app.results.len() - 1);
+    }
+
+    #[test]
+    fn the_apply_view_shows_steps_failures_and_cancelled_targets() {
+        let mut app = app();
+        let multi_line = "printf 'a\\n'\nprintf 'b\\n'";
+        show(
+            &mut app,
+            RunResult::Apply {
+                targets: vec![
+                    ran(
+                        "local",
+                        vec![step(multi_line, Some(0), "a\nb\n", "warn: \x1b[31mred\n")],
+                    ),
+                    ran(
+                        "pi\x1b]0;x",
+                        vec![
+                            step("hostname", Some(0), "pi\n", ""),
+                            step("false", Some(2), "", ""),
+                        ],
+                    ),
+                    cancelled("mac"),
+                ],
+                ok: Some(false),
+                error: None,
+            },
+        );
+        let status = render(&app, 100, 20).pop().unwrap();
+        assert_eq!(
+            results(&app, 20),
+            [
+                "▶ local",
+                "  $ printf 'a\\n' …",
+                "    a",
+                "    b",
+                "    warn: \\x1b[31mred",
+                "  ✔ ok · 1 step",
+                "",
+                "▶ pi\\x1b]0;x",
+                "  $ hostname",
+                "    pi",
+                "  $ false",
+                "  ✘ step 2 exited 2",
+                "",
+                "▶ mac",
+                "  ⊘ cancelled",
+                "",
+                "",
+            ]
+        );
+        assert!(status.ends_with("│ 1 ok, 2 failed"), "{status}");
+    }
+
+    #[test]
+    fn a_transport_error_and_a_run_error_end_the_view() {
+        let mut app = app();
+        show(
+            &mut app,
+            RunResult::Apply {
+                targets: vec![crate::apply::TargetReport::Failed {
+                    target: "pi".to_owned(),
+                    steps: Vec::new(),
+                    error: "ssh: connect timed out\x07".to_owned(),
+                    ok: false,
+                }],
+                ok: Some(false),
+                error: Some("apply panicked: boom".to_owned()),
+            },
+        );
+        assert_eq!(
+            results(&app, 8)[..4],
+            [
+                "▶ pi",
+                "  ✘ ssh: connect timed out\\x07",
+                "",
+                "✘ apply panicked: boom"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_running_target_has_a_spinner() {
+        let mut app = app();
+        show(
+            &mut app,
+            RunResult::Apply {
+                targets: vec![ran("local", Vec::new())],
+                ok: None,
+                error: None,
+            },
+        );
+        app.running = Some(Running {
+            kind: RunKind::Apply,
+            current: Some("pi\x1b".to_owned()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            tick: 11,
+        });
+        assert_eq!(
+            results(&app, 8)[..4],
+            ["▶ local", "  ✔ ok · 0 steps", "", "⠙ pi\\x1b"]
+        );
+        // The spinner goes with the newest result only.
+        app.results.push(RunResult::Apply {
+            targets: Vec::new(),
+            ok: None,
+            error: None,
+        });
+        assert_eq!(
+            results(&app, 8)[..4],
+            ["▶ local", "  ✔ ok · 0 steps", "", ""]
+        );
+    }
+
+    #[test]
+    fn the_doctor_view_shows_local_checks_then_each_target() {
+        let mut app = app();
+        show(
+            &mut app,
+            RunResult::Doctor {
+                local: Some(local_report()),
+                targets: vec![
+                    probed("pi", None),
+                    probed("mac", Some("ssh: no route\x1b[2J")),
+                ],
+                ok: Some(false),
+                error: None,
+            },
+        );
+        let status = render(&app, 100, 22).pop().unwrap();
+        assert_eq!(
+            results(&app, 22),
+            [
+                "local checks",
+                "  ssh             ok",
+                "  sh              ok",
+                "  editor          /usr/bin/vi",
+                "  secret API      missing",
+                "",
+                "pi",
+                "  transport       ssh pi",
+                "  connectable     yes",
+                "  hostname        pi",
+                "  os              Linux",
+                "",
+                "mac",
+                "  transport       ssh mac",
+                "  connectable     no",
+                "  error           ssh: no route\\x1b[2J",
+                "",
+                "",
+                "",
+            ]
+        );
+        assert!(status.ends_with("│ 1 ok, 1 failed"), "{status}");
+    }
+
+    #[test]
+    fn the_results_pane_scrolls() {
+        let mut app = app();
+        show(
+            &mut app,
+            RunResult::Apply {
+                targets: vec![ran("local", Vec::new()), ran("pi", Vec::new())],
+                ok: Some(true),
+                error: None,
+            },
+        );
+        app.scroll = 3;
+        assert_eq!(results(&app, 6)[..3], ["▶ pi", "  ✔ ok · 0 steps", ""]);
+    }
+
+    #[test]
+    fn a_notice_replaces_the_key_hints() {
+        let mut app = app();
+        app.notice = Some("busy: apply is running (Esc cancels)".to_owned());
+        assert_eq!(
+            render(&app, 80, 6)[5],
+            " busy: apply is running (Esc cancels) │ format default │ -v 0"
         );
     }
 

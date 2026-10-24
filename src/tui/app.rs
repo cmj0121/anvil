@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -32,13 +32,15 @@ pub struct App {
     pub shown: Option<usize>,
     /// Results pane.
     pub scroll: u16,
-    #[expect(dead_code, reason = "set by the U4 worker runs")]
     pub running: Option<Running>,
     pub log: VecDeque<LogLine>,
     pub show_log: bool,
     pub overlay: Option<Overlay>,
     /// `None`: the config's `[anvil].format`.
     pub edit_format: Option<Format>,
+    /// Why the last key did nothing, or what it started; shown in the status bar.
+    pub notice: Option<String>,
+    /// Set by `q`; while a run is going, the loop ends only once it ends.
     pub quit: bool,
 }
 
@@ -69,7 +71,6 @@ pub enum Pane {
     Log,
 }
 
-#[expect(dead_code, reason = "U4 runs doctor and apply")]
 pub struct Running {
     pub kind: RunKind,
     pub current: Option<String>,
@@ -78,10 +79,18 @@ pub struct Running {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(dead_code, reason = "U4 runs doctor and apply")]
 pub enum RunKind {
     Doctor,
     Apply,
+}
+
+impl RunKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunKind::Doctor => "doctor",
+            RunKind::Apply => "apply",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,7 +102,6 @@ pub enum EditKind {
     Migrate(BackendKind),
 }
 
-#[expect(dead_code, reason = "U4 and U5 record the results")]
 pub enum RunResult {
     Doctor {
         local: Option<doctor::LocalReport>,
@@ -107,6 +115,7 @@ pub enum RunResult {
         ok: Option<bool>,
         error: Option<String>,
     },
+    #[expect(dead_code, reason = "U5 records the editor actions")]
     Edit {
         /// `inventory`, `config`, `secret NAME` or `migrate → age`.
         what: String,
@@ -142,17 +151,11 @@ pub enum Overlay {
 }
 
 pub enum Msg {
-    #[expect(dead_code, reason = "sent by the U4 worker")]
     Start(String),
-    #[expect(dead_code, reason = "sent by the U4 worker")]
     DoctorDone(doctor::Report),
-    #[expect(dead_code, reason = "sent by the U4 worker")]
     TargetDone(apply::TargetReport),
-    #[expect(dead_code, reason = "sent by the U4 worker")]
     DoctorTarget(doctor::TargetReport),
-    #[expect(dead_code, reason = "sent by the U4 worker")]
     Finished(Result<(), String>),
-    #[expect(dead_code, reason = "sent by the U4 worker")]
     Panicked(String),
     Log(LogLine),
     /// A worker's handoff: the main loop leaves the screen and acks (D6).
@@ -161,7 +164,6 @@ pub enum Msg {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    #[expect(dead_code, reason = "U4 runs doctor and apply")]
     Spawn(RunKind),
     #[expect(dead_code, reason = "U5 runs the editor actions")]
     Edit(EditKind),
@@ -207,15 +209,23 @@ impl App {
             show_log: false,
             overlay: None,
             edit_format: None,
+            notice: None,
             quit: false,
         }
     }
 
+    /// `q` and Ctrl-C quit; while a run is going they cancel it first, and
+    /// the loop ends once it has.
     pub fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let had_notice = self.notice.take().is_some();
         let ctrl_c =
             key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl_c || key.code == KeyCode::Char('q') {
             self.quit = true;
+            if let Some(running) = &self.running {
+                running.cancel.store(true, Ordering::Relaxed);
+                self.notice = Some(format!("quitting once {} ends", running.kind.as_str()));
+            }
             return vec![Effect::Redraw];
         }
         if self.overlay.is_some() {
@@ -226,30 +236,175 @@ impl App {
             return Vec::new();
         }
         match key.code {
+            KeyCode::Char('d') => return self.start(RunKind::Doctor),
+            KeyCode::Char('a') => return self.start(RunKind::Apply),
+            KeyCode::Char('i' | 'c' | 's' | 'm' | 'o') if self.running.is_some() => {
+                self.notice = self.busy();
+            }
+            KeyCode::Esc if self.running.is_some() => self.cancel(),
+            KeyCode::Char('[') => self.show(self.shown.map(|i| i.saturating_sub(1))),
+            KeyCode::Char(']') => self.show(self.shown.map(|i| i + 1)),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
             KeyCode::Tab => self.focus = self.next_focus(),
             KeyCode::Up | KeyCode::Char('k') => self.step(false),
             KeyCode::Down | KeyCode::Char('j') => self.step(true),
             KeyCode::Char(' ') if self.focus == Pane::Targets => self.toggle(),
+            _ if had_notice => {}
             _ => return Vec::new(),
         }
         vec![Effect::Redraw]
     }
 
+    /// Advances the spinner; the main loop calls it every tick.
+    pub fn tick(&mut self) -> Vec<Effect> {
+        match &mut self.running {
+            Some(running) => {
+                running.tick = running.tick.wrapping_add(1);
+                vec![Effect::Redraw]
+            }
+            None => Vec::new(),
+        }
+    }
+
     pub fn on_msg(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
+            Msg::Start(name) => {
+                if let Some(running) = &mut self.running {
+                    running.current = Some(name);
+                }
+            }
+            Msg::DoctorTarget(report) => {
+                self.target_ended();
+                if let Some(RunResult::Doctor { targets, .. }) = self.results.last_mut() {
+                    targets.push(report);
+                }
+            }
+            Msg::TargetDone(report) => {
+                self.target_ended();
+                if let Some(RunResult::Apply { targets, .. }) = self.results.last_mut() {
+                    targets.push(report);
+                }
+            }
+            Msg::DoctorDone(report) => {
+                if let Some(RunResult::Doctor {
+                    local, targets, ok, ..
+                }) = self.results.last_mut()
+                {
+                    *local = Some(report.local);
+                    *targets = report.targets;
+                    *ok = Some(report.ok);
+                }
+            }
+            Msg::Finished(result) => self.finish(result.err()),
+            Msg::Panicked(message) => {
+                let kind = self.running.as_ref().map_or("the run", |r| r.kind.as_str());
+                self.finish(Some(format!("{kind} panicked: {message}")));
+            }
             Msg::Log(line) => {
                 if self.log.len() == LOG_CAP {
                     self.log.pop_front();
                 }
                 self.log.push_back(line);
-                if self.show_log {
-                    vec![Effect::Redraw]
-                } else {
-                    Vec::new()
+                if !self.show_log {
+                    return Vec::new();
                 }
             }
-            _ => Vec::new(),
+            // Served by the main loop before it reaches the app.
+            Msg::Suspend(_) => return Vec::new(),
+        }
+        vec![Effect::Redraw]
+    }
+
+    /// Starts a run as a new, shown result, unless one is going already.
+    fn start(&mut self, kind: RunKind) -> Vec<Effect> {
+        if self.running.is_some() {
+            self.notice = self.busy();
+            return vec![Effect::Redraw];
+        }
+        self.running = Some(Running {
+            kind,
+            current: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            tick: 0,
+        });
+        self.results.push(match kind {
+            RunKind::Doctor => RunResult::Doctor {
+                local: None,
+                targets: Vec::new(),
+                ok: None,
+                error: None,
+            },
+            RunKind::Apply => RunResult::Apply {
+                targets: Vec::new(),
+                ok: None,
+                error: None,
+            },
+        });
+        self.show(Some(self.results.len() - 1));
+        vec![Effect::Spawn(kind), Effect::Redraw]
+    }
+
+    /// Why a key is refused while a run is going.
+    fn busy(&self) -> Option<String> {
+        let running = self.running.as_ref()?;
+        Some(format!(
+            "busy: {} is running (Esc cancels)",
+            running.kind.as_str()
+        ))
+    }
+
+    /// Sets the cancel flag: apply stops before its next target or step,
+    /// doctor runs to the end (D3).
+    fn cancel(&mut self) {
+        let Some(running) = &self.running else {
+            return;
+        };
+        running.cancel.store(true, Ordering::Relaxed);
+        self.notice = Some(match running.kind {
+            RunKind::Apply => "cancelling: the running step finishes first".to_owned(),
+            RunKind::Doctor => "doctor cannot be cancelled; it ends with its probes".to_owned(),
+        });
+    }
+
+    fn target_ended(&mut self) {
+        if let Some(running) = &mut self.running {
+            running.current = None;
+        }
+    }
+
+    /// Ends the run: the result's `ok` is settled, `error` recorded, and a
+    /// notice about the run cleared, so the key hints come back.
+    fn finish(&mut self, error: Option<String>) {
+        self.running = None;
+        self.notice = None;
+        match self.results.last_mut() {
+            Some(RunResult::Doctor {
+                ok, error: slot, ..
+            }) => {
+                if error.is_some() {
+                    *ok = Some(false);
+                }
+                *slot = error;
+            }
+            Some(RunResult::Apply {
+                targets,
+                ok,
+                error: slot,
+            }) => {
+                *ok = Some(error.is_none() && targets.iter().all(apply::TargetReport::ok));
+                *slot = error;
+            }
+            Some(RunResult::Edit { .. }) | None => {}
+        }
+    }
+
+    /// Shows result `index`, kept inside the history, from its top.
+    fn show(&mut self, index: Option<usize>) {
+        if let Some(index) = index
+            && !self.results.is_empty()
+        {
+            self.shown = Some(index.min(self.results.len() - 1));
+            self.scroll = 0;
         }
     }
 
@@ -354,6 +509,8 @@ pub mod tests {
             secret_store: None,
             #[cfg(debug_assertions)]
             ssh_program: None,
+            #[cfg(debug_assertions)]
+            ssh_home: None,
         }
     }
 
@@ -380,6 +537,61 @@ pub mod tests {
 
     pub fn app() -> App {
         App::with_inventory(opts(), Ok(inventory()))
+    }
+
+    pub fn step(run: &str, code: Option<i32>, stdout: &str, stderr: &str) -> apply::StepReport {
+        apply::StepReport {
+            run: run.to_owned(),
+            code,
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+        }
+    }
+
+    pub fn ran(target: &str, steps: Vec<apply::StepReport>) -> apply::TargetReport {
+        let ok = steps.iter().all(|s| s.code == Some(0));
+        apply::TargetReport::Ran {
+            target: target.to_owned(),
+            steps,
+            ok,
+        }
+    }
+
+    pub fn cancelled(target: &str) -> apply::TargetReport {
+        apply::TargetReport::Cancelled {
+            target: target.to_owned(),
+            steps: Vec::new(),
+            ok: false,
+        }
+    }
+
+    pub fn probed(target: &str, error: Option<&str>) -> doctor::TargetReport {
+        let facts = crate::facts::Facts(
+            [("hostname", target), ("os", "Linux")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+        );
+        doctor::TargetReport {
+            target: target.to_owned(),
+            connectable: error.is_none(),
+            facts: error.is_none().then_some(facts),
+            error: error.map(str::to_owned),
+            transport: format!("ssh {target}"),
+        }
+    }
+
+    pub fn local_report() -> doctor::LocalReport {
+        doctor::LocalReport {
+            ssh: true,
+            sh: true,
+            editor: Ok("/usr/bin/vi".into()),
+            secrets: [("API".to_owned(), doctor::SecretStatus::Missing)].into(),
+        }
+    }
+
+    fn cancel_flag(app: &App) -> bool {
+        app.running.as_ref().unwrap().cancel.load(Ordering::Relaxed)
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -541,6 +753,193 @@ pub mod tests {
         assert_eq!((app.scroll, app.cursor), (1, 0));
         press(&mut app, &[KeyCode::Char(' ')]);
         assert!(app.opts.target.is_empty(), "Space selects only in Targets");
+    }
+
+    #[test]
+    fn d_and_a_start_a_run_as_a_new_shown_result() {
+        let mut app = app();
+        app.scroll = 4;
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('a'))),
+            [Effect::Spawn(RunKind::Apply), Effect::Redraw]
+        );
+        let running = app.running.as_ref().unwrap();
+        assert_eq!(
+            (running.kind, running.current.as_deref()),
+            (RunKind::Apply, None)
+        );
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Apply { ok: None, .. })
+        ));
+        assert_eq!((app.shown, app.scroll), (Some(0), 0));
+    }
+
+    #[test]
+    fn apply_messages_fill_the_result_then_finish_it() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('a')]);
+        app.on_msg(Msg::Start("local".to_owned()));
+        assert_eq!(
+            app.running.as_ref().unwrap().current.as_deref(),
+            Some("local")
+        );
+        app.on_msg(Msg::TargetDone(ran(
+            "local",
+            vec![step("true", Some(0), "", "")],
+        )));
+        assert_eq!(app.running.as_ref().unwrap().current, None);
+        app.on_msg(Msg::Start("pi".to_owned()));
+        app.on_msg(Msg::TargetDone(ran(
+            "pi",
+            vec![step("false", Some(1), "", "")],
+        )));
+        assert_eq!(app.shown_result().unwrap().counts(), Some((1, 1)));
+        assert_eq!(app.on_msg(Msg::Finished(Ok(()))), [Effect::Redraw]);
+        assert!(app.running.is_none());
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Apply { ok: Some(false), error: None, targets }) if targets.len() == 2
+        ));
+    }
+
+    #[test]
+    fn a_failed_run_records_its_error() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('a')]);
+        app.on_msg(Msg::Finished(Err("no config".to_owned())));
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Apply { ok: Some(false), error: Some(e), .. }) if e == "no config"
+        ));
+    }
+
+    #[test]
+    fn doctor_messages_add_targets_then_the_whole_report() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('d')]);
+        app.on_msg(Msg::Start("pi".to_owned()));
+        app.on_msg(Msg::DoctorTarget(probed("pi", None)));
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Doctor { local: None, targets, ok: None, .. }) if targets.len() == 1
+        ));
+        app.on_msg(Msg::DoctorDone(doctor::Report {
+            local: local_report(),
+            targets: vec![probed("pi", None), probed("mac", Some("timeout"))],
+            ok: false,
+        }));
+        app.on_msg(Msg::Finished(Ok(())));
+        assert!(app.running.is_none());
+        let result = app.shown_result().unwrap();
+        assert_eq!(result.counts(), Some((1, 1)));
+        assert!(matches!(
+            result,
+            RunResult::Doctor {
+                local: Some(_),
+                ok: Some(false),
+                error: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn esc_while_running_sets_the_cancel_flag() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('a')]);
+        assert!(!cancel_flag(&app));
+        app.on_key(key(KeyCode::Esc));
+        assert!(cancel_flag(&app));
+        assert!(app.notice.as_deref().unwrap().starts_with("cancelling"));
+        app.on_msg(Msg::TargetDone(cancelled("local")));
+        app.on_msg(Msg::Finished(Ok(())));
+        assert_eq!(app.shown_result().unwrap().counts(), Some((0, 1)));
+        assert_eq!(app.notice, None, "the key hints come back");
+    }
+
+    #[test]
+    fn a_second_run_and_the_editor_keys_are_refused_while_running() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('d')]);
+        for c in ['d', 'a', 'i', 'c', 's', 'm', 'o'] {
+            assert_eq!(app.on_key(key(KeyCode::Char(c))), [Effect::Redraw], "{c}");
+            assert_eq!(
+                app.notice.as_deref(),
+                Some("busy: doctor is running (Esc cancels)")
+            );
+        }
+        assert_eq!(app.results.len(), 1);
+        // The notice goes with the next key.
+        assert_eq!(app.on_key(key(KeyCode::Char('x'))), [Effect::Redraw]);
+        assert_eq!(app.notice, None);
+        app.on_msg(Msg::Finished(Ok(())));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('a'))),
+            [Effect::Spawn(RunKind::Apply), Effect::Redraw]
+        );
+    }
+
+    #[test]
+    fn q_while_running_cancels_and_quits_once_the_run_ends() {
+        for quit in [
+            key(KeyCode::Char('q')),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = app();
+            press(&mut app, &[KeyCode::Char('a')]);
+            app.on_key(quit);
+            assert!(app.quit && cancel_flag(&app));
+            assert_eq!(app.notice.as_deref(), Some("quitting once apply ends"));
+            assert!(app.running.is_some(), "the loop waits for the worker");
+            app.on_msg(Msg::Finished(Ok(())));
+            assert!(app.quit && app.running.is_none());
+        }
+    }
+
+    #[test]
+    fn a_worker_panic_becomes_an_error_result_and_the_app_goes_on() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('d')]);
+        app.on_msg(Msg::Panicked("boom".to_owned()));
+        assert!(app.running.is_none() && !app.quit);
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Doctor { ok: Some(false), error: Some(e), .. }) if e == "doctor panicked: boom"
+        ));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('d'))),
+            [Effect::Spawn(RunKind::Doctor), Effect::Redraw]
+        );
+    }
+
+    #[test]
+    fn the_tick_turns_the_spinner_only_while_running() {
+        let mut app = app();
+        assert!(app.tick().is_empty());
+        press(&mut app, &[KeyCode::Char('a')]);
+        assert_eq!(app.tick(), [Effect::Redraw]);
+        app.tick();
+        assert_eq!(app.running.as_ref().unwrap().tick, 2);
+    }
+
+    #[test]
+    fn brackets_move_between_results_inside_the_history() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('[')]);
+        assert_eq!(app.shown, None);
+        for _ in 0..3 {
+            press(&mut app, &[KeyCode::Char('a')]);
+            app.on_msg(Msg::Finished(Ok(())));
+        }
+        assert_eq!(app.shown, Some(2));
+        app.scroll = 3;
+        press(&mut app, &[KeyCode::Char('['), KeyCode::Char('[')]);
+        assert_eq!((app.shown, app.scroll), (Some(0), 0));
+        press(&mut app, &[KeyCode::Char('['), KeyCode::Char(']')]);
+        assert_eq!(app.shown, Some(1));
+        press(&mut app, &[KeyCode::Char(']'), KeyCode::Char(']')]);
+        assert_eq!(app.shown, Some(2));
     }
 
     #[test]

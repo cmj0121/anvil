@@ -19,7 +19,7 @@ use crate::logger::{BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, is_esca
 use crate::options::Options;
 use crate::transport::{Output, Transport, TransportError, into_string};
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StepReport {
     pub run: String,
     /// `None` when the script was killed by a signal.
@@ -39,7 +39,7 @@ impl StepReport {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum TargetReport {
     Ran {
@@ -133,7 +133,10 @@ impl Report {
 
 /// What [`run_targets`] reports as it goes: a target about to run, and its
 /// report once it ends.
-#[allow(dead_code, reason = "read by the TUI")]
+#[cfg_attr(
+    not(any(test, feature = "tui")),
+    expect(dead_code, reason = "read by the TUI")
+)]
 pub enum Progress<'a> {
     Start(&'a Target),
     Done(&'a TargetReport),
@@ -383,7 +386,7 @@ fn print_lines(lines: &[Line], style: Style) {
 /// The step's command as shown in its `$` line: a multi-line script shows its
 /// first line and an ellipsis. Only whitespace that stays whitespace once
 /// escaped is trimmed, so a `\r` stays visible.
-fn command(run: &str) -> String {
+pub fn command(run: &str) -> String {
     let blank = |c: char| c.is_whitespace() && !is_escaped(c);
     let run = run.trim_matches(blank);
     match run.split_once('\n') {

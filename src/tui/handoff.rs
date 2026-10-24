@@ -143,21 +143,21 @@ fn note_interrupt(interrupted: &AtomicBool) {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::time::Duration;
 
     use super::*;
 
     /// Records the screen's leave/enter calls and the test's own marks, in order.
     #[derive(Default)]
-    struct Fake(Mutex<Vec<&'static str>>);
+    pub struct Fake(Mutex<Vec<&'static str>>);
 
     impl Fake {
-        fn mark(&self, what: &'static str) {
+        pub fn mark(&self, what: &'static str) {
             self.0.lock().unwrap().push(what);
         }
 
-        fn events(&self) -> Vec<&'static str> {
+        pub fn events(&self) -> Vec<&'static str> {
             self.0.lock().unwrap().clone()
         }
     }

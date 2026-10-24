@@ -30,6 +30,9 @@ pub struct Options {
     pub secret_store: Option<SecretStoreKind>,
     #[cfg(debug_assertions)]
     pub ssh_program: Option<PathBuf>,
+    /// Replaces `$HOME` for ssh's control directory; set only by tests.
+    #[cfg(debug_assertions)]
+    pub ssh_home: Option<PathBuf>,
 }
 
 #[cfg(debug_assertions)]
@@ -54,6 +57,8 @@ impl Options {
             secret_store: cli.secret_store,
             #[cfg(debug_assertions)]
             ssh_program: cli.ssh_program.clone(),
+            #[cfg(debug_assertions)]
+            ssh_home: None,
         }
     }
 
@@ -111,13 +116,21 @@ impl Options {
     pub fn transport(&self, target: &Target) -> Result<Box<dyn Transport>, TransportError> {
         match &target.kind {
             TargetKind::Local => Ok(Box::new(Local)),
-            TargetKind::Ssh { host, user, port } => Ok(Box::new(Ssh::new(
-                self.ssh_settings(),
-                self.ssh_config.clone(),
-                host,
-                user.clone(),
-                *port,
-            )?)),
+            TargetKind::Ssh { host, user, port } => {
+                #[cfg_attr(not(debug_assertions), expect(unused_mut, reason = "debug: ssh_home"))]
+                let mut ssh = Ssh::new(
+                    self.ssh_settings(),
+                    self.ssh_config.clone(),
+                    host,
+                    user.clone(),
+                    *port,
+                )?;
+                #[cfg(debug_assertions)]
+                if let Some(home) = &self.ssh_home {
+                    ssh.home = home.clone();
+                }
+                Ok(Box::new(ssh))
+            }
         }
     }
 }

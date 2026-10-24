@@ -3,6 +3,7 @@
 mod app;
 mod handoff;
 mod ui;
+mod worker;
 
 use std::io::{self, IsTerminal, Stdout, Write};
 use std::panic::{self, PanicHookInfo};
@@ -25,6 +26,7 @@ use crate::logger::{self, Sink};
 use crate::options::Options;
 use app::{App, Effect, LogLine, Msg};
 use handoff::{Screen, Session};
+use worker::Worker;
 
 /// How long the loop waits for a key before it drains the messages.
 const TICK: Duration = Duration::from_millis(100);
@@ -54,22 +56,30 @@ pub fn run(mut opts: Options) -> Result<(), Failure> {
     screen
         .try_enter()
         .map_err(|err| Failure::failed(format!("cannot enter the terminal: {err}")))?;
-    let session = handoff::start(tx, rx, screen.clone(), interrupted);
+    let session = handoff::start(tx.clone(), rx, screen.clone(), interrupted);
     opts.can_prompt = true;
     let app = App::with_inventory(opts, inventory);
+    // Dropped before the session, on every path: see Runs.
+    let mut runs = Runs {
+        tx,
+        session: &session,
+        screen: screen.as_ref(),
+        worker: None,
+    };
     Terminal::new(CrosstermBackend::new(io::stdout()))
-        .and_then(|mut terminal| event_loop(&mut terminal, app, &session, &screen))
+        .and_then(|mut terminal| event_loop(&mut terminal, app, &mut runs))
         .map_err(|err| Failure::failed(format!("terminal: {err}")))
 }
 
+/// Runs until `q`, and then until the run going (if any) has ended.
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut app: App,
-    session: &Session,
-    screen: &Tty,
+    runs: &mut Runs<'_, Tty>,
 ) -> io::Result<()> {
+    let (session, screen) = (runs.session, runs.screen);
     let mut redraw = true;
-    while !app.quit {
+    while !(app.quit && app.running.is_none()) {
         if redraw || screen.dirty.load(Ordering::Relaxed) {
             render(terminal, &app, screen)?;
             redraw = false;
@@ -83,24 +93,89 @@ fn event_loop(
                 Event::Resize(..) => redraw = true,
                 _ => {}
             }
+        } else {
+            effects.extend(app.tick());
         }
         while let Ok(msg) = session.rx.try_recv() {
             match msg {
                 Msg::Suspend(ack) => session.side.serve(screen, ack, || {
                     let _ = render(terminal, &app, screen);
                 }),
-                msg => effects.extend(app.on_msg(msg)),
+                msg => {
+                    // A helper thread of the job (unmarked, so on the
+                    // default hook) may have printed its panic onto the
+                    // screen before the job's own panic got here.
+                    if matches!(msg, Msg::Panicked(_)) {
+                        screen.dirty.store(true, Ordering::Relaxed);
+                    }
+                    effects.extend(app.on_msg(msg));
+                }
             }
+        }
+        if app.running.is_none() {
+            runs.join();
         }
         for effect in effects {
             match effect {
                 Effect::Redraw => redraw = true,
-                // Not produced yet: the worker runs and editor actions come later.
-                Effect::Spawn(_) | Effect::Edit(_) | Effect::Reload => {}
+                Effect::Spawn(kind) => {
+                    if let Some(running) = &app.running {
+                        runs.spawn(kind, &app, running.cancel.clone());
+                    }
+                }
+                // Not produced yet: the editor actions come in U5.
+                Effect::Edit(_) | Effect::Reload => {}
             }
         }
     }
     Ok(())
+}
+
+/// The worker running doctor or apply, if any. Dropping it (teardown, a
+/// terminal error) cancels the run and joins the worker before the session
+/// drops, serving its handoffs meanwhile: a suspend that failed because the
+/// session was gone would still run ssh or the editor on the raw screen.
+struct Runs<'a, S: Screen> {
+    tx: Sender<Msg>,
+    session: &'a Session,
+    screen: &'a S,
+    /// The worker and its run's cancel flag.
+    worker: Option<(Worker, Arc<AtomicBool>)>,
+}
+
+impl<S: Screen> Runs<'_, S> {
+    fn spawn(&mut self, kind: app::RunKind, app: &App, cancel: Arc<AtomicBool>) {
+        let worker = worker::spawn(kind, app.opts.clone(), cancel.clone(), self.tx.clone());
+        self.worker = Some((worker, cancel));
+    }
+
+    /// Joins a worker that has sent its last message.
+    fn join(&mut self) {
+        if let Some((worker, _)) = self.worker.take() {
+            worker.join();
+        }
+    }
+}
+
+impl<S: Screen> Drop for Runs<'_, S> {
+    fn drop(&mut self) {
+        let Some((worker, cancel)) = self.worker.take() else {
+            return;
+        };
+        cancel.store(true, Ordering::Relaxed);
+        if thread::panicking() {
+            // The hook restored the terminal, so a handoff failed by the
+            // session's drop runs on the real screen; joining could wait on
+            // a handoff nobody serves.
+            return;
+        }
+        while !worker.is_finished() {
+            if let Ok(Msg::Suspend(ack)) = self.session.rx.recv_timeout(TICK) {
+                self.session.side.serve(self.screen, ack, || {});
+            }
+        }
+        worker.join();
+    }
 }
 
 /// Draws `app`; after a handoff, repaints the whole screen first.
@@ -147,6 +222,13 @@ impl Tty {
             && !self.restored.swap(true, Ordering::Relaxed)
     }
 
+    /// Whether a panic on this thread stays off the screen: a job thread's
+    /// while entered, since its payload reaches the results pane, escaped.
+    /// Any other thread keeps the default hook.
+    fn silences_panic(&self) -> bool {
+        worker::is_job_thread() && self.entered.load(Ordering::Relaxed)
+    }
+
     /// Raw mode plus a fresh, blank alternate screen.
     fn try_enter(&self) -> io::Result<()> {
         terminal::enable_raw_mode()?;
@@ -174,10 +256,14 @@ impl Screen for Tty {
 
 /// Restores the terminal at most once, and only for a panic on the main
 /// thread while it has the terminal entered, then runs the previous hook.
-/// A worker's panic leaves the TUI running: its join reports it.
+/// A job thread's panic leaves the TUI running and, while entered, skips
+/// the previous hook: its join reports it as `Msg::Panicked`.
 fn install_panic_hook(tty: Arc<Tty>) {
     let previous = panic::take_hook();
     panic::set_hook(Box::new(move |info: &PanicHookInfo<'_>| {
+        if tty.silences_panic() {
+            return;
+        }
         if tty.claim_restore() {
             tty.leave();
         }
@@ -242,6 +328,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dropping_runs_cancels_serves_the_worker_handoff_and_joins() {
+        let _lock = crate::term::test_lock();
+        let fake = Arc::new(handoff::tests::Fake::default());
+        let (tx, rx) = mpsc::channel();
+        let session = handoff::start(
+            tx.clone(),
+            rx,
+            fake.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let fake = fake.clone();
+            worker::spawn_job(tx.clone(), move |_| {
+                crate::term::with_terminal(|| fake.mark("child runs"));
+                Ok(())
+            })
+        };
+        let runs = Runs {
+            tx,
+            session: &session,
+            screen: fake.as_ref(),
+            worker: Some((worker, cancel.clone())),
+        };
+        drop(runs);
+        assert!(cancel.load(Ordering::Relaxed));
+        // The drop returned only after the worker resumed and ended.
+        assert_eq!(fake.events(), ["leave", "child runs", "enter"]);
+    }
+
+    #[test]
     fn a_panic_restores_once_and_only_on_the_main_thread_while_entered() {
         let tty = Arc::new(Tty::new());
         assert!(!tty.claim_restore(), "not entered yet");
@@ -254,5 +371,38 @@ mod tests {
         );
         assert!(tty.claim_restore());
         assert!(!tty.claim_restore(), "at most once");
+    }
+
+    #[test]
+    fn only_a_job_thread_panic_is_silenced_and_only_while_entered() {
+        let tty = Arc::new(Tty::new());
+        let on_thread = |tty: &Arc<Tty>, job: bool| {
+            let tty = tty.clone();
+            let (tx, rx) = mpsc::channel();
+            let check = move |_: &Sender<Msg>| {
+                tx.send(tty.silences_panic()).unwrap();
+                Ok(())
+            };
+            if job {
+                worker::spawn_job(mpsc::channel().0, check).join();
+            } else {
+                let unused = mpsc::channel().0;
+                thread::spawn(move || check(&unused))
+                    .join()
+                    .unwrap()
+                    .unwrap();
+            }
+            rx.recv().unwrap()
+        };
+        assert!(!on_thread(&tty, true), "not entered yet");
+        tty.entered.store(true, Ordering::Relaxed);
+        assert!(on_thread(&tty, true));
+        assert!(
+            !on_thread(&tty, false),
+            "a helper thread keeps the default hook"
+        );
+        assert!(!tty.silences_panic(), "the main thread restores instead");
+        tty.entered.store(false, Ordering::Relaxed);
+        assert!(!on_thread(&tty, true), "left, as in a handoff");
     }
 }
