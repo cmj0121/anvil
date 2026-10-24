@@ -312,7 +312,7 @@ fn create_temp(dir: &Path, ext: &str) -> Result<(PathBuf, File), EditorError> {
 }
 
 /// 64 random bits from `/dev/urandom`, else the clock mixed with the pid.
-fn random() -> u64 {
+pub fn random() -> u64 {
     let mut bytes = [0u8; 8];
     if File::open("/dev/urandom")
         .and_then(|mut urandom| urandom.read_exact(&mut bytes))
