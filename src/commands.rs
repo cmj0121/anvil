@@ -461,6 +461,9 @@ mod tests {
 
     /// A config naming a scripted editor: `script` runs with the temp file as
     /// `$1` and must write it itself (an empty script leaves it unchanged).
+    /// `sh` reads the script rather than it being executed: an executable
+    /// written by a test can fail to start while another test's fork still
+    /// holds it open for writing.
     struct Scripted {
         dir: PathBuf,
         config: PathBuf,
@@ -470,12 +473,11 @@ mod tests {
         fn new(tag: &str, script: &str) -> Scripted {
             let dir = temp_dir(&format!("secret-{tag}"));
             let editor = dir.join("editor.sh");
-            fs::write(&editor, format!("#!/bin/sh\nset -eu\n{script}\n")).unwrap();
-            fs::set_permissions(&editor, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(&editor, format!("set -eu\n{script}\n")).unwrap();
             let config = dir.join("config.toml");
             fs::write(
                 &config,
-                format!("[anvil]\neditor = \"{}\"\n", editor.display()),
+                format!("[anvil]\neditor = \"/bin/sh {}\"\n", editor.display()),
             )
             .unwrap();
             Scripted { dir, config }
