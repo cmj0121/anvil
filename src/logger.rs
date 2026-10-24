@@ -38,7 +38,10 @@ pub fn set_sink(sink: Option<Arc<dyn Sink>>) {
 }
 
 /// Sets the level from a `-v` count, as [`level_for`] maps it.
-#[cfg_attr(not(test), expect(dead_code, reason = "called by the TUI"))]
+#[cfg_attr(
+    not(any(test, feature = "tui")),
+    expect(dead_code, reason = "called by the TUI")
+)]
 pub fn set_verbosity(verbosity: u8) {
     LOGGER
         .get_or_init(|| Logger::new(verbosity))
@@ -160,6 +163,13 @@ impl Log for Logger {
     }
 }
 
+/// Serializes the tests that touch the process-wide sink or level.
+#[cfg(test)]
+pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,12 +193,6 @@ mod tests {
         let mut buf = Vec::new();
         logger.write_record(&mut buf, &record).unwrap();
         String::from_utf8(buf).unwrap()
-    }
-
-    /// Serializes the tests that touch the process-wide sink or level.
-    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     #[derive(Default)]

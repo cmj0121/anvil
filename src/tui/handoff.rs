@@ -34,6 +34,7 @@ pub struct TuiHandoff {
 /// The main loop's end of the rendezvous; dropping it releases any waiting
 /// worker.
 pub struct MainSide {
+    app: Sender<Msg>,
     resume: Receiver<()>,
     resumed: Sender<()>,
     interrupted: Arc<AtomicBool>,
@@ -73,17 +74,18 @@ fn pair(
 ) -> (TuiHandoff, MainSide) {
     let (resume_tx, resume_rx) = mpsc::channel();
     let (resumed_tx, resumed_rx) = mpsc::channel();
+    let side = MainSide {
+        app: app.clone(),
+        resume: resume_rx,
+        resumed: resumed_tx,
+        interrupted: interrupted.clone(),
+    };
     let handoff = TuiHandoff {
         main: thread::current().id(),
         screen,
         app,
         resume: resume_tx,
         resumed: Mutex::new(resumed_rx),
-        interrupted: interrupted.clone(),
-    };
-    let side = MainSide {
-        resume: resume_rx,
-        resumed: resumed_tx,
         interrupted,
     };
     (handoff, side)
@@ -110,7 +112,7 @@ impl Handoff for TuiHandoff {
     fn resume(&self) {
         if self.on_main() {
             self.screen.enter();
-            note_interrupt(&self.interrupted);
+            note_interrupt(&self.interrupted, &self.app);
             return;
         }
         if self.resume.send(()).is_ok() {
@@ -130,15 +132,17 @@ impl MainSide {
         let _ = self.resume.recv();
         screen.enter();
         redraw();
-        note_interrupt(&self.interrupted);
+        note_interrupt(&self.interrupted, &self.app);
         let _ = self.resumed.send(());
     }
 }
 
-/// Ctrl-C at a prompt during the handoff reached anvil as SIGINT (D8).
-fn note_interrupt(interrupted: &AtomicBool) {
+/// Ctrl-C at a prompt during the handoff reached anvil as SIGINT (D8): the
+/// app logs and shows it whatever the `-v` level, so the user learns why
+/// ssh or the editor ended.
+fn note_interrupt(interrupted: &AtomicBool, app: &Sender<Msg>) {
     if interrupted.swap(false, Ordering::Relaxed) {
-        log::warn!("interrupted at a prompt");
+        let _ = app.send(Msg::Interrupted);
     }
 }
 
@@ -313,6 +317,17 @@ pub mod tests {
         };
         serve_one(&fake, &side, &rx);
         worker.join().unwrap();
+        assert!(!handoff.interrupted.load(Ordering::Relaxed));
+        assert!(matches!(rx.try_recv(), Ok(Msg::Interrupted)));
+    }
+
+    #[test]
+    fn a_main_thread_resume_reports_an_interrupt() {
+        let (_fake, handoff, _side, rx) = setup();
+        handoff.interrupted.store(true, Ordering::Relaxed);
+        handoff.suspend();
+        handoff.resume();
+        assert!(matches!(rx.try_recv(), Ok(Msg::Interrupted)));
         assert!(!handoff.interrupted.load(Ordering::Relaxed));
     }
 }

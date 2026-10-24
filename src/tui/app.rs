@@ -2,6 +2,7 @@
 //! I/O beyond [`load_inventory`].
 
 use std::collections::{BTreeSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -11,11 +12,23 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::document::Format;
 use crate::inventory::{Inventory, LOCAL, Sel, UnknownSel};
 use crate::options::Options;
-use crate::secret::BackendKind;
+use crate::secret::{self, BackendKind};
 use crate::{apply, doctor};
 
 /// Log lines kept for the log pane; the oldest is dropped beyond this.
 pub const LOG_CAP: usize = 2000;
+
+/// The highest `-v` count `+` reaches: Debug.
+pub const MAX_VERBOSE: u8 = 3;
+
+/// The backends `m` offers, in the order the Migrate overlay lists them.
+pub const BACKENDS: [BackendKind; 3] = [BackendKind::Keychain, BackendKind::Age, BackendKind::Sops];
+
+/// What the TUI says after Ctrl-C at a prompt during a handoff.
+pub const INTERRUPTED: &str = "interrupted at a prompt";
+
+/// The options overlay's fields, in order: the flag each one stands for.
+pub const OPTION_FLAGS: [&str; 3] = ["--inventory", "--config", "--ssh-config"];
 
 pub struct App {
     pub opts: Options,
@@ -94,12 +107,23 @@ impl RunKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[expect(dead_code, reason = "U5 runs the editor actions")]
 pub enum EditKind {
     Inventory,
     Config,
     Secret(String),
     Migrate(BackendKind),
+}
+
+impl EditKind {
+    /// The `what` of its [`RunResult::Edit`].
+    pub fn what(&self) -> String {
+        match self {
+            EditKind::Inventory => "inventory".to_owned(),
+            EditKind::Config => "config".to_owned(),
+            EditKind::Secret(name) => format!("secret {name}"),
+            EditKind::Migrate(to) => format!("migrate → {to}"),
+        }
+    }
 }
 
 pub enum RunResult {
@@ -115,7 +139,6 @@ pub enum RunResult {
         ok: Option<bool>,
         error: Option<String>,
     },
-    #[expect(dead_code, reason = "U5 records the editor actions")]
     Edit {
         /// `inventory`, `config`, `secret NAME` or `migrate → age`.
         what: String,
@@ -148,6 +171,21 @@ pub struct LogLine {
 
 pub enum Overlay {
     Help,
+    /// The secret NAME prompt; `invalid` once Enter refused `text`.
+    Input {
+        text: String,
+        invalid: bool,
+    },
+    /// The backend to migrate to: an index into [`BACKENDS`].
+    Migrate {
+        choice: usize,
+    },
+    /// `--inventory`, `--config`, `--ssh-config` as text ([`OPTION_FLAGS`]);
+    /// `field` is the one being typed into. Empty means the default.
+    Options {
+        field: usize,
+        texts: [String; 3],
+    },
 }
 
 pub enum Msg {
@@ -158,6 +196,8 @@ pub enum Msg {
     Finished(Result<(), String>),
     Panicked(String),
     Log(LogLine),
+    /// Ctrl-C reached anvil as SIGINT during a handoff (D8).
+    Interrupted,
     /// A worker's handoff: the main loop leaves the screen and acks (D6).
     Suspend(Sender<()>),
 }
@@ -165,9 +205,9 @@ pub enum Msg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Spawn(RunKind),
-    #[expect(dead_code, reason = "U5 runs the editor actions")]
+    /// Run an editor flow on the main thread, with the real terminal.
     Edit(EditKind),
-    #[expect(dead_code, reason = "U5 reloads the inventory")]
+    /// Load the inventory again: [`App::reload`].
     Reload,
     Redraw,
 }
@@ -220,7 +260,11 @@ impl App {
         let had_notice = self.notice.take().is_some();
         let ctrl_c =
             key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl_c || key.code == KeyCode::Char('q') {
+        let typing = matches!(
+            self.overlay,
+            Some(Overlay::Input { .. } | Overlay::Options { .. })
+        );
+        if ctrl_c || (key.code == KeyCode::Char('q') && !typing) {
             self.quit = true;
             if let Some(running) = &self.running {
                 running.cancel.store(true, Ordering::Relaxed);
@@ -228,18 +272,56 @@ impl App {
             }
             return vec![Effect::Redraw];
         }
-        if self.overlay.is_some() {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
-                self.overlay = None;
-                return vec![Effect::Redraw];
-            }
-            return Vec::new();
+        if let Some(overlay) = self.overlay.take() {
+            return self.on_overlay_key(overlay, key);
         }
         match key.code {
             KeyCode::Char('d') => return self.start(RunKind::Doctor),
             KeyCode::Char('a') => return self.start(RunKind::Apply),
             KeyCode::Char('i' | 'c' | 's' | 'm' | 'o') if self.running.is_some() => {
                 self.notice = self.busy();
+            }
+            KeyCode::Char('i') => return vec![Effect::Edit(EditKind::Inventory), Effect::Redraw],
+            KeyCode::Char('c') => return vec![Effect::Edit(EditKind::Config), Effect::Redraw],
+            KeyCode::Char('s') => {
+                self.overlay = Some(Overlay::Input {
+                    text: String::new(),
+                    invalid: false,
+                });
+            }
+            KeyCode::Char('m') => self.overlay = Some(Overlay::Migrate { choice: 0 }),
+            KeyCode::Char('o') => {
+                let text = |path: &Option<PathBuf>| {
+                    path.as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                };
+                self.overlay = Some(Overlay::Options {
+                    field: 0,
+                    texts: [
+                        text(&self.opts.inventory),
+                        text(&self.opts.config),
+                        text(&self.opts.ssh_config),
+                    ],
+                });
+            }
+            KeyCode::Char('r') => return vec![Effect::Reload, Effect::Redraw],
+            KeyCode::Char('f') => {
+                self.edit_format = match self.edit_format {
+                    None => Some(Format::Toml),
+                    Some(Format::Toml) => Some(Format::Yaml),
+                    Some(Format::Yaml) => None,
+                };
+            }
+            KeyCode::Char('+') => self.opts.verbose = (self.opts.verbose + 1).min(MAX_VERBOSE),
+            KeyCode::Char('-') => {
+                self.opts.verbose = self.opts.verbose.min(MAX_VERBOSE).saturating_sub(1);
+            }
+            KeyCode::Char('l') => {
+                self.show_log = !self.show_log;
+                if !self.show_log && self.focus == Pane::Log {
+                    self.focus = Pane::Targets;
+                }
             }
             KeyCode::Esc if self.running.is_some() => self.cancel(),
             KeyCode::Char('[') => self.show(self.shown.map(|i| i.saturating_sub(1))),
@@ -253,6 +335,125 @@ impl App {
             _ => return Vec::new(),
         }
         vec![Effect::Redraw]
+    }
+
+    /// A key under `overlay`, which was taken out of `self.overlay`: it is
+    /// put back unless the key closes it. Esc closes any overlay; Enter
+    /// confirms the Input, Migrate and Options overlays.
+    fn on_overlay_key(&mut self, mut overlay: Overlay, key: KeyEvent) -> Vec<Effect> {
+        let mut effects = vec![Effect::Redraw];
+        let keep = match (&mut overlay, key.code) {
+            (_, KeyCode::Esc) | (Overlay::Help, KeyCode::Char('?')) => false,
+            (Overlay::Help, _) => {
+                self.overlay = Some(overlay);
+                return Vec::new();
+            }
+            (Overlay::Input { text, invalid }, code) => match code {
+                KeyCode::Enter if secret::is_name(text) => {
+                    effects.insert(0, Effect::Edit(EditKind::Secret(std::mem::take(text))));
+                    false
+                }
+                KeyCode::Enter => {
+                    *invalid = true;
+                    true
+                }
+                code => {
+                    *invalid &= !edit_text(text, code, key.modifiers);
+                    true
+                }
+            },
+            (Overlay::Migrate { choice }, code) => match code {
+                KeyCode::Enter => {
+                    effects.insert(0, Effect::Edit(EditKind::Migrate(BACKENDS[*choice])));
+                    false
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *choice = choice.saturating_sub(1);
+                    true
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *choice = (*choice + 1).min(BACKENDS.len() - 1);
+                    true
+                }
+                _ => true,
+            },
+            (Overlay::Options { field, texts }, code) => match code {
+                KeyCode::Enter => {
+                    let home = std::env::var_os("HOME");
+                    let path = |text: &str| option_path(text, home.as_deref());
+                    self.opts.inventory = path(&texts[0]);
+                    self.opts.config = path(&texts[1]);
+                    self.opts.ssh_config = path(&texts[2]);
+                    effects.insert(0, Effect::Reload);
+                    false
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    *field = (*field + 1) % texts.len();
+                    true
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    *field = (*field + texts.len() - 1) % texts.len();
+                    true
+                }
+                code => {
+                    edit_text(&mut texts[*field], code, key.modifiers);
+                    true
+                }
+            },
+        };
+        if keep {
+            self.overlay = Some(overlay);
+        }
+        effects
+    }
+
+    /// Records an editor flow's outcome as a new, shown result.
+    pub fn record_edit(&mut self, kind: &EditKind, outcome: Result<String, String>) {
+        self.results.push(RunResult::Edit {
+            what: kind.what(),
+            outcome,
+        });
+        self.show(Some(self.results.len() - 1));
+    }
+
+    /// Loads the inventory `opts` names again: [`App::set_inventory`].
+    pub fn reload(&mut self) {
+        let inventory = load_inventory(&self.opts);
+        self.set_inventory(inventory);
+    }
+
+    /// Rebuilds the rows from `inventory`, keeping the selection of every
+    /// name it still has; `opts.target` drops the others, with a notice.
+    /// An inventory that did not load keeps `opts.target` as it was.
+    pub fn set_inventory(&mut self, inventory: Result<Inventory, String>) {
+        match inventory {
+            Ok(inventory) => {
+                let (targets, tags) = rows(&inventory, &self.opts.target);
+                self.targets = targets;
+                self.tags = tags;
+                self.inventory_error = None;
+                let before = std::mem::take(&mut self.opts.target);
+                self.sync_target();
+                let gone: Vec<&str> = before
+                    .iter()
+                    .filter(|name| !self.opts.target.contains(name))
+                    .map(String::as_str)
+                    .collect();
+                if !gone.is_empty() {
+                    self.notice = Some(format!(
+                        "no longer in the inventory, unselected: {}",
+                        gone.join(", ")
+                    ));
+                }
+            }
+            Err(err) => {
+                self.targets.clear();
+                self.tags.clear();
+                self.inventory_error = Some(err);
+            }
+        }
+        let rows = self.targets.len() + self.tags.len();
+        self.cursor = self.cursor.min(rows.saturating_sub(1));
     }
 
     /// Advances the spinner; the main loop calls it every tick.
@@ -300,11 +501,18 @@ impl App {
                 let kind = self.running.as_ref().map_or("the run", |r| r.kind.as_str());
                 self.finish(Some(format!("{kind} panicked: {message}")));
             }
+            // Logged whatever the `-v` level, and noticed, as the log pane
+            // is hidden by default.
+            Msg::Interrupted => {
+                self.notice = Some(INTERRUPTED.to_owned());
+                self.push_log(LogLine {
+                    level: log::Level::Warn,
+                    target: "anvil::tui".to_owned(),
+                    message: INTERRUPTED.to_owned(),
+                });
+            }
             Msg::Log(line) => {
-                if self.log.len() == LOG_CAP {
-                    self.log.pop_front();
-                }
-                self.log.push_back(line);
+                self.push_log(line);
                 if !self.show_log {
                     return Vec::new();
                 }
@@ -313,6 +521,13 @@ impl App {
             Msg::Suspend(_) => return Vec::new(),
         }
         vec![Effect::Redraw]
+    }
+
+    fn push_log(&mut self, line: LogLine) {
+        if self.log.len() == LOG_CAP {
+            self.log.pop_front();
+        }
+        self.log.push_back(line);
     }
 
     /// Starts a run as a new, shown result, unless one is going already.
@@ -453,9 +668,41 @@ impl App {
         } else {
             return;
         }
+        self.sync_target();
+    }
+
+    /// Sets `opts.target` to the selected targets then tags.
+    fn sync_target(&mut self) {
         let targets = self.targets.iter().filter(|r| r.selected).map(|r| &r.name);
         let tags = self.tags.iter().filter(|r| r.selected).map(|r| &r.name);
         self.opts.target = targets.chain(tags).cloned().collect();
+    }
+}
+
+/// An options-overlay path: empty is the default (`None`); a leading `~/`
+/// or a bare `~` is `home`, as a shell would expand it (`~//etc` stays under
+/// `home`); anything else is taken literally.
+fn option_path(text: &str, home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    match (text, home) {
+        ("", _) => None,
+        ("~", Some(home)) => Some(PathBuf::from(home)),
+        (text, Some(home)) if text.starts_with("~/") => {
+            Some(PathBuf::from(home).join(text[1..].trim_start_matches('/')))
+        }
+        (text, _) => Some(PathBuf::from(text)),
+    }
+}
+
+/// Applies a typing key to `text`: a character (Shift allowed) or
+/// Backspace. Whether it changed `text`.
+fn edit_text(text: &mut String, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    match code {
+        KeyCode::Char(c) if (modifiers - KeyModifiers::SHIFT).is_empty() => {
+            text.push(c);
+            true
+        }
+        KeyCode::Backspace => text.pop().is_some(),
+        _ => false,
     }
 }
 
@@ -940,6 +1187,277 @@ pub mod tests {
         assert_eq!(app.shown, Some(1));
         press(&mut app, &[KeyCode::Char(']'), KeyCode::Char(']')]);
         assert_eq!(app.shown, Some(2));
+    }
+
+    fn chars(app: &mut App, text: &str) -> Vec<Effect> {
+        text.chars()
+            .flat_map(|c| app.on_key(key(KeyCode::Char(c))))
+            .collect()
+    }
+
+    #[test]
+    fn i_and_c_ask_for_their_editor_flow() {
+        let mut app = app();
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('i'))),
+            [Effect::Edit(EditKind::Inventory), Effect::Redraw]
+        );
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('c'))),
+            [Effect::Edit(EditKind::Config), Effect::Redraw]
+        );
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('r'))),
+            [Effect::Reload, Effect::Redraw]
+        );
+    }
+
+    #[test]
+    fn f_cycles_the_edit_format_default_toml_yaml() {
+        let mut app = app();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Char('f')));
+            seen.push(app.edit_format);
+        }
+        assert_eq!(
+            seen,
+            [
+                Some(Format::Toml),
+                Some(Format::Yaml),
+                None,
+                Some(Format::Toml)
+            ]
+        );
+    }
+
+    #[test]
+    fn plus_and_minus_keep_the_verbosity_in_0_to_3() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('-')]);
+        assert_eq!(app.opts.verbose, 0);
+        press(&mut app, &[KeyCode::Char('+'); 5]);
+        assert_eq!(app.opts.verbose, 3);
+        press(&mut app, &[KeyCode::Char('-')]);
+        assert_eq!(app.opts.verbose, 2);
+        // -vvvvv on the command line: `-` steps down from the top level.
+        app.opts.verbose = 5;
+        press(&mut app, &[KeyCode::Char('-')]);
+        assert_eq!(app.opts.verbose, 2);
+    }
+
+    #[test]
+    fn l_toggles_the_log_and_takes_the_focus_off_it() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('l')]);
+        assert!(app.show_log);
+        press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+        assert_eq!(app.focus, Pane::Log);
+        press(&mut app, &[KeyCode::Char('l')]);
+        assert!(!app.show_log);
+        assert_eq!(app.focus, Pane::Targets);
+    }
+
+    #[test]
+    fn s_prompts_for_a_valid_name_then_asks_for_the_secret_flow() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('s')]);
+        // q types instead of quitting, Shift is a capital, Backspace erases.
+        chars(&mut app, "q");
+        app.on_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(!app.quit);
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Input { text, invalid: true }) if text == "qA"
+        ));
+        press(&mut app, &[KeyCode::Backspace, KeyCode::Backspace]);
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Input { text, invalid: false }) if text.is_empty()
+        ));
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Input { invalid: true, .. })
+        ));
+        chars(&mut app, "HOST_SUDO");
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            [
+                Effect::Edit(EditKind::Secret("HOST_SUDO".to_owned())),
+                Effect::Redraw
+            ]
+        );
+        assert!(app.overlay.is_none());
+        // Esc cancels the prompt; Ctrl-C still quits from it.
+        press(
+            &mut app,
+            &[KeyCode::Char('s'), KeyCode::Char('X'), KeyCode::Esc],
+        );
+        assert!(app.overlay.is_none());
+        press(&mut app, &[KeyCode::Char('s')]);
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn m_chooses_a_backend_then_asks_for_the_migration() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('m'), KeyCode::Up]);
+        assert!(matches!(app.overlay, Some(Overlay::Migrate { choice: 0 })));
+        press(
+            &mut app,
+            &[KeyCode::Down, KeyCode::Char('j'), KeyCode::Down],
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Migrate { choice: 2 })));
+        press(&mut app, &[KeyCode::Char('k')]);
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            [
+                Effect::Edit(EditKind::Migrate(BackendKind::Age)),
+                Effect::Redraw
+            ]
+        );
+        assert!(app.overlay.is_none());
+        press(&mut app, &[KeyCode::Char('m'), KeyCode::Down]);
+        assert_eq!(app.on_key(key(KeyCode::Esc)), [Effect::Redraw]);
+        assert!(app.overlay.is_none());
+        assert_eq!(EditKind::Migrate(BackendKind::Age).what(), "migrate → age");
+        assert_eq!(EditKind::Secret("API".to_owned()).what(), "secret API");
+    }
+
+    #[test]
+    fn o_edits_the_paths_and_enter_applies_them_with_a_reload() {
+        let mut app = app();
+        app.opts.config = Some(PathBuf::from("/etc/c.toml"));
+        press(&mut app, &[KeyCode::Char('o')]);
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Options { field: 0, texts }) if texts[1] == "/etc/c.toml"
+        ));
+        chars(&mut app, "/tmp/inv.toml");
+        // Down to --config, cleared to the default; Up and BackTab wrap.
+        press(&mut app, &[KeyCode::Down]);
+        press(&mut app, &[KeyCode::Backspace; 20]);
+        press(&mut app, &[KeyCode::Up, KeyCode::BackTab]);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Options { field: 2, .. })
+        ));
+        chars(&mut app, "q+-");
+        press(&mut app, &[KeyCode::Tab]);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Options { field: 0, .. })
+        ));
+        assert_eq!(app.opts.verbose, 0, "+ and - type into the field");
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            [Effect::Reload, Effect::Redraw]
+        );
+        assert!(app.overlay.is_none() && !app.quit);
+        assert_eq!(app.opts.inventory, Some(PathBuf::from("/tmp/inv.toml")));
+        assert_eq!(app.opts.config, None);
+        assert_eq!(app.opts.ssh_config, Some(PathBuf::from("q+-")));
+    }
+
+    #[test]
+    fn esc_cancels_the_options_and_keeps_the_paths() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('o')]);
+        chars(&mut app, "/x.toml");
+        assert_eq!(app.on_key(key(KeyCode::Esc)), [Effect::Redraw]);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.opts.inventory, None);
+    }
+
+    #[test]
+    fn the_editor_overlays_are_refused_while_running() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('a')]);
+        for c in ['s', 'm', 'o'] {
+            assert_eq!(app.on_key(key(KeyCode::Char(c))), [Effect::Redraw], "{c}");
+            assert!(app.overlay.is_none(), "{c}");
+        }
+        // Not an editor flow: still free while running.
+        press(&mut app, &[KeyCode::Char('f'), KeyCode::Char('+')]);
+        assert_eq!((app.edit_format, app.opts.verbose), (Some(Format::Toml), 1));
+    }
+
+    #[test]
+    fn an_edit_outcome_becomes_a_new_shown_result() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('a')]);
+        app.on_msg(Msg::Finished(Ok(())));
+        app.record_edit(&EditKind::Inventory, Ok("wrote /tmp/i.toml".to_owned()));
+        assert_eq!(app.shown, Some(1));
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Edit { what, outcome: Ok(text) })
+                if what == "inventory" && text == "wrote /tmp/i.toml"
+        ));
+        assert_eq!(app.shown_result().unwrap().counts(), None);
+    }
+
+    #[test]
+    fn a_reload_keeps_the_selection_of_names_still_there() {
+        let mut app = app();
+        app.opts.target = vec!["pi".to_owned(), "mac".to_owned(), "home".to_owned()];
+        app.cursor = 4;
+        let mut smaller = inventory();
+        smaller.hosts.remove("mac");
+        app.set_inventory(Ok(smaller));
+        assert_eq!(app.opts.target, ["pi", "home"]);
+        let names: Vec<_> = app
+            .targets
+            .iter()
+            .map(|r| (r.name.as_str(), r.selected))
+            .collect();
+        assert_eq!(names, [("local", false), ("pi", true)]);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("no longer in the inventory, unselected: mac")
+        );
+        assert_eq!(app.cursor, 3, "kept inside the rows");
+        // A broken inventory shows its error and keeps the selection.
+        app.set_inventory(Err("bad".to_owned()));
+        assert_eq!(app.inventory_error.as_deref(), Some("bad"));
+        assert_eq!(app.opts.target, ["pi", "home"]);
+        app.set_inventory(Ok(inventory()));
+        assert_eq!(app.inventory_error, None);
+        assert!(app.targets[2].selected && app.tags[1].selected);
+    }
+
+    #[test]
+    fn options_paths_expand_a_leading_tilde_only() {
+        let home = Some(std::ffi::OsStr::new("/home/me"));
+        let path = |text| option_path(text, home);
+        assert_eq!(path(""), None);
+        assert_eq!(path("~"), Some(PathBuf::from("/home/me")));
+        assert_eq!(path("~/inv.toml"), Some(PathBuf::from("/home/me/inv.toml")));
+        assert_eq!(
+            path("~//etc/x.toml"),
+            Some(PathBuf::from("/home/me/etc/x.toml"))
+        );
+        assert_eq!(path("~/"), Some(PathBuf::from("/home/me/")));
+        assert_eq!(path("~bob/x.toml"), Some(PathBuf::from("~bob/x.toml")));
+        assert_eq!(path("/a/~/b.toml"), Some(PathBuf::from("/a/~/b.toml")));
+        assert_eq!(path("rel/c.toml"), Some(PathBuf::from("rel/c.toml")));
+        assert_eq!(option_path("~/x", None), Some(PathBuf::from("~/x")));
+    }
+
+    #[test]
+    fn an_interrupt_is_logged_and_noticed_with_the_log_hidden() {
+        let mut app = app();
+        assert!(!app.show_log);
+        assert_eq!(app.on_msg(Msg::Interrupted), [Effect::Redraw]);
+        assert_eq!(app.notice.as_deref(), Some(INTERRUPTED));
+        let line = app.log.back().unwrap();
+        assert_eq!(
+            (line.level, line.message.as_str()),
+            (log::Level::Warn, INTERRUPTED)
+        );
     }
 
     #[test]

@@ -22,9 +22,12 @@ use signal_hook::SigId;
 use signal_hook::consts::SIGINT;
 
 use crate::cli::Failure;
+use crate::commands;
+use crate::document::Format;
 use crate::logger::{self, Sink};
 use crate::options::Options;
-use app::{App, Effect, LogLine, Msg};
+use crate::term;
+use app::{App, EditKind, Effect, LogLine, Msg};
 use handoff::{Screen, Session};
 use worker::Worker;
 
@@ -79,6 +82,7 @@ fn event_loop(
 ) -> io::Result<()> {
     let (session, screen) = (runs.session, runs.screen);
     let mut redraw = true;
+    let mut verbose = app.opts.verbose;
     while !(app.quit && app.running.is_none()) {
         if redraw || screen.dirty.load(Ordering::Relaxed) {
             render(terminal, &app, screen)?;
@@ -123,12 +127,42 @@ fn event_loop(
                         runs.spawn(kind, &app, running.cancel.clone());
                     }
                 }
-                // Not produced yet: the editor actions come in U5.
-                Effect::Edit(_) | Effect::Reload => {}
+                // The busy rule keeps a worker from running meanwhile.
+                Effect::Edit(kind) => run_edit(&mut app, &kind),
+                Effect::Reload => app.reload(),
             }
+        }
+        if app.opts.verbose != verbose {
+            verbose = app.opts.verbose;
+            logger::set_verbosity(verbose);
         }
     }
     Ok(())
+}
+
+/// Runs the editor flow `kind` on this (the main) thread with the real
+/// terminal, records its outcome, and reloads the inventory after an
+/// inventory or config edit.
+fn run_edit(app: &mut App, kind: &EditKind) {
+    let outcome = term::with_terminal(|| edit(&app.opts, app.edit_format, kind));
+    app.record_edit(kind, outcome.map_err(|failure| failure.message));
+    if matches!(kind, EditKind::Inventory | EditKind::Config) {
+        app.reload();
+    }
+}
+
+/// The CLI's editor flow for `kind`, its outcome as the CLI words it.
+fn edit(opts: &Options, format: Option<Format>, kind: &EditKind) -> Result<String, Failure> {
+    match kind {
+        EditKind::Inventory => commands::edit_inventory(opts, format).map(|o| o.to_string()),
+        EditKind::Config => commands::edit_config(opts, format).map(|o| o.to_string()),
+        EditKind::Secret(name) => {
+            let config = opts.load_config()?;
+            let store = opts.secret_store(&config)?;
+            commands::edit_secret(&config, name, store.as_ref()).map(|o| o.to_string())
+        }
+        EditKind::Migrate(to) => commands::migrate_to(opts, *to).map(|o| o.to_string()),
+    }
 }
 
 /// The worker running doctor or apply, if any. Dropping it (teardown, a
@@ -325,7 +359,158 @@ impl Drop for Unregister {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::term::testing::{Event, Recorder};
+    use crate::test_util::temp_dir;
+    use app::RunResult;
+
+    /// A temp config naming a scripted editor (`script` gets the buffer's
+    /// path as `$1`; empty leaves it unchanged) and a temp inventory, and
+    /// an app on them.
+    struct Edits {
+        dir: PathBuf,
+        app: App,
+    }
+
+    impl Edits {
+        fn new(tag: &str, script: &str) -> Edits {
+            let dir = temp_dir(&format!("tui-{tag}"));
+            let editor = dir.join("editor.sh");
+            fs::write(&editor, format!("set -eu\n{script}\n")).unwrap();
+            let config = dir.join("config.toml");
+            let toml = format!("[anvil]\neditor = \"/bin/sh {}\"\n", editor.display());
+            fs::write(&config, toml).unwrap();
+            let inventory = dir.join("inventory.toml");
+            fs::write(&inventory, "[hosts.pi]\nhost = \"pi.lan\"\n").unwrap();
+            let mut opts = app::tests::opts();
+            opts.config = Some(config);
+            opts.inventory = Some(inventory);
+            let mut app = App::with_inventory(opts, Err("not loaded yet".to_owned()));
+            app.reload();
+            Edits { dir, app }
+        }
+
+        /// Runs `kind` as the main loop does, with a recording handoff
+        /// installed; checks that the flow ran inside one handoff.
+        fn run(&mut self, kind: EditKind) -> Result<String, String> {
+            let _lock = term::test_lock();
+            let (recorder, _guard) = Recorder::install();
+            run_edit(&mut self.app, &kind);
+            assert_eq!(recorder.events(), [Event::Suspend, Event::Resume]);
+            match self.app.shown_result() {
+                Some(RunResult::Edit { what, outcome }) => {
+                    assert_eq!(*what, kind.what());
+                    outcome.clone()
+                }
+                _ => panic!("no edit result shown"),
+            }
+        }
+
+        fn names(&self) -> Vec<&str> {
+            self.app.targets.iter().map(|r| r.name.as_str()).collect()
+        }
+    }
+
+    impl Drop for Edits {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn an_inventory_edit_writes_and_reloads_the_targets() {
+        let mut edits = Edits::new(
+            "inventory",
+            "printf '\\n[hosts.mac]\\nhost = \"mac.lan\"\\n' >> \"$1\"",
+        );
+        edits.app.opts.target = vec!["pi".to_owned()];
+        assert_eq!(edits.names(), ["local", "pi"]);
+        let path = edits.dir.join("inventory.toml");
+        assert_eq!(
+            edits.run(EditKind::Inventory),
+            Ok(format!("wrote {}", path.display()))
+        );
+        assert_eq!(edits.names(), ["local", "mac", "pi"]);
+        assert_eq!(edits.app.opts.target, ["pi"], "the selection is kept");
+        assert!(edits.app.targets[2].selected);
+    }
+
+    #[test]
+    fn an_unchanged_edit_says_so_in_the_chosen_format() {
+        let mut edits = Edits::new("unchanged", "echo \"$1\" > \"$(dirname \"$0\")/seen\"");
+        edits.app.edit_format = Some(Format::Yaml);
+        let path = edits.dir.join("config.toml");
+        assert_eq!(
+            edits.run(EditKind::Config),
+            Ok(format!("{}: unchanged", path.display()))
+        );
+        let seen = fs::read_to_string(edits.dir.join("seen")).unwrap();
+        assert!(seen.trim_end().ends_with(".yaml"), "{seen}");
+    }
+
+    #[test]
+    fn a_failed_flow_shows_its_failure_message() {
+        let mut edits = Edits::new("migrate", "");
+        let outcome = edits.run(EditKind::Migrate(crate::secret::BackendKind::Age));
+        let err = outcome.unwrap_err();
+        assert!(err.starts_with("secret --migrate --to age: "), "{err}");
+    }
+
+    /// A secret edit through the debug Memory store: the value shows up in
+    /// neither the app, the drawn screen nor the log lines.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_secret_edit_reports_updated_and_never_the_value() {
+        use ratatui::backend::TestBackend;
+
+        const VALUE: &str = "hunter2-s3cr3t";
+        let mut edits = Edits::new("secret", &format!("printf '{VALUE}\\n' > \"$1\""));
+        edits.app.opts.secret_store = Some(crate::options::SecretStoreKind::Memory);
+        edits.app.show_log = true;
+
+        let (tx, rx) = mpsc::channel();
+        let outcome = {
+            let _lock = logger::test_lock();
+            let before = log::max_level();
+            logger::Logger::install(3);
+            logger::set_verbosity(3);
+            logger::set_sink(Some(Arc::new(ChannelSink(tx))));
+            let outcome = edits.run(EditKind::Secret("HOST_SUDO".to_owned()));
+            logger::set_sink(None);
+            log::set_max_level(before);
+            outcome
+        };
+        assert_eq!(outcome, Ok("secret HOST_SUDO: updated".to_owned()));
+        let app = &mut edits.app;
+        while let Ok(msg) = rx.try_recv() {
+            app.on_msg(msg);
+        }
+        let logged: Vec<_> = app.log.iter().map(|l| l.message.as_str()).collect();
+        assert!(logged.contains(&"secret HOST_SUDO: stored"), "{logged:?}");
+
+        let mut seen: Vec<String> = app
+            .log
+            .iter()
+            .map(|l| format!("{} {}", l.target, l.message))
+            .collect();
+        for result in &app.results {
+            if let RunResult::Edit { what, outcome } = result {
+                seen.extend([what.clone(), format!("{outcome:?}")]);
+            }
+        }
+        seen.push(format!("{:?}", app.opts));
+        seen.extend(app.notice.clone());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(app, f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        seen.push(buffer.content().iter().map(|c| c.symbol()).collect());
+        for text in seen {
+            assert!(!text.contains(VALUE), "{text}");
+        }
+    }
 
     #[test]
     fn dropping_runs_cancels_serves_the_worker_handoff_and_joins() {

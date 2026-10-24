@@ -1,6 +1,7 @@
 //! Draws [`App`]: Targets and Tags on the left, Results on the right, an
-//! optional log pane, the status bar and the help overlay. Host and config
-//! text is escaped before it is drawn.
+//! optional log pane, the status bar and the overlays (help, the secret
+//! NAME prompt, the migrate choice, the options). Host and config text is
+//! escaped before it is drawn.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -8,9 +9,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use super::app::{App, Overlay, Pane, RunResult, Running};
+use super::app::{App, BACKENDS, OPTION_FLAGS, Overlay, Pane, RunResult, Running};
 use crate::doctor::{self, SecretStatus};
 use crate::logger::escape_controls;
+use crate::secret;
 use crate::{apply, apply::TargetReport};
 
 const LEFT_WIDTH: u16 = 28;
@@ -24,6 +26,15 @@ const HELP: &[(&str, &str)] = &[
     ("d", "doctor"),
     ("a", "apply"),
     ("Esc", "cancel a run / close"),
+    ("i", "edit the inventory"),
+    ("c", "edit the config"),
+    ("f", "cycle the edit format"),
+    ("s", "edit a secret"),
+    ("m", "migrate the secrets"),
+    ("o", "inventory/config/ssh paths"),
+    ("+ -", "verbosity"),
+    ("l", "show / hide the log"),
+    ("r", "reload the inventory"),
     ("[ ]", "previous / next result"),
     ("?", "this help"),
     ("q / Ctrl-C", "quit"),
@@ -45,8 +56,12 @@ pub fn draw(app: &App, f: &mut Frame) {
         draw_log(app, f, log);
     }
     f.render_widget(Paragraph::new(status_line(app)), status);
-    if let Some(Overlay::Help) = app.overlay {
-        draw_help(f);
+    match &app.overlay {
+        None => {}
+        Some(Overlay::Help) => draw_help(f),
+        Some(Overlay::Input { text, invalid }) => draw_input(f, text, *invalid),
+        Some(Overlay::Migrate { choice }) => draw_migrate(f, *choice),
+        Some(Overlay::Options { field, texts }) => draw_options(f, *field, texts),
     }
 }
 
@@ -130,11 +145,11 @@ fn draw_results(app: &App, f: &mut Frame, area: Rect) {
             lines
         }
         Some(RunResult::Edit { what, outcome }) => {
-            let text = match outcome {
-                Ok(text) => format!("{what}: {text}"),
-                Err(err) => format!("{what}: ✘ {err}"),
+            let end = match outcome {
+                Ok(done) => Line::from(format!("  {}", text(done))).style(Color::Green),
+                Err(err) => Line::from(format!("  ✘ {}", text(err))).style(Color::Red),
             };
-            vec![Line::from(escape_controls(&text).into_owned())]
+            vec![Line::from(text(what)).style(Modifier::BOLD), end]
         }
     };
     // The running result is the newest one.
@@ -280,15 +295,64 @@ fn draw_help(f: &mut Frame) {
         .iter()
         .map(|(key, what)| Line::from(format!(" {key:<11} {what}")))
         .collect();
+    popup(f, "Help", 44, lines);
+}
+
+/// `lines` in a bordered box of `width` columns, centred over the screen.
+fn popup(f: &mut Frame, title: &str, width: u16, lines: Vec<Line<'_>>) {
     let height = u16::try_from(lines.len()).unwrap_or(u16::MAX) + 2;
     let area = f
         .area()
-        .centered(Constraint::Length(40), Constraint::Length(height));
+        .centered(Constraint::Length(width), Constraint::Length(height));
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title("Help")),
+        Paragraph::new(lines).block(Block::bordered().title(title)),
         area,
     );
+}
+
+/// The secret NAME prompt; the name rule once Enter refused the text.
+fn draw_input(f: &mut Frame, name: &str, invalid: bool) {
+    let hint = if invalid {
+        Line::from(format!(" NAME {}", secret::NAME_RULE)).style(Color::Red)
+    } else {
+        Line::from(" Enter edit · Esc cancel").style(Modifier::DIM)
+    };
+    let lines = vec![Line::from(format!(" NAME {}▏", text(name))), hint];
+    popup(f, "Edit secret", 46, lines);
+}
+
+fn draw_migrate(f: &mut Frame, choice: usize) {
+    let mut lines: Vec<Line> = BACKENDS
+        .iter()
+        .enumerate()
+        .map(|(i, backend)| {
+            let mark = if i == choice { ">" } else { " " };
+            line(format!(" {mark} {backend}"), i == choice)
+        })
+        .collect();
+    lines.push(Line::from(" ↑↓ choose · Enter migrate · Esc cancel").style(Modifier::DIM));
+    popup(f, "Migrate secrets to", 46, lines);
+}
+
+/// The three paths, the one being typed into marked; empty is the default.
+fn draw_options(f: &mut Frame, field: usize, texts: &[String; 3]) {
+    let mut lines: Vec<Line> = OPTION_FLAGS
+        .iter()
+        .zip(texts)
+        .enumerate()
+        .map(|(i, (flag, value))| {
+            let (mark, cursor) = if i == field { (">", "▏") } else { (" ", "") };
+            let value = if value.is_empty() && i != field {
+                "(default)".to_owned()
+            } else {
+                text(value)
+            };
+            Line::from(format!(" {mark} {flag:<12} {value}{cursor}"))
+        })
+        .collect();
+    lines.push(Line::from(" Tab/↑↓ field · Enter apply · Esc cancel").style(Modifier::DIM));
+    popup(f, "Options (empty = default)", 60, lines);
 }
 
 #[cfg(test)]
@@ -343,21 +407,30 @@ mod tests {
     fn the_help_overlay_lists_the_keys() {
         let mut app = app();
         app.overlay = Some(Overlay::Help);
-        let screen = render(&app, 80, 15);
+        let screen = render(&app, 80, 24);
         assert_eq!(
-            screen[2..13],
+            screen[2..22],
             [
-                "│[ ] mac  me@10.0.0.┌Help──────────────────────────────────┐                   │",
-                "│[ ] pi  pi.lan     │ ↑↓ / j k    move                     │                   │",
-                "└───────────────────│ Space       select a target or tag   │                   │",
-                "┌Tags───────────────│ Tab         cycle focus              │                   │",
-                "│[ ] dev            │ d           doctor                   │                   │",
-                "│[ ] home           │ a           apply                    │                   │",
-                "│                   │ Esc         cancel a run / close     │                   │",
-                "│                   │ [ ]         previous / next result   │                   │",
-                "│                   │ ?           this help                │                   │",
-                "│                   │ q / Ctrl-C  quit                     │                   │",
-                "│                   └──────────────────────────────────────┘                   │",
+                "│[ ] mac  me@10.0.┌Help──────────────────────────────────────┐                 │",
+                "│[ ] pi  pi.lan   │ ↑↓ / j k    move                         │                 │",
+                "└─────────────────│ Space       select a target or tag       │                 │",
+                "┌Tags─────────────│ Tab         cycle focus                  │                 │",
+                "│[ ] dev          │ d           doctor                       │                 │",
+                "│[ ] home         │ a           apply                        │                 │",
+                "│                 │ Esc         cancel a run / close         │                 │",
+                "│                 │ i           edit the inventory           │                 │",
+                "│                 │ c           edit the config              │                 │",
+                "│                 │ f           cycle the edit format        │                 │",
+                "│                 │ s           edit a secret                │                 │",
+                "│                 │ m           migrate the secrets          │                 │",
+                "│                 │ o           inventory/config/ssh paths   │                 │",
+                "│                 │ + -         verbosity                    │                 │",
+                "│                 │ l           show / hide the log          │                 │",
+                "│                 │ r           reload the inventory         │                 │",
+                "│                 │ [ ]         previous / next result       │                 │",
+                "│                 │ ?           this help                    │                 │",
+                "│                 │ q / Ctrl-C  quit                         │                 │",
+                "│                 └──────────────────────────────────────────┘                 │",
             ]
         );
     }
@@ -622,6 +695,139 @@ mod tests {
         assert_eq!(
             screen[15],
             "│WARN anvil: line 7                                        │"
+        );
+    }
+
+    #[test]
+    fn the_secret_prompt_shows_the_name_then_the_rule_when_refused() {
+        let mut app = app();
+        app.overlay = Some(Overlay::Input {
+            text: "HOST_\x1b".to_owned(),
+            invalid: false,
+        });
+        assert_eq!(
+            render(&app, 80, 10)[3..7],
+            [
+                "│[ ] pi  pi.lan  ┌Edit secret─────────────────────────────────┐                │",
+                "└────────────────│ NAME HOST_\\x1b▏                            │                │",
+                "┌Tags────────────│ Enter edit · Esc cancel                    │                │",
+                "│[ ] dev         └────────────────────────────────────────────┘                │",
+            ]
+        );
+        app.overlay = Some(Overlay::Input {
+            text: "bad".to_owned(),
+            invalid: true,
+        });
+        assert_eq!(
+            render(&app, 80, 10)[4..6],
+            [
+                "└────────────────│ NAME bad▏                                  │                │",
+                "┌Tags────────────│ NAME must match [A-Z][A-Z0-9_]*            │                │",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_migrate_overlay_marks_the_choice() {
+        let mut app = app();
+        app.overlay = Some(Overlay::Migrate { choice: 1 });
+        assert_eq!(
+            render(&app, 80, 10)[2..8],
+            [
+                "│[ ] mac  me@10.0┌Migrate secrets to──────────────────────────┐                │",
+                "│[ ] pi  pi.lan  │   keychain                                 │                │",
+                "└────────────────│ > age                                      │                │",
+                "┌Tags────────────│   sops                                     │                │",
+                "│[ ] dev         │ ↑↓ choose · Enter migrate · Esc cancel     │                │",
+                "│[ ] home        └────────────────────────────────────────────┘                │",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_options_overlay_shows_each_path_or_the_default() {
+        let mut app = app();
+        app.overlay = Some(Overlay::Options {
+            field: 1,
+            texts: ["/tmp/inv.toml".to_owned(), String::new(), String::new()],
+        });
+        assert_eq!(
+            render(&app, 80, 10)[2..8],
+            [
+                "│[ ] mac  ┌Options (empty = default)─────────────────────────────────┐         │",
+                "│[ ] pi  p│   --inventory  /tmp/inv.toml                             │         │",
+                "└─────────│ > --config     ▏                                         │         │",
+                "┌Tags─────│   --ssh-config (default)                                 │         │",
+                "│[ ] dev  │ Tab/↑↓ field · Enter apply · Esc cancel                  │         │",
+                "│[ ] home └──────────────────────────────────────────────────────────┘         │",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_edit_result_shows_what_then_its_outcome() {
+        let mut app = app();
+        show(
+            &mut app,
+            RunResult::Edit {
+                what: "secret API".to_owned(),
+                outcome: Ok("secret API: updated".to_owned()),
+            },
+        );
+        assert_eq!(
+            render(&app, 80, 6),
+            [
+                "┌Targets───────────────────┐┌Results───────────────────────────────────────────┐",
+                "│[ ] local  local          ││secret API                                        │",
+                "│[ ] mac  me@10.0.0.2:2222 ││  secret API: updated                             │",
+                "│[ ] pi  pi.lan            ││                                                  │",
+                "└──────────────────────────┘└──────────────────────────────────────────────────┘",
+                " d doctor · a apply · [ ] results · ? help · q quit │ format default │ -v 0",
+            ]
+        );
+        show(
+            &mut app,
+            RunResult::Edit {
+                what: "inventory".to_owned(),
+                outcome: Err("inventory: still invalid\x07".to_owned()),
+            },
+        );
+        assert_eq!(
+            results(&app, 6)[..2],
+            ["inventory", "  ✘ inventory: still invalid\\x07"]
+        );
+    }
+
+    #[test]
+    fn the_log_pane_sits_above_the_status_bar_newest_last() {
+        let mut app = app();
+        app.show_log = true;
+        app.focus = Pane::Log;
+        let lines = [
+            (log::Level::Error, "cannot connect: \\x1b[2J"),
+            (log::Level::Warn, "interrupted at a prompt"),
+            (log::Level::Debug, "opening the age secret store"),
+        ];
+        for (level, message) in lines {
+            app.log.push_back(LogLine {
+                level,
+                target: "anvil".to_owned(),
+                message: message.to_owned(),
+            });
+        }
+        assert_eq!(
+            render(&app, 60, 14)[5..],
+            [
+                "┌Log───────────────────────────────────────────────────────┐",
+                "│ERROR anvil: cannot connect: \\x1b[2J                      │",
+                "│WARN anvil: interrupted at a prompt                       │",
+                "│DEBUG anvil: opening the age secret store                 │",
+                "│                                                          │",
+                "│                                                          │",
+                "│                                                          │",
+                "└──────────────────────────────────────────────────────────┘",
+                " d doctor · a apply · [ ] results · ? help · q quit │ format",
+            ]
         );
     }
 }

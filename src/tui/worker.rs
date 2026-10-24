@@ -203,7 +203,7 @@ mod tests {
                 Msg::DoctorDone(_) => "doctor done".to_owned(),
                 Msg::Finished(result) => format!("finished {result:?}"),
                 Msg::Panicked(message) => format!("panicked {message}"),
-                Msg::Log(_) | Msg::Suspend(_) => "other".to_owned(),
+                Msg::Log(_) | Msg::Interrupted | Msg::Suspend(_) => "other".to_owned(),
             })
             .collect()
     }
