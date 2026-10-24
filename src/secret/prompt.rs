@@ -14,6 +14,8 @@ use rustix::fs::{Mode, OFlags};
 use rustix::termios::{self, LocalModes, OptionalActions, SpecialCodeIndex, Termios};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::term;
+
 /// The longest passphrase accepted, in bytes.
 const MAX_LEN: usize = 1024;
 
@@ -65,6 +67,19 @@ impl Drop for Restore<'_> {
 /// clears the line; Ctrl-C, or Ctrl-D on an empty line, cancels; more than
 /// 1024 bytes is refused.
 pub fn read_passphrase(prompt: &str) -> Result<SecretString, PromptError> {
+    ask_with_terminal(ask, prompt)
+}
+
+/// Runs `ask` with the real terminal; split out so a test can stand in for
+/// the terminal read.
+fn ask_with_terminal(
+    ask: impl FnOnce(&str) -> Result<SecretString, PromptError>,
+    prompt: &str,
+) -> Result<SecretString, PromptError> {
+    term::with_terminal(|| ask(prompt))
+}
+
+fn ask(prompt: &str) -> Result<SecretString, PromptError> {
     let tty = open_tty().map_err(|_| PromptError::NoTty)?;
     let saved = termios::tcgetattr(&tty).map_err(io::Error::from)?;
     let mut raw = saved.clone();
@@ -124,6 +139,23 @@ mod tests {
 
     fn typed(keys: &[u8]) -> Result<Zeroizing<Vec<u8>>, PromptError> {
         read_line(&mut &keys[..])
+    }
+
+    #[test]
+    fn the_prompt_runs_with_the_terminal_handed_back() {
+        use crate::term::testing::{Event, Recorder};
+        let _lock = term::test_lock();
+        let (recorder, _guard) = Recorder::install();
+        let no_tty = |prompt: &str| {
+            assert_eq!(prompt, "x: ");
+            assert_eq!(recorder.events(), [Event::Suspend]);
+            Err(PromptError::NoTty)
+        };
+        assert!(matches!(
+            ask_with_terminal(no_tty, "x: "),
+            Err(PromptError::NoTty)
+        ));
+        assert_eq!(recorder.events(), [Event::Suspend, Event::Resume]);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::paths::{self, PrivateDirError};
+use crate::term;
 use crate::transport::{
     Output, RUN_TIMEOUT, Transport, TransportError, collect, into_string, run_with_script,
 };
@@ -184,7 +185,7 @@ impl Ssh {
         match self.master_attempt(control_dir, true)? {
             MasterOutcome::Connected => Ok(()),
             MasterOutcome::Denied if self.can_prompt => {
-                match self.master_attempt(control_dir, false)? {
+                match term::with_terminal(|| self.master_attempt(control_dir, false))? {
                     MasterOutcome::Connected => Ok(()),
                     MasterOutcome::Denied => Err(TransportError::AuthDenied { after_prompt: true }),
                 }
@@ -327,6 +328,7 @@ fn mode_of(path: &Path) -> Result<u32, TransportError> {
 mod tests {
     use super::*;
     use crate::facts::{Facts, PROBE};
+    use crate::term::testing::{Event, Recorder};
     use crate::test_util::{temp_dir, write_knobs};
     use std::os::unix::fs::PermissionsExt;
 
@@ -587,9 +589,12 @@ mod tests {
 
     #[test]
     fn key_success_opens_the_master_then_runs_the_script() {
+        let _lock = term::test_lock();
+        let (recorder, _guard) = Recorder::install();
         let home = temp_home();
         let (ssh, log) = fake_with(&home, &[]);
         let out = ssh.run("echo hi").unwrap();
+        assert!(recorder.events().is_empty());
         assert_eq!(out.stdout, b"hi\n");
         let calls = invocations(&log);
         assert_eq!(calls.len(), 3, "{calls:?}");
@@ -665,6 +670,7 @@ mod tests {
 
     #[test]
     fn with_a_tty_the_key_refusal_is_retried_without_batchmode() {
+        let _lock = term::test_lock();
         let home = temp_home();
         let (ssh, log) = fake_with(
             &home,
@@ -677,8 +683,11 @@ mod tests {
             can_prompt: true,
             ..ssh
         };
+        let (recorder, _guard) = Recorder::install();
         // The retry (FAKE_SSH_RETRY_EXIT unset) succeeds, so the client runs.
         let out = ssh.run("echo hi").unwrap();
+        // Only the interactive retry gets the terminal.
+        assert_eq!(recorder.events(), [Event::Suspend, Event::Resume]);
         assert_eq!(out.stdout, b"hi\n");
         let calls = invocations(&log);
         assert_eq!(calls.len(), 4, "{calls:?}");
@@ -698,6 +707,7 @@ mod tests {
 
     #[test]
     fn a_refused_interactive_attempt_has_its_own_message() {
+        let _lock = term::test_lock();
         let home = temp_home();
         let (ssh, log) = fake_with(
             &home,

@@ -537,6 +537,7 @@ mod tests {
         }
 
         fn run(&self, name: &str, store: &dyn Store) -> Result<(), Failure> {
+            let _lock = crate::term::test_lock();
             let config = self.config.to_str().unwrap();
             let cli = Cli::try_parse_from(["anvil", "--config", config, "secret", name]).unwrap();
             let opts = Options::from_cli(&cli);

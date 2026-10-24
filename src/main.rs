@@ -14,6 +14,7 @@ mod options;
 mod paths;
 mod secret;
 mod ssh;
+mod term;
 #[cfg(test)]
 mod test_util;
 mod transport;
