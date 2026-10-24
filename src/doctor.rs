@@ -20,6 +20,7 @@ use crate::editor::{Editor, EditorError, Fallback};
 use crate::facts::{self, Facts, PROBE};
 use crate::inventory::{Target, TargetKind};
 use crate::logger::escape_controls;
+use crate::options::Options;
 use crate::paths;
 use crate::secret::{SecretError, Store};
 use crate::transport::{Output, Transport, TransportError};
@@ -37,7 +38,7 @@ pub enum SecretStatus {
 }
 
 impl SecretStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             SecretStatus::Ok => "ok",
             SecretStatus::Missing => "missing",
@@ -49,13 +50,13 @@ impl SecretStatus {
 
 #[derive(Debug, Serialize)]
 pub struct LocalReport {
-    ssh: bool,
-    sh: bool,
+    pub ssh: bool,
+    pub sh: bool,
     /// The resolved editor program, or why it cannot be resolved; JSON shows
     /// the path or `null`.
     #[serde(serialize_with = "path_or_null")]
-    editor: Result<PathBuf, String>,
-    secrets: BTreeMap<String, SecretStatus>,
+    pub editor: Result<PathBuf, String>,
+    pub secrets: BTreeMap<String, SecretStatus>,
 }
 
 fn path_or_null<S: serde::Serializer>(
@@ -76,24 +77,24 @@ impl LocalReport {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TargetReport {
-    target: String,
-    connectable: bool,
+    pub target: String,
+    pub connectable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    facts: Option<Facts>,
+    pub facts: Option<Facts>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub error: Option<String>,
     /// How the target is reached, for the human output.
     #[serde(skip)]
-    transport: String,
+    pub transport: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Report {
-    local: LocalReport,
-    targets: Vec<TargetReport>,
-    ok: bool,
+    pub local: LocalReport,
+    pub targets: Vec<TargetReport>,
+    pub ok: bool,
 }
 
 impl Report {
@@ -103,19 +104,47 @@ impl Report {
     }
 }
 
-pub fn run(cli: &Cli, config: &Config, store: &dyn Store) -> Result<(), Failure> {
+/// What [`check`] reports as it goes: a target about to be probed, and its
+/// report once probed.
+#[cfg_attr(
+    not(any(test, feature = "tui")),
+    expect(dead_code, reason = "read by the TUI")
+)]
+pub enum Progress<'a> {
+    Start(&'a Target),
+    Done(&'a TargetReport),
+}
+
+/// The local checks, then each target's probe in order. The store is opened
+/// before the targets are loaded.
+pub fn check(
+    opts: &Options,
+    config: &Config,
+    store: &dyn Store,
+    on: &mut dyn FnMut(Progress<'_>),
+) -> Result<Report, Failure> {
     let secrets = check_secrets(config.names(), store);
-    let targets = cli.targets()?;
+    let targets = opts.targets()?;
     let local = local_checks(
-        &cli.ssh_program(),
+        &opts.ssh_program(),
         Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict),
         secrets,
     );
     let targets = targets
         .iter()
-        .map(|target| check_target(target, cli.transport(target)))
+        .map(|target| {
+            on(Progress::Start(target));
+            let report = check_target(target, opts.transport(target));
+            on(Progress::Done(&report));
+            report
+        })
         .collect();
-    let report = Report::new(local, targets);
+    Ok(Report::new(local, targets))
+}
+
+/// `anvil doctor`: prints the whole report (or one JSON document) at the end.
+pub fn run(cli: &Cli, opts: &Options, config: &Config, store: &dyn Store) -> Result<(), Failure> {
+    let report = check(opts, config, store, &mut |_| {})?;
     if cli.json {
         print_json(&report, Failure::failed)?;
     } else {
@@ -245,18 +274,35 @@ pub fn describe(target: &Target) -> String {
     match &target.kind {
         TargetKind::Local => "local".to_owned(),
         TargetKind::Ssh { host, user, port } => {
-            let mut out = String::from("ssh ");
-            if let Some(user) = user {
-                out.push_str(user);
-                out.push('@');
-            }
-            out.push_str(host);
-            if let Some(port) = port {
-                let _ = write!(out, ":{port}");
-            }
-            out
+            format!("ssh {}", address(host, user.as_deref(), *port))
         }
     }
+}
+
+/// How a host is reached: `[user@]host[:port]`.
+pub fn address(host: &str, user: Option<&str>, port: Option<impl std::fmt::Display>) -> String {
+    let mut out = String::new();
+    if let Some(user) = user {
+        out.push_str(user);
+        out.push('@');
+    }
+    out.push_str(host);
+    if let Some(port) = port {
+        let _ = write!(out, ":{port}");
+    }
+    out
+}
+
+/// A target's facts as `(key, value)` rows in [`facts::KEYS`] order, the
+/// packages joined with `, `; empty values are left out.
+pub fn fact_rows(facts: &Facts) -> impl Iterator<Item = (&'static str, String)> + '_ {
+    facts::KEYS.iter().filter_map(|key| {
+        let value = match *key {
+            "pkg" => facts.pkg().join(", "),
+            key => facts.get(key).unwrap_or_default().to_owned(),
+        };
+        (!value.is_empty()).then_some((*key, value))
+    })
 }
 
 /// The human report. Facts and errors come from the host, so control
@@ -290,16 +336,8 @@ fn render(report: &Report) -> String {
     for target in &report.targets {
         let _ = writeln!(out, "\n{}", target.target);
         let _ = writeln!(out, "  {:<15} {}", "transport", target.transport);
-        if let Some(facts) = &target.facts {
-            for key in facts::KEYS {
-                let value = match *key {
-                    "pkg" => facts.pkg().join(", "),
-                    key => facts.get(key).unwrap_or_default().to_owned(),
-                };
-                if !value.is_empty() {
-                    let _ = writeln!(out, "  {key:<15} {value}");
-                }
-            }
+        for (key, value) in target.facts.iter().flat_map(fact_rows) {
+            let _ = writeln!(out, "  {key:<15} {value}");
         }
         if let Some(error) = &target.error {
             let _ = writeln!(out, "  {:<15} {error}", "error");
@@ -563,10 +601,57 @@ mod tests {
             steps: vec![],
         };
         let store = Unopenable::new(|| SecretError::Locked);
-        let failure = run(&cli, &config, &store).unwrap_err();
+        let failure = run(&cli, &Options::from_cli(&cli), &config, &store).unwrap_err();
         assert_eq!(failure.code, 2, "{}", failure.message);
         assert_eq!(store.opened.get(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn check_reports_progress_start_then_done_per_target() {
+        let inventory = crate::test_util::fixture("inventory.toml");
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "anvil",
+            "--inventory",
+            inventory.to_str().unwrap(),
+            "--target",
+            "local",
+            "--target",
+            "pi",
+            "--ssh-program",
+            "/nonexistent/ssh",
+            "doctor",
+        ])
+        .unwrap();
+        let config = Config {
+            secrets: None,
+            anvil: Default::default(),
+            steps: vec![],
+        };
+        let mut events = Vec::new();
+        let report = check(
+            &Options::from_cli(&cli),
+            &config,
+            &Memory::default(),
+            &mut |progress| {
+                events.push(match progress {
+                    Progress::Start(target) => format!("start {}", target.name),
+                    Progress::Done(report) => format!("done {}", report.target),
+                })
+            },
+        )
+        .unwrap();
+        let names: Vec<&str> = report.targets.iter().map(|t| t.target.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        let expected: Vec<String> = names
+            .iter()
+            .flat_map(|name| [format!("start {name}"), format!("done {name}")])
+            .collect();
+        assert_eq!(events, expected);
+        let pi = report.targets.iter().find(|t| t.target == "pi").unwrap();
+        assert!(!pi.connectable);
+        assert!(!report.ok);
     }
 
     #[test]

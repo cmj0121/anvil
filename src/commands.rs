@@ -19,6 +19,7 @@
 //! the same atomic write; any failure before that leaves the config as it
 //! was.
 
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -33,6 +34,7 @@ use crate::config::Config;
 use crate::document::{self, DocumentError, Format, MAX_BYTES};
 use crate::editor::{Buffer, Editor, Fallback};
 use crate::inventory::Inventory;
+use crate::options::Options;
 use crate::paths::{self, DocPath};
 use crate::secret::{self, BackendKind, Store};
 
@@ -41,9 +43,21 @@ const ATTEMPTS: u32 = 3;
 
 /// What `--json` prints: the file written and whether it changed.
 #[derive(Debug, Serialize)]
-struct Outcome {
-    path: PathBuf,
-    changed: bool,
+pub struct Outcome {
+    pub path: PathBuf,
+    pub changed: bool,
+}
+
+/// The line the CLI prints (and the TUI shows) for an editor flow.
+impl fmt::Display for Outcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let path = self.path.display();
+        if self.changed {
+            write!(f, "wrote {path}")
+        } else {
+            write!(f, "{path}: unchanged")
+        }
+    }
 }
 
 /// Where the edited document ends up (always TOML) and the format it is
@@ -53,18 +67,25 @@ struct Destination {
     format: Format,
 }
 
-pub fn inventory(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
+/// `anvil inventory`: [`edit_inventory`], then its outcome.
+pub fn inventory(cli: &Cli, opts: &Options, format: Option<Format>) -> Result<(), Failure> {
     warn_target(cli);
-    let config = cli.load_config()?;
+    let outcome = edit_inventory(opts, format)?;
+    report(cli, &outcome)
+}
+
+/// The inventory's editor flow; `format` is the edit view.
+pub fn edit_inventory(opts: &Options, format: Option<Format>) -> Result<Outcome, Failure> {
+    let config = opts.load_config()?;
     let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict)?;
-    let current = paths::locate(cli.inventory.as_deref(), "inventory")?;
+    let current = paths::locate(opts.inventory.as_deref(), "inventory")?;
     let dest = destination(
-        cli.inventory.as_deref(),
+        opts.inventory.as_deref(),
         "inventory",
         format.unwrap_or(config.anvil.format),
     )?;
     let inventory = Inventory::load(current.as_ref())?;
-    let outcome = edit_document(
+    edit_document(
         &editor,
         "inventory",
         inventory,
@@ -72,21 +93,27 @@ pub fn inventory(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
         &dest,
         |_: &mut Inventory| false,
         Inventory::validate,
-    )?;
+    )
+}
+
+/// `anvil config`: [`edit_config`], then its outcome.
+pub fn config(cli: &Cli, opts: &Options, format: Option<Format>) -> Result<(), Failure> {
+    warn_target(cli);
+    let outcome = edit_config(opts, format)?;
     report(cli, &outcome)
 }
 
-pub fn config(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
-    warn_target(cli);
-    let current = paths::locate(cli.config.as_deref(), "config")?;
+/// The config's editor flow; `format` is the edit view.
+pub fn edit_config(opts: &Options, format: Option<Format>) -> Result<Outcome, Failure> {
+    let current = paths::locate(opts.config.as_deref(), "config")?;
     let config = Config::load(current.as_ref())?;
     let dest = destination(
-        cli.config.as_deref(),
+        opts.config.as_deref(),
         "config",
         format.unwrap_or(config.anvil.format),
     )?;
     let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Lenient)?;
-    let outcome = edit_document(
+    edit_document(
         &editor,
         "config",
         config,
@@ -94,22 +121,43 @@ pub fn config(cli: &Cli, format: Option<Format>) -> Result<(), Failure> {
         &dest,
         Config::migrate,
         Config::validate,
-    )?;
-    report(cli, &outcome)
+    )
 }
 
 /// What `--json` prints for `secret`: the name and whether the store changed.
 #[derive(Debug, Serialize)]
-struct SecretOutcome<'a> {
-    name: &'a str,
-    changed: bool,
+pub struct SecretOutcome {
+    pub name: String,
+    pub changed: bool,
 }
 
-/// `anvil secret NAME`: open the store → `get` → edit as `.txt` → strip one
-/// trailing newline → empty deletes, anything else is stored → commit. An
-/// unchanged buffer writes nothing.
+impl fmt::Display for SecretOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let what = if self.changed { "updated" } else { "unchanged" };
+        write!(f, "secret {}: {what}", self.name)
+    }
+}
+
+/// `anvil secret NAME`: [`edit_secret`], then whether it changed.
 pub fn secret(cli: &Cli, config: &Config, name: &str, store: &dyn Store) -> Result<(), Failure> {
     warn_target(cli);
+    let outcome = edit_secret(config, name, store)?;
+    if cli.json {
+        print_json(&outcome, Failure::usage)?;
+    } else {
+        println!("{outcome}");
+    }
+    Ok(())
+}
+
+/// Open the store → `get` → edit as `.txt` → strip one trailing newline →
+/// empty deletes, anything else is stored → commit. An unchanged buffer
+/// writes nothing.
+pub fn edit_secret(
+    config: &Config,
+    name: &str,
+    store: &dyn Store,
+) -> Result<SecretOutcome, Failure> {
     if !secret::is_name(name) {
         return Err(Failure::usage(format!(
             "secret `{name}`: {}",
@@ -157,36 +205,50 @@ pub fn secret(cli: &Cli, config: &Config, name: &str, store: &dyn Store) -> Resu
     if let Some(action) = action {
         log::info!("secret {name}: {action}");
     }
-    let changed = action.is_some();
-    if cli.json {
-        print_json(&SecretOutcome { name, changed }, Failure::usage)?;
-    } else if changed {
-        println!("secret {name}: updated");
-    } else {
-        println!("secret {name}: unchanged");
-    }
-    Ok(())
+    Ok(SecretOutcome {
+        name: name.to_owned(),
+        changed: action.is_some(),
+    })
 }
 
 /// What `--json` prints for `secret --migrate`.
 #[derive(Debug, Serialize)]
-struct Migrated {
-    from: &'static str,
-    to: &'static str,
-    count: usize,
+pub struct Migrated {
+    pub from: &'static str,
+    pub to: &'static str,
+    pub count: usize,
 }
 
-/// `anvil secret --migrate --to BACKEND`: the target must be another backend
-/// whose config section is present (exit 2 otherwise).
-pub fn migrate(cli: &Cli, to: BackendKind) -> Result<(), Failure> {
+impl fmt::Display for Migrated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Migrated { from, to, count } = self;
+        let secrets = if *count == 1 { "secret" } else { "secrets" };
+        write!(f, "migrated {count} {secrets} from {from} to {to}")
+    }
+}
+
+/// `anvil secret --migrate --to BACKEND`: [`migrate_to`], then what moved.
+pub fn migrate(cli: &Cli, opts: &Options, to: BackendKind) -> Result<(), Failure> {
     warn_target(cli);
+    let migrated = migrate_to(opts, to)?;
+    if cli.json {
+        print_json(&migrated, Failure::usage)
+    } else {
+        println!("{migrated}");
+        Ok(())
+    }
+}
+
+/// Moves every secret to backend `to`: it must be another backend whose
+/// config section is present (exit 2 otherwise).
+pub fn migrate_to(opts: &Options, to: BackendKind) -> Result<Migrated, Failure> {
     #[cfg(debug_assertions)]
-    if cli.secret_store == Some(crate::cli::SecretStoreKind::Memory) {
+    if opts.secret_store == Some(crate::options::SecretStoreKind::Memory) {
         return Err(Failure::usage(
             "secret --migrate: not with --secret-store memory; it moves the configured store",
         ));
     }
-    let current = paths::locate(cli.config.as_deref(), "config")?;
+    let current = paths::locate(opts.config.as_deref(), "config")?;
     let config = Config::load(current.as_ref())?;
     let usage = |message: String| Failure::usage(format!("secret --migrate --to {to}: {message}"));
     let from_kind = config.backend_kind().map_err(usage)?;
@@ -200,9 +262,8 @@ pub fn migrate(cli: &Cli, to: BackendKind) -> Result<(), Failure> {
     secret::migrate::check_apart(&source, &backend).map_err(usage)?;
     let from = secret::from_config(&source)?;
     let target = secret::from_config(&backend)?;
-    let dest = destination(cli.config.as_deref(), "config", Format::Toml)?;
+    let dest = destination(opts.config.as_deref(), "config", Format::Toml)?;
     migrate_stores(
-        cli,
         config,
         current.as_ref(),
         &dest.path,
@@ -216,14 +277,13 @@ pub fn migrate(cli: &Cli, to: BackendKind) -> Result<(), Failure> {
 /// then writes the config selecting backend `to` to `dest` (removing a
 /// legacy `current` YAML file).
 fn migrate_stores(
-    cli: &Cli,
     mut config: Config,
     current: Option<&DocPath>,
     dest: &Path,
     from: &dyn Store,
     target: &dyn Store,
     [from_name, to]: [BackendKind; 2],
-) -> Result<(), Failure> {
+) -> Result<Migrated, Failure> {
     log::debug!("migrating the {from_name} secret store to {to}");
     let count = secret::migrate::copy(from, target)
         .map_err(|err| Failure::failed(format!("migrate: {err}")))?;
@@ -240,21 +300,13 @@ fn migrate_stores(
             err.message
         )));
     }
-    let secrets = if count == 1 { "secret" } else { "secrets" };
-    log::info!("migrated {count} {secrets} from {from_name} to {to}");
-    if cli.json {
-        print_json(
-            &Migrated {
-                from: from_name.as_str(),
-                to: to.as_str(),
-                count,
-            },
-            Failure::usage,
-        )
-    } else {
-        println!("migrated {count} {secrets} from {from_name} to {to}");
-        Ok(())
-    }
+    let migrated = Migrated {
+        from: from_name.as_str(),
+        to: to.as_str(),
+        count,
+    };
+    log::info!("{migrated}");
+    Ok(migrated)
 }
 
 fn warn_target(cli: &Cli) {
@@ -325,6 +377,8 @@ where
                 break;
             }
             Err(err) => {
+                // Not a log line: runs inside an editor flow, which a front end always
+                // runs with the real terminal (term::with_terminal).
                 eprintln!("{err}");
                 if attempt == ATTEMPTS {
                     return Err(Failure::usage(format!(
@@ -443,10 +497,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
 fn report(cli: &Cli, outcome: &Outcome) -> Result<(), Failure> {
     if cli.json {
         print_json(outcome, Failure::usage)?;
-    } else if outcome.changed {
-        println!("wrote {}", outcome.path.display());
     } else {
-        println!("{}: unchanged", outcome.path.display());
+        println!("{outcome}");
     }
     Ok(())
 }
@@ -485,9 +537,11 @@ mod tests {
         }
 
         fn run(&self, name: &str, store: &dyn Store) -> Result<(), Failure> {
+            let _lock = crate::term::test_lock();
             let config = self.config.to_str().unwrap();
             let cli = Cli::try_parse_from(["anvil", "--config", config, "secret", name]).unwrap();
-            secret(&cli, &cli.load_config().unwrap(), name, store)
+            let opts = Options::from_cli(&cli);
+            secret(&cli, &opts.load_config().unwrap(), name, store)
         }
     }
 
@@ -620,7 +674,7 @@ mod tests {
             Migration { dir, config, text }
         }
 
-        fn run(&self, from: &dyn Store, target: &dyn Store) -> Result<(), Failure> {
+        fn run(&self, from: &dyn Store, target: &dyn Store) -> Result<Migrated, Failure> {
             let config = self.config.to_str().unwrap();
             let cli = Cli::try_parse_from([
                 "anvil",
@@ -635,7 +689,6 @@ mod tests {
             let current = paths::locate(cli.config.as_deref(), "config").unwrap();
             let loaded = Config::load(current.as_ref()).unwrap();
             migrate_stores(
-                &cli,
                 loaded,
                 current.as_ref(),
                 &self.config,
@@ -959,10 +1012,7 @@ mod tests {
         keychain.0.open().unwrap().set("STALE", b"x").unwrap();
         let config =
             Config::load(Some(&DocPath::from_extension(&migration.config).unwrap())).unwrap();
-        let cli =
-            Cli::try_parse_from(["anvil", "secret", "--migrate", "--to", "keychain"]).unwrap();
         migrate_stores(
-            &cli,
             config,
             None,
             &migration.config,

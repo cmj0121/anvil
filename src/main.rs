@@ -10,12 +10,16 @@ mod editor;
 mod facts;
 mod inventory;
 mod logger;
+mod options;
 mod paths;
 mod secret;
 mod ssh;
+mod term;
 #[cfg(test)]
 mod test_util;
 mod transport;
+#[cfg(feature = "tui")]
+mod tui;
 
 use std::process::ExitCode;
 

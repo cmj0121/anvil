@@ -30,6 +30,7 @@ anvil inventory --format=yaml   # edit it as YAML this once; it is still saved a
 anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secrets] says otherwise)
 anvil doctor               # local checks + every target's facts and reachability
 anvil apply                # run the config's steps on every target
+anvil tui                  # all of the above in one terminal UI
 ```
 
 With no files at all, the inventory holds only `local` (this machine) and the config runs `hostname`, so a fresh install
@@ -188,10 +189,39 @@ On a terminal the blocks are coloured (set `NO_COLOR` to turn that off).
 
 The `doctor --json` shape and the rest are in [docs/cli.md](docs/cli.md).
 
+## Terminal UI
+
+`anvil tui` runs the same commands in one screen and keeps every result of the session for browsing. It needs a
+terminal and starts only when asked; the global flags (`--target`, `--inventory`, `--config`, `--ssh-config`, `-v`)
+are its starting state:
+
+```sh
+anvil tui                  # or: anvil tui --target linode1
+```
+
+```text
+┌Targets───────────────────┐┌Results───────────────────────────────────────────────────────────┐
+│[ ] local  local          ││▶ local                                                           │
+│[x] linode1  cmj@203.0.113││  $ hostname                                                      │
+└──────────────────────────┘│    linode1                                                       │
+┌Tags──────────────────────┐│  ✔ ok · 1 step                                                   │
+│[ ] arch                  ││                                                                  │
+│[ ] linode                ││                                                                  │
+└──────────────────────────┘└──────────────────────────────────────────────────────────────────┘
+ d doctor · a apply · [ ] results · ? help · q quit │ format default │ -v 0 │ 1 ok, 0 failed
+```
+
+`Space` selects targets and tags, `d` runs doctor and `a` apply on them, `i`, `c` and `s` open the editor, `m` migrates
+the secrets, `[` and `]` step through the results, `?` lists every key and `q` quits. The editor, ssh's password prompt
+and the age passphrase prompt (also during `m`) get the real terminal while they run. The key table and the rules are
+in [docs/cli.md](docs/cli.md#anvil-tui). The TUI is the default-on cargo feature `tui`; `cargo install --path .
+--no-default-features` builds anvil without it.
+
 ## Logging and exit codes
 
-Logs go to stderr only, so `--json` output stays parseable. The default shows errors; `-v` adds warnings, `-vv` info and
-`-vvv` debug (every `ssh` and editor argv). Secret values, probe output and file contents are never logged.
+Logs go to stderr only (in `anvil tui`, to its Log pane), so `--json` output stays parseable. The default shows errors;
+`-v` adds warnings, `-vv` info and `-vvv` debug (every `ssh` and editor argv). Secret values, probe output and file
+contents are never logged.
 
 | Exit | Meaning                                                                                                      |
 | ---- | ------------------------------------------------------------------------------------------------------------ |
@@ -235,8 +265,12 @@ make test   # cargo fmt --check, clippy -D warnings, cargo test
 make e2e    # doctor, apply and the ssh auth paths against an Arch sshd container; prints `skip` without docker
 ```
 
+The terminal tests in `make test` (the age passphrase prompt and `anvil tui` on a pseudo-terminal) need python3 3.11
+or newer, for `os.login_tty`, and are skipped with a message without it.
+
 `make e2e` needs docker and `sops` on `PATH` (its sops round trip runs on the host and fails without it); its
-interactive password check also needs `python3` and is skipped without it. It uses a temporary `HOME` and config
-directory and never touches `~/.ssh`, the keychain or a real host. The official `archlinux` image is amd64-only, so on
-arm64 (Apple silicon) the e2e builds from the third-party `lopsided/archlinux` image (Arch Linux ARM,
-`distro=archarm`), pinned by digest like the official one.
+interactive password checks, from the CLI and from `anvil tui`, also need `python3` (3.11 or newer for the TUI's,
+which uses `os.login_tty`) and are skipped without it. It uses a temporary `HOME` and config directory and never
+touches `~/.ssh`, the keychain or a real host. The official `archlinux` image is amd64-only, so on arm64 (Apple
+silicon) the e2e builds from the third-party `lopsided/archlinux` image (Arch Linux ARM, `distro=archarm`), pinned by
+digest like the official one.

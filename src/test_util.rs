@@ -1,14 +1,14 @@
 //! Helpers shared by the unit tests.
 
 use std::cell::Cell;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde::Serialize;
 
+use crate::editor::random;
 use crate::paths::DocPath;
 use crate::secret::{BackendKind, SecretError, Store, Vault};
 
@@ -37,15 +37,20 @@ pub fn fixture_doc(name: &str) -> DocPath {
     DocPath::from_extension(&fixture(name)).unwrap()
 }
 
-/// A fresh, empty `/tmp/anvil-<tag>-<pid>-<n>`. Directly under `/tmp` so a
-/// control socket path below it stays within the `sun_path` limit.
+/// A new, empty, 0700 `/tmp/anvil-<tag>-<random>`, created like mkdtemp.
+/// Directly under `/tmp` so a control socket path below it stays within the
+/// `sun_path` limit.
 pub fn temp_dir(tag: &str) -> PathBuf {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(format!("/tmp/anvil-{tag}-{}-{n}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    const ATTEMPTS: u32 = 16;
+    for _ in 0..ATTEMPTS {
+        let dir = PathBuf::from(format!("/tmp/anvil-{tag}-{:08x}", random() as u32));
+        match DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return dir,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => panic!("cannot create {}: {err}", dir.display()),
+        }
+    }
+    panic!("no free /tmp/anvil-{tag}-* after {ATTEMPTS} attempts");
 }
 
 /// Writes `bytes` to a new 0600 `path`, as a key file must be.

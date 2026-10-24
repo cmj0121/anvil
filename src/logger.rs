@@ -1,20 +1,53 @@
 //! Stderr logger behind the `log` facade.
 //!
 //! Lines look like `<LEVEL> <target>: <message>`; no timestamps. Colour is used
-//! only when stderr is a terminal. The level comes from the `-v` count.
+//! only when stderr is a terminal. The level comes from the `-v` count and can
+//! change at runtime ([`set_verbosity`]). A front end that owns the terminal
+//! installs a [`Sink`] instead, and then nothing is written to stderr.
 //! Messages can carry text from a host (ssh errors, a script's stderr), so
 //! their control characters are escaped: a host cannot drive the terminal.
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 pub struct Logger {
-    level: LevelFilter,
+    verbosity: AtomicU8,
     colour: bool,
+}
+
+/// Receives each record's line, already escaped with escape_controls, no colour.
+pub trait Sink: Send + Sync {
+    fn line(&self, level: log::Level, target: &str, message: &str);
+}
+
+static LOGGER: OnceLock<Logger> = OnceLock::new();
+static SINK: RwLock<Option<Arc<dyn Sink>>> = RwLock::new(None);
+
+/// Sends every log line to `sink` instead of stderr; `None`: back to stderr.
+#[cfg_attr(
+    not(any(test, feature = "tui")),
+    expect(dead_code, reason = "called by the TUI")
+)]
+pub fn set_sink(sink: Option<Arc<dyn Sink>>) {
+    *SINK.write().unwrap_or_else(PoisonError::into_inner) = sink;
+}
+
+/// Sets the level from a `-v` count, as [`level_for`] maps it.
+#[cfg_attr(
+    not(any(test, feature = "tui")),
+    expect(dead_code, reason = "called by the TUI")
+)]
+pub fn set_verbosity(verbosity: u8) {
+    LOGGER
+        .get_or_init(|| Logger::new(verbosity))
+        .verbosity
+        .store(verbosity, Ordering::Relaxed);
+    log::set_max_level(level_for(verbosity));
 }
 
 /// Maps the `-v` count to a level: 0 Error, 1 Warn, 2 Info, 3 and more Debug.
@@ -30,18 +63,21 @@ pub fn level_for(verbosity: u8) -> LevelFilter {
 impl Logger {
     pub fn new(verbosity: u8) -> Self {
         Self {
-            level: level_for(verbosity),
+            verbosity: AtomicU8::new(verbosity),
             colour: std::io::stderr().is_terminal(),
         }
     }
 
     /// Installs the logger for the process; a second call is a no-op.
     pub fn install(verbosity: u8) {
-        static LOGGER: OnceLock<Logger> = OnceLock::new();
         let logger = LOGGER.get_or_init(|| Self::new(verbosity));
         if log::set_logger(logger).is_ok() {
-            log::set_max_level(logger.level);
+            log::set_max_level(logger.level());
         }
+    }
+
+    fn level(&self) -> LevelFilter {
+        level_for(self.verbosity.load(Ordering::Relaxed))
     }
 
     fn write_record(&self, out: &mut dyn Write, record: &Record) -> std::io::Result<()> {
@@ -104,11 +140,17 @@ fn colour_code(level: Level) -> &'static str {
 
 impl Log for Logger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.level
+        metadata.level() <= self.level()
     }
 
     fn log(&self, record: &Record) {
         if !self.enabled(record.metadata()) {
+            return;
+        }
+        let sink = SINK.read().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(sink) = sink {
+            let message = record.args().to_string();
+            sink.line(record.level(), record.target(), &escape_controls(&message));
             return;
         }
         let stderr = std::io::stderr();
@@ -121,6 +163,13 @@ impl Log for Logger {
     }
 }
 
+/// Serializes the tests that touch the process-wide sink or level.
+#[cfg(test)]
+pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,7 +180,7 @@ mod tests {
 
     fn plain(verbosity: u8) -> Logger {
         Logger {
-            level: level_for(verbosity),
+            verbosity: AtomicU8::new(verbosity),
             colour: false,
         }
     }
@@ -144,6 +193,66 @@ mod tests {
         let mut buf = Vec::new();
         logger.write_record(&mut buf, &record).unwrap();
         String::from_utf8(buf).unwrap()
+    }
+
+    #[derive(Default)]
+    struct Lines(std::sync::Mutex<Vec<(Level, String, String)>>);
+
+    impl Sink for Lines {
+        fn line(&self, level: Level, target: &str, message: &str) {
+            let line = (level, target.to_owned(), message.to_owned());
+            self.0.lock().unwrap().push(line);
+        }
+    }
+
+    fn log_to(logger: &Logger, level: Level, args: std::fmt::Arguments) {
+        let record = Record::builder()
+            .metadata(metadata(level))
+            .args(args)
+            .build();
+        logger.log(&record);
+    }
+
+    #[test]
+    fn an_installed_sink_gets_escaped_uncoloured_lines() {
+        let _lock = test_lock();
+        let lines = Arc::new(Lines::default());
+        set_sink(Some(lines.clone()));
+        let logger = Logger {
+            verbosity: AtomicU8::new(1),
+            colour: true,
+        };
+        log_to(&logger, Level::Warn, format_args!("host said \x1b[2Jhi"));
+        log_to(&logger, Level::Info, format_args!("below the level"));
+        set_sink(None);
+        log_to(
+            &logger,
+            Level::Error,
+            format_args!("to stderr, not the sink"),
+        );
+        assert_eq!(
+            *lines.0.lock().unwrap(),
+            [(
+                Level::Warn,
+                "anvil".to_owned(),
+                "host said \\x1b[2Jhi".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn set_verbosity_changes_the_level_at_runtime() {
+        let _lock = test_lock();
+        let before = log::max_level();
+        set_verbosity(0);
+        let logger = LOGGER.get().unwrap();
+        assert!(!logger.enabled(&metadata(Level::Info)));
+        assert_eq!(log::max_level(), LevelFilter::Error);
+        set_verbosity(2);
+        assert!(logger.enabled(&metadata(Level::Info)));
+        assert!(!logger.enabled(&metadata(Level::Debug)));
+        assert_eq!(log::max_level(), LevelFilter::Info);
+        log::set_max_level(before);
     }
 
     #[test]
@@ -183,7 +292,7 @@ mod tests {
     #[test]
     fn colour_wraps_only_the_level() {
         let logger = Logger {
-            level: LevelFilter::Error,
+            verbosity: AtomicU8::new(0),
             colour: true,
         };
         assert_eq!(
@@ -205,7 +314,7 @@ mod tests {
     #[test]
     fn log_messages_are_escaped_but_the_colour_is_not() {
         let logger = Logger {
-            level: LevelFilter::Error,
+            verbosity: AtomicU8::new(0),
             colour: true,
         };
         assert_eq!(

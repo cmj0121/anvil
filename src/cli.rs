@@ -1,18 +1,15 @@
 //! Command line per the CLI contract.
 
-use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 use serde::Serialize;
 
-use crate::config::Config;
 use crate::document::Format;
-use crate::inventory::{Inventory, Sel, Target, TargetKind};
-use crate::paths;
-use crate::secret::{self, BackendKind, Store};
-use crate::ssh::{self, Ssh, SshSettings};
-use crate::transport::{Local, Transport, TransportError};
+use crate::options::Options;
+#[cfg(debug_assertions)]
+use crate::options::SecretStoreKind;
+use crate::secret::BackendKind;
 
 #[derive(Debug, Parser)]
 #[command(name = "anvil", version, about, propagate_version = true)]
@@ -56,74 +53,6 @@ pub struct Cli {
     pub command: Command,
 }
 
-impl Cli {
-    /// The secret store `config` selects, or `Memory` when a debug build was
-    /// started with `--secret-store memory`. Nothing is opened yet.
-    pub fn secret_store(&self, config: &Config) -> Result<Box<dyn Store>, Failure> {
-        #[cfg(debug_assertions)]
-        if self.secret_store == Some(SecretStoreKind::Memory) {
-            return Ok(Box::new(secret::Memory::default()));
-        }
-        let backend = config.backend().map_err(Failure::usage)?;
-        Ok(secret::from_config(&backend)?)
-    }
-
-    /// The ssh program: `ssh` on `PATH`, or the debug-only `--ssh-program`.
-    pub fn ssh_program(&self) -> PathBuf {
-        #[cfg(debug_assertions)]
-        if let Some(program) = &self.ssh_program {
-            return program.clone();
-        }
-        PathBuf::from("ssh")
-    }
-
-    /// How ssh runs: [`Cli::ssh_program`], a password prompt only when stdin
-    /// and stderr are both terminals, and the production deadlines.
-    fn ssh_settings(&self) -> SshSettings {
-        SshSettings {
-            program: self.ssh_program(),
-            can_prompt: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
-            key_timeout: ssh::KEY_TIMEOUT,
-            check_timeout: ssh::CHECK_TIMEOUT,
-        }
-    }
-
-    /// The config: `--config`, else the discovered file, else the defaults.
-    pub fn load_config(&self) -> Result<Config, Failure> {
-        let path = paths::locate(self.config.as_deref(), "config")?;
-        Ok(Config::load(path.as_ref())?)
-    }
-
-    /// The targets `--target` selects from the inventory (all when none).
-    pub fn targets(&self) -> Result<Vec<Target>, Failure> {
-        let path = paths::locate(self.inventory.as_deref(), "inventory")?;
-        let inventory = Inventory::load(path.as_ref())?;
-        let sels: Vec<Sel> = self.target.iter().map(|sel| Sel::parse(sel)).collect();
-        Ok(inventory.select(&sels)?)
-    }
-
-    /// The transport for `target`: [`Local`] for `local`, [`Ssh`] otherwise.
-    pub fn transport(&self, target: &Target) -> Result<Box<dyn Transport>, TransportError> {
-        match &target.kind {
-            TargetKind::Local => Ok(Box::new(Local)),
-            TargetKind::Ssh { host, user, port } => Ok(Box::new(Ssh::new(
-                self.ssh_settings(),
-                self.ssh_config.clone(),
-                host,
-                user.clone(),
-                *port,
-            )?)),
-        }
-    }
-}
-
-#[cfg(debug_assertions)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum SecretStoreKind {
-    Keychain,
-    Memory,
-}
-
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Edit the inventory in the editor; --format picks the edit view, saved as TOML
@@ -160,6 +89,9 @@ pub enum Command {
         )]
         to: Option<BackendKind>,
     },
+    /// Run every command and browse the results in a terminal UI
+    #[cfg(feature = "tui")]
+    Tui,
 }
 
 impl Command {
@@ -170,6 +102,8 @@ impl Command {
             Command::Doctor => "doctor",
             Command::Apply => "apply",
             Command::Secret { .. } => "secret",
+            #[cfg(feature = "tui")]
+            Command::Tui => "tui",
         }
     }
 }
@@ -250,22 +184,27 @@ pub fn print_json(value: &impl Serialize, on_err: fn(String) -> Failure) -> Resu
 
 /// Runs the parsed command.
 pub fn run(cli: &Cli) -> Result<(), Failure> {
+    let opts = Options::from_cli(cli);
     match &cli.command {
-        Command::Inventory { format } => crate::commands::inventory(cli, *format),
-        Command::Config { format } => crate::commands::config(cli, *format),
+        Command::Inventory { format } => crate::commands::inventory(cli, &opts, *format),
+        Command::Config { format } => crate::commands::config(cli, &opts, *format),
         Command::Doctor => {
-            let config = cli.load_config()?;
-            let store = cli.secret_store(&config)?;
-            crate::doctor::run(cli, &config, store.as_ref())
+            let config = opts.load_config()?;
+            let store = opts.secret_store(&config)?;
+            crate::doctor::run(cli, &opts, &config, store.as_ref())
         }
-        Command::Apply => crate::apply::run(cli),
-        Command::Secret { to: Some(to), .. } => crate::commands::migrate(cli, *to),
+        Command::Apply => crate::apply::run(cli, &opts),
+        Command::Secret { to: Some(to), .. } => crate::commands::migrate(cli, &opts, *to),
         Command::Secret { name, .. } => {
-            let config = cli.load_config()?;
-            let store = cli.secret_store(&config)?;
+            let config = opts.load_config()?;
+            let store = opts.secret_store(&config)?;
             let name = name.as_deref().unwrap_or_default();
             crate::commands::secret(cli, &config, name, store.as_ref())
         }
+        #[cfg(feature = "tui")]
+        Command::Tui if cli.json => Err(Failure::usage("anvil tui: --json is not available")),
+        #[cfg(feature = "tui")]
+        Command::Tui => crate::tui::run(opts),
     }
 }
 
@@ -374,34 +313,5 @@ mod tests {
                 "{args:?}"
             );
         }
-    }
-
-    #[test]
-    fn local_target_gets_the_local_transport_and_hosts_get_ssh() {
-        let cli = parse(&["apply"]);
-        let local = Target {
-            name: "local".to_owned(),
-            kind: TargetKind::Local,
-        };
-        assert_eq!(cli.transport(&local).unwrap().name(), "local");
-        let host = Target {
-            name: "box".to_owned(),
-            kind: TargetKind::Ssh {
-                host: "203.0.113.10".to_owned(),
-                user: None,
-                port: None,
-            },
-        };
-        assert_eq!(cli.transport(&host).unwrap().name(), "203.0.113.10");
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn hidden_ssh_program_overrides_ssh() {
-        assert_eq!(parse(&["doctor"]).ssh_program(), PathBuf::from("ssh"));
-        assert_eq!(
-            parse(&["doctor", "--ssh-program", "/x/fake-ssh"]).ssh_program(),
-            PathBuf::from("/x/fake-ssh")
-        );
     }
 }

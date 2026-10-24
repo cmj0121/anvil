@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::document;
 use crate::paths::{self, PrivateDirError};
+use crate::term;
 
 /// The editor when neither the config nor the environment names one.
 pub const DEFAULT: &str = "nvim";
@@ -209,26 +210,28 @@ impl Editor {
         file.sync_all().map_err(io)?;
         drop(file);
 
-        // Always shown, not a log line: the user must know before typing a secret.
-        if buffer == Buffer::Sensitive && !self.is_vim() {
-            eprintln!("{}", copies_note(&self.program));
-        }
         let args = self.args_for(path, buffer);
-        log::debug!(
-            "spawn {} {}",
-            self.program.display(),
-            args.iter()
-                .map(|arg| arg.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        let status = Command::new(&self.program)
-            .args(&args)
-            .status()
-            .map_err(|source| EditorError::Spawn {
-                program: self.program.display().to_string(),
-                source,
-            })?;
+        let status = term::with_terminal(|| {
+            // Always shown, not a log line: the user must know before typing a
+            // secret. It runs with the real terminal (inside `with_terminal`),
+            // so it reaches the user even under the TUI.
+            if buffer == Buffer::Sensitive && !self.is_vim() {
+                eprintln!("{}", copies_note(&self.program));
+            }
+            log::debug!(
+                "spawn {} {}",
+                self.program.display(),
+                args.iter()
+                    .map(|arg| arg.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            Command::new(&self.program).args(&args).status()
+        })
+        .map_err(|source| EditorError::Spawn {
+            program: self.program.display().to_string(),
+            source,
+        })?;
         if !status.success() {
             return Err(EditorError::Aborted(status.code()));
         }
@@ -309,7 +312,7 @@ fn create_temp(dir: &Path, ext: &str) -> Result<(PathBuf, File), EditorError> {
 }
 
 /// 64 random bits from `/dev/urandom`, else the clock mixed with the pid.
-fn random() -> u64 {
+pub fn random() -> u64 {
     let mut bytes = [0u8; 8];
     if File::open("/dev/urandom")
         .and_then(|mut urandom| urandom.read_exact(&mut bytes))
@@ -388,6 +391,7 @@ mod tests {
 
     #[test]
     fn unchanged_buffer_is_none_and_the_file_is_gone() {
+        let _lock = term::test_lock();
         let editor = Editor::from_command("true", system_path().as_deref()).unwrap();
         let result = editor
             .edit(b"[hosts]\n", "unchanged", Buffer::Document)
@@ -400,11 +404,22 @@ mod tests {
 
     #[test]
     fn failing_editor_aborts_with_its_status() {
+        let _lock = term::test_lock();
         let editor = Editor::from_command("false", system_path().as_deref()).unwrap();
         let err = editor.edit(b"x", "aborted", Buffer::Document).unwrap_err();
         assert!(matches!(err, EditorError::Aborted(Some(1))), "{err}");
         assert!(err.to_string().contains("nothing written"));
         assert!(edits_in_dir("aborted").is_empty());
+    }
+
+    #[test]
+    fn the_editor_runs_with_the_terminal_handed_back() {
+        use crate::term::testing::{Event, Recorder};
+        let _lock = term::test_lock();
+        let (recorder, _guard) = Recorder::install();
+        let editor = Editor::from_command("true", system_path().as_deref()).unwrap();
+        editor.edit(b"x", "handoff", Buffer::Sensitive).unwrap();
+        assert_eq!(recorder.events(), [Event::Suspend, Event::Resume]);
     }
 
     fn editor_at(program: &str) -> Editor {
