@@ -71,9 +71,12 @@ Local checks, then every selected target's facts:
 - `ssh`: the ssh program is on `PATH`; `sh`: `/bin/sh` exists. Either missing fails doctor (exit 1).
 - `editor`: the editor `anvil inventory` would use, as an absolute path; when none resolves it is `null` and a warning,
   not a failure.
-- `secrets`: each name in `[secrets].names` is looked up in the keychain by its attributes only (never its value, so no
-  keychain prompt): `ok`, `missing` (a warning, still exit 0, with a hint to run `anvil secret NAME`) or `error` (exit
-  1).
+- `secrets`: each name in `[secrets].names` is looked up in the [secret store](#secret-backends): `ok`, `missing` (a
+  warning, still exit 0, with a hint to run `anvil secret NAME`), `locked` (exit 1) or `error` (exit 1). An age or sops
+  store is opened (decrypted) first; the keychain is asked for its item names by attributes only, never a value, so it
+  never raises a keychain prompt. A store that cannot be opened reports every name `error`, or `locked` with
+  `run in a terminal to unlock` when it needs a passphrase and there is no terminal. With no names the store is not
+  opened at all.
 - each target: the facts probe (a POSIX sh script) runs over the target's transport. `connectable: true` with the facts,
   or `connectable: false` with the error. Facts: `hostname`, `os`, `kernel`, `arch`, `distro`, `distro_version`, `user`,
   `shell`, `pkg` (present managers among brew, pacman, apt, dnf, apk), `sudo` (`none`, `binary` = needs a password,
@@ -111,8 +114,8 @@ Exit 0 when every check passed and every target is connectable, else 1. `--json`
 }
 ```
 
-`editor` is a string or `null`; each secret is `"ok"`, `"missing"` or `"error"`; `facts` holds every key the probe
-reported (abridged above).
+`editor` is a string or `null`; each secret is `"ok"`, `"missing"`, `"locked"` or `"error"`; `facts` holds every key
+the probe reported (abridged above).
 
 ### `anvil apply`
 
@@ -180,12 +183,13 @@ the step was killed by a signal.
 
 ### `anvil secret NAME`
 
-Opens the secret's current value (empty when unset) in the editor as a plain-text file. On save one trailing newline is
-stripped; an empty buffer deletes the secret, anything else is stored; an unchanged buffer writes nothing. `NAME` must
-match `[A-Z][A-Z0-9_]*` (else exit 2). Storage is the macOS login keychain: a generic password with service `anvil`
-(or `[secrets.keychain].service`) and account `NAME`. The value never appears on argv, in the environment, in logs or in
-any output. Reading the current value may raise one keychain access prompt per rebuild of the binary (an unsigned
-binary has no stable identity). A value larger than 1 MiB is refused (exit 2) and nothing is stored.
+Opens the secret store, then the secret's current value (empty when unset) in the editor as a plain-text file. On
+save one trailing newline is stripped; an empty buffer deletes the secret, anything else is stored; an unchanged buffer
+writes nothing. `NAME` must match `[A-Z][A-Z0-9_]*` (else exit 2). The store is the one `[secrets].backend` selects
+(see [Secret backends](#secret-backends)); it is opened before the editor starts, so a passphrase is asked for, and a
+wrong key or a locked store fails (exit 1), before anything is edited. An age or sops store holds UTF-8 text only. The
+value never appears on argv, in the environment, in logs or in any output. A value larger than 1 MiB is refused (exit 2)
+and nothing is stored.
 
 When the editor is `vim`, `nvim`, `vi` or `view`, anvil adds
 `-n -i NONE --cmd "set noswapfile noundofile nobackup nowritebackup"` and the same `set` again with `-c` (after your
@@ -201,18 +205,28 @@ Human output: `secret NAME: updated` or `secret NAME: unchanged`. `--json`:
 
 ### `anvil secret --migrate --to keychain|age|sops`
 
-Copies every secret of the current backend (for the keychain, every item under its service) into the target, replacing
-whatever the target held (an age or sops file is rewritten without being decrypted, so one that no longer opens is
-replaced too; stale keychain items in the service are deleted), re-opens the target and checks every name and value,
-then rewrites config.toml with `[secrets].backend` set to the target and a legacy `[anvil].secrets` moved to
-`[secrets].names`. That rewrite goes through the same save as `anvil config`, so comments and layout in config.toml are
-not kept. The old store is left as it was. An age identity with a passphrase is asked for again when the target is
-re-opened. `NAME` cannot be given with `--migrate`; the target's config section must exist, and the target must differ
-from the current backend (exit 2 otherwise). A failure before the config write leaves config.toml unchanged and names
-the failed step (exit 1); a keychain target that fails part way lists the names already written. Values never appear in
-any output.
+Copies every secret of the current backend into the target, replacing whatever the target held, re-opens the target and
+checks every name and value, then rewrites config.toml with `[secrets].backend` set to the target and a legacy
+`[anvil].secrets` moved to `[secrets].names`. The old store is left as it was.
 
-Human output: `migrated N secrets from X to Y`. `--json`:
+- **Every secret, not only `names`.** From an age or sops store, every key in the file; from the keychain, every item
+  under its service, whether or not `[secrets].names` lists it. Reading each keychain value may raise a keychain prompt;
+  an item whose account is not a valid secret name fails the read and nothing is written.
+- **The target is replaced, not merged.** An age or sops target is rewritten without its old contents being read, so a
+  file that no longer decrypts is replaced too; a keychain target gets every item set and loses the items in its
+  service that the source does not hold.
+- **Verify asks again.** An age identity with a passphrase is asked for when the target is opened to write and again
+  when it is re-opened to check.
+- **Comments in config.toml are dropped.** The rewrite goes through the same save as `anvil config`, so comments and
+  layout are not kept.
+
+`NAME` cannot be given with `--migrate`; the target's config section must exist, the target must differ from the
+current backend, and its store `path` must not be a file the current backend uses (its store, identity, `age_key_file`
+or `config`), which the write would destroy (exit 2 otherwise). A failure before the config write leaves config.toml
+unchanged and names the failed step (exit 1); a keychain target that fails part way lists the names already written.
+Values never appear in any output.
+
+Human output: `migrated N secrets from X to Y` (`1 secret` for one). `--json`:
 
 ```json
 { "from": "age", "to": "sops", "count": 2 }
@@ -236,8 +250,9 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 | 2    | usage or configuration error; the full list is below            |
 
 - **0**: for `doctor`, a `missing` secret or an unresolved editor is only a warning.
-- **1**: `doctor`/`apply`: a target or a check failed. `inventory`/`config`/`secret`: the editor exited non-zero
-  (aborted), a file write failed or the keychain refused.
+- **1**: `doctor`/`apply`: a target or a check failed (including a `locked` or `error` secret).
+  `inventory`/`config`/`secret`: the editor exited non-zero (aborted), a file write failed, or the secret store failed,
+  is locked or its passphrase prompt was cancelled.
 - **2**: a bad flag or argument (including an `--inventory` or `--config` path not ending in `.toml`), an unknown
   `--target`, an invalid or ambiguous file, no `$HOME`, editor not found, an invalid buffer after three attempts, or a
   secret larger than 1 MiB.
@@ -298,6 +313,7 @@ identity = "~/.config/anvil/age-identity.txt"
 [secrets.sops]             # required when backend = "sops"
 path = "~/.config/anvil/secrets.sops.json"
 age_key_file = "~/.config/sops/age/keys.txt"   # optional
+config = "~/.config/anvil/.sops.yaml"          # optional; default .sops.yaml beside path
 program = "/opt/homebrew/bin/sops"             # optional; default sops on PATH
 
 [[steps]]
@@ -308,10 +324,24 @@ Without any `[[steps]]` the config runs one step, `hostname`.
 
 Without `[secrets]` the backend is the keychain on macOS (and unsupported elsewhere). Only the selected backend's section
 is required and checked: a missing section, an unknown backend or `keychain` off macOS is a config error (exit 2). A
-path may start with `~/`, which is `$HOME`; after that it must be absolute. The age and sops backends are not
-implemented yet: `secret` and `doctor` fail with exit 1 when one is selected. The legacy `[anvil].secrets` is still read
-as `[secrets].names` (setting both is exit 2); `anvil config` moves it to `[secrets].names` on the next save, adding
-`backend = "keychain"` when there is no `[secrets]` yet (off macOS such a config is left as it is).
+path may start with `~/`, which is `$HOME`; after that it must be absolute. Each backend's setup is in
+[Secret backends](#secret-backends).
+
+The required names moved from `[anvil].secrets` to `[secrets].names`. A config with the legacy key is still read as
+before (setting both is exit 2). The next `anvil config` save writes it as `[secrets].names` and drops
+`[anvil].secrets`, adding `backend = "keychain"` when there is no `[secrets]` yet (off macOS such a config is left as
+it is); `anvil secret --migrate` moves it to `[secrets].names` along with the new backend:
+
+```toml
+# before
+[anvil]
+secrets = ["HOST_SUDO"]
+
+# after
+[secrets]
+backend = "keychain"
+names = ["HOST_SUDO"]
+```
 
 ### Limits and refusals
 
@@ -321,6 +351,126 @@ and `anvil config` open the parsed document, not the file's text, so comments ar
 1 MiB cap also holds for the edit view and the stored TOML: when the document rendered in the edit format is over
 1 MiB, `anvil inventory` / `anvil config` exit 2 before starting the editor (naming the other `--format` when that view
 fits), and when a YAML edit's TOML form would be over 1 MiB, nothing is written and the exit is 2.
+
+## Secret backends
+
+One backend per config holds every secret: `[secrets].backend` selects it and only its section is read. Switch with
+`anvil secret --migrate --to BACKEND`, which copies the values and updates the config. A store `path` that names the
+same file as its own `identity`, `age_key_file` or `config` (compared by inode when they exist, so a symlink or hard
+link counts) is a config error (exit 2), since the first save would overwrite that file.
+
+### keychain
+
+The default on macOS, and the only backend that needs no setup: each secret is a generic password in the login keychain
+with service `anvil` (or `[secrets.keychain].service`) and account `NAME`. Reading a value may raise one keychain
+access prompt per rebuild of the binary (an unsigned binary has no stable identity). Off macOS the keychain is a
+config error (exit 2).
+
+### age
+
+One ASCII-armored age file at `[secrets.age].path` holds every secret, encrypted to the identity at
+`[secrets.age].identity`. anvil does not generate keys; create the identity with `age-keygen`, plain or protected by a
+passphrase:
+
+```sh
+age-keygen -o ~/.config/anvil/age-identity.txt              # plain: no prompt
+age-keygen | age -p -a -o ~/.config/anvil/age-identity.age  # passphrase: asked for on every open
+chmod 600 ~/.config/anvil/age-identity.*
+```
+
+```toml
+[secrets]
+backend = "age"
+
+[secrets.age]
+path = "~/.config/anvil/secrets.age"
+identity = "~/.config/anvil/age-identity.txt"
+```
+
+The identity must be a regular file owned by you, at most 64 KiB, with no group or other permission bits (a looser
+mode fails with exit 1 and says to run `chmod 600` on it). A plain identity file may hold several identities; the store
+is encrypted to their own recipients and nobody else's. A passphrase-protected one (as `age -p` writes it, armored or
+not) is unlocked with the [passphrase prompt](#the-passphrase-prompt). The store file need not exist: a missing one is
+an empty store, and the first save creates it (and its directory, mode 0700). An existing directory must be yours and
+not writable by group or others, who could swap the file (exit 1 otherwise, with the `chmod go-w` to run). Every write
+replaces the file atomically through a fresh 0600 temp file in the same directory that holds ciphertext only. The
+store is read up to 1 MiB of armored ciphertext, about 750 KiB of secrets; a save past that is refused and the store is
+kept. A store of another identity fails with `no identity matched`.
+
+While anvil has an age or sops store open it holds an exclusive lock on `<store>.lock` beside it (0600, left in place),
+so a second anvil on the same store fails at once with `another anvil is using <store>` (exit 1) instead of one of
+them losing the other's change.
+
+### sops
+
+One sops file at `[secrets.sops].path` holds every secret as a JSON object, whatever the file is called; sops' own
+creation rules pick the keys. anvil runs `sops` (`[secrets.sops].program`, an absolute path, else `sops` on `PATH`)
+with `decrypt` and `encrypt` only, over pipes, so sops writes no file of its own. Put a `.sops.yaml` next to the store,
+or name another with `[secrets.sops].config`: anvil always passes it with `--config`, so sops never looks upward from
+the store's directory for one that someone else may have planted there. It must be a regular file owned by you that
+group and others cannot write, in a directory of yours they cannot write either (else exit 1, with the `chmod go-w` to
+run). Saving needs it; reading does not (without
+it, sops gets `--config /dev/null`), so a missing config fails only when something is stored. The rules are matched
+against the store path. For an age key:
+
+```sh
+mkdir -p ~/.config/sops/age
+age-keygen -o ~/.config/sops/age/keys.txt   # prints the public key, age1...
+```
+
+```yaml
+# ~/.config/anvil/.sops.yaml
+creation_rules:
+  - age: age1...
+```
+
+```toml
+[secrets]
+backend = "sops"
+
+[secrets.sops]
+path = "~/.config/anvil/secrets.sops.json"
+age_key_file = "~/.config/sops/age/keys.txt"   # given to sops as SOPS_AGE_KEY_FILE
+```
+
+`age_key_file`, when set, must pass the same checks as an age identity: a regular file owned by you with no group or
+other permission bits (`chmod 600`).
+
+sops runs with a cleared environment: only `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_*`, `GNUPGHOME` and
+`XDG_CONFIG_HOME` are passed on, plus `SOPS_AGE_KEY_FILE` from `age_key_file`. Cloud KMS credentials in anvil's
+environment (AWS, GCP, Azure, Vault tokens) therefore never reach sops; use age or PGP keys. sops' error output can
+quote a value from a damaged store, so it is never shown or logged: anvil names the failure in its own words, else sops'
+exit status. A sops run is killed after 60 s. As with age, a missing store file is an empty store, its directory is
+checked the same way, writes are atomic, ciphertext only, and the store is locked while open. The store holds at most
+1 MiB of plaintext (sops prints it back indented and with `<`, `>` and `&` escaped, up to six times as long) and 4 MiB
+of ciphertext; a save past either is refused and the store is kept.
+
+### Decrypt first
+
+Every command that needs a secret opens the store before it does anything else: an age or sops store is read and
+decrypted whole, so a passphrase is asked for up front and a wrong key fails the command (exit 1) before anything is
+edited or written. The keychain is the exception: opening it reads nothing, and `doctor` asks it for item names by
+attributes only, so a keychain `doctor` never reads a value and never prompts. `doctor` with no
+`[secrets].names` does not open any store.
+
+### The passphrase prompt
+
+A passphrase-protected age identity is unlocked once per open with `passphrase for <identity path>:`, written to and
+read from `/dev/tty` with echo off, never from stdin or the environment. Backspace and Ctrl-U edit the line; Ctrl-C, or
+Ctrl-D on an empty line, cancels (exit 1, `cancelled`); a line over 1024 bytes is refused. A wrong passphrase fails with
+`wrong passphrase`. The terminal is restored on every exit from the prompt, but a SIGTERM or SIGHUP that kills anvil
+while it waits can leave echo off; run `stty sane` to get it back.
+
+Without a terminal (no `/dev/tty`, as under cron or an agent) nothing is prompted: `anvil secret` and `--migrate` fail
+with `the secret store is locked: run in a terminal to unlock` (exit 1), and `doctor` reports every name `locked` (exit
+1). Use a plain identity, or the sops backend, where anvil must run unattended.
+
+### Where plaintext lives
+
+anvil and sops never write a secret to disk in plain text, with one exception: `anvil secret NAME` puts the value in the
+[editor](#the-editor)'s temp file (0700 private directory, 0600 file, zeroed best effort and removed) while you edit it.
+In memory the decrypted store, each value, the passphrase and the plaintext about to be encrypted are zeroed when
+dropped; copies made while parsing JSON and in pipe buffers are out of anvil's reach.
 
 ## SSH behaviour
 
@@ -375,3 +525,11 @@ never logged at any level. There are no log files and no `RUST_LOG`.
 - The e2e (`make e2e`) runs on an Arch sshd container as #3 asks, but on arm64 hosts it builds from the third-party
   `lopsided/archlinux` image (Arch Linux ARM, `distro=archarm`), pinned by digest: the official `archlinux` image is
   amd64-only and its sshd sandbox fails under emulation.
+
+## Deviations from #6
+
+- `doctor` on the keychain checks names by attributes only instead of opening the store first, so it never prompts;
+  age and sops are decrypted first as #6 asks.
+- Plaintext touches the disk in one place: the editor's temp file while `anvil secret NAME` runs.
+- sops gets a cleared environment, so cloud KMS credentials from the environment are not available to it; use age or
+  PGP keys.

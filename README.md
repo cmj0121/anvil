@@ -8,7 +8,8 @@ system OpenSSH client.
 
 This is the MVP ([#3](https://github.com/mini-poc/anvil/issues/3)): `doctor` reports facts and reachability for this Mac
 and the hosts in the inventory, `apply` runs the config's placeholder step (`hostname`) on each of them, and `secret`
-keeps a value in the macOS keychain. The full command reference is in [docs/cli.md](docs/cli.md).
+keeps a value in the secret backend the config selects: the macOS keychain, an age file or a sops file. The full
+command reference is in [docs/cli.md](docs/cli.md).
 
 ## Install
 
@@ -26,7 +27,7 @@ make build                 # builds target/release/anvil
 anvil inventory            # add your hosts (opens $EDITOR, default nvim)
 anvil config               # edit the preferences and the steps
 anvil inventory --format=yaml   # edit it as YAML this once; it is still saved as TOML
-anvil secret HOST_SUDO     # store a secret in the macOS keychain
+anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secrets] says otherwise)
 anvil doctor               # local checks + every target's facts and reachability
 anvil apply                # run the config's steps on every target
 ```
@@ -74,6 +75,32 @@ without a change over an existing `NAME.toml` writes nothing, whatever the edit 
 An `inventory.yaml` or `config.yml` from an older anvil is still read by every command; the next `anvil inventory` or
 `anvil config` saves it as `NAME.toml` and removes the YAML file, even when you leave the editor without a change.
 
+### Secrets
+
+Every secret lives in one backend, chosen by `[secrets].backend`: the macOS `keychain` (the default on macOS, no setup),
+`age` (one age-encrypted file, opened with an identity you create with `age-keygen`) or `sops` (one sops file, encrypted
+by the keys in a `.sops.yaml` next to it). To move from the keychain to an age file, add a `[secrets]` section that
+still selects the keychain, with the age section under it, and migrate:
+
+```toml
+[secrets]
+backend = "keychain"       # the current backend; --migrate changes it
+names = ["HOST_SUDO"]
+
+[secrets.age]
+path = "~/.config/anvil/secrets.age"
+identity = "~/.config/anvil/age-identity.txt"   # from `age-keygen -o`; mode 0600
+```
+
+```sh
+anvil secret --migrate --to age   # copies every secret, checks the copy, sets backend = "age"
+```
+
+The migration replaces whatever the target held, leaves the old store as it was, and rewrites config.toml without its
+comments. An age or sops store is decrypted before anything else happens, so a wrong key fails up front; an identity
+with a passphrase has its passphrase asked for on the terminal, and without one the store reports `locked`. Setup for
+each backend, the passphrase prompt and the sops environment are in [docs/cli.md](docs/cli.md#secret-backends).
+
 ## Output
 
 `anvil doctor` on this Mac with an empty config:
@@ -99,7 +126,8 @@ local
 ```
 
 With `names = ["HOST_SUDO"]` under `[secrets]` the local checks gain a line `secret HOST_SUDO ok` (or `missing`, a
-warning only), and every inventory host gets a section of the same shape (values illustrative):
+warning only; `locked` or `error` fail doctor), and every inventory host gets a section of the same shape (values
+illustrative):
 
 ```text
 linode1
@@ -165,11 +193,11 @@ The `doctor --json` shape and the rest are in [docs/cli.md](docs/cli.md).
 Logs go to stderr only, so `--json` output stays parseable. The default shows errors; `-v` adds warnings, `-vv` info and
 `-vvv` debug (every `ssh` and editor argv). Secret values, probe output and file contents are never logged.
 
-| Exit | Meaning                                                                                                    |
-| ---- | ---------------------------------------------------------------------------------------------------------- |
-| 0    | everything ok                                                                                              |
-| 1    | a target or check failed; for `inventory`, `config` and `secret`, the editor was aborted or a write failed |
-| 2    | usage or configuration error (bad flag, invalid file, unknown `--target`)                                  |
+| Exit | Meaning                                                                                                      |
+| ---- | ------------------------------------------------------------------------------------------------------------ |
+| 0    | everything ok                                                                                                |
+| 1    | a target or check failed; for `inventory`, `config` and `secret`, an aborted editor, a failed write or store |
+| 2    | usage or configuration error (bad flag, invalid file, unknown `--target`)                                    |
 
 ## Good to know
 
@@ -185,7 +213,15 @@ Logs go to stderr only, so `--json` output stays parseable. The default shows er
   and `--json` is untouched.
 - **Keychain prompts.** `anvil secret` reads the stored value, and macOS may ask once for keychain access after every
   rebuild, because the unsigned binary has no stable identity. `anvil doctor` only checks that the item exists and never
-  prompts.
+  prompts; unlike age and sops, the keychain is not decrypted first.
+- **Plaintext on disk.** Secrets are only ever written encrypted, except for the editor temp file `anvil secret` uses
+  while you edit a value.
+- **One anvil per store.** An open age or sops store is locked through `<store>.lock` beside it; a second anvil on the
+  same store fails with `another anvil is using <store>` rather than wait.
+- **sops sees a cleared environment.** Cloud KMS credentials in your environment do not reach sops; use age or PGP
+  keys.
+- **Echo after a killed prompt.** A SIGTERM or SIGHUP while anvil waits for a passphrase can leave the terminal's echo
+  off; `stty sane` restores it.
 - **ssh control sockets** live in `~/.ssh/anvil` (0700). A socket path must fit macOS' 104-byte limit, so a `$HOME`
   longer than 34 bytes is refused with a clear error.
 - **Comments are not preserved.** `anvil inventory` and `anvil config` rewrite the file from the parsed document, so
@@ -199,7 +235,8 @@ make test   # cargo fmt --check, clippy -D warnings, cargo test
 make e2e    # doctor, apply and the ssh auth paths against an Arch sshd container; prints `skip` without docker
 ```
 
-`make e2e` needs docker; its interactive password check also needs `python3` and is skipped without it. It uses a
-temporary `HOME` and config directory and never touches `~/.ssh`, the keychain or a real host. The official `archlinux`
-image is amd64-only, so on arm64 (Apple silicon) the e2e builds from the third-party `lopsided/archlinux` image (Arch
-Linux ARM, `distro=archarm`), pinned by digest like the official one.
+`make e2e` needs docker and `sops` on `PATH` (its sops round trip runs on the host and fails without it); its
+interactive password check also needs `python3` and is skipped without it. It uses a temporary `HOME` and config
+directory and never touches `~/.ssh`, the keychain or a real host. The official `archlinux` image is amd64-only, so on
+arm64 (Apple silicon) the e2e builds from the third-party `lopsided/archlinux` image (Arch Linux ARM,
+`distro=archarm`), pinned by digest like the official one.
