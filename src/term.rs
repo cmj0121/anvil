@@ -43,7 +43,7 @@ fn state() -> MutexGuard<'static, State> {
 
 /// Installs `h` process-wide until the guard drops.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "tui")),
     expect(dead_code, reason = "installed by the TUI front end")
 )]
 pub fn install(h: Arc<dyn Handoff>) -> HandoffGuard {

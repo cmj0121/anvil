@@ -14,7 +14,10 @@ use crate::transport::{Local, Transport, TransportError};
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    #[allow(dead_code, reason = "read by the TUI")]
+    #[cfg_attr(
+        not(any(test, feature = "tui")),
+        expect(dead_code, reason = "read by the TUI")
+    )]
     pub verbose: u8,
     pub inventory: Option<PathBuf>,
     pub config: Option<PathBuf>,

@@ -76,3 +76,17 @@ fn debug_log_needs_three_v_and_stays_on_stderr() {
         "{stderr}"
     );
 }
+
+#[cfg(feature = "tui")]
+#[test]
+fn tui_refuses_json_and_a_missing_terminal_with_exit_two() {
+    for (args, message) in [
+        (&["tui", "--json"][..], "anvil tui: --json is not available"),
+        (&["tui"], "anvil tui needs a terminal"),
+    ] {
+        let out = anvil(args);
+        assert_eq!(out.status.code(), Some(2), "args {args:?}");
+        assert!(out.stdout.is_empty(), "args {args:?}");
+        assert_eq!(text(&out.stderr), format!("ERROR anvil: {message}\n"));
+    }
+}

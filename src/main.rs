@@ -18,6 +18,8 @@ mod term;
 #[cfg(test)]
 mod test_util;
 mod transport;
+#[cfg(feature = "tui")]
+mod tui;
 
 use std::process::ExitCode;
 

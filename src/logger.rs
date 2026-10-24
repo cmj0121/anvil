@@ -29,7 +29,10 @@ static LOGGER: OnceLock<Logger> = OnceLock::new();
 static SINK: RwLock<Option<Arc<dyn Sink>>> = RwLock::new(None);
 
 /// Sends every log line to `sink` instead of stderr; `None`: back to stderr.
-#[cfg_attr(not(test), expect(dead_code, reason = "called by the TUI"))]
+#[cfg_attr(
+    not(any(test, feature = "tui")),
+    expect(dead_code, reason = "called by the TUI")
+)]
 pub fn set_sink(sink: Option<Arc<dyn Sink>>) {
     *SINK.write().unwrap_or_else(PoisonError::into_inner) = sink;
 }

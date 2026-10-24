@@ -89,6 +89,9 @@ pub enum Command {
         )]
         to: Option<BackendKind>,
     },
+    /// Run every command and browse the results in a terminal UI
+    #[cfg(feature = "tui")]
+    Tui,
 }
 
 impl Command {
@@ -99,6 +102,8 @@ impl Command {
             Command::Doctor => "doctor",
             Command::Apply => "apply",
             Command::Secret { .. } => "secret",
+            #[cfg(feature = "tui")]
+            Command::Tui => "tui",
         }
     }
 }
@@ -196,6 +201,10 @@ pub fn run(cli: &Cli) -> Result<(), Failure> {
             let name = name.as_deref().unwrap_or_default();
             crate::commands::secret(cli, &config, name, store.as_ref())
         }
+        #[cfg(feature = "tui")]
+        Command::Tui if cli.json => Err(Failure::usage("anvil tui: --json is not available")),
+        #[cfg(feature = "tui")]
+        Command::Tui => crate::tui::run(opts),
     }
 }
 
