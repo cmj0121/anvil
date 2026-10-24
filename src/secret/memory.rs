@@ -23,6 +23,28 @@ impl Memory {
     }
 }
 
+#[cfg(test)]
+impl Memory {
+    /// A store holding `items`.
+    pub fn with(items: &[(&str, &[u8])]) -> Memory {
+        let items = items
+            .iter()
+            .map(|(name, value)| (name.to_string(), Zeroizing::new(value.to_vec())))
+            .collect();
+        Memory {
+            items: Mutex::new(items),
+        }
+    }
+
+    /// Every name and its value, sorted by name.
+    pub fn contents(&self) -> Vec<(String, Vec<u8>)> {
+        self.items()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.to_vec()))
+            .collect()
+    }
+}
+
 impl Store for Memory {
     fn kind(&self) -> BackendKind {
         BackendKind::Memory

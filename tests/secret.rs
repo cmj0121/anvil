@@ -10,20 +10,9 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::process::Output;
 
-use common::{Sandbox, fixture, text};
-
-const VALUE: &str = "s3cr3t-hunter2";
-
-/// A file holding `VALUE` plus a newline, for the fake editor to type.
-fn typed(sandbox: &Sandbox) -> PathBuf {
-    let path = sandbox.root().join("typed.txt");
-    fs::write(&path, format!("{VALUE}\n")).unwrap();
-    path
-}
+use common::{Sandbox, VALUE, assert_no_value, fixture, have_sops, text};
 
 /// The stderr line every `anvil secret` with the fake (non-vim) editor starts with.
 fn copies_note() -> String {
@@ -36,23 +25,10 @@ fn copies_note() -> String {
 
 const MAX_BYTES: usize = 1 << 20;
 
-fn assert_no_value(out: &Output) {
-    assert!(
-        !text(&out.stdout).contains(VALUE),
-        "stdout: {}",
-        text(&out.stdout)
-    );
-    assert!(
-        !text(&out.stderr).contains(VALUE),
-        "stderr: {}",
-        text(&out.stderr)
-    );
-}
-
 #[test]
 fn a_stored_secret_reaches_neither_stdout_nor_stderr_at_vvv() {
     let sandbox = Sandbox::new("as");
-    let typed = typed(&sandbox);
+    let typed = sandbox.typed();
     let out = sandbox.edit(&["-vvv", "secret", "HOST_SUDO"], Some(&typed), None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), "secret HOST_SUDO: updated\n");
@@ -68,7 +44,7 @@ fn a_stored_secret_reaches_neither_stdout_nor_stderr_at_vvv() {
 #[test]
 fn json_names_the_secret_and_whether_it_changed() {
     let sandbox = Sandbox::new("as");
-    let typed = typed(&sandbox);
+    let typed = sandbox.typed();
     let out = sandbox.edit(
         &["--json", "-vvv", "secret", "HOST_SUDO"],
         Some(&typed),
@@ -119,7 +95,7 @@ fn editor_abort_is_exit_one() {
 #[test]
 fn an_invalid_name_exits_two() {
     let sandbox = Sandbox::new("as");
-    let typed = typed(&sandbox);
+    let typed = sandbox.typed();
     let out = sandbox.edit(&["secret", "host_sudo"], Some(&typed), None);
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
@@ -129,35 +105,16 @@ fn an_invalid_name_exits_two() {
     );
 }
 
-/// Whether `sops` is on `PATH` the way anvil looks for it: an executable
-/// file in an absolute directory. The sops tests skip without it.
-fn have_sops() -> bool {
-    let found = std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path)
-            .filter(|dir| dir.is_absolute())
-            .any(|dir| {
-                fs::metadata(dir.join("sops"))
-                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-            })
-    });
-    if !found {
-        eprintln!("skip: sops not found on PATH");
-    }
-    found
-}
-
 /// A sops store under the sandbox, encrypted to the fixture age key.
 fn sops_sandbox() -> Sandbox {
     let sandbox = Sandbox::new("as").without_debug_flags();
-    let store = sandbox.root().join("store");
-    fs::create_dir_all(&store).unwrap();
-    fs::copy(fixture("sops/.sops.yaml"), store.join(".sops.yaml")).unwrap();
+    let store = sandbox.sops_store();
     sandbox.write_config(
         "config.toml",
         &format!(
             "[secrets]\nbackend = \"sops\"\nnames = [\"HOST_SUDO\"]\n\n[secrets.sops]\n\
              path = \"{}\"\nage_key_file = \"{}\"\n",
-            store.join("secrets.json").display(),
+            store.display(),
             sandbox.sops_key().display()
         ),
     );
@@ -177,7 +134,7 @@ fn a_secret_round_trips_through_a_sops_store() {
         serde_json::json!({"HOST_SUDO": "missing"})
     );
 
-    let typed = typed(&sandbox);
+    let typed = sandbox.typed();
     let out = sandbox.edit(&["secret", "HOST_SUDO"], Some(&typed), None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), "secret HOST_SUDO: updated\n");
@@ -210,7 +167,7 @@ fn a_sops_failure_stops_the_command_before_the_editor() {
     }
     let sandbox = sops_sandbox().recording();
     fs::write(sandbox.root().join("store/secrets.json"), "{}").unwrap();
-    let typed = typed(&sandbox);
+    let typed = sandbox.typed();
     let out = sandbox.edit(&["secret", "HOST_SUDO"], Some(&typed), None);
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
@@ -233,7 +190,7 @@ fn a_value_edited_into_a_sops_store_is_never_quoted() {
         return;
     }
     let sandbox = sops_sandbox();
-    let typed = typed(&sandbox);
+    let typed = sandbox.typed();
     let out = sandbox.edit(&["secret", "HOST_SUDO"], Some(&typed), None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
 
@@ -288,7 +245,7 @@ fn target_is_ignored_with_a_warning() {
 #[test]
 fn a_non_vim_editor_note_shows_without_v_and_never_the_value() {
     let sandbox = Sandbox::new("as");
-    let typed = typed(&sandbox);
+    let typed = sandbox.typed();
     let out = sandbox.edit(&["secret", "HOST_SUDO"], Some(&typed), None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(text(&out.stderr), copies_note());

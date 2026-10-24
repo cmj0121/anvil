@@ -327,7 +327,7 @@ fn mode_of(path: &Path) -> Result<u32, TransportError> {
 mod tests {
     use super::*;
     use crate::facts::{Facts, PROBE};
-    use crate::test_util::temp_dir;
+    use crate::test_util::{temp_dir, write_knobs};
     use std::os::unix::fs::PermissionsExt;
 
     const CONTROL: &str = "/tmp/h/.ssh/anvil";
@@ -571,11 +571,9 @@ mod tests {
     fn fake_with(home: &Path, vars: &[(&str, &str)]) -> (Ssh, PathBuf) {
         let log = home.join("argv.log");
         let _ = fs::remove_file(&log);
-        let mut body = format!("FAKE_SSH_LOG='{}'\n", log.display());
-        for (key, value) in vars {
-            body.push_str(&format!("{key}='{value}'\n"));
-        }
-        fs::write(home.join("fake-ssh.env"), body).unwrap();
+        let shown = log.display().to_string();
+        let knobs = [&[("FAKE_SSH_LOG", shown.as_str())][..], vars].concat();
+        write_knobs(&home.join("fake-ssh.env"), &knobs);
         (fake(home), log)
     }
 

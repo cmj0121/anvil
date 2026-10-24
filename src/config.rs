@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::{self, DocumentError, Format};
 use crate::paths::{self, DocPath};
-use crate::secret::{self, SERVICE};
+use crate::secret::{self, BackendKind, SERVICE};
 
 /// Longest `run` script, in bytes.
 pub const MAX_RUN_BYTES: usize = 4 << 10;
@@ -139,6 +139,15 @@ impl Backend {
     }
 }
 
+/// The config key of the first of `files` that is the same file as
+/// `store`.
+pub fn shared_file(store: &Path, files: &[(&'static str, &Path)]) -> Option<&'static str> {
+    files
+        .iter()
+        .find(|(_, file)| paths::same_file(store, file))
+        .map(|&(key, _)| key)
+}
+
 /// Refuses a backend whose store file is one of the files that unlock it:
 /// the first save would overwrite that file with the store.
 fn check_apart(backend: &Backend) -> Result<(), String> {
@@ -146,11 +155,8 @@ fn check_apart(backend: &Backend) -> Result<(), String> {
     let Some(((store_key, store), others)) = files.split_first() else {
         return Ok(());
     };
-    match others
-        .iter()
-        .find(|(_, file)| paths::same_file(store, file))
-    {
-        Some((key, _)) => Err(format!(
+    match shared_file(store, others) {
+        Some(key) => Err(format!(
             "{store_key} and {key}: name the same file `{}`; keep the store apart from it",
             store.display()
         )),
@@ -232,26 +238,32 @@ impl Config {
 
     fn backend_for(&self, home: Option<&OsStr>, macos: bool) -> Result<Backend, String> {
         match &self.secrets {
-            Some(secrets) => resolve(Some(secrets), &secrets.backend, home, macos),
+            Some(secrets) => resolve(Some(secrets), self.backend_kind()?, home, macos),
             None => Ok(Backend::Keychain {
                 service: SERVICE.to_string(),
             }),
         }
     }
 
-    /// The selected backend's name, `keychain` without `[secrets]`.
-    pub fn backend_name(&self) -> &str {
-        self.secrets
-            .as_ref()
-            .map_or("keychain", |secrets| secrets.backend.as_str())
+    /// The selected backend's kind, the keychain without `[secrets]`.
+    pub fn backend_kind(&self) -> Result<BackendKind, String> {
+        match &self.secrets {
+            Some(secrets) => secrets.backend.parse().map_err(|()| {
+                format!(
+                    "secrets.backend `{}`: must be one of keychain, age, sops",
+                    secrets.backend
+                )
+            }),
+            None => Ok(BackendKind::Keychain),
+        }
     }
 
-    /// Backend `name` as this config would select it, with the same checks
+    /// Backend `kind` as this config would select it, with the same checks
     /// as [`Config::backend`]: its section must be present and valid.
-    pub fn backend_named(&self, name: &str) -> Result<Backend, String> {
+    pub fn backend_named(&self, kind: BackendKind) -> Result<Backend, String> {
         resolve(
             self.secrets.as_ref(),
-            name,
+            kind,
             std::env::var_os("HOME").as_deref(),
             MACOS,
         )
@@ -259,13 +271,11 @@ impl Config {
 
     /// Selects `backend`, moving the legacy `[anvil].secrets` to
     /// `[secrets].names` on the way.
-    pub fn set_backend(&mut self, backend: &str) {
-        let names = self.anvil.secrets.take();
-        let secrets = self.secrets.get_or_insert_with(|| Secrets::new(backend));
-        secrets.backend = backend.to_string();
-        if names.is_some() {
-            secrets.names = names;
-        }
+    pub fn set_backend(&mut self, backend: BackendKind) {
+        self.migrate_for(true);
+        self.secrets
+            .get_or_insert_with(|| Secrets::new(backend))
+            .backend = backend.as_str().to_string();
     }
 
     /// Moves the legacy `[anvil].secrets` to `[secrets].names`, adding
@@ -282,16 +292,16 @@ impl Config {
         }
         let names = self.anvil.secrets.take();
         self.secrets
-            .get_or_insert_with(|| Secrets::new("keychain"))
+            .get_or_insert_with(|| Secrets::new(BackendKind::Keychain))
             .names = names;
         true
     }
 }
 
 impl Secrets {
-    fn new(backend: &str) -> Secrets {
+    fn new(backend: BackendKind) -> Secrets {
         Secrets {
-            backend: backend.to_string(),
+            backend: backend.as_str().to_string(),
             names: None,
             keychain: None,
             age: None,
@@ -303,7 +313,7 @@ impl Secrets {
 /// `backend` built from the sections of `secrets`; the error names the key.
 fn resolve(
     secrets: Option<&Secrets>,
-    backend: &str,
+    backend: BackendKind,
     home: Option<&OsStr>,
     macos: bool,
 ) -> Result<Backend, String> {
@@ -311,10 +321,10 @@ fn resolve(
         |section: &str| format!("secrets.{section}: required when secrets.backend = \"{backend}\"");
     let path = |key: &str, value: &str| expand(&format!("secrets.{backend}.{key}"), value, home);
     match backend {
-        "keychain" if !macos => {
+        BackendKind::Keychain if !macos => {
             Err("secrets.backend `keychain`: the keychain is only available on macOS".to_string())
         }
-        "keychain" => {
+        BackendKind::Keychain => {
             let service = secrets
                 .and_then(|s| s.keychain.as_ref())
                 .and_then(|k| k.service.clone())
@@ -324,7 +334,7 @@ fn resolve(
             }
             Ok(Backend::Keychain { service })
         }
-        "age" => {
+        BackendKind::Age => {
             let age = secrets
                 .and_then(|s| s.age.as_ref())
                 .ok_or_else(|| missing("age"))?;
@@ -335,7 +345,7 @@ fn resolve(
             check_apart(&backend)?;
             Ok(backend)
         }
-        "sops" => {
+        BackendKind::Sops => {
             let sops = secrets
                 .and_then(|s| s.sops.as_ref())
                 .ok_or_else(|| missing("sops"))?;
@@ -361,9 +371,8 @@ fn resolve(
             check_apart(&backend)?;
             Ok(backend)
         }
-        other => Err(format!(
-            "secrets.backend `{other}`: must be one of keychain, age, sops"
-        )),
+        #[cfg(any(test, debug_assertions))]
+        BackendKind::Memory => unreachable!("memory is never parsed from a config"),
     }
 }
 
@@ -755,26 +764,26 @@ mod tests {
         );
         let secrets = config.secrets.as_ref();
         assert_eq!(
-            resolve(secrets, "age", home(), true).unwrap(),
+            resolve(secrets, BackendKind::Age, home(), true).unwrap(),
             Backend::Age {
                 path: "/home/u/a".into(),
                 identity: "/i".into(),
             }
         );
         assert_eq!(
-            resolve(secrets, "keychain", home(), true).unwrap(),
+            resolve(secrets, BackendKind::Keychain, home(), true).unwrap(),
             Backend::Keychain {
                 service: "anvil".into()
             }
         );
-        let err = resolve(secrets, "keychain", home(), false).unwrap_err();
+        let err = resolve(secrets, BackendKind::Keychain, home(), false).unwrap_err();
         assert!(err.contains("macOS"), "{err}");
-        let err = resolve(None, "sops", home(), true).unwrap_err();
+        let err = resolve(None, BackendKind::Sops, home(), true).unwrap_err();
         assert!(err.contains("secrets.sops: required"), "{err}");
         let config = parse(
             "[secrets]\nbackend = \"age\"\n\n[secrets.age]\npath = \"rel\"\nidentity = \"/i\"\n",
         );
-        let err = resolve(config.secrets.as_ref(), "age", home(), true).unwrap_err();
+        let err = resolve(config.secrets.as_ref(), BackendKind::Age, home(), true).unwrap_err();
         assert!(err.contains("secrets.age.path `rel`"), "{err}");
     }
 
@@ -784,7 +793,7 @@ mod tests {
             "[anvil]\nsecrets = [\"API\"]\n\n[secrets]\nbackend = \"sops\"\n\n\
              [secrets.sops]\npath = \"/s\"\n\n[secrets.age]\npath = \"/a\"\nidentity = \"/i\"\n",
         );
-        config.set_backend("age");
+        config.set_backend(BackendKind::Age);
         assert_eq!(config.anvil.secrets, None);
         assert_eq!(config.names(), ["API"]);
         let secrets = config.secrets.as_ref().unwrap();
@@ -792,11 +801,11 @@ mod tests {
         assert!(secrets.sops.is_some(), "other sections are kept");
 
         let mut config = parse("[secrets]\nbackend = \"age\"\nnames = [\"A\"]\n");
-        config.set_backend("sops");
+        config.set_backend(BackendKind::Sops);
         assert_eq!(config.names(), ["A"]);
 
         let mut config = Config::default();
-        config.set_backend("keychain");
+        config.set_backend(BackendKind::Keychain);
         assert_eq!(config.secrets.unwrap().backend, "keychain");
     }
 

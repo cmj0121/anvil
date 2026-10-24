@@ -4,16 +4,11 @@
 
 mod common;
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::process::Output;
+use std::fs;
 
 use age::secrecy::ExposeSecret;
 use age::x25519;
-use common::{Sandbox, fixture, json, text};
-
-const VALUE: &str = "s3cr3t-hunter2";
+use common::{Sandbox, VALUE, assert_no_value, have_sops, json, text, write_private};
 
 /// A config selecting the age store `~/secrets.age` (opened with a fresh
 /// `~/key.txt`), with a sops section for the fixture key and the legacy
@@ -25,24 +20,15 @@ fn age_sandbox() -> Sandbox {
         "{}\n",
         x25519::Identity::generate().to_string().expose_secret()
     );
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(home.join("key.txt"))
-        .unwrap()
-        .write_all(line.as_bytes())
-        .unwrap();
-    let store = sandbox.root().join("store");
-    fs::create_dir_all(&store).unwrap();
-    fs::copy(fixture("sops/.sops.yaml"), store.join(".sops.yaml")).unwrap();
+    write_private(&home.join("key.txt"), line.as_bytes());
+    let store = sandbox.sops_store();
     sandbox.write_config(
         "config.toml",
         &format!(
             "[anvil]\nsecrets = [\"HOST_SUDO\"]\n\n[secrets]\nbackend = \"age\"\n\n\
              [secrets.age]\npath = \"~/secrets.age\"\nidentity = \"~/key.txt\"\n\n\
              [secrets.sops]\npath = \"{}\"\nage_key_file = \"{}\"\n",
-            store.join("secrets.json").display(),
+            store.display(),
             sandbox.sops_key().display()
         ),
     );
@@ -53,35 +39,13 @@ fn config_text(sandbox: &Sandbox) -> String {
     fs::read_to_string(sandbox.config_dir().join("config.toml")).unwrap()
 }
 
-fn assert_no_value(out: &Output) {
-    assert!(!text(&out.stdout).contains(VALUE), "{}", text(&out.stdout));
-    assert!(!text(&out.stderr).contains(VALUE), "{}", text(&out.stderr));
-}
-
-/// Whether `sops` is on `PATH`; the sops test skips without it.
-fn have_sops() -> bool {
-    let found = std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path)
-            .filter(|dir| dir.is_absolute())
-            .any(|dir| {
-                fs::metadata(dir.join("sops"))
-                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-            })
-    });
-    if !found {
-        eprintln!("skip: sops not found on PATH");
-    }
-    found
-}
-
 #[test]
 fn an_age_store_moves_to_sops_and_the_config_follows() {
     if !have_sops() {
         return;
     }
     let sandbox = age_sandbox();
-    let typed = sandbox.root().join("typed.txt");
-    fs::write(&typed, format!("{VALUE}\n")).unwrap();
+    let typed = sandbox.typed();
     for name in ["HOST_SUDO", "API_KEY"] {
         let out = sandbox.edit(&["secret", name], Some(&typed), None);
         assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
@@ -129,8 +93,7 @@ fn junk_in_the_sops_target_is_replaced_without_being_read() {
         return;
     }
     let sandbox = age_sandbox();
-    let typed = sandbox.root().join("typed.txt");
-    fs::write(&typed, format!("{VALUE}\n")).unwrap();
+    let typed = sandbox.typed();
     let out = sandbox.edit(&["secret", "HOST_SUDO"], Some(&typed), None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let target = sandbox.root().join("store/secrets.json");

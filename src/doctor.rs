@@ -311,10 +311,9 @@ fn render(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
 
-    use crate::secret::{BackendKind, Memory, Vault};
-    use crate::test_util::{json, keys};
+    use crate::secret::Memory;
+    use crate::test_util::{Unopenable, json, keys};
 
     /// Answers every script with fixed output, or fails, without a process.
     struct Fake(Result<&'static str, TransportError>);
@@ -347,32 +346,6 @@ mod tests {
                 code: Some(0),
                 ..Output::default()
             })
-        }
-    }
-
-    /// A store that fails to open with `error()`, counting the attempts.
-    struct Unopenable {
-        error: fn() -> SecretError,
-        opened: Cell<u32>,
-    }
-
-    impl Unopenable {
-        fn new(error: fn() -> SecretError) -> Unopenable {
-            Unopenable {
-                error,
-                opened: Cell::new(0),
-            }
-        }
-    }
-
-    impl Store for Unopenable {
-        fn kind(&self) -> BackendKind {
-            BackendKind::Age
-        }
-
-        fn open(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
-            self.opened.set(self.opened.get() + 1);
-            Err((self.error)())
         }
     }
 

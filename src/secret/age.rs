@@ -22,9 +22,9 @@ use age::secrecy::SecretString;
 use age::{Callbacks, DecryptError, Decryptor, EncryptError, Encryptor, IdentityFile};
 use zeroize::Zeroizing;
 
-use super::file_store::{Codec, FileVault, check_owner, open_regular};
+use super::file_store::{Codec, FileBacked, open_private};
 use super::prompt::{self, PromptError};
-use super::{BackendKind, SecretError, Store, Vault};
+use super::{BackendKind, SecretError};
 
 /// The largest store file read, in bytes of ciphertext.
 const STORE_LIMIT: u64 = 1 << 20;
@@ -54,18 +54,14 @@ impl AgeStore {
     }
 
     fn identity_error(&self, message: impl Into<String>) -> SecretError {
-        SecretError::Store {
-            path: self.identity.clone(),
-            message: message.into(),
-        }
+        SecretError::store(&self.identity, message)
     }
 
     /// The identity file's bytes, once it passes the ownership and
     /// permission checks.
     fn read_identity(&self) -> Result<Zeroizing<Vec<u8>>, SecretError> {
         let io = |err: io::Error| self.identity_error(err.to_string());
-        let (file, meta) = open_regular(&self.identity).map_err(io)?;
-        check_owner(&meta, 0o077).map_err(|message| self.identity_error(message))?;
+        let (file, _) = open_private(&self.identity)?;
         let mut bytes = Zeroizing::new(Vec::with_capacity(IDENTITY_LIMIT as usize + 1));
         file.take(IDENTITY_LIMIT + 1)
             .read_to_end(&mut bytes)
@@ -124,6 +120,16 @@ impl AgeStore {
             }
         })
     }
+}
+
+impl FileBacked for AgeStore {
+    type Codec<'a> = AgeCodec<'a>;
+    const KIND: BackendKind = BackendKind::Age;
+    const LIMIT: u64 = STORE_LIMIT;
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
 
     /// The identity's keys and recipients, unlocked.
     fn codec(&self) -> Result<AgeCodec<'_>, SecretError> {
@@ -142,28 +148,6 @@ impl AgeStore {
             identities,
             recipients,
         })
-    }
-}
-
-impl Store for AgeStore {
-    fn kind(&self) -> BackendKind {
-        BackendKind::Age
-    }
-
-    fn open(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
-        Ok(Box::new(FileVault::open(
-            &self.path,
-            STORE_LIMIT,
-            self.codec()?,
-        )?))
-    }
-
-    fn replace(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
-        Ok(Box::new(FileVault::empty(
-            &self.path,
-            STORE_LIMIT,
-            self.codec()?,
-        )))
     }
 }
 
@@ -216,7 +200,7 @@ impl Callbacks for Ask {
 }
 
 /// Decrypts with the identities and encrypts to their recipients.
-struct AgeCodec<'a> {
+pub(super) struct AgeCodec<'a> {
     /// The store file, for errors.
     path: &'a Path,
     identities: Vec<Box<dyn age::Identity + Send + Sync>>,
@@ -288,7 +272,7 @@ fn encrypt_error(path: &Path, err: EncryptError) -> SecretError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -296,21 +280,11 @@ mod tests {
     use age::x25519;
 
     use super::*;
-    use crate::test_util::temp_dir;
+    use crate::secret::Store;
+    use crate::test_util::{assert_no_plaintext, files, temp_dir, write_private};
 
     const VALUE: &str = "s3cr3t-hunter2";
     const PASSPHRASE: &str = "correct horse battery staple";
-
-    fn write_private(path: &Path, bytes: &[u8]) {
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .unwrap()
-            .write_all(bytes)
-            .unwrap();
-    }
 
     /// A fresh plain identity file; returns its secret key line.
     fn plain_identity(path: &Path) -> String {
@@ -363,27 +337,6 @@ mod tests {
         Ok(SecretString::from(PASSPHRASE))
     }
 
-    /// Every file under `dir`.
-    fn files(dir: &Path) -> Vec<PathBuf> {
-        let mut out: Vec<PathBuf> = fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        out.sort();
-        out
-    }
-
-    fn assert_no_plaintext(dir: &Path) {
-        for file in files(dir) {
-            let bytes = fs::read(&file).unwrap();
-            assert!(
-                !bytes.windows(VALUE.len()).any(|w| w == VALUE.as_bytes()),
-                "{} holds the plaintext",
-                file.display()
-            );
-        }
-    }
-
     fn round_trip(store: &AgeStore) {
         let mut vault = store.open().unwrap();
         assert!(vault.names().unwrap().is_empty());
@@ -411,7 +364,7 @@ mod tests {
             files(&root.join("store")),
             [path.clone(), root.join("store/secrets.age.lock")]
         );
-        assert_no_plaintext(&root.join("store"));
+        assert_no_plaintext(&root.join("store"), VALUE);
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -426,7 +379,7 @@ mod tests {
         round_trip(&store);
         assert_eq!(asked.load(Ordering::Relaxed), 2, "one prompt per open");
         assert!(armored(&path));
-        assert_no_plaintext(&root);
+        assert_no_plaintext(&root, VALUE);
         fs::remove_dir_all(&root).unwrap();
     }
 

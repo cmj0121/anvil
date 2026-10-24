@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::document::Format;
 use crate::inventory::{Inventory, Sel, Target, TargetKind};
 use crate::paths;
-use crate::secret::{self, Store};
+use crate::secret::{self, BackendKind, Store};
 use crate::ssh::{self, Ssh, SshSettings};
 use crate::transport::{Local, Transport, TransportError};
 
@@ -158,26 +158,8 @@ pub enum Command {
             requires = "migrate",
             conflicts_with = "name"
         )]
-        to: Option<BackendName>,
+        to: Option<BackendKind>,
     },
-}
-
-/// A backend `--migrate` can move secrets to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum BackendName {
-    Keychain,
-    Age,
-    Sops,
-}
-
-impl BackendName {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            BackendName::Keychain => "keychain",
-            BackendName::Age => "age",
-            BackendName::Sops => "sops",
-        }
-    }
 }
 
 impl Command {
@@ -333,7 +315,7 @@ mod tests {
             Command::Secret { name, migrate, to } => {
                 assert_eq!(name, None);
                 assert!(migrate);
-                assert_eq!(to, Some(BackendName::Age));
+                assert_eq!(to, Some(BackendKind::Age));
             }
             other => panic!("unexpected {other:?}"),
         }

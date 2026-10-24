@@ -33,7 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rustix::fs::{FlockOperation, Mode, OFlags};
 use zeroize::Zeroizing;
 
-use super::{SecretError, Vault, is_name};
+use super::{BackendKind, SecretError, Store, Vault, is_name};
 
 /// How often a commit tries another temp file name that already exists.
 const TEMP_ATTEMPTS: u32 = 8;
@@ -44,8 +44,52 @@ const LOCK_PAUSE: Duration = Duration::from_millis(20);
 
 /// How a file store turns its plaintext into the bytes on disk and back.
 pub trait Codec {
+    /// Whether `decrypt` needs the store's bytes; a codec that reads the
+    /// file itself gets none, the file still checked as for any other.
+    fn reads_store(&self) -> bool {
+        true
+    }
     fn decrypt(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, SecretError>;
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, SecretError>;
+}
+
+/// A store kept in one encrypted file, opened into a [`FileVault`].
+pub(super) trait FileBacked {
+    type Codec<'a>: Codec
+    where
+        Self: 'a;
+    const KIND: BackendKind;
+    /// The most ciphertext `open` reads, so the most a commit may write.
+    const LIMIT: u64;
+    fn path(&self) -> &Path;
+    /// The codec with its key unlocked, which may ask for a passphrase.
+    fn codec(&self) -> Result<Self::Codec<'_>, SecretError>;
+}
+
+impl<T: FileBacked> Store for T {
+    fn kind(&self) -> BackendKind {
+        T::KIND
+    }
+
+    fn writes_through(&self) -> bool {
+        false
+    }
+
+    fn open(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
+        Ok(Box::new(FileVault::open(
+            self.path(),
+            T::LIMIT,
+            self.codec()?,
+        )?))
+    }
+
+    fn replace(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
+        Ok(Box::new(FileVault::empty(
+            self.path(),
+            T::LIMIT,
+            self.codec()?,
+        )))
+    }
 }
 
 /// Refuses `meta` unless the current user owns it and none of the
@@ -85,16 +129,39 @@ pub fn open_regular(path: &Path) -> io::Result<(File, Metadata)> {
     Ok((file, meta))
 }
 
+/// [`open_regular`] for a key file: refused, naming `path`, unless the
+/// current user owns it and no one else has any permission on it.
+pub fn open_private(path: &Path) -> Result<(File, Metadata), SecretError> {
+    let (file, meta) =
+        open_regular(path).map_err(|err| SecretError::store(path, err.to_string()))?;
+    check_owner(&meta, 0o077).map_err(|message| SecretError::store(path, message))?;
+    Ok((file, meta))
+}
+
+/// Refuses a directory that is not ours or that others can write to.
+pub fn check_dir(dir: &Path) -> Result<(), SecretError> {
+    let meta = fs::metadata(dir).map_err(|err| SecretError::store(dir, err.to_string()))?;
+    check_dir_meta(dir, &meta)
+}
+
+/// [`check_dir`] on the metadata of `dir`.
+fn check_dir_meta(dir: &Path, meta: &Metadata) -> Result<(), SecretError> {
+    if !meta.is_dir() {
+        return Err(SecretError::store(dir, "not a directory"));
+    }
+    check_owner(meta, 0o022).map_err(|message| SecretError::store(dir, message))
+}
+
 /// The refusal of a commit that would write a store `open` could not read
 /// back: `what` (ciphertext or plaintext) is over `limit` bytes.
 pub fn too_large(path: &Path, what: &str, limit: u64) -> SecretError {
-    SecretError::Store {
-        path: path.to_path_buf(),
-        message: format!(
+    SecretError::store(
+        path,
+        format!(
             "the store would be too large to open again: its {what} is over the {limit} byte \
              limit, nothing written"
         ),
-    }
+    )
 }
 
 /// A decrypted store file; see the module documentation.
@@ -118,23 +185,35 @@ impl<'a, C: Codec> FileVault<'a, C> {
     pub fn open(path: &'a Path, limit: u64, codec: C) -> Result<Self, SecretError> {
         let mut vault = FileVault::new(path, limit, codec, false);
         let dir = vault.dir()?;
-        if dir.exists() {
-            vault.check_dir(dir)?;
-            vault.lock = Some(vault.lock()?);
+        match fs::metadata(dir) {
+            Ok(meta) => {
+                check_dir_meta(dir, &meta)?;
+                vault.lock = Some(vault.lock()?);
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(SecretError::store(dir, err.to_string())),
         }
-        let mut ciphertext = Vec::new();
-        match open_regular(path)
-            .and_then(|(file, _)| file.take(limit + 1).read_to_end(&mut ciphertext))
-        {
-            Ok(_) => {}
+        let (file, meta) = match open_regular(path) {
+            Ok(opened) => opened,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 vault.absent = true;
                 return Ok(vault);
             }
             Err(err) => return Err(vault.error(err.to_string())),
+        };
+        let too_big = || vault.error(format!("larger than the {limit} byte limit"));
+        if meta.len() > limit {
+            return Err(too_big());
         }
-        if ciphertext.len() as u64 > limit {
-            return Err(vault.error(format!("larger than the {limit} byte limit")));
+        let mut ciphertext = Vec::new();
+        if vault.codec.reads_store() {
+            ciphertext.reserve_exact(meta.len() as usize + 1);
+            file.take(limit + 1)
+                .read_to_end(&mut ciphertext)
+                .map_err(|err| vault.error(err.to_string()))?;
+            if ciphertext.len() as u64 > limit {
+                return Err(too_big());
+            }
         }
         let plaintext = vault.codec.decrypt(&ciphertext)?;
         // The parse error names a position only: serde's message can quote a value.
@@ -171,30 +250,13 @@ impl<'a, C: Codec> FileVault<'a, C> {
     }
 
     fn error(&self, message: String) -> SecretError {
-        SecretError::Store {
-            path: self.path.to_path_buf(),
-            message,
-        }
+        SecretError::store(self.path, message)
     }
 
     fn dir(&self) -> Result<&'a Path, SecretError> {
         self.path
             .parent()
             .ok_or_else(|| self.error("not a file path".to_string()))
-    }
-
-    /// Refuses a store directory that is not ours or that others can write
-    /// to.
-    fn check_dir(&self, dir: &Path) -> Result<(), SecretError> {
-        let refuse = |message: String| SecretError::Store {
-            path: dir.to_path_buf(),
-            message,
-        };
-        let meta = fs::metadata(dir).map_err(|err| refuse(err.to_string()))?;
-        if !meta.is_dir() {
-            return Err(refuse("not a directory".to_string()));
-        }
-        check_owner(&meta, 0o022).map_err(refuse)
     }
 
     /// `<store><suffix>` beside the store.
@@ -208,10 +270,7 @@ impl<'a, C: Codec> FileVault<'a, C> {
     /// another anvil holds is an error, not a wait.
     fn lock(&self) -> Result<File, SecretError> {
         let path = self.sibling(".lock");
-        let refuse = |message: String| SecretError::Store {
-            path: path.clone(),
-            message,
-        };
+        let refuse = |message: String| SecretError::store(&path, message);
         let fd = rustix::fs::open(
             &path,
             OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -263,7 +322,7 @@ impl<'a, C: Codec> FileVault<'a, C> {
                 .map_err(|err| self.error(err.to_string()))?;
         }
         // Checked even when just made: someone else may have made it first.
-        self.check_dir(dir)?;
+        check_dir(dir)?;
         if self.lock.is_none() {
             self.lock = Some(self.lock()?);
         }
@@ -385,7 +444,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::test_util::temp_dir;
+    use crate::test_util::{assert_no_plaintext, files, temp_dir};
 
     const VALUE: &str = "s3cr3t-hunter2";
     const LIMIT: u64 = 1 << 20;
@@ -401,10 +460,9 @@ mod tests {
 
     impl Codec for Xor {
         fn decrypt(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, SecretError> {
-            let body = ciphertext.strip_prefix(MAGIC).ok_or(SecretError::Store {
-                path: PathBuf::new(),
-                message: "not ciphertext".to_string(),
-            })?;
+            let body = ciphertext
+                .strip_prefix(MAGIC)
+                .ok_or_else(|| SecretError::store(Path::new(""), "not ciphertext"))?;
             Ok(Zeroizing::new(body.iter().map(|b| b ^ 0xff).collect()))
         }
 
@@ -434,21 +492,6 @@ mod tests {
         let mut name = path.as_os_str().to_os_string();
         name.push(".lock");
         PathBuf::from(name)
-    }
-
-    /// Every file in `dir`, recursively, sorted.
-    fn files(dir: &Path) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        for entry in fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                out.extend(files(&path));
-            } else {
-                out.push(path);
-            }
-        }
-        out.sort();
-        out
     }
 
     #[test]
@@ -515,14 +558,7 @@ mod tests {
             [path.clone(), lock_of(&path)],
             "no temp file is left"
         );
-        for file in files(&root) {
-            let bytes = fs::read(&file).unwrap();
-            assert!(
-                !bytes.windows(VALUE.len()).any(|w| w == VALUE.as_bytes()),
-                "{} holds the plaintext",
-                file.display()
-            );
-        }
+        assert_no_plaintext(&root, VALUE);
         let plaintext = codec.decrypt(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(
             std::str::from_utf8(&plaintext).unwrap(),

@@ -200,7 +200,14 @@ pub fn collect_capped(
     }
     let take = |stream: &Option<Arc<Mutex<Captured>>>| {
         stream.as_ref().map_or_else(Captured::default, |shared| {
-            std::mem::take(&mut *shared.lock().unwrap_or_else(|e| e.into_inner()))
+            let mut captured = shared.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(
+                &mut *captured,
+                Captured {
+                    taken: true,
+                    ..Captured::default()
+                },
+            )
         })
     };
     let mut stdout = take(&streams[0]);
@@ -230,6 +237,8 @@ struct Captured {
     bytes: Vec<u8>,
     /// Whether anything past the cap was discarded.
     cut: bool,
+    /// Whether the buffer was taken, so the reader keeps nothing more.
+    taken: bool,
 }
 
 /// Reads `pipe` into a shared buffer up to `cap` bytes and drains the rest,
@@ -246,7 +255,7 @@ fn spawn_reader(
 ) -> Arc<Mutex<Captured>> {
     let shared = Arc::new(Mutex::new(Captured {
         bytes: Vec::with_capacity(cap),
-        cut: false,
+        ..Captured::default()
     }));
     let buffer = Arc::clone(&shared);
     thread::spawn(move || {
@@ -256,10 +265,11 @@ fn spawn_reader(
                 Ok(0) => break,
                 Ok(n) => {
                     let mut captured = buffer.lock().unwrap_or_else(|e| e.into_inner());
-                    // A taken buffer is replaced by an empty one with no room.
-                    let room = cap
-                        .min(captured.bytes.capacity())
-                        .saturating_sub(captured.bytes.len());
+                    let room = if captured.taken {
+                        0
+                    } else {
+                        cap.saturating_sub(captured.bytes.len())
+                    };
                     captured.bytes.extend_from_slice(&chunk[..n.min(room)]);
                     captured.cut |= n > room;
                 }

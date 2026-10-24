@@ -28,13 +28,13 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use zeroize::Zeroizing;
 
-use crate::cli::{BackendName, Cli, Failure, print_json};
+use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
 use crate::document::{self, DocumentError, Format, MAX_BYTES};
 use crate::editor::{Buffer, Editor, Fallback};
 use crate::inventory::Inventory;
 use crate::paths::{self, DocPath};
-use crate::secret::{self, Store};
+use crate::secret::{self, BackendKind, Store};
 
 /// How often an invalid buffer is re-opened before the command gives up.
 const ATTEMPTS: u32 = 3;
@@ -170,17 +170,16 @@ pub fn secret(cli: &Cli, config: &Config, name: &str, store: &dyn Store) -> Resu
 
 /// What `--json` prints for `secret --migrate`.
 #[derive(Debug, Serialize)]
-struct Migrated<'a> {
-    from: String,
-    to: &'a str,
+struct Migrated {
+    from: &'static str,
+    to: &'static str,
     count: usize,
 }
 
 /// `anvil secret --migrate --to BACKEND`: the target must be another backend
 /// whose config section is present (exit 2 otherwise).
-pub fn migrate(cli: &Cli, to: BackendName) -> Result<(), Failure> {
+pub fn migrate(cli: &Cli, to: BackendKind) -> Result<(), Failure> {
     warn_target(cli);
-    let to = to.as_str();
     #[cfg(debug_assertions)]
     if cli.secret_store == Some(crate::cli::SecretStoreKind::Memory) {
         return Err(Failure::usage(
@@ -189,15 +188,17 @@ pub fn migrate(cli: &Cli, to: BackendName) -> Result<(), Failure> {
     }
     let current = paths::locate(cli.config.as_deref(), "config")?;
     let config = Config::load(current.as_ref())?;
-    let from = cli.secret_store(&config)?;
-    if config.backend_name() == to {
+    let usage = |message: String| Failure::usage(format!("secret --migrate --to {to}: {message}"));
+    let from_kind = config.backend_kind().map_err(usage)?;
+    if from_kind == to {
         return Err(Failure::usage(format!(
             "secret --migrate --to {to}: {to} is already the backend"
         )));
     }
-    let usage = |message: String| Failure::usage(format!("secret --migrate --to {to}: {message}"));
     let backend = config.backend_named(to).map_err(usage)?;
-    secret::migrate::check_apart(&config.backend().map_err(usage)?, &backend).map_err(usage)?;
+    let source = config.backend().map_err(usage)?;
+    secret::migrate::check_apart(&source, &backend).map_err(usage)?;
+    let from = secret::from_config(&source)?;
     let target = secret::from_config(&backend)?;
     let dest = destination(cli.config.as_deref(), "config", Format::Toml)?;
     migrate_stores(
@@ -207,12 +208,13 @@ pub fn migrate(cli: &Cli, to: BackendName) -> Result<(), Failure> {
         &dest.path,
         from.as_ref(),
         target.as_ref(),
-        to,
+        [from_kind, to],
     )
 }
 
-/// Copies `from` into `target` and verifies it, then writes the config
-/// selecting backend `to` to `dest` (removing a legacy `current` YAML file).
+/// Copies `from` (of backend `from_name`) into `target` and verifies it,
+/// then writes the config selecting backend `to` to `dest` (removing a
+/// legacy `current` YAML file).
 fn migrate_stores(
     cli: &Cli,
     mut config: Config,
@@ -220,9 +222,8 @@ fn migrate_stores(
     dest: &Path,
     from: &dyn Store,
     target: &dyn Store,
-    to: &str,
+    [from_name, to]: [BackendKind; 2],
 ) -> Result<(), Failure> {
-    let from_name = config.backend_name().to_string();
     log::debug!("migrating the {from_name} secret store to {to}");
     let count = secret::migrate::copy(from, target)
         .map_err(|err| Failure::failed(format!("migrate: {err}")))?;
@@ -244,8 +245,8 @@ fn migrate_stores(
     if cli.json {
         print_json(
             &Migrated {
-                from: from_name,
-                to,
+                from: from_name.as_str(),
+                to: to.as_str(),
                 count,
             },
             Failure::usage,
@@ -456,8 +457,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-    use crate::secret::{BackendKind, Memory, SecretError, Vault};
-    use crate::test_util::temp_dir;
+    use crate::secret::{Memory, SecretError, Vault};
+    use crate::test_util::{Unopenable, temp_dir, write_private};
 
     /// A config naming a scripted editor: `script` runs with the temp file as
     /// `$1` and must write it itself (an empty script leaves it unchanged).
@@ -503,23 +504,6 @@ mod tests {
         store.open().unwrap().get(name).unwrap().map(|v| v.to_vec())
     }
 
-    fn put(store: &Memory, name: &str, value: &[u8]) {
-        store.open().unwrap().set(name, value).unwrap();
-    }
-
-    /// A store that cannot be opened, like a locked age identity.
-    struct Locked;
-
-    impl Store for Locked {
-        fn kind(&self) -> BackendKind {
-            BackendKind::Age
-        }
-
-        fn open(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
-            Err(SecretError::Locked)
-        }
-    }
-
     #[test]
     fn an_edit_stores_the_value_without_its_trailing_newline() {
         let scripted = Scripted::new("store", "printf 'hunter2\\n' > \"$1\"");
@@ -531,8 +515,7 @@ mod tests {
     #[test]
     fn the_current_value_is_offered_and_an_empty_edit_deletes() {
         let scripted = Scripted::new("delete", "cp \"$1\" \"$(dirname \"$0\")/seen\"; : > \"$1\"");
-        let store = Memory::default();
-        put(&store, "HOST_SUDO", b"old");
+        let store = Memory::with(&[("HOST_SUDO", b"old")]);
         scripted.run("HOST_SUDO", &store).unwrap();
         assert_eq!(fs::read(scripted.dir.join("seen")).unwrap(), b"old\n");
         assert_eq!(stored(&store, "HOST_SUDO"), None);
@@ -541,8 +524,7 @@ mod tests {
     #[test]
     fn an_unchanged_buffer_writes_nothing() {
         let scripted = Scripted::new("unchanged", "");
-        let store = Memory::default();
-        put(&store, "HOST_SUDO", b"keep");
+        let store = Memory::with(&[("HOST_SUDO", b"keep")]);
         scripted.run("HOST_SUDO", &store).unwrap();
         assert_eq!(stored(&store, "HOST_SUDO").unwrap(), b"keep");
         scripted.run("OTHER", &store).unwrap();
@@ -565,7 +547,8 @@ mod tests {
             "locked",
             "printf 'x' > \"$1\"; touch \"$(dirname \"$0\")/ran\"",
         );
-        let failure = scripted.run("HOST_SUDO", &Locked).unwrap_err();
+        let locked = Unopenable::new(|| SecretError::Locked);
+        let failure = scripted.run("HOST_SUDO", &locked).unwrap_err();
         assert_eq!(failure.code, 1);
         assert_eq!(
             failure.message,
@@ -596,14 +579,8 @@ mod tests {
     /// No log call site in the secret flow mentions a value.
     #[test]
     fn log_calls_never_mention_a_value() {
-        for (file, source) in [
-            ("commands.rs", include_str!("commands.rs")),
-            ("secret/mod.rs", include_str!("secret/mod.rs")),
-            ("secret/keychain.rs", include_str!("secret/keychain.rs")),
-            ("secret/memory.rs", include_str!("secret/memory.rs")),
-            ("secret/file_store.rs", include_str!("secret/file_store.rs")),
-            ("secret/migrate.rs", include_str!("secret/migrate.rs")),
-        ] {
+        let commands = ("commands.rs", include_str!("commands.rs"));
+        for (file, source) in std::iter::once(commands).chain(secret::SOURCES) {
             for (i, line) in source.lines().enumerate() {
                 if line.contains("log::") {
                     let lower = line.to_ascii_lowercase();
@@ -664,7 +641,7 @@ mod tests {
                 &self.config,
                 from,
                 target,
-                "age",
+                [BackendKind::Sops, BackendKind::Age],
             )
         }
 
@@ -695,14 +672,7 @@ mod tests {
             use age::secrecy::ExposeSecret;
             let identity = self.dir.join(key);
             let key = age::x25519::Identity::generate().to_string();
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&identity)
-                .unwrap()
-                .write_all(format!("{}\n", key.expose_secret()).as_bytes())
-                .unwrap();
+            write_private(&identity, format!("{}\n", key.expose_secret()).as_bytes());
             secret::from_config(&crate::config::Backend::Age {
                 path: self.dir.join("secrets.age"),
                 identity,
@@ -719,17 +689,16 @@ mod tests {
     }
 
     fn source() -> Memory {
-        let store = Memory::default();
-        for name in ["API_KEY", "HOST_SUDO", "TOKEN"] {
-            put(&store, name, SECRET);
-        }
-        store
+        Memory::with(&[
+            ("API_KEY", SECRET),
+            ("HOST_SUDO", SECRET),
+            ("TOKEN", SECRET),
+        ])
     }
 
     /// What a test store gets wrong.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Fault {
-        Open,
         /// The set with this index (from 0) is refused.
         Set(usize),
         Commit,
@@ -761,10 +730,11 @@ mod tests {
             self.kind
         }
 
+        fn writes_through(&self) -> bool {
+            self.kind == BackendKind::Keychain
+        }
+
         fn open(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
-            if self.fault == Fault::Open {
-                return Err(SecretError::Locked);
-            }
             let opened = self
                 .opened
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -815,10 +785,7 @@ mod tests {
 
         fn commit(self: Box<Self>) -> Result<(), SecretError> {
             if self.fault == Fault::Commit {
-                return Err(SecretError::Store {
-                    path: "/store".into(),
-                    message: "disk full".into(),
-                });
+                return Err(SecretError::store(Path::new("/store"), "disk full"));
             }
             self.inner.commit()
         }
@@ -836,11 +803,7 @@ mod tests {
         let from = source();
         migration.run(&from, age.as_ref()).unwrap();
 
-        let vault = age.open().unwrap();
-        assert_eq!(vault.names().unwrap(), ["API_KEY", "HOST_SUDO", "TOKEN"]);
-        for name in ["API_KEY", "HOST_SUDO", "TOKEN"] {
-            assert_eq!(*vault.get(name).unwrap().unwrap(), SECRET, "{name}");
-        }
+        holds_the_source(age.as_ref());
         assert_eq!(stored(&from, "HOST_SUDO").unwrap(), SECRET, "source kept");
 
         let text = fs::read_to_string(&migration.config).unwrap();
@@ -897,7 +860,7 @@ mod tests {
     fn a_source_that_cannot_open_leaves_the_config() {
         let migration = Migration::new("open");
         let target = Memory::default();
-        let message = migration.fails(&Faulty::new(BackendKind::Sops, Fault::Open), &target);
+        let message = migration.fails(&Unopenable::new(|| SecretError::Locked), &target);
         assert_eq!(
             message,
             "migrate: open source failed: the secret store is locked: run in a terminal to unlock"
@@ -1005,7 +968,7 @@ mod tests {
             &migration.config,
             age.as_ref(),
             &keychain.0,
-            "keychain",
+            [BackendKind::Age, BackendKind::Keychain],
         )
         .unwrap();
         let vault = keychain.0.open().unwrap();

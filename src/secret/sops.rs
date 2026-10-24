@@ -30,6 +30,7 @@
 //! a value from a damaged store, so it is never shown or logged: an error
 //! names the failure sops reported in anvil's own words, else its exit status.
 
+use std::cell::OnceCell;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
@@ -41,8 +42,10 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use super::file_store::{Codec, FileVault, check_owner, open_regular, too_large};
-use super::{BackendKind, SecretError, Store, Vault};
+use super::file_store::{
+    Codec, FileBacked, check_dir, check_owner, open_private, open_regular, too_large,
+};
+use super::{BackendKind, SecretError};
 use crate::paths;
 use crate::transport::{TransportError, collect_capped};
 
@@ -77,6 +80,8 @@ pub struct Sops {
     /// What sops gets of anvil's environment.
     env: Vec<(OsString, OsString)>,
     timeout: Duration,
+    /// `program` as an absolute path, once found.
+    found: OnceCell<PathBuf>,
 }
 
 impl Sops {
@@ -93,161 +98,149 @@ impl Sops {
             program,
             env: paths::env_subset(is_passed),
             timeout: TIMEOUT,
+            found: OnceCell::new(),
         }
     }
 
-    /// The program to run, as an absolute path.
-    fn program(&self) -> Result<PathBuf, SecretError> {
+    /// The program to run, as an absolute path; looked for on the first
+    /// open only.
+    fn program(&self) -> Result<&Path, SecretError> {
+        if let Some(found) = self.found.get() {
+            return Ok(found);
+        }
         let search = self
             .env
             .iter()
             .find(|(name, _)| name == "PATH")
             .map(|(_, value)| value.as_os_str());
         let program = self.program.as_deref().unwrap_or(Path::new("sops"));
-        paths::find_program(program, search).ok_or_else(|| SecretError::Sops {
+        let found = paths::find_program(program, search).ok_or_else(|| SecretError::Sops {
             message: if program.is_absolute() {
                 format!("program {} is not an executable file", program.display())
             } else {
                 format!("program `{}` not found on PATH", program.display())
             },
-        })
+        })?;
+        Ok(self.found.get_or_init(|| found))
+    }
+}
+
+impl FileBacked for Sops {
+    type Codec<'a> = Runner<'a>;
+    const KIND: BackendKind = BackendKind::Sops;
+    const LIMIT: u64 = CIPHERTEXT_LIMIT as u64;
+
+    fn path(&self) -> &Path {
+        &self.path
     }
 
     /// How sops is run for this store.
-    fn runner(&self) -> Result<Runner<'_>, SecretError> {
-        let dir = self.path.parent().ok_or_else(|| SecretError::Store {
-            path: self.path.clone(),
-            message: "not a file path".to_string(),
-        })?;
+    fn codec(&self) -> Result<Runner<'_>, SecretError> {
+        let dir = self
+            .path
+            .parent()
+            .ok_or_else(|| SecretError::store(&self.path, "not a file path"))?;
         Ok(Runner {
+            sops: self,
             program: self.program()?,
-            store: &self.path,
-            config: &self.config,
             // The directory may not exist until the first commit.
             cwd: dir.ancestors().find(|dir| dir.is_dir()).unwrap_or(dir),
-            env: &self.env,
-            age_key_file: self.age_key_file.as_deref(),
-            timeout: self.timeout,
         })
     }
 }
 
-impl Store for Sops {
-    fn kind(&self) -> BackendKind {
-        BackendKind::Sops
-    }
+/// What sops is asked to do.
+#[derive(Clone, Copy)]
+enum Op<'a> {
+    Decrypt,
+    /// Encrypt this plaintext.
+    Encrypt(&'a [u8]),
+}
 
-    fn open(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
-        Ok(Box::new(FileVault::open(
-            &self.path,
-            CIPHERTEXT_LIMIT as u64,
-            self.runner()?,
-        )?))
-    }
-
-    fn replace(&self) -> Result<Box<dyn Vault + '_>, SecretError> {
-        Ok(Box::new(FileVault::empty(
-            &self.path,
-            CIPHERTEXT_LIMIT as u64,
-            self.runner()?,
-        )))
+impl Op<'_> {
+    fn subcommand(self) -> &'static str {
+        match self {
+            Op::Decrypt => "decrypt",
+            Op::Encrypt(_) => "encrypt",
+        }
     }
 }
 
 /// How one store's sops is run.
-struct Runner<'a> {
-    program: PathBuf,
-    store: &'a Path,
-    config: &'a Path,
+pub(super) struct Runner<'a> {
+    sops: &'a Sops,
+    program: &'a Path,
     cwd: &'a Path,
-    env: &'a [(OsString, OsString)],
-    age_key_file: Option<&'a Path>,
-    timeout: Duration,
 }
 
 impl Runner<'_> {
-    /// What `--config` names for `subcommand`, once the file passes the
-    /// checks: never left out, so sops never searches upward for a
-    /// `.sops.yaml`. `decrypt` needs no creation rule, so an absent config
-    /// is `/dev/null`, which sops 3.13 reads as an empty one.
-    fn config_for(&self, subcommand: &str) -> Result<&Path, SecretError> {
-        let refuse = |path: &Path, message: String| SecretError::Store {
-            path: path.to_path_buf(),
-            message,
-        };
-        match open_regular(self.config) {
+    /// What `--config` names for `op`, once the file passes the checks:
+    /// never left out, so sops never searches upward for a `.sops.yaml`.
+    /// `decrypt` needs no creation rule, so an absent config is
+    /// `/dev/null`, which sops 3.13 reads as an empty one.
+    fn config_for(&self, op: Op<'_>) -> Result<&Path, SecretError> {
+        let config = self.sops.config.as_path();
+        match open_regular(config) {
             Ok((_, meta)) => {
-                check_owner(&meta, 0o022).map_err(|message| refuse(self.config, message))?;
+                check_owner(&meta, 0o022).map_err(|message| SecretError::store(config, message))?;
                 // Others able to write the directory of the real file, not
                 // of a symlink to it, could swap it.
-                let real = fs::canonicalize(self.config)
-                    .map_err(|err| refuse(self.config, err.to_string()))?;
-                let dir = real.parent().unwrap_or(Path::new("/"));
-                let dir_meta = fs::metadata(dir).map_err(|err| refuse(dir, err.to_string()))?;
-                check_owner(&dir_meta, 0o022).map_err(|message| refuse(dir, message))?;
-                Ok(self.config)
+                let real = fs::canonicalize(config)
+                    .map_err(|err| SecretError::store(config, err.to_string()))?;
+                check_dir(real.parent().unwrap_or(Path::new("/")))?;
+                Ok(config)
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound && subcommand == "decrypt" => {
+            Err(err) if err.kind() == io::ErrorKind::NotFound && matches!(op, Op::Decrypt) => {
                 Ok(Path::new("/dev/null"))
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Err(SecretError::Sops {
                 message: format!(
-                    "{subcommand}: no config {}: create it with a creation rule for {}, or set \
+                    "{}: no config {}: create it with a creation rule for {}, or set \
                      [secrets.sops].config",
-                    self.config.display(),
-                    self.store.display()
+                    op.subcommand(),
+                    config.display(),
+                    self.sops.path.display()
                 ),
             }),
-            Err(err) => Err(refuse(self.config, err.to_string())),
+            Err(err) => Err(SecretError::store(config, err.to_string())),
         }
     }
 
-    /// Refuses an `age_key_file` that is not a private regular file of the
-    /// current user.
-    fn check_key_file(&self) -> Result<(), SecretError> {
-        let Some(key_file) = self.age_key_file else {
-            return Ok(());
-        };
-        let refuse = |message: String| SecretError::Store {
-            path: key_file.to_path_buf(),
-            message,
-        };
-        let (_, meta) = open_regular(key_file).map_err(|err| refuse(err.to_string()))?;
-        check_owner(&meta, 0o077).map_err(refuse)
-    }
-
-    /// Runs `sops <subcommand>`, writing `input` to its stdin from a thread
-    /// while its output is read; its stdout, at most `limit` bytes, when it
-    /// succeeds.
-    fn run(
-        &self,
-        subcommand: &str,
-        input: Option<&[u8]>,
-        limit: usize,
-    ) -> Result<Zeroizing<Vec<u8>>, SecretError> {
+    /// Runs sops for `op`, writing an encrypt's plaintext to its stdin from
+    /// a thread while its output is read; its stdout, at most `limit`
+    /// bytes, when it succeeds.
+    fn run(&self, op: Op<'_>, limit: usize) -> Result<Zeroizing<Vec<u8>>, SecretError> {
+        let sops = self.sops;
+        let subcommand = op.subcommand();
         let fail = |message: String| SecretError::Sops {
             message: format!("{subcommand}: {message}"),
         };
-        let config = self.config_for(subcommand)?;
-        self.check_key_file()?;
-        let mut command = Command::new(&self.program);
+        let config = self.config_for(op)?;
+        if let Some(key_file) = &sops.age_key_file {
+            open_private(key_file)?;
+        }
+        let input = match op {
+            Op::Decrypt => None,
+            Op::Encrypt(plaintext) => Some(plaintext),
+        };
+        let mut command = Command::new(self.program);
         command.arg("--config").arg(config);
         command.args([subcommand, "--input-type", "json", "--output-type", "json"]);
         if input.is_some() {
             command.arg("--filename-override");
         }
         command
-            .arg(self.store)
+            .arg(&sops.path)
             .current_dir(self.cwd)
             .env_clear()
-            .envs(self.env.iter().map(|(name, value)| (name, value)));
-        if let Some(key_file) = self.age_key_file {
+            .envs(sops.env.iter().map(|(name, value)| (name, value)));
+        if let Some(key_file) = &sops.age_key_file {
             command.env("SOPS_AGE_KEY_FILE", key_file);
         }
         log::debug!(
             "spawn {} {subcommand} {}",
             self.program.display(),
-            self.store.display()
+            sops.path.display()
         );
         let mut child = command
             .process_group(0)
@@ -268,7 +261,7 @@ impl Runner<'_> {
                     let _ = stdin.write_all(input);
                 });
             }
-            collect_capped(child, Some(self.timeout), [limit, STDERR_LIMIT])
+            collect_capped(child, Some(sops.timeout), [limit, STDERR_LIMIT])
         })
         .map_err(|err| match err {
             TransportError::Timeout(after) => fail(format!("timed out after {after:?}")),
@@ -281,28 +274,22 @@ impl Runner<'_> {
             Some(0) if output.abandoned => Err(fail(
                 "a process it started still held its output open".to_string(),
             )),
-            Some(0) if output.truncated && subcommand == "encrypt" => {
-                Err(too_large(self.store, "ciphertext", limit as u64))
+            Some(0) if output.truncated && input.is_some() => {
+                Err(too_large(&sops.path, "ciphertext", limit as u64))
             }
             Some(0) if output.truncated => Err(fail(format!(
                 "output is larger than the {limit} byte limit"
             ))),
             Some(0) => Ok(stdout),
-            Some(code) => Err(fail(failure(
-                subcommand,
-                &stderr,
-                code,
-                self.store,
-                self.config,
-            ))),
+            Some(code) => Err(fail(failure(op, &stderr, code, &sops.path, &sops.config))),
             None => Err(fail("was killed by a signal".to_string())),
         }
     }
 }
 
-/// What a failed `sops <subcommand>` means, told from its `stderr` in fixed
-/// words: stderr itself can quote a value from a damaged store.
-fn failure(subcommand: &str, stderr: &[u8], code: i32, store: &Path, config: &Path) -> String {
+/// What a failed `op` means, told from sops' `stderr` in fixed words:
+/// stderr itself can quote a value from a damaged store.
+fn failure(op: Op<'_>, stderr: &[u8], code: i32, store: &Path, config: &Path) -> String {
     let says = |needles: &[&str]| {
         needles.iter().any(|needle| {
             stderr
@@ -330,7 +317,7 @@ fn failure(subcommand: &str, stderr: &[u8], code: i32, store: &Path, config: &Pa
         "MAC mismatch",
     ]) {
         format!("{store} is damaged or was edited by hand")
-    } else if subcommand == "decrypt" {
+    } else if matches!(op, Op::Decrypt) {
         format!("failed with exit status {code}; run `sops decrypt {store}` to see why")
     } else {
         format!("failed with exit status {code}")
@@ -338,18 +325,27 @@ fn failure(subcommand: &str, stderr: &[u8], code: i32, store: &Path, config: &Pa
 }
 
 impl Codec for Runner<'_> {
-    /// sops reads the store itself; `ciphertext` was only read to check it
-    /// exists and is within the limit.
+    /// sops reads the store itself.
+    fn reads_store(&self) -> bool {
+        false
+    }
+
     fn decrypt(&self, _ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, SecretError> {
-        self.run("decrypt", None, DECRYPTED_LIMIT)
+        self.run(Op::Decrypt, DECRYPTED_LIMIT)
     }
 
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, SecretError> {
         if plaintext.len() > PLAINTEXT_LIMIT {
-            return Err(too_large(self.store, "plaintext", PLAINTEXT_LIMIT as u64));
+            return Err(too_large(
+                &self.sops.path,
+                "plaintext",
+                PLAINTEXT_LIMIT as u64,
+            ));
         }
-        let mut ciphertext = self.run("encrypt", Some(plaintext), CIPHERTEXT_LIMIT)?;
-        Ok(std::mem::take(&mut *ciphertext))
+        let ciphertext = self.run(Op::Encrypt(plaintext), CIPHERTEXT_LIMIT)?;
+        // No secret: copied out of the buffer reserved at the limit, so
+        // that buffer is freed before the commit writes.
+        Ok(ciphertext.to_vec())
     }
 }
 
@@ -360,7 +356,8 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::test_util::{fixture, temp_dir};
+    use crate::secret::Store;
+    use crate::test_util::{fixture, temp_dir, write_knobs};
 
     const VALUE: &str = "s3cr3t-hunter2";
     /// What a shell adds to its own environment.
@@ -402,11 +399,7 @@ mod tests {
 
         /// Sets the fake's knobs for the calls that follow.
         fn knobs(&self, vars: &[(&str, &str)]) {
-            let body: String = vars
-                .iter()
-                .map(|(name, value)| format!("{name}='{value}'\n"))
-                .collect();
-            fs::write(self.root.join("fake-sops.env"), body).unwrap();
+            write_knobs(&self.root.join("fake-sops.env"), vars);
         }
 
         fn record(&self, what: &str) -> String {
@@ -676,53 +669,57 @@ mod tests {
     fn a_failure_is_told_in_fixed_words() {
         let store = Path::new("/s/secrets.json");
         let config = Path::new("/c/.sops.yaml");
-        let cases: [(&str, &str, &str); 9] = [
+        let cases: [(Op, &str, &str); 9] = [
             (
-                "encrypt",
+                Op::Encrypt(b""),
                 "error loading config: no matching creation rules found",
                 "no creation rule in /c/.sops.yaml matches /s/secrets.json",
             ),
             (
-                "encrypt",
+                Op::Encrypt(b""),
                 "config file not found, or has no creation rules, and no keys provided",
                 "/c/.sops.yaml has no creation rule for /s/secrets.json",
             ),
             (
-                "decrypt",
+                Op::Decrypt,
                 "Failed to get the data key required to decrypt the SOPS file.\n\nGroup 0: FAILED",
                 "no key could decrypt the store (check age_key_file)",
             ),
             (
-                "decrypt",
+                Op::Decrypt,
                 "Recovery failed because no master key was able to decrypt the file.",
                 "no key could decrypt the store (check age_key_file)",
             ),
             (
-                "decrypt",
+                Op::Decrypt,
                 "sops metadata not found",
                 "/s/secrets.json is not a sops file",
             ),
             (
-                "decrypt",
+                Op::Decrypt,
                 "Error decrypting tree: Error walking tree: Could not decrypt value: \
                  Input string s3cr3t-hunter2 does not match sops' data format",
                 "/s/secrets.json is damaged or was edited by hand",
             ),
             (
-                "decrypt",
+                Op::Decrypt,
                 "Cannot decrypt MAC: Could not decrypt with AES_GCM",
                 "/s/secrets.json is damaged or was edited by hand",
             ),
             (
-                "decrypt",
+                Op::Decrypt,
                 "s3cr3t-hunter2",
                 "failed with exit status 2; run `sops decrypt /s/secrets.json` to see why",
             ),
-            ("encrypt", "s3cr3t-hunter2", "failed with exit status 2"),
+            (
+                Op::Encrypt(b""),
+                "s3cr3t-hunter2",
+                "failed with exit status 2",
+            ),
         ];
-        for (subcommand, stderr, expected) in cases {
+        for (op, stderr, expected) in cases {
             assert_eq!(
-                failure(subcommand, stderr.as_bytes(), 2, store, config),
+                failure(op, stderr.as_bytes(), 2, store, config),
                 expected,
                 "{stderr}"
             );

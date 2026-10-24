@@ -8,7 +8,8 @@
 //! from an environment variable.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use zeroize::Zeroizing;
 
@@ -32,24 +33,47 @@ pub use sops::Sops;
 /// The keychain service anvil secrets are filed under by default.
 pub const SERVICE: &str = "anvil";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A backend, as `[secrets].backend` and `--migrate --to` name it; the
+/// in-memory test store is never one a config or `--to` can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum BackendKind {
     Keychain,
     Age,
     Sops,
     #[cfg(any(test, debug_assertions))]
+    #[value(skip)]
     Memory,
 }
 
-impl fmt::Display for BackendKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl BackendKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
             BackendKind::Keychain => "keychain",
             BackendKind::Age => "age",
             BackendKind::Sops => "sops",
             #[cfg(any(test, debug_assertions))]
             BackendKind::Memory => "memory",
-        })
+        }
+    }
+}
+
+impl fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `keychain`, `age` or `sops`; anything else, `memory` included, is `Err`.
+impl FromStr for BackendKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "keychain" => Ok(BackendKind::Keychain),
+            "age" => Ok(BackendKind::Age),
+            "sops" => Ok(BackendKind::Sops),
+            _ => Err(()),
+        }
     }
 }
 
@@ -128,9 +152,24 @@ impl fmt::Display for SecretError {
 
 impl std::error::Error for SecretError {}
 
+impl SecretError {
+    /// [`SecretError::Store`] for `path`.
+    pub fn store(path: &Path, message: impl Into<String>) -> Self {
+        SecretError::Store {
+            path: path.to_path_buf(),
+            message: message.into(),
+        }
+    }
+}
+
 /// A configured backend; cheap to build, does no I/O until `open`.
 pub trait Store {
     fn kind(&self) -> BackendKind;
+    /// Whether each change is stored as it is made, so a failure part way
+    /// leaves some of them behind; a file store writes only on commit.
+    fn writes_through(&self) -> bool {
+        true
+    }
     /// Decrypt-first: a file store reads and decrypts the whole store here;
     /// the keychain only checks it is reachable. A store that needs a
     /// passphrase without a terminal to ask on fails with
@@ -212,21 +251,22 @@ pub fn is_name(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// The sources of this module, for the checks that read code.
+#[cfg(test)]
+pub(crate) const SOURCES: [(&str, &str); 8] = [
+    ("secret/mod.rs", include_str!("mod.rs")),
+    ("secret/keychain.rs", include_str!("keychain.rs")),
+    ("secret/memory.rs", include_str!("memory.rs")),
+    ("secret/file_store.rs", include_str!("file_store.rs")),
+    ("secret/age.rs", include_str!("age.rs")),
+    ("secret/prompt.rs", include_str!("prompt.rs")),
+    ("secret/sops.rs", include_str!("sops.rs")),
+    ("secret/migrate.rs", include_str!("migrate.rs")),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The sources of this module, for the checks that read code.
-    const SOURCES: [(&str, &str); 8] = [
-        ("secret/mod.rs", include_str!("mod.rs")),
-        ("secret/keychain.rs", include_str!("keychain.rs")),
-        ("secret/memory.rs", include_str!("memory.rs")),
-        ("secret/file_store.rs", include_str!("file_store.rs")),
-        ("secret/age.rs", include_str!("age.rs")),
-        ("secret/prompt.rs", include_str!("prompt.rs")),
-        ("secret/sops.rs", include_str!("sops.rs")),
-        ("secret/migrate.rs", include_str!("migrate.rs")),
-    ];
 
     #[test]
     fn name_rule_is_upper_snake() {

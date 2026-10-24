@@ -6,18 +6,17 @@
 
 mod common;
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 use age::armor::{ArmoredReader, ArmoredWriter, Format};
 use age::secrecy::{ExposeSecret, SecretString};
 use age::{Decryptor, Encryptor, Identity, x25519};
-use common::{Sandbox, fixture, json, text};
+use common::{Sandbox, VALUE, fixture, json, text, write_private};
 
-const VALUE: &str = "s3cr3t-hunter2";
 const PASSPHRASE: &str = "correct horse battery staple";
 
 /// A sandbox whose config selects the age store `~/secrets.age`, opened
@@ -34,18 +33,6 @@ fn age_sandbox(prefix: &str) -> Sandbox {
 
 fn home(sandbox: &Sandbox, name: &str) -> PathBuf {
     sandbox.root().join("h").join(name)
-}
-
-fn write_private(path: &Path, bytes: &[u8]) {
-    let _ = fs::remove_file(path);
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .unwrap()
-        .write_all(bytes)
-        .unwrap();
 }
 
 /// Writes a fresh plain identity to `~/key.txt`.
@@ -100,12 +87,6 @@ fn assert_only_ciphertext(sandbox: &Sandbox) {
     assert!(!store.windows(VALUE.len()).any(|w| w == VALUE.as_bytes()));
 }
 
-fn typed(sandbox: &Sandbox) -> PathBuf {
-    let path = sandbox.root().join("typed.txt");
-    fs::write(&path, format!("{VALUE}\n")).unwrap();
-    path
-}
-
 fn editor_calls(sandbox: &Sandbox) -> usize {
     fs::read_to_string(sandbox.record("editor.count"))
         .map(|count| count.lines().count())
@@ -115,16 +96,10 @@ fn editor_calls(sandbox: &Sandbox) -> usize {
 /// `program args` in the sandbox's environment, the fake editor copying
 /// `typed.txt` over the buffer.
 fn command(sandbox: &Sandbox, program: &str, args: &[&str]) -> Command {
-    let mut command = Command::new(program);
+    let mut command = sandbox.command(program);
     command
         .args(args)
-        .env("XDG_CONFIG_HOME", sandbox.root().join("x"))
-        .env("HOME", sandbox.root().join("h"))
-        .env("TMPDIR", sandbox.tmp_dir())
-        .env("EDITOR", fixture("fake-editor.sh"))
-        .env("FAKE_EDITOR_RECORD", sandbox.record("editor"))
-        .env("FAKE_EDITOR_CONTENT", typed(sandbox))
-        .env_remove("VISUAL")
+        .env("FAKE_EDITOR_CONTENT", sandbox.typed())
         .env_remove("PTY_PASSPHRASE");
     command
 }

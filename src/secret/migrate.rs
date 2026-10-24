@@ -12,9 +12,8 @@ use std::fmt;
 
 use zeroize::Zeroizing;
 
-use super::{BackendKind, SecretError, Store, is_name, shown_name};
-use crate::config::Backend;
-use crate::paths;
+use super::{SecretError, Store, is_name, shown_name};
+use crate::config::{self, Backend};
 
 /// The step a migration failed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,12 +81,8 @@ pub fn check_apart(from: &Backend, to: &Backend) -> Result<(), String> {
     let Some(&(key, store)) = to.files().first() else {
         return Ok(());
     };
-    match from
-        .files()
-        .into_iter()
-        .find(|(_, file)| paths::same_file(store, file))
-    {
-        Some((other, _)) => Err(format!(
+    match config::shared_file(store, &from.files()) {
+        Some(other) => Err(format!(
             "{key} and {other}: name the same file `{}`; the target would overwrite it",
             store.display()
         )),
@@ -128,7 +123,7 @@ fn write_all(to: &dyn Store, secrets: &Secrets) -> Result<(), MigrateError> {
     let mut vault = to
         .replace()
         .map_err(|err| MigrateError::new(Step::OpenTarget, err))?;
-    let through = writes_through(to.kind());
+    let through = to.writes_through();
     let mut written = Vec::new();
     let failed = |err: SecretError, written: &[String]| MigrateError {
         written: written.to_vec(),
@@ -147,17 +142,6 @@ fn write_all(to: &dyn Store, secrets: &Secrets) -> Result<(), MigrateError> {
         vault.delete(name).map_err(|err| failed(err, &written))?;
     }
     vault.commit().map_err(|err| failed(err, &written))
-}
-
-/// Whether `kind` stores each change as it is made, so a failure part way
-/// leaves some secrets behind.
-fn writes_through(kind: BackendKind) -> bool {
-    match kind {
-        BackendKind::Keychain => true,
-        BackendKind::Age | BackendKind::Sops => false,
-        #[cfg(any(test, debug_assertions))]
-        BackendKind::Memory => true,
-    }
 }
 
 fn verify(to: &dyn Store, secrets: &Secrets) -> Result<(), MigrateError> {
@@ -196,62 +180,39 @@ mod tests {
     use super::super::Memory;
     use super::*;
 
-    fn with(items: &[(&str, &[u8])]) -> Memory {
-        let store = Memory::default();
-        let mut vault = store.open().unwrap();
-        for (name, value) in items {
-            vault.set(name, value).unwrap();
-        }
-        drop(vault);
-        store
-    }
-
-    fn contents(store: &Memory) -> Vec<(String, Vec<u8>)> {
-        let vault = store.open().unwrap();
-        vault
-            .names()
-            .unwrap()
-            .into_iter()
-            .map(|name| {
-                let value = vault.get(&name).unwrap().unwrap().to_vec();
-                (name, value)
-            })
-            .collect()
-    }
-
     #[test]
     fn every_secret_is_copied_and_the_target_is_replaced() {
-        let from = with(&[("API", b"k"), ("HOST_SUDO", b"\xffbinary")]);
-        let to = with(&[("API", b"old"), ("STALE", b"gone")]);
+        let from = Memory::with(&[("API", b"k"), ("HOST_SUDO", b"\xffbinary")]);
+        let to = Memory::with(&[("API", b"old"), ("STALE", b"gone")]);
         assert_eq!(copy(&from, &to).unwrap(), 2);
         assert_eq!(
-            contents(&to),
+            to.contents(),
             [
                 ("API".to_string(), b"k".to_vec()),
                 ("HOST_SUDO".to_string(), b"\xffbinary".to_vec())
             ]
         );
-        assert_eq!(contents(&from), contents(&to), "the source is unchanged");
+        assert_eq!(from.contents(), to.contents(), "the source is unchanged");
     }
 
     #[test]
     fn an_empty_source_empties_the_target() {
-        let to = with(&[("STALE", b"gone")]);
+        let to = Memory::with(&[("STALE", b"gone")]);
         assert_eq!(copy(&Memory::default(), &to).unwrap(), 0);
-        assert!(contents(&to).is_empty());
+        assert!(to.contents().is_empty());
     }
 
     #[test]
     fn a_source_name_outside_the_rule_stops_before_the_target() {
-        let from = with(&[("lower", b"v")]);
-        let to = with(&[("KEEP", b"v")]);
+        let from = Memory::with(&[("lower", b"v")]);
+        let to = Memory::with(&[("KEEP", b"v")]);
         let err = copy(&from, &to).unwrap_err();
         assert_eq!(err.step, Step::ReadSource);
         assert_eq!(
             err.to_string(),
             "read source failed: secret store key `lower`: must match [A-Z][A-Z0-9_]*"
         );
-        assert_eq!(contents(&to).len(), 1);
+        assert_eq!(to.contents().len(), 1);
     }
 
     #[test]
