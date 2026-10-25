@@ -70,7 +70,7 @@ fn path_or_null<S: serde::Serializer>(
 }
 
 impl LocalReport {
-    fn ok(&self) -> bool {
+    pub(crate) fn ok(&self) -> bool {
         self.ssh
             && self.sh
             && !self

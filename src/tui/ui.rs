@@ -39,6 +39,7 @@ const HELP: &[(&str, &str)] = &[
     ("l", "show / hide the log"),
     ("r", "reload the inventory"),
     ("[ ]", "previous / next result"),
+    ("←→", "previous / next tab"),
     ("?", "this help"),
     ("q / Ctrl-C", "quit"),
 ];
@@ -247,43 +248,270 @@ fn fit_name_detail(name: &str, detail: &str, col: usize, room: usize) -> (String
 }
 
 fn draw_results(app: &App, f: &mut Frame, area: Rect) {
-    let mut lines = match app.shown_result() {
-        None => vec![Line::from("No results yet.")],
-        Some(RunResult::Apply { targets, error, .. }) => {
-            let mut lines: Vec<Line> = targets.iter().flat_map(apply_block).collect();
-            lines.extend(run_error(error.as_deref()));
-            lines
-        }
-        Some(RunResult::Doctor {
-            local,
-            targets,
-            error,
-            ..
-        }) => {
-            let mut lines = local.as_ref().map(local_block).unwrap_or_default();
-            lines.extend(targets.iter().flat_map(doctor_block));
-            lines.extend(run_error(error.as_deref()));
-            lines
-        }
-        Some(RunResult::Edit { what, outcome }) => {
-            let end = match outcome {
-                Ok(done) => Line::from(format!("  {}", text(done))).style(Color::Green),
-                Err(err) => Line::from(format!("  ✘ {}", text(err))).style(Color::Red),
-            };
-            vec![Line::from(text(what)).style(Modifier::BOLD), end]
-        }
-    };
-    // The running result is the newest one.
-    if let Some(running) = &app.running
-        && app.shown == Some(app.results.len() - 1)
-    {
-        lines.push(spinner(running));
+    let border = block("Results", app.focus == Pane::Results);
+    let inner = border.inner(area);
+    f.render_widget(border, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
     }
-    let results = Paragraph::new(lines)
+    let Some(result) = app.shown_result() else {
+        f.render_widget(
+            body_paragraph(app, vec![Line::from("No results yet.")]),
+            inner,
+        );
+        return;
+    };
+    let tabs = result_tabs(result);
+    let mut body_area = inner;
+    if !tabs.is_empty() {
+        let strip = Rect { height: 1, ..inner };
+        f.render_widget(
+            Paragraph::new(strip_line(&tabs, app.shown_tab(), usize::from(inner.width))),
+            strip,
+        );
+        if inner.height == 1 {
+            return;
+        }
+        body_area = Rect {
+            y: inner.y.saturating_add(1),
+            height: inner.height - 1,
+            ..inner
+        };
+    }
+    let selected = app.shown_tab();
+    let mut lines = if tabs.is_empty() {
+        Vec::new()
+    } else {
+        section_lines(result, selected)
+    };
+    lines.extend(run_error(result_error(result)));
+    if let Some(running) = running_line(app) {
+        lines.push(running);
+    }
+    f.render_widget(body_paragraph(app, lines), body_area);
+}
+
+fn body_paragraph(app: &App, lines: Vec<Line<'static>>) -> Paragraph<'static> {
+    Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((app.scroll, 0))
-        .block(block("Results", app.focus == Pane::Results));
-    f.render_widget(results, area);
+}
+
+/// The running result is the newest one. An edit has no spinner.
+fn running_line(app: &App) -> Option<Line<'static>> {
+    let running = app.running.as_ref()?;
+    if app.shown != Some(app.results.len() - 1)
+        || matches!(app.shown_result(), Some(RunResult::Edit { .. }))
+    {
+        return None;
+    }
+    Some(spinner(running))
+}
+
+fn result_error(result: &RunResult) -> Option<&str> {
+    match result {
+        RunResult::Doctor { error, .. } | RunResult::Apply { error, .. } => error.as_deref(),
+        RunResult::Edit { .. } => None,
+    }
+}
+
+struct StripTab {
+    ok: bool,
+    label: String,
+}
+
+fn result_tabs(result: &RunResult) -> Vec<StripTab> {
+    match result {
+        RunResult::Doctor { local, targets, .. } => {
+            let mut tabs = Vec::new();
+            if let Some(local) = local {
+                tabs.push(StripTab {
+                    ok: local.ok(),
+                    label: "local checks".to_owned(),
+                });
+            }
+            tabs.extend(targets.iter().map(|target| StripTab {
+                ok: target.connectable,
+                label: text(&target.target),
+            }));
+            tabs
+        }
+        RunResult::Apply { targets, .. } => targets
+            .iter()
+            .map(|target| StripTab {
+                ok: target.ok(),
+                label: text(target.target()),
+            })
+            .collect(),
+        RunResult::Edit { what, outcome } => vec![StripTab {
+            ok: outcome.is_ok(),
+            label: text(what),
+        }],
+    }
+}
+
+fn section_lines(result: &RunResult, index: usize) -> Vec<Line<'static>> {
+    match result {
+        RunResult::Doctor { local, targets, .. } => match local {
+            Some(local) if index == 0 => local_block(local),
+            Some(_) => doctor_block(&targets[index - 1]),
+            None => doctor_block(&targets[index]),
+        },
+        RunResult::Apply { targets, .. } => apply_block(&targets[index]),
+        RunResult::Edit { what, outcome } => edit_lines(what, outcome),
+    }
+}
+
+fn edit_lines(what: &str, outcome: &Result<String, String>) -> Vec<Line<'static>> {
+    let end = match outcome {
+        Ok(done) => Line::from(format!("  {}", text(done))).style(Color::Green),
+        Err(err) => Line::from(format!("  ✘ {}", text(err))).style(Color::Red),
+    };
+    vec![Line::from(text(what)).style(Modifier::BOLD), end]
+}
+
+const TAB_GAP: &str = "  ";
+const TAB_BEFORE: &str = "‹ ";
+const TAB_AFTER: &str = " ›";
+
+/// One row of tabs in `width` columns. Every tab that fits is at its
+/// natural width; the window grows to the right first, then to the left.
+/// Only a selected tab that fills the row by itself is cut.
+fn strip_line(tabs: &[StripTab], selected: usize, width: usize) -> Line<'static> {
+    let selected = selected.min(tabs.len() - 1);
+    let window = tab_window(tabs, selected, width);
+    let mut spans = Vec::new();
+    if window.chevrons && window.lo > 0 {
+        spans.push(Span::styled(TAB_BEFORE, secondary()));
+    }
+    for (i, tab) in tabs
+        .iter()
+        .enumerate()
+        .skip(window.lo)
+        .take(window.hi - window.lo + 1)
+    {
+        if i > window.lo {
+            spans.push(Span::styled(TAB_GAP, secondary()));
+        }
+        let budget = if i == selected {
+            window.budget.unwrap_or(usize::MAX)
+        } else {
+            usize::MAX
+        };
+        spans.extend(tab_spans(tab, i == selected, budget));
+    }
+    if window.chevrons && window.hi + 1 < tabs.len() {
+        spans.push(Span::styled(TAB_AFTER, secondary()));
+    }
+    Line::from(spans)
+}
+
+struct TabWindow {
+    lo: usize,
+    hi: usize,
+    /// Set only when the selected tab is the whole window and must be cut.
+    budget: Option<usize>,
+    chevrons: bool,
+}
+
+fn tab_window(tabs: &[StripTab], selected: usize, width: usize) -> TabWindow {
+    let n = tabs.len();
+    let natural = |lo: usize, hi: usize| {
+        (lo..=hi)
+            .map(|i| cols(&tab_text(&tabs[i], i == selected)))
+            .sum::<usize>()
+            + cols(TAB_GAP) * hi.saturating_sub(lo)
+    };
+    let chrome = |lo: usize, hi: usize| {
+        usize::from(lo > 0) * cols(TAB_BEFORE) + usize::from(hi + 1 < n) * cols(TAB_AFTER)
+    };
+    let fits = |lo: usize, hi: usize| natural(lo, hi) + chrome(lo, hi) <= width;
+    if natural(0, n - 1) <= width {
+        return TabWindow {
+            lo: 0,
+            hi: n - 1,
+            budget: None,
+            chevrons: true,
+        };
+    }
+    if fits(selected, selected) {
+        let mut lo = selected;
+        let mut hi = selected;
+        loop {
+            if hi + 1 < n && fits(lo, hi + 1) {
+                hi += 1;
+                continue;
+            }
+            if lo > 0 && fits(lo - 1, hi) {
+                lo -= 1;
+                continue;
+            }
+            break;
+        }
+        return TabWindow {
+            lo,
+            hi,
+            budget: None,
+            chevrons: true,
+        };
+    }
+    let around = chrome(selected, selected);
+    let budget = width.saturating_sub(around);
+    if budget == 0 {
+        TabWindow {
+            lo: selected,
+            hi: selected,
+            budget: Some(width),
+            chevrons: false,
+        }
+    } else {
+        TabWindow {
+            lo: selected,
+            hi: selected,
+            budget: Some(budget),
+            chevrons: true,
+        }
+    }
+}
+
+fn tab_text(tab: &StripTab, selected: bool) -> String {
+    let (open, close) = if selected { ("[", "]") } else { ("", "") };
+    format!("{open}{} {}{close}", tab_mark(tab.ok), tab.label)
+}
+
+fn tab_mark(ok: bool) -> &'static str {
+    if ok { "✔" } else { "✘" }
+}
+
+/// `budget` columns of `{open}{mark} {label}{close}`. The mark and the
+/// space after it stay whole while the budget can hold them.
+fn tab_spans(tab: &StripTab, selected: bool, budget: usize) -> Vec<Span<'static>> {
+    let (open, close) = if selected { ("[", "]") } else { ("", "") };
+    let mark = tab_mark(tab.ok);
+    let rest = if selected {
+        cursor_style()
+    } else {
+        secondary()
+    };
+    let fixed = cols(open) + cols(close) + cols(mark) + 1;
+    if budget >= fixed {
+        let label = ellipsize(&tab.label, budget - fixed);
+        let mut spans = Vec::new();
+        if !open.is_empty() {
+            spans.push(Span::styled(open, rest));
+        }
+        spans.push(Span::styled(
+            mark,
+            if tab.ok { Color::Green } else { Color::Red },
+        ));
+        spans.push(Span::styled(format!(" {label}{close}"), rest));
+        spans
+    } else {
+        vec![Span::styled(
+            ellipsize(&tab_text(tab, selected), budget),
+            rest,
+        )]
+    }
 }
 
 fn spinner(running: &Running) -> Line<'static> {
@@ -530,8 +758,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
+    use crossterm::event::KeyCode;
+
     use crate::tui::app::tests::{app, cancelled, local_report, opts, probed, ran, step};
-    use crate::tui::app::{LogLine, RunKind, RunResult, Running};
+    use crate::tui::app::{LogLine, Msg, RunKind, RunResult, Running};
 
     fn render(app: &App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -745,11 +975,16 @@ mod tests {
             },
         );
         let buf = buffer(&doctor, 80, 16);
-        let (x, y) = find(&buf, 80, 16, "local checks");
-        assert_eq!(buf[(x, y)].fg, Color::Cyan);
-        assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
-        let (x, y) = find(&buf, 80, 16, "remote");
-        assert_eq!(buf[(x, y)].fg, Color::Cyan);
+        // The strip also says "local checks"; the section heading under it stays cyan.
+        let (x, y) = find(&buf, 80, 16, "ssh             ok");
+        assert_eq!(buf[(x - 2, y - 1)].symbol(), "l");
+        assert_eq!(buf[(x - 2, y - 1)].fg, Color::Cyan);
+        assert!(buf[(x - 2, y - 1)].modifier.contains(Modifier::BOLD));
+        doctor.tab = 1;
+        let buf = buffer(&doctor, 80, 16);
+        let (x, y) = find(&buf, 80, 16, "transport");
+        assert_eq!(buf[(x - 2, y - 1)].symbol(), "r");
+        assert_eq!(buf[(x - 2, y - 1)].fg, Color::Cyan);
 
         app.overlay = Some(Overlay::Help);
         let buf = buffer(&app, 80, 24);
@@ -781,8 +1016,14 @@ mod tests {
         let mut app = app();
         app.overlay = Some(Overlay::Help);
         let screen = render(&app, 80, 24);
+        assert!(
+            screen
+                .iter()
+                .any(|row| row.contains("←→") && row.contains("previous / next tab")),
+            "help lists ←→: {screen:?}"
+        );
         assert_eq!(
-            screen[2..22],
+            screen[2..23],
             [
                 "│[ ] mac   me@10.0┌Help──────────────────────────────────────┐                 │",
                 "│[ ] pi    pi.lan │ ↑↓ / j k    move                         │                 │",
@@ -801,9 +1042,10 @@ mod tests {
                 "│                 │ l           show / hide the log          │                 │",
                 "│                 │ r           reload the inventory         │                 │",
                 "│                 │ [ ]         previous / next result       │                 │",
+                "│                 │ ←→          previous / next tab          │                 │",
                 "│                 │ ?           this help                    │                 │",
                 "│                 │ q / Ctrl-C  quit                         │                 │",
-                "│                 └──────────────────────────────────────────┘                 │",
+                "└─────────────────└──────────────────────────────────────────┘─────────────────┘",
             ]
         );
     }
@@ -850,15 +1092,27 @@ mod tests {
         );
     }
 
-    /// The Results pane's inner rows of an 80-column screen.
-    fn results(app: &App, height: u16) -> Vec<String> {
-        render(app, 80, height)[1..usize::from(height) - 2]
+    /// The Results pane's inner rows.
+    fn results_at(app: &App, width: u16, height: u16) -> Vec<String> {
+        render(app, width, height)[1..usize::from(height) - 2]
             .iter()
             .map(|row| {
-                let inner: String = row.chars().skip(29).collect();
+                let inner: String = row.chars().skip(usize::from(LEFT_WIDTH) + 1).collect();
                 inner.trim_end_matches(['│', ' ']).to_owned()
             })
             .collect()
+    }
+
+    /// The Results pane's inner rows of an 80-column screen.
+    fn results(app: &App, height: u16) -> Vec<String> {
+        results_at(app, 80, height)
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ));
     }
 
     fn show(app: &mut App, result: RunResult) {
@@ -893,8 +1147,9 @@ mod tests {
         );
         let status = render(&app, 100, 20).pop().unwrap();
         assert_eq!(
-            results(&app, 20),
+            &results(&app, 20)[..8],
             [
+                "[✔ local]  ✘ pi\\x1b]0;x  ✘ mac",
                 "▶ local",
                 "  $ printf 'a\\n' …",
                 "    a",
@@ -902,19 +1157,35 @@ mod tests {
                 "    warn: \\x1b[31mred",
                 "  ✔ ok · 1 step",
                 "",
+            ]
+        );
+        assert!(status.ends_with("│ 1 ok, 2 failed"), "{status}");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            &results(&app, 12)[..6],
+            [
+                "✔ local  [✘ pi\\x1b]0;x]  ✘ mac",
                 "▶ pi\\x1b]0;x",
                 "  $ hostname",
                 "    pi",
                 "  $ false",
                 "  ✘ step 2 exited 2",
-                "",
-                "▶ mac",
-                "  ⊘ cancelled",
-                "",
-                "",
             ]
         );
-        assert!(status.ends_with("│ 1 ok, 2 failed"), "{status}");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            &results(&app, 10)[..4],
+            [
+                "✔ local  ✘ pi\\x1b]0;x  [✘ mac]",
+                "▶ mac",
+                "  ⊘ cancelled",
+                ""
+            ]
+        );
+        press(&mut app, KeyCode::Right);
+        assert_eq!(results(&app, 8)[1], "▶ mac", "Right on the last tab stays");
+        press(&mut app, KeyCode::Left);
+        assert_eq!(results(&app, 8)[1], "▶ pi\\x1b]0;x");
     }
 
     #[test]
@@ -934,12 +1205,13 @@ mod tests {
             },
         );
         assert_eq!(
-            results(&app, 8)[..4],
+            results(&app, 8),
             [
+                "[✘ pi]",
                 "▶ pi",
                 "  ✘ ssh: connect timed out\\x07",
                 "",
-                "✘ apply panicked: boom"
+                "✘ apply panicked: boom",
             ]
         );
     }
@@ -962,8 +1234,8 @@ mod tests {
             tick: 11,
         });
         assert_eq!(
-            results(&app, 8)[..4],
-            ["▶ local", "  ✔ ok · 0 steps", "", "⠙ pi\\x1b"]
+            results(&app, 8),
+            ["[✔ local]", "▶ local", "  ✔ ok · 0 steps", "", "⠙ pi\\x1b"]
         );
         // The spinner goes with the newest result only.
         app.results.push(RunResult::Apply {
@@ -972,8 +1244,8 @@ mod tests {
             error: None,
         });
         assert_eq!(
-            results(&app, 8)[..4],
-            ["▶ local", "  ✔ ok · 0 steps", "", ""]
+            results(&app, 8),
+            ["[✔ local]", "▶ local", "  ✔ ok · 0 steps", "", ""]
         );
     }
 
@@ -994,30 +1266,42 @@ mod tests {
         );
         let status = render(&app, 100, 22).pop().unwrap();
         assert_eq!(
-            results(&app, 22),
+            &results(&app, 22)[..7],
             [
+                "[✔ local checks]  ✔ pi  ✘ mac",
                 "local checks",
                 "  ssh             ok",
                 "  sh              ok",
                 "  editor          /usr/bin/vi",
                 "  secret API      missing",
                 "",
+            ]
+        );
+        assert!(
+            !results(&app, 22)[1..].iter().any(|row| row == "pi"),
+            "tab 0 is only the checks"
+        );
+        assert!(status.ends_with("│ 1 ok, 1 failed"), "{status}");
+        app.scroll = 2;
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.scroll, 0);
+        assert_eq!(
+            &results(&app, 14)[..7],
+            [
+                "✔ local checks  [✔ pi]  ✘ mac",
                 "pi",
                 "  transport       ssh pi",
                 "  connectable     yes",
                 "  hostname        pi",
                 "  os              Linux",
                 "",
-                "mac",
-                "  transport       ssh mac",
-                "  connectable     no",
-                "  error           ssh: no route\\x1b[2J",
-                "",
-                "",
-                "",
             ]
         );
-        assert!(status.ends_with("│ 1 ok, 1 failed"), "{status}");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(results(&app, 12)[1], "mac");
+        assert!(results(&app, 12).iter().any(|row| row.contains("no route")));
+        press(&mut app, KeyCode::Left);
+        assert_eq!(results(&app, 8)[0], "✔ local checks  [✔ pi]  ✘ mac");
     }
 
     #[test]
@@ -1072,8 +1356,15 @@ mod tests {
                 error: None,
             },
         );
-        app.scroll = 3;
-        assert_eq!(results(&app, 6)[..3], ["▶ pi", "  ✔ ok · 0 steps", ""]);
+        app.scroll = 1;
+        assert_eq!(
+            results(&app, 8),
+            ["[✔ local]  ✔ pi", "  ✔ ok · 0 steps", "", "", ""]
+        );
+        assert!(
+            !results(&app, 8)[1..].iter().any(|row| row.contains("▶ pi")),
+            "scroll stays inside the shown tab"
+        );
     }
 
     #[test]
@@ -1189,15 +1480,8 @@ mod tests {
             },
         );
         assert_eq!(
-            render(&app, 80, 6),
-            [
-                "┌Targets───────────────────┐┌Results───────────────────────────────────────────┐",
-                "│[ ] local local           ││secret API                                        │",
-                "│[ ] mac   me@10.0.0.2:2222││  secret API: updated                             │",
-                "│[ ] pi    pi.lan          ││                                                  │",
-                "└──────────────────────────┘└──────────────────────────────────────────────────┘",
-                " d doctor · a apply · [ ] results · ? help · q quit │ format default │ -v 0",
-            ]
+            results(&app, 6),
+            ["[✔ secret API]", "secret API", "  secret API: updated"]
         );
         show(
             &mut app,
@@ -1207,9 +1491,18 @@ mod tests {
             },
         );
         assert_eq!(
-            results(&app, 6)[..2],
-            ["inventory", "  ✘ inventory: still invalid\\x07"]
+            results(&app, 6),
+            [
+                "[✘ inventory]",
+                "inventory",
+                "  ✘ inventory: still invalid\\x07",
+            ]
         );
+        let tab = app.tab;
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.tab, tab);
+        assert_eq!(results(&app, 6)[0], "[✘ inventory]");
     }
 
     #[test]
@@ -1243,5 +1536,234 @@ mod tests {
                 " d doctor · a apply · [ ] results · ? help · q quit │ format",
             ]
         );
+    }
+
+    #[test]
+    fn a_failed_checks_tab_stays_marked_while_a_target_is_selected() {
+        let mut app = app();
+        let mut local = local_report();
+        local.ssh = false;
+        show(
+            &mut app,
+            RunResult::Doctor {
+                local: Some(local),
+                targets: vec![probed("pi", None), probed("mac", None)],
+                ok: Some(false),
+                error: None,
+            },
+        );
+        press(&mut app, KeyCode::Right);
+        let rows = results(&app, 12);
+        assert_eq!(rows[0], "✘ local checks  [✔ pi]  ✔ mac");
+        assert_eq!(rows[1], "pi");
+        assert!(
+            !rows[1..]
+                .iter()
+                .any(|row| row == "local checks" || row.contains("secret"))
+        );
+        let status = render(&app, 100, 12).pop().unwrap();
+        assert!(
+            status.ends_with("│ 2 ok, 0 failed"),
+            "counts ignore local checks: {status}"
+        );
+        let buf = buffer(&app, 80, 12);
+        let (x, y) = find(&buf, 80, 12, "✘ local checks");
+        assert_eq!(buf[(x, y)].fg, Color::Red);
+        assert_eq!(buf[(x + 1, y)].fg, Color::DarkGray);
+        let (x, y) = find(&buf, 80, 12, "[✔ pi]");
+        assert_eq!(buf[(x, y)].fg, Color::LightBlue);
+        assert_eq!(buf[(x + 1, y)].fg, Color::Green);
+        assert_eq!(buf[(x + 3, y)].symbol(), "p");
+        assert_eq!(buf[(x + 3, y)].fg, Color::LightBlue);
+        assert!(!buf[(x, y)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn a_run_error_is_visible_on_every_tab() {
+        let mut app = app();
+        show(
+            &mut app,
+            RunResult::Apply {
+                targets: vec![
+                    ran("local", Vec::new()),
+                    ran("pi", vec![step("false", Some(1), "", "")]),
+                ],
+                ok: Some(false),
+                error: Some("apply panicked: boom".to_owned()),
+            },
+        );
+        assert!(
+            results(&app, 12)
+                .iter()
+                .any(|row| row == "✘ apply panicked: boom")
+        );
+        assert!(results(&app, 12).iter().any(|row| row == "▶ local"));
+        press(&mut app, KeyCode::Right);
+        let rows = results(&app, 12);
+        assert!(rows.iter().any(|row| row == "✘ apply panicked: boom"));
+        assert!(rows.iter().any(|row| row == "▶ pi"));
+        assert!(!rows.iter().any(|row| row == "▶ local"));
+    }
+
+    #[test]
+    fn a_result_with_no_tabs_draws_the_run_error_and_no_strip() {
+        let mut app = app();
+        show(
+            &mut app,
+            RunResult::Apply {
+                targets: Vec::new(),
+                ok: Some(false),
+                error: Some("no config".to_owned()),
+            },
+        );
+        assert_eq!(results(&app, 8)[0], "✘ no config");
+        assert!(!results(&app, 8).iter().any(|row| row.contains('[')));
+    }
+
+    #[test]
+    fn one_inner_row_draws_only_the_strip() {
+        let mut app = app();
+        show(
+            &mut app,
+            RunResult::Doctor {
+                local: Some(local_report()),
+                targets: vec![probed("pi", None), probed("mac", Some("down"))],
+                ok: Some(false),
+                error: Some("doctor panicked: boom".to_owned()),
+            },
+        );
+        assert_eq!(results(&app, 4), ["[✔ local checks]  ✔ pi  ✘ mac"]);
+        assert!(results(&app, 3).is_empty());
+    }
+
+    #[test]
+    fn the_strip_uses_chevrons_and_ellipsizes_only_the_selected_tab() {
+        let mut wide = app();
+        show(
+            &mut wide,
+            RunResult::Apply {
+                targets: vec![
+                    ran("zz", Vec::new()),
+                    ran("local checks", Vec::new()),
+                    ran("pi", Vec::new()),
+                    ran("abcdefghijklmno", Vec::new()),
+                ],
+                ok: Some(true),
+                error: None,
+            },
+        );
+        wide.tab = 2;
+        // W = 26. High cannot take the long name, so the window is the two
+        // tabs around pi, with both neighbors hidden.
+        assert_eq!(results_at(&wide, 56, 8)[0], "‹ ✔ local checks  [✔ pi] ›");
+
+        let mut high = app();
+        show(
+            &mut high,
+            RunResult::Apply {
+                targets: vec![
+                    ran("a", Vec::new()),
+                    ran("b", Vec::new()),
+                    ran("c", Vec::new()),
+                ],
+                ok: Some(true),
+                error: None,
+            },
+        );
+        high.tab = 1;
+        assert_eq!(results_at(&high, 42, 8)[0], "‹ [✔ b]  ✔ c");
+
+        let mut cut = app();
+        show(
+            &mut cut,
+            RunResult::Doctor {
+                local: Some(local_report()),
+                targets: vec![probed("pi", None)],
+                ok: Some(true),
+                error: None,
+            },
+        );
+        assert_eq!(results_at(&cut, 42, 8)[0], "[✔ local…] ›");
+        assert_eq!(results_at(&cut, 48, 8)[0], "[✔ local checks] ›");
+        assert_eq!(results_at(&cut, 31, 8)[0], "…");
+        assert!(cols(&results_at(&cut, 42, 8)[0]) <= 12);
+    }
+
+    #[test]
+    fn a_tab_past_the_end_draws_the_last_section() {
+        let mut app = app();
+        show(
+            &mut app,
+            RunResult::Doctor {
+                local: Some(local_report()),
+                targets: vec![probed("pi", None), probed("mac", Some("down"))],
+                ok: Some(false),
+                error: None,
+            },
+        );
+        app.tab = 40;
+        let rows = results(&app, 12);
+        assert_eq!(rows[0], "✔ local checks  ✔ pi  [✘ mac]");
+        assert_eq!(rows[1], "mac");
+    }
+
+    #[test]
+    fn doctor_done_keeps_the_target_on_screen_unless_another_result_is_shown() {
+        let mut shown = app();
+        press(&mut shown, KeyCode::Char('d'));
+        shown.on_msg(Msg::DoctorTarget(probed("pi", None)));
+        shown.on_msg(Msg::DoctorTarget(probed("mac", Some("down"))));
+        press(&mut shown, KeyCode::Right);
+        shown.on_msg(Msg::DoctorDone(crate::doctor::Report {
+            local: local_report(),
+            targets: vec![probed("pi", None), probed("mac", Some("down"))],
+            ok: false,
+        }));
+        let rows = results(&shown, 12);
+        assert_eq!(rows[0], "✔ local checks  ✔ pi  [✘ mac]");
+        assert_eq!(rows[1], "mac");
+
+        let mut older = app();
+        press(&mut older, KeyCode::Char('a'));
+        older.on_msg(Msg::TargetDone(ran("local", Vec::new())));
+        older.on_msg(Msg::Finished(Ok(())));
+        press(&mut older, KeyCode::Char('d'));
+        older.on_msg(Msg::DoctorTarget(probed("pi", None)));
+        older.on_msg(Msg::DoctorTarget(probed("mac", None)));
+        press(&mut older, KeyCode::Char('['));
+        older.on_msg(Msg::DoctorDone(crate::doctor::Report {
+            local: local_report(),
+            targets: vec![probed("pi", None), probed("mac", None)],
+            ok: true,
+        }));
+        assert_eq!((older.shown, older.tab), (Some(0), 0));
+        let rows = results(&older, 10);
+        assert_eq!(rows[0], "[✔ local]");
+        assert_eq!(rows[1], "▶ local");
+        assert!(!rows.iter().any(|row| row.contains("local checks")));
+    }
+
+    #[test]
+    fn an_edit_tab_is_labeled_by_what() {
+        let mut app = app();
+        show(
+            &mut app,
+            RunResult::Edit {
+                what: "migrate → age".to_owned(),
+                outcome: Ok("migrated".to_owned()),
+            },
+        );
+        assert_eq!(
+            results(&app, 6),
+            ["[✔ migrate → age]", "migrate → age", "  migrated"]
+        );
+        show(
+            &mut app,
+            RunResult::Edit {
+                what: "secret \u{7}".to_owned(),
+                outcome: Err("no".to_owned()),
+            },
+        );
+        assert_eq!(results(&app, 6)[0], "[✘ secret \\x07]");
     }
 }
