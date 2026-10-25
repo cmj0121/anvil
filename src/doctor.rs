@@ -4,7 +4,9 @@
 //! The secret store is opened before anything else, so a store that cannot
 //! be opened is known before any target is probed. A missing secret is a
 //! warning; a store that cannot answer or is locked, a missing `ssh` or
-//! `/bin/sh`, or an unreachable target fails the command (exit 1). An
+//! `/bin/sh`, or an unreachable target fails the command (exit 1). With
+//! `[packages]`, each connectable target also resolves its package manager,
+//! and a manager that cannot be resolved fails the command too. An
 //! unresolvable editor is reported but does not fail it: neither `doctor`
 //! nor `apply` needs one.
 
@@ -21,6 +23,7 @@ use crate::facts::{self, Facts, PROBE};
 use crate::inventory::{Target, TargetKind};
 use crate::logger::escape_controls;
 use crate::options::Options;
+use crate::packages::{self, Choice};
 use crate::paths;
 use crate::secret::{SecretError, Store};
 use crate::transport::{Output, Transport, TransportError};
@@ -85,9 +88,35 @@ pub struct TargetReport {
     pub facts: Option<Facts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The resolved package manager; only with `[packages]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manager: Option<String>,
+    /// Why the package manager cannot be resolved; only with `[packages]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manager_error: Option<String>,
     /// How the target is reached, for the human output.
     #[serde(skip)]
     pub transport: String,
+}
+
+impl TargetReport {
+    /// Connectable, and its package manager resolved when one is asked for.
+    pub fn ok(&self) -> bool {
+        self.connectable && self.manager_error.is_none()
+    }
+
+    /// Resolves `choice` against the facts of a connectable target; an
+    /// unreachable one is left as is.
+    fn resolve_manager(&mut self, choice: Choice) {
+        let Some(facts) = &self.facts else { return };
+        match packages::resolve(choice, facts) {
+            Ok(manager) => self.manager = Some(manager.as_str().to_owned()),
+            Err(err) => {
+                log::error!("doctor {}: package manager: {err}", self.target);
+                self.manager_error = Some(err);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -99,7 +128,7 @@ pub struct Report {
 
 impl Report {
     fn new(local: LocalReport, targets: Vec<TargetReport>) -> Report {
-        let ok = local.ok() && targets.iter().all(|t| t.connectable);
+        let ok = local.ok() && targets.iter().all(TargetReport::ok);
         Report { local, targets, ok }
     }
 }
@@ -134,7 +163,10 @@ pub fn check(
         .iter()
         .map(|target| {
             on(Progress::Start(target));
-            let report = check_target(target, opts.transport(target));
+            let mut report = check_target(target, opts.transport(target));
+            if let Some(packages) = &config.packages {
+                report.resolve_manager(packages.choice_for(target));
+            }
             on(Progress::Done(&report));
             report
         })
@@ -249,6 +281,8 @@ fn check_target(
         connectable: facts.is_some(),
         facts,
         error,
+        manager: None,
+        manager_error: None,
         transport: describe(target),
     }
 }
@@ -338,6 +372,12 @@ fn render(report: &Report) -> String {
         let _ = writeln!(out, "  {:<15} {}", "transport", target.transport);
         for (key, value) in target.facts.iter().flat_map(fact_rows) {
             let _ = writeln!(out, "  {key:<15} {value}");
+        }
+        if let Some(manager) = &target.manager {
+            let _ = writeln!(out, "  {:<15} {manager}", "manager");
+        }
+        if let Some(error) = &target.manager_error {
+            let _ = writeln!(out, "  {:<15} error: {error}", "manager");
         }
         if let Some(error) = &target.error {
             let _ = writeln!(out, "  {:<15} {error}", "error");
@@ -681,6 +721,94 @@ mod tests {
         );
         assert!(
             blocks[2].contains("error           key auth failed"),
+            "{text}"
+        );
+    }
+
+    const ROOT_FACTS: &str =
+        "hostname=box\nos=Linux\ndistro=arch\nuser=root\npkg=pacman apt\nanvil-probe-end=1\n";
+
+    fn with_manager(mut report: TargetReport, choice: Choice) -> TargetReport {
+        report.resolve_manager(choice);
+        report
+    }
+
+    #[test]
+    fn without_packages_the_target_has_no_manager_row_or_key() {
+        let report = check_target(&host("up"), fake(Ok(ROOT_FACTS)));
+        assert_eq!(keys(&json(&report)), ["connectable", "facts", "target"]);
+        let store = Memory::default();
+        let text = render(&Report::new(healthy_local(&store, &[]), vec![report]));
+        assert!(!text.contains("manager"), "{text}");
+        assert!(text.ends_with("  pkg             pacman, apt\n"), "{text}");
+    }
+
+    #[test]
+    fn a_resolved_manager_is_a_row_after_the_facts_and_a_json_key() {
+        let report = with_manager(
+            check_target(&host("up"), fake(Ok(ROOT_FACTS))),
+            Choice::Auto,
+        );
+        let value = json(&report);
+        assert_eq!(keys(&value), ["connectable", "facts", "manager", "target"]);
+        assert_eq!(value["manager"], "pacman");
+        let store = Memory::default();
+        let report = Report::new(healthy_local(&store, &[]), vec![report]);
+        assert!(report.ok);
+        let text = render(&report);
+        assert!(
+            text.ends_with("  pkg             pacman, apt\n  manager         pacman\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_manager_fails_the_report() {
+        let report = with_manager(
+            check_target(&host("up"), fake(Ok(FACTS))),
+            Choice::Is(packages::Manager::Pacman),
+        );
+        assert!(report.connectable && !report.ok());
+        let value = json(&report);
+        assert_eq!(
+            keys(&value),
+            ["connectable", "facts", "manager_error", "target"]
+        );
+        assert_eq!(
+            value["manager_error"],
+            "`pacman` needs root and sudo is not installed"
+        );
+        let store = Memory::default();
+        let report = Report::new(healthy_local(&store, &[]), vec![report]);
+        assert!(!report.ok);
+        assert_eq!(json(&report)["ok"], false);
+        let text = render(&report);
+        assert!(
+            text.contains(
+                "  pkg             pacman, apt\n  manager         error: `pacman` needs root and sudo is not installed\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_target_gets_no_manager() {
+        let report = with_manager(
+            check_target(&host("down"), fake(Err(TransportError::HostKey))),
+            Choice::Auto,
+        );
+        assert!(report.manager.is_none() && report.manager_error.is_none());
+        assert_eq!(keys(&json(&report)), ["connectable", "error", "target"]);
+    }
+
+    #[test]
+    fn the_manager_error_is_escaped_in_human_output() {
+        let mut report = check_target(&host("up"), fake(Ok(ROOT_FACTS)));
+        report.manager_error = Some("bad\x1b[2J".to_owned());
+        let store = Memory::default();
+        let text = render(&Report::new(healthy_local(&store, &[]), vec![report]));
+        assert!(
+            text.contains("manager         error: bad\\x1b[2J\n"),
             "{text}"
         );
     }

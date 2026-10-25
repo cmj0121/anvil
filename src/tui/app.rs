@@ -150,10 +150,9 @@ impl RunResult {
     /// How many targets succeeded and failed; `None` for an edit.
     pub fn counts(&self) -> Option<(usize, usize)> {
         let (ok, all) = match self {
-            RunResult::Doctor { targets, .. } => (
-                targets.iter().filter(|t| t.connectable).count(),
-                targets.len(),
-            ),
+            RunResult::Doctor { targets, .. } => {
+                (targets.iter().filter(|t| t.ok()).count(), targets.len())
+            }
             RunResult::Apply { targets, .. } => {
                 (targets.iter().filter(|t| t.ok()).count(), targets.len())
             }
@@ -825,6 +824,8 @@ pub mod tests {
             connectable: error.is_none(),
             facts: error.is_none().then_some(facts),
             error: error.map(str::to_owned),
+            manager: None,
+            manager_error: None,
             transport: format!("ssh {target}"),
         }
     }
