@@ -82,9 +82,16 @@ Local checks, then every selected target's facts:
 - each target: the facts probe (a POSIX sh script) runs over the target's transport. `connectable: true` with the facts,
   or `connectable: false` with the error. Facts: `hostname`, `os`, `kernel`, `arch`, `distro`, `distro_version`, `user`,
   `shell`, `pkg` (present managers among brew, pacman, apt, dnf, apk), `sudo` (`none`, `binary` = needs a password,
-  `nopasswd`).
+  `nopasswd`). brew counts when `command -v brew` finds it or `/opt/homebrew/bin/brew`, `/usr/local/bin/brew` or
+  `/home/linuxbrew/.linuxbrew/bin/brew` is executable, since a non-login ssh shell may leave Homebrew off `PATH`.
+- `manager`, only when the config has a `[packages]` section: each connectable target's package manager as
+  [Packages](#packages) resolves it, as a row `manager         pacman` after the facts, or `manager         error: REASON`
+  when it cannot be resolved (`` `pacman` needs root and sudo asks for a password; set NOPASSWD or connect as root ``,
+  say). An unreachable target gets no `manager` row.
 
-Exit 0 when every check passed and every target is connectable, else 1. `--json`:
+Exit 0 when every check passed and every target is connectable, else 1. With `[packages]`, a target whose package
+manager cannot be resolved also makes the exit 1; without `[packages]` nothing is resolved and the exit is as before.
+`--json`:
 
 ```json
 {
@@ -104,7 +111,8 @@ Exit 0 when every check passed and every target is connectable, else 1. `--json`
         "hostname": "mac.local",
         "os": "Darwin",
         "pkg": "brew"
-      }
+      },
+      "manager": "brew"
     },
     {
       "target": "linode1",
@@ -117,13 +125,23 @@ Exit 0 when every check passed and every target is connectable, else 1. `--json`
 ```
 
 `editor` is a string or `null`; each secret is `"ok"`, `"missing"`, `"locked"` or `"error"`; `facts` holds every key
-the probe reported (abridged above).
+the probe reported (abridged above). `manager` (the resolved manager) or `manager_error` (the reason, without the
+`error:` prefix) appears only with `[packages]` and only on a connectable target.
 
 ### `anvil apply`
 
 Runs the config's `[[steps]]` in order on every selected target: each step's `run` is sent to `sh -s` on the target
 (`/bin/sh -s` for `local`). A step that exits non-zero ends that target; the other targets still run. Exit 0 when
 every step on every target exited 0, else 1.
+
+With `[packages]` that has work to do (a non-empty `install` or `upgrade = true`), each target first runs the facts
+probe over the same transport, resolves its package manager and runs the generated install/upgrade script as step 1,
+before the `[[steps]]`. That step is an ordinary step: it shows as `$ SCRIPT` with its output, counts in
+`✔ ok · N steps` and in `steps` in `--json`, and a non-zero exit ends the target like any step. A probe that fails in the
+transport fails the target with that error as is; a probe that exits non-zero or prints bad output, or a manager that
+cannot be resolved, fails it with `packages: REASON`. Either way the target runs no steps (see
+[Packages](#packages)). Without `[packages]`, or with nothing to install or upgrade, no probe runs and apply runs only
+the `[[steps]]`.
 
 Human output is one block per target, a blank line after each, then a summary:
 
@@ -251,8 +269,9 @@ status bar with the key hints or the last notice, the edit format, the `-v` leve
 result. Target names share one column: the widest name, at most 12 columns, then one space and the detail. When the
 row is short of room the name is cut with `…`. The detail is cut with `…` only when the detail itself cannot fit.
 Apply results read like the CLI's blocks (`▶ name`, `$ command`, its output, `✔ ok · N steps`, `✘ reason` or
-`⊘ cancelled`), doctor results like its human output; a spinner marks the running target. Host and config text is
-escaped as in the CLI, and a secret value is never drawn.
+`⊘ cancelled`), doctor results like its human output, including the `manager` row with `[packages]` (a target whose
+manager cannot be resolved counts as failed in `N ok, M failed`); a spinner marks the running target. Host and config
+text is escaped as in the CLI, and a secret value is never drawn.
 
 | Key          | Action                                                 | CLI equivalent                            |
 | ------------ | ------------------------------------------------------ | ----------------------------------------- |
@@ -329,7 +348,8 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 | 2    | usage or configuration error; the full list is below            |
 
 - **0**: for `doctor`, a `missing` secret or an unresolved editor is only a warning.
-- **1**: `doctor`/`apply`: a target or a check failed (including a `locked` or `error` secret).
+- **1**: `doctor`/`apply`: a target or a check failed (including a `locked` or `error` secret, and, with `[packages]`, a
+  package manager that cannot be resolved).
   `inventory`/`config`/`secret`: the editor exited non-zero (aborted), a file write failed, or the secret store failed,
   is locked or its passphrase prompt was cancelled.
 - **2**: a bad flag or argument (including an `--inventory` or `--config` path not ending in `.toml`), an unknown
@@ -359,6 +379,7 @@ host = "203.0.113.10"     # required: [A-Za-z0-9._:-]+, not starting with '-'
 user = "cmj"              # optional: [A-Za-z0-9._-]+, not starting with '-'
 port = 22                 # optional: 1..=65535
 tags = ["linode", "arch"] # optional: [A-Za-z0-9_-]+
+pkg = "pacman"            # optional: auto | brew | pacman | apt | dnf | apk; see Packages
 ```
 
 The same inventory in the YAML edit view:
@@ -370,10 +391,13 @@ hosts:
     user: cmj
     port: 22
     tags: [linode, arch]
+    pkg: pacman
 ```
 
 Host names match `[A-Za-z0-9_-]+`. `local` is reserved: it is always present, uses the local transport and carries the
-tag `local`; defining it is an error, as is a host name equal to a tag.
+tag `local`; defining it is an error, as is a host name equal to a tag. Its package manager is set with
+`[packages].local` in the config, since it has no inventory entry. Any other `pkg` value is exit 2 with
+``pkg `VALUE`: must be one of auto, brew, pacman, apt, dnf, apk``.
 
 ### Config
 
@@ -399,6 +423,12 @@ age_key_file = "~/.config/sops/age/keys.txt"   # optional
 config = "~/.config/anvil/.sops.yaml"          # optional; default .sops.yaml beside path
 program = "/opt/homebrew/bin/sops"             # optional; default sops on PATH
 
+[packages]                 # optional; without it apply and doctor ignore packages
+manager = "auto"           # auto | brew | pacman | apt | dnf | apk; default "auto"
+local = "brew"             # optional; the choice for the local target; default: manager
+install = ["git", "curl"]  # names to install; default []
+upgrade = false            # upgrade every installed package first; default false
+
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
 ```
@@ -409,6 +439,14 @@ Without `[secrets]` the backend is the keychain on macOS (and unsupported elsewh
 is required and checked: a missing section, an unknown backend or `keychain` off macOS is a config error (exit 2). A
 path may start with `~/`, which is `$HOME`; after that it must be absolute. Each backend's setup is in
 [Secret backends](#secret-backends).
+
+`[packages]` refuses unknown keys. `manager` and `local` take `auto` or a manager name; anything else is exit 2 with
+``packages.manager `VALUE`: must be one of auto, brew, pacman, apt, dnf, apk`` (or `packages.local`). Each `install`
+entry must match `[A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*` (so none starts with `-` or `.`) and be at most 128 bytes, with at
+most 256 entries. A violation is exit 2: ``packages.install[1] `-rf`: must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*``,
+``packages.install[I] `NAME`: N bytes exceeds the 128 byte limit`` or
+`packages.install: N entries exceeds the 256 entry limit`. How the manager is chosen and what runs is
+in [Packages](#packages).
 
 The required names moved from `[anvil].secrets` to `[secrets].names`. A config with the legacy key is still read as
 before (setting both is exit 2). The next `anvil config` save writes it as `[secrets].names` and drops
@@ -434,6 +472,95 @@ and `anvil config` open the parsed document, not the file's text, so comments ar
 1 MiB cap also holds for the edit view and the stored TOML: when the document rendered in the edit format is over
 1 MiB, `anvil inventory` / `anvil config` exit 2 before starting the editor (naming the other `--format` when that view
 fits), and when a YAML edit's TOML form would be over 1 MiB, nothing is written and the exit is 2.
+
+## Packages
+
+`[packages]` in the config installs and upgrades packages on every target with that target's package manager.
+
+```toml
+[packages]
+install = ["git", "curl"]
+```
+
+### Which manager
+
+The choice for a target is its inventory `pkg`, else `[packages].local` for the `local` target, else
+`[packages].manager` (default `auto`). It is resolved against the target's facts from the probe:
+
+| `distro` fact                                      | `auto` picks |
+| -------------------------------------------------- | ------------ |
+| `macos`                                            | brew         |
+| `arch`, `archarm`, `manjaro`, `endeavouros`        | pacman       |
+| `debian`, `ubuntu`, `raspbian`, `linuxmint`, `pop` | apt          |
+| `fedora`, `rhel`, `centos`, `rocky`, `almalinux`   | dnf          |
+| `alpine`                                           | apk          |
+
+Any other distro takes the first manager in the `pkg` fact that is not brew, else brew when present, else fails with
+`no package manager found`. The manager must be in the `pkg` fact: otherwise a named choice fails with
+`` `pacman` is not installed on this target `` and `auto` with `` `pacman`, the default for arch, is not installed ``.
+
+### Root and sudo
+
+brew runs as the connecting user and fails with `brew refuses to run as root` when that user is `root`. Every other
+manager needs root: when the facts' `user` is `root` the commands run as they are, otherwise each is prefixed with
+`sudo -n`, which never prompts. That needs the `sudo` fact `nopasswd`: `binary` fails with
+`` `pacman` needs root and sudo asks for a password; set NOPASSWD or connect as root ``, and `none` with
+`` `pacman` needs root and sudo is not installed ``. anvil never feeds a password to sudo; a stored `HOST_SUDO` is not
+used. The probe tests `sudo -n true`, so a host whose NOPASSWD rule covers only some commands reads as `binary` and is
+refused even when the package manager itself would be allowed.
+
+### What runs
+
+The step is one line: the upgrade part, then the install part, joined with `&&`. `S` stands for `sudo -n` followed by
+a space (nothing as root) and `P` for the `install` names joined by spaces:
+
+| Manager | Part    | Command                                                                   |
+| ------- | ------- | ------------------------------------------------------------------------- |
+| brew    | upgrade | `brew update && brew upgrade`                                             |
+| brew    | install | `brew install P`                                                          |
+| pacman  | upgrade | `S pacman -Syu --noconfirm --needed P` (one command, it installs `P` too) |
+| pacman  | install | `S pacman -S --noconfirm --needed P`                                      |
+| apt     | first   | `S apt-get update` (always, once)                                         |
+| apt     | upgrade | `S env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y`                 |
+| apt     | install | `S env DEBIAN_FRONTEND=noninteractive apt-get install -y P`               |
+| dnf     | upgrade | `S dnf -y upgrade`                                                        |
+| dnf     | install | `S dnf -y install P`                                                      |
+| apk     | upgrade | `S apk update && S apk upgrade`                                           |
+| apk     | install | `S apk add --update-cache P`                                              |
+
+- **Index refresh.** apt always starts with one `apt-get update`, before the upgrade and the install; apk refreshes
+  with `--update-cache`; dnf refreshes expired metadata itself. pacman installs with `-S`, without `-y`: `-Sy` without
+  `-u` is a partial upgrade, which Arch does not support, so a stale database is refreshed only by `upgrade = true`
+  (`-Syu`).
+- **brew's PATH.** The brew line starts with an `export PATH=...;` that appends `/opt/homebrew/bin`, `/usr/local/bin`
+  and `/home/linuxbrew/.linuxbrew/bin` to `$PATH`, since a non-login ssh shell may leave Homebrew off `PATH`. They go
+  after `$PATH`, so the user's own `PATH` wins and a binary under another account's prefix never shadows it. It is all
+  one line, so apply's `$` line shows the whole script.
+- **Names as is.** The `install` names are passed to the manager as is, unquoted (the name rule keeps shell syntax
+  out). A name containing `/` is a brew tap: `owner/repo/formula` adds the third-party tap `owner/repo` and installs
+  from it. A config decides what every target installs and from where, so only use configs you trust.
+
+`install = ["git", "curl"]` on Debian as a NOPASSWD user, on Arch as root, and on a Mac:
+
+```sh
+sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y git curl
+pacman -S --noconfirm --needed git curl
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; brew install git curl
+```
+
+With `upgrade = true` as well, the Mac's line ends `brew update && brew upgrade && brew install git curl`, and Arch's
+is `pacman -Syu --noconfirm --needed git curl`.
+
+Packages are only installed or upgraded, never removed or pinned.
+
+### Failures
+
+A probe that cannot reach the target fails it with the transport error as is (`cannot connect: …`). Any other failure
+before the step fails the target with no steps and `packages: REASON`: `packages: probe exited C`,
+`packages: probe was killed by a signal`, `packages: probe output has no end marker`, or a resolution error from above
+(`packages: brew refuses to run as root`). The step itself failing reads like any step, `✘ step 1 exited C`, and the
+`[[steps]]` do not run. `anvil doctor` shows the same resolution as its `manager` row, so it reports a target apply
+would refuse before apply runs.
 
 ## Secret backends
 

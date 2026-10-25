@@ -7,9 +7,10 @@ for both humans and agents. It is agentless: a target needs only POSIX `sh`, and
 system OpenSSH client.
 
 This is the MVP ([#3](https://github.com/mini-poc/anvil/issues/3)): `doctor` reports facts and reachability for this Mac
-and the hosts in the inventory, `apply` runs the config's placeholder step (`hostname`) on each of them, and `secret`
-keeps a value in the secret backend the config selects: the macOS keychain, an age file or a sops file. The full
-command reference is in [docs/cli.md](docs/cli.md).
+and the hosts in the inventory, `apply` installs the config's `[packages]` with each target's package manager and
+runs its `[[steps]]` (by default the placeholder `hostname`) on each of them, and `secret` keeps a value in the secret
+backend the config selects: the macOS keychain, an age file or a sops file. The full command reference is in
+[docs/cli.md](docs/cli.md).
 
 ## Install
 
@@ -46,6 +47,7 @@ host = "203.0.113.10"     # required
 user = "cmj"              # optional, else ssh's own default
 port = 22                 # optional
 tags = ["linode", "arch"] # optional; select hosts with --target
+pkg = "pacman"            # optional; this host's package manager, overrides [packages].manager
 ```
 
 `local` is reserved for this machine and is always present. Per-host ssh options (keys, jump hosts) belong in
@@ -64,6 +66,12 @@ format = "toml"            # the format anvil inventory/config open in: toml | y
 backend = "keychain"       # keychain (macOS) | age | sops; see docs/cli.md
 names = ["HOST_SUDO"]      # names `doctor` checks; default []
 
+[packages]                 # optional; without it apply and doctor ignore packages
+manager = "auto"           # auto | brew | pacman | apt | dnf | apk; default auto
+local = "brew"             # optional; the choice for `local`, which has no inventory entry
+install = ["git", "curl"]  # default []
+upgrade = false            # upgrade every installed package first; default false
+
 [[steps]]
 run = "hostname"           # placeholder: a POSIX sh script run on every target
 ```
@@ -75,6 +83,19 @@ without a change over an existing `NAME.toml` writes nothing, whatever the edit 
 
 An `inventory.yaml` or `config.yml` from an older anvil is still read by every command; the next `anvil inventory` or
 `anvil config` saves it as `NAME.toml` and removes the YAML file, even when you leave the editor without a change.
+
+### Packages
+
+With `[packages]`, `anvil apply` probes each target, picks its package manager and runs one generated step, before
+the `[[steps]]`, that upgrades (with `upgrade = true`) and installs the `install` list. The choice is the host's `pkg`,
+else `[packages].local` for `local`, else `[packages].manager`. `auto` follows the `distro` fact: `macos` uses brew,
+Arch and its derivatives pacman, Debian and Ubuntu apt, Fedora and RHEL dnf, Alpine apk; an unknown distro takes the
+first manager found that is not brew, else brew.
+
+brew runs as the connecting user and refuses root. Every other manager needs root: anvil connects as `root` or runs it
+with `sudo -n`, so sudo must be passwordless (NOPASSWD); anvil never types a sudo password, and a target where sudo asks
+for one fails with `packages: ...`. `anvil doctor` shows the manager each target resolves to, as a `manager` row, and
+fails when one cannot be resolved. The exact commands and rules are in [docs/cli.md](docs/cli.md#packages).
 
 ### Secrets
 
