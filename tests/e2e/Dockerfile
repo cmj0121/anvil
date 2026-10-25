@@ -2,7 +2,7 @@
 # passed as AUTHORIZED_KEY at start, `pw` only with the password `pw-secret`.
 # inetutils provides `hostname`, the config placeholder step `apply` runs.
 # sudo: `key` has passwordless sudo (the `[packages]` step's `sudo -n`), `pw`
-# is not in sudoers.
+# needs its password (typed by anvil from a secret).
 # BASE defaults to the official amd64 image; tests/e2e.sh passes the pinned
 # digest and picks an Arch Linux ARM build on arm64 hosts, where sshd's seccomp
 # sandbox cannot start under emulation.
@@ -20,7 +20,10 @@ RUN sed -i 's/^#\?DisableSandbox/DisableSandbox/' /etc/pacman.conf \
     && echo 'pw:pw-secret' | chpasswd \
     && echo 'key ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/key \
     && chmod 0440 /etc/sudoers.d/key \
-    && visudo -cf /etc/sudoers.d/key
+    && visudo -cf /etc/sudoers.d/key \
+    && echo 'pw ALL=(ALL) ALL' > /etc/sudoers.d/pw \
+    && chmod 0440 /etc/sudoers.d/pw \
+    && visudo -cf /etc/sudoers.d/pw
 
 COPY sshd_config /etc/ssh/sshd_config
 
