@@ -1,0 +1,20 @@
+[anvil]
+editor = "nvim"
+format = "yaml"
+
+[secrets]
+backend = "age"
+names = ["HOST_SUDO", "API_KEY_2"]
+
+[secrets.keychain]
+service = "anvil-test"
+
+[secrets.age]
+path = "/etc/anvil/secrets.age"
+identity = "/etc/anvil/age-identity.txt"
+
+[[steps]]
+run = "hostname"
+
+[[steps]]
+run = "uname -a"

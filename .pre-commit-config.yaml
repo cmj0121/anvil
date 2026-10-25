@@ -3,6 +3,7 @@ repos:
     rev: v5.0.0
     hooks:
       - id: check-yaml
+        exclude: ^tests/fixtures/invalid/
       - id: end-of-file-fixer
       - id: trailing-whitespace
   - repo: https://github.com/gitleaks/gitleaks
@@ -17,4 +18,3 @@ repos:
     rev: v3.9.6
     hooks:
       - id: prettier
-         - .bendit.yml

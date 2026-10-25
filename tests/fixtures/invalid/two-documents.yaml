@@ -1,0 +1,7 @@
+hosts:
+  web:
+    host: web.example.net
+---
+hosts:
+  other:
+    host: other.example.net

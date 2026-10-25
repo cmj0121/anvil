@@ -1,0 +1,7 @@
+# The default rules, minus the throwaway age key the sops tests encrypt to.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "throwaway age key of the sops tests; it protects nothing"
+paths = ['''^tests/fixtures/sops/age-key\.txt$''']

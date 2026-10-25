@@ -1,0 +1,766 @@
+//! `anvil inventory` and `anvil config` driven by the fake editor.
+//!
+//! Every test gets its own root holding `$XDG_CONFIG_HOME`, `$HOME` and
+//! `$TMPDIR`, so neither the real `~/.config/anvil` nor the real temp dir is
+//! touched.
+
+mod common;
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+
+use common::{Sandbox, fixture, text};
+
+/// A sandbox whose fake editor records each call; no debug-only flags, so
+/// these tests also run against a release build.
+fn sandbox() -> Sandbox {
+    Sandbox::new("ae").without_debug_flags().recording()
+}
+
+impl Sandbox {
+    /// How many times the editor ran since the last `reset_record`.
+    fn calls(&self) -> usize {
+        fs::read_to_string(self.record("editor.count"))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    fn seen(&self, call: usize) -> String {
+        fs::read_to_string(self.record(&format!("editor.in.{call}"))).unwrap()
+    }
+
+    fn reset_record(&self) {
+        let _ = fs::remove_dir_all(self.root().join("record"));
+        fs::create_dir_all(self.root().join("record")).unwrap();
+    }
+
+    /// Every `edit-*` file left in anvil's private temp directory.
+    fn leftovers(&self) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for dir in fs::read_dir(self.tmp_dir()).unwrap() {
+            let dir = dir.unwrap().path();
+            assert!(
+                dir.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("anvil-"),
+                "unexpected {dir:?}"
+            );
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            found.extend(fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()));
+        }
+        found
+    }
+
+    /// The temp file as the editor saw it (`ls -l` line) and as it is now via
+    /// the hard link the editor kept.
+    fn temp_file(&self, call: usize) -> (String, Vec<u8>) {
+        let ls = fs::read_to_string(self.record(&format!("editor.ls.{call}"))).unwrap();
+        let link = fs::read(self.record(&format!("editor.link.{call}"))).unwrap();
+        (ls, link)
+    }
+
+    fn files(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(self.config_dir())
+            .map(|dir| {
+                dir.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Writes `NAME` into the config directory.
+    fn put(&self, name: &str, content: &str) -> PathBuf {
+        fs::create_dir_all(self.config_dir()).unwrap();
+        let path = self.config_dir().join(name);
+        fs::write(&path, content).unwrap();
+        path
+    }
+}
+
+#[test]
+fn inventory_writes_a_valid_file_atomically() {
+    let sb = sandbox();
+    let out = sb.edit(&["inventory"], Some(&fixture("inventory.toml")), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let path = sb.config_dir().join("inventory.toml");
+    assert_eq!(text(&out.stdout), format!("wrote {}\n", path.display()));
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        fs::read_to_string(fixture("inventory.toml")).unwrap()
+    );
+    assert_eq!(sb.files(), ["inventory.toml"]);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    assert_eq!(sb.calls(), 1);
+    assert_eq!(sb.seen(1), "[hosts]\n", "an empty inventory is shown first");
+    let (ls, link) = sb.temp_file(1);
+    assert!(ls.starts_with("-rw-------"), "{ls}");
+    assert!(
+        ls.contains("/anvil-") && ls.contains("/edit-") && ls.trim_end().ends_with(".toml"),
+        "{ls}"
+    );
+    let saved = fs::read(fixture("inventory.toml")).unwrap();
+    assert_eq!(link.len(), saved.len(), "zeroed in place");
+    assert!(link.iter().all(|&b| b == 0), "temp file was not zeroed");
+    assert!(sb.leftovers().is_empty());
+}
+
+#[test]
+fn invalid_content_is_refused_after_three_attempts() {
+    let sb = sandbox();
+    let original = "[hosts.pi]\nhost = \"pi.local\"\n";
+    fs::create_dir_all(sb.config_dir()).unwrap();
+    fs::write(sb.config_dir().join("inventory.toml"), original).unwrap();
+
+    let invalid = fixture("invalid/host-leading-dash.toml");
+    let out = sb.edit(&["inventory"], Some(&invalid), None);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = text(&out.stderr);
+    assert_eq!(stderr.matches("host `evil`: host").count(), 3, "{stderr}");
+    assert!(
+        stderr
+            .ends_with("ERROR anvil: inventory: still invalid after 3 attempts, nothing written\n"),
+        "{stderr}"
+    );
+
+    assert_eq!(sb.calls(), 3);
+    assert_eq!(sb.seen(1), original);
+    let invalid_text = fs::read_to_string(&invalid).unwrap();
+    assert_eq!(sb.seen(2), invalid_text, "re-opened with the same buffer");
+    assert_eq!(sb.seen(3), invalid_text);
+    assert_eq!(
+        fs::read_to_string(sb.config_dir().join("inventory.toml")).unwrap(),
+        original
+    );
+    assert_eq!(sb.files(), ["inventory.toml"]);
+    assert!(sb.leftovers().is_empty());
+}
+
+#[test]
+fn a_fix_on_the_second_attempt_is_written() {
+    let sb = sandbox();
+    let content = sb.root().join("content.toml");
+    fs::copy(
+        fixture("invalid/port-zero.toml"),
+        content.with_extension("toml.1"),
+    )
+    .unwrap();
+    fs::copy(fixture("inventory.toml"), &content).unwrap();
+    let out = sb.edit(&["inventory"], Some(&content), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(sb.calls(), 2);
+    assert!(text(&out.stderr).contains("port"));
+    assert_eq!(sb.files(), ["inventory.toml"]);
+}
+
+const CONFIG_TOML: &str = "[anvil]\nformat = \"toml\"\n\n[[steps]]\nrun = \"uname\"\n";
+const INVENTORY_TOML: &str = "[hosts.pi]\nhost = \"pi.local\"\n";
+
+#[test]
+fn configured_yaml_opens_yaml_and_writes_toml() {
+    let sb = sandbox();
+    sb.put("config.toml", "[anvil]\nformat = \"yaml\"\n");
+    let out = sb.edit(&["inventory"], Some(&fixture("inventory.yaml")), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let path = sb.config_dir().join("inventory.toml");
+    assert_eq!(text(&out.stdout), format!("wrote {}\n", path.display()));
+    assert_eq!(
+        sb.seen(1),
+        "hosts: {}\n",
+        "an empty inventory shown as YAML"
+    );
+    let (ls, _) = sb.temp_file(1);
+    assert!(ls.trim_end().ends_with(".yaml"), "{ls}");
+    assert_eq!(sb.files(), ["config.toml", "inventory.toml"]);
+    let written = fs::read_to_string(&path).unwrap();
+    assert!(written.contains("[hosts.linode1]"), "{written}");
+    assert!(written.contains("host = \"203.0.113.10\""), "{written}");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn config_format_yaml_writes_toml_and_keeps_the_format_key() {
+    let sb = sandbox();
+    sb.put("config.toml", CONFIG_TOML);
+    sb.put("inventory.toml", INVENTORY_TOML);
+
+    let content = sb.root().join("content.yaml");
+    fs::write(
+        &content,
+        "anvil:\n  format: toml\nsteps:\n  - run: uname -a\n",
+    )
+    .unwrap();
+    let out = sb.edit(&["config", "--format", "yaml"], Some(&content), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let path = sb.config_dir().join("config.toml");
+    assert_eq!(text(&out.stdout), format!("wrote {}\n", path.display()));
+    let seen = sb.seen(1);
+    assert!(
+        seen.contains("format: toml") && seen.contains("run: uname"),
+        "{seen}"
+    );
+    let (ls, _) = sb.temp_file(1);
+    assert!(ls.trim_end().ends_with(".yaml"), "{ls}");
+    assert_eq!(sb.files(), ["config.toml", "inventory.toml"]);
+    let written = fs::read_to_string(&path).unwrap();
+    assert!(written.contains("format = \"toml\""), "{written}");
+    assert!(written.contains("run = \"uname -a\""), "{written}");
+    assert_eq!(
+        fs::read_to_string(sb.config_dir().join("inventory.toml")).unwrap(),
+        INVENTORY_TOML
+    );
+
+    sb.reset_record();
+    let out = sb.edit(&["inventory"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        sb.seen(1),
+        INVENTORY_TOML,
+        "the flag did not change the default"
+    );
+}
+
+#[test]
+fn an_edit_of_the_format_key_is_stored_in_toml() {
+    let sb = sandbox();
+    let content = sb.root().join("content.yaml");
+    fs::write(&content, "anvil:\n  format: yaml\n").unwrap();
+    let out = sb.edit(&["config", "--format", "yaml"], Some(&content), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(sb.files(), ["config.toml"]);
+    let written = fs::read_to_string(sb.config_dir().join("config.toml")).unwrap();
+    assert!(written.contains("format = \"yaml\""), "{written}");
+
+    sb.reset_record();
+    let out = sb.edit(&["config"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(sb.seen(1).contains("format: yaml"), "{}", sb.seen(1));
+    assert_eq!(sb.files(), ["config.toml"]);
+}
+
+#[test]
+fn an_unchanged_toml_writes_nothing_in_either_edit_format() {
+    let sb = sandbox();
+    let path = sb.put(
+        "inventory.toml",
+        "# mine\n[hosts.pi]\nhost = \"pi.local\"\n",
+    );
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    for args in [
+        ["inventory"].as_slice(),
+        ["inventory", "--format", "yaml"].as_slice(),
+        ["inventory", "--format", "toml"].as_slice(),
+    ] {
+        sb.reset_record();
+        let out = sb.edit(args, None, None);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+        assert_eq!(
+            text(&out.stdout),
+            format!("{}: unchanged\n", path.display()),
+            "{args:?}"
+        );
+        assert_eq!(sb.calls(), 1, "{args:?}");
+    }
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "# mine\n[hosts.pi]\nhost = \"pi.local\"\n"
+    );
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+    assert_eq!(sb.files(), ["inventory.toml"]);
+}
+
+#[test]
+fn a_legacy_yml_config_is_migrated_by_an_unchanged_edit() {
+    let sb = sandbox();
+    sb.put(
+        "config.yml",
+        "anvil:\n  secrets: [HOST_SUDO]\nsteps:\n  - run: uname\n",
+    );
+    let out = sb.edit(&["--json", "config"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let path = sb.config_dir().join("config.toml");
+    assert_eq!(
+        common::json(&out),
+        serde_json::json!({"path": path.display().to_string(), "changed": true})
+    );
+    assert_eq!(sb.files(), ["config.toml"]);
+    let written = fs::read_to_string(&path).unwrap();
+    let names = if cfg!(target_os = "macos") {
+        "[secrets]\nbackend = \"keychain\"\nnames = [\"HOST_SUDO\"]\n"
+    } else {
+        "secrets = [\"HOST_SUDO\"]"
+    };
+    assert!(written.contains(names), "{written}");
+    assert!(written.contains("run = \"uname\""), "{written}");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_secret_names_move_to_the_secrets_table_on_an_unchanged_save() {
+    let sb = sandbox();
+    let path = sb.put(
+        "config.toml",
+        "[anvil]\nsecrets = [\"HOST_SUDO\"]\n\n[[steps]]\nrun = \"uname\"\n",
+    );
+    let out = sb.edit(&["--json", "config"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        common::json(&out),
+        serde_json::json!({"path": path.display().to_string(), "changed": true})
+    );
+    assert!(
+        sb.seen(1).contains("names = [\"HOST_SUDO\"]"),
+        "{}",
+        sb.seen(1)
+    );
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "[anvil]\nformat = \"toml\"\n\n[secrets]\nbackend = \"keychain\"\n\
+         names = [\"HOST_SUDO\"]\n\n[[steps]]\nrun = \"uname\"\n"
+    );
+
+    let out = sb.edit(&["--json", "config"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(common::json(&out)["changed"], false);
+}
+
+#[test]
+fn legacy_names_into_an_existing_secrets_table_and_yaml_view() {
+    let sb = sandbox();
+    let path = sb.put(
+        "config.toml",
+        "[anvil]\nsecrets = [\"API\"]\n\n[secrets]\nbackend = \"age\"\n\n\
+         [secrets.age]\npath = \"~/s.age\"\nidentity = \"/id.txt\"\n",
+    );
+    let out = sb.edit(&["config", "--format", "yaml"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let written = fs::read_to_string(&path).unwrap();
+    assert!(!written.contains("[anvil]\nsecrets"), "{written}");
+    assert!(
+        written.contains("[secrets]\nbackend = \"age\"\nnames = [\"API\"]\n"),
+        "{written}"
+    );
+    assert!(
+        written.contains("path = \"~/s.age\""),
+        "kept unexpanded: {written}"
+    );
+}
+
+#[test]
+fn a_legacy_key_typed_into_the_toml_view_is_saved_as_secrets_names() {
+    let sb = sandbox();
+    let content = sb.root().join("content.toml");
+    fs::write(
+        &content,
+        "[anvil]\nsecrets = [\"API\"]\n\n[secrets]\nbackend = \"age\"\n\n\
+         [secrets.age]\npath = \"/s.age\"\nidentity = \"/id.txt\"\n",
+    )
+    .unwrap();
+    let out = sb.edit(&["config"], Some(&content), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let written = fs::read_to_string(sb.config_dir().join("config.toml")).unwrap();
+    assert_eq!(
+        written,
+        "[anvil]\nformat = \"toml\"\n\n[secrets]\nbackend = \"age\"\nnames = [\"API\"]\n\n\
+         [secrets.age]\npath = \"/s.age\"\nidentity = \"/id.txt\"\n\n[[steps]]\nrun = \"hostname\"\n"
+    );
+}
+
+#[test]
+fn a_typed_buffer_keeps_its_comments_when_only_the_loaded_file_was_migrated() {
+    let sb = sandbox();
+    let path = sb.put(
+        "config.toml",
+        "[anvil]\nsecrets = [\"API\"]\n\n[secrets]\nbackend = \"age\"\n\n\
+         [secrets.age]\npath = \"/s.age\"\nidentity = \"/id.txt\"\n",
+    );
+    let content = sb.root().join("content.toml");
+    let typed = "# the age store\n[secrets]\nbackend = \"age\"\nnames = [\"API\"]  # required\n\n\
+                 [secrets.age]\npath = \"/s.age\"\nidentity = \"/id.txt\"\n";
+    fs::write(&content, typed).unwrap();
+    let out = sb.edit(&["config"], Some(&content), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(fs::read_to_string(&path).unwrap(), typed);
+}
+
+#[test]
+fn secrets_table_errors_exit_two_naming_the_key() {
+    for (body, key) in [
+        (
+            "[anvil]\nsecrets = [\"A\"]\n\n[secrets]\nbackend = \"age\"\nnames = [\"A\"]\n\n\
+             [secrets.age]\npath = \"/a\"\nidentity = \"/i\"\n",
+            "secrets.names and anvil.secrets",
+        ),
+        (
+            "[secrets]\nbackend = \"vault\"\n",
+            "secrets.backend `vault`",
+        ),
+        ("[secrets]\nbackend = \"sops\"\n", "secrets.sops: required"),
+        ("[secrets]\nnames = []\n", "backend"),
+        (
+            "[secrets]\nbackend = \"age\"\n\n[secrets.age]\npath = \"a.age\"\nidentity = \"/i\"\n",
+            "secrets.age.path `a.age`",
+        ),
+    ] {
+        let sb = sandbox();
+        let path = sb.put("config.toml", body);
+        for command in ["config", "inventory"] {
+            let out = sb.edit(&[command], None, None);
+            assert_eq!(out.status.code(), Some(2), "{body}: {}", text(&out.stderr));
+            assert!(
+                text(&out.stderr).contains(key),
+                "{body}: {}",
+                text(&out.stderr)
+            );
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), body);
+        assert_eq!(sb.calls(), 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_keychain_backend_off_macos_exits_two() {
+    let sb = sandbox();
+    sb.put("config.toml", "[secrets]\nbackend = \"keychain\"\n");
+    let out = sb.edit(&["config"], None, None);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr).contains("secrets.backend `keychain`"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn a_legacy_yaml_inventory_is_replaced_by_toml() {
+    let sb = sandbox();
+    let legacy = sb.put("inventory.yaml", "hosts:\n  pi:\n    host: pi.local\n");
+    let content = sb.root().join("content.toml");
+    fs::write(&content, "[hosts.pi]\nhost = \"pi.lan\"\n").unwrap();
+    let out = sb.edit(&["inventory"], Some(&content), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let path = sb.config_dir().join("inventory.toml");
+    assert_eq!(text(&out.stdout), format!("wrote {}\n", path.display()));
+    assert_eq!(sb.seen(1), INVENTORY_TOML, "the YAML is shown as TOML");
+    assert!(!legacy.exists());
+    assert_eq!(sb.files(), ["inventory.toml"]);
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "[hosts.pi]\nhost = \"pi.lan\"\n"
+    );
+}
+
+/// `doctor` and `apply` read a legacy YAML inventory; the next edit migrates it.
+#[cfg(debug_assertions)]
+#[test]
+fn a_legacy_yaml_inventory_is_loaded_and_then_migrated() {
+    let sb = Sandbox::new("ae");
+    sb.put("inventory.yaml", "hosts:\n  fake:\n    host: fakehost\n");
+    let out = sb.anvil(&["--json", "doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let doctor = common::json(&out);
+    let targets: Vec<&str> = doctor["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["target"].as_str().unwrap())
+        .collect();
+    assert_eq!(targets, ["local", "fake"]);
+    let out = sb.anvil(&["--json", "apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(sb.files(), ["inventory.yaml"], "reading migrates nothing");
+
+    let out = sb.edit(&["inventory"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(sb.files(), ["inventory.toml"]);
+    assert_eq!(
+        fs::read_to_string(sb.config_dir().join("inventory.toml")).unwrap(),
+        "[hosts.fake]\nhost = \"fakehost\"\n"
+    );
+    let out = sb.anvil(&["--json", "doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+}
+
+#[test]
+fn format_is_a_usage_error_outside_inventory_and_config() {
+    let sb = sandbox();
+    for args in [
+        ["secret", "--format", "yaml", "X"].as_slice(),
+        ["doctor", "--format", "yaml"].as_slice(),
+        ["apply", "--format", "yaml"].as_slice(),
+    ] {
+        let out = sb.edit(args, None, None);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(text(&out.stderr).contains("--format"), "{args:?}");
+    }
+    assert_eq!(sb.calls(), 0);
+}
+
+#[test]
+fn a_non_toml_explicit_path_is_a_usage_error() {
+    let sb = sandbox();
+    let inv = sb.root().join("x.yaml");
+    let cfg = sb.root().join("x.yml");
+    let inv_arg = inv.to_str().unwrap();
+    let cfg_arg = cfg.to_str().unwrap();
+    for (args, named) in [
+        (["--inventory", inv_arg, "inventory"].as_slice(), &inv),
+        (["--inventory", inv_arg, "doctor"].as_slice(), &inv),
+        (["--inventory", inv_arg, "apply"].as_slice(), &inv),
+        (["--config", cfg_arg, "config"].as_slice(), &cfg),
+        (["--config", cfg_arg, "inventory"].as_slice(), &cfg),
+    ] {
+        let out = sb.edit(args, Some(&fixture("inventory.yaml")), None);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let stderr = text(&out.stderr);
+        assert!(
+            stderr.contains(&format!("{}: must end in .toml", named.display())),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert_eq!(sb.calls(), 0);
+    assert!(!inv.exists() && !cfg.exists());
+}
+
+#[test]
+fn an_explicit_toml_path_edits_in_yaml_and_writes_the_path() {
+    let sb = sandbox();
+    let legacy = "hosts:\n  pi:\n    host: pi.local\n";
+    sb.put("inventory.yaml", legacy);
+    let path = sb.root().join("inv.toml");
+    let out = sb.edit(
+        &[
+            "--inventory",
+            path.to_str().unwrap(),
+            "--json",
+            "inventory",
+            "--format",
+            "yaml",
+        ],
+        Some(&fixture("inventory.yml")),
+        None,
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        common::json(&out),
+        serde_json::json!({"path": path.display().to_string(), "changed": true})
+    );
+    assert_eq!(sb.seen(1), "hosts: {}\n");
+    let written = fs::read_to_string(&path).unwrap();
+    assert!(written.contains("[hosts.pi]"), "{written}");
+    assert_eq!(sb.files(), ["inventory.yaml"], "nothing beside the path");
+    assert_eq!(
+        fs::read_to_string(sb.config_dir().join("inventory.yaml")).unwrap(),
+        legacy
+    );
+}
+
+#[test]
+fn a_first_run_left_unchanged_writes_nothing() {
+    let sb = sandbox();
+    let out = sb.edit(&["inventory"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let path = sb.config_dir().join("inventory.toml");
+    assert_eq!(
+        text(&out.stdout),
+        format!("{}: unchanged\n", path.display())
+    );
+    assert!(sb.files().is_empty());
+
+    let out = sb.edit(&["--json", "config"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let path = sb.config_dir().join("config.toml");
+    assert_eq!(
+        json,
+        serde_json::json!({"path": path.display().to_string(), "changed": false})
+    );
+    assert!(sb.files().is_empty());
+    assert_eq!(sb.calls(), 2);
+}
+
+#[test]
+fn editor_exit_non_zero_writes_nothing_and_exits_one() {
+    let sb = sandbox();
+    let out = sb.edit(&["inventory"], Some(&fixture("inventory.toml")), Some("3"));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        text(&out.stderr),
+        "ERROR anvil: editor exited with status 3, nothing written\n"
+    );
+    assert!(sb.files().is_empty());
+    let (_, link) = sb.temp_file(1);
+    assert!(link.iter().all(|&b| b == 0), "temp file was not zeroed");
+    assert!(sb.leftovers().is_empty());
+}
+
+#[test]
+fn json_reports_path_and_changed() {
+    let sb = sandbox();
+    let path = sb.config_dir().join("inventory.toml");
+    let out = sb.edit(
+        &["--json", "inventory"],
+        Some(&fixture("inventory.toml")),
+        None,
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"path": path.display().to_string(), "changed": true})
+    );
+
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    let out = sb.edit(&["inventory", "--json"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"path": path.display().to_string(), "changed": false})
+    );
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+}
+
+#[test]
+fn target_is_ignored_with_a_warning() {
+    let sb = sandbox();
+    let out = sb.edit(&["-v", "--target", "local", "inventory"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("WARN anvil::commands: --target is ignored by `inventory`"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn a_missing_configured_editor_fails_inventory_but_config_falls_back() {
+    let sb = sandbox();
+    fs::create_dir_all(sb.config_dir()).unwrap();
+    fs::write(
+        sb.config_dir().join("config.toml"),
+        "[anvil]\neditor = \"anvil-no-such-editor\"\n",
+    )
+    .unwrap();
+    let out = sb.edit(&["inventory"], None, None);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr).contains("editor `anvil-no-such-editor`"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(sb.calls(), 0);
+
+    let out = sb.edit(&["-v", "config"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("WARN anvil::commands: editor `anvil-no-such-editor`")
+            && stderr.contains("falling back"),
+        "{stderr}"
+    );
+    assert_eq!(sb.calls(), 1, "the $EDITOR fake editor ran");
+}
+
+#[test]
+fn a_stale_tmp_file_is_replaced_and_the_result_is_0600() {
+    let sb = sandbox();
+    fs::create_dir_all(sb.config_dir()).unwrap();
+    let tmp = sb.config_dir().join("inventory.toml.tmp");
+    fs::write(&tmp, "stale").unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let out = sb.edit(&["inventory"], Some(&fixture("inventory.toml")), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let path = sb.config_dir().join("inventory.toml");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        fs::read_to_string(fixture("inventory.toml")).unwrap()
+    );
+    assert_eq!(sb.files(), ["inventory.toml"], "no .tmp left behind");
+}
+
+#[test]
+fn an_edit_view_past_the_size_limit_is_refused_before_the_editor() {
+    let sb = sandbox();
+    // Inline tags take 5 bytes each in the TOML view and a line each in the
+    // YAML view, so the TOML view fits the 1 MiB limit and the YAML one does not.
+    let toml = format!(
+        "[hosts.h]\nhost = \"a\"\ntags = [{}]\n",
+        "\"t\",".repeat(200_000)
+    );
+    assert!(toml.len() < 1 << 20);
+    let path = sb.put("inventory.toml", &toml);
+
+    let out = sb.edit(&["inventory", "--format", "yaml"], None, None);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        text(&out.stderr),
+        format!(
+            "ERROR anvil: the yaml view of {} is larger than the 1048576 byte limit; \
+             edit with --format toml\n",
+            path.display()
+        )
+    );
+    assert_eq!(sb.calls(), 0, "the editor never started");
+    assert_eq!(sb.files(), ["inventory.toml"]);
+    assert_eq!(fs::read_to_string(&path).unwrap(), toml);
+}
+
+#[test]
+fn a_yaml_edit_whose_toml_form_is_past_the_size_limit_writes_nothing() {
+    let sb = sandbox();
+    // A flow list tag takes 12 bytes in YAML (`tttttttttt, `) and 14 in TOML
+    // (quoted), so only the TOML form crosses the limit.
+    let tags = "tttttttttt, ".repeat(80_000);
+    let yaml = format!("hosts:\n  h:\n    host: a\n    tags: [{tags}]\n");
+    assert!(yaml.len() < 1 << 20);
+    let content = sb.root().join("content.yaml");
+    fs::write(&content, &yaml).unwrap();
+
+    let out = sb.edit(&["inventory", "--format", "yaml"], Some(&content), None);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(out.stdout.is_empty());
+    let path = sb.config_dir().join("inventory.toml");
+    assert_eq!(
+        text(&out.stderr),
+        format!(
+            "ERROR anvil: {}: the TOML form would be larger than the 1048576 byte limit; \
+             nothing written\n",
+            path.display()
+        )
+    );
+    assert_eq!(sb.calls(), 1);
+    assert!(sb.files().is_empty());
+}

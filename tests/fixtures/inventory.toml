@@ -1,0 +1,14 @@
+[hosts.linode1]
+host = "203.0.113.10"
+user = "cmj"
+port = 22
+tags = ["linode", "arch"]
+
+[hosts.mac]
+host = "mac.example.net"
+user = "cmj"
+tags = ["darwin"]
+
+[hosts.pi]
+host = "pi.local"
+tags = ["arch"]
