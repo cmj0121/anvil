@@ -331,7 +331,7 @@ fn result_tabs(result: &RunResult) -> Vec<StripTab> {
                 });
             }
             tabs.extend(targets.iter().map(|target| StripTab {
-                ok: target.connectable,
+                ok: target.ok(),
                 label: text(&target.target),
             }));
             tabs
@@ -1321,9 +1321,12 @@ mod tests {
             },
         );
         let status = render(&app, 100, 22).pop().unwrap();
+        assert!(status.ends_with("│ 1 ok, 1 failed"), "{status}");
+        press(&mut app, KeyCode::Right);
         assert_eq!(
-            results(&app, 22)[6..18],
+            &results(&app, 16)[..8],
             [
+                "✔ local checks  [✔ pi]  ✘ mac",
                 "pi",
                 "  transport       ssh pi",
                 "  connectable     yes",
@@ -1331,18 +1334,22 @@ mod tests {
                 "  os              Linux",
                 "  manager         pacman",
                 "",
+            ]
+        );
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            &results(&app, 16)[..8],
+            [
+                "✔ local checks  ✔ pi  [✘ mac]",
                 "mac",
                 "  transport       ssh mac",
                 "  connectable     yes",
                 "  hostname        mac",
                 "  os              Linux",
+                "  manager         error: no package manager found",
+                "",
             ]
         );
-        assert_eq!(
-            results(&app, 22)[18],
-            "  manager         error: no package manager found"
-        );
-        assert!(status.ends_with("│ 1 ok, 1 failed"), "{status}");
     }
 
     #[test]
