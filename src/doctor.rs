@@ -411,6 +411,10 @@ mod tests {
                 ..Output::default()
             })
         }
+
+        fn run_tty(&self, _script: &str, _password: &[u8]) -> Result<Output, TransportError> {
+            unreachable!("no tty script in these tests")
+        }
     }
 
     impl Transport for Fake {
@@ -424,6 +428,10 @@ mod tests {
                 code: Some(0),
                 ..Output::default()
             })
+        }
+
+        fn run_tty(&self, _script: &str, _password: &[u8]) -> Result<Output, TransportError> {
+            unreachable!("no tty script in these tests")
         }
     }
 

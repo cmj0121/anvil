@@ -567,6 +567,10 @@ mod tests {
                 },
             })
         }
+
+        fn run_tty(&self, _script: &str, _password: &[u8]) -> Result<Output, TransportError> {
+            unreachable!("no tty script in these tests")
+        }
     }
 
     fn target(name: &str) -> Target {
@@ -981,6 +985,10 @@ mod tests {
                 code: Some(0),
                 ..Output::default()
             })
+        }
+
+        fn run_tty(&self, _script: &str, _password: &[u8]) -> Result<Output, TransportError> {
+            unreachable!("no tty script in these tests")
         }
     }
 

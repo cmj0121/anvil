@@ -12,6 +12,8 @@
 #   FAKE_SSH_RETRY_STDERR   stderr text of the interactive master attempt
 #   FAKE_SSH_CLIENT_EXIT    exit code of the client; unset runs the script with sh -s
 #   FAKE_SSH_CLIENT_STDERR  stderr text of the client when FAKE_SSH_CLIENT_EXIT is set
+# A client with -tt runs its last argument (the remote command) under script(1),
+# so it gets a terminal as on a real host.
 for arg in "$@"; do
   case "$arg" in
     ControlPath=*/.ssh/anvil/*)
@@ -30,8 +32,10 @@ fi
 
 kind=client
 batch=no
+tty=no
 for arg in "$@"; do
   case "$arg" in
+    -tt) tty=yes ;;
     check) [ "$prev" = "-O" ] && kind=check ;;
     -M) kind=master ;;
     BatchMode=yes) batch=yes ;;
@@ -58,6 +62,16 @@ case "$kind" in
     if [ -n "${FAKE_SSH_CLIENT_EXIT-}" ]; then
       [ -n "${FAKE_SSH_CLIENT_STDERR-}" ] && printf '%s\n' "$FAKE_SSH_CLIENT_STDERR" >&2
       exit "$FAKE_SSH_CLIENT_EXIT"
+    fi
+    if [ "$tty" = yes ]; then
+      for remote in "$@"; do :; done
+      export SHELL=/bin/sh
+      script=/usr/bin/script
+      [ -e "$script" ] || script=/bin/script
+      case "$(uname)" in
+        Linux) exec "$script" -qec "$remote" /dev/null ;;
+        *) exec "$script" -q /dev/null /bin/sh -c "$remote" ;;
+      esac
     fi
     exec sh -s
     ;;

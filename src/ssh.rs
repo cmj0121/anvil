@@ -15,7 +15,8 @@ use std::time::Duration;
 use crate::paths::{self, PrivateDirError};
 use crate::term;
 use crate::transport::{
-    Output, RUN_TIMEOUT, Transport, TransportError, collect, into_string, run_with_script,
+    Output, RUN_TIMEOUT, Transport, TransportError, TtyLimits, collect, into_string, run_tty_with,
+    run_with_script,
 };
 
 /// Deadline for the BatchMode master attempt (no prompt can be pending).
@@ -155,6 +156,41 @@ impl Ssh {
         args
     }
 
+    /// The control directory, with a live master behind it.
+    fn connected(&self) -> Result<&Path, TransportError> {
+        let control_dir = self.control_dir()?;
+        if !self.master_alive(control_dir) {
+            self.open_master(control_dir)?;
+        }
+        Ok(control_dir)
+    }
+
+    /// `ssh <common> -o ControlMaster=no -o BatchMode=yes -o LogLevel=ERROR -tt
+    /// -e none -- <host>
+    /// 'echo <b64> | base64 -d | sh'`: the script on a remote terminal, passed
+    /// as one remote command of shell-neutral characters.
+    pub fn tty_client_args(&self, control_dir: &Path, script: &str) -> Vec<String> {
+        let mut args = self.common_options(control_dir);
+        args.extend(
+            [
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "LogLevel=ERROR",
+                "-tt",
+                "-e",
+                "none",
+                "--",
+            ]
+            .map(str::to_owned),
+        );
+        args.push(self.host.clone());
+        args.push(remote_tty_command(script));
+        args
+    }
+
     /// A command for `program` with `args` and the prompt-answering env removed.
     pub fn command(&self, args: &[String]) -> Command {
         log::debug!("spawn {} {}", self.program.display(), args.join(" "));
@@ -246,15 +282,43 @@ impl Transport for Ssh {
     }
 
     fn run(&self, script: &str) -> Result<Output, TransportError> {
-        let control_dir = self.control_dir()?;
-        if !self.master_alive(control_dir) {
-            self.open_master(control_dir)?;
-        }
+        let control_dir = self.connected()?;
         // Auth happened in the master; any client exit, 255 included, is the
         // script's (a nested ssh, say) and comes back as its output.
         let mut command = self.command(&self.client_args(control_dir));
         run_with_script(&mut command, script, RUN_TIMEOUT)
     }
+
+    fn run_tty(&self, script: &str, password: &[u8]) -> Result<Output, TransportError> {
+        let control_dir = self.connected()?;
+        let mut command = self.command(&self.tty_client_args(control_dir, script));
+        run_tty_with(&mut command, password, TtyLimits::DEFAULT)
+    }
+}
+
+/// `echo <base64 of script> | base64 -d | sh`: only `[A-Za-z0-9+/=-]`, spaces
+/// and `|`, so every login shell (sh, bash, zsh, fish, csh) runs it alike.
+pub fn remote_tty_command(script: &str) -> String {
+    format!("echo {} | base64 -d | sh", base64(script.as_bytes()))
+}
+
+/// Standard base64 with padding.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let group = chunk.iter().enumerate().fold(0u32, |group, (i, &byte)| {
+            group | u32::from(byte) << (16 - 8 * i)
+        });
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[(group >> (18 - 6 * i)) as usize & 63]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 fn is_host_key_failure(stderr: &str) -> bool {
@@ -923,6 +987,7 @@ mod tests {
         all.extend(ssh.master_args(control, true));
         all.extend(ssh.client_args(control));
         all.extend(ssh.check_args(control));
+        all.extend(ssh.tty_client_args(control, "sudo -v"));
         for arg in &all {
             let lower = arg.to_ascii_lowercase();
             assert!(
@@ -932,5 +997,104 @@ mod tests {
         }
         let command = ssh.command(&all);
         assert!(command.get_envs().all(|(_, value)| value.is_none()));
+    }
+
+    // --- tty client ----------------------------------------------------------
+
+    #[test]
+    fn tty_client_argv_matches_d2() {
+        assert_eq!(
+            full().tty_client_args(Path::new(CONTROL), "echo hi\n"),
+            with(
+                common(),
+                &[
+                    "-o",
+                    "ControlMaster=no",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "LogLevel=ERROR",
+                    "-tt",
+                    "-e",
+                    "none",
+                    "--",
+                    "box",
+                    "echo ZWNobyBoaQo= | base64 -d | sh"
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn base64_matches_the_standard_vectors() {
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(plain.as_bytes()), encoded, "{plain:?}");
+        }
+        assert_eq!(base64(&[0xfb, 0xff, 0xbf]), "+/+/");
+    }
+
+    const AWKWARD: &str = "printf '%s\\n' \"$HOME\" `true` 'it''s' \\\\ ; echo \"a  b\" | tr a A\n\
+                           for x in 1 2; do echo \"$x\"; done # \u{e9}\n";
+
+    #[test]
+    fn the_remote_command_is_shell_neutral_and_round_trips_through_sh() {
+        let remote = remote_tty_command(AWKWARD);
+        assert!(
+            remote
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+/=- |".contains(&b)),
+            "{remote}"
+        );
+        let out = Command::new("/bin/sh")
+            .args(["-c", &remote])
+            .output()
+            .unwrap();
+        let direct = Command::new("/bin/sh")
+            .args(["-c", AWKWARD])
+            .output()
+            .unwrap();
+        assert_eq!(out.stdout, direct.stdout);
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            format!(
+                "{}\nits\n\\\nA  b\n1\n2\n",
+                std::env::var("HOME").unwrap_or_default()
+            )
+        );
+    }
+
+    #[test]
+    fn run_tty_types_the_password_through_the_fake_on_a_terminal() {
+        let home = temp_home();
+        let (ssh, log) = fake_with(&home, &[]);
+        let script = "export TERM=dumb\n\
+                      stty -echo </dev/tty; echo anvil-tty-ready\n\
+                      IFS= read -r n </dev/tty\n\
+                      printf %s \"$n\" >/dev/tty; IFS= read -r pw </dev/tty\n\
+                      echo anvil-sudo-ok; echo \"got:${#pw}\"; exit 5\n";
+        let out = ssh.run_tty(script, b"pw-secret").unwrap();
+        assert_eq!(out.stdout, b"got:9\n");
+        assert_eq!(out.code, Some(5));
+        let calls = invocations(&log);
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert!(
+            calls[2].ends_with(&format!(
+                "-o ControlMaster=no -o BatchMode=yes -o LogLevel=ERROR -tt -e none -- box {}",
+                remote_tty_command(script)
+            )),
+            "{}",
+            calls[2]
+        );
+        for call in &calls {
+            assert!(!call.contains("pw-secret") && !call.contains("anvil-sudo-"));
+        }
     }
 }
