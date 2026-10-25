@@ -228,6 +228,41 @@ else
   fail "exit $code"
 fi
 
+step "(l) [packages] in a --config of its own: doctor resolves pacman, apply installs through sudo"
+# Never target `local` with this config: it would run brew on this host.
+PKG_CONFIG="$TMP/packages.toml"
+# inetutils is preinstalled in the image, so `--needed` keeps pacman offline;
+# another package would need the network and a fresh sync db.
+cat >"$PKG_CONFIG" <<CONF
+[packages]
+install = ["inetutils"]
+
+[[steps]]
+run = "hostname"
+CONF
+PKG_RUN='sudo -n pacman -S --noconfirm --needed inetutils'
+anvil --config "$PKG_CONFIG" doctor --json --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -Eq '"target":"arch","connectable":true,"facts":\{[^}]*\},"manager":"pacman"' "$TMP/out"; then
+  pass "doctor reports pacman"
+else
+  fail "doctor with [packages]: exit $code"
+fi
+anvil --config "$PKG_CONFIG" apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF "  \$ $PKG_RUN" "$TMP/out" && grep -qxF '  ✔ ok · 2 steps' "$TMP/out"; then
+  pass "apply ran the package step, then hostname"
+else
+  fail "apply with [packages]: exit $code"
+fi
+anvil --config "$PKG_CONFIG" apply --json --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qF "\"steps\":[{\"run\":\"$PKG_RUN\",\"code\":0," "$TMP/out"; then
+  pass "apply --json step 1 is the package step"
+else
+  fail "apply --json with [packages]: exit $code"
+fi
+
 step "(e) password user through a pty: prompted once by doctor, not again by apply"
 if command -v python3 >/dev/null 2>&1; then
   run_env PTY_PASSWORD="$PASSWORD" python3 tests/e2e/pty_login.py --prompts 1 --expect "$DISTRO_LINE" \
