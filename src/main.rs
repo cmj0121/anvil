@@ -14,18 +14,10 @@ mod options;
 mod packages;
 mod paths;
 mod secret;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the tty runner is wired into apply next")
-)]
 mod ssh;
 mod term;
 #[cfg(test)]
 mod test_util;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the tty runner is wired into apply next")
-)]
 mod transport;
 #[cfg(feature = "tui")]
 mod tui;

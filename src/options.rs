@@ -186,6 +186,7 @@ mod tests {
             name: "local".to_owned(),
             kind: TargetKind::Local,
             pkg: None,
+            sudo_secret: None,
         };
         assert_eq!(opts.transport(&local).unwrap().name(), "local");
         let host = Target {
@@ -196,6 +197,7 @@ mod tests {
                 port: None,
             },
             pkg: None,
+            sudo_secret: None,
         };
         assert_eq!(opts.transport(&host).unwrap().name(), "203.0.113.10");
     }

@@ -1,16 +1,17 @@
 //! `anvil doctor`: local checks, then every selected target's
 //! reachability and facts, one target at a time.
 //!
-//! The secret store is opened before anything else, so a store that cannot
-//! be opened is known before any target is probed. A missing secret is a
-//! warning; a store that cannot answer or is locked, a missing `ssh` or
-//! `/bin/sh`, or an unreachable target fails the command (exit 1). With
-//! `[packages]`, each connectable target also resolves its package manager,
-//! and a manager that cannot be resolved fails the command too. An
-//! unresolvable editor is reported but does not fail it: neither `doctor`
-//! nor `apply` needs one.
+//! The secret store is opened before any target is probed, so a store that
+//! cannot be opened is known first. With `[packages]`, each selected
+//! target's sudo secret is checked with the config's secret names. A
+//! missing secret is a warning; a store that cannot answer or is locked, a
+//! missing `ssh` or `/bin/sh`, or an unreachable target fails the command
+//! (exit 1). With `[packages]`, each connectable target also resolves its
+//! package manager, and a manager that cannot be resolved fails the command
+//! too. An unresolvable editor is reported but does not fail it: neither
+//! `doctor` nor `apply` needs one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -105,11 +106,12 @@ impl TargetReport {
         self.connectable && self.manager_error.is_none()
     }
 
-    /// Resolves `choice` against the facts of a connectable target; an
+    /// Resolves `choice` against the facts of a connectable target, with a
+    /// password sudo accepted when the target has `sudo_secret`; an
     /// unreachable one is left as is.
-    fn resolve_manager(&mut self, choice: Choice) {
+    fn resolve_manager(&mut self, choice: Choice, sudo_secret: bool) {
         let Some(facts) = &self.facts else { return };
-        match packages::resolve(choice, facts) {
+        match packages::resolve(choice, facts, sudo_secret) {
             Ok(manager) => self.manager = Some(manager.as_str().to_owned()),
             Err(err) => {
                 log::error!("doctor {}: package manager: {err}", self.target);
@@ -145,15 +147,17 @@ pub enum Progress<'a> {
 }
 
 /// The local checks, then each target's probe in order. The store is opened
-/// before the targets are loaded.
+/// before an inventory error is reported and before any target is probed.
 pub fn check(
     opts: &Options,
     config: &Config,
     store: &dyn Store,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
-    let secrets = check_secrets(config.names(), store);
-    let targets = opts.targets()?;
+    let targets = opts.targets();
+    let names = required_names(config, targets.as_deref().unwrap_or_default());
+    let secrets = check_secrets(&names, store);
+    let targets = targets?;
     let local = local_checks(
         &opts.ssh_program(),
         Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict),
@@ -165,7 +169,10 @@ pub fn check(
             on(Progress::Start(target));
             let mut report = check_target(target, opts.transport(target));
             if let Some(packages) = &config.packages {
-                report.resolve_manager(packages.choice_for(target));
+                report.resolve_manager(
+                    packages.choice_for(target),
+                    packages.sudo_secret_for(target).is_some(),
+                );
             }
             on(Progress::Done(&report));
             report
@@ -215,6 +222,16 @@ fn local_checks(
         editor,
         secrets,
     }
+}
+
+/// The secrets doctor checks: the config's names, and with `[packages]` the
+/// sudo secret of each of `targets`; sorted, each once.
+fn required_names(config: &Config, targets: &[Target]) -> Vec<String> {
+    let mut names: BTreeSet<&str> = config.names().iter().map(String::as_str).collect();
+    if let Some(packages) = &config.packages {
+        names.extend(packages.sudo_secrets(targets));
+    }
+    names.into_iter().map(str::to_owned).collect()
 }
 
 /// Opens the store and checks `names` against the names it holds; the
@@ -455,6 +472,7 @@ mod tests {
                 port: Some(2222),
             },
             pkg: None,
+            sudo_secret: None,
         }
     }
 
@@ -737,7 +755,7 @@ mod tests {
         "hostname=box\nos=Linux\ndistro=arch\nuser=root\npkg=pacman apt\nanvil-probe-end=1\n";
 
     fn with_manager(mut report: TargetReport, choice: Choice) -> TargetReport {
-        report.resolve_manager(choice);
+        report.resolve_manager(choice, false);
         report
     }
 
@@ -827,6 +845,7 @@ mod tests {
             name: "local".to_owned(),
             kind: TargetKind::Local,
             pkg: None,
+            sudo_secret: None,
         };
         assert_eq!(describe(&local), "local");
         let bare = Target {
@@ -866,5 +885,105 @@ mod tests {
             value["targets"][1]["error"],
             "cannot connect: ssh: \x1b[2Jgone"
         );
+    }
+
+    #[test]
+    fn a_sudo_secret_lets_a_password_sudo_resolve() {
+        const SUDO_FACTS: &str = "hostname=box\nos=Linux\ndistro=arch\nuser=cmj\nsudo=binary\npkg=pacman\nanvil-probe-end=1\n";
+        let mut report = check_target(&host("up"), fake(Ok(SUDO_FACTS)));
+        report.resolve_manager(Choice::Auto, true);
+        assert_eq!(report.manager.as_deref(), Some("pacman"));
+        assert!(report.ok());
+        let mut report = check_target(&host("up"), fake(Ok(SUDO_FACTS)));
+        report.resolve_manager(Choice::Auto, false);
+        assert!(!report.ok(), "without a secret it is still refused");
+    }
+
+    #[test]
+    fn with_packages_each_targets_sudo_secret_is_required_once() {
+        let mut config = Config {
+            secrets: None,
+            packages: None,
+            anvil: crate::config::AnvilPrefs {
+                secrets: Some(vec!["API_KEY".to_owned(), "BOX_SUDO".to_owned()]),
+                ..Default::default()
+            },
+            steps: vec![],
+        };
+        let local = Target {
+            name: "local".to_owned(),
+            kind: TargetKind::Local,
+            pkg: None,
+            sudo_secret: None,
+        };
+        let boxed = Target {
+            sudo_secret: Some("BOX_SUDO".to_owned()),
+            ..host("box")
+        };
+        let other = Target {
+            sudo_secret: Some("PI_SUDO".to_owned()),
+            ..host("pi")
+        };
+        let targets = [local, boxed, other];
+        assert_eq!(
+            required_names(&config, &targets),
+            ["API_KEY", "BOX_SUDO"],
+            "without [packages] the sudo secrets are not checked"
+        );
+        config.packages = Some(packages::Packages {
+            local_sudo_secret: Some("LOCAL_SUDO".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            required_names(&config, &targets),
+            ["API_KEY", "BOX_SUDO", "LOCAL_SUDO", "PI_SUDO"]
+        );
+        assert_eq!(
+            required_names(&config, &targets[1..]),
+            ["API_KEY", "BOX_SUDO", "PI_SUDO"],
+            "local_sudo_secret only when local is selected"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn check_reports_sudo_secrets_ok_or_missing() {
+        let dir = crate::test_util::temp_dir("doctor-sudo");
+        let inventory = dir.join("inventory.toml");
+        std::fs::write(
+            &inventory,
+            "[hosts.pw]\nhost = \"pw.example\"\nsudo_secret = \"PW_SUDO\"\n",
+        )
+        .unwrap();
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "anvil",
+            "--inventory",
+            inventory.to_str().unwrap(),
+            "--ssh-program",
+            "/nonexistent/ssh",
+            "doctor",
+        ])
+        .unwrap();
+        let config = Config {
+            secrets: None,
+            packages: Some(packages::Packages {
+                local_sudo_secret: Some("LOCAL_SUDO".to_owned()),
+                ..Default::default()
+            }),
+            anvil: Default::default(),
+            steps: vec![],
+        };
+        let store = Memory::with(&[("LOCAL_SUDO", b"hunter2-secret")]);
+        let report = check(&Options::from_cli(&cli), &config, &store, &mut |_| {}).unwrap();
+        assert_eq!(
+            json(&report.local)["secrets"],
+            serde_json::json!({"LOCAL_SUDO": "ok", "PW_SUDO": "missing"})
+        );
+        let text = render(&report);
+        assert!(text.contains("  secret LOCAL_SUDO ok\n"), "{text}");
+        assert!(text.contains("  secret PW_SUDO  missing\n"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!serde_json::to_string(&report).unwrap().contains("hunter2"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

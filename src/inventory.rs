@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::document::{self, DocumentError};
 use crate::packages::{self, Choice};
 use crate::paths::DocPath;
+use crate::secret;
 
 /// The implicit target: the machine anvil runs on.
 pub const LOCAL: &str = "local";
@@ -36,6 +37,9 @@ pub struct Host {
         deserialize_with = "packages::de_pkg"
     )]
     pub pkg: Option<Choice>,
+    /// The secret holding this host's sudo password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sudo_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +58,8 @@ pub struct Target {
     pub kind: TargetKind,
     /// The host's `pkg`; `None` for `local`.
     pub pkg: Option<Choice>,
+    /// The host's `sudo_secret`; `None` for `local`.
+    pub sudo_secret: Option<String>,
 }
 
 /// One `--target SEL`: `local`, or a word that is a host name or a tag.
@@ -128,6 +134,15 @@ impl Inventory {
             if host.port.is_some_and(|port| !(1..=65535).contains(&port)) {
                 return fail(name, "port", "must be in 1..=65535");
             }
+            if let Some(secret) = &host.sudo_secret
+                && !secret::is_name(secret)
+            {
+                return fail(
+                    name,
+                    "sudo_secret",
+                    &format!("`{}`: {}", secret::shown_name(secret), secret::NAME_RULE),
+                );
+            }
             for tag in &host.tags {
                 if tag == LOCAL {
                     return fail(name, "tags", "contains `local`, which is reserved");
@@ -183,6 +198,7 @@ impl Inventory {
                 name: LOCAL.to_string(),
                 kind: TargetKind::Local,
                 pkg: None,
+                sudo_secret: None,
             });
         }
         for (name, host) in &self.hosts {
@@ -195,6 +211,7 @@ impl Inventory {
                         port: host.port.map(|port| port as u16),
                     },
                     pkg: host.pkg,
+                    sudo_secret: host.sudo_secret.clone(),
                 });
             }
         }
@@ -416,5 +433,43 @@ mod tests {
         assert_eq!(err, UnknownSel("nope".into()));
         assert!(err.to_string().contains("`nope`"));
         assert!(Inventory::default().select(&sels(&["mac"])).is_err());
+    }
+
+    #[test]
+    fn sudo_secret_reaches_its_host_target_and_is_validated() {
+        let text = "[hosts.a]\nhost = \"a\"\nsudo_secret = \"A_SUDO\"\n\n[hosts.b]\nhost = \"b\"\n";
+        let inventory: Inventory = document::from_str(text, document::Format::Toml).unwrap();
+        assert!(inventory.validate(Path::new("inventory.toml")).is_ok());
+        let secrets: Vec<_> = inventory
+            .select(&[])
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.name, t.sudo_secret))
+            .collect();
+        assert_eq!(
+            secrets,
+            [
+                ("local".to_string(), None),
+                ("a".to_string(), Some("A_SUDO".to_string())),
+                ("b".to_string(), None),
+            ]
+        );
+        for format in [document::Format::Toml, document::Format::Yaml] {
+            let text = document::to_string(&inventory, format).unwrap();
+            let back: Inventory = document::from_str(&text, format).unwrap();
+            assert_eq!(back, inventory, "{text}");
+        }
+        for bad in ["a_sudo", "1A", "", "A-B"] {
+            let text = format!("[hosts.a]\nhost = \"a\"\nsudo_secret = \"{bad}\"\n");
+            let inventory: Inventory = document::from_str(&text, document::Format::Toml).unwrap();
+            let err = inventory.validate(Path::new("inventory.toml")).unwrap_err();
+            assert!(matches!(err, DocumentError::Invalid { .. }), "{err}");
+            assert!(
+                err.to_string().contains(&format!(
+                    "host `a`: sudo_secret `{bad}`: must match [A-Z][A-Z0-9_]*"
+                )),
+                "{bad}: {err}"
+            );
+        }
     }
 }

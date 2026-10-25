@@ -6,9 +6,12 @@
 //! Step output is printed, never logged.
 //!
 //! With `[packages]` work to do, each target first runs the probe, and the
-//! install/upgrade script for its package manager runs as step 1.
+//! install/upgrade script for its package manager runs as step 1. A target
+//! with a sudo secret whose sudo asks for a password runs that step on a
+//! terminal, and the secret's value is typed at sudo's prompt.
 
 use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +25,40 @@ use crate::inventory::Target;
 use crate::logger::{BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, is_escaped, paint};
 use crate::options::Options;
 use crate::packages::{self, Packages};
-use crate::transport::{Output, Transport, TransportError, into_string};
+use crate::secret::Store;
+use crate::transport::{Output, Transport, TransportError, has_control_bytes, into_string};
+use zeroize::Zeroizing;
+
+/// Sudo passwords by secret name; a name that is not set is absent.
+type Passwords = BTreeMap<String, Zeroizing<Vec<u8>>>;
+
+/// A target's sudo secret: its name, and its value when set.
+#[derive(Clone, Copy)]
+struct Sudo<'a> {
+    name: &'a str,
+    password: Option<&'a [u8]>,
+}
+
+impl<'a> Sudo<'a> {
+    /// The value to type: set, and free of control characters.
+    fn password(self) -> Result<&'a [u8], String> {
+        let name = self.name;
+        match self.password {
+            None => Err(format!("packages: secret {name} is not set")),
+            Some(password) if has_control_bytes(password) => Err(format!(
+                "packages: secret {name} contains control characters"
+            )),
+            Some(password) => Ok(password),
+        }
+    }
+}
+
+/// The package step: its one-line script, and the secret name and password
+/// to type when it runs through sudo with a password.
+struct PackageStep<'a> {
+    run: String,
+    password: Option<(&'a str, &'a [u8])>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StepReport {
@@ -158,20 +194,75 @@ pub fn run_targets(
     let config = opts.load_config()?;
     let targets = opts.targets()?;
     let packages = config.packages.as_ref().filter(|p| p.has_work());
+    let passwords = load_passwords(&targets, packages, || opts.secret_store(&config))?;
     Ok(apply_targets(
         &targets,
         |target| opts.transport(target),
         packages,
+        &passwords,
         &config.steps,
         cancel,
         on,
     ))
 }
 
+/// The sudo password of each of `targets` with a sudo secret, read from the
+/// store `store` builds, opened once; nothing is built or opened when
+/// `packages` (`Some` only with work to do) is `None` or no target has a
+/// sudo secret. One trailing newline is trimmed. A store error fails the
+/// command. Core dumps are turned off first.
+fn load_passwords(
+    targets: &[Target],
+    packages: Option<&Packages>,
+    store: impl FnOnce() -> Result<Box<dyn Store>, Failure>,
+) -> Result<Passwords, Failure> {
+    let names: BTreeSet<&str> = packages
+        .map(|packages| packages.sudo_secrets(targets).collect())
+        .unwrap_or_default();
+    let mut passwords = Passwords::new();
+    if names.is_empty() {
+        return Ok(passwords);
+    }
+    no_core_dumps();
+    let store = store()?;
+    log::debug!("opening the {} secret store", store.kind());
+    let vault = store.open()?;
+    for name in names {
+        if let Some(mut password) = vault.get(name)? {
+            if password.last() == Some(&b'\n') {
+                password.pop();
+            }
+            passwords.insert(name.to_owned(), password);
+        }
+    }
+    Ok(passwords)
+}
+
+/// Keeps the passwords about to be read out of a core dump: the soft core
+/// limit becomes 0 and, on Linux, the process is no longer dumpable. Best
+/// effort; a failure is only logged.
+fn no_core_dumps() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let limit = Rlimit {
+        current: Some(0),
+        ..getrlimit(Resource::Core)
+    };
+    if let Err(err) = setrlimit(Resource::Core, limit) {
+        log::debug!("cannot turn core dumps off: {err}");
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(err) =
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+    {
+        log::debug!("cannot make the process non-dumpable: {err}");
+    }
+}
+
 fn apply_targets(
     targets: &[Target],
     transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError>,
     packages: Option<&Packages>,
+    passwords: &Passwords,
     steps: &[Step],
     cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
@@ -179,10 +270,16 @@ fn apply_targets(
     let mut reports = Vec::with_capacity(targets.len());
     for target in targets {
         on(Progress::Start(target));
+        let sudo = packages
+            .and_then(|packages| packages.sudo_secret_for(target))
+            .map(|name| Sudo {
+                name,
+                password: passwords.get(name).map(|password| password.as_slice()),
+            });
         let report = if cancel.load(Ordering::Relaxed) {
             cancelled(target, Vec::new())
         } else {
-            apply_target(target, transport(target), packages, steps, cancel)
+            apply_target(target, transport(target), packages, sudo, steps, cancel)
         };
         on(Progress::Done(&report));
         reports.push(report);
@@ -234,11 +331,13 @@ fn cancelled(target: &Target, steps: Vec<StepReport>) -> TargetReport {
     }
 }
 
-/// `packages` is `Some` only when it has work to do.
+/// `packages` is `Some` only when it has work to do; `sudo` is the target's
+/// sudo secret.
 fn apply_target(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
     packages: Option<&Packages>,
+    sudo: Option<Sudo<'_>>,
     steps: &[Step],
     cancel: &AtomicBool,
 ) -> TargetReport {
@@ -263,25 +362,29 @@ fn apply_target(
             if cancel.load(Ordering::Relaxed) {
                 return cancelled(target, Vec::new());
             }
-            match package_script(target, transport.as_ref(), packages) {
-                Ok(script) => script,
+            match package_script(target, transport.as_ref(), packages, sudo) {
+                Ok(step) => step,
                 Err(error) => return failed(Vec::new(), error),
             }
         }
     };
     let runs = package_step
         .iter()
-        .map(String::as_str)
-        .chain(steps.iter().map(|step| step.run.as_str()));
+        .map(|step| (step.run.as_str(), step.password))
+        .chain(steps.iter().map(|step| (step.run.as_str(), None)));
     let mut reports = Vec::with_capacity(steps.len() + 1);
     let mut ok = true;
-    for run in runs {
+    for (run, password) in runs {
         if cancel.load(Ordering::Relaxed) {
             return cancelled(target, reports);
         }
-        let output = match transport.run(run) {
+        let output = match password {
+            None => transport.run(run).map_err(|err| err.to_string()),
+            Some((name, password)) => run_with_password(transport.as_ref(), run, name, password),
+        };
+        let output = match output {
             Ok(output) => output,
-            Err(err) => return failed(reports, err.to_string()),
+            Err(error) => return failed(reports, error),
         };
         let succeeded = output.code == Some(0);
         if succeeded && output.truncated {
@@ -305,14 +408,38 @@ fn apply_target(
     }
 }
 
-/// Probes `target` and builds the script that installs and upgrades
-/// `packages` with its package manager. The error is the target's failure:
-/// a transport error as is, anything else as `packages: <reason>`.
-fn package_script(
+/// Runs the package step `run` on a terminal through [`packages::with_password`],
+/// typing `password` from secret `name` at sudo's prompt. The error names
+/// the secret, never its value.
+fn run_with_password(
+    transport: &dyn Transport,
+    run: &str,
+    name: &str,
+    password: &[u8],
+) -> Result<Output, String> {
+    transport
+        .run_tty(&packages::with_password(run), password)
+        .map_err(|err| match err {
+            TransportError::PasswordRejected => {
+                format!("packages: sudo rejected the password from secret {name}")
+            }
+            TransportError::NoPrompt => {
+                format!("packages: sudo did not show anvil's prompt (secret {name})")
+            }
+            err => err.to_string(),
+        })
+}
+
+/// Probes `target` and builds the step that installs and upgrades
+/// `packages` with its package manager, typing `sudo`'s password when sudo
+/// asks for one. The error is the target's failure: a transport error as
+/// is, anything else as `packages: <reason>`.
+fn package_script<'a>(
     target: &Target,
     transport: &dyn Transport,
     packages: &Packages,
-) -> Result<Option<String>, String> {
+    sudo: Option<Sudo<'a>>,
+) -> Result<Option<PackageStep<'a>>, String> {
     let output = transport.run(facts::PROBE).map_err(|err| err.to_string())?;
     let reason = |why: String| format!("packages: {why}");
     match output.code {
@@ -321,9 +448,26 @@ fn package_script(
         None => return Err(reason("probe was killed by a signal".to_owned())),
     }
     let facts = Facts::parse(&output.stdout).map_err(|err| reason(err.to_string()))?;
-    let manager = packages::resolve(packages.choice_for(target), &facts).map_err(reason)?;
-    log::info!("apply {}: packages with {manager}", target.name);
-    Ok(packages::script(manager, packages, facts.is_root()))
+    let manager =
+        packages::resolve(packages.choice_for(target), &facts, sudo.is_some()).map_err(reason)?;
+    let Some(run) = packages::script(manager, packages, facts.is_root()) else {
+        return Ok(None);
+    };
+    let password = match sudo {
+        Some(sudo) if packages::uses_password(manager, &facts) => {
+            log::info!(
+                "apply {}: packages with {manager}, sudo password from secret {}",
+                target.name,
+                sudo.name
+            );
+            Some((sudo.name, sudo.password()?))
+        }
+        _ => {
+            log::info!("apply {}: packages with {manager}", target.name);
+            None
+        }
+    };
+    Ok(Some(PackageStep { run, password }))
 }
 
 /// When a line's text has its control characters escaped.
@@ -518,6 +662,10 @@ mod tests {
         succeed: usize,
         probe: &'static str,
         probe_code: Option<i32>,
+        /// The password of each `run_tty`, which logs its script too.
+        typed: Rc<RefCell<Vec<Vec<u8>>>>,
+        /// Returned from `run_tty`.
+        tty_fail: Option<TransportError>,
     }
 
     impl Fake {
@@ -528,6 +676,8 @@ mod tests {
                 succeed: 0,
                 probe: "",
                 probe_code: Some(0),
+                typed: Rc::default(),
+                tty_fail: None,
             }
         }
     }
@@ -568,8 +718,18 @@ mod tests {
             })
         }
 
-        fn run_tty(&self, _script: &str, _password: &[u8]) -> Result<Output, TransportError> {
-            unreachable!("no tty script in these tests")
+        fn run_tty(&self, script: &str, password: &[u8]) -> Result<Output, TransportError> {
+            self.log.borrow_mut().push(script.to_owned());
+            self.typed.borrow_mut().push(password.to_vec());
+            match &self.tty_fail {
+                Some(err) => Err(err.clone()),
+                None => Ok(Output {
+                    stdout: b"tty-out\n".to_vec(),
+                    stderr: b"ssh-err\n".to_vec(),
+                    code: Some(0),
+                    ..Output::default()
+                }),
+            }
         }
     }
 
@@ -578,6 +738,7 @@ mod tests {
             name: name.to_owned(),
             kind: TargetKind::Local,
             pkg: None,
+            sudo_secret: None,
         }
     }
 
@@ -614,6 +775,7 @@ mod tests {
         let report = apply_target(
             &target(name),
             Ok(Box::new(fake)),
+            None,
             None,
             &steps(runs),
             &AtomicBool::new(false),
@@ -714,6 +876,7 @@ mod tests {
         let report = apply_target(
             &target("box"),
             Err(TransportError::Spawn("HOME is not set".to_owned())),
+            None,
             None,
             &steps(&["one"]),
             &AtomicBool::new(false),
@@ -1013,6 +1176,7 @@ mod tests {
                 }))
             },
             None,
+            &Passwords::new(),
             &steps(runs),
             &cancel,
             &mut |progress| {
@@ -1124,6 +1288,7 @@ mod tests {
             &target(name),
             Ok(Box::new(fake)),
             Some(packages),
+            None,
             &steps(runs),
             &AtomicBool::new(false),
         );
@@ -1173,6 +1338,7 @@ mod tests {
                 ..Fake::new(&log)
             })),
             Some(&packages(&["git"], false)),
+            None,
             &steps(&["one"]),
             &AtomicBool::new(false),
         );
@@ -1190,7 +1356,7 @@ mod tests {
             (
                 "distro=arch\nuser=cmj\nsudo=binary\npkg=pacman\nanvil-probe-end=1\n",
                 "packages: `pacman` needs root and sudo asks for a password; \
-                 set NOPASSWD or connect as root",
+                 set sudo_secret (local_sudo_secret for local), set NOPASSWD, or connect as root",
             ),
             (
                 "distro=macos\nuser=root\npkg=brew\nanvil-probe-end=1\n",
@@ -1215,6 +1381,7 @@ mod tests {
                 ..Fake::new(&log)
             })),
             Some(&pkgs),
+            None,
             &steps(&["one"]),
             &AtomicBool::new(false),
         );
@@ -1247,6 +1414,7 @@ mod tests {
                 }))
             },
             Some(packages),
+            &Passwords::new(),
             &steps(runs),
             &AtomicBool::new(cancelled),
             &mut |_| {},
@@ -1296,6 +1464,7 @@ mod tests {
             &target("a"),
             Ok(Box::new(Fake::new(&log))),
             Some(&pkgs),
+            None,
             &steps(&["one"]),
             &AtomicBool::new(true),
         );
@@ -1314,5 +1483,291 @@ mod tests {
     fn without_package_work_no_probe_runs() {
         let (_, runs) = apply("t", &["one", "two"], None);
         assert_eq!(runs, ["one", "two"], "no packages: only the steps");
+    }
+
+    const ARCH_SUDO: &str = "distro=arch\nuser=cmj\nsudo=binary\npkg=pacman\nanvil-probe-end=1\n";
+    const ARCH_NOPASSWD: &str =
+        "distro=arch\nuser=cmj\nsudo=nopasswd\npkg=pacman\nanvil-probe-end=1\n";
+    const PASSWORD: &str = "hunter2-secret";
+
+    /// Applies `["one"]` with `packages(["git"])` to `local` probing as
+    /// `probe`, with sudo secret `LOCAL_SUDO` holding `password` (unset when
+    /// `None`) and `run_tty` failing with `tty_fail`; returns the report, the
+    /// scripts run and the passwords typed.
+    fn apply_sudo(
+        probe: &'static str,
+        password: Option<&[u8]>,
+        tty_fail: Option<TransportError>,
+    ) -> (TargetReport, Vec<String>, Vec<Vec<u8>>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let fake = Fake {
+            probe,
+            tty_fail,
+            ..Fake::new(&log)
+        };
+        let typed = Rc::clone(&fake.typed);
+        let report = apply_target(
+            &target("local"),
+            Ok(Box::new(fake)),
+            Some(&packages(&["git"], false)),
+            Some(Sudo {
+                name: "LOCAL_SUDO",
+                password,
+            }),
+            &steps(&["one"]),
+            &AtomicBool::new(false),
+        );
+        let runs = log.borrow().clone();
+        let typed = typed.borrow().clone();
+        (report, runs, typed)
+    }
+
+    /// Fails when `PASSWORD` shows up in the human output or the JSON.
+    fn assert_hidden(report: &TargetReport) {
+        for style in [piped(), terminal()] {
+            let shown = screen(report, style);
+            assert!(!shown.contains(PASSWORD), "{shown}");
+        }
+        let json = serde_json::to_string(report).unwrap();
+        assert!(!json.contains(PASSWORD), "{json}");
+        if let Some(failure) = report.failure() {
+            assert!(!failure.contains(PASSWORD), "{failure}");
+        }
+    }
+
+    #[test]
+    fn a_password_sudo_runs_the_wrapped_script_on_a_tty_with_the_secret() {
+        let (report, runs, typed) = apply_sudo(ARCH_SUDO, Some(PASSWORD.as_bytes()), None);
+        let one_liner = "sudo -n pacman -S --noconfirm --needed git";
+        assert_eq!(
+            runs,
+            [
+                facts::PROBE,
+                packages::with_password(one_liner).as_str(),
+                "one"
+            ]
+        );
+        assert_eq!(typed, [PASSWORD.as_bytes()]);
+        assert!(report.ok());
+        assert_eq!(
+            report.steps()[0],
+            step(one_liner, Some(0), "tty-out\n", "ssh-err\n"),
+            "the $ line is the one-liner, not the wrapper"
+        );
+        let shown = screen(&report, piped());
+        assert!(
+            shown.contains(&format!("  $ {one_liner}\n  tty-out\n")),
+            "{shown}"
+        );
+        assert_hidden(&report);
+    }
+
+    #[test]
+    fn nopasswd_or_root_with_a_sudo_secret_types_nothing() {
+        for probe in [ARCH_NOPASSWD, ARCH_ROOT] {
+            let (report, runs, typed) = apply_sudo(probe, Some(PASSWORD.as_bytes()), None);
+            assert!(report.ok(), "{probe}");
+            assert!(typed.is_empty(), "{probe}");
+            assert_eq!(runs.len(), 3, "{probe}");
+            assert!(!runs[1].contains("anvil-tty-ready"), "{probe}");
+            assert_eq!(runs[1], report.steps()[0].run);
+        }
+        let (report, _, typed) = apply_sudo(ARCH_NOPASSWD, None, None);
+        assert!(
+            report.ok() && typed.is_empty(),
+            "an unset secret is not needed"
+        );
+    }
+
+    #[test]
+    fn a_secret_that_is_unset_or_has_control_characters_fails_the_target() {
+        for (password, error) in [
+            (None, "packages: secret LOCAL_SUDO is not set"),
+            (
+                Some(&b"hunter2\rsecret"[..]),
+                "packages: secret LOCAL_SUDO contains control characters",
+            ),
+            (
+                Some(&b"hunter2-secret\x7f"[..]),
+                "packages: secret LOCAL_SUDO contains control characters",
+            ),
+        ] {
+            let (report, runs, typed) = apply_sudo(ARCH_SUDO, password, None);
+            assert_eq!(runs, [facts::PROBE], "{error}");
+            assert!(typed.is_empty(), "{error}");
+            assert_eq!(
+                json(&report),
+                serde_json::json!({"target": "local", "error": error, "ok": false})
+            );
+            assert_hidden(&report);
+        }
+    }
+
+    #[test]
+    fn a_rejected_password_or_a_missing_prompt_names_the_secret() {
+        for (err, error) in [
+            (
+                TransportError::PasswordRejected,
+                "packages: sudo rejected the password from secret LOCAL_SUDO",
+            ),
+            (
+                TransportError::NoPrompt,
+                "packages: sudo did not show anvil's prompt (secret LOCAL_SUDO)",
+            ),
+            (
+                TransportError::Timeout(crate::transport::RUN_TIMEOUT),
+                "timed out after 30 s",
+            ),
+        ] {
+            let (report, runs, typed) = apply_sudo(ARCH_SUDO, Some(PASSWORD.as_bytes()), Some(err));
+            assert_eq!(runs.len(), 2, "the steps do not run: {runs:?}");
+            assert_eq!(typed, [PASSWORD.as_bytes()]);
+            assert_eq!(
+                json(&report),
+                serde_json::json!({"target": "local", "error": error, "ok": false})
+            );
+            assert_eq!(
+                screen(&report, piped()),
+                format!("▶ local\n  ✘ {error}\n\n")
+            );
+            assert_hidden(&report);
+        }
+    }
+
+    #[test]
+    fn without_a_sudo_secret_a_password_sudo_is_still_refused() {
+        let (report, runs) = apply_packages("local", &packages(&["git"], false), ARCH_SUDO, &[]);
+        assert_eq!(runs, [facts::PROBE]);
+        assert!(
+            report
+                .failure()
+                .unwrap()
+                .contains("sudo asks for a password"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn apply_targets_hands_each_target_its_own_secret() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let typed = Rc::new(RefCell::new(Vec::new()));
+        let mut a = target("a");
+        a.sudo_secret = Some("A_SUDO".to_owned());
+        let mut b = target("b");
+        b.sudo_secret = Some("B_SUDO".to_owned());
+        let local = target("local");
+        let pkgs = Packages {
+            local_sudo_secret: Some("LOCAL_SUDO".to_owned()),
+            ..packages(&["git"], false)
+        };
+        let passwords = Passwords::from([
+            ("A_SUDO".to_owned(), Zeroizing::new(b"pw-a".to_vec())),
+            (
+                "LOCAL_SUDO".to_owned(),
+                Zeroizing::new(b"pw-local".to_vec()),
+            ),
+        ]);
+        let report = apply_targets(
+            &[local, a, b],
+            |_| {
+                Ok(Box::new(Fake {
+                    probe: ARCH_SUDO,
+                    typed: Rc::clone(&typed),
+                    ..Fake::new(&log)
+                }))
+            },
+            Some(&pkgs),
+            &passwords,
+            &[],
+            &AtomicBool::new(false),
+            &mut |_| {},
+        );
+        assert_eq!(*typed.borrow(), [&b"pw-local"[..], b"pw-a"]);
+        assert_eq!(report.counts(), (2, 1));
+        assert_eq!(
+            report.targets[2].failure().unwrap(),
+            "packages: secret B_SUDO is not set"
+        );
+    }
+
+    /// Calls [`load_passwords`] with a store builder that counts its calls.
+    fn load(
+        targets: &[Target],
+        packages: Option<&Packages>,
+        store: impl Fn() -> Box<dyn Store>,
+    ) -> (Result<Passwords, Failure>, u32) {
+        let built = std::cell::Cell::new(0);
+        let result = load_passwords(targets, packages, || {
+            built.set(built.get() + 1);
+            Ok(store())
+        });
+        (result, built.get())
+    }
+
+    #[test]
+    fn the_store_is_opened_only_when_a_target_needs_a_password() {
+        use crate::secret::SecretError;
+        use crate::test_util::Unopenable;
+
+        let locked = || -> Box<dyn Store> { Box::new(Unopenable::new(|| SecretError::Locked)) };
+        let mut host = target("box");
+        host.kind = TargetKind::Ssh {
+            host: "box".to_owned(),
+            user: None,
+            port: None,
+        };
+        let pkgs = packages(&["git"], false);
+        let local_secret = Packages {
+            local_sudo_secret: Some("LOCAL_SUDO".to_owned()),
+            ..pkgs.clone()
+        };
+        for (targets, packages) in [
+            (vec![target("local"), host.clone()], None),
+            (vec![target("local"), host.clone()], Some(&pkgs)),
+            (vec![host.clone()], Some(&local_secret)),
+        ] {
+            let (result, built) = load(&targets, packages, locked);
+            assert!(result.unwrap().is_empty());
+            assert_eq!(built, 0, "nothing needs a password");
+        }
+
+        let (result, built) = load(&[target("local")], Some(&local_secret), || {
+            assert_eq!(
+                rustix::process::getrlimit(rustix::process::Resource::Core).current,
+                Some(0),
+                "core dumps are off before the store opens"
+            );
+            locked()
+        });
+        assert_eq!(built, 1);
+        let failure = result.unwrap_err();
+        assert_eq!(failure.message, SecretError::Locked.to_string());
+
+        let memory = || -> Box<dyn Store> {
+            Box::new(crate::secret::Memory::with(&[
+                ("LOCAL_SUDO", b"pw\n\n"),
+                ("BOX_SUDO", b"box-pw\n"),
+                ("OTHER", b"x"),
+            ]))
+        };
+        host.sudo_secret = Some("BOX_SUDO".to_owned());
+        let mut gone = host.clone();
+        gone.sudo_secret = Some("GONE".to_owned());
+        let (result, built) = load(
+            &[target("local"), host.clone(), gone, host],
+            Some(&local_secret),
+            memory,
+        );
+        assert_eq!(built, 1);
+        let passwords = result.unwrap();
+        let got: Vec<(&str, &[u8])> = passwords
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_slice()))
+            .collect();
+        assert_eq!(
+            got,
+            [("BOX_SUDO", &b"box-pw"[..]), ("LOCAL_SUDO", b"pw\n")],
+            "one trailing newline trimmed; unset and unused names absent"
+        );
     }
 }
