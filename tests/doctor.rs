@@ -150,3 +150,47 @@ fn an_unreachable_host_is_not_connectable_with_the_connect_message() {
         serde_json::json!({"target": "fake", "connectable": false, "error": CONNECT_REFUSED_MESSAGE})
     );
 }
+
+#[test]
+fn with_packages_each_reachable_target_reports_its_manager() {
+    let sandbox = Sandbox::new("ad");
+    sandbox.with_fake_host();
+    let out = sandbox.anvil(&["--json", "doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let pkg = value["targets"][0]["facts"]["pkg"]
+        .as_str()
+        .unwrap_or_default();
+    if pkg.split_whitespace().any(|m| m == "apk") {
+        return;
+    }
+
+    sandbox.write_config("config.toml", "[packages]\nmanager = \"apk\"\n");
+    let out = sandbox.anvil(&["--json", "doctor"], &CONNECT_REFUSED);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(value["ok"], false);
+    let targets = value["targets"].as_array().unwrap();
+    assert_eq!(
+        keys(&targets[0]),
+        ["connectable", "facts", "manager_error", "target"]
+    );
+    assert_eq!(
+        targets[0]["manager_error"],
+        "`apk` is not installed on this target"
+    );
+    assert_eq!(
+        keys(&targets[1]),
+        ["connectable", "error", "target"],
+        "an unreachable target gets no manager"
+    );
+
+    let out = sandbox.anvil(&["doctor", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stdout)
+            .contains("  manager         error: `apk` is not installed on this target\n"),
+        "{}",
+        text(&out.stdout)
+    );
+}

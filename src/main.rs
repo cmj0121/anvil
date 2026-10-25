@@ -11,6 +11,7 @@ mod facts;
 mod inventory;
 mod logger;
 mod options;
+mod packages;
 mod paths;
 mod secret;
 mod ssh;

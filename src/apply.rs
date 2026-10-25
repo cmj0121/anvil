@@ -4,6 +4,9 @@
 //! A step that exits non-zero stops that target's remaining steps; a transport
 //! error ends the target with only the error. Neither stops the next target.
 //! Step output is printed, never logged.
+//!
+//! With `[packages]` work to do, each target first runs the probe, and the
+//! install/upgrade script for its package manager runs as step 1.
 
 use std::borrow::Cow;
 use std::ffi::OsStr;
@@ -14,9 +17,11 @@ use serde::Serialize;
 
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::Step;
+use crate::facts::{self, Facts};
 use crate::inventory::Target;
 use crate::logger::{BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, is_escaped, paint};
 use crate::options::Options;
+use crate::packages::{self, Packages};
 use crate::transport::{Output, Transport, TransportError, into_string};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -152,9 +157,11 @@ pub fn run_targets(
 ) -> Result<Report, Failure> {
     let config = opts.load_config()?;
     let targets = opts.targets()?;
+    let packages = config.packages.as_ref().filter(|p| p.has_work());
     Ok(apply_targets(
         &targets,
         |target| opts.transport(target),
+        packages,
         &config.steps,
         cancel,
         on,
@@ -164,6 +171,7 @@ pub fn run_targets(
 fn apply_targets(
     targets: &[Target],
     transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError>,
+    packages: Option<&Packages>,
     steps: &[Step],
     cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
@@ -174,7 +182,7 @@ fn apply_targets(
         let report = if cancel.load(Ordering::Relaxed) {
             cancelled(target, Vec::new())
         } else {
-            apply_target(target, transport(target), steps, cancel)
+            apply_target(target, transport(target), packages, steps, cancel)
         };
         on(Progress::Done(&report));
         reports.push(report);
@@ -226,42 +234,60 @@ fn cancelled(target: &Target, steps: Vec<StepReport>) -> TargetReport {
     }
 }
 
+/// `packages` is `Some` only when it has work to do.
 fn apply_target(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
+    packages: Option<&Packages>,
     steps: &[Step],
     cancel: &AtomicBool,
 ) -> TargetReport {
     log::info!("apply {}: start", target.name);
-    let failed = |steps: Vec<StepReport>, error: TransportError| {
+    let failed = |steps: Vec<StepReport>, error: String| {
         log::info!("apply {}: failed: {error}", target.name);
         TargetReport::Failed {
             target: target.name.clone(),
             steps,
-            error: error.to_string(),
+            error,
             ok: false,
         }
     };
     let transport = match transport {
         Ok(transport) => transport,
-        Err(err) => return failed(Vec::new(), err),
+        Err(err) => return failed(Vec::new(), err.to_string()),
     };
     log::info!("apply {}: over {}", target.name, transport.name());
-    let mut reports = Vec::with_capacity(steps.len());
+    let package_step = match packages {
+        None => None,
+        Some(packages) => {
+            if cancel.load(Ordering::Relaxed) {
+                return cancelled(target, Vec::new());
+            }
+            match package_script(target, transport.as_ref(), packages) {
+                Ok(script) => script,
+                Err(error) => return failed(Vec::new(), error),
+            }
+        }
+    };
+    let runs = package_step
+        .iter()
+        .map(String::as_str)
+        .chain(steps.iter().map(|step| step.run.as_str()));
+    let mut reports = Vec::with_capacity(steps.len() + 1);
     let mut ok = true;
-    for step in steps {
+    for run in runs {
         if cancel.load(Ordering::Relaxed) {
             return cancelled(target, reports);
         }
-        let output = match transport.run(&step.run) {
+        let output = match transport.run(run) {
             Ok(output) => output,
-            Err(err) => return failed(reports, err),
+            Err(err) => return failed(reports, err.to_string()),
         };
         let succeeded = output.code == Some(0);
         if succeeded && output.truncated {
             log::warn!("apply {}: step output cut at 1 MiB", target.name);
         }
-        reports.push(StepReport::from_output(&step.run, output));
+        reports.push(StepReport::from_output(run, output));
         if !succeeded {
             ok = false;
             break;
@@ -277,6 +303,27 @@ fn apply_target(
         steps: reports,
         ok,
     }
+}
+
+/// Probes `target` and builds the script that installs and upgrades
+/// `packages` with its package manager. The error is the target's failure:
+/// a transport error as is, anything else as `packages: <reason>`.
+fn package_script(
+    target: &Target,
+    transport: &dyn Transport,
+    packages: &Packages,
+) -> Result<Option<String>, String> {
+    let output = transport.run(facts::PROBE).map_err(|err| err.to_string())?;
+    let reason = |why: String| format!("packages: {why}");
+    match output.code {
+        Some(0) => {}
+        Some(code) => return Err(reason(format!("probe exited {code}"))),
+        None => return Err(reason("probe was killed by a signal".to_owned())),
+    }
+    let facts = Facts::parse(&output.stdout).map_err(|err| reason(err.to_string()))?;
+    let manager = packages::resolve(packages.choice_for(target), &facts).map_err(reason)?;
+    log::info!("apply {}: packages with {manager}", target.name);
+    Ok(packages::script(manager, packages, facts.is_root()))
 }
 
 /// When a line's text has its control characters escaped.
@@ -461,13 +508,28 @@ mod tests {
     use crate::inventory::TargetKind;
     use crate::test_util::{json, keys};
 
-    /// Runs nothing: `fail` exits 3, anything else echoes `<script>-out`;
-    /// every script is recorded in the shared log.
+    /// Runs nothing: the probe prints `probe` (exiting `probe_code`), `fail`
+    /// exits 3, anything else echoes `<script>-out`; every script is
+    /// recorded in the shared log.
     struct Fake {
         log: Rc<RefCell<Vec<String>>>,
         /// Returned from the run after `succeed` scripts have run.
         fail_with: Option<TransportError>,
         succeed: usize,
+        probe: &'static str,
+        probe_code: Option<i32>,
+    }
+
+    impl Fake {
+        fn new(log: &Rc<RefCell<Vec<String>>>) -> Fake {
+            Fake {
+                log: Rc::clone(log),
+                fail_with: None,
+                succeed: 0,
+                probe: "",
+                probe_code: Some(0),
+            }
+        }
     }
 
     impl Transport for Fake {
@@ -487,6 +549,11 @@ mod tests {
                 return Err(err.clone());
             }
             Ok(match script {
+                facts::PROBE => Output {
+                    stdout: self.probe.as_bytes().to_vec(),
+                    code: self.probe_code,
+                    ..Output::default()
+                },
                 "fail" => Output {
                     stdout: b"partial\n".to_vec(),
                     stderr: b"boom\n".to_vec(),
@@ -506,6 +573,7 @@ mod tests {
         Target {
             name: name.to_owned(),
             kind: TargetKind::Local,
+            pkg: None,
         }
     }
 
@@ -535,13 +603,14 @@ mod tests {
     ) -> (TargetReport, Vec<String>) {
         let log = Rc::new(RefCell::new(Vec::new()));
         let fake = Fake {
-            log: Rc::clone(&log),
             fail_with,
             succeed,
+            ..Fake::new(&log)
         };
         let report = apply_target(
             &target(name),
             Ok(Box::new(fake)),
+            None,
             &steps(runs),
             &AtomicBool::new(false),
         );
@@ -641,6 +710,7 @@ mod tests {
         let report = apply_target(
             &target("box"),
             Err(TransportError::Spawn("HOME is not set".to_owned())),
+            None,
             &steps(&["one"]),
             &AtomicBool::new(false),
         );
@@ -934,6 +1004,7 @@ mod tests {
                     cancel: Rc::clone(&cancel),
                 }))
             },
+            None,
             &steps(runs),
             &cancel,
             &mut |progress| {
@@ -1015,5 +1086,225 @@ mod tests {
             ok: false,
         };
         assert_eq!(report.counts(), (1, 1));
+    }
+
+    const MAC: &str = "distro=macos\nuser=cmj\nsudo=binary\npkg=brew\nanvil-probe-end=1\n";
+    const ARCH_ROOT: &str = "distro=arch\nuser=root\nsudo=none\npkg=pacman\nanvil-probe-end=1\n";
+
+    fn packages(install: &[&str], upgrade: bool) -> Packages {
+        Packages {
+            install: install.iter().map(|s| (*s).to_owned()).collect(),
+            upgrade,
+            ..Packages::default()
+        }
+    }
+
+    /// Applies `runs` with `packages` to target `name` over a [`Fake`]
+    /// probing as `probe`; returns the report and the scripts run.
+    fn apply_packages(
+        name: &str,
+        packages: &Packages,
+        probe: &'static str,
+        runs: &[&str],
+    ) -> (TargetReport, Vec<String>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let fake = Fake {
+            probe,
+            ..Fake::new(&log)
+        };
+        let report = apply_target(
+            &target(name),
+            Ok(Box::new(fake)),
+            Some(packages),
+            &steps(runs),
+            &AtomicBool::new(false),
+        );
+        let runs = log.borrow().clone();
+        (report, runs)
+    }
+
+    #[test]
+    fn packages_probe_then_run_their_script_as_step_one() {
+        let pkgs = packages(&["git", "curl"], false);
+        let (report, runs) = apply_packages("local", &pkgs, MAC, &["one"]);
+        let brew = packages::script(packages::Manager::Brew, &pkgs, false).unwrap();
+        assert_eq!(runs, [facts::PROBE, brew.as_str(), "one"]);
+        assert!(report.ok());
+        assert_eq!(report.steps().len(), 2);
+        assert_eq!(report.steps()[0].run, brew);
+
+        let shown = screen(&report, piped());
+        let dollar: Vec<&str> = shown.lines().filter(|l| l.starts_with("  $ ")).collect();
+        assert_eq!(dollar.len(), 2, "{shown}");
+        let line = dollar[0].strip_prefix("  $ ").unwrap();
+        assert!(line.starts_with("export PATH="), "{line}");
+        assert!(line.contains("brew install git curl"), "{line}");
+        assert_eq!(line, brew, "the whole script is the $ line");
+        assert!(shown.ends_with("  ✔ ok · 2 steps\n\n"), "{shown}");
+
+        let (_, runs) = apply_packages(
+            "box",
+            &Packages {
+                manager: packages::Choice::Is(packages::Manager::Pacman),
+                ..packages(&[], true)
+            },
+            ARCH_ROOT,
+            &[],
+        );
+        assert_eq!(runs, [facts::PROBE, "pacman -Syu --noconfirm --needed"]);
+    }
+
+    #[test]
+    fn a_probe_exiting_non_zero_fails_the_target() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let report = apply_target(
+            &target("box"),
+            Ok(Box::new(Fake {
+                probe: ARCH_ROOT,
+                probe_code: Some(2),
+                ..Fake::new(&log)
+            })),
+            Some(&packages(&["git"], false)),
+            &steps(&["one"]),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(*log.borrow(), [facts::PROBE]);
+        assert_eq!(
+            json(&report),
+            serde_json::json!({"target": "box", "error": "packages: probe exited 2", "ok": false})
+        );
+    }
+
+    #[test]
+    fn a_package_failure_fails_the_target_without_steps() {
+        let pkgs = packages(&["git"], false);
+        for (probe, error) in [
+            (
+                "distro=arch\nuser=cmj\nsudo=binary\npkg=pacman\nanvil-probe-end=1\n",
+                "packages: `pacman` needs root and sudo asks for a password; \
+                 set NOPASSWD or connect as root",
+            ),
+            (
+                "distro=macos\nuser=root\npkg=brew\nanvil-probe-end=1\n",
+                "packages: brew refuses to run as root",
+            ),
+            ("pkg=brew\n", "packages: probe output has no end marker"),
+        ] {
+            let (report, runs) = apply_packages("box", &pkgs, probe, &["one"]);
+            assert_eq!(runs, [facts::PROBE], "{probe}");
+            assert_eq!(
+                json(&report),
+                serde_json::json!({"target": "box", "error": error, "ok": false})
+            );
+            assert_eq!(screen(&report, piped()), format!("▶ box\n  ✘ {error}\n\n"));
+        }
+
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let report = apply_target(
+            &target("box"),
+            Ok(Box::new(Fake {
+                fail_with: Some(TransportError::HostKey),
+                ..Fake::new(&log)
+            })),
+            Some(&pkgs),
+            &steps(&["one"]),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(*log.borrow(), [facts::PROBE]);
+        assert_eq!(
+            json(&report),
+            serde_json::json!({"target": "box", "error": TransportError::HostKey.to_string(), "ok": false}),
+            "a probe transport error is the error as is"
+        );
+    }
+
+    /// Applies `runs` with `packages` to each of `names` over [`Fake`]s
+    /// that each probe as the next of `probes`.
+    fn apply_all_packages(
+        names: &[&str],
+        probes: &[&'static str],
+        packages: &Packages,
+        runs: &[&str],
+        cancelled: bool,
+    ) -> (Report, Vec<String>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let next = RefCell::new(probes.iter());
+        let targets: Vec<Target> = names.iter().map(|name| target(name)).collect();
+        let report = apply_targets(
+            &targets,
+            |_| {
+                Ok(Box::new(Fake {
+                    probe: next.borrow_mut().next().unwrap(),
+                    ..Fake::new(&log)
+                }))
+            },
+            Some(packages),
+            &steps(runs),
+            &AtomicBool::new(cancelled),
+            &mut |_| {},
+        );
+        let runs = log.borrow().clone();
+        (report, runs)
+    }
+
+    #[test]
+    fn a_resolve_error_does_not_stop_later_targets() {
+        let pkgs = packages(&["git"], false);
+        let (report, runs) = apply_all_packages(
+            &["a", "b"],
+            &[
+                "distro=arch\nuser=cmj\npkg=\nanvil-probe-end=1\n",
+                ARCH_ROOT,
+            ],
+            &pkgs,
+            &["one"],
+            false,
+        );
+        assert_eq!(
+            runs,
+            [
+                facts::PROBE,
+                facts::PROBE,
+                "pacman -S --noconfirm --needed git",
+                "one"
+            ]
+        );
+        assert_eq!(report.counts(), (1, 1));
+        assert_eq!(
+            report.targets[0].failure().unwrap(),
+            "packages: `pacman`, the default for arch, is not installed"
+        );
+    }
+
+    #[test]
+    fn cancel_is_honoured_before_the_probe() {
+        let pkgs = packages(&["git"], false);
+        let (report, runs) = apply_all_packages(&["a"], &[MAC], &pkgs, &["one"], true);
+        assert!(runs.is_empty());
+        assert_eq!(report.targets[0].failure().as_deref(), Some("cancelled"));
+
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let report = apply_target(
+            &target("a"),
+            Ok(Box::new(Fake::new(&log))),
+            Some(&pkgs),
+            &steps(&["one"]),
+            &AtomicBool::new(true),
+        );
+        assert!(log.borrow().is_empty(), "the probe does not run");
+        assert_eq!(
+            report,
+            TargetReport::Cancelled {
+                target: "a".to_owned(),
+                steps: vec![],
+                ok: false,
+            }
+        );
+    }
+
+    #[test]
+    fn without_package_work_no_probe_runs() {
+        let (_, runs) = apply("t", &["one", "two"], None);
+        assert_eq!(runs, ["one", "two"], "no packages: only the steps");
     }
 }

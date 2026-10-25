@@ -79,6 +79,11 @@ impl Facts {
             .map(|pkg| pkg.split_whitespace().collect())
             .unwrap_or_default()
     }
+
+    /// Whether the probe ran as root.
+    pub fn is_root(&self) -> bool {
+        self.get("user") == Some("root")
+    }
 }
 
 fn clean_value(value: &str) -> String {
@@ -203,6 +208,33 @@ mod tests {
                 .all(|line| line.starts_with("  ")),
             "everything between the braces is inside the group"
         );
+    }
+
+    const BREW_PREFIXES: [&str; 3] = [
+        "/opt/homebrew/bin/brew",
+        "/usr/local/bin/brew",
+        "/home/linuxbrew/.linuxbrew/bin/brew",
+    ];
+
+    /// brew off `PATH` still counts at a standard prefix; the run checks it
+    /// on a machine that has brew at one.
+    #[test]
+    fn the_probe_finds_brew_at_the_standard_prefixes_off_path() {
+        for prefix in BREW_PREFIXES {
+            assert!(PROBE.contains(prefix), "{prefix}");
+        }
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(PROBE)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        let facts = Facts::parse(&out.stdout).unwrap();
+        let installed = BREW_PREFIXES
+            .iter()
+            .any(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()));
+        assert_eq!(facts.pkg().contains(&"brew"), installed, "{facts:?}");
     }
 
     #[test]

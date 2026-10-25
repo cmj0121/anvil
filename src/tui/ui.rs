@@ -357,8 +357,8 @@ fn local_block(local: &doctor::LocalReport) -> Vec<Line<'static>> {
     lines
 }
 
-/// One target: how it is reached, whether it is connectable, its facts
-/// and its error.
+/// One target: how it is reached, whether it is connectable, its facts,
+/// its package manager and its error.
 fn doctor_block(report: &doctor::TargetReport) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(text(&report.target)).style(heading()),
@@ -367,6 +367,12 @@ fn doctor_block(report: &doctor::TargetReport) -> Vec<Line<'static>> {
     ];
     for (key, value) in report.facts.iter().flat_map(doctor::fact_rows) {
         lines.push(row(key, &value));
+    }
+    if let Some(manager) = &report.manager {
+        lines.push(row("manager", manager));
+    }
+    if let Some(error) = &report.manager_error {
+        lines.push(row("manager", &format!("error: {error}")).style(Color::Red));
     }
     if let Some(error) = &report.error {
         lines.push(row("error", error).style(Color::Red));
@@ -1010,6 +1016,47 @@ mod tests {
                 "",
                 "",
             ]
+        );
+        assert!(status.ends_with("│ 1 ok, 1 failed"), "{status}");
+    }
+
+    #[test]
+    fn the_doctor_view_shows_the_manager_after_the_facts() {
+        let mut app = app();
+        let mut pi = probed("pi", None);
+        pi.manager = Some("pacman".to_owned());
+        let mut mac = probed("mac", None);
+        mac.manager_error = Some("no package manager found".to_owned());
+        show(
+            &mut app,
+            RunResult::Doctor {
+                local: Some(local_report()),
+                targets: vec![pi, mac],
+                ok: Some(false),
+                error: None,
+            },
+        );
+        let status = render(&app, 100, 22).pop().unwrap();
+        assert_eq!(
+            results(&app, 22)[6..18],
+            [
+                "pi",
+                "  transport       ssh pi",
+                "  connectable     yes",
+                "  hostname        pi",
+                "  os              Linux",
+                "  manager         pacman",
+                "",
+                "mac",
+                "  transport       ssh mac",
+                "  connectable     yes",
+                "  hostname        mac",
+                "  os              Linux",
+            ]
+        );
+        assert_eq!(
+            results(&app, 22)[18],
+            "  manager         error: no package manager found"
         );
         assert!(status.ends_with("│ 1 ok, 1 failed"), "{status}");
     }

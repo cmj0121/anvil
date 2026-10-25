@@ -3,6 +3,8 @@
 # with anvil-probe-end=1. The body is one group reading </dev/null so nothing
 # can block on the transport's stdin, which is closed once this script has been
 # sent; the shell reads the whole group from stdin before it runs any of it.
+# brew counts when on PATH or at a standard Homebrew prefix, which a
+# non-login ssh shell may leave off PATH.
 {
   printf '%s\n' "hostname=$(hostname 2>/dev/null)"
   printf '%s\n' "os=$(uname -s 2>/dev/null)"
@@ -23,7 +25,15 @@
   printf '%s\n' "user=$(id -un 2>/dev/null)"
   printf '%s\n' "shell=$SHELL"
   pkg=""
-  for m in brew pacman apt dnf apk; do
+  if command -v brew >/dev/null 2>&1; then
+    pkg="brew"
+  else
+    for b in /opt/homebrew/bin/brew /usr/local/bin/brew \
+      /home/linuxbrew/.linuxbrew/bin/brew; do
+      [ -x "$b" ] && pkg="brew" && break
+    done
+  fi
+  for m in pacman apt dnf apk; do
     command -v "$m" >/dev/null 2>&1 && pkg="$pkg $m"
   done
   printf '%s\n' "pkg=${pkg# }"
