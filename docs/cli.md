@@ -73,12 +73,13 @@ Local checks, then every selected target's facts:
 - `ssh`: the ssh program is on `PATH`; `sh`: `/bin/sh` exists. Either missing fails doctor (exit 1).
 - `editor`: the editor `anvil inventory` would use, as an absolute path; when none resolves it is `null` and a warning,
   not a failure.
-- `secrets`: each name in `[secrets].names` is looked up in the [secret store](#secret-backends): `ok`, `missing` (a
-  warning, still exit 0, with a hint to run `anvil secret NAME`), `locked` (exit 1) or `error` (exit 1). An age or sops
-  store is opened (decrypted) first; the keychain is asked for its item names by attributes only, never a value, so it
-  never raises a keychain prompt. A store that cannot be opened reports every name `error`, or `locked` with
-  `run in a terminal to unlock` when it needs a passphrase and there is no terminal. With no names the store is not
-  opened at all.
+- `secrets`: each name in `[secrets].names`, and with `[packages]` the sudo secret of each selected target (its
+  `sudo_secret`, or `[packages].local_sudo_secret` for `local`), is looked up in the
+  [secret store](#secret-backends) and shown as a row `secret NAME ok`: `ok`, `missing` (a warning, still exit 0, with a
+  hint to run `anvil secret NAME`), `locked` (exit 1) or `error` (exit 1). An age or sops store is opened (decrypted)
+  first; the keychain is asked for its item names by attributes only, never a value, so it never raises a keychain
+  prompt. A store that cannot be opened reports every name `error`, or `locked` with `run in a terminal to unlock` when
+  it needs a passphrase and there is no terminal. With no names the store is not opened at all.
 - each target: the facts probe (a POSIX sh script) runs over the target's transport. `connectable: true` with the facts,
   or `connectable: false` with the error. Facts: `hostname`, `os`, `kernel`, `arch`, `distro`, `distro_version`, `user`,
   `shell`, `pkg` (present managers among brew, pacman, apt, dnf, apk), `sudo` (`none`, `binary` = needs a password,
@@ -86,8 +87,9 @@ Local checks, then every selected target's facts:
   `/home/linuxbrew/.linuxbrew/bin/brew` is executable, since a non-login ssh shell may leave Homebrew off `PATH`.
 - `manager`, only when the config has a `[packages]` section: each connectable target's package manager as
   [Packages](#packages) resolves it, as a row `manager         pacman` after the facts, or `manager         error: REASON`
-  when it cannot be resolved (`` `pacman` needs root and sudo asks for a password; set NOPASSWD or connect as root ``,
-  say). An unreachable target gets no `manager` row.
+  when it cannot be resolved (`` `pacman` needs root and sudo is not installed ``, say, or the sudo password refusal in
+  [Root and sudo](#root-and-sudo)). A target with a sudo secret resolves the way apply does, so sudo `binary` is
+  accepted for it. An unreachable target gets no `manager` row.
 
 Exit 0 when every check passed and every target is connectable, else 1. With `[packages]`, a target whose package
 manager cannot be resolved also makes the exit 1; without `[packages]` nothing is resolved and the exit is as before.
@@ -140,8 +142,10 @@ before the `[[steps]]`. That step is an ordinary step: it shows as `$ SCRIPT` wi
 `✔ ok · N steps` and in `steps` in `--json`, and a non-zero exit ends the target like any step. A probe that fails in the
 transport fails the target with that error as is; a probe that exits non-zero or prints bad output, or a manager that
 cannot be resolved, fails it with `packages: REASON`. Either way the target runs no steps (see
-[Packages](#packages)). Without `[packages]`, or with nothing to install or upgrade, no probe runs and apply runs only
-the `[[steps]]`.
+[Packages](#packages)). When the target's sudo asks for a password and it has a sudo secret, that step runs on a
+terminal and anvil types the password at sudo's prompt ([Typing the sudo password](#typing-the-sudo-password)); its
+`$` line is still the one-line script. Without `[packages]`, or with nothing to install or upgrade, no probe runs and
+apply runs only the `[[steps]]`.
 
 Human output is one block per target, a blank line after each, then a summary:
 
@@ -386,6 +390,7 @@ user = "cmj"              # optional: [A-Za-z0-9._-]+, not starting with '-'
 port = 22                 # optional: 1..=65535
 tags = ["linode", "arch"] # optional: [A-Za-z0-9_-]+
 pkg = "pacman"            # optional: auto | brew | pacman | apt | dnf | apk; see Packages
+sudo_secret = "HOST_SUDO" # optional: [A-Z][A-Z0-9_]*, the secret holding the sudo password; see Packages
 ```
 
 The same inventory in the YAML edit view:
@@ -398,12 +403,15 @@ hosts:
     port: 22
     tags: [linode, arch]
     pkg: pacman
+    sudo_secret: HOST_SUDO
 ```
 
 Host names match `[A-Za-z0-9_-]+`. `local` is reserved: it is always present, uses the local transport and carries the
 tag `local`; defining it is an error, as is a host name equal to a tag. Its package manager is set with
 `[packages].local` in the config, since it has no inventory entry. Any other `pkg` value is exit 2 with
-``pkg `VALUE`: must be one of auto, brew, pacman, apt, dnf, apk``.
+``pkg `VALUE`: must be one of auto, brew, pacman, apt, dnf, apk``. A `sudo_secret` that is not a secret name is exit 2
+with ``host `linode1`: sudo_secret `VALUE`: must match [A-Z][A-Z0-9_]*``; `local`'s is
+`[packages].local_sudo_secret`.
 
 ### Config
 
@@ -434,6 +442,7 @@ manager = "auto"           # auto | brew | pacman | apt | dnf | apk; default "au
 local = "brew"             # optional; the choice for the local target; default: manager
 install = ["git", "curl"]  # names to install; default []
 upgrade = false            # upgrade every installed package first; default false
+local_sudo_secret = "LOCAL_SUDO" # optional: [A-Z][A-Z0-9_]*, the local target's sudo password secret
 
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
@@ -451,7 +460,8 @@ path may start with `~/`, which is `$HOME`; after that it must be absolute. Each
 entry must match `[A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*` (so none starts with `-` or `.`) and be at most 128 bytes, with at
 most 256 entries. A violation is exit 2: ``packages.install[1] `-rf`: must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*``,
 ``packages.install[I] `NAME`: N bytes exceeds the 128 byte limit`` or
-`packages.install: N entries exceeds the 256 entry limit`. How the manager is chosen and what runs is
+`packages.install: N entries exceeds the 256 entry limit`. `local_sudo_secret` must be a secret name, else exit 2 with
+``packages.local_sudo_secret `VALUE`: must match [A-Z][A-Z0-9_]*``. How the manager is chosen and what runs is
 in [Packages](#packages).
 
 The required names moved from `[anvil].secrets` to `[secrets].names`. A config with the legacy key is still read as
@@ -509,11 +519,92 @@ Any other distro takes the first manager in the `pkg` fact that is not brew, els
 
 brew runs as the connecting user and fails with `brew refuses to run as root` when that user is `root`. Every other
 manager needs root: when the facts' `user` is `root` the commands run as they are, otherwise each is prefixed with
-`sudo -n`, which never prompts. That needs the `sudo` fact `nopasswd`: `binary` fails with
-`` `pacman` needs root and sudo asks for a password; set NOPASSWD or connect as root ``, and `none` with
-`` `pacman` needs root and sudo is not installed ``. anvil never feeds a password to sudo; a stored `HOST_SUDO` is not
-used. The probe tests `sudo -n true`, so a host whose NOPASSWD rule covers only some commands reads as `binary` and is
-refused even when the package manager itself would be allowed.
+`sudo -n`, which never prompts. With the `sudo` fact `nopasswd` that is all. With `binary` (sudo asks for a password)
+the target needs a sudo secret: its inventory `sudo_secret`, or `[packages].local_sudo_secret` for `local` (a host's
+`sudo_secret` is its own; `local_sudo_secret` applies to `local` only). With one, anvil types the password from that
+secret ([Typing the sudo password](#typing-the-sudo-password)); without one the target fails with
+`` `pacman` needs root and sudo asks for a password; set sudo_secret (local_sudo_secret for local),
+set NOPASSWD, or connect as root ``, and `none` fails with `` `pacman` needs root and sudo is not installed ``.
+
+The password is used only when all of these hold: the manager is not brew, the facts' `user` is not `root`, the `sudo`
+fact is `binary`, and the target has a sudo secret. A `root` or NOPASSWD target runs the plain one-line script and its
+secret is never typed, nor checked by apply. The probe tests `sudo -n true`, so a host whose NOPASSWD rule covers only
+some commands reads as `binary`: without a secret it is refused even when the package manager itself would be allowed,
+and with one the password is typed.
+
+### Typing the sudo password
+
+```toml
+# inventory.toml
+[hosts.linode1]
+host = "203.0.113.10"
+sudo_secret = "HOST_SUDO"
+```
+
+```sh
+anvil secret HOST_SUDO   # store the password; one trailing newline is trimmed
+anvil doctor             # shows `secret HOST_SUDO ok` and the manager linode1 resolves to
+anvil apply
+```
+
+**Loading.** When `[packages]` has work to do and a selected target has a sudo secret, apply opens the secret store
+once, before any target runs, and reads each distinct secret; otherwise the store is not opened at all. A store that
+cannot be opened fails the command. One trailing `\n` of the value is trimmed; anything else stays. When the password
+is needed, a secret that is not set fails that target with `packages: secret NAME is not set`, and a value with a
+control character (any byte below 0x20, or 0x7f; a CRLF ending leaves a `\r`, which counts) fails it with
+`packages: secret NAME contains control characters`. The other targets still run.
+
+**On a terminal.** The package step runs on a pseudo-terminal: for a host, as an ssh client of the master with
+`-o ControlMaster=no -o BatchMode=yes -o LogLevel=ERROR -tt -e none -- HOST 'echo BASE64 | base64 -d | sh'`, the
+script base64-encoded into one remote command of shell-neutral characters (so the login shell may be sh, bash, zsh,
+fish or csh; the host needs `base64`); for `local`, through `script(1)` by its absolute path (`/usr/bin/script`, or
+`/bin/script` where that one does not exist; never looked up in `PATH`) with `SHELL=/bin/sh`: `/usr/bin/script -q
+/dev/null /bin/sh -c SCRIPT` on macOS and the BSDs, `/usr/bin/script -qec SCRIPT /dev/null` (util-linux) on Linux. The
+script it runs is the one-line script wrapped like this:
+
+```sh
+export TERM=dumb
+mesg n </dev/tty 2>/dev/null; stty -echo </dev/tty; echo anvil-tty-ready
+IFS= read -r n </dev/tty
+trap 'sudo -k' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+LC_ALL=C SUDO_PROMPT="$n" sudo -v </dev/tty && echo anvil-sudo-ok && SCRIPT
+```
+
+**The prompt.** For each run anvil makes a fresh prompt, `anvil-sudo-` followed by 32 hex digits from `/dev/urandom`
+and `:`. It never appears in an argv: when the script prints `anvil-tty-ready` (echo is off by then), anvil types the
+prompt on the terminal, the script reads it and hands it to `sudo -v` as `SUDO_PROMPT`. anvil types the password, once,
+only when the output ends with exactly that prompt and nothing more arrives for 100 ms. `sudo -v` validates the ticket
+first, the one-line script then runs with its `sudo -n` as usual, and `sudo -k` drops the ticket afterwards, whatever
+the outcome. A cached
+ticket means sudo asks nothing, and nothing is typed.
+
+**Failures.** The target fails like a transport error (`✘ ERROR`), naming the secret and never its value; in the first
+three cases the process group is killed, which hangs up the terminal and ends sh and sudo with it:
+
+- the prompt again after the password: `packages: sudo rejected the password from secret NAME` (anvil never retries);
+- neither the prompt nor `anvil-sudo-ok` within 15 s of `anvil-tty-ready`:
+  `packages: sudo did not show anvil's prompt (secret NAME)`;
+- a run longer than 30 s, as for any script: `timed out after 30 s`;
+- `script(1)` or `ssh` that cannot start: `cannot start the transport: REASON`.
+
+**Output.** The step's stdout is the terminal's output with CRLF turned into LF, the `anvil-tty-ready` and
+`anvil-sudo-ok` lines and every occurrence of the prompt removed; on a terminal the script's stderr arrives in it too.
+Its stderr is ssh's own (for `local`, `script`'s). The `$` line, the report and `--json` show the one-line script, not
+the wrapper.
+
+**Secret hygiene.** anvil types the password on the terminal and never puts it in an argv, the environment, a file, a
+log line or an error; it zeroes its copies in memory. The terminal's echo is off while sudo reads it. As a backstop for
+a terminal that echoes it anyway, step output (and so `--json`) has any occurrence of a password of 8 bytes or more
+replaced with `***`; a shorter one is not scrubbed. `-vv` logs which secret a target uses, never the value.
+
+**Limits.**
+
+- sudo must ask with anvil's prompt. A PAM stack that asks something else (a 2FA code, a fingerprint) gets no answer,
+  and the target fails with `packages: sudo did not show anvil's prompt (secret NAME)` after 15 s.
+- `sudo -v` creates a ticket that the steps' `sudo -n` use; with `Defaults timestamp_timeout=0` the ticket expires at
+  once and the later `sudo -n` fails, so the step exits non-zero.
+- On Linux the local target needs util-linux `script`; busybox `script` has no `-e`, so the local run fails there.
+- Only the package step runs on a terminal; `[[steps]]` never get a password.
 
 ### What runs
 
@@ -564,9 +655,10 @@ Packages are only installed or upgraded, never removed or pinned.
 A probe that cannot reach the target fails it with the transport error as is (`cannot connect: …`). Any other failure
 before the step fails the target with no steps and `packages: REASON`: `packages: probe exited C`,
 `packages: probe was killed by a signal`, `packages: probe output has no end marker`, or a resolution error from above
-(`packages: brew refuses to run as root`). The step itself failing reads like any step, `✘ step 1 exited C`, and the
-`[[steps]]` do not run. `anvil doctor` shows the same resolution as its `manager` row, so it reports a target apply
-would refuse before apply runs.
+(`packages: brew refuses to run as root`), or a sudo password failure from
+[Typing the sudo password](#typing-the-sudo-password) (`packages: secret NAME is not set`). The step itself failing
+reads like any step, `✘ step 1 exited C`, and the `[[steps]]` do not run. `anvil doctor` shows the same resolution as
+its `manager` row, so it reports a target apply would refuse before apply runs.
 
 ## Secret backends
 
@@ -709,6 +801,8 @@ from `--ssh-config`; `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE` and `DISPLAY` are remo
   `authentication failed after the interactive attempt`.
 - **Host keys are never auto-accepted.** An unknown or changed host key fails the target with
   ``host key unknown or changed; run `ssh <host>` once to verify the fingerprint``.
+- **Package step with a sudo password** runs as a `-tt` client instead; see
+  [Typing the sudo password](#typing-the-sudo-password).
 - **Scripts** run as clients of the master (`-o ControlMaster=no -o BatchMode=yes ... sh -s`), with the script on stdin
   and a 30 s timeout; a client never prompts. Each stream is kept up to 1 MiB. A background process that leaves the
   script's process group and keeps its output open is given 1 s after the script ends; then anvil stops reading and
