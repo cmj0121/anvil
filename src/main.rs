@@ -11,10 +11,6 @@ mod facts;
 mod inventory;
 mod logger;
 mod options;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "resolve and script are for apply and doctor")
-)]
 mod packages;
 mod paths;
 mod secret;

@@ -178,6 +178,11 @@ impl Packages {
         Ok(())
     }
 
+    /// Whether there is anything to install or upgrade.
+    pub fn has_work(&self) -> bool {
+        self.upgrade || !self.install.is_empty()
+    }
+
     /// The choice for `target`: its inventory `pkg`, else `local` for the
     /// local target, else `manager`.
     pub fn choice_for(&self, target: &Target) -> Choice {
@@ -253,10 +258,10 @@ pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<Strin
         packages.validate().is_ok(),
         "packages::script: install names must pass Packages::validate before they reach a shell line"
     );
-    let install = !packages.install.is_empty();
-    if !install && !packages.upgrade {
+    if !packages.has_work() {
         return None;
     }
+    let install = !packages.install.is_empty();
     let s = if root { "" } else { "sudo -n " };
     let p = packages.install.join(" ");
     let mut parts: Vec<String> = Vec::new();
