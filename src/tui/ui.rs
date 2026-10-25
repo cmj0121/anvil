@@ -6,7 +6,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Text};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use super::app::{App, BACKENDS, OPTION_FLAGS, Overlay, Pane, RunResult, Running};
@@ -17,6 +17,9 @@ use crate::{apply, apply::TargetReport};
 
 const LEFT_WIDTH: u16 = 28;
 const LOG_ROWS: u16 = 8;
+/// Widest shared name column. A longer name is cut before the detail is.
+const NAME_CAP: usize = 12;
+const ELLIPSIS: &str = "…";
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const HELP: &[(&str, &str)] = &[
@@ -65,10 +68,28 @@ pub fn draw(app: &App, f: &mut Frame) {
     }
 }
 
+fn focus_style() -> Style {
+    Style::new()
+        .fg(Color::LightBlue)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn cursor_style() -> Style {
+    Style::new().fg(Color::LightBlue)
+}
+
+fn secondary() -> Style {
+    Style::new().fg(Color::DarkGray)
+}
+
+fn heading() -> Style {
+    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+}
+
 fn block(title: &str, focused: bool) -> Block<'_> {
     let block = Block::bordered().title(title);
     if focused {
-        block.border_style(Style::new().add_modifier(Modifier::BOLD))
+        block.border_style(focus_style()).title_style(focus_style())
     } else {
         block
     }
@@ -85,29 +106,39 @@ fn draw_left(app: &App, f: &mut Frame, area: Rect) {
         return;
     }
     let rows = u16::try_from(app.targets.len()).unwrap_or(u16::MAX);
-    let [targets, tags] = Layout::vertical([
+    let [target_area, tags] = Layout::vertical([
         Constraint::Length(rows.saturating_add(2)),
         Constraint::Min(0),
     ])
     .areas(area);
     let cursor = |i: usize| focused && i == app.cursor;
+    // Columns left after the border and the `[x] ` mark.
+    let room = usize::from(target_area.width.saturating_sub(2)).saturating_sub(4);
+    let col = app
+        .targets
+        .iter()
+        .map(|row| cols(&text(&row.name)))
+        .max()
+        .unwrap_or(0)
+        .min(NAME_CAP);
     let target_lines = app.targets.iter().enumerate().map(|(i, row)| {
-        let text = format!(
-            "{} {}  {}",
-            mark(row.selected),
-            escape_controls(&row.name),
-            escape_controls(&row.detail)
-        );
-        line(text, cursor(i))
+        let (name, detail) = fit_name_detail(&text(&row.name), &text(&row.detail), col, room);
+        let body = if name.is_empty() {
+            detail
+        } else {
+            format!("{name} {detail}")
+        };
+        marked_line(row.selected, &body, cursor(i))
     });
     let n = app.targets.len();
-    let tag_lines = app.tags.iter().enumerate().map(|(i, row)| {
-        let text = format!("{} {}", mark(row.selected), escape_controls(&row.name));
-        line(text, cursor(n + i))
-    });
+    let tag_lines = app
+        .tags
+        .iter()
+        .enumerate()
+        .map(|(i, row)| marked_line(row.selected, &text(&row.name), cursor(n + i)));
     let targets_pane =
         Paragraph::new(target_lines.collect::<Vec<_>>()).block(block("Targets", focused));
-    f.render_widget(targets_pane, targets);
+    f.render_widget(targets_pane, target_area);
     let tags_pane = Paragraph::new(tag_lines.collect::<Vec<_>>()).block(block("Tags", focused));
     f.render_widget(tags_pane, tags);
 }
@@ -116,13 +147,103 @@ fn mark(selected: bool) -> &'static str {
     if selected { "[x]" } else { "[ ]" }
 }
 
+/// `[x]` stays green on the cursor row. `[ ]` is light blue there and
+/// dark gray otherwise, so selection and the cursor read as two things.
+fn marked_line(selected: bool, body: &str, under_cursor: bool) -> Line<'static> {
+    let mark_style = if selected {
+        Style::new().fg(Color::Green)
+    } else if under_cursor {
+        cursor_style()
+    } else {
+        secondary()
+    };
+    let body_style = if under_cursor {
+        cursor_style()
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(mark(selected), mark_style),
+        Span::styled(format!(" {body}"), body_style),
+    ])
+}
+
 fn line(text: String, under_cursor: bool) -> Line<'static> {
     let line = Line::from(text);
     if under_cursor {
-        line.style(Style::new().add_modifier(Modifier::REVERSED))
+        line.style(cursor_style())
     } else {
         line
     }
+}
+
+fn cols(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+fn pad_columns(text: &str, width: usize) -> String {
+    let have = cols(text);
+    if have >= width {
+        return text.to_owned();
+    }
+    let mut out = text.to_owned();
+    out.extend(std::iter::repeat_n(' ', width - have));
+    out
+}
+
+fn ellipsize(text: &str, width: usize) -> String {
+    if cols(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let ellipsis_width = cols(ELLIPSIS);
+    if width <= ellipsis_width {
+        return ELLIPSIS.to_owned();
+    }
+    let budget = width - ellipsis_width;
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let ch_width = cols(&ch.to_string());
+        if used + ch_width > budget {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out.push_str(ELLIPSIS);
+    out
+}
+
+/// Fits `name` and `detail` into `room` columns after `[x] `. Names share
+/// `col` (already capped). A name is cut before the detail is. The detail
+/// is cut only when the detail itself cannot fit.
+fn fit_name_detail(name: &str, detail: &str, col: usize, room: usize) -> (String, String) {
+    let gap = 1;
+    let detail_width = cols(detail);
+    if col + gap + detail_width <= room {
+        let shown = if cols(name) <= col {
+            pad_columns(name, col)
+        } else {
+            ellipsize(name, col)
+        };
+        return (shown, detail.to_owned());
+    }
+    if room > gap && detail_width <= room - gap {
+        let name_budget = room - gap - detail_width;
+        let shown = if cols(name) <= name_budget {
+            name.to_owned()
+        } else {
+            ellipsize(name, name_budget)
+        };
+        return (shown, detail.to_owned());
+    }
+    let name_shown = ellipsize(name, room.min(1));
+    let gap_used = usize::from(!name_shown.is_empty());
+    let detail_budget = room.saturating_sub(cols(&name_shown) + gap_used);
+    (name_shown, ellipsize(detail, detail_budget))
 }
 
 fn draw_results(app: &App, f: &mut Frame, area: Rect) {
@@ -179,8 +300,7 @@ fn text(text: &str) -> String {
 /// output, then `✔ ok · N steps`, `✘ reason` or `⊘ cancelled`.
 fn apply_block(report: &TargetReport) -> Vec<Line<'static>> {
     let steps = report.steps();
-    let bold = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let mut lines = vec![Line::from(format!("▶ {}", text(report.target()))).style(bold)];
+    let mut lines = vec![Line::from(format!("▶ {}", text(report.target()))).style(heading())];
     for step in steps {
         let command = format!("  $ {}", text(&apply::command(&step.run)));
         lines.push(Line::from(command).style(Modifier::DIM));
@@ -215,7 +335,7 @@ fn row(key: &str, value: &str) -> Line<'static> {
 fn local_block(local: &doctor::LocalReport) -> Vec<Line<'static>> {
     let yes_no = |ok: bool| if ok { "ok" } else { "missing" };
     let mut lines = vec![
-        Line::from("local checks").style(Modifier::BOLD),
+        Line::from("local checks").style(heading()),
         row("ssh", yes_no(local.ssh)),
         row("sh", yes_no(local.sh)),
         match &local.editor {
@@ -241,7 +361,7 @@ fn local_block(local: &doctor::LocalReport) -> Vec<Line<'static>> {
 /// and its error.
 fn doctor_block(report: &doctor::TargetReport) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from(text(&report.target)).style(Modifier::BOLD),
+        Line::from(text(&report.target)).style(heading()),
         row("transport", &report.transport),
         row("connectable", if report.connectable { "yes" } else { "no" }),
     ];
@@ -267,7 +387,12 @@ fn draw_log(app: &App, f: &mut Frame, area: Rect) {
         .log
         .iter()
         .skip(skip)
-        .map(|l| Line::from(format!("{} {}: {}", l.level, l.target, l.message)))
+        .map(|l| {
+            Line::from(vec![
+                Span::styled(l.level.to_string(), log_level_style(l.level)),
+                Span::raw(format!(" {}: {}", l.target, l.message)),
+            ])
+        })
         .collect();
     f.render_widget(
         Paragraph::new(lines).block(block("Log", app.focus == Pane::Log)),
@@ -275,25 +400,57 @@ fn draw_log(app: &App, f: &mut Frame, area: Rect) {
     );
 }
 
-fn status_line(app: &App) -> String {
+fn log_level_style(level: log::Level) -> Style {
+    match level {
+        log::Level::Error => Style::new().fg(Color::Red),
+        log::Level::Warn => Style::new().fg(Color::Yellow),
+        log::Level::Info => Style::new().fg(Color::Cyan),
+        log::Level::Debug | log::Level::Trace => secondary(),
+    }
+}
+
+fn status_line(app: &App) -> Line<'static> {
     let format = app
         .edit_format
         .map_or_else(|| "default".to_owned(), |format| format.to_string());
-    let lead = app.notice.as_deref().map_or_else(
-        || "d doctor · a apply · [ ] results · ? help · q quit".to_owned(),
-        |notice| escape_controls(notice).into_owned(),
-    );
-    let mut status = format!(" {lead} │ format {format} │ -v {}", app.opts.verbose);
-    if let Some((ok, failed)) = app.shown_result().and_then(|r| r.counts()) {
-        status.push_str(&format!(" │ {ok} ok, {failed} failed"));
+    let (lead, lead_style) = match &app.notice {
+        Some(notice) => (
+            escape_controls(notice).into_owned(),
+            Style::new().fg(Color::Yellow),
+        ),
+        None => (
+            "d doctor · a apply · [ ] results · ? help · q quit".to_owned(),
+            Style::default(),
+        ),
+    };
+    let mut spans = vec![
+        Span::styled(format!(" {lead}"), lead_style),
+        Span::styled(
+            format!(" │ format {format} │ -v {}", app.opts.verbose),
+            secondary(),
+        ),
+    ];
+    if let Some((ok, failed)) = app.shown_result().and_then(|result| result.counts()) {
+        spans.extend([
+            Span::styled(" │ ", secondary()),
+            Span::styled(ok.to_string(), Style::new().fg(Color::Green)),
+            Span::styled(" ok, ", secondary()),
+            Span::styled(failed.to_string(), Style::new().fg(Color::Red)),
+            Span::styled(" failed", secondary()),
+        ]);
     }
-    status
+    Line::from(spans)
 }
 
 fn draw_help(f: &mut Frame) {
     let lines: Vec<Line> = HELP
         .iter()
-        .map(|(key, what)| Line::from(format!(" {key:<11} {what}")))
+        .map(|(key, what)| {
+            Line::from(vec![
+                Span::styled(format!(" {key:<11}"), cursor_style()),
+                Span::raw(format!(" {what}")),
+            ])
+        })
         .collect();
     popup(f, "Help", 44, lines);
 }
@@ -305,10 +462,7 @@ fn popup(f: &mut Frame, title: &str, width: u16, lines: Vec<Line<'_>>) {
         .area()
         .centered(Constraint::Length(width), Constraint::Length(height));
     f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(title)),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).block(block(title, true)), area);
 }
 
 /// The secret NAME prompt; the name rule once Enter refused the text.
@@ -316,7 +470,7 @@ fn draw_input(f: &mut Frame, name: &str, invalid: bool) {
     let hint = if invalid {
         Line::from(format!(" NAME {}", secret::NAME_RULE)).style(Color::Red)
     } else {
-        Line::from(" Enter edit · Esc cancel").style(Modifier::DIM)
+        Line::from(" Enter edit · Esc cancel").style(secondary())
     };
     let lines = vec![Line::from(format!(" NAME {}▏", text(name))), hint];
     popup(f, "Edit secret", 46, lines);
@@ -331,7 +485,7 @@ fn draw_migrate(f: &mut Frame, choice: usize) {
             line(format!(" {mark} {backend}"), i == choice)
         })
         .collect();
-    lines.push(Line::from(" ↑↓ choose · Enter migrate · Esc cancel").style(Modifier::DIM));
+    lines.push(Line::from(" ↑↓ choose · Enter migrate · Esc cancel").style(secondary()));
     popup(f, "Migrate secrets to", 46, lines);
 }
 
@@ -348,10 +502,15 @@ fn draw_options(f: &mut Frame, field: usize, texts: &[String; 3]) {
             } else {
                 text(value)
             };
-            Line::from(format!(" {mark} {flag:<12} {value}{cursor}"))
+            let row = Line::from(format!(" {mark} {flag:<12} {value}{cursor}"));
+            if i == field {
+                row.style(cursor_style())
+            } else {
+                row
+            }
         })
         .collect();
-    lines.push(Line::from(" Tab/↑↓ field · Enter apply · Esc cancel").style(Modifier::DIM));
+    lines.push(Line::from(" Tab/↑↓ field · Enter apply · Esc cancel").style(secondary()));
     popup(f, "Options (empty = default)", 60, lines);
 }
 
@@ -359,6 +518,7 @@ fn draw_options(f: &mut Frame, field: usize, texts: &[String; 3]) {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier};
 
     use super::*;
     use std::sync::Arc;
@@ -382,6 +542,39 @@ mod tests {
             .collect()
     }
 
+    fn buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(app, f)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        (0..width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// Column of `needle` in a row of cell symbols. Box-drawing glyphs are
+    /// one cell and several bytes, so this counts chars, not bytes.
+    fn column_of(row: &str, needle: &str) -> u16 {
+        let byte = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle} in {row}"));
+        u16::try_from(row[..byte].chars().count()).unwrap()
+    }
+
+    fn chars_at(line: &str, start: usize, end: usize) -> String {
+        line.chars().skip(start).take(end - start).collect()
+    }
+
+    fn find(buf: &ratatui::buffer::Buffer, width: u16, height: u16, needle: &str) -> (u16, u16) {
+        for y in 0..height {
+            let row = row_text(buf, y, width);
+            if row.contains(needle) {
+                return (column_of(&row, needle), y);
+            }
+        }
+        panic!("missing {needle}");
+    }
+
     #[test]
     fn the_layout_shows_targets_tags_results_and_the_status_bar() {
         let mut app = app();
@@ -390,9 +583,9 @@ mod tests {
             render(&app, 80, 10),
             [
                 "┌Targets───────────────────┐┌Results───────────────────────────────────────────┐",
-                "│[ ] local  local          ││No results yet.                                   │",
-                "│[x] mac  me@10.0.0.2:2222 ││                                                  │",
-                "│[ ] pi  pi.lan            ││                                                  │",
+                "│[ ] local local           ││No results yet.                                   │",
+                "│[x] mac   me@10.0.0.2:2222││                                                  │",
+                "│[ ] pi    pi.lan          ││                                                  │",
                 "└──────────────────────────┘│                                                  │",
                 "┌Tags──────────────────────┐│                                                  │",
                 "│[ ] dev                   ││                                                  │",
@@ -404,6 +597,180 @@ mod tests {
     }
 
     #[test]
+    fn target_details_share_a_column_and_long_text_is_cut_at_the_name_first() {
+        let mut app = app();
+        app.targets[1].selected = true;
+        let screen = render(&app, 80, 10);
+        // `[x] ` is four columns, the shared name column is five (`local`).
+        assert_eq!(chars_at(&screen[1], 5, 11), "local ");
+        assert_eq!(chars_at(&screen[1], 11, 16), "local");
+        assert_eq!(chars_at(&screen[2], 5, 11), "mac   ");
+        assert!(
+            chars_at(&screen[2], 11, screen[2].chars().count()).starts_with("me@10.0.0.2:2222")
+        );
+        assert_eq!(chars_at(&screen[3], 5, 11), "pi    ");
+        assert!(chars_at(&screen[3], 11, screen[3].chars().count()).starts_with("pi.lan"));
+
+        app.targets[1].name = "abcdefghijklmnopqrst".to_owned();
+        let screen = render(&app, 80, 10);
+        assert!(
+            screen[2].contains("abcd… me@10.0.0.2:2222"),
+            "the address stays whole: {}",
+            screen[2]
+        );
+        assert_eq!(chars_at(&screen[1], 5, 17), "local       ");
+        assert!(chars_at(&screen[1], 18, screen[1].chars().count()).starts_with("local"));
+
+        app.targets[0].name = "abcdefghijklm".to_owned();
+        app.targets[0].detail = "x".to_owned();
+        app.targets[1].name = "mac".to_owned();
+        app.targets[1].detail = "m".to_owned();
+        app.targets[2].name = "pi".to_owned();
+        app.targets[2].detail = "p".to_owned();
+        let screen = render(&app, 80, 10);
+        assert!(
+            screen[1].contains("abcdefghijk… x"),
+            "a name past 12 columns is cut: {}",
+            screen[1]
+        );
+
+        app.targets[1].detail = "x".repeat(40);
+        let screen = render(&app, 80, 10);
+        let detail: String = "x".repeat(19) + "…";
+        assert!(
+            screen[2].contains(&format!("… {detail}")),
+            "the detail is cut only once the name is down to an ellipsis: {}",
+            screen[2]
+        );
+    }
+
+    #[test]
+    fn chrome_uses_foreground_color_for_focus_cursor_selection_log_and_counts() {
+        let mut app = app();
+        app.targets[1].selected = true;
+        let buf = buffer(&app, 80, 12);
+        assert_eq!(buf[(0, 0)].symbol(), "┌");
+        assert_eq!(buf[(0, 0)].fg, Color::LightBlue);
+        assert!(buf[(0, 0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(1, 0)].symbol(), "T");
+        assert_eq!(buf[(1, 0)].fg, Color::LightBlue);
+        assert_eq!(buf[(28, 0)].symbol(), "┌");
+        assert_eq!(buf[(28, 0)].fg, Color::Reset);
+
+        assert_eq!(buf[(1, 1)].symbol(), "[");
+        assert_eq!(buf[(1, 1)].fg, Color::LightBlue);
+        assert!(!buf[(1, 1)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buf[(5, 1)].symbol(), "l");
+        assert_eq!(buf[(5, 1)].fg, Color::LightBlue);
+        assert_eq!(buf[(2, 2)].symbol(), "x");
+        assert_eq!(buf[(2, 2)].fg, Color::Green);
+        assert_eq!(buf[(5, 2)].symbol(), "m");
+        assert_eq!(buf[(5, 2)].fg, Color::Reset);
+        assert_eq!(buf[(1, 3)].fg, Color::DarkGray);
+
+        app.focus = Pane::Results;
+        let buf = buffer(&app, 80, 12);
+        assert_eq!(buf[(0, 0)].fg, Color::Reset);
+        assert_eq!(buf[(28, 0)].fg, Color::LightBlue);
+        assert_eq!(buf[(1, 1)].fg, Color::DarkGray, "the cursor follows focus");
+
+        app.focus = Pane::Targets;
+        show(
+            &mut app,
+            RunResult::Apply {
+                targets: vec![ran("local", Vec::new()), cancelled("pi")],
+                ok: Some(false),
+                error: None,
+            },
+        );
+        let buf = buffer(&app, 100, 12);
+        let status = row_text(&buf, 11, 100);
+        let ok_at = column_of(&status, " ok") - 1;
+        let failed_at = column_of(&status, " failed") - 1;
+        assert_eq!(buf[(ok_at, 11)].fg, Color::Green);
+        assert_eq!(buf[(failed_at, 11)].fg, Color::Red);
+        let format_at = column_of(&status, "format");
+        assert_eq!(buf[(format_at, 11)].fg, Color::DarkGray);
+        assert_eq!(buf[(1, 11)].symbol(), "d");
+        assert_eq!(buf[(1, 11)].fg, Color::Reset);
+
+        app.notice = Some("busy: apply is running".to_owned());
+        let buf = buffer(&app, 100, 12);
+        assert_eq!(buf[(1, 11)].symbol(), "b");
+        assert_eq!(buf[(1, 11)].fg, Color::Yellow);
+
+        app.notice = None;
+        app.show_log = true;
+        for (level, message) in [
+            (log::Level::Error, "boom"),
+            (log::Level::Warn, "careful"),
+            (log::Level::Info, "noted"),
+            (log::Level::Debug, "tracing"),
+        ] {
+            app.log.push_back(LogLine {
+                level,
+                target: "anvil".to_owned(),
+                message: message.to_owned(),
+            });
+        }
+        let buf = buffer(&app, 80, 20);
+        for (word, color) in [
+            ("ERROR", Color::Red),
+            ("WARN", Color::Yellow),
+            ("INFO", Color::Cyan),
+            ("DEBUG", Color::DarkGray),
+        ] {
+            let (x, y) = find(&buf, 80, 20, word);
+            assert_eq!(buf[(x, y)].fg, color, "{word}");
+            assert_eq!(
+                buf[(x + u16::try_from(word.len()).unwrap(), y)].fg,
+                Color::Reset
+            );
+        }
+
+        let mut doctor = crate::tui::app::tests::app();
+        show(
+            &mut doctor,
+            RunResult::Doctor {
+                local: Some(local_report()),
+                targets: vec![probed("remote", None)],
+                ok: Some(true),
+                error: None,
+            },
+        );
+        let buf = buffer(&doctor, 80, 16);
+        let (x, y) = find(&buf, 80, 16, "local checks");
+        assert_eq!(buf[(x, y)].fg, Color::Cyan);
+        assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
+        let (x, y) = find(&buf, 80, 16, "remote");
+        assert_eq!(buf[(x, y)].fg, Color::Cyan);
+
+        app.overlay = Some(Overlay::Help);
+        let buf = buffer(&app, 80, 24);
+        let (x, y) = find(&buf, 80, 24, "Help");
+        assert_eq!(buf[(x.saturating_sub(1), y)].symbol(), "┌");
+        assert_eq!(buf[(x.saturating_sub(1), y)].fg, Color::LightBlue);
+        let (x, y) = find(&buf, 80, 24, "Tab");
+        assert_eq!(buf[(x, y)].fg, Color::LightBlue);
+
+        app.overlay = Some(Overlay::Migrate { choice: 1 });
+        let buf = buffer(&app, 80, 12);
+        let (x, y) = find(&buf, 80, 12, "age");
+        assert_eq!(buf[(x, y)].fg, Color::LightBlue);
+        assert!(!buf[(x, y)].modifier.contains(Modifier::REVERSED));
+
+        app.overlay = Some(Overlay::Options {
+            field: 1,
+            texts: [String::new(), String::new(), String::new()],
+        });
+        let buf = buffer(&app, 80, 12);
+        let (x, y) = find(&buf, 80, 12, "--config");
+        assert_eq!(buf[(x, y)].fg, Color::LightBlue);
+        let (x, y) = find(&buf, 80, 12, "--inventory");
+        assert_eq!(buf[(x, y)].fg, Color::Reset);
+    }
+
+    #[test]
     fn the_help_overlay_lists_the_keys() {
         let mut app = app();
         app.overlay = Some(Overlay::Help);
@@ -411,8 +778,8 @@ mod tests {
         assert_eq!(
             screen[2..22],
             [
-                "│[ ] mac  me@10.0.┌Help──────────────────────────────────────┐                 │",
-                "│[ ] pi  pi.lan   │ ↑↓ / j k    move                         │                 │",
+                "│[ ] mac   me@10.0┌Help──────────────────────────────────────┐                 │",
+                "│[ ] pi    pi.lan │ ↑↓ / j k    move                         │                 │",
                 "└─────────────────│ Space       select a target or tag       │                 │",
                 "┌Tags─────────────│ Tab         cycle focus                  │                 │",
                 "│[ ] dev          │ d           doctor                       │                 │",
@@ -455,7 +822,7 @@ mod tests {
         let screen = render(&app, 60, 8);
         assert_eq!(
             screen[3],
-            "│[ ] pi  pi\\x07.lan        ││                              │"
+            "│[ ] pi    pi\\x07.lan      ││                              │"
         );
     }
 
@@ -708,7 +1075,7 @@ mod tests {
         assert_eq!(
             render(&app, 80, 10)[3..7],
             [
-                "│[ ] pi  pi.lan  ┌Edit secret─────────────────────────────────┐                │",
+                "│[ ] pi    pi.lan┌Edit secret─────────────────────────────────┐                │",
                 "└────────────────│ NAME HOST_\\x1b▏                            │                │",
                 "┌Tags────────────│ Enter edit · Esc cancel                    │                │",
                 "│[ ] dev         └────────────────────────────────────────────┘                │",
@@ -734,8 +1101,8 @@ mod tests {
         assert_eq!(
             render(&app, 80, 10)[2..8],
             [
-                "│[ ] mac  me@10.0┌Migrate secrets to──────────────────────────┐                │",
-                "│[ ] pi  pi.lan  │   keychain                                 │                │",
+                "│[ ] mac   me@10.┌Migrate secrets to──────────────────────────┐                │",
+                "│[ ] pi    pi.lan│   keychain                                 │                │",
                 "└────────────────│ > age                                      │                │",
                 "┌Tags────────────│   sops                                     │                │",
                 "│[ ] dev         │ ↑↓ choose · Enter migrate · Esc cancel     │                │",
@@ -755,7 +1122,7 @@ mod tests {
             render(&app, 80, 10)[2..8],
             [
                 "│[ ] mac  ┌Options (empty = default)─────────────────────────────────┐         │",
-                "│[ ] pi  p│   --inventory  /tmp/inv.toml                             │         │",
+                "│[ ] pi   │   --inventory  /tmp/inv.toml                             │         │",
                 "└─────────│ > --config     ▏                                         │         │",
                 "┌Tags─────│   --ssh-config (default)                                 │         │",
                 "│[ ] dev  │ Tab/↑↓ field · Enter apply · Esc cancel                  │         │",
@@ -778,9 +1145,9 @@ mod tests {
             render(&app, 80, 6),
             [
                 "┌Targets───────────────────┐┌Results───────────────────────────────────────────┐",
-                "│[ ] local  local          ││secret API                                        │",
-                "│[ ] mac  me@10.0.0.2:2222 ││  secret API: updated                             │",
-                "│[ ] pi  pi.lan            ││                                                  │",
+                "│[ ] local local           ││secret API                                        │",
+                "│[ ] mac   me@10.0.0.2:2222││  secret API: updated                             │",
+                "│[ ] pi    pi.lan          ││                                                  │",
                 "└──────────────────────────┘└──────────────────────────────────────────────────┘",
                 " d doctor · a apply · [ ] results · ? help · q quit │ format default │ -v 0",
             ]

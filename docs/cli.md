@@ -248,7 +248,9 @@ but only when the inventory loads. Quitting exits 0.
 
 The screen has Targets (`[x] name  detail`, `local` first) and Tags on the left, the Results pane on the right, and a
 status bar with the key hints or the last notice, the edit format, the `-v` level and `N ok, M failed` for the shown
-result. Apply results read like the CLI's blocks (`▶ name`, `$ command`, its output, `✔ ok · N steps`, `✘ reason` or
+result. Target names share one column: the widest name, at most 12 columns, then one space and the detail. When the
+row is short of room the name is cut with `…`. The detail is cut with `…` only when the detail itself cannot fit.
+Apply results read like the CLI's blocks (`▶ name`, `$ command`, its output, `✔ ok · N steps`, `✘ reason` or
 `⊘ cancelled`), doctor results like its human output; a spinner marks the running target. Host and config text is
 escaped as in the CLI, and a secret value is never drawn.
 

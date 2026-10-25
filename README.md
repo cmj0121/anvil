@@ -201,8 +201,8 @@ anvil tui                  # or: anvil tui --target linode1
 
 ```text
 ┌Targets───────────────────┐┌Results───────────────────────────────────────────────────────────┐
-│[ ] local  local          ││▶ local                                                           │
-│[x] linode1  cmj@203.0.113││  $ hostname                                                      │
+│[ ] local   local         ││▶ local                                                           │
+│[x] linode1 cmj@203.0.113 ││  $ hostname                                                      │
 └──────────────────────────┘│    linode1                                                       │
 ┌Tags──────────────────────┐│  ✔ ok · 1 step                                                   │
 │[ ] arch                  ││                                                                  │
