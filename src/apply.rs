@@ -506,6 +506,7 @@ mod tests {
         Target {
             name: name.to_owned(),
             kind: TargetKind::Local,
+            pkg: None,
         }
     }
 

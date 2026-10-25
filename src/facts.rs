@@ -79,6 +79,11 @@ impl Facts {
             .map(|pkg| pkg.split_whitespace().collect())
             .unwrap_or_default()
     }
+
+    /// Whether the probe ran as root.
+    pub fn is_root(&self) -> bool {
+        self.get("user") == Some("root")
+    }
 }
 
 fn clean_value(value: &str) -> String {

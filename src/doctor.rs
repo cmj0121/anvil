@@ -406,6 +406,7 @@ mod tests {
                 user: Some("cmj".to_owned()),
                 port: Some(2222),
             },
+            pkg: None,
         }
     }
 
@@ -594,6 +595,7 @@ mod tests {
         .unwrap();
         let config = Config {
             secrets: None,
+            packages: None,
             anvil: crate::config::AnvilPrefs {
                 secrets: Some(vec!["HOST_SUDO".to_owned()]),
                 ..Default::default()
@@ -626,6 +628,7 @@ mod tests {
         .unwrap();
         let config = Config {
             secrets: None,
+            packages: None,
             anvil: Default::default(),
             steps: vec![],
         };
@@ -687,6 +690,7 @@ mod tests {
         let local = Target {
             name: "local".to_owned(),
             kind: TargetKind::Local,
+            pkg: None,
         };
         assert_eq!(describe(&local), "local");
         let bare = Target {

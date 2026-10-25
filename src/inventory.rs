@@ -7,6 +7,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::document::{self, DocumentError};
+use crate::packages::{self, Choice};
 use crate::paths::DocPath;
 
 /// The implicit target: the machine anvil runs on.
@@ -28,6 +29,13 @@ pub struct Host {
     pub port: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// The package manager choice for this host; overrides `packages.manager`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "packages::de_pkg"
+    )]
+    pub pkg: Option<Choice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +52,8 @@ pub enum TargetKind {
 pub struct Target {
     pub name: String,
     pub kind: TargetKind,
+    /// The host's `pkg`; `None` for `local`.
+    pub pkg: Option<Choice>,
 }
 
 /// One `--target SEL`: `local`, or a word that is a host name or a tag.
@@ -172,6 +182,7 @@ impl Inventory {
             targets.push(Target {
                 name: LOCAL.to_string(),
                 kind: TargetKind::Local,
+                pkg: None,
             });
         }
         for (name, host) in &self.hosts {
@@ -183,6 +194,7 @@ impl Inventory {
                         user: host.user.clone(),
                         port: host.port.map(|port| port as u16),
                     },
+                    pkg: host.pkg,
                 });
             }
         }
@@ -345,6 +357,56 @@ mod tests {
         assert_eq!(pick(&["pi", "local", "linode1"]), "local,linode1,pi");
         assert_eq!(pick(&["arch", "linode1", "arch"]), "linode1,pi");
         assert_eq!(pick(&["mac", "darwin"]), "mac");
+    }
+
+    #[test]
+    fn host_pkg_reaches_its_target_and_round_trips() {
+        use crate::packages::{Choice, Manager};
+        let text = "[hosts.a]\nhost = \"a\"\npkg = \"brew\"\n\n\
+                    [hosts.b]\nhost = \"b\"\npkg = \"auto\"\n\n[hosts.c]\nhost = \"c\"\n";
+        let inventory: Inventory = document::from_str(text, document::Format::Toml).unwrap();
+        let pkgs: Vec<_> = inventory
+            .select(&[])
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.name, t.pkg))
+            .collect();
+        assert_eq!(
+            pkgs,
+            [
+                ("local".to_string(), None),
+                ("a".to_string(), Some(Choice::Is(Manager::Brew))),
+                ("b".to_string(), Some(Choice::Auto)),
+                ("c".to_string(), None),
+            ]
+        );
+        for format in [document::Format::Toml, document::Format::Yaml] {
+            let text = document::to_string(&inventory, format).unwrap();
+            let back: Inventory = document::from_str(&text, format).unwrap();
+            assert_eq!(back, inventory, "{text}");
+        }
+        for (text, format) in [
+            (
+                "[hosts.a]\nhost = \"a\"\npkg = \"yum\"\n",
+                document::Format::Toml,
+            ),
+            (
+                "hosts:\n  a:\n    host: a\n    pkg: yum\n",
+                document::Format::Yaml,
+            ),
+        ] {
+            let err = document::from_str::<Inventory>(text, format).unwrap_err();
+            assert!(
+                err.contains("pkg `yum`: must be one of auto, brew"),
+                "{err}"
+            );
+        }
+        let inventory: Inventory = document::from_str(
+            "hosts:\n  a:\n    host: a\n    pkg: null\n  b:\n    host: b\n    pkg: ~\n",
+            document::Format::Yaml,
+        )
+        .unwrap();
+        assert!(inventory.hosts.values().all(|host| host.pkg.is_none()));
     }
 
     #[test]

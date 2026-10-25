@@ -767,6 +767,7 @@ pub mod tests {
             user: user.map(str::to_owned),
             port,
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+            pkg: None,
         };
         Inventory {
             hosts: BTreeMap::from([

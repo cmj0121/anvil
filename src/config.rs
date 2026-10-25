@@ -1,5 +1,5 @@
-//! The config document: `[anvil]` preferences, the `[secrets]` backend and
-//! the `[[steps]]` that `anvil apply` runs.
+//! The config document: `[anvil]` preferences, the `[secrets]` backend, the
+//! `[packages]` to install and the `[[steps]]` that `anvil apply` runs.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::document::{self, DocumentError, Format};
+use crate::packages::Packages;
 use crate::paths::{self, DocPath};
 use crate::secret::{self, BackendKind, SERVICE};
 
@@ -22,6 +23,8 @@ pub struct Config {
     pub anvil: AnvilPrefs,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secrets: Option<Secrets>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packages: Option<Packages>,
     pub steps: Vec<Step>,
 }
 
@@ -30,6 +33,7 @@ impl Default for Config {
         Config {
             anvil: AnvilPrefs::default(),
             secrets: None,
+            packages: None,
             steps: vec![Step {
                 run: "hostname".to_string(),
             }],
@@ -191,6 +195,11 @@ impl Config {
         }
         self.backend()
             .map_err(|message| DocumentError::invalid(path, message))?;
+        if let Some(packages) = &self.packages {
+            packages
+                .validate()
+                .map_err(|message| DocumentError::invalid(path, message))?;
+        }
         for (i, step) in self.steps.iter().enumerate() {
             if step.run.trim().is_empty() {
                 return Err(DocumentError::invalid(
@@ -807,6 +816,63 @@ mod tests {
         let mut config = Config::default();
         config.set_backend(BackendKind::Keychain);
         assert_eq!(config.secrets.unwrap().backend, "keychain");
+    }
+
+    #[test]
+    fn packages_section_loads_validates_and_round_trips() {
+        use crate::packages::{Choice, Manager};
+        assert_eq!(parse("").packages, None);
+        let config = parse(
+            "[packages]\nmanager = \"pacman\"\nlocal = \"brew\"\n\
+             install = [\"git\", \"curl\"]\nupgrade = true\n",
+        );
+        let packages = config.packages.as_ref().unwrap();
+        assert_eq!(packages.manager, Choice::Is(Manager::Pacman));
+        assert_eq!(packages.local, Some(Choice::Is(Manager::Brew)));
+        assert_eq!(packages.install, ["git", "curl"]);
+        assert!(packages.upgrade);
+        assert!(config.validate(Path::new("config.toml")).is_ok());
+        for config in [config, parse("[packages]\n")] {
+            for format in [Format::Toml, Format::Yaml] {
+                let text = document::to_string(&config, format).unwrap();
+                let back: Config = document::from_str(&text, format).unwrap();
+                assert_eq!(back, config, "{text}");
+            }
+        }
+
+        let config = parse("[packages]\ninstall = [\"git\", \"-rf\"]\n");
+        let err = config.validate(Path::new("config.toml")).unwrap_err();
+        assert!(matches!(err, DocumentError::Invalid { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("packages.install[1] `-rf`: must match"),
+            "{err}"
+        );
+        for (text, format, needle) in [
+            (
+                "[packages]\nmanager = \"yum\"\n",
+                Format::Toml,
+                "packages.manager `yum`",
+            ),
+            (
+                "packages:\n  manager: local\n",
+                Format::Yaml,
+                "packages.manager `local`",
+            ),
+            (
+                "[packages]\nlocal = \"nix\"\n",
+                Format::Toml,
+                "packages.local `nix`",
+            ),
+            ("[packages]\nremove = []\n", Format::Toml, "remove"),
+        ] {
+            let err = document::from_str::<Config>(text, format).unwrap_err();
+            assert!(err.contains(needle), "{text}: {err}");
+            assert!(
+                err.contains("must be one of") || needle == "remove",
+                "{err}"
+            );
+        }
     }
 
     #[test]
