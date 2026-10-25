@@ -268,10 +268,15 @@ The screen has Targets (`[x] name  detail`, `local` first) and Tags on the left,
 status bar with the key hints or the last notice, the edit format, the `-v` level and `N ok, M failed` for the shown
 result. Target names share one column: the widest name, at most 12 columns, then one space and the detail. When the
 row is short of room the name is cut with `…`. The detail is cut with `…` only when the detail itself cannot fit.
-Apply results read like the CLI's blocks (`▶ name`, `$ command`, its output, `✔ ok · N steps`, `✘ reason` or
-`⊘ cancelled`), doctor results like its human output, including the `manager` row with `[packages]` (a target whose
-manager cannot be resolved counts as failed in `N ok, M failed`); a spinner marks the running target. Host and config
-text is escaped as in the CLI, and a secret value is never drawn.
+Doctor, apply, and edit show one section per tab of the shown result, not one tab per past run. A doctor result has
+a `local checks` tab when local checks exist, then one tab per target, in order. Apply has one tab per target, in
+order. Edit has one tab, labeled by what it edited (`inventory`, `config`, `secret NAME`, `migrate → age`).
+`←` and `→` switch tabs from any pane, except while an overlay is open. They stop at the ends and do not wrap.
+`[` and `]` still switch history. The shown apply section reads like the CLI's blocks (`▶ name`, `$ command`, its
+output, `✔ ok · N steps`, `✘ reason` or `⊘ cancelled`); the shown doctor section reads like its human output,
+including the `manager` row with `[packages]` (a target whose manager cannot be resolved counts as failed in
+`N ok, M failed`). A spinner marks the running target. Host and config text is escaped as in the CLI, and a secret
+value is never drawn.
 
 | Key          | Action                                                 | CLI equivalent                            |
 | ------------ | ------------------------------------------------------ | ----------------------------------------- |
@@ -290,6 +295,7 @@ text is escaped as in the CLI, and a secret value is never drawn.
 | `+` / `-`    | log level 0 to 3                                       | `-v`, `-vv`, `-vvv`                       |
 | `l`          | show or hide the Log pane (8 rows)                     | the log on stderr                         |
 | `[` / `]`    | previous / next result                                 | —                                         |
+| `←` / `→`    | previous / next tab                                    | —                                         |
 | `r`          | reload the inventory                                   | —                                         |
 | `?`          | help                                                   | `--help`                                  |
 | `q` / Ctrl-C | quit; while running, cancel and quit once the run ends | —                                         |

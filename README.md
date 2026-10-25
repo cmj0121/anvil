@@ -233,8 +233,9 @@ anvil tui                  # or: anvil tui --target linode1
 ```
 
 `Space` selects targets and tags, `d` runs doctor and `a` apply on them, `i`, `c` and `s` open the editor, `m` migrates
-the secrets, `[` and `]` step through the results, `?` lists every key and `q` quits. The editor, ssh's password prompt
-and the age passphrase prompt (also during `m`) get the real terminal while they run. The key table and the rules are
+the secrets. Doctor, apply, and edit show one section per tab. `←` and `→` switch tabs.
+`[` and `]` still switch history. `?` lists every key and `q` quits. The editor, ssh's password prompt and the age
+passphrase prompt (also during `m`) get the real terminal while they run. The key table and the rules are
 in [docs/cli.md](docs/cli.md#anvil-tui). The TUI is the default-on cargo feature `tui`; `cargo install --path .
 --no-default-features` builds anvil without it.
 

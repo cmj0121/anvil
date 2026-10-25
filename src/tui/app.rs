@@ -43,6 +43,9 @@ pub struct App {
     pub results: Vec<RunResult>,
     /// Index into `results`.
     pub shown: Option<usize>,
+    /// Tab of whatever result is shown. Not stored on the result; drawing
+    /// clamps it, and `[` `]` put it back at 0.
+    pub tab: usize,
     /// Results pane.
     pub scroll: u16,
     pub running: Option<Running>,
@@ -160,6 +163,18 @@ impl RunResult {
         };
         Some((ok, all - ok))
     }
+
+    /// Doctor: checks when `local` is present, then one tab per target.
+    /// Apply: one tab per target. An edit always has its one tab.
+    pub fn tab_count(&self) -> usize {
+        match self {
+            RunResult::Doctor { local, targets, .. } => {
+                usize::from(local.is_some()) + targets.len()
+            }
+            RunResult::Apply { targets, .. } => targets.len(),
+            RunResult::Edit { .. } => 1,
+        }
+    }
 }
 
 pub struct LogLine {
@@ -242,6 +257,7 @@ impl App {
             cursor: 0,
             results: Vec::new(),
             shown: None,
+            tab: 0,
             scroll: 0,
             running: None,
             log: VecDeque::new(),
@@ -325,6 +341,8 @@ impl App {
             KeyCode::Esc if self.running.is_some() => self.cancel(),
             KeyCode::Char('[') => self.show(self.shown.map(|i| i.saturating_sub(1))),
             KeyCode::Char(']') => self.show(self.shown.map(|i| i + 1)),
+            KeyCode::Left => self.move_tab(false),
+            KeyCode::Right => self.move_tab(true),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
             KeyCode::Tab => self.focus = self.next_focus(),
             KeyCode::Up | KeyCode::Char('k') => self.step(false),
@@ -485,16 +503,7 @@ impl App {
                     targets.push(report);
                 }
             }
-            Msg::DoctorDone(report) => {
-                if let Some(RunResult::Doctor {
-                    local, targets, ok, ..
-                }) = self.results.last_mut()
-                {
-                    *local = Some(report.local);
-                    *targets = report.targets;
-                    *ok = Some(report.ok);
-                }
-            }
+            Msg::DoctorDone(report) => self.doctor_done(report),
             Msg::Finished(result) => self.finish(result.err()),
             Msg::Panicked(message) => {
                 let kind = self.running.as_ref().map_or("the run", |r| r.kind.as_str());
@@ -586,6 +595,47 @@ impl App {
         }
     }
 
+    /// Writes the finished doctor over the newest result. The tab moves
+    /// only when that result is the one on screen: a streamed target keeps
+    /// its name once checks take tab 0. Any other result's tab is left
+    /// alone.
+    fn doctor_done(&mut self, report: doctor::Report) {
+        let shown_is_this = !self.results.is_empty() && self.shown == Some(self.results.len() - 1);
+        let remembered = if shown_is_this {
+            match self.results.last() {
+                Some(RunResult::Doctor {
+                    local: None,
+                    targets,
+                    ..
+                }) => targets.get(self.tab).map(|target| target.target.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(RunResult::Doctor {
+            local, targets, ok, ..
+        }) = self.results.last_mut()
+        {
+            *local = Some(report.local);
+            *targets = report.targets;
+            *ok = Some(report.ok);
+        }
+        if shown_is_this && matches!(self.results.last(), Some(RunResult::Doctor { .. })) {
+            self.tab = remembered
+                .and_then(|name| {
+                    let RunResult::Doctor { targets, .. } = self.results.last()? else {
+                        return None;
+                    };
+                    targets
+                        .iter()
+                        .position(|target| target.target == name)
+                        .map(|index| index + 1)
+                })
+                .unwrap_or(0);
+        }
+    }
+
     /// Ends the run: the result's `ok` is settled, `error` recorded, and a
     /// notice about the run cleared, so the key hints come back.
     fn finish(&mut self, error: Option<String>) {
@@ -612,19 +662,49 @@ impl App {
         }
     }
 
-    /// Shows result `index`, kept inside the history, from its top.
+    /// Shows result `index`, kept inside the history, from its first tab.
     fn show(&mut self, index: Option<usize>) {
         if let Some(index) = index
             && !self.results.is_empty()
         {
             self.shown = Some(index.min(self.results.len() - 1));
             self.scroll = 0;
+            self.tab = 0;
         }
     }
 
     /// The result the Results pane shows.
     pub fn shown_result(&self) -> Option<&RunResult> {
         self.results.get(self.shown?)
+    }
+
+    /// `tab` clamped into the shown result. A stored tab past the end is
+    /// the last tab, not a panic; zero tabs stay at 0.
+    pub(crate) fn shown_tab(&self) -> usize {
+        let count = self.shown_result().map(RunResult::tab_count).unwrap_or(0);
+        if count == 0 {
+            0
+        } else {
+            self.tab.min(count - 1)
+        }
+    }
+
+    /// Left or Right: one tab, no wrap. A move returns the body to the top.
+    fn move_tab(&mut self, right: bool) {
+        let count = self.shown_result().map(RunResult::tab_count).unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        let current = self.shown_tab();
+        let next = if right {
+            (current + 1).min(count - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        if next != current {
+            self.tab = next;
+            self.scroll = 0;
+        }
     }
 
     fn next_focus(&self) -> Pane {
@@ -1475,5 +1555,161 @@ pub mod tests {
         }
         assert_eq!(app.log.len(), LOG_CAP);
         assert_eq!(app.log.front().unwrap().message, "3");
+    }
+
+    fn doctor_with(app: &mut App, targets: Vec<doctor::TargetReport>) {
+        app.on_msg(Msg::DoctorDone(doctor::Report {
+            local: local_report(),
+            targets,
+            ok: true,
+        }));
+    }
+
+    #[test]
+    fn arrows_move_one_tab_from_any_pane_and_stop_at_the_ends() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('d')]);
+        doctor_with(
+            &mut app,
+            vec![probed("pi", None), probed("mac", Some("down"))],
+        );
+        assert_eq!(app.tab, 0, "no streamed target was on screen");
+        app.scroll = 4;
+        press(&mut app, &[KeyCode::Left]);
+        assert_eq!((app.tab, app.scroll), (0, 4), "Left on the first tab stays");
+        press(&mut app, &[KeyCode::Right]);
+        assert_eq!((app.tab, app.scroll), (1, 0));
+        app.focus = Pane::Results;
+        press(&mut app, &[KeyCode::Right]);
+        assert_eq!(app.tab, 2);
+        app.show_log = true;
+        app.focus = Pane::Log;
+        app.scroll = 3;
+        press(&mut app, &[KeyCode::Right]);
+        assert_eq!((app.tab, app.scroll), (2, 3), "Right on the last tab stays");
+        press(&mut app, &[KeyCode::Left]);
+        assert_eq!((app.tab, app.scroll), (1, 0));
+
+        app.overlay = Some(Overlay::Help);
+        app.scroll = 2;
+        assert!(app.on_key(key(KeyCode::Right)).is_empty());
+        assert_eq!(app.tab, 1);
+        assert_eq!(app.scroll, 2);
+        assert!(matches!(app.overlay, Some(Overlay::Help)));
+    }
+
+    #[test]
+    fn a_stored_tab_past_the_end_clamps_for_left_and_right() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('d')]);
+        doctor_with(&mut app, vec![probed("pi", None), probed("mac", None)]);
+        app.tab = 9;
+        app.scroll = 5;
+        press(&mut app, &[KeyCode::Right]);
+        assert_eq!((app.tab, app.scroll), (9, 5));
+        press(&mut app, &[KeyCode::Left]);
+        assert_eq!((app.tab, app.scroll), (1, 0));
+    }
+
+    #[test]
+    fn brackets_return_the_tab_to_zero() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('a')]);
+        app.on_msg(Msg::Finished(Ok(())));
+        press(&mut app, &[KeyCode::Char('a')]);
+        app.on_msg(Msg::TargetDone(ran("local", Vec::new())));
+        app.on_msg(Msg::TargetDone(ran("pi", Vec::new())));
+        app.on_msg(Msg::Finished(Ok(())));
+        press(&mut app, &[KeyCode::Right]);
+        assert_eq!((app.shown, app.tab), (Some(1), 1));
+        app.scroll = 4;
+        press(&mut app, &[KeyCode::Char('['), KeyCode::Char(']')]);
+        assert_eq!((app.shown, app.tab, app.scroll), (Some(1), 0, 0));
+    }
+
+    #[test]
+    fn arrows_stay_on_an_edits_only_tab() {
+        let mut app = app();
+        app.record_edit(&EditKind::Config, Err("no".to_owned()));
+        app.scroll = 2;
+        press(&mut app, &[KeyCode::Left, KeyCode::Right]);
+        assert_eq!((app.tab, app.scroll), (0, 2));
+        assert_eq!(app.shown_result().unwrap().tab_count(), 1);
+    }
+
+    #[test]
+    fn appending_a_target_does_not_change_the_tab() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('a')]);
+        app.on_msg(Msg::TargetDone(ran("local", Vec::new())));
+        app.on_msg(Msg::TargetDone(ran("pi", Vec::new())));
+        press(&mut app, &[KeyCode::Right]);
+        assert_eq!(app.tab, 1);
+        app.on_msg(Msg::TargetDone(ran("mac", Vec::new())));
+        assert_eq!(app.tab, 1);
+    }
+
+    #[test]
+    fn doctor_done_keeps_the_shown_target_name_once_checks_exist() {
+        let mut shown = app();
+        press(&mut shown, &[KeyCode::Char('d')]);
+        shown.on_msg(Msg::DoctorTarget(probed("pi", None)));
+        shown.on_msg(Msg::DoctorTarget(probed("mac", Some("x"))));
+        assert_eq!(shown.tab, 0);
+        press(&mut shown, &[KeyCode::Right]);
+        shown.on_msg(Msg::DoctorTarget(probed("extra", None)));
+        assert_eq!(shown.tab, 1, "a streamed target does not move the tab");
+        shown.on_msg(Msg::DoctorDone(doctor::Report {
+            local: local_report(),
+            targets: vec![
+                probed("pi", None),
+                probed("mac", Some("x")),
+                probed("extra", None),
+            ],
+            ok: false,
+        }));
+        assert_eq!(shown.tab, 2, "mac stays on screen; checks is tab 0");
+        assert!(matches!(
+            shown.shown_result(),
+            Some(RunResult::Doctor { targets, .. }) if targets[1].target == "mac"
+        ));
+
+        let mut gone = app();
+        press(&mut gone, &[KeyCode::Char('d')]);
+        gone.on_msg(Msg::DoctorTarget(probed("pi", None)));
+        gone.on_msg(Msg::DoctorDone(doctor::Report {
+            local: local_report(),
+            targets: vec![probed("mac", None)],
+            ok: true,
+        }));
+        assert_eq!(
+            gone.tab, 0,
+            "a target that did not come back starts at checks"
+        );
+    }
+
+    #[test]
+    fn doctor_done_leaves_an_older_result_on_tab_zero() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('a')]);
+        app.on_msg(Msg::TargetDone(ran("local", Vec::new())));
+        app.on_msg(Msg::Finished(Ok(())));
+        press(&mut app, &[KeyCode::Char('d')]);
+        app.on_msg(Msg::DoctorTarget(probed("pi", None)));
+        app.on_msg(Msg::DoctorTarget(probed("mac", None)));
+        press(&mut app, &[KeyCode::Right]);
+        assert_eq!(app.tab, 1);
+        press(&mut app, &[KeyCode::Char('[')]);
+        assert_eq!((app.shown, app.tab), (Some(0), 0));
+        app.on_msg(Msg::DoctorDone(doctor::Report {
+            local: local_report(),
+            targets: vec![probed("pi", None), probed("mac", None)],
+            ok: true,
+        }));
+        assert_eq!((app.shown, app.tab), (Some(0), 0));
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Apply { targets, .. }) if targets.len() == 1
+        ));
     }
 }
