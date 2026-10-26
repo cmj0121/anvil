@@ -1,5 +1,7 @@
 # Terminal UI
 
+English | [繁體中文](tui.zh-TW.md)
+
 `anvil tui` runs the same commands in one screen and keeps every result of the session for browsing. It needs a
 terminal and starts only when asked; the global flags (`--target`, `--inventory`, `--config`, `--ssh-config`, `-v`)
 are its starting state:

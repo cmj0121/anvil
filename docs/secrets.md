@@ -1,5 +1,7 @@
 # Secrets
 
+English | [繁體中文](secrets.zh-TW.md)
+
 Every secret lives in one backend, chosen by `[secrets].backend`: the macOS `keychain` (the default on macOS, no setup),
 `age` (one age-encrypted file, opened with an identity you create with `age-keygen`) or `sops` (one sops file, encrypted
 by the keys in a `.sops.yaml` next to it). To move from the keychain to an age file, add a `[secrets]` section that

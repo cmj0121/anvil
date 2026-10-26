@@ -1,5 +1,7 @@
 # Packages
 
+English | [繁體中文](packages.zh-TW.md)
+
 With `[packages]`, `anvil apply` probes each target, picks its package manager and runs one generated step, before
 the `[[steps]]`, that upgrades (with `upgrade = true`) and installs the `install` list. The choice is the host's `pkg`,
 else `[packages].local` for `local`, else `[packages].manager`. `auto` follows the `distro` fact: `macos` uses brew,
