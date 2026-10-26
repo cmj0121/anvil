@@ -30,26 +30,43 @@ const STATUS_KEYS: &[&str] = &[
     "? help",
 ];
 
-const HELP: &[(&str, &str)] = &[
-    ("↑↓ / j k", "move"),
-    ("Space", "select a target or tag"),
-    ("Tab", "cycle focus"),
-    ("d", "doctor"),
-    ("a", "apply"),
-    ("Esc", "cancel a run / close"),
-    ("i", "edit the inventory"),
-    ("c", "edit the config"),
-    ("f", "cycle the edit format"),
-    ("s", "edit a secret"),
-    ("m", "migrate the secrets"),
-    ("o", "inventory/config/ssh paths"),
-    ("+ -", "verbosity"),
-    ("l", "show / hide the log"),
-    ("r", "reload the inventory"),
-    ("[ ]", "previous / next result"),
-    ("←→", "previous / next tab"),
-    ("?", "this help"),
-    ("q / Ctrl-C", "quit"),
+/// The `?` overlay: one row per group of `(key, what)` pairs. Every key
+/// [`App::on_key`] handles is listed once.
+const HELP: &[(&str, &[(&str, &str)])] = &[
+    ("Run", &[("a", "apply"), ("d", "doctor"), ("Esc", "cancel")]),
+    ("Targets", &[("t", "pick"), ("Space", "select")]),
+    (
+        "Move",
+        &[
+            ("↑↓/jk", "step/scroll"),
+            ("←→", "target"),
+            ("Enter", "go to step"),
+            ("Tab", "focus"),
+        ],
+    ),
+    ("History", &[("[ ]", "run")]),
+    (
+        "Edit",
+        &[
+            ("i", "inventory"),
+            ("c", "config"),
+            ("s", "secret"),
+            ("m", "migrate"),
+        ],
+    ),
+    (
+        "Options",
+        &[("f", "format"), ("o", "paths"), ("+/-", "log")],
+    ),
+    (
+        "App",
+        &[
+            ("l", "log"),
+            ("r", "reload"),
+            ("?", "help"),
+            ("q/^C", "quit"),
+        ],
+    ),
 ];
 
 pub fn draw(app: &App, f: &mut Frame) {
@@ -802,17 +819,21 @@ fn log_level_style(level: log::Level) -> Style {
     }
 }
 
+/// [`HELP`], a group per row: its name, then each key and what it does.
 fn draw_help(f: &mut Frame) {
     let lines: Vec<Line> = HELP
         .iter()
-        .map(|(key, what)| {
-            Line::from(vec![
-                Span::styled(format!(" {key:<11}"), cursor_style()),
-                Span::raw(format!(" {what}")),
-            ])
+        .map(|(group, keys)| {
+            let mut spans = vec![Span::styled(format!(" {group:<8}"), heading())];
+            for (key, what) in *keys {
+                spans.push(Span::styled(format!(" {key}"), cursor_style()));
+                spans.push(Span::raw(format!(" {what} ")));
+            }
+            Line::from(spans)
         })
         .collect();
-    popup(f, "Help", 44, lines);
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) + 2;
+    popup(f, "Help", u16::try_from(width).unwrap_or(u16::MAX), lines);
 }
 
 /// `lines` in a bordered box of `width` columns, centred over the screen.
@@ -1406,42 +1427,90 @@ mod tests {
     }
 
     #[test]
-    fn the_help_overlay_lists_the_keys() {
+    fn the_help_overlay_lists_the_keys_by_group() {
         let mut app = app();
         app.overlay = Some(Overlay::Help);
         let screen = render(&app, 80, 24);
-        assert!(
-            screen
-                .iter()
-                .any(|row| row.contains("←→") && row.contains("previous / next tab")),
-            "help lists ←→: {screen:?}"
-        );
         assert_eq!(
-            screen[2..23],
+            screen[8..17],
             [
-                "│                 ┌Help──────────────────────────────────────┐                 │",
-                "│                 │ ↑↓ / j k    move                         │                 │",
-                "│                 │ Space       select a target or tag       │                 │",
-                "│                 │ Tab         cycle focus                  │                 │",
-                "│                 │ d           doctor                       │                 │",
-                "│                 │ a           apply                        │                 │",
-                "│                 │ Esc         cancel a run / close         │                 │",
-                "│                 │ i           edit the inventory           │                 │",
-                "│                 │ c           edit the config              │                 │",
-                "│                 │ f           cycle the edit format        │                 │",
-                "│                 │ s           edit a secret                │                 │",
-                "│                 │ m           migrate the secrets          │                 │",
-                "│                 │ o           inventory/config/ssh paths   │                 │",
-                "│                 │ + -         verbosity                    │                 │",
-                "│                 │ l           show / hide the log          │                 │",
-                "│                 │ r           reload the inventory         │                 │",
-                "│                 │ [ ]         previous / next result       │                 │",
-                "│                 │ ←→          previous / next tab          │                 │",
-                "│                 │ ?           this help                    │                 │",
-                "│                 │ q / Ctrl-C  quit                         │                 │",
-                "└─────────────────└──────────────────────────────────────────┘─────────────────┘",
+                "│    ┌Help────────────────────────────────────────────────────────────────┐    │",
+                "│    │ Run      a apply  d doctor  Esc cancel                             │    │",
+                "│    │ Targets  t pick  Space select                                      │    │",
+                "│    │ Move     ↑↓/jk step/scroll  ←→ target  Enter go to step  Tab focus │    │",
+                "│    │ History  [ ] run                                                   │    │",
+                "│    │ Edit     i inventory  c config  s secret  m migrate                │    │",
+                "│    │ Options  f format  o paths  +/- log                                │    │",
+                "│    │ App      l log  r reload  ? help  q/^C quit                        │    │",
+                "│    └────────────────────────────────────────────────────────────────────┘    │",
             ]
         );
+        let buf = buffer(&app, 80, 24);
+        assert_eq!(buf[(7, 9)].fg, Color::Cyan, "the group name");
+        assert_eq!(buf[(16, 9)].fg, Color::LightBlue, "a key");
+    }
+
+    /// The help key that stands for `code`.
+    fn help_key(code: KeyCode) -> String {
+        match code {
+            KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k') => "↑↓/jk".to_owned(),
+            KeyCode::Left | KeyCode::Right => "←→".to_owned(),
+            KeyCode::Char('[' | ']') => "[ ]".to_owned(),
+            KeyCode::Char('+' | '-') => "+/-".to_owned(),
+            KeyCode::Char('q') => "q/^C".to_owned(),
+            KeyCode::Char(' ') => "Space".to_owned(),
+            KeyCode::Char(c) => c.to_string(),
+            KeyCode::Enter => "Enter".to_owned(),
+            KeyCode::Tab => "Tab".to_owned(),
+            KeyCode::Esc => "Esc".to_owned(),
+            code => format!("{code:?}"),
+        }
+    }
+
+    #[test]
+    fn help_lists_every_key_the_app_handles_once() {
+        let listed: Vec<&str> = HELP
+            .iter()
+            .flat_map(|(_, keys)| keys.iter().map(|(key, _)| *key))
+            .collect();
+        let mut once = listed.clone();
+        once.sort_unstable();
+        once.dedup();
+        assert_eq!(once.len(), listed.len(), "a key listed twice: {listed:?}");
+        let specials = [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::Esc,
+        ];
+        let codes = (' '..='~').map(KeyCode::Char).chain(specials);
+        for code in codes {
+            let mut app = app();
+            // Esc cancels only while running; Space selects in the targets overlay.
+            app.running = (code == KeyCode::Esc).then(|| Running {
+                kind: RunKind::Apply,
+                current: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                tick: 0,
+            });
+            if code == KeyCode::Char(' ') {
+                app.overlay = Some(Overlay::Targets { cursor: 0 });
+            }
+            let handled = !app
+                .on_key(crossterm::event::KeyEvent::new(
+                    code,
+                    crossterm::event::KeyModifiers::NONE,
+                ))
+                .is_empty();
+            assert_eq!(
+                handled,
+                listed.contains(&help_key(code).as_str()),
+                "{code} handled: {handled}"
+            );
+        }
     }
 
     #[test]
