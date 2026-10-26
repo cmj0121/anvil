@@ -162,10 +162,14 @@ pub fn load_or_default<T: DeserializeOwned + Default>(
 /// caller can tell an oversize file from one that just fits.
 pub fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(MAX_BYTES + 1)
-        .read_to_end(&mut bytes)?;
+    read_capped_from(fs::File::open(path)?, &mut bytes)?;
     Ok(bytes)
+}
+
+/// Appends at most `MAX_BYTES + 1` bytes of `reader` to `bytes`, as
+/// [`read_capped`] reads a file.
+pub fn read_capped_from(reader: impl Read, bytes: &mut Vec<u8>) -> io::Result<()> {
+    reader.take(MAX_BYTES + 1).read_to_end(bytes).map(drop)
 }
 
 /// Parses `bytes` read from `path` as `format`: refused past [`MAX_BYTES`],

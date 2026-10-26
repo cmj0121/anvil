@@ -1,0 +1,126 @@
+//! `anvil run FILE|-`: one ad-hoc POSIX sh script on every selected target,
+//! one target at a time, through apply's step runner.
+//!
+//! The config is never loaded, so a broken one cannot block a run; nothing
+//! is probed, the secret store is never opened and no sudo password is
+//! typed. The script travels on the transport's stdin, never on an argv,
+//! wrapped in `{ : }` so sh parses all of it before a command in it can read
+//! the rest from that same stdin; the `:` keeps a comment-only script a
+//! valid group.
+
+use std::fs::File;
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
+
+use crate::apply::{self, PlannedRun, Report, TargetReport};
+use crate::cli::{Cli, Failure};
+use crate::document::{MAX_BYTES, read_capped_from};
+use crate::inventory::Target;
+use crate::logger::escape_controls;
+use crate::options::Options;
+use crate::packages::MAX_TIMEOUT;
+use crate::transport::{Transport, TransportError};
+
+/// `--timeout` when unset, in seconds.
+pub const DEFAULT_TIMEOUT: u64 = 300;
+
+/// Loads the targets and runs `script` on each in order, killing it after
+/// `timeout`. Before each target, `cancel` is checked; once set, every later
+/// target is Cancelled.
+pub fn run_targets(
+    opts: &Options,
+    script: String,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    on: &mut dyn FnMut(apply::Progress<'_>),
+) -> Result<Report, Failure> {
+    let targets = opts.targets()?;
+    let runs = [PlannedRun {
+        run: format!("{{ :\n{script}\n}}\n"),
+        label: Some(script),
+        sudo_secret: None,
+        timeout,
+    }];
+    Ok(apply::for_each_target(&targets, cancel, on, |target| {
+        run_target(target, opts.transport(target), &runs, cancel)
+    }))
+}
+
+fn run_target(
+    target: &Target,
+    transport: Result<Box<dyn Transport>, TransportError>,
+    runs: &[PlannedRun],
+    cancel: &AtomicBool,
+) -> TargetReport {
+    log::info!("run {}: start", target.name);
+    match transport {
+        Ok(transport) => {
+            log::info!("run {}: over {}", target.name, transport.name());
+            apply::execute(
+                target,
+                transport.as_ref(),
+                runs,
+                &apply::Passwords::new(),
+                cancel,
+            )
+        }
+        Err(err) => apply::failed(target, Vec::new(), err.to_string()),
+    }
+}
+
+/// `anvil run`: reads the script from `source` (`-` for stdin), then prints
+/// each target's block as apply does (or one JSON document), then the summary.
+pub fn run(cli: &Cli, opts: &Options, source: &Path, timeout: u64) -> Result<(), Failure> {
+    if !(1..=MAX_TIMEOUT).contains(&timeout) {
+        return Err(Failure::usage(format!(
+            "--timeout `{timeout}`: must be 1..={MAX_TIMEOUT}"
+        )));
+    }
+    let script = read_script(source)?;
+    // Only the TUI cancels a run.
+    let cancel = AtomicBool::new(false);
+    let timeout = Duration::from_secs(timeout);
+    apply::print_report(cli, "run", |on| {
+        run_targets(opts, script, timeout, &cancel, on)
+    })
+}
+
+/// The script at `source`, or stdin for `-`: refused when unreadable, over
+/// [`MAX_BYTES`] (read no further than one byte past it), not UTF-8, or blank.
+fn read_script(source: &Path) -> Result<String, Failure> {
+    let stdin = source == Path::new("-");
+    let cannot_read = |err: std::io::Error| {
+        let name = if stdin {
+            "stdin".to_owned()
+        } else {
+            escape_controls(&source.display().to_string())
+                .replace('\n', "\\n")
+                .replace('\t', "\\t")
+        };
+        Failure::usage(format!("run: cannot read {name}: {err}"))
+    };
+    let mut bytes = Vec::new();
+    // A file reports its full size; stdin is never read past the cap.
+    let size = if stdin {
+        read_capped_from(std::io::stdin().lock(), &mut bytes).map_err(cannot_read)?;
+        None
+    } else {
+        let file = File::open(source).map_err(cannot_read)?;
+        let size = file.metadata().map_err(cannot_read)?.len();
+        read_capped_from(file, &mut bytes).map_err(cannot_read)?;
+        Some(size.max(bytes.len() as u64))
+    };
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(Failure::usage(match size {
+            Some(size) => format!("run: the script is {size} bytes, over the 1 MiB limit"),
+            None => "run: the script on stdin is over the 1 MiB limit".to_owned(),
+        }));
+    }
+    let script =
+        String::from_utf8(bytes).map_err(|_| Failure::usage("run: the script is not UTF-8"))?;
+    if script.trim().is_empty() {
+        return Err(Failure::usage("run: the script is empty"));
+    }
+    Ok(script)
+}

@@ -71,6 +71,16 @@ pub enum Command {
     Apply,
     /// Show the steps apply would run on every target, running none
     Plan,
+    /// Run a POSIX sh script on every target, read from FILE or stdin (`-`)
+    Run {
+        /// The script file, or `-` for stdin
+        #[arg(value_name = "FILE|-")]
+        script: PathBuf,
+
+        /// Seconds the script may run on each target, 1..=3600
+        #[arg(long, value_name = "SECS", default_value_t = crate::run::DEFAULT_TIMEOUT)]
+        timeout: u64,
+    },
     /// Edit one secret in the editor, or move every secret to another backend
     Secret {
         /// Secret name
@@ -104,6 +114,7 @@ impl Command {
             Command::Doctor => "doctor",
             Command::Apply => "apply",
             Command::Plan => "plan",
+            Command::Run { .. } => "run",
             Command::Secret { .. } => "secret",
             #[cfg(feature = "tui")]
             Command::Tui => "tui",
@@ -198,6 +209,7 @@ pub fn run(cli: &Cli) -> Result<(), Failure> {
         }
         Command::Apply => crate::apply::run(cli, &opts),
         Command::Plan => crate::plan::run(cli, &opts),
+        Command::Run { script, timeout } => crate::run::run(cli, &opts, script, *timeout),
         Command::Secret { to: Some(to), .. } => crate::commands::migrate(cli, &opts, *to),
         Command::Secret { name, .. } => {
             let config = opts.load_config()?;
@@ -245,6 +257,17 @@ mod tests {
         assert!(matches!(parse(&["doctor"]).command, Command::Doctor));
         assert!(matches!(parse(&["apply"]).command, Command::Apply));
         assert!(matches!(parse(&["plan"]).command, Command::Plan));
+        match parse(&["run", "-"]).command {
+            Command::Run { script, timeout } => {
+                assert_eq!(script, PathBuf::from("-"));
+                assert_eq!(timeout, 300);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            parse(&["run", "--timeout", "5", "x.sh"]).command,
+            Command::Run { timeout: 5, .. }
+        ));
         match parse(&["secret", "HOST_SUDO"]).command {
             Command::Secret {
                 name, migrate, to, ..
@@ -312,6 +335,8 @@ mod tests {
             ["secret", "--to", "age", "HOST_SUDO"].as_slice(),
             ["secret", "--migrate", "--to", "memory"].as_slice(),
             ["secret", "--migrate", "--to", "vault"].as_slice(),
+            ["run"].as_slice(),
+            ["run", "--timeout", "soon", "x.sh"].as_slice(),
         ] {
             assert!(
                 Cli::try_parse_from(std::iter::once("anvil").chain(args.iter().copied())).is_err(),
