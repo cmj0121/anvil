@@ -16,6 +16,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
   plan                           show the steps apply would run on every target, running none
+  run [--timeout SECS] <FILE|->  run a POSIX sh script on every target, read from FILE or stdin
   secret <NAME>                  edit one secret in the editor
   secret --migrate --to BACKEND  move every secret to keychain, age or sops and select it
   tui                            run every command and browse the results in a terminal UI
@@ -305,6 +306,53 @@ step 只有 `run`，以及 apply 會輸入 sudo 密碼時的 `sudo_secret`，絕
 
 每個選定的 target 都解析成功時以 0 結束，任一個無法連線或解析時為 1，用法或設定錯誤為 2。
 
+### `anvil run [--timeout SECS] <FILE|->`
+
+在每個選定的 target 上執行一份臨時的 POSIX sh 腳本，從 `FILE` 讀取，或以 `-` 從 stdin 讀到 EOF：
+
+```sh
+anvil run fix.sh
+printf 'df -h /\nuptime\n' | anvil run --target pi -
+```
+
+target 的選法與 apply 相同（`--target`；未指定表示 `local` 加上所有 host），並逐一執行；失敗的 target 不會中止其他 target。
+腳本是每個 target 唯一的 step，經其 stdin 送到 `sh -s`（`local` 則為 `/bin/sh -s`），絕不放在 argv 上。
+它一律是 POSIX sh：shebang 行只是註解。run 不詢問確認。
+
+- **不讀 config。** run 絕不載入 config，因此壞掉的 `[packages]` 或 `[[steps]]` 擋不住它。
+  不執行任何探測、絕不開啟 secret store，也不輸入 sudo 密碼。
+  需要 root 的工作請在腳本中呼叫 `sudo -n`，或使用 sudo 為 NOPASSWD 的 target。
+- **stdin。** 腳本以 `{ :` … `}` 包住後送出，因此 sh 會先讀完整份再執行其中任何一行：
+  讀取 stdin 的指令（`cat`、`read`、`ssh`）只會讀到 EOF，吃不到其後的行。
+  最後一行未關閉的 heredoc 會吞掉結尾的 `}`，該 step 以 sh 的語法錯誤失敗。
+- **`--timeout SECS`。** 每個 target 的執行在 SECS 秒後被終止，範圍 1..=3600，預設 300；
+  超出範圍以 2 結束，訊息為 ``--timeout `N`: must be 1..=3600``。
+  逾時的執行保留它已印出的輸出，並以 `✘ timed out after N s` 結尾。
+- **限制。** 腳本必須非空、不超過 1 MiB 且為 UTF-8；否則以 2 結束，且什麼都不執行：
+
+  | 腳本                          | 訊息                                                |
+  | ----------------------------- | --------------------------------------------------- |
+  | 空的或只有空白                | `run: the script is empty`                          |
+  | 超過 1 MiB 的檔案             | `run: the script is N bytes, over the 1 MiB limit`  |
+  | 超過 1 MiB 的 stdin           | `run: the script on stdin is over the 1 MiB limit`  |
+  | 不是 UTF-8                    | `run: the script is not UTF-8`                      |
+  | 無法讀取的 `FILE`（或 stdin） | `run: cannot read FILE: REASON`（`-` 時為 `stdin`） |
+
+給人看的輸出、`--json` 與結束碼都與 apply 相同：每個 target 一個區塊，腳本是其唯一的 `$` 行
+（有多行時顯示第一行與 `…`），接著是摘要。`--json` 中 step 的 `run` 是原本給的腳本，不含外層包裝。
+腳本在每個 target 上都以 0 結束時以 0 結束，任一 target 失敗時為 1，用法錯誤為 2。
+在 Mac 上執行 `printf 'hostname\nuname -s\n' | anvil run --target local -`：
+
+```text
+▶ local
+  $ hostname …
+  mac.local
+  Darwin
+  ✔ ok · 1 step
+
+1 ok, 0 failed
+```
+
 ### `anvil secret NAME`
 
 先開啟 secret store，再將該 secret 目前的值（未設定時為空）以純文字檔案在編輯器中開啟。
@@ -387,9 +435,11 @@ TUI 照常啟動，在標頭以紅色顯示 `inventory error`，錯誤本身則�
 - **0**：對 `doctor` 而言，`missing` 的 secret 或無法解析的編輯器只是警告。
 - **1**：`doctor`/`apply`：某個 target 或檢查失敗（包括 `locked` 或 `error` 的 secret，以及有 `[packages]` 時無法解析的套件管理器）。
   `plan`：某個 target 無法連線、探測或解析。
+  `run`：某個 target 失敗或無法連線。
   `inventory`/`config`/`secret`：編輯器以非零結束（中止）、檔案寫入失敗，或 secret store 失敗、被鎖住或其密語提示被取消。
 - **2**：錯誤的旗標或引數（包括不以 `.toml` 結尾的 `--inventory` 或 `--config` 路徑）、未知的 `--target`、
   無效、無法讀取或模稜兩可的檔案、沒有 `$HOME`、找不到編輯器、三次嘗試後仍無效的緩衝區，或大於 1 MiB 的 secret。
+  對 `run` 而言，還有空的、超過 1 MiB、不是 UTF-8 或無法讀取的腳本，以及超出 1..=3600 的 `--timeout`。
   `tui` 見下方。
 - **`tui`**：離開時為 0，不論結果為何。
   stdin 或 stdout 不是終端機、使用 `--json`，或未知的 `--target`（只在 inventory 載入成功時檢查）時為 2；
@@ -417,7 +467,7 @@ anvil 以 argv 陣列執行系統的 `ssh`，絕不使用 shell 字串，因此 
   未知或已變更的 host key 會讓 target 以 ``host key unknown or changed; run `ssh <host>` once to verify the fingerprint`` 失敗。
 - **帶 sudo 密碼的套件 step** 改以 `-tt` 用戶端執行；見 [輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)。
 - **腳本**以 master 的用戶端執行（`-o ControlMaster=no -o BatchMode=yes ... sh -s`），腳本經 stdin 傳入，
-  逾時 30 秒（套件 step 有自己的 `[packages].timeout`）；
+  逾時 30 秒（套件 step 有自己的 `[packages].timeout`，`anvil run` 則用其 `--timeout`）；
   用戶端絕不提示。每個串流最多保留 1 MiB。
   離開腳本的行程群組並持續開著其輸出的背景行程，在腳本結束後有 1 秒時間；之後 anvil 停止讀取並回報已取得的內容。
 - **控制目錄** `~/.ssh/anvil`：以 mode 0700 建立（缺少 `~/.ssh` 時也以 0700 建立）；
