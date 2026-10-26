@@ -137,7 +137,7 @@ run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
 沒有 `[secrets]` 時，backend（後端）在 macOS 上是 keychain（其他平台不支援）。
 只有被選中的 backend 的區段是必要的且會被檢查：缺少該區段、未知的 backend，或在非 macOS 上使用 `keychain`，
 都是 config 錯誤（以 2 結束）。路徑可以 `~/` 開頭，代表 `$HOME`；除此之外必須是絕對路徑。
-各 backend 的設定方式請見 [Secret backends](secrets.md#secret-backends)。
+各 backend 的設定方式請見 [機密 backend](secrets.zh-TW.md#機密-backend)。
 
 `[packages]` 拒絕未知的鍵。`manager` 與 `local` 接受 `auto` 或某個套件管理器名稱；
 其他值都以 2 結束並顯示 ``packages.manager `VALUE`: must be one of auto, brew, pacman, apt, dnf, apk``（或 `packages.local`）。
@@ -145,7 +145,7 @@ run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
 最多 256 個項目。違規時以 2 結束：``packages.install[1] `-rf`: must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*``、
 ``packages.install[I] `NAME`: N bytes exceeds the 128 byte limit`` 或 `packages.install: N entries exceeds the 256 entry limit`。
 `local_sudo_secret` 必須是 secret 名稱，否則以 2 結束並顯示 ``packages.local_sudo_secret `VALUE`: must match [A-Z][A-Z0-9_]*``。
-套件管理程式如何選定、會執行什麼，請見 [Packages](packages.md)。
+套件管理器如何選定、會執行什麼，請見 [套件](packages.zh-TW.md)。
 
 必要的名稱已從 `[anvil].secrets` 移到 `[secrets].names`。帶有舊鍵的 config 仍照舊讀取（兩者同時設定則以 2 結束）。
 下一次 `anvil config` 儲存時會寫成 `[secrets].names` 並移除 `[anvil].secrets`，

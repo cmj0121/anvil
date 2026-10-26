@@ -1,5 +1,7 @@
 # Anvil
 
+English | [繁體中文](README.zh-TW.md)
+
 > Setup your env, both for human and agent, in one command.
 
 anvil is a secure, single-binary Rust tool that sets up the local machine and remote hosts from one declarative config,

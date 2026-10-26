@@ -33,4 +33,4 @@
   作為最後防線，step 輸出（因此也包括 `--json`）中出現的任何 8 位元組以上的密碼都會被替換成 `***`；
   較短的密碼則不會被清除。
   sudo 必須顯示 anvil 自己的提示；其他類型的 PAM 提示（2FA、指紋）會讓該 target 在 15 秒後失敗。
-  請參閱[Typing the sudo password](packages.md#typing-the-sudo-password)。
+  請參閱[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)。

@@ -2,12 +2,12 @@
 
 [English](cli.md) | 繁體中文
 
-MVP（[#3](https://github.com/mini-poc/anvil/issues/3)）的規範，依循 [#2](https://github.com/mini-poc/anvil/issues/2) 的 CLI 設計。
-入門介紹請見 [README](../README.md)。
+完整的指令規範，依循 [#2](https://github.com/mini-poc/anvil/issues/2) 的 CLI 設計。
+入門介紹請見 [README](../README.zh-TW.md)。
 
 主題指南：[入門](getting-started.zh-TW.md)、[設定](configuration.zh-TW.md)、
-[Packages](packages.md)、[Secrets](secrets.md)、[Terminal UI](tui.md)、[Good to know](security.md)、
-[Development](development.md)。
+[套件](packages.zh-TW.md)、[機密](secrets.zh-TW.md)、[終端機介面](tui.zh-TW.md)、[安全須知](security.zh-TW.md)、
+[開發](development.zh-TW.md)。
 
 ```text
 anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [--target SEL]... <COMMAND>
@@ -79,7 +79,7 @@ target（目標）依序執行，先 `local`，再依名稱排序的 host（主�
 - `editor`：`anvil inventory` 會使用的編輯器，以絕對路徑表示；無法解析時為 `null` 並發出警告，不算失敗。
 - `secrets`：`[secrets].names` 中的每個名稱，以及有 `[packages]` 時每個選定 target 的 sudo secret（其 `sudo_secret`，
   `local` 則為 `[packages].local_sudo_secret`），
-  會在 [secret store](secrets.md#secret-backends) 中查詢，並顯示為一列 `secret NAME ok`：
+  會在 [secret store](secrets.zh-TW.md#機密-backend) 中查詢，並顯示為一列 `secret NAME ok`：
   `ok`、`missing`（警告，仍以 0 結束，並提示執行 `anvil secret NAME`）、`locked`（以 1 結束）或 `error`（以 1 結束）。
   age 或 sops store 會先被開啟（解密）；keychain 只依屬性詢問其項目名稱，絕不取值，因此絕不會跳出 keychain 提示。
   無法開啟的 store 會將每個名稱回報為 `error`，
@@ -90,10 +90,10 @@ target（目標）依序執行，先 `local`，再依名稱排序的 host（主�
   `pkg`（brew、pacman、apt、dnf、apk 中存在的套件管理器）、`sudo`（`none`、`binary` = 需要密碼、`nopasswd`）。
   當 `command -v brew` 找得到 brew，或 `/opt/homebrew/bin/brew`、`/usr/local/bin/brew`、
   `/home/linuxbrew/.linuxbrew/bin/brew` 可執行時，brew 即算存在，因為非登入的 ssh shell 可能沒把 Homebrew 放進 `PATH`。
-- `manager`，僅在 config 有 `[packages]` 區段時：每個可連線 target 的套件管理程式，依 [Packages](packages.md) 的方式解析，
+- `manager`，僅在 config 有 `[packages]` 區段時：每個可連線 target 的套件管理器，依 [套件](packages.zh-TW.md) 的方式解析，
   在 facts 之後顯示為一列 `manager         pacman`，
   無法解析時則為 `manager         error: REASON`（例如 `` `pacman` needs root and sudo is not installed ``，
-  或 [Root and sudo](packages.md#root-and-sudo) 中的 sudo 密碼拒絕訊息）。
+  或 [Root 與 sudo](packages.zh-TW.md#root-與-sudo) 中的 sudo 密碼拒絕訊息）。
   有 sudo secret 的 target 以 apply 的方式解析，因此對它而言 sudo `binary` 是可接受的。無法連線的 target 沒有 `manager` 列。
 
 每項檢查都通過且每個 target 都可連線時以 0 結束，否則為 1。
@@ -146,10 +146,10 @@ target（目標）依序執行，先 `local`，再依名稱排序的 host（主�
 該 step 是一般的 step：它顯示為 `$ SCRIPT` 及其輸出，計入 `✔ ok · N steps` 與 `--json` 中的 `steps`，
 以非零結束時也像任何 step 一樣結束該 target。
 探測在傳輸中失敗時，target 以該錯誤原樣失敗；
-探測以非零結束或印出格式不正確的輸出，或套件管理程式無法解析時，target 以 `packages: REASON` 失敗。
-無論哪種情況，該 target 都不執行任何 step（見 [Packages](packages.md)）。
+探測以非零結束或印出格式不正確的輸出，或套件管理器無法解析時，target 以 `packages: REASON` 失敗。
+無論哪種情況，該 target 都不執行任何 step（見 [套件](packages.zh-TW.md)）。
 當 target 的 sudo 要求密碼且它有 sudo secret 時，該 step 在終端機上執行，
-anvil 會在 sudo 的提示處輸入密碼（[Typing the sudo password](packages.md#typing-the-sudo-password)）；
+anvil 會在 sudo 的提示處輸入密碼（[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)）；
 其 `$` 行仍是那行一行式腳本。沒有 `[packages]`，或沒有要安裝或升級的東西時，不會執行探測，apply 只執行 `[[steps]]`。
 
 給人看的輸出是每個 target 一個區塊，每個區塊後有一個空行，最後是摘要：
@@ -212,7 +212,7 @@ step 被訊號終止時 `code` 為 `null`。
 先開啟 secret store，再將該 secret 目前的值（未設定時為空）以純文字檔案在編輯器中開啟。
 儲存時會去掉一個結尾換行；空的緩衝區會刪除該 secret，其他內容則會儲存；未變更的緩衝區不寫入任何東西。
 `NAME` 必須符合 `[A-Z][A-Z0-9_]*`（否則以 2 結束）。
-store 是 `[secrets].backend` 所選的那個（見 [Secret backends](secrets.md#secret-backends)）；
+store 是 `[secrets].backend` 所選的那個（見 [機密 backend](secrets.zh-TW.md#機密-backend)）；
 它在編輯器啟動前就開啟，因此密語的詢問，以及錯誤金鑰或鎖住的 store 造成的失敗（以 1 結束），都發生在編輯任何東西之前。
 age 或 sops store 只存放 UTF-8 文字。值絕不會出現在 argv、環境變數、日誌或任何輸出中。
 大於 1 MiB 的值會被拒絕（以 2 結束），且不儲存任何東西。
@@ -267,7 +267,7 @@ stdin 與 stdout 必須是終端機（否則以 2 結束，`anvil tui needs a te
 TUI 照常啟動，並在 Inventory pane 中顯示錯誤，取代 Targets 與 Tags；`o` 變更路徑，`r` 重新載入。
 未知的 `--target` 和任何指令一樣以 2 結束，但只在 inventory 載入成功時。離開時以 0 結束。
 
-畫面、按鍵表與 TUI 的規則請見 [tui.md](tui.md)。
+畫面、按鍵表與 TUI 的規則請見 [終端機介面](tui.zh-TW.md)。
 
 ### 編輯器
 
@@ -315,7 +315,7 @@ anvil 以 argv 陣列執行系統的 `ssh`，絕不使用 shell 字串，因此 
   被拒絕的互動式嘗試回報 `authentication failed after the interactive attempt`。
 - **絕不自動接受 host key。**
   未知或已變更的 host key 會讓 target 以 ``host key unknown or changed; run `ssh <host>` once to verify the fingerprint`` 失敗。
-- **帶 sudo 密碼的套件 step** 改以 `-tt` 用戶端執行；見 [Typing the sudo password](packages.md#typing-the-sudo-password)。
+- **帶 sudo 密碼的套件 step** 改以 `-tt` 用戶端執行；見 [輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)。
 - **腳本**以 master 的用戶端執行（`-o ControlMaster=no -o BatchMode=yes ... sh -s`），腳本經 stdin 傳入，逾時 30 秒；
   用戶端絕不提示。每個串流最多保留 1 MiB。
   離開腳本的行程群組並持續開著其輸出的背景行程，在腳本結束後有 1 秒時間；之後 anvil 停止讀取並回報已取得的內容。
@@ -325,7 +325,7 @@ anvil 以 argv 陣列執行系統的 `ssh`，絕不使用 shell 字串，因此 
 
 ## 日誌
 
-日誌以 `LEVEL target: message` 的形式寫到 stderr（在 `anvil tui` 中則改寫到其 [Log pane](tui.md)）；
+日誌以 `LEVEL target: message` 的形式寫到 stderr（在 `anvil tui` 中則改寫到其 [Log 窗格](tui.zh-TW.md)）；
 stdout 上的 `--json` 輸出維持單一文件。預設只顯示錯誤；`-v` 加上警告、`-vv` info、`-vvv` debug，
 其中包含每次 `ssh` 與編輯器啟動的 argv。致命錯誤是非零結束前的最後一行。
 訊息中的控制字元（ssh 或 host 的文字）顯示為 `\x1b` 式跳脫；`doctor` 給人看的輸出也會跳脫它們。

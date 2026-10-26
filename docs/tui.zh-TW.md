@@ -27,7 +27,7 @@ Doctor、apply 與 edit 每個分頁顯示一個區段。`←` 與 `→` 切換�
 按鍵表與規則見[下文](#按鍵)。TUI 是預設啟用的 cargo feature `tui`；
 `cargo install --path . --no-default-features` 會建置不含它的 anvil。
 
-它的旗標與結束行為見 [cli.md](cli.md#anvil-tui)。
+它的旗標與結束行為見 [命令列](cli.zh-TW.md#anvil-tui)。
 
 ## 畫面
 
@@ -81,9 +81,9 @@ Enter 套用三個路徑（開頭的 `~/` 或單獨的 `~` 為 `$HOME`）並重�
   狀態列顯示 `busy: <run> is running (Esc cancels)`。執行會保留它開始時的選擇與路徑。
 - **Esc 在 step 之間取消。** apply 在每個 target 與每個 step（步驟）之前檢查：正在執行的 step 會跑完，
   該 target 剩下的部分以及之後的每個 target 都以 `⊘ cancelled` 結束。遠端 step 從不被終止。
-  doctor 無法取消；它的探測受 [ssh 逾時](cli.md#ssh-behaviour)限制。
+  doctor 無法取消；它的探測受 [ssh 逾時](cli.zh-TW.md#ssh-行為)限制。
 - **交接。** 編輯器（`i`、`c`、`s`）、遷移（`m`，讓它的 age 密碼短語提示能運作）、
-  ssh 的互動式重試（密碼、密碼短語或 PIN，見 [SSH 行為](cli.md#ssh-behaviour)），
+  ssh 的互動式重試（密碼、密碼短語或 PIN，見 [SSH 行為](cli.zh-TW.md#ssh-行為)），
   與 [age 密碼短語提示](secrets.zh-TW.md#密碼短語提示)會取得真正的終端機：TUI 離開它的畫面，
   程式像在 CLI 中一樣執行，然後 TUI 回來並顯示結果。ssh 的提示來自 doctor 或 apply 執行；它等待時 TUI 不讀取任何按鍵，
   因此 `Esc` 要等 TUI 回來後才會生效。在這類提示中按 Ctrl-C 會送給 ssh 或編輯器，從不送給 anvil：
