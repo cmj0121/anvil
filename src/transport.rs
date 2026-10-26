@@ -102,13 +102,18 @@ impl std::error::Error for TransportError {}
 
 pub trait Transport {
     fn name(&self) -> &str;
-    /// Runs `script`; a script that ran to completion is `Ok` whatever its
-    /// exit code, which the caller judges.
-    fn run(&self, script: &str) -> Result<Output, TransportError>;
+    /// Runs `script`, killed after `timeout`; a script that ran to completion
+    /// is `Ok` whatever its exit code, which the caller judges.
+    fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError>;
     /// Runs `script` on a terminal and types `password` once at sudo's prompt,
-    /// per [`run_tty_with`]. The output's stdout is the
-    /// cleaned terminal output.
-    fn run_tty(&self, script: &str, password: &[u8]) -> Result<Output, TransportError>;
+    /// per [`run_tty_with`] with `timeout` as [`TtyLimits::run`]. The output's
+    /// stdout is the cleaned terminal output.
+    fn run_tty(
+        &self,
+        script: &str,
+        password: &[u8],
+        timeout: Duration,
+    ) -> Result<Output, TransportError>;
 }
 
 /// Runs scripts on this machine with `/bin/sh -s`.
@@ -120,14 +125,23 @@ impl Transport for Local {
         "local"
     }
 
-    fn run(&self, script: &str) -> Result<Output, TransportError> {
+    fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
         let mut command = Command::new("/bin/sh");
         command.arg("-s");
-        run_with_script(&mut command, script, RUN_TIMEOUT)
+        run_with_script(&mut command, script, timeout)
     }
 
-    fn run_tty(&self, script: &str, password: &[u8]) -> Result<Output, TransportError> {
-        run_tty_with(&mut local_tty_command(script), password, TtyLimits::DEFAULT)
+    fn run_tty(
+        &self,
+        script: &str,
+        password: &[u8],
+        timeout: Duration,
+    ) -> Result<Output, TransportError> {
+        run_tty_with(
+            &mut local_tty_command(script),
+            password,
+            TtyLimits::with_run(timeout),
+        )
     }
 }
 
@@ -235,7 +249,7 @@ pub fn has_control_bytes(bytes: &[u8]) -> bool {
 /// The deadlines of [`run_tty_with`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TtyLimits {
-    /// The whole run, as [`RUN_TIMEOUT`] for [`run_with_script`].
+    /// The whole run, as the timeout of [`run_with_script`].
     pub run: Duration,
     /// From the ready line until the prompt or the sudo-ok marker.
     pub prompt: Duration,
@@ -244,11 +258,14 @@ pub struct TtyLimits {
 }
 
 impl TtyLimits {
-    pub const DEFAULT: Self = Self {
-        run: RUN_TIMEOUT,
-        prompt: Duration::from_secs(15),
-        quiet: Duration::from_millis(100),
-    };
+    /// The default prompt deadlines, with the whole run limited to `run`.
+    pub const fn with_run(run: Duration) -> Self {
+        Self {
+            run,
+            prompt: Duration::from_secs(15),
+            quiet: Duration::from_millis(100),
+        }
+    }
 }
 
 /// Runs `command`, which puts a script on a terminal, and speaks the sudo
@@ -830,7 +847,7 @@ mod tests {
 
     #[test]
     fn local_runs_the_script_and_returns_its_output() {
-        let out = Local.run("echo out; echo err >&2").unwrap();
+        let out = Local.run("echo out; echo err >&2", RUN_TIMEOUT).unwrap();
         assert_eq!(out.stdout, b"out\n");
         assert_eq!(out.stderr, b"err\n");
         assert_eq!(out.code, Some(0));
@@ -840,7 +857,7 @@ mod tests {
 
     #[test]
     fn output_over_the_cap_is_cut_and_flagged() {
-        let out = Local.run("yes | head -c 3000000").unwrap();
+        let out = Local.run("yes | head -c 3000000", RUN_TIMEOUT).unwrap();
         assert_eq!(out.stdout.len(), OUTPUT_CAP);
         assert!(out.truncated);
         assert!(!out.abandoned);
@@ -866,14 +883,19 @@ mod tests {
     #[test]
     fn stdin_is_closed_after_the_script() {
         let out = Local
-            .run("if read -r line; then echo \"got $line\"; else echo eof; fi")
+            .run(
+                "if read -r line; then echo \"got $line\"; else echo eof; fi",
+                RUN_TIMEOUT,
+            )
             .unwrap();
         assert_eq!(out.stdout, b"eof\n");
     }
 
     #[test]
     fn non_zero_exit_is_output_with_its_code() {
-        let out = Local.run("echo out; echo nope >&2; exit 3").unwrap();
+        let out = Local
+            .run("echo out; echo nope >&2; exit 3", RUN_TIMEOUT)
+            .unwrap();
         assert_eq!(out.code, Some(3));
         assert_eq!(out.stdout, b"out\n");
         assert_eq!(out.stderr, b"nope\n");
@@ -1005,7 +1027,7 @@ mod tests {
 
     #[test]
     fn probe_runs_locally_on_this_mac() {
-        let out = Local.run(PROBE).unwrap();
+        let out = Local.run(PROBE, RUN_TIMEOUT).unwrap();
         let facts = Facts::parse(&out.stdout).unwrap();
         let uname = if cfg!(target_os = "macos") {
             "Darwin"
@@ -1102,7 +1124,11 @@ mod tests {
     #[test]
     fn local_run_tty_uses_the_default_limits() {
         let out = Local
-            .run_tty(&wrapped("fake_sudo && echo anvil-sudo-ok"), PASSWORD)
+            .run_tty(
+                &wrapped("fake_sudo && echo anvil-sudo-ok"),
+                PASSWORD,
+                RUN_TIMEOUT,
+            )
             .unwrap();
         assert_eq!(text(&out), "got:14\n");
         assert_eq!(out.code, Some(0));

@@ -1,0 +1,3 @@
+[packages]
+install = ["git"]
+timeout = 0

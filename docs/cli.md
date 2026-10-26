@@ -180,7 +180,7 @@ Human output is one block per target, a blank line after each, then a summary:
   not a terminal each one is prefixed with `TARGET:` (`local: warn` above).
 - The block ends with `✔ ok · N steps`, or `✘ step K exited C` for a failing step, or `✘ ERROR` for a transport error
   (after the steps that completed before it). A step that times out still shows its `$` line and the output it printed
-  before it was killed, then `✘ timed out after 30 s`.
+  before it was killed, then `✘ timed out after 30 s` (for the package step, after its `[packages].timeout`).
 - Colour (bold cyan header, dim command, yellow stderr, green `✔`, red `✘` and failed count) is used on a stream only
   when it is a terminal and `NO_COLOR` is unset or empty.
 - Control characters a host sends (escape sequences, say) are shown as visible `\x1b`-style escapes on stderr and in
@@ -332,9 +332,9 @@ from `--ssh-config`; `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE` and `DISPLAY` are remo
 - **Package step with a sudo password** runs as a `-tt` client instead; see
   [Typing the sudo password](packages.md#typing-the-sudo-password).
 - **Scripts** run as clients of the master (`-o ControlMaster=no -o BatchMode=yes ... sh -s`), with the script on stdin
-  and a 30 s timeout; a client never prompts. Each stream is kept up to 1 MiB. A background process that leaves the
-  script's process group and keeps its output open is given 1 s after the script ends; then anvil stops reading and
-  reports what it has.
+  and a 30 s timeout (the package step has its own `[packages].timeout`);
+  a client never prompts. Each stream is kept up to 1 MiB. A background process that leaves the script's process group
+  and keeps its output open is given 1 s after the script ends; then anvil stops reading and reports what it has.
 - **Control directory** `~/.ssh/anvil`: created with mode 0700 (and `~/.ssh` 0700 if missing); refused when owned by
   another user, open to group or others, when `~/.ssh` is group- or world-writable, when `$HOME` contains `%`, or when a
   socket path would not fit macOS' 104-byte `sun_path` — that is, a `$HOME` longer than 34 bytes.

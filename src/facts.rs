@@ -239,7 +239,12 @@ mod tests {
 
     #[test]
     fn the_probe_prints_every_key_locally() {
-        let out = crate::transport::Transport::run(&crate::transport::Local, PROBE).unwrap();
+        let out = crate::transport::Transport::run(
+            &crate::transport::Local,
+            PROBE,
+            crate::transport::RUN_TIMEOUT,
+        )
+        .unwrap();
         assert_eq!(out.code, Some(0));
         let facts = Facts::parse(&out.stdout).unwrap();
         let mut keys = KEYS.to_vec();

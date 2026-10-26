@@ -504,6 +504,10 @@ mod tests {
             ),
             ("invalid/config-empty-run.yaml", "steps[1].run"),
             ("invalid/config-blank-run.toml", "steps[0].run"),
+            (
+                "invalid/config-bad-timeout.toml",
+                "packages.timeout `0`: must be 1..=3600",
+            ),
         ] {
             let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
             let message = err.to_string();
@@ -831,13 +835,29 @@ mod tests {
         assert_eq!(packages.local, Some(Choice::Is(Manager::Brew)));
         assert_eq!(packages.install, ["git", "curl"]);
         assert!(packages.upgrade);
+        assert_eq!(packages.timeout, 300);
         assert!(config.validate(Path::new("config.toml")).is_ok());
-        for config in [config, parse("[packages]\n")] {
+        let longer = parse("[packages]\ntimeout = 3600\n");
+        assert_eq!(longer.packages.as_ref().unwrap().timeout, 3600);
+        assert!(longer.validate(Path::new("config.toml")).is_ok());
+        for config in [config, parse("[packages]\n"), longer] {
             for format in [Format::Toml, Format::Yaml] {
                 let text = document::to_string(&config, format).unwrap();
                 let back: Config = document::from_str(&text, format).unwrap();
                 assert_eq!(back, config, "{text}");
+                let timeout = config.packages.as_ref().unwrap().timeout;
+                assert_eq!(text.contains("timeout"), timeout != 300, "{text}");
             }
+        }
+        for timeout in [0, 3601] {
+            let config = parse(&format!("[packages]\ntimeout = {timeout}\n"));
+            let err = config.validate(Path::new("config.toml")).unwrap_err();
+            assert!(matches!(err, DocumentError::Invalid { .. }), "{err}");
+            assert!(
+                err.to_string()
+                    .contains(&format!("packages.timeout `{timeout}`: must be 1..=3600")),
+                "{err}"
+            );
         }
 
         let config = parse("[packages]\ninstall = [\"git\", \"-rf\"]\n");
