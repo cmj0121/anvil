@@ -11,7 +11,8 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
 
 - **`anvil doctor`** 回報每個 target 的資訊（OS、發行版、套件管理器、sudo）以及是否可連線。
 - **`anvil apply`** 以每個 target 的套件管理器（brew、pacman、apt、dnf、apk）安裝 config 中的套件，
-  接著執行 config 中的 step。它直接執行，不會詢問確認。
+  接著執行 config 中的 step。它直接執行，不會詢問確認。`[packages.alias]` 可依管理器為套件指定名稱，
+  因此 `fd` 在 apt 與 dnf 上會以 `fd-find` 安裝。
 - **`anvil plan`** 列出 apply 會在每個 target 上執行的 step，但一個都不執行；`--json` 的文件標記為
   `"executed": false`。
 - **secret（機密）** 存放在 macOS keychain、age 檔案或 sops 檔案中，`anvil secret --migrate` 可在 backend 之間搬移它們。
@@ -44,6 +45,17 @@ anvil doctor               # local checks + every target's facts and reachabilit
 anvil plan                 # the steps apply would run on every target, running none
 anvil apply                # install packages and run the steps on every target
 anvil tui                  # all of the above in one terminal UI
+```
+
+一份在每個 target 上安裝 `fd` 的 config，管理器為 apt 或 dnf 時則安裝 `fd-find`（[別名](docs/packages.zh-TW.md#別名)）：
+
+```toml
+[packages]
+install = ["fd"]
+
+[packages.alias.fd]
+apt = "fd-find"
+dnf = "fd-find"
 ```
 
 ## 文件

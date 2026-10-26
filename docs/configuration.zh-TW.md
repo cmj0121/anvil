@@ -42,6 +42,10 @@ upgrade = false            # upgrade every installed package first; default fals
 local_sudo_secret = "LOCAL_SUDO" # optional; the secret holding this machine's sudo password
 timeout = 300              # seconds the package step may run, 1..=3600; default 300
 
+[packages.alias.fd]        # optional; the name a manager installs `fd` as
+apt = "fd-find"
+dnf = "fd-find"
+
 [[steps]]
 run = "hostname"           # placeholder: a POSIX sh script run on every target
 ```
@@ -130,6 +134,10 @@ upgrade = false            # upgrade every installed package first; default fals
 local_sudo_secret = "LOCAL_SUDO" # optional: [A-Z][A-Z0-9_]*, the local target's sudo password secret
 timeout = 300              # seconds the package step may run, 1..=3600; default 300
 
+[packages.alias.fd]        # optional; PLAIN under alias, then brew | pacman | apt | dnf | apk = "NAME"
+apt = "fd-find"            # installed in place of fd on apt; a manager with no entry installs fd
+dnf = "fd-find"
+
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
 ```
@@ -148,6 +156,10 @@ run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
 ``packages.install[I] `NAME`: N bytes exceeds the 128 byte limit`` 或 `packages.install: N entries exceeds the 256 entry limit`。
 `local_sudo_secret` 必須是 secret 名稱，否則以 2 結束並顯示 ``packages.local_sudo_secret `VALUE`: must match [A-Z][A-Z0-9_]*``。
 `timeout` 必須介於 1 到 3600 之間，否則以 2 結束並顯示 ``packages.timeout `N`: must be 1..=3600``。
+每個 `[packages.alias.PLAIN]` 的鍵必須是 `brew`、`pacman`、`apt`、`dnf` 或 `apk`，
+PLAIN 與每個值都遵循 `install` 的規則與位元組上限，原名最多 256 個；違規時以 2 結束並指出原名，
+例如 ``packages.alias.fd `auto`: must be one of brew, pacman, apt, dnf, apk`` 或
+``packages.alias.fd.apt `x y`: must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*``（完整列表見 [別名](packages.zh-TW.md#別名)）。
 套件管理器如何選定、會執行什麼，請見 [套件](packages.zh-TW.md)。
 
 必要的名稱已從 `[anvil].secrets` 移到 `[secrets].names`。帶有舊鍵的 config 仍照舊讀取（兩者同時設定則以 2 結束）。

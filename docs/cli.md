@@ -156,6 +156,19 @@ terminal and anvil types the password at sudo's prompt ([Typing the sudo passwor
 `$` line is still the one-line script. Without `[packages]`, or with nothing to install or upgrade, no probe runs and
 apply runs only the `[[steps]]`.
 
+Each `install` name goes into the script as the resolved manager's `[packages.alias]` entry, else as is
+([Aliases](packages.md#aliases)). With this config apt and dnf install `fd-find`, and brew, pacman and apk `fd`; `anvil
+plan` shows the same script:
+
+```toml
+[packages]
+install = ["fd"]
+
+[packages.alias.fd]
+apt = "fd-find"
+dnf = "fd-find"
+```
+
 Human output is one block per target, a blank line after each, then a summary:
 
 ```text

@@ -12,7 +12,8 @@ system OpenSSH client.
 
 - **`anvil doctor`** reports each target's facts (OS, distro, package manager, sudo) and whether it is reachable.
 - **`anvil apply`** installs the config's packages with each target's package manager (brew, pacman, apt, dnf, apk),
-  then runs the config's steps. It runs directly, with no prompt.
+  then runs the config's steps. It runs directly, with no prompt. `[packages.alias]` names a package per manager, so
+  `fd` installs as `fd-find` on apt and dnf.
 - **`anvil plan`** shows the steps apply would run on each target and runs none of them; `--json` marks the document
   `"executed": false`.
 - **Secrets** live in the macOS keychain, an age file or a sops file, and `anvil secret --migrate` moves them between
@@ -46,6 +47,18 @@ anvil doctor               # local checks + every target's facts and reachabilit
 anvil plan                 # the steps apply would run on every target, running none
 anvil apply                # install packages and run the steps on every target
 anvil tui                  # all of the above in one terminal UI
+```
+
+A config that installs `fd` on every target, as `fd-find` where apt or dnf is the manager
+([Aliases](docs/packages.md#aliases)):
+
+```toml
+[packages]
+install = ["fd"]
+
+[packages.alias.fd]
+apt = "fd-find"
+dnf = "fd-find"
 ```
 
 ## Documentation
