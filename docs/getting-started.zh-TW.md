@@ -52,6 +52,7 @@ anvil config               # edit the preferences, packages and steps
 anvil inventory --format=yaml   # edit it as YAML this once; it is still saved as TOML
 anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secrets] says otherwise)
 anvil doctor               # local checks + every target's facts and reachability
+anvil plan                 # the steps apply would run on every target, running none
 anvil apply                # install packages and run the steps on every target
 anvil tui                  # all of the above in one terminal UI
 ```

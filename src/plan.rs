@@ -64,17 +64,46 @@ pub struct Plan {
     pub ok: bool,
 }
 
-/// Plans `config` for each of `targets` in order, calling `on` with each
-/// target's report. Once `cancel` is set, every later target is Cancelled.
+/// What [`plan_targets`] reports as it goes: a target about to be planned,
+/// and its report once it ends.
+#[cfg_attr(
+    not(any(test, feature = "tui")),
+    expect(dead_code, reason = "read by the TUI")
+)]
+pub enum Progress<'a> {
+    Start(&'a Target),
+    Done(&'a PlanReport),
+}
+
+/// Loads the targets and plans `config` for each, as [`plan_targets`].
+pub fn run_targets(
+    opts: &Options,
+    config: &Config,
+    cancel: &AtomicBool,
+    on: &mut dyn FnMut(Progress<'_>),
+) -> Result<Plan, Failure> {
+    let targets = opts.targets()?;
+    Ok(plan_targets(
+        &targets,
+        |target| opts.transport(target),
+        config,
+        cancel,
+        on,
+    ))
+}
+
+/// Plans `config` for each of `targets` in order. Once `cancel` is set,
+/// every later target is Cancelled.
 pub fn plan_targets(
     targets: &[Target],
     transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError>,
     config: &Config,
     cancel: &AtomicBool,
-    on: &mut dyn FnMut(&PlanReport),
+    on: &mut dyn FnMut(Progress<'_>),
 ) -> Plan {
     let mut reports = Vec::with_capacity(targets.len());
     for target in targets {
+        on(Progress::Start(target));
         let report = if cancel.load(Ordering::Relaxed) {
             log::info!("plan {}: cancelled", target.name);
             PlanReport::Cancelled {
@@ -84,7 +113,7 @@ pub fn plan_targets(
         } else {
             plan_target(target, transport(target), config)
         };
-        on(&report);
+        on(Progress::Done(&report));
         reports.push(report);
     }
     let ok = reports.iter().all(PlanReport::ok);
@@ -131,20 +160,15 @@ fn plan_target(
 pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
     let style = Style::detect();
     let config = opts.load_config()?;
-    let targets = opts.targets()?;
     // Only the TUI cancels a plan.
     let cancel = AtomicBool::new(false);
-    let plan = plan_targets(
-        &targets,
-        |target| opts.transport(target),
-        &config,
-        &cancel,
-        &mut |report| {
-            if !cli.json {
-                print_lines(&render(report), style);
-            }
-        },
-    );
+    let plan = run_targets(opts, &config, &cancel, &mut |progress| {
+        if let Progress::Done(report) = progress
+            && !cli.json
+        {
+            print_lines(&render(report), style);
+        }
+    })?;
     let failed = plan.targets.iter().filter(|t| !t.ok()).count();
     if cli.json {
         print_json(&plan, Failure::failed)?;
@@ -308,6 +332,7 @@ mod tests {
     ) -> (Plan, Vec<String>) {
         let log = Rc::new(RefCell::new(Vec::new()));
         let targets: Vec<Target> = names.iter().map(|name| target(name)).collect();
+        let mut events = Vec::new();
         let plan = plan_targets(
             &targets,
             |target| {
@@ -321,8 +346,18 @@ mod tests {
             },
             config,
             &AtomicBool::new(cancelled),
-            &mut |_| {},
+            &mut |progress| {
+                events.push(match progress {
+                    Progress::Start(target) => format!("start {}", target.name),
+                    Progress::Done(report) => format!("done {}", report.target()),
+                })
+            },
         );
+        let order: Vec<String> = names
+            .iter()
+            .flat_map(|name| [format!("start {name}"), format!("done {name}")])
+            .collect();
+        assert_eq!(events, order, "start then done per target, in order");
         let runs = log.borrow().clone();
         (plan, runs)
     }
