@@ -3,7 +3,8 @@
 English | [繁體中文](packages.zh-TW.md)
 
 With `[packages]`, `anvil apply` probes each target, picks its package manager and runs one generated step, before
-the `[[steps]]`, that upgrades (with `upgrade = true`) and installs the `install` list. The choice is the host's `pkg`,
+the `[[steps]]`, that upgrades (with `upgrade = true`), installs the `install` list and the missing `pin` names,
+and removes the `remove` list ([Pin and remove](#pin-and-remove)). The choice is the host's `pkg`,
 else `[packages].local` for `local`, else `[packages].manager`. `auto` follows the `distro` fact: `macos` uses brew,
 Arch and its derivatives pacman, Debian and Ubuntu apt, Fedora and RHEL dnf, Alpine apk; an unknown distro takes the
 first manager found that is not brew, else brew.
@@ -16,7 +17,8 @@ NOPASSWD and `root` targets never use the password. `anvil doctor` checks those 
 target resolves to, as a `manager` row, and fails when one cannot be resolved. The exact commands and rules are
 [below](#which-manager).
 
-`[packages]` in the config installs and upgrades packages on every target with that target's package manager.
+`[packages]` in the config installs, upgrades, pins and removes packages on every target with that target's package
+manager.
 
 ```toml
 [packages]
@@ -177,11 +179,76 @@ A violation is exit 2 and names the plain name:
 The name between backticks has control characters escaped and is cut to 64 characters. A value that is not a string
 (`apt = 3`) is a parse error, also exit 2.
 
+## Pin and remove
+
+```toml
+[packages]
+install = ["git", "vim"]
+pin = ["vim"]       # installed when missing, never upgraded by this run
+remove = ["nano"]   # removed after the install when it is installed
+upgrade = true
+```
+
+**Remove.** After the install, the step removes the `remove` names that are installed, all in one command, so a
+re-run where they are already gone does nothing and exits 0 (`pacman -R`, `dnf remove`, `brew uninstall` and `apk del`
+fail on a name that is not installed, which is why anvil checks first). It never purges and never autoremoves: apt uses
+`apt-get remove`, not `purge`, so configuration files stay; dnf gets `--setopt=clean_requirements_on_remove=False`,
+since it removes unneeded dependencies by default; pacman gets no `-s`, `-c` or `-n`. A name other packages depend on
+behaves per manager: `apt-get remove` and `dnf remove` also remove those packages; `pacman -R` and `brew uninstall`
+refuse, and the step fails; `apk del` keeps it, reports why (`World updated, but the following packages are not
+removed due to: libcurl: curl`) and the step still succeeds.
+
+**Pin.** A pinned name is skipped by this run's upgrade and installed only when it is missing; nothing is held after
+the run. pacman upgrades with `--ignore` and dnf with `--exclude`. A pinned name never goes in the install list, even
+when it is also in `install` (allowed: the pin wins): pacman's `--noconfirm` answers yes to "install the ignored
+package anyway?", and `dnf install` upgrades a name that is already installed. The match is by resolved name, so an
+`install` name that a manager's [alias](#aliases) maps to a pin's name is left to the pin too. So the step checks each pin
+(`pacman -T`, `rpm -q --whatprovides`, which also find a package that provides the name) and installs only the missing
+ones. On dnf the install part comes after that and gets `--exclude` too, so it cannot upgrade a pin as a dependency:
+when `P` needs a newer pin, that install fails, and so does the step.
+
+**Refused on brew, apt and apk.** They have no way to skip a package for one run: `brew install` and
+`apt-get install` upgrade an installed name, and `apk upgrade` has no exclude. Any `pin` fails such a target, with or
+without `upgrade`, before anything runs:
+
+```text
+packages: pin is not one-shot on brew: vim
+```
+
+The names are the ones that manager would use ([aliases](#aliases) applied), in config order, comma-separated. anvil
+never writes a lasting hold (`brew pin`, `apt-mark hold`, an `/etc/apk/world` edit) instead. `anvil plan` fails the
+target with the same line; `anvil doctor`'s `manager` row does not check pins.
+
+**Rules.** `remove` and `pin` entries follow the `install` name rule and byte limit, at most 256 entries each; an empty
+list is not saved by `anvil config`. A violation is exit 2, with the name's control characters escaped and cut to 64
+characters:
+
+- ``packages.remove[1] `-rf`: must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*`` (or `packages.pin[I]`);
+- ``packages.pin[I] `NAME`: N bytes exceeds the 128 byte limit``;
+- `packages.remove: N entries exceeds the 256 entry limit` (or `packages.pin`);
+- ``packages.remove `nano`: also in install`` and ``packages.remove `git`: also in pin``;
+- ``packages.remove `fd-find`: also in install as `fd` on apt`` when the names differ but a manager's
+  [alias](#aliases) makes them one package (or `also in pin as`).
+
+`anvil plan` prints the whole line as `would $ ...`, so it shows what each target would skip, install and remove.
+
+**Limits.**
+
+- On pacman, if the upgrade needs a newer version of a pin (another package depends on it), pacman's "install the
+  ignored package?" question defaults to yes under `--noconfirm`, and the pin is upgraded anyway. dnf skips such an
+  upgrade instead (or fails with `best=True`).
+- On dnf, when an `install` name needs a newer version of a pin, `dnf -y install --exclude=KC P` fails and the step
+  fails.
+- `pacman -Q` does not resolve provides: removing a name that is only provided, not a package name, does nothing on
+  pacman.
+
 ## What runs
 
-The step is one line: the upgrade part, then the install part, joined with `&&`. `S` stands for `sudo -n` followed by
-a space (nothing as root) and `P` for the `install` names joined by spaces, each replaced by its
-[alias](#aliases) for the manager when it has one:
+The step is one line, its parts joined with `&&`: the upgrade, the install, the missing pins, then the removal (on dnf
+the missing pins come before the install). A part with nothing to do is left out. `S` stands for `sudo -n` followed by
+a space (nothing as root), `P` for the `install` names whose resolved name is not a pin's, joined by spaces, and `K`
+for the `pin` names, each replaced by its [alias](#aliases) for the manager when it has one, joined by spaces; `KC` is
+the same pin names joined by commas:
 
 | Manager | Part    | Command                                                                   |
 | ------- | ------- | ------------------------------------------------------------------------- |
@@ -189,7 +256,7 @@ a space (nothing as root) and `P` for the `install` names joined by spaces, each
 | brew    | install | `brew install P`                                                          |
 | pacman  | upgrade | `S pacman -Syu --noconfirm --needed P` (one command, it installs `P` too) |
 | pacman  | install | `S pacman -S --noconfirm --needed P`                                      |
-| apt     | first   | `S apt-get update` (always, once)                                         |
+| apt     | first   | `S apt-get update` (once, with an upgrade or an install)                  |
 | apt     | upgrade | `S env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y`                 |
 | apt     | install | `S env DEBIAN_FRONTEND=noninteractive apt-get install -y P`               |
 | dnf     | upgrade | `S dnf -y upgrade`                                                        |
@@ -197,7 +264,33 @@ a space (nothing as root) and `P` for the `install` names joined by spaces, each
 | apk     | upgrade | `S apk update && S apk upgrade`                                           |
 | apk     | install | `S apk add --update-cache P`                                              |
 
-- **Index refresh.** apt always starts with one `apt-get update`, before the upgrade and the install; apk refreshes
+With a `pin`, pacman's upgrade is `S pacman -Syu --noconfirm --needed --ignore KC P` (`P` may be empty), dnf's is
+`S dnf -y upgrade --exclude=KC` and dnf's install is `S dnf -y install --exclude=KC P`. The missing pins and the
+removal are each a brace group that keeps the names CHECK reports missing (pin) or installed (remove), then runs CMD
+once on them, or nothing when there are none; the group's status is CMD's, so a failed earlier part still fails the
+line. `R` is the `remove` names, aliased like `P`:
+
+```sh
+{ m=$(for n in K; do CHECK "$n" >/dev/null 2>&1 || printf '%s ' "$n"; done); [ -z "$m" ] || CMD $m; }
+{ r=$(for n in R; do CHECK "$n" >/dev/null 2>&1 && printf '%s ' "$n"; done); [ -z "$r" ] || CMD $r; }
+```
+
+| Manager | Pin CHECK               | Pin CMD                   |
+| ------- | ----------------------- | ------------------------- |
+| pacman  | `pacman -T`             | `S pacman -S --noconfirm` |
+| dnf     | `rpm -q --whatprovides` | `S dnf -y install`        |
+
+brew, apt and apk refuse a pin (above).
+
+| Manager | Remove CHECK            | Remove CMD                                                    |
+| ------- | ----------------------- | ------------------------------------------------------------- |
+| brew    | `brew list`             | `brew uninstall`                                              |
+| pacman  | `pacman -Q`             | `S pacman -R --noconfirm`                                     |
+| apt     | `dpkg -s`               | `S env DEBIAN_FRONTEND=noninteractive apt-get remove -y`      |
+| dnf     | `rpm -q --whatprovides` | `S dnf -y remove --setopt=clean_requirements_on_remove=False` |
+| apk     | `apk info -e`           | `S apk del`                                                   |
+
+- **Index refresh.** apt starts with one `apt-get update` when it upgrades or installs, before both; apk refreshes
   with `--update-cache`; dnf refreshes expired metadata itself. pacman installs with `-S`, without `-y`: `-Sy` without
   `-u` is a partial upgrade, which Arch does not support, so a stale database is refreshed only by `upgrade = true`
   (`-Syu`).
@@ -220,14 +313,23 @@ export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/b
 With `upgrade = true` as well, the Mac's line ends `brew update && brew upgrade && brew install git curl`, and Arch's
 is `pacman -Syu --noconfirm --needed git curl`.
 
-Packages are only installed or upgraded, never removed or pinned.
+The [Pin and remove](#pin-and-remove) example on Arch as root is this one line (wrapped here with `\`):
+
+```sh
+pacman -Syu --noconfirm --needed --ignore vim git && \
+  { m=$(for n in vim; do pacman -T "$n" >/dev/null 2>&1 || printf '%s ' "$n"; done); \
+  [ -z "$m" ] || pacman -S --noconfirm $m; } && \
+  { r=$(for n in nano; do pacman -Q "$n" >/dev/null 2>&1 && printf '%s ' "$n"; done); \
+  [ -z "$r" ] || pacman -R --noconfirm $r; }
+```
 
 ## Failures
 
 A probe that cannot reach the target fails it with the transport error as is (`cannot connect: …`). Any other failure
 before the step fails the target with no steps and `packages: REASON`: `packages: probe exited C`,
 `packages: probe was killed by a signal`, `packages: probe output has no end marker`, or a resolution error from above
-(`packages: brew refuses to run as root`), or a sudo password failure from
+(`packages: brew refuses to run as root`), a [pin](#pin-and-remove) on brew, apt or apk
+(`packages: pin is not one-shot on brew: vim`), or a sudo password failure from
 [Typing the sudo password](#typing-the-sudo-password) (`packages: secret NAME is not set`). The step itself failing
 reads like any step, `✘ step 1 exited C`, and the `[[steps]]` do not run. `anvil doctor` shows the same resolution as
 its `manager` row, so it reports a target apply would refuse before apply runs.

@@ -38,6 +38,8 @@ names = ["HOST_SUDO"]      # names `doctor` checks; default []
 manager = "auto"           # auto | brew | pacman | apt | dnf | apk; default auto
 local = "brew"             # optional; the choice for `local`, which has no inventory entry
 install = ["git", "curl"]  # default []
+pin = ["vim"]              # installed when missing, skipped by the upgrade; pacman and dnf only; default []
+remove = ["nano"]          # removed after the install when installed; default []
 upgrade = false            # upgrade every installed package first; default false
 local_sudo_secret = "LOCAL_SUDO" # optional; the secret holding this machine's sudo password
 timeout = 300              # seconds the package step may run, 1..=3600; default 300
@@ -129,6 +131,8 @@ program = "/opt/homebrew/bin/sops"             # optional; default sops on PATH
 manager = "auto"           # auto | brew | pacman | apt | dnf | apk; default "auto"
 local = "brew"             # optional; the choice for the local target; default: manager
 install = ["git", "curl"]  # names to install; default []
+pin = ["vim"]              # names this run never upgrades, installed when missing; brew, apt, apk refuse; default []
+remove = ["nano"]          # names to remove after the install, when installed; not in install or pin; default []
 upgrade = false            # upgrade every installed package first; default false
 local_sudo_secret = "LOCAL_SUDO" # optional: [A-Z][A-Z0-9_]*, the local target's sudo password secret
 timeout = 300              # seconds the package step may run, 1..=3600; default 300
@@ -159,7 +163,12 @@ most 256 entries. A violation is exit 2: ``packages.install[1] `-rf`: must match
 `apk`, and PLAIN and each value follow the `install` rule and byte limit, with at most 256 plain names; a violation is
 exit 2 naming the plain name, such as ``packages.alias.fd `auto`: must be one of brew, pacman, apt, dnf, apk`` or
 ``packages.alias.fd.apt `x y`: must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*`` (all of them in
-[Aliases](packages.md#aliases)). How the manager is chosen and what runs is in [Packages](packages.md).
+[Aliases](packages.md#aliases)). `pin` and `remove` follow the `install` rule and limits, with the field in the message
+(``packages.remove[1] `-rf`: must match ...``, `packages.pin: N entries exceeds the 256 entry limit`), and a `remove`
+name also in `install` or `pin`, by plain name or by a manager's alias, is exit 2 with
+``packages.remove `nano`: also in install`` or ``packages.remove `fd-find`: also in install as `fd` on apt``; a name
+in both `install` and `pin` is allowed ([Pin and remove](packages.md#pin-and-remove)). How the manager is chosen and
+what runs is in [Packages](packages.md).
 
 The required names moved from `[anvil].secrets` to `[secrets].names`. A config with the legacy key is still read as
 before (setting both is exit 2). The next `anvil config` save writes it as `[secrets].names` and drops

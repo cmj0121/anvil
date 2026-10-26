@@ -145,16 +145,16 @@ Runs the config's `[[steps]]` in order on every selected target: each step's `ru
 every step on every target exited 0, else 1. apply runs directly: it prints no plan and asks for no confirmation; run
 [`anvil plan`](#anvil-plan) first to see what it would run.
 
-With `[packages]` that has work to do (a non-empty `install` or `upgrade = true`), each target first runs the facts
-probe over the same transport, resolves its package manager and runs the generated install/upgrade script as step 1,
+With `[packages]` that has work to do (a non-empty `install`, `pin` or `remove`, or `upgrade = true`), each target
+first runs the facts probe over the same transport, resolves its package manager and runs the generated script as step 1,
 before the `[[steps]]`. That step is an ordinary step: it shows as `$ SCRIPT` with its output, counts in
 `✔ ok · N steps` and in `steps` in `--json`, and a non-zero exit ends the target like any step. A probe that fails in the
-transport fails the target with that error as is; a probe that exits non-zero or prints bad output, or a manager that
-cannot be resolved, fails it with `packages: REASON`. Either way the target runs no steps (see
+transport fails the target with that error as is; a probe that exits non-zero or prints bad output, a manager that
+cannot be resolved, or a `pin` on brew, apt or apk, fails it with `packages: REASON`. Either way the target runs no steps (see
 [Packages](packages.md)). When the target's sudo asks for a password and it has a sudo secret, that step runs on a
 terminal and anvil types the password at sudo's prompt ([Typing the sudo password](packages.md#typing-the-sudo-password)); its
-`$` line is still the one-line script. Without `[packages]`, or with nothing to install or upgrade, no probe runs and
-apply runs only the `[[steps]]`.
+`$` line is still the one-line script. Without `[packages]`, or with nothing to install, upgrade, pin or remove, no
+probe runs and apply runs only the `[[steps]]`.
 
 Each `install` name goes into the script as the resolved manager's `[packages.alias]` entry, else as is
 ([Aliases](packages.md#aliases)). With this config apt and dnf install `fd-find`, and brew, pacman and apk `fd`; `anvil
@@ -167,6 +167,20 @@ install = ["fd"]
 [packages.alias.fd]
 apt = "fd-find"
 dnf = "fd-find"
+```
+
+`pin` and `remove` add to the same line ([Pin and remove](packages.md#pin-and-remove)). With this config pacman
+upgrades with `--ignore vim` and dnf with `--exclude=vim`, each then installs `vim` only when it is missing, and every
+manager removes `nano` when it is installed, after the install, with `brew uninstall`, `pacman -R --noconfirm`,
+`apt-get remove -y`, `dnf -y remove --setopt=clean_requirements_on_remove=False` or `apk del`, never purging or
+autoremoving (exact lines in [What runs](packages.md#what-runs)). brew, apt and apk fail the target before
+the step with `packages: pin is not one-shot on brew: vim` (or `apt`, `apk`), and `anvil plan` shows the same:
+
+```toml
+[packages]
+pin = ["vim"]
+remove = ["nano"]
+upgrade = true
 ```
 
 Human output is one block per target, a blank line after each, then a summary:
@@ -234,8 +248,8 @@ Shows the steps `anvil apply` would run on every selected target, and runs none 
 transport, even without `[packages]` work, so a target that cannot be reached fails here as it would under apply. Its
 steps then come from the same resolver apply uses: the package step when `[packages]` has work, then each `[[steps]]`
 entry. No package command and no `[[steps]]` script runs. A target that cannot be reached, probed or resolved fails
-with the same reason apply gives (`packages: REASON` for the probe and the manager), and the other targets are still
-planned.
+with the same reason apply gives (`packages: REASON` for the probe, the manager and a `pin` on brew, apt or apk, such
+as `packages: pin is not one-shot on brew: vim`), and the other targets are still planned.
 
 plan never opens the secret store. A step that would type a sudo password says which secret it would use; whether that
 secret is set and free of control characters is not checked, so plan can pass where apply then fails with

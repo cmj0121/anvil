@@ -12,7 +12,8 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
 - **`anvil doctor`** 回報每個 target 的資訊（OS、發行版、套件管理器、sudo）以及是否可連線。
 - **`anvil apply`** 以每個 target 的套件管理器（brew、pacman、apt、dnf、apk）安裝 config 中的套件，
   接著執行 config 中的 step。它直接執行，不會詢問確認。`[packages.alias]` 可依管理器為套件指定名稱，
-  因此 `fd` 在 apt 與 dnf 上會以 `fd-find` 安裝。
+  因此 `fd` 在 apt 與 dnf 上會以 `fd-find` 安裝。`remove` 會移除已安裝的套件，`pin` 則在 pacman 與 dnf 上讓套件不被升級
+  （brew、apt 與 apk 拒絕）。
 - **`anvil plan`** 列出 apply 會在每個 target 上執行的 step，但一個都不執行；`--json` 的文件標記為
   `"executed": false`。
 - **secret（機密）** 存放在 macOS keychain、age 檔案或 sops 檔案中，`anvil secret --migrate` 可在 backend 之間搬移它們。
@@ -56,6 +57,17 @@ install = ["fd"]
 [packages.alias.fd]
 apt = "fd-find"
 dnf = "fd-find"
+```
+
+一份讓 `vim` 維持現有版本並移除 `nano` 的 config（[鎖定與移除](docs/packages.zh-TW.md#鎖定與移除)）；
+在 brew、apt 或 apk 上，鎖定會使 target 以 `packages: pin is not one-shot on apt: vim` 失敗：
+
+```toml
+[packages]
+install = ["git"]
+pin = ["vim"]
+remove = ["nano"]
+upgrade = true
 ```
 
 ## 文件
