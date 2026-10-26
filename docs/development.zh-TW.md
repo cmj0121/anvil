@@ -21,17 +21,38 @@ make e2e    # doctor, apply and the ssh auth paths against an Arch sshd containe
 ## CI
 
 GitHub Actions（[`.github/workflows/ci.yml`](../.github/workflows/ci.yml)）會在每個 pull request、
-推送到 `main` 時執行，也可以手動觸發：
+推送到 `main` 時執行，也可以手動觸發，發布版本時也會執行：
 
 | Job          | 執行環境             | 檢查內容                                                                         |
 | ------------ | -------------------- | -------------------------------------------------------------------------------- |
+| `version`    | Ubuntu               | 在 `v*` tag 上檢查 tag 是否與 Cargo.toml 的 `version` 相符；在測試之前執行       |
 | `pre-commit` | Ubuntu               | `pre-commit run --all-files`（YAML、空白字元、gitleaks、markdownlint、prettier） |
 | `make test`  | Ubuntu 與 macOS      | 搭配 sops 與 python3 3.12 執行 `make test`，再以 `--no-default-features` 建置    |
 | `MSRV`       | Ubuntu、Rust 1.89    | 以 Cargo.toml 的 `rust-version` 執行 `cargo check --all-targets`                 |
 | `make e2e`   | Ubuntu，在測試通過後 | 對 amd64 的 Arch 映像檔執行 `make e2e`；出現 `skip`（沒有 docker）時該 job 失敗  |
+| `build`      | Ubuntu 與 macOS      | 在測試通過後，為三個 target 建置 release 執行檔，並保留為 artifact（見下文）     |
+
+`build` 以 `cargo build --release --locked` 為 `aarch64-apple-darwin`、`x86_64-apple-darwin` 與 `x86_64-unknown-linux-musl` 建置執行檔。
+[`.github/package.sh`](../.github/package.sh) 將每個執行檔打包成 `anvil-<version>-<target>.tar.gz` 與 `.sha256`，
+並上傳為保留 14 天的 workflow artifact。
 
 各個 action 都以 commit SHA 固定版本，sops 則是固定版本的 release，並比對其 SHA-256（`.github/install-sops.sh`）。
 會寫入登入 keychain 的測試維持 `#[ignore]`，不在 CI 中執行。
+
+## 發布版本
+
+發布版本時，先調高 Cargo.toml 的 `version`，
+執行 `cargo check` 讓 Cargo.lock 跟著更新版本（`build` 使用 `--locked`），
+將這兩個檔案一起 commit 到 `main`，再推送與其相符的 `vX.Y.Z` tag；
+該 tag 必須指向 `main` 上的 commit。
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) 會在該 tag 上執行完整的 CI，
+接著發布一個附上壓縮檔與其 checksum 的 GitHub Release。
+重新執行該 workflow 會將這些檔案重新上傳到同一個 release。
+含有 `-` 的 tag（例如 `v0.2.0-rc.1`）會標示為 prerelease。
+這些檔案都沒有簽署，也沒有經過 notarization。
+
+要撤回有問題的版本，請執行 `gh release delete vX.Y.Z --cleanup-tag --yes`，
+修正問題後再推送新的 patch 版本 tag。
 
 anvil 刻意偏離設計 issue 之處，列在[偏離設計之處](deviations.zh-TW.md)。
 
