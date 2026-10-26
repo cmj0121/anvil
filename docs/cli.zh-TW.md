@@ -262,10 +262,11 @@ keychain 目標在中途失敗時會列出已寫入的名稱。值絕不會出�
 單獨執行 `anvil` 仍印出說明，因此腳本或 agent 絕不會掉進 TUI。
 stdin 與 stdout 必須是終端機（否則以 2 結束，`anvil tui needs a terminal`），
 且 `--json` 會被拒絕（以 2 結束，`anvil tui: --json is not available`），儘管 `anvil tui --help` 將它列在全域旗標中。
-全域旗標是起始狀態：`--target` 預先選取列，`-v` 設定 Log pane 的層級，`--inventory`、`--config` 與 `--ssh-config` 設定路徑。
+全域旗標是起始狀態：`--target` 預先選取 `t` overlay 中的列，`-v` 設定 Log pane 的層級，`--inventory`、`--config` 與 `--ssh-config` 設定路徑。
 無法載入的 inventory（任何載入錯誤：無法讀取，例如權限不足或是目錄、無效或模稜兩可、
 不以 `.toml` 結尾的 `--inventory` 路徑，或沒有 `$HOME`）不會以 2 結束：
-TUI 照常啟動，並在 Inventory pane 中顯示錯誤，取代 Targets 與 Tags；`o` 變更路徑，`r` 重新載入。
+TUI 照常啟動，在標頭以紅色顯示 `inventory error`，錯誤本身則顯示為狀態列通知，並在 `t` overlay 中取代它的列；
+`o` 變更路徑，`r` 重新載入。
 未知的 `--target` 和任何指令一樣以 2 結束，但只在 inventory 載入成功時。離開時以 0 結束。
 
 畫面、按鍵表與 TUI 的規則請見 [終端機介面](tui.zh-TW.md)。
@@ -294,7 +295,7 @@ TUI 照常啟動，並在 Inventory pane 中顯示錯誤，取代 Targets 與 Ta
   `tui` 見下方。
 - **`tui`**：離開時為 0，不論結果為何。
   stdin 或 stdout 不是終端機、使用 `--json`，或未知的 `--target`（只在 inventory 載入成功時檢查）時為 2；
-  無法載入的 inventory（任何載入錯誤，包括不以 `.toml` 結尾的 `--inventory` 路徑）改為顯示在 Inventory pane 中。
+  無法載入的 inventory（任何載入錯誤，包括不以 `.toml` 結尾的 `--inventory` 路徑）改為顯示在標頭、狀態列與 `t` overlay 中。
   終端機無法設定（`cannot handle SIGINT: …`、`cannot enter the terminal: …`）或 TUI 執行中失敗（`terminal: …`）時為 1。
 
 ## SSH 行為

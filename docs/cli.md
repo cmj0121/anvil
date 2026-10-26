@@ -269,12 +269,13 @@ Human output: `migrated N secrets from X to Y` (`1 secret` for one). `--json`:
 Runs every command above in one terminal UI and keeps their results for browsing. It starts only when asked: bare
 `anvil` still prints the help, so a script or an agent never lands in a TUI. stdin and stdout must be a terminal (else
 exit 2, `anvil tui needs a terminal`), and `--json` is refused (exit 2, `anvil tui: --json is not available`), although
-`anvil tui --help` lists it among the global flags. The global flags are the starting state: `--target` preselects rows,
-`-v` sets the Log pane level, and `--inventory`, `--config` and `--ssh-config` the paths. An inventory that does not
-load (any load error: unreadable, such as permission denied or a directory, invalid or ambiguous, an `--inventory`
-path not ending in `.toml`, or no `$HOME`) is not exit 2: the TUI starts and shows the error in the Inventory pane, in
-place of Targets and Tags; `o` changes the path and `r` reloads it. An unknown `--target` is exit 2, as for any command,
-but only when the inventory loads. Quitting exits 0.
+`anvil tui --help` lists it among the global flags. The global flags are the starting state: `--target` preselects
+rows of the `t` overlay, `-v` sets the Log pane level, and `--inventory`, `--config` and `--ssh-config` the paths. An
+inventory that does not load (any load error: unreadable, such as permission denied or a directory, invalid or
+ambiguous, an `--inventory` path not ending in `.toml`, or no `$HOME`) is not exit 2: the TUI starts and shows
+`inventory error` in red in the header, the error as the status-bar notice and in the `t` overlay in place of its rows;
+`o` changes the path and `r` reloads it. An unknown `--target` is exit 2, as for any command, but only when the
+inventory loads. Quitting exits 0.
 
 The screen, the key table and the TUI's rules are in [tui.md](tui.md).
 
@@ -305,8 +306,9 @@ that exits non-zero aborts the command: nothing is written, exit 1.
   attempts, or a secret larger than 1 MiB. For `tui`, see below.
 - **`tui`**: 0 on quit, whatever the results. 2 when stdin or stdout is not a terminal, for `--json`, or for an unknown
   `--target` (checked only when the inventory loads); an inventory that does not load (any load error, including an
-  `--inventory` path not ending in `.toml`) is shown in the Inventory pane instead. 1 when the terminal cannot be set up
-  (`cannot handle SIGINT: …`, `cannot enter the terminal: …`) or fails while the TUI runs (`terminal: …`).
+  `--inventory` path not ending in `.toml`) is shown in the header, the status bar and the `t` overlay instead. 1 when
+  the terminal cannot be set up (`cannot handle SIGINT: …`, `cannot enter the terminal: …`) or fails while the TUI runs
+  (`terminal: …`).
 
 ## SSH behaviour
 
