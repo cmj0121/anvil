@@ -1,0 +1,5 @@
+[packages]
+install = ["fd"]
+
+[packages.alias.fd]
+auto = "x"

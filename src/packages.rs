@@ -1,6 +1,7 @@
 //! `[packages]`: the package manager each target uses, and the one-line
 //! script that installs or upgrades packages with it.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -22,7 +23,13 @@ pub const DEFAULT_TIMEOUT: u64 = 300;
 /// Longest `timeout`, in seconds.
 pub const MAX_TIMEOUT: u64 = 3600;
 
-const CHOICES: &str = "auto, brew, pacman, apt, dnf, apk";
+macro_rules! managers {
+    () => {
+        "brew, pacman, apt, dnf, apk"
+    };
+}
+const CHOICES: &str = concat!("auto, ", managers!());
+const MANAGERS: &str = managers!();
 const BREW_PATH: &str =
     "export PATH=\"$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin\"; ";
 
@@ -158,6 +165,9 @@ pub struct Packages {
     pub local: Option<Choice>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub install: Vec<String>,
+    /// Per plain name, the name each manager uses instead.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub alias: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub upgrade: bool,
     /// The secret holding the sudo password of the `local` target.
@@ -177,6 +187,7 @@ impl Default for Packages {
             manager: Choice::default(),
             local: None,
             install: Vec::new(),
+            alias: BTreeMap::new(),
             upgrade: false,
             local_sudo_secret: None,
             timeout: DEFAULT_TIMEOUT,
@@ -193,8 +204,8 @@ fn is_default_timeout(timeout: &u64) -> bool {
 }
 
 impl Packages {
-    /// Checks the `install` names, `local_sudo_secret` and `timeout`; the
-    /// error names the entry.
+    /// Checks the `install` names, the `alias` table, `local_sudo_secret` and
+    /// `timeout`; the error names the entry.
     pub fn validate(&self) -> Result<(), String> {
         if !(1..=MAX_TIMEOUT).contains(&self.timeout) {
             return Err(format!(
@@ -218,14 +229,30 @@ impl Packages {
             ));
         }
         for (i, name) in self.install.iter().enumerate() {
-            if name.len() > MAX_NAME_BYTES {
-                return Err(format!(
-                    "packages.install[{i}] `{name}`: {} bytes exceeds the {MAX_NAME_BYTES} byte limit",
-                    name.len()
-                ));
-            }
-            if !is_name(name) {
-                return Err(format!("packages.install[{i}] `{name}`: {NAME_RULE}"));
+            check_name(name).map_err(|why| format!("packages.install[{i}] `{name}`: {why}"))?;
+        }
+        if self.alias.len() > MAX_INSTALL {
+            return Err(format!(
+                "packages.alias: {} entries exceeds the {MAX_INSTALL} entry limit",
+                self.alias.len()
+            ));
+        }
+        for (plain, names) in &self.alias {
+            check_name(plain)
+                .map_err(|why| format!("packages.alias `{}`: {why}", secret::shown_name(plain)))?;
+            for (key, name) in names {
+                if Manager::parse(key).is_none() {
+                    return Err(format!(
+                        "packages.alias.{plain} `{}`: must be one of {MANAGERS}",
+                        secret::shown_name(key)
+                    ));
+                }
+                check_name(name).map_err(|why| {
+                    format!(
+                        "packages.alias.{plain}.{key} `{}`: {why}",
+                        secret::shown_name(name)
+                    )
+                })?;
             }
         }
         Ok(())
@@ -268,6 +295,21 @@ impl Packages {
             .iter()
             .filter_map(|target| self.sudo_secret_for(target))
     }
+}
+
+/// `name` within the byte limit and [`NAME_RULE`]; the error is the rule it
+/// breaks, for the caller to prefix with the field.
+fn check_name(name: &str) -> Result<(), String> {
+    if name.len() > MAX_NAME_BYTES {
+        return Err(format!(
+            "{} bytes exceeds the {MAX_NAME_BYTES} byte limit",
+            name.len()
+        ));
+    }
+    if !is_name(name) {
+        return Err(NAME_RULE.to_string());
+    }
+    Ok(())
 }
 
 /// `[A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*`.
@@ -741,6 +783,96 @@ mod tests {
     }
 
     #[test]
+    fn aliases_parse_in_both_formats() {
+        let toml = parse("install = [\"fd\"]\n[alias.fd]\napt = \"fd-find\"\ndnf = \"fd-find\"\n")
+            .unwrap();
+        let yaml: Packages = document::from_str(
+            "install: [fd]\nalias:\n  fd:\n    apt: fd-find\n    dnf: fd-find\n",
+            Format::Yaml,
+        )
+        .unwrap();
+        assert_eq!(toml, yaml);
+        assert_eq!(toml.alias["fd"]["apt"], "fd-find");
+        assert_eq!(toml.alias["fd"]["dnf"], "fd-find");
+        assert_eq!(toml.validate(), Ok(()));
+        // An empty table, and an alias for a name not in `install`, are fine.
+        let p = parse("[alias.fd]\n[alias.rg]\nbrew = \"ripgrep\"\n").unwrap();
+        assert_eq!(p.validate(), Ok(()));
+        assert!(parse("[alias]\nfd = 3\n").is_err());
+    }
+
+    #[test]
+    fn aliases_are_validated_and_name_the_plain_name() {
+        for (text, err) in [
+            (
+                "[alias.fd]\nauto = \"x\"\n",
+                "packages.alias.fd `auto`: must be one of brew, pacman, apt, dnf, apk".to_string(),
+            ),
+            (
+                "[alias.fd]\nyum = \"x\"\n",
+                "packages.alias.fd `yum`: must be one of brew, pacman, apt, dnf, apk".to_string(),
+            ),
+            (
+                "[alias.fd]\napt = \"x y\"\n",
+                format!("packages.alias.fd.apt `x y`: {NAME_RULE}"),
+            ),
+            (
+                "[alias.fd]\napt = \"\"\n",
+                format!("packages.alias.fd.apt ``: {NAME_RULE}"),
+            ),
+            (
+                "[alias.\"-x\"]\napt = \"x\"\n",
+                format!("packages.alias `-x`: {NAME_RULE}"),
+            ),
+            (
+                &format!("[alias.fd]\napt = \"{}\"\n", "x".repeat(129)),
+                format!(
+                    "packages.alias.fd.apt `{}…`: 129 bytes exceeds the 128 byte limit",
+                    "x".repeat(64)
+                ),
+            ),
+            (
+                &format!("[alias.{}]\n", "x".repeat(129)),
+                format!(
+                    "packages.alias `{}…`: 129 bytes exceeds the 128 byte limit",
+                    "x".repeat(64)
+                ),
+            ),
+            (
+                "[alias.\"f\\u001b[2Jd\"]\n",
+                format!("packages.alias `f\\x1b[2Jd`: {NAME_RULE}"),
+            ),
+            (
+                "[alias.fd]\n\"a\\u001b]0;x\\u0007pt\" = \"x\"\n",
+                "packages.alias.fd `a\\x1b]0;x\\x07pt`: must be one of brew, pacman, apt, dnf, apk"
+                    .to_string(),
+            ),
+            (
+                "[alias.fd]\napt = \"x\\ny\"\n",
+                format!("packages.alias.fd.apt `x\\ny`: {NAME_RULE}"),
+            ),
+        ] {
+            assert_eq!(parse(text).unwrap().validate(), Err(err), "{text}");
+        }
+
+        let ok = "x".repeat(128);
+        let p = parse(&format!("[alias.{ok}]\napt = \"{ok}\"\n")).unwrap();
+        assert_eq!(p.validate(), Ok(()));
+        let mut p = Packages {
+            alias: (0..MAX_INSTALL)
+                .map(|i| (format!("p{i}"), BTreeMap::new()))
+                .collect(),
+            ..Packages::default()
+        };
+        assert_eq!(p.validate(), Ok(()));
+        p.alias.insert("one-more".into(), BTreeMap::new());
+        assert_eq!(
+            p.validate(),
+            Err("packages.alias: 257 entries exceeds the 256 entry limit".to_string())
+        );
+    }
+
+    #[test]
     fn choices_parse_and_unknown_values_name_the_key() {
         let p =
             parse("manager = \"pacman\"\nlocal = \"brew\"\ninstall = [\"git\"]\nupgrade = true\n")
@@ -788,6 +920,10 @@ mod tests {
             manager: Choice::Is(Manager::Apt),
             local: Some(Choice::Auto),
             install: vec!["git".into(), "curl".into()],
+            alias: BTreeMap::from([(
+                "fd".into(),
+                BTreeMap::from([("apt".into(), "fd-find".into())]),
+            )]),
             upgrade: true,
             local_sudo_secret: Some("LOCAL_SUDO".into()),
             timeout: 600,
@@ -803,7 +939,7 @@ mod tests {
         assert_eq!(
             text,
             "manager = \"apt\"\nlocal = \"auto\"\ninstall = [\"git\", \"curl\"]\nupgrade = true\n\
-             local_sudo_secret = \"LOCAL_SUDO\"\ntimeout = 600\n"
+             local_sudo_secret = \"LOCAL_SUDO\"\ntimeout = 600\n\n[alias.fd]\napt = \"fd-find\"\n"
         );
         assert_eq!(
             document::to_string(&Packages::default(), Format::Toml).unwrap(),
