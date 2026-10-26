@@ -410,9 +410,8 @@ if python3 -c 'import os; os.login_tty' 2>/dev/null; then
   # A HOME of its own, so the master (e) left behind does not answer for archpw.
   mkdir -p "$TMP/home-tui"
   before=$(docker logs "$NAME" 2>&1 | grep -c 'Accepted password for pw')
-  # The targets pane may shorten the name (`ar… pw@…`), so match on the user.
   run_env HOME="$TMP/home-tui" PTY_PASSWORD="$PASSWORD" python3 tests/fixtures/pty_tui.py --prompts 1 \
-    --wait '\[x\] ar\S* pw@' --send d --wait 'connectable +yes' --wait 'distro +arch' --send q \
+    --wait 'targets: archpw' --send d --wait 'connectable +yes' --wait 'distro +arch' --send q \
     -- "$ANVIL" --ssh-config "$CFG" tui --target archpw >"$TMP/out" 2>"$TMP/err"
   code=$?
   after=$(docker logs "$NAME" 2>&1 | grep -c 'Accepted password for pw')
