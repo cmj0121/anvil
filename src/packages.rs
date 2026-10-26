@@ -7,6 +7,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::facts::Facts;
 use crate::inventory::{Target, TargetKind};
+use crate::secret;
+use crate::transport::{SUDO_OK, TTY_READY};
 
 /// Most `install` entries.
 pub const MAX_INSTALL: usize = 256;
@@ -153,11 +155,24 @@ pub struct Packages {
     pub install: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub upgrade: bool,
+    /// The secret holding the sudo password of the `local` target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_sudo_secret: Option<String>,
 }
 
 impl Packages {
-    /// Checks the `install` names; the error names the entry.
+    /// Checks the `install` names and `local_sudo_secret`; the error names
+    /// the entry.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(name) = &self.local_sudo_secret
+            && !secret::is_name(name)
+        {
+            return Err(format!(
+                "packages.local_sudo_secret `{}`: {}",
+                secret::shown_name(name),
+                secret::NAME_RULE
+            ));
+        }
         if self.install.len() > MAX_INSTALL {
             return Err(format!(
                 "packages.install: {} entries exceeds the {MAX_INSTALL} entry limit",
@@ -194,6 +209,22 @@ impl Packages {
             })
             .unwrap_or(self.manager)
     }
+
+    /// The secret holding `target`'s sudo password: its inventory
+    /// `sudo_secret`, else `local_sudo_secret` for the local target.
+    pub fn sudo_secret_for<'a>(&'a self, target: &'a Target) -> Option<&'a str> {
+        target.sudo_secret.as_deref().or(match target.kind {
+            TargetKind::Local => self.local_sudo_secret.as_deref(),
+            TargetKind::Ssh { .. } => None,
+        })
+    }
+
+    /// The sudo secrets of `targets`, per [`Self::sudo_secret_for`].
+    pub fn sudo_secrets<'a>(&'a self, targets: &'a [Target]) -> impl Iterator<Item = &'a str> {
+        targets
+            .iter()
+            .filter_map(|target| self.sudo_secret_for(target))
+    }
 }
 
 /// `[A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*`.
@@ -207,8 +238,9 @@ fn is_name(s: &str) -> bool {
 
 /// The manager `choice` means on the target `facts` describe: it must be
 /// installed, and runnable by the connecting user (brew not as root, the
-/// others as root or through passwordless sudo).
-pub fn resolve(choice: Choice, facts: &Facts) -> Result<Manager, String> {
+/// others as root, through passwordless sudo, or, with `sudo_secret`, through
+/// sudo with a password).
+pub fn resolve(choice: Choice, facts: &Facts, sudo_secret: bool) -> Result<Manager, String> {
     let installed = facts.pkg();
     let manager = match choice {
         Choice::Is(manager) => {
@@ -240,13 +272,34 @@ pub fn resolve(choice: Choice, facts: &Facts) -> Result<Manager, String> {
         (Manager::Brew, false) | (_, true) => Ok(manager),
         (_, false) => match facts.get("sudo") {
             Some("nopasswd") => Ok(manager),
+            Some("binary") if sudo_secret => Ok(manager),
             Some("binary") => Err(format!(
                 "`{manager}` needs root and sudo asks for a password; \
-                 set NOPASSWD or connect as root"
+                 set sudo_secret (local_sudo_secret for local), set NOPASSWD, or connect as root"
             )),
             _ => Err(format!("`{manager}` needs root and sudo is not installed")),
         },
     }
+}
+
+/// Whether `manager`, resolved on the target `facts` describe, runs through
+/// sudo with a password: not brew, not root, and sudo without NOPASSWD.
+pub fn uses_password(manager: Manager, facts: &Facts) -> bool {
+    manager != Manager::Brew && !facts.is_root() && facts.get("sudo") == Some("binary")
+}
+
+/// `script` (from [`script`]) wrapped to run on a terminal: it turns echo off,
+/// reads anvil's prompt from the terminal, validates sudo with it, runs
+/// `script`, and drops the sudo ticket whatever the outcome, a hangup or a
+/// signal included; the exit code is `script`'s, or sudo's when it fails.
+pub fn with_password(script: &str) -> String {
+    format!(
+        "export TERM=dumb\n\
+         mesg n </dev/tty 2>/dev/null; stty -echo </dev/tty; echo {TTY_READY}\n\
+         IFS= read -r n </dev/tty\n\
+         trap 'sudo -k' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM\n\
+         LC_ALL=C SUDO_PROMPT=\"$n\" sudo -v </dev/tty && echo {SUDO_OK} && {script}\n"
+    )
 }
 
 /// The one-line script that upgrades and installs `packages` with
@@ -503,7 +556,7 @@ mod tests {
             let f = facts(&format!(
                 "distro={distro};user=cmj;sudo=nopasswd;pkg=brew pacman apt dnf apk"
             ));
-            assert_eq!(resolve(Choice::Auto, &f), Ok(want), "{distro}");
+            assert_eq!(resolve(Choice::Auto, &f, false), Ok(want), "{distro}");
         }
     }
 
@@ -513,6 +566,7 @@ mod tests {
             resolve(
                 Choice::Auto,
                 &facts(&format!("distro=gentoo;user=cmj;sudo=nopasswd;pkg={pkg}")),
+                false,
             )
         };
         assert_eq!(resolve_with("brew apk"), Ok(Manager::Apk));
@@ -523,7 +577,11 @@ mod tests {
             Err("no package manager found".to_string())
         );
         assert_eq!(
-            resolve(Choice::Auto, &facts("user=cmj;sudo=nopasswd;pkg=apt")),
+            resolve(
+                Choice::Auto,
+                &facts("user=cmj;sudo=nopasswd;pkg=apt"),
+                false
+            ),
             Ok(Manager::Apt),
             "no distro fact"
         );
@@ -533,14 +591,17 @@ mod tests {
     fn a_manager_that_is_not_installed_is_an_error() {
         let f = facts("distro=arch;user=cmj;sudo=nopasswd;pkg=brew");
         assert_eq!(
-            resolve(Choice::Auto, &f),
+            resolve(Choice::Auto, &f, false),
             Err("`pacman`, the default for arch, is not installed".to_string())
         );
         assert_eq!(
-            resolve(Choice::Is(Manager::Apt), &f),
+            resolve(Choice::Is(Manager::Apt), &f, false),
             Err("`apt` is not installed on this target".to_string())
         );
-        assert_eq!(resolve(Choice::Is(Manager::Brew), &f), Ok(Manager::Brew));
+        assert_eq!(
+            resolve(Choice::Is(Manager::Brew), &f, false),
+            Ok(Manager::Brew)
+        );
     }
 
     #[test]
@@ -550,21 +611,24 @@ mod tests {
         };
         let pacman = Choice::Is(Manager::Pacman);
         assert_eq!(
-            resolve(pacman, &with("cmj", "nopasswd")),
+            resolve(pacman, &with("cmj", "nopasswd"), false),
             Ok(Manager::Pacman)
         );
         assert_eq!(
-            resolve(pacman, &with("cmj", "binary")),
+            resolve(pacman, &with("cmj", "binary"), false),
             Err("`pacman` needs root and sudo asks for a password; \
-                 set NOPASSWD or connect as root"
+                 set sudo_secret (local_sudo_secret for local), set NOPASSWD, or connect as root"
                 .to_string())
         );
         assert_eq!(
-            resolve(pacman, &with("cmj", "none")),
+            resolve(pacman, &with("cmj", "none"), false),
             Err("`pacman` needs root and sudo is not installed".to_string())
         );
         for sudo in ["nopasswd", "binary", "none"] {
-            assert_eq!(resolve(pacman, &with("root", sudo)), Ok(Manager::Pacman));
+            assert_eq!(
+                resolve(pacman, &with("root", sudo), false),
+                Ok(Manager::Pacman)
+            );
         }
     }
 
@@ -574,16 +638,19 @@ mod tests {
             facts(&format!("distro=macos;user={user};sudo={sudo};pkg=brew"))
         };
         assert_eq!(
-            resolve(Choice::Auto, &with("root", "nopasswd")),
+            resolve(Choice::Auto, &with("root", "nopasswd"), false),
             Err("brew refuses to run as root".to_string())
         );
         assert_eq!(
-            resolve(Choice::Is(Manager::Brew), &with("root", "nopasswd")),
+            resolve(Choice::Is(Manager::Brew), &with("root", "nopasswd"), false),
             Err("brew refuses to run as root".to_string()),
             "an explicit brew is refused as root too"
         );
         for sudo in ["nopasswd", "binary", "none"] {
-            assert_eq!(resolve(Choice::Auto, &with("cmj", sudo)), Ok(Manager::Brew));
+            assert_eq!(
+                resolve(Choice::Auto, &with("cmj", sudo), false),
+                Ok(Manager::Brew)
+            );
         }
     }
 
@@ -679,6 +746,7 @@ mod tests {
             local: Some(Choice::Auto),
             install: vec!["git".into(), "curl".into()],
             upgrade: true,
+            local_sudo_secret: Some("LOCAL_SUDO".into()),
         };
         for format in [Format::Toml, Format::Yaml] {
             for p in [full.clone(), Packages::default()] {
@@ -690,7 +758,8 @@ mod tests {
         let text = document::to_string(&full, Format::Toml).unwrap();
         assert_eq!(
             text,
-            "manager = \"apt\"\nlocal = \"auto\"\ninstall = [\"git\", \"curl\"]\nupgrade = true\n"
+            "manager = \"apt\"\nlocal = \"auto\"\ninstall = [\"git\", \"curl\"]\nupgrade = true\n\
+             local_sudo_secret = \"LOCAL_SUDO\"\n"
         );
         assert_eq!(
             document::to_string(&Packages::default(), Format::Toml).unwrap(),
@@ -704,6 +773,7 @@ mod tests {
             name: "local".into(),
             kind: TargetKind::Local,
             pkg: None,
+            sudo_secret: None,
         };
         let host = Target {
             name: "box".into(),
@@ -713,6 +783,7 @@ mod tests {
                 port: None,
             },
             pkg: None,
+            sudo_secret: None,
         };
         let p = Packages {
             manager: Choice::Is(Manager::Pacman),
@@ -729,5 +800,177 @@ mod tests {
         let p = Packages::default();
         assert_eq!(p.choice_for(&local), Choice::Auto);
         assert_eq!(p.choice_for(&host), Choice::Auto);
+    }
+
+    #[test]
+    fn with_a_sudo_secret_a_password_sudo_is_accepted() {
+        let with = |user: &str, sudo: &str| {
+            facts(&format!(
+                "distro=arch;user={user};sudo={sudo};pkg=pacman brew"
+            ))
+        };
+        let pacman = Choice::Is(Manager::Pacman);
+        let brew = Choice::Is(Manager::Brew);
+        // (user, sudo fact, secret) -> resolved, password used
+        let cases = [
+            ("cmj", "binary", true, Ok(Manager::Pacman), true),
+            ("cmj", "nopasswd", true, Ok(Manager::Pacman), false),
+            ("cmj", "nopasswd", false, Ok(Manager::Pacman), false),
+            ("root", "binary", true, Ok(Manager::Pacman), false),
+            ("root", "binary", false, Ok(Manager::Pacman), false),
+            (
+                "cmj",
+                "none",
+                true,
+                Err("`pacman` needs root and sudo is not installed".to_string()),
+                false,
+            ),
+            (
+                "cmj",
+                "binary",
+                false,
+                Err("`pacman` needs root and sudo asks for a password; \
+                     set sudo_secret (local_sudo_secret for local), set NOPASSWD, or connect as root"
+                    .to_string()),
+                false,
+            ),
+        ];
+        for (user, sudo, secret, want, password) in cases {
+            let f = with(user, sudo);
+            let got = resolve(pacman, &f, secret);
+            assert_eq!(got, want, "{user} {sudo} secret={secret}");
+            if let Ok(manager) = got {
+                assert_eq!(
+                    uses_password(manager, &f),
+                    password,
+                    "{user} {sudo} secret={secret}"
+                );
+            }
+        }
+        let f = with("cmj", "binary");
+        assert_eq!(resolve(brew, &f, true), Ok(Manager::Brew));
+        assert!(!uses_password(Manager::Brew, &f), "brew never uses sudo");
+    }
+
+    #[test]
+    fn the_password_wrapper_is_d4_exactly() {
+        let one_liner = script(Manager::Pacman, &packages(&["git"], false), false).unwrap();
+        assert_eq!(
+            with_password(&one_liner),
+            "export TERM=dumb\n\
+             mesg n </dev/tty 2>/dev/null; stty -echo </dev/tty; echo anvil-tty-ready\n\
+             IFS= read -r n </dev/tty\n\
+             trap 'sudo -k' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM\n\
+             LC_ALL=C SUDO_PROMPT=\"$n\" sudo -v </dev/tty && echo anvil-sudo-ok && \
+             sudo -n pacman -S --noconfirm --needed git\n"
+        );
+    }
+
+    /// Runs the password wrapper around `one_liner` on a terminal with a fake
+    /// `sudo` first in `PATH` that logs its arguments; the output and the log.
+    fn run_wrapper(one_liner: &str) -> (crate::transport::Output, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir("wrapper");
+        let log = dir.join("log");
+        let sudo = dir.join("sudo");
+        std::fs::write(
+            &sudo,
+            format!(
+                "#!/bin/sh\necho \"$*\" >>{}\n\
+                 [ \"$1\" = -v ] && printf %s \"$SUDO_PROMPT\" >/dev/tty && IFS= read -r pw </dev/tty\n\
+                 exit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap());
+        let mut command = crate::transport::local_tty_command(&with_password(one_liner));
+        command.env("PATH", path);
+        let out = crate::transport::run_tty_with(
+            &mut command,
+            b"hunter2-secret",
+            crate::transport::TtyLimits::DEFAULT,
+        )
+        .unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        (out, logged)
+    }
+
+    #[test]
+    fn the_password_wrapper_drops_the_ticket_and_keeps_the_exit_code() {
+        let (out, logged) = run_wrapper("sh -c 'exit 3'");
+        assert_eq!(out.code, Some(3));
+        assert_eq!(logged, "-v\n-k\n");
+    }
+
+    #[test]
+    fn a_terminated_wrapper_stops_and_drops_the_ticket() {
+        let started = std::time::Instant::now();
+        let (out, logged) = run_wrapper("kill -TERM $$; sleep 10; echo still-running");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(out.code, Some(143));
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("still-running"),
+            "{out:?}"
+        );
+        assert_eq!(logged, "-v\n-k\n");
+    }
+
+    #[test]
+    fn local_sudo_secret_is_validated_and_parsed() {
+        let p = parse("local_sudo_secret = \"LOCAL_SUDO\"\n").unwrap();
+        assert_eq!(p.local_sudo_secret.as_deref(), Some("LOCAL_SUDO"));
+        assert_eq!(p.validate(), Ok(()));
+        for bad in ["local_sudo", "1X", "", "A-B"] {
+            let p = Packages {
+                local_sudo_secret: Some(bad.to_string()),
+                ..Packages::default()
+            };
+            assert_eq!(
+                p.validate(),
+                Err(format!(
+                    "packages.local_sudo_secret `{bad}`: {}",
+                    secret::NAME_RULE
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn the_effective_sudo_secret_is_the_hosts_else_local_sudo_secret_for_local() {
+        let local = Target {
+            name: "local".into(),
+            kind: TargetKind::Local,
+            pkg: None,
+            sudo_secret: None,
+        };
+        let host = Target {
+            name: "box".into(),
+            kind: TargetKind::Ssh {
+                host: "box".into(),
+                user: None,
+                port: None,
+            },
+            pkg: None,
+            sudo_secret: None,
+        };
+        let p = Packages {
+            local_sudo_secret: Some("LOCAL_SUDO".into()),
+            ..Packages::default()
+        };
+        assert_eq!(p.sudo_secret_for(&local), Some("LOCAL_SUDO"));
+        assert_eq!(
+            p.sudo_secret_for(&host),
+            None,
+            "local_sudo_secret is local only"
+        );
+        let with_secret = Target {
+            sudo_secret: Some("BOX_SUDO".into()),
+            ..host
+        };
+        assert_eq!(p.sudo_secret_for(&with_secret), Some("BOX_SUDO"));
+        assert_eq!(Packages::default().sudo_secret_for(&local), None);
     }
 }

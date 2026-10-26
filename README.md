@@ -48,6 +48,7 @@ user = "cmj"              # optional, else ssh's own default
 port = 22                 # optional
 tags = ["linode", "arch"] # optional; select hosts with --target
 pkg = "pacman"            # optional; this host's package manager, overrides [packages].manager
+sudo_secret = "HOST_SUDO" # optional; the secret holding this host's sudo password, see Packages
 ```
 
 `local` is reserved for this machine and is always present. Per-host ssh options (keys, jump hosts) belong in
@@ -71,6 +72,7 @@ manager = "auto"           # auto | brew | pacman | apt | dnf | apk; default aut
 local = "brew"             # optional; the choice for `local`, which has no inventory entry
 install = ["git", "curl"]  # default []
 upgrade = false            # upgrade every installed package first; default false
+local_sudo_secret = "LOCAL_SUDO" # optional; the secret holding this machine's sudo password
 
 [[steps]]
 run = "hostname"           # placeholder: a POSIX sh script run on every target
@@ -93,9 +95,12 @@ Arch and its derivatives pacman, Debian and Ubuntu apt, Fedora and RHEL dnf, Alp
 first manager found that is not brew, else brew.
 
 brew runs as the connecting user and refuses root. Every other manager needs root: anvil connects as `root` or runs it
-with `sudo -n`, so sudo must be passwordless (NOPASSWD); anvil never types a sudo password, and a target where sudo asks
-for one fails with `packages: ...`. `anvil doctor` shows the manager each target resolves to, as a `manager` row, and
-fails when one cannot be resolved. The exact commands and rules are in [docs/cli.md](docs/cli.md#packages).
+with `sudo -n`. When sudo asks for a password, name a secret that holds it, `sudo_secret` on the host (or
+`[packages].local_sudo_secret` for `local`), and set it with `anvil secret NAME`: apply then runs the package step on a
+terminal and types the password once at sudo's prompt. Without one, such a target fails with `packages: ...`.
+NOPASSWD and `root` targets never use the password. `anvil doctor` checks those secrets and shows the manager each
+target resolves to, as a `manager` row, and fails when one cannot be resolved. The exact commands and rules are in
+[docs/cli.md](docs/cli.md#packages).
 
 ### Secrets
 
@@ -279,6 +284,11 @@ contents are never logged.
 - **Comments are not preserved.** `anvil inventory` and `anvil config` rewrite the file from the parsed document, so
   comments in it are lost on save.
 - **Host keys are never auto-accepted.** Connect once with `ssh <host>` to verify a new host's fingerprint.
+- **Sudo passwords stay out of sight.** anvil types a sudo password from `sudo_secret` on the target's terminal, with
+  echo off, and never puts it in argv, the environment, a file, a log line or an error. As a backstop, step output (and
+  so `--json`) has any occurrence of a password of 8 bytes or more replaced with `***`; a shorter one is not scrubbed.
+  sudo must show anvil's own prompt; a PAM prompt of another kind (2FA, fingerprint) fails the target after 15 s. See
+  [docs/cli.md](docs/cli.md#typing-the-sudo-password).
 
 ## Development
 

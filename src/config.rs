@@ -848,6 +848,14 @@ mod tests {
                 .contains("packages.install[1] `-rf`: must match"),
             "{err}"
         );
+        let config = parse("[packages]\nlocal_sudo_secret = \"sudo\"\n");
+        let err = config.validate(Path::new("config.toml")).unwrap_err();
+        assert!(matches!(err, DocumentError::Invalid { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("packages.local_sudo_secret `sudo`: must match [A-Z][A-Z0-9_]*"),
+            "{err}"
+        );
         for (text, format, needle) in [
             (
                 "[packages]\nmanager = \"yum\"\n",

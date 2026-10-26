@@ -847,6 +847,7 @@ pub mod tests {
             port,
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
             pkg: None,
+            sudo_secret: None,
         };
         Inventory {
             hosts: BTreeMap::from([

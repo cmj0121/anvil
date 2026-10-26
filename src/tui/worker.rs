@@ -85,6 +85,8 @@ fn run_doctor(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
     Ok(())
 }
 
+/// As [`run_doctor`]: the config, and the secret store when a target types a
+/// sudo password, are opened by [`apply::run_targets`] here, on the worker.
 fn run_apply(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(), Failure> {
     apply::run_targets(opts, cancel, &mut |progress| {
         let _ = tx.send(match progress {

@@ -285,6 +285,116 @@ else
   echo "skip (no python3)"
 fi
 
+step "(m) sudo password from an age secret: archpw installs through sudo over a tty"
+# Never target `local` with these files: it would run brew on this host.
+if command -v python3 >/dev/null 2>&1; then
+  # A HOME of its own, so this check signs archpw in itself.
+  SUDO_HOME="$TMP/home-sudo"
+  SUDO_INV="$TMP/sudo-inventory.toml"
+  SUDO_CONFIG="$TMP/sudo-config.toml"
+  mkdir -p "$SUDO_HOME" "$TMP/age"
+  # The fixture's age identity has no passphrase, so the store opens without a tty.
+  cp tests/fixtures/sops/age-key.txt "$TMP/age-key.txt"
+  chmod 600 "$TMP/age-key.txt"
+  # archbad is archpw with a wrong password stored; both share the master (%C).
+  cat >"$SUDO_INV" <<INV
+[hosts.archpw]
+host = "127.0.0.1"
+user = "pw"
+port = $PORT
+sudo_secret = "PW_SUDO"
+
+[hosts.archbad]
+host = "127.0.0.1"
+user = "pw"
+port = $PORT
+sudo_secret = "PW_BAD"
+INV
+  cat >"$SUDO_CONFIG" <<CONF
+[secrets]
+backend = "age"
+
+[secrets.age]
+path = "$TMP/age/secrets.age"
+identity = "$TMP/age-key.txt"
+
+[packages]
+install = ["inetutils"]
+
+[[steps]]
+run = "hostname"
+CONF
+  # sudo_anvil [VAR=value...] ARGS...: anvil on these files, stdin not a tty.
+  sudo_anvil() {
+    sudo_env=""
+    while [ $# -gt 0 ]; do
+      case $1 in
+        *=*) sudo_env="$sudo_env $1"; shift ;;
+        *) break ;;
+      esac
+    done
+    # shellcheck disable=SC2086 # the assignments hold no spaces
+    run_env HOME="$SUDO_HOME" $sudo_env "$ANVIL" --ssh-config "$CFG" --inventory "$SUDO_INV" \
+      --config "$SUDO_CONFIG" "$@" </dev/null >"$TMP/out" 2>"$TMP/err"
+  }
+  # The password reaches the store only through the editor buffer.
+  printf '%s\n' "$PASSWORD" >"$TMP/typed.good"
+  printf 'not-the-password\n' >"$TMP/typed.bad"
+  # The store is ASCII-armored age: the armor line first, never the password.
+  sudo_anvil FAKE_EDITOR_CONTENT="$TMP/typed.good" secret PW_SUDO \
+    && grep -qx 'secret PW_SUDO: updated' "$TMP/out" && ! grep -qF "$PASSWORD" "$TMP/out" "$TMP/err" \
+    && sudo_anvil FAKE_EDITOR_CONTENT="$TMP/typed.bad" secret PW_BAD \
+    && grep -qx 'secret PW_BAD: updated' "$TMP/out" && ! grep -qF "$PASSWORD" "$TMP/out" "$TMP/err" \
+    && [ "$(head -n1 "$TMP/age/secrets.age")" = '-----BEGIN AGE ENCRYPTED FILE-----' ] \
+    && ! grep -qF -e "$PASSWORD" -e 'not-the-password' "$TMP/age/secrets.age"
+  code=$?
+  if [ "$code" -eq 0 ]; then
+    pass "PW_SUDO and PW_BAD stored in the age file, encrypted"
+  else
+    fail "secret into the age store: exit $code"
+  fi
+  run_env HOME="$SUDO_HOME" PTY_PASSWORD="$PASSWORD" python3 tests/e2e/pty_login.py --prompts 1 \
+    --expect '^  secret PW_SUDO +ok$' \
+    -- "$ANVIL" --ssh-config "$CFG" --inventory "$SUDO_INV" --config "$SUDO_CONFIG" \
+    doctor --target archpw >"$TMP/out" 2>"$TMP/err"
+  code=$?
+  # sudo `binary` (not `nopasswd`): pw's sudo needs the password.
+  if [ "$code" -eq 0 ] && grep -Eq '^  manager +pacman$' "$TMP/out" && grep -Eq '^  sudo +binary$' "$TMP/out" \
+    && ! grep -qF "$PASSWORD" "$TMP/out" "$TMP/err"; then
+    pass "doctor signed in by password, secret PW_SUDO ok, sudo binary, manager pacman"
+  else
+    fail "doctor over the pty: exit $code"
+  fi
+  sudo_anvil apply --target archpw
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF "  \$ $PKG_RUN" "$TMP/out" && grep -qxF '  ✔ ok · 2 steps' "$TMP/out" \
+    && ! grep -qF -e "$PASSWORD" -e '***' "$TMP/out" "$TMP/err"; then
+    pass "apply typed the password at sudo's prompt, the package step and hostname ran"
+  else
+    fail "apply with the sudo secret: exit $code"
+  fi
+  sudo_anvil apply --json --target archpw
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qF "\"steps\":[{\"run\":\"$PKG_RUN\",\"code\":0," "$TMP/out" \
+    && ! grep -qF -e "$PASSWORD" -e '***' "$TMP/out" "$TMP/err"; then
+    pass "apply --json ok, no password in it"
+  else
+    fail "apply --json with the sudo secret: exit $code"
+  fi
+  # One wrong attempt only, and last: pam_faillock locks pw after three.
+  sudo_anvil apply --json --target archbad
+  code=$?
+  if [ "$code" -eq 1 ] && grep -qF 'packages: sudo rejected the password from secret PW_BAD' "$TMP/out" \
+    && grep -q '"ok":false}$' "$TMP/out" \
+    && ! grep -qF -e "$PASSWORD" -e 'not-the-password' "$TMP/out" "$TMP/err"; then
+    pass "a wrong stored password fails the target, naming the secret"
+  else
+    fail "apply with a wrong sudo secret: exit $code"
+  fi
+else
+  echo "skip (no python3)"
+fi
+
 step "(k) anvil tui: doctor on the password user, ssh's prompt handed over from the worker"
 # pty_tui.py needs os.login_tty: python3 3.11 or newer.
 if python3 -c 'import os; os.login_tty' 2>/dev/null; then
