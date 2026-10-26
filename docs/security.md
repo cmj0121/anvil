@@ -1,5 +1,7 @@
 # Security notes
 
+English | [繁體中文](security.zh-TW.md)
+
 - **Editor temp files.** The buffer is written to `edit-<random>.<ext>` with mode 0600, created with `create_new`
   inside a per-user 0700 directory under the system temp dir; afterwards it is overwritten with zeros and removed. The
   zeroing is best effort only: APFS is copy-on-write, so the old blocks may survive. The real protection is the private

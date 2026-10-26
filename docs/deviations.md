@@ -1,5 +1,7 @@
 # Deviations
 
+English | [繁體中文](deviations.zh-TW.md)
+
 ## Deviations from #2/#3
 
 - The inventory and config are stored as TOML only ([#4](https://github.com/mini-poc/anvil/issues/4)); YAML is an
