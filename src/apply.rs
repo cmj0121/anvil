@@ -63,7 +63,7 @@ struct PackageStep<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StepReport {
     pub run: String,
-    /// `None` when the script was killed by a signal.
+    /// `None` when the script was killed by a signal or at the time limit.
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
@@ -89,7 +89,8 @@ pub enum TargetReport {
         ok: bool,
     },
     /// A transport error ended the target; `steps` holds the ones that ran
-    /// before it (omitted when none did).
+    /// before it, then a step that timed out with what it printed (omitted
+    /// when none did).
     Failed {
         target: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -379,12 +380,23 @@ fn apply_target(
             return cancelled(target, reports);
         }
         let output = match password {
-            None => transport.run(run).map_err(|err| err.to_string()),
-            Some((name, password)) => run_with_password(transport.as_ref(), run, name, password),
+            None => transport.run(run),
+            Some((_, password)) => transport.run_tty(&packages::with_password(run), password),
         };
         let output = match output {
             Ok(output) => output,
-            Err(error) => return failed(reports, error),
+            Err(err) => {
+                let error = step_error(&err, password.map(|(name, _)| name));
+                // A step killed at the limit still shows what it printed.
+                if let TransportError::Timeout {
+                    output: Some(output),
+                    ..
+                } = err
+                {
+                    reports.push(StepReport::from_output(run, *output));
+                }
+                return failed(reports, error);
+            }
         };
         let succeeded = output.code == Some(0);
         if succeeded && output.truncated {
@@ -408,26 +420,18 @@ fn apply_target(
     }
 }
 
-/// Runs the package step `run` on a terminal through [`packages::with_password`],
-/// typing `password` from secret `name` at sudo's prompt. The error names
-/// the secret, never its value.
-fn run_with_password(
-    transport: &dyn Transport,
-    run: &str,
-    name: &str,
-    password: &[u8],
-) -> Result<Output, String> {
-    transport
-        .run_tty(&packages::with_password(run), password)
-        .map_err(|err| match err {
-            TransportError::PasswordRejected => {
-                format!("packages: sudo rejected the password from secret {name}")
-            }
-            TransportError::NoPrompt => {
-                format!("packages: sudo did not show anvil's prompt (secret {name})")
-            }
-            err => err.to_string(),
-        })
+/// The failure of a step: for the package step run on a terminal with the
+/// password from secret `secret`, sudo's refusals name the secret, never its value.
+fn step_error(err: &TransportError, secret: Option<&str>) -> String {
+    match (err, secret) {
+        (TransportError::PasswordRejected, Some(name)) => {
+            format!("packages: sudo rejected the password from secret {name}")
+        }
+        (TransportError::NoPrompt, Some(name)) => {
+            format!("packages: sudo did not show anvil's prompt (secret {name})")
+        }
+        (err, _) => err.to_string(),
+    }
 }
 
 /// Probes `target` and builds the step that installs and upgrades
@@ -893,7 +897,10 @@ mod tests {
             "box",
             &["one", "two", "three"],
             1,
-            Some(TransportError::Timeout(crate::transport::RUN_TIMEOUT)),
+            Some(TransportError::Timeout {
+                after: crate::transport::RUN_TIMEOUT,
+                output: None,
+            }),
         );
         assert_eq!(runs, ["one", "two"]);
         assert!(!report.ok());
@@ -911,6 +918,42 @@ mod tests {
         assert_eq!(
             screen(&report, piped()),
             "▶ box\n  $ one\n  one-out\n  ✘ timed out after 30 s\n\n"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_step_keeps_its_run_and_partial_output() {
+        let (report, runs) = apply_after(
+            "box",
+            &["one", "slow", "three"],
+            1,
+            Some(TransportError::Timeout {
+                after: crate::transport::RUN_TIMEOUT,
+                output: Some(Box::new(Output {
+                    stdout: b"start\n".to_vec(),
+                    stderr: b"warn\n".to_vec(),
+                    ..Output::default()
+                })),
+            }),
+        );
+        assert_eq!(runs, ["one", "slow"]);
+        assert!(!report.ok());
+        let value = json(&report);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "target": "box",
+                "steps": [
+                    {"run": "one", "code": 0, "stdout": "one-out\n", "stderr": ""},
+                    {"run": "slow", "code": null, "stdout": "start\n", "stderr": "warn\n"},
+                ],
+                "error": "timed out after 30 s",
+                "ok": false,
+            })
+        );
+        assert_eq!(
+            screen(&report, piped()),
+            "▶ box\n  $ one\n  one-out\n  $ slow\n  start\n  box: warn\n  ✘ timed out after 30 s\n\n"
         );
     }
 
@@ -1615,7 +1658,10 @@ mod tests {
                 "packages: sudo did not show anvil's prompt (secret LOCAL_SUDO)",
             ),
             (
-                TransportError::Timeout(crate::transport::RUN_TIMEOUT),
+                TransportError::Timeout {
+                    after: crate::transport::RUN_TIMEOUT,
+                    output: None,
+                },
                 "timed out after 30 s",
             ),
         ] {
@@ -1632,6 +1678,61 @@ mod tests {
             );
             assert_hidden(&report);
         }
+    }
+
+    #[test]
+    fn a_timed_out_password_step_shows_the_one_line_run_and_its_output() {
+        let timeout = TransportError::Timeout {
+            after: crate::transport::RUN_TIMEOUT,
+            output: Some(Box::new(Output {
+                stdout: b"resolving\n".to_vec(),
+                ..Output::default()
+            })),
+        };
+        let (report, runs, _) = apply_sudo(ARCH_SUDO, Some(PASSWORD.as_bytes()), Some(timeout));
+        assert_eq!(runs.len(), 2, "the steps do not run: {runs:?}");
+        let one_liner = "sudo -n pacman -S --noconfirm --needed git";
+        assert_eq!(
+            json(&report),
+            serde_json::json!({
+                "target": "local",
+                "steps": [{"run": one_liner, "code": null, "stdout": "resolving\n", "stderr": ""}],
+                "error": "timed out after 30 s",
+                "ok": false,
+            })
+        );
+        assert_eq!(
+            screen(&report, piped()),
+            format!("▶ local\n  $ {one_liner}\n  resolving\n  ✘ timed out after 30 s\n\n")
+        );
+        assert_hidden(&report);
+    }
+
+    #[test]
+    fn a_timed_out_probe_shows_no_step() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let fake = Fake {
+            fail_with: Some(TransportError::Timeout {
+                after: crate::transport::RUN_TIMEOUT,
+                output: Some(Box::new(Output {
+                    stdout: b"distro=arch\n".to_vec(),
+                    ..Output::default()
+                })),
+            }),
+            ..Fake::new(&log)
+        };
+        let report = apply_target(
+            &target("local"),
+            Ok(Box::new(fake)),
+            Some(&packages(&["git"], false)),
+            None,
+            &steps(&["one"]),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            json(&report),
+            serde_json::json!({"target": "local", "error": "timed out after 30 s", "ok": false})
+        );
     }
 
     #[test]

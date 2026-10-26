@@ -179,7 +179,8 @@ Human output is one block per target, a blank line after each, then a summary:
 - A step's stderr lines go to stderr, indented the same way so they interleave in place on a terminal; when stderr is
   not a terminal each one is prefixed with `TARGET:` (`local: warn` above).
 - The block ends with `✔ ok · N steps`, or `✘ step K exited C` for a failing step, or `✘ ERROR` for a transport error
-  (after the steps that completed before it).
+  (after the steps that completed before it). A step that times out still shows its `$` line and the output it printed
+  before it was killed, then `✘ timed out after 30 s`.
 - Colour (bold cyan header, dim command, yellow stderr, green `✔`, red `✘` and failed count) is used on a stream only
   when it is a terminal and `NO_COLOR` is unset or empty.
 - Control characters a host sends (escape sequences, say) are shown as visible `\x1b`-style escapes on stderr and in
@@ -210,7 +211,7 @@ Human output is one block per target, a blank line after each, then a summary:
 
 A target either ran its steps (`steps` and `ok`; a failed step shows its `code`, and `ok` is false) or failed in the
 transport (`error`, `ok: false`, and `steps` only when some steps completed before the error). `code` is `null` when
-the step was killed by a signal.
+the step was killed by a signal or timed out; a timed-out step is the last `steps` entry, next to `error`.
 
 ### `anvil secret NAME`
 

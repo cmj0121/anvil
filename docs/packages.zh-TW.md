@@ -104,7 +104,7 @@ anvil 才會輸入密碼，而且只輸入一次。`sudo -v` 先驗證 ticket，
 - 輸入密碼後提示再次出現：`packages: sudo rejected the password from secret NAME`（anvil 從不重試）；
 - 在 `anvil-tty-ready` 之後 15 s 內，提示與 `anvil-sudo-ok` 都沒有出現：
   `packages: sudo did not show anvil's prompt (secret NAME)`；
-- 執行超過 30 s，與任何腳本相同：`timed out after 30 s`；
+- 執行超過 30 s，與任何腳本相同：`timed out after 30 s`，排在該 step 的 `$` 行與至此印出的輸出（依下文清理）之後；
 - `script(1)` 或 `ssh` 無法啟動：`cannot start the transport: REASON`。
 
 **輸出。** step 的 stdout 是終端機的輸出，其中 CRLF 轉為 LF，

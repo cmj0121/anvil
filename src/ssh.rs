@@ -898,7 +898,13 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let err = ssh.run("true").unwrap_err();
-        assert_eq!(err, TransportError::Timeout(Duration::from_millis(200)));
+        assert_eq!(
+            err,
+            TransportError::Timeout {
+                after: Duration::from_millis(200),
+                output: None
+            }
+        );
         // Well under the fake's 30 s sleep; generous because macOS scans a freshly
         // written script on its first exec, which is slow under a loaded suite.
         assert!(started.elapsed() < Duration::from_secs(15));

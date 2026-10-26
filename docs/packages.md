@@ -109,7 +109,8 @@ three cases the process group is killed, which hangs up the terminal and ends sh
 - the prompt again after the password: `packages: sudo rejected the password from secret NAME` (anvil never retries);
 - neither the prompt nor `anvil-sudo-ok` within 15 s of `anvil-tty-ready`:
   `packages: sudo did not show anvil's prompt (secret NAME)`;
-- a run longer than 30 s, as for any script: `timed out after 30 s`;
+- a run longer than 30 s, as for any script: `timed out after 30 s`, after the step's `$` line and the output it
+  printed so far (cleaned as below);
 - `script(1)` or `ssh` that cannot start: `cannot start the transport: REASON`.
 
 **Output.** The step's stdout is the terminal's output with CRLF turned into LF, the `anvil-tty-ready` and
