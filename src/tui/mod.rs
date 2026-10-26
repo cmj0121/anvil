@@ -61,7 +61,8 @@ pub fn run(mut opts: Options) -> Result<(), Failure> {
         .map_err(|err| Failure::failed(format!("cannot enter the terminal: {err}")))?;
     let session = handoff::start(tx.clone(), rx, screen.clone(), interrupted);
     opts.can_prompt = true;
-    let app = App::with_inventory(opts, inventory);
+    let steps = app::load_steps(&opts);
+    let app = App::with_inventory(opts, inventory, steps);
     // Dropped before the session, on every path: see Runs.
     let mut runs = Runs {
         tx,
@@ -141,8 +142,8 @@ fn event_loop(
 }
 
 /// Runs the editor flow `kind` on this (the main) thread with the real
-/// terminal, records its outcome, and reloads the inventory after an
-/// inventory or config edit.
+/// terminal, records its outcome, and reloads the inventory and the config
+/// after an inventory or config edit.
 fn run_edit(app: &mut App, kind: &EditKind) {
     let outcome = term::with_terminal(|| edit(&app.opts, app.edit_format, kind));
     app.record_edit(kind, outcome.map_err(|failure| failure.message));
@@ -388,7 +389,8 @@ mod tests {
             let mut opts = app::tests::opts();
             opts.config = Some(config);
             opts.inventory = Some(inventory);
-            let mut app = App::with_inventory(opts, Err("not loaded yet".to_owned()));
+            let mut app =
+                App::with_inventory(opts, Err("not loaded yet".to_owned()), Ok(Vec::new()));
             app.reload();
             Edits { dir, app }
         }

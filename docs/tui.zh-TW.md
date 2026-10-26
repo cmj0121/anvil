@@ -10,20 +10,27 @@ anvil tui                  # or: anvil tui --target linode1
 ```
 
 ```text
-┌Targets───────────────────┐┌Results───────────────────────────────────────────────────────────┐
-│[ ] local   local         ││▶ local                                                           │
-│[x] linode1 cmj@203.0.113 ││  $ hostname                                                      │
-└──────────────────────────┘│    linode1                                                       │
-┌Tags──────────────────────┐│  ✔ ok · 1 step                                                   │
-│[ ] arch                  ││                                                                  │
-│[ ] linode                ││                                                                  │
-└──────────────────────────┘└──────────────────────────────────────────────────────────────────┘
- d doctor · a apply · [ ] results · ? help · q quit │ format default │ -v 0 │ 1 ok, 0 failed
+ anvil · apply · run 1/1 · targets: all (2)                                                ✔ 1  ✘ 1
+┌Steps─────────────────────┐┌Results───────────────────────────────────────────────────────────────┐
+│ ✔ 1 packages             ││[✘ local]  ✔ linode1                                                  │
+│ ✔ 2 hostname             ││▶ local                                                               │
+│▶✘ 3 install -m 0644 "$sr…││  $ brew install tree                                                 │
+│ ⊘ 4 mkdir -p ~/.local/bin││    ==> Fetching tree                                                 │
+│                          ││  $ hostname                                                          │
+│                          ││    mbp                                                               │
+│                          ││  $ install -m 0644 "$src/tmux.conf" ~/.tmux.conf …                   │
+│                          ││    install: tmux.conf: No such file or directory                     │
+│                          ││  ✘ step 3 exited 1                                                   │
+│                          ││                                                                      │
+└──────────────────────────┘└──────────────────────────────────────────────────────────────────────┘
+ a apply · d doctor · t targets · ↑↓ step · ←→ target · ? help                       -v 0 · default
 ```
 
-`Space` 選擇 target（目標）與 tag，`d` 對它們執行 doctor，`a` 執行 apply，`i`、`c` 與 `s` 開啟編輯器，`m` 遷移 secret。
-Doctor、apply 與 edit 每個分頁顯示一個區段。`←` 與 `→` 切換分頁。`[` 與 `]` 仍然切換歷史紀錄。
-`?` 列出所有按鍵，`q` 結束。編輯器、ssh 的密碼提示與 age 密碼短語提示（`m` 期間也是）在執行時會取得真正的終端機。
+`d` 對以 `t` 挑選的 target（目標）執行 doctor，`a` 執行 apply（沒有挑選時為全部）；`i`、`c` 與 `s` 開啟編輯器，
+`m` 遷移 secret。Steps 窗格列出 apply 會執行的 step（步驟），每個 step 依顯示中的 target 標上記號，
+Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 apply 結果上也會把 Results 捲動到該 step 的 `$` 行。
+`←` 與 `→` 切換分頁，`[` 與 `]` 切換歷史紀錄。`?` 列出所有按鍵，`q` 結束。
+編輯器、ssh 的密碼提示與 age 密碼短語提示（`m` 期間也是）在執行時會取得真正的終端機。
 按鍵表與規則見[下文](#按鍵)。TUI 是預設啟用的 cargo feature `tui`；
 `cargo install --path . --no-default-features` 會建置不含它的 anvil。
 
@@ -31,47 +38,63 @@ Doctor、apply 與 edit 每個分頁顯示一個區段。`←` 與 `→` 切換�
 
 ## 畫面
 
-畫面左側是 Targets（`[x] name  detail`，`local` 在最前）與 Tags，右側是 Results 窗格，底部是狀態列，
-顯示按鍵提示或最後一則通知、編輯格式、`-v` 等級，以及所顯示結果的 `N ok, M failed`。
-target 名稱共用一欄：寬度為最寬的名稱，最多 12 欄，接著一個空格與 detail。列的空間不足時，名稱會以 `…` 截斷。
-只有在 detail 本身放不下時，detail 才會以 `…` 截斷。
-Doctor、apply 與 edit 在所顯示的結果中每個分頁顯示一個區段，而不是每次過去的執行一個分頁。
-doctor 結果在有本機檢查時會有一個 `local checks` 分頁，接著依序每個 target 一個分頁。
-apply 依序每個 target 一個分頁。edit 只有一個分頁，以它編輯的對象標示（`inventory`、`config`、`secret NAME`、`migrate → age`）。
-除了 overlay 開啟期間以外，`←` 與 `→` 可在任何窗格切換分頁。它們在兩端停止，不會循環。
-`[` 與 `]` 仍然切換歷史紀錄。
-所顯示的 apply 區段讀起來像 CLI 的區塊（`▶ name`、`$ command`、其輸出、`✔ ok · N steps`、`✘ reason` 或 `⊘ cancelled`）；
-所顯示的 doctor 區段讀起來像它的人類可讀輸出，包括有 `[packages]` 時的 `manager` 列（無法解析管理器的 target 在 `N ok, M failed` 中算作失敗）。
-spinner 標示正在執行的 target。
-host（主機）與 config（設定檔）文字會如同 CLI 一樣跳脫，secret 的值從不繪出。
+- **標頭。** `anvil · <kind> · run N/M · targets: <selection>`：顯示中結果的種類（`doctor`、`apply` 或 edit 編輯的對象）
+  與它在歷史紀錄中的位置，接著是挑選的 target 與 `tag:NAME`，沒有挑選時為 `all (N)`。
+  顯示中的結果正在執行時，它的 spinner 與正在執行的 target（`· ⠙ linode1`）會出現在 `targets:` 之前。
+  右側的 `✔ ok  ✘ failed` 計算顯示中結果的 target。放不下的文字以 `…` 截斷。
+  inventory 載入失敗時，選擇的位置改以紅色顯示 `inventory error`，錯誤本身則顯示為通知。
+- **Steps。** apply 會執行的 step，附編號：`[packages]` 有工作時為 `packages`，接著是每個 `[[steps]]` 的指令
+  （第一行，還有更多行時加上 `…`）；兩者都沒有的 config 執行預設的 `hostname` step。游標所在列標記為 `▶`。
+  在 apply 結果上，列表是該次執行載入的 config 的 step，每列依顯示中分頁的 target 標上記號：
+  `✔` 結束碼為 0，`✘` 結束碼非 0 或被終止，`⊘` 未執行（在失敗的 step 或取消之後）。
+  傳輸錯誤結束 target 時，被它結束的 step 為 `✘`（尚未執行任何 step 時為第一個：連線或探測失敗），
+  但若有逾時的 step 保留了輸出，則該列為 `✘`；其餘為 `⊘`。target 還沒有報告時（排隊中或執行中）每列皆為 `·`；
+  正在執行的 target 在結束前沒有分頁，它的 spinner 在標頭與 Results 的最後一行。
+  在 doctor 與 edit 結果上，列表是上次重新載入時 config 的 step，沒有記號。config 載入失敗時改以紅色顯示錯誤。
+- **Results。** 顯示中結果的每個區段一個分頁，而不是每次過去的執行一個分頁。
+  doctor 結果在有本機檢查時有一個 `local checks` 分頁，接著依序每個 target 一個分頁；apply 依序每個 target 一個分頁；
+  edit 只有一個分頁，以它編輯的對象命名（`inventory`、`config`、`secret NAME`、`migrate → age`）。
+  `←` 與 `→` 在任何窗格都能切換分頁（overlay 開啟時除外），到兩端就停止。
+  apply 區段讀起來像 CLI 的區塊（`▶ name`、`$ command`、它的輸出、`✔ ok · N steps`、`✘ reason` 或 `⊘ cancelled`）；
+  doctor 區段讀起來像它的人類可讀輸出，包含 `[packages]` 的 `manager` 列（無法解析 manager 的 target 算作失敗）。
+  長行會換行。執行本身的錯誤（config、inventory、panic）是每個分頁的最後一行。
+- **狀態列。** 最後的通知，否則是放得下的按鍵 `a apply · d doctor · t targets · ↑↓ step · ←→ target · ? help`；
+  右側為 `-v N · <edit format>`。
+- **Targets overlay（`t`）。** `Hosts`：`[x] name  detail  tags`，`local` 在最前；`Tags`：`[x] tag  N hosts`。
+  `↑↓` 移動，`Space` 選擇（立即生效），`Enter`、`Esc` 或 `t` 關閉。執行中也能開啟，但執行會保留它開始時的選擇。
+  inventory 錯誤會取代列顯示在其中。
+- **說明（`?`）。** 每個群組一列：Run、Targets、Move、History、Edit、Options、App。`?` 或 `Esc` 關閉。
+
+主機與 config 的文字會如同 CLI 一樣跳脫，secret 的值從不繪出。
 
 ## 按鍵
 
-| 按鍵         | 動作                                          | CLI 對應                                  |
-| ------------ | --------------------------------------------- | ----------------------------------------- |
-| `↑↓` / `jk`  | 在 Targets 中移動；在 Results 中捲動          | —                                         |
-| `Space`      | 選擇游標所在的 target 或 tag                  | `--target SEL`                            |
-| `Tab`        | 循環切換焦點：Targets、Results、Log（顯示時） | —                                         |
-| `d`          | 對選擇執行 doctor                             | `anvil doctor`                            |
-| `a`          | 對選擇執行 apply                              | `anvil apply`                             |
-| `Esc`        | 取消執行；關閉 overlay                        | —                                         |
-| `i`          | 編輯 inventory，然後重新載入它                | `anvil inventory`                         |
-| `c`          | 編輯 config，然後重新載入 inventory           | `anvil config`                            |
-| `f`          | 循環切換編輯格式：預設、`toml`、`yaml`        | `--format toml\|yaml`                     |
-| `s`          | 提示輸入 NAME，然後編輯該 secret              | `anvil secret NAME`                       |
-| `m`          | 選擇 keychain、age 或 sops，然後遷移          | `anvil secret --migrate --to BACKEND`     |
-| `o`          | 編輯路徑；空白為預設，`~` 為 `$HOME`          | `--inventory`, `--config`, `--ssh-config` |
-| `+` / `-`    | 日誌等級 0 到 3                               | `-v`, `-vv`, `-vvv`                       |
-| `l`          | 顯示或隱藏 Log 窗格（8 列）                   | stderr 上的日誌                           |
-| `[` / `]`    | 上一個／下一個結果                            | —                                         |
-| `←` / `→`    | 上一個／下一個分頁                            | —                                         |
-| `r`          | 重新載入 inventory                            | —                                         |
-| `?`          | 說明                                          | `--help`                                  |
-| `q` / Ctrl-C | 結束；執行中時，取消並在執行結束後結束        | —                                         |
+| 按鍵         | 動作                                                    | CLI 對應                                  |
+| ------------ | ------------------------------------------------------- | ----------------------------------------- |
+| `↑↓` / `jk`  | Steps：移動游標（apply 時前往它的 step）；Results：捲動 | —                                         |
+| `Enter`      | apply 時在 Results 中前往游標所在的 step                | —                                         |
+| `Tab`        | 循環切換焦點：Steps、Results、Log（顯示時）             | —                                         |
+| `t`          | 挑選 target 與 tag（在 overlay 中以 `Space` 選擇）      | `--target SEL`                            |
+| `d`          | 對選擇執行 doctor                                       | `anvil doctor`                            |
+| `a`          | 對選擇執行 apply                                        | `anvil apply`                             |
+| `Esc`        | 取消執行；關閉 overlay                                  | —                                         |
+| `i`          | 編輯 inventory，然後重新載入 inventory 與 config        | `anvil inventory`                         |
+| `c`          | 編輯 config，然後重新載入 inventory 與 config           | `anvil config`                            |
+| `f`          | 循環切換編輯格式：預設、`toml`、`yaml`                  | `--format toml\|yaml`                     |
+| `s`          | 提示輸入 NAME，然後編輯該 secret                        | `anvil secret NAME`                       |
+| `m`          | 選擇 keychain、age 或 sops，然後遷移                    | `anvil secret --migrate --to BACKEND`     |
+| `o`          | 編輯路徑；空白為預設，`~` 為 `$HOME`                    | `--inventory`, `--config`, `--ssh-config` |
+| `+` / `-`    | 日誌等級 0 到 3                                         | `-v`, `-vv`, `-vvv`                       |
+| `l`          | 顯示或隱藏 Log 窗格（8 列）                             | stderr 上的日誌                           |
+| `[` / `]`    | 上一個／下一個結果                                      | —                                         |
+| `←` / `→`    | 上一個／下一個分頁；apply 時位於游標所在的 step         | —                                         |
+| `r`          | 重新載入 inventory 與 config                            | —                                         |
+| `?`          | 說明                                                    | `--help`                                  |
+| `q` / Ctrl-C | 結束；執行中時，取消並在執行結束後結束                  | —                                         |
 
 沒有選擇任何東西時，`d` 與 `a` 會在每個 target 上執行，如同 CLI 沒有 `--target` 時。
 `f` 從 `[anvil].format` 開始，其選擇在整個工作階段中保持。在 `o` overlay 中，`Tab` 或 `↑↓` 在欄位間移動，
-Enter 套用三個路徑（開頭的 `~/` 或單獨的 `~` 為 `$HOME`）並重新載入 inventory，`Esc` 則捨棄它們。
+Enter 套用三個路徑（開頭的 `~/` 或單獨的 `~` 為 `$HOME`）並重新載入 inventory 與 config，`Esc` 則捨棄它們。
 `s` 會拒絕不符合 `[A-Z][A-Z0-9_]*` 的 NAME，並顯示該規則。在文字欄位中（`s` 的 NAME 提示、`o` 的路徑），
 `q` 會被輸入到欄位裡；Ctrl-C 仍會結束。`anvil tui --version` 會印出 `anvil-tui VERSION`。
 
@@ -97,6 +120,7 @@ Enter 套用三個路徑（開頭的 `~/` 或單獨的 `~` 為 `$HOME`）並重�
   `migrated N secrets from X to Y`，或錯誤。
 - **重新載入保留選擇。** `r`、`o` 以及 `i` 或 `c` 之後的重新載入，都會依名稱保留每個選取的 target 與 tag。
   已不在 inventory 中的選取名稱會被取消選取，並在狀態列顯示通知 `no longer in the inventory, unselected: NAME, …`。
+  Steps 列表會依 config 重建。
 - **日誌**寫入 Log 窗格，從不寫入 stderr，等級從 `-v` 開始，並由 `+` 與 `-` 調整。
 - **訊號。** 只有 SIGINT 會還原終端機。SIGTERM、SIGHUP 或 `kill -TSTP` 會結束或停止 anvil 而不還原，
   可能讓終端機停留在 raw mode；執行 `reset` 即可修復。

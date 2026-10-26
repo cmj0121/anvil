@@ -96,13 +96,13 @@ fn an_inventory_edit_hands_the_terminal_to_the_editor_and_back() {
             "--main",
             &format!("^{MARKER} .*\\.toml$"),
             "--wait",
-            r"\[ \] local local",
+            r"targets: all \(1\)",
             "--send",
             "i",
             "--wait",
             &regex_escape(&wrote),
             "--wait",
-            r"\[ \] pi    pi\.lan",
+            r"targets: all \(2\)",
             "--send",
             "q",
         ],
@@ -124,7 +124,7 @@ fn apply_shows_each_step_and_the_ok_block() {
         &[],
         &[
             "--wait",
-            r"\[ \] local",
+            r"1 printf 'out-%s\\n' tui",
             "--send",
             "a",
             "--wait",
@@ -137,7 +137,7 @@ fn apply_shows_each_step_and_the_ok_block() {
         "▶ local",
         "$ printf 'out-%s\\n' tui",
         "    out-tui",
-        "1 ok, 0 failed",
+        "✔ 1  ✘ 0",
     ] {
         assert!(transcript.contains(line), "{line:?} in:\n{transcript}");
     }

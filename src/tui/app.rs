@@ -1,6 +1,7 @@
 //! TUI state and its pure key and message handling: no terminal, and no
-//! I/O beyond [`load_inventory`].
+//! I/O beyond [`load_inventory`] and [`load_steps`].
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,11 +10,14 @@ use std::sync::mpsc::Sender;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::config::Config;
 use crate::document::Format;
 use crate::inventory::{Inventory, LOCAL, Sel, UnknownSel};
 use crate::options::Options;
 use crate::secret::{self, BackendKind};
 use crate::{apply, doctor};
+
+use super::ui;
 
 /// Log lines kept for the log pane; the oldest is dropped beyond this.
 pub const LOG_CAP: usize = 2000;
@@ -34,10 +38,14 @@ pub struct App {
     pub opts: Options,
     pub targets: Vec<TargetRow>,
     pub tags: Vec<TagRow>,
-    /// Shown instead of the lists.
+    /// Shown in the targets overlay instead of the rows, and in the header.
     pub inventory_error: Option<String>,
+    /// The config's steps as of the last reload.
+    pub steps: Vec<StepRow>,
+    /// Shown instead of the steps.
+    pub config_error: Option<String>,
     pub focus: Pane,
-    /// In the Targets pane: targets, then tags.
+    /// In the Steps pane: an index into [`App::shown_steps`].
     pub cursor: usize,
     /// Session history, newest last.
     pub results: Vec<RunResult>,
@@ -48,6 +56,9 @@ pub struct App {
     pub tab: usize,
     /// Results pane.
     pub scroll: u16,
+    /// The Results body's width as last drawn; scrolling to a step wraps
+    /// the lines before it at this width.
+    pub results_width: Cell<u16>,
     pub running: Option<Running>,
     pub log: VecDeque<LogLine>,
     pub show_log: bool,
@@ -64,13 +75,6 @@ pub struct TargetRow {
     pub name: String,
     /// `local` or `user@host:port`.
     pub detail: String,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "in the D7 row, but not drawn in the 28-column pane yet"
-        )
-    )]
     pub tags: Vec<String>,
     pub selected: bool,
 }
@@ -80,9 +84,15 @@ pub struct TagRow {
     pub selected: bool,
 }
 
+/// One step apply runs: `packages`, or a `[[steps]]` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepRow {
+    pub label: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
-    Targets,
+    Steps,
     Results,
     Log,
 }
@@ -136,8 +146,10 @@ pub enum RunResult {
         ok: Option<bool>,
         error: Option<String>,
     },
-    /// `ok` is `None` while running.
+    /// `ok` is `None` while running. `steps` are those of the config the
+    /// worker loaded for this run; empty until it has.
     Apply {
+        steps: Vec<StepRow>,
         targets: Vec<apply::TargetReport>,
         ok: Option<bool>,
         error: Option<String>,
@@ -200,9 +212,16 @@ pub enum Overlay {
         field: usize,
         texts: [String; 3],
     },
+    /// The targets and tags to run on; `cursor` counts the targets then
+    /// the tags, headings left out.
+    Targets {
+        cursor: usize,
+    },
 }
 
 pub enum Msg {
+    /// The steps of the config an apply run loaded, before its first target.
+    Steps(Vec<StepRow>),
     Start(String),
     DoctorDone(doctor::Report),
     TargetDone(apply::TargetReport),
@@ -221,7 +240,7 @@ pub enum Effect {
     Spawn(RunKind),
     /// Run an editor flow on the main thread, with the real terminal.
     Edit(EditKind),
-    /// Load the inventory again: [`App::reload`].
+    /// Load the inventory and the config again: [`App::reload`].
     Reload,
     Redraw,
 }
@@ -231,6 +250,25 @@ pub fn load_inventory(opts: &Options) -> Result<Inventory, String> {
     opts.inventory().map_err(|failure| failure.message)
 }
 
+/// The steps of the config `opts` names, or why it did not load.
+pub fn load_steps(opts: &Options) -> Result<Vec<StepRow>, String> {
+    opts.load_config()
+        .map(|config| step_rows(&config))
+        .map_err(|failure| failure.message)
+}
+
+/// The steps apply runs for `config`: `packages` first when it has work,
+/// then each step's command as its `$` line shows it.
+pub fn step_rows(config: &Config) -> Vec<StepRow> {
+    let packages = config.packages.as_ref().is_some_and(|p| p.has_work());
+    packages
+        .then(|| "packages".to_owned())
+        .into_iter()
+        .chain(config.steps.iter().map(|step| apply::command(&step.run)))
+        .map(|label| StepRow { label })
+        .collect()
+}
+
 /// Refuses a `--target` that names no target or tag, as the CLI does.
 pub fn check_targets(inventory: &Inventory, target: &[String]) -> Result<(), UnknownSel> {
     let sels: Vec<Sel> = target.iter().map(|sel| Sel::parse(sel)).collect();
@@ -238,9 +276,14 @@ pub fn check_targets(inventory: &Inventory, target: &[String]) -> Result<(), Unk
 }
 
 impl App {
-    /// The state for `opts` and an already loaded inventory (or why it did
-    /// not load). Rows named by `opts.target` start selected.
-    pub fn with_inventory(opts: Options, inventory: Result<Inventory, String>) -> App {
+    /// The state for `opts` and an already loaded inventory and step list
+    /// (or why each did not load; an inventory error is the first notice).
+    /// Rows named by `opts.target` start selected.
+    pub fn with_inventory(
+        opts: Options,
+        inventory: Result<Inventory, String>,
+        steps: Result<Vec<StepRow>, String>,
+    ) -> App {
         let (targets, tags, inventory_error) = match inventory {
             Ok(inventory) => {
                 let (targets, tags) = rows(&inventory, &opts.target);
@@ -248,25 +291,31 @@ impl App {
             }
             Err(err) => (Vec::new(), Vec::new(), Some(err)),
         };
-        App {
+        let notice = inventory_error.clone();
+        let mut app = App {
             opts,
             targets,
             tags,
             inventory_error,
-            focus: Pane::Targets,
+            steps: Vec::new(),
+            config_error: None,
+            focus: Pane::Steps,
             cursor: 0,
             results: Vec::new(),
             shown: None,
             tab: 0,
             scroll: 0,
+            results_width: Cell::new(0),
             running: None,
             log: VecDeque::new(),
             show_log: false,
             overlay: None,
             edit_format: None,
-            notice: None,
+            notice,
             quit: false,
-        }
+        };
+        app.set_steps(steps);
+        app
     }
 
     /// `q` and Ctrl-C quit; while a run is going they cancel it first, and
@@ -305,6 +354,7 @@ impl App {
                 });
             }
             KeyCode::Char('m') => self.overlay = Some(Overlay::Migrate { choice: 0 }),
+            KeyCode::Char('t') => self.overlay = Some(Overlay::Targets { cursor: 0 }),
             KeyCode::Char('o') => {
                 let text = |path: &Option<PathBuf>| {
                     path.as_ref()
@@ -335,7 +385,7 @@ impl App {
             KeyCode::Char('l') => {
                 self.show_log = !self.show_log;
                 if !self.show_log && self.focus == Pane::Log {
-                    self.focus = Pane::Targets;
+                    self.focus = Pane::Steps;
                 }
             }
             KeyCode::Esc if self.running.is_some() => self.cancel(),
@@ -345,9 +395,9 @@ impl App {
             KeyCode::Right => self.move_tab(true),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
             KeyCode::Tab => self.focus = self.next_focus(),
+            KeyCode::Enter => self.scroll_to_step(),
             KeyCode::Up | KeyCode::Char('k') => self.step(false),
             KeyCode::Down | KeyCode::Char('j') => self.step(true),
-            KeyCode::Char(' ') if self.focus == Pane::Targets => self.toggle(),
             _ if had_notice => {}
             _ => return Vec::new(),
         }
@@ -356,7 +406,8 @@ impl App {
 
     /// A key under `overlay`, which was taken out of `self.overlay`: it is
     /// put back unless the key closes it. Esc closes any overlay; Enter
-    /// confirms the Input, Migrate and Options overlays.
+    /// confirms the Input, Migrate and Options overlays, and closes Targets
+    /// as `t` does: its selection changes as Space is pressed.
     fn on_overlay_key(&mut self, mut overlay: Overlay, key: KeyEvent) -> Vec<Effect> {
         let mut effects = vec![Effect::Redraw];
         let keep = match (&mut overlay, key.code) {
@@ -390,6 +441,22 @@ impl App {
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     *choice = (*choice + 1).min(BACKENDS.len() - 1);
+                    true
+                }
+                _ => true,
+            },
+            (Overlay::Targets { cursor }, code) => match code {
+                KeyCode::Enter | KeyCode::Char('t') => false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *cursor = cursor.saturating_sub(1);
+                    true
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *cursor = (*cursor + 1).min(self.last_row());
+                    true
+                }
+                KeyCode::Char(' ') => {
+                    self.toggle(*cursor);
                     true
                 }
                 _ => true,
@@ -433,15 +500,29 @@ impl App {
         self.show(Some(self.results.len() - 1));
     }
 
-    /// Loads the inventory `opts` names again: [`App::set_inventory`].
+    /// Loads the inventory `opts` names again ([`App::set_inventory`]), and
+    /// the config's steps.
     pub fn reload(&mut self) {
         let inventory = load_inventory(&self.opts);
         self.set_inventory(inventory);
+        let steps = load_steps(&self.opts);
+        self.set_steps(steps);
+    }
+
+    /// The steps of a config that loaded, or why it did not; the cursor
+    /// stays inside them.
+    fn set_steps(&mut self, steps: Result<Vec<StepRow>, String>) {
+        (self.steps, self.config_error) = match steps {
+            Ok(steps) => (steps, None),
+            Err(err) => (Vec::new(), Some(err)),
+        };
+        self.cursor = self.cursor.min(self.steps.len().saturating_sub(1));
     }
 
     /// Rebuilds the rows from `inventory`, keeping the selection of every
     /// name it still has; `opts.target` drops the others, with a notice.
-    /// An inventory that did not load keeps `opts.target` as it was.
+    /// An inventory that did not load keeps `opts.target` as it was, and
+    /// its error is the notice.
     pub fn set_inventory(&mut self, inventory: Result<Inventory, String>) {
         match inventory {
             Ok(inventory) => {
@@ -466,11 +547,10 @@ impl App {
             Err(err) => {
                 self.targets.clear();
                 self.tags.clear();
+                self.notice = Some(err.clone());
                 self.inventory_error = Some(err);
             }
         }
-        let rows = self.targets.len() + self.tags.len();
-        self.cursor = self.cursor.min(rows.saturating_sub(1));
     }
 
     /// Advances the spinner; the main loop calls it every tick.
@@ -486,6 +566,11 @@ impl App {
 
     pub fn on_msg(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
+            Msg::Steps(rows) => {
+                if let Some(RunResult::Apply { steps, .. }) = self.results.last_mut() {
+                    *steps = rows;
+                }
+            }
             Msg::Start(name) => {
                 if let Some(running) = &mut self.running {
                     running.current = Some(name);
@@ -558,6 +643,7 @@ impl App {
                 error: None,
             },
             RunKind::Apply => RunResult::Apply {
+                steps: Vec::new(),
                 targets: Vec::new(),
                 ok: None,
                 error: None,
@@ -654,6 +740,7 @@ impl App {
                 targets,
                 ok,
                 error: slot,
+                ..
             }) => {
                 *ok = Some(error.is_none() && targets.iter().all(apply::TargetReport::ok));
                 *slot = error;
@@ -689,7 +776,8 @@ impl App {
         }
     }
 
-    /// Left or Right: one tab, no wrap. A move returns the body to the top.
+    /// Left or Right: one tab, no wrap. A move returns the body to the top,
+    /// or on an apply result to the cursor's step.
     fn move_tab(&mut self, right: bool) {
         let count = self.shown_result().map(RunResult::tab_count).unwrap_or(0);
         if count == 0 {
@@ -704,26 +792,60 @@ impl App {
         if next != current {
             self.tab = next;
             self.scroll = 0;
+            self.scroll_to_step();
+        }
+    }
+
+    /// The steps the Steps pane lists: those of the shown apply result's
+    /// config, else the config's as of the last reload.
+    pub fn shown_steps(&self) -> &[StepRow] {
+        match self.shown_result() {
+            Some(RunResult::Apply { steps, .. }) => steps,
+            _ => &self.steps,
+        }
+    }
+
+    /// `cursor` clamped into [`App::shown_steps`]; 0 with none.
+    pub(crate) fn step_cursor(&self) -> usize {
+        self.cursor.min(self.shown_steps().len().saturating_sub(1))
+    }
+
+    /// Scrolls Results so the cursor step's `$` line is the shown apply
+    /// tab's top row; a step the tab did not reach scrolls to its end line.
+    /// With no steps listed there is no step to go to.
+    fn scroll_to_step(&mut self) {
+        if self.shown_steps().is_empty() {
+            return;
+        }
+        let scroll = match self.shown_result() {
+            Some(RunResult::Apply { targets, .. }) => targets.get(self.shown_tab()).map(|report| {
+                ui::step_scroll(report, self.step_cursor(), self.results_width.get())
+            }),
+            _ => None,
+        };
+        if let Some(scroll) = scroll {
+            self.scroll = scroll;
         }
     }
 
     fn next_focus(&self) -> Pane {
         match self.focus {
-            Pane::Targets => Pane::Results,
+            Pane::Steps => Pane::Results,
             Pane::Results if self.show_log => Pane::Log,
-            Pane::Results | Pane::Log => Pane::Targets,
+            Pane::Results | Pane::Log => Pane::Steps,
         }
     }
 
     fn step(&mut self, down: bool) {
         match self.focus {
-            Pane::Targets => {
-                let last = (self.targets.len() + self.tags.len()).saturating_sub(1);
+            Pane::Steps => {
+                let cursor = self.step_cursor();
                 self.cursor = if down {
-                    (self.cursor + 1).min(last)
+                    (cursor + 1).min(self.shown_steps().len().saturating_sub(1))
                 } else {
-                    self.cursor.saturating_sub(1)
+                    cursor.saturating_sub(1)
                 };
+                self.scroll_to_step();
             }
             Pane::Results => {
                 self.scroll = if down {
@@ -736,13 +858,18 @@ impl App {
         }
     }
 
-    /// Toggles the row under the cursor and rewrites `opts.target` to the
-    /// selected targets then tags; nothing selected means all targets.
-    fn toggle(&mut self) {
+    /// The index of the last target or tag row; 0 with none.
+    fn last_row(&self) -> usize {
+        (self.targets.len() + self.tags.len()).saturating_sub(1)
+    }
+
+    /// Toggles row `index` (targets, then tags) and rewrites `opts.target`
+    /// to the selected targets then tags; nothing selected means all targets.
+    fn toggle(&mut self, index: usize) {
         let n = self.targets.len();
-        if let Some(row) = self.targets.get_mut(self.cursor) {
+        if let Some(row) = self.targets.get_mut(index) {
             row.selected = !row.selected;
-        } else if let Some(row) = self.tags.get_mut(self.cursor - n) {
+        } else if let Some(row) = self.tags.get_mut(index - n) {
             row.selected = !row.selected;
         } else {
             return;
@@ -863,8 +990,14 @@ pub mod tests {
         }
     }
 
+    pub fn row(label: &str) -> StepRow {
+        StepRow {
+            label: label.to_owned(),
+        }
+    }
+
     pub fn app() -> App {
-        App::with_inventory(opts(), Ok(inventory()))
+        App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()))
     }
 
     pub fn step(run: &str, code: Option<i32>, stdout: &str, stderr: &str) -> apply::StepReport {
@@ -974,28 +1107,118 @@ pub mod tests {
 
     #[test]
     fn an_inventory_error_replaces_the_lists() {
-        let app = App::with_inventory(opts(), Err("bad inventory".to_owned()));
+        let app = App::with_inventory(opts(), Err("bad inventory".to_owned()), Ok(Vec::new()));
         assert!(app.targets.is_empty() && app.tags.is_empty());
         assert_eq!(app.inventory_error.as_deref(), Some("bad inventory"));
+        assert_eq!(app.notice.as_deref(), Some("bad inventory"));
+    }
+
+    /// Options naming a config file holding `toml` and an empty inventory.
+    fn config_opts(tag: &str, toml: &str) -> Options {
+        let dir = crate::test_util::temp_dir(tag);
+        let (config, inventory) = (dir.join("config.toml"), dir.join("inventory.toml"));
+        std::fs::write(&config, toml).unwrap();
+        std::fs::write(&inventory, "").unwrap();
+        let mut opts = opts();
+        opts.config = Some(config);
+        opts.inventory = Some(inventory);
+        opts
+    }
+
+    #[test]
+    fn steps_are_packages_with_work_then_each_step_command() {
+        let toml = "[packages]\ninstall = [\"tree\"]\n\n\
+                    [[steps]]\nrun = \"hostname\"\n\n\
+                    [[steps]]\nrun = \"\"\"\nmkdir -p ~/.local\ntouch x\n\"\"\"\n";
+        let mut app = App::with_inventory(
+            config_opts("tui-steps", toml),
+            Ok(inventory()),
+            Ok(Vec::new()),
+        );
+        app.reload();
+        assert_eq!(
+            app.steps,
+            [row("packages"), row("hostname"), row("mkdir -p ~/.local …")]
+        );
+        assert_eq!(app.config_error, None);
+    }
+
+    #[test]
+    fn packages_without_work_and_no_steps_is_the_default_step() {
+        let opts = config_opts("tui-steps-default", "[packages]\ninstall = []\n");
+        assert_eq!(load_steps(&opts), Ok(vec![row("hostname")]));
+        assert_eq!(step_rows(&Config::default()), [row("hostname")]);
+    }
+
+    #[test]
+    fn a_broken_config_sets_config_error_and_keeps_the_inventory() {
+        let opts = config_opts("tui-steps-broken", "[[steps]]\nrun = \"ls\"\n");
+        let mut app = App::with_inventory(opts, Ok(inventory()), Ok(Vec::new()));
+        app.reload();
+        assert_eq!(app.steps, [row("ls")]);
+        std::fs::write(app.opts.config.as_ref().unwrap(), "[[steps]]\nnope = 1\n").unwrap();
+        app.reload();
+        assert!(app.steps.is_empty());
+        assert!(app.config_error.as_deref().unwrap().contains("nope"));
+        assert_eq!(app.inventory_error, None);
+        assert_eq!(app.targets.len(), 1, "only local: the inventory is empty");
     }
 
     #[test]
     fn the_initial_target_flags_preselect_rows() {
         let mut opts = opts();
         opts.target = vec!["pi".to_owned(), "dev".to_owned()];
-        let app = App::with_inventory(opts, Ok(inventory()));
+        let app = App::with_inventory(opts, Ok(inventory()), Ok(Vec::new()));
         let selected: Vec<_> = app.targets.iter().map(|r| r.selected).collect();
         assert_eq!(selected, [false, false, true]);
         assert!(app.tags[0].selected && !app.tags[1].selected);
     }
 
     #[test]
-    fn space_maps_the_selection_into_opts_target() {
+    fn the_step_cursor_stays_inside_the_steps() {
+        let steps = Ok(vec![row("packages"), row("hostname")]);
+        let mut app = App::with_inventory(opts(), Ok(inventory()), steps);
+        assert_eq!(app.focus, Pane::Steps);
+        press(&mut app, &[KeyCode::Up, KeyCode::Char('k')]);
+        assert_eq!(app.cursor, 0);
+        press(
+            &mut app,
+            &[KeyCode::Down, KeyCode::Char('j'), KeyCode::Down],
+        );
+        assert_eq!(app.cursor, 1);
+        app.set_steps(Ok(vec![row("hostname")]));
+        assert_eq!(app.cursor, 0, "kept inside a shorter list");
+        app.set_steps(Err("bad".to_owned()));
+        press(&mut app, &[KeyCode::Down]);
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn space_outside_the_targets_overlay_selects_nothing() {
         let mut app = app();
-        // local, then down to pi, then down twice to the `home` tag.
+        assert!(app.on_key(key(KeyCode::Char(' '))).is_empty());
+        assert!(app.opts.target.is_empty());
+    }
+
+    #[test]
+    fn t_opens_the_targets_overlay_and_enter_esc_or_t_close_it() {
+        for close in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('t')] {
+            let mut app = app();
+            assert_eq!(app.on_key(key(KeyCode::Char('t'))), [Effect::Redraw]);
+            assert!(matches!(app.overlay, Some(Overlay::Targets { cursor: 0 })));
+            assert_eq!(app.on_key(key(close)), [Effect::Redraw]);
+            assert!(app.overlay.is_none(), "{close:?} closes it");
+        }
+    }
+
+    #[test]
+    fn the_targets_overlay_moves_and_selects_live() {
+        let mut app = app();
+        // local, pi, then the `home` tag.
         press(
             &mut app,
             &[
+                KeyCode::Char('t'),
                 KeyCode::Char(' '),
                 KeyCode::Down,
                 KeyCode::Char('j'),
@@ -1005,29 +1228,44 @@ pub mod tests {
                 KeyCode::Char(' '),
             ],
         );
-        assert_eq!(app.opts.target, ["local", "pi", "home"]);
-        press(&mut app, &[KeyCode::Char(' ')]);
-        assert_eq!(app.opts.target, ["local", "pi"]);
-        press(&mut app, &[KeyCode::Up, KeyCode::Up, KeyCode::Char(' ')]);
-        press(&mut app, &[KeyCode::Up, KeyCode::Up, KeyCode::Char(' ')]);
-        assert!(app.opts.target.is_empty(), "nothing selected means all");
+        assert!(matches!(app.overlay, Some(Overlay::Targets { cursor: 4 })));
+        assert_eq!(app.opts.target, ["local", "pi", "home"], "selected live");
+        press(&mut app, &[KeyCode::Down, KeyCode::Down]);
+        assert!(matches!(app.overlay, Some(Overlay::Targets { cursor: 4 })));
+        press(&mut app, &[KeyCode::Up; 9]);
+        press(&mut app, &[KeyCode::Char('k')]);
+        assert!(matches!(app.overlay, Some(Overlay::Targets { cursor: 0 })));
+        press(&mut app, &[KeyCode::Char(' '), KeyCode::Enter]);
+        assert_eq!(app.opts.target, ["pi", "home"]);
+        press(
+            &mut app,
+            &[KeyCode::Char('t'), KeyCode::Up, KeyCode::Char(' ')],
+        );
+        assert_eq!(
+            app.opts.target,
+            ["local", "pi", "home"],
+            "the cursor starts at the top"
+        );
     }
 
     #[test]
-    fn the_cursor_stays_inside_the_rows() {
+    fn the_targets_overlay_opens_and_selects_while_running() {
         let mut app = app();
-        press(&mut app, &[KeyCode::Up, KeyCode::Char('k')]);
-        assert_eq!(app.cursor, 0);
-        press(&mut app, &[KeyCode::Down; 9]);
-        assert_eq!(app.cursor, 4);
-        press(&mut app, &[KeyCode::Char(' '), KeyCode::Char(' ')]);
-        assert!(app.opts.target.is_empty());
+        press(&mut app, &[KeyCode::Char('a'), KeyCode::Char('t')]);
+        assert!(matches!(app.overlay, Some(Overlay::Targets { .. })));
+        press(&mut app, &[KeyCode::Down, KeyCode::Char(' ')]);
+        assert_eq!(app.opts.target, ["mac"]);
+        assert!(app.running.is_some());
     }
 
     #[test]
-    fn space_with_no_rows_does_nothing() {
-        let mut app = App::with_inventory(opts(), Err("x".to_owned()));
-        press(&mut app, &[KeyCode::Down, KeyCode::Char(' ')]);
+    fn the_targets_overlay_with_an_inventory_error_has_no_rows() {
+        let mut app = App::with_inventory(opts(), Err("x".to_owned()), Ok(Vec::new()));
+        press(
+            &mut app,
+            &[KeyCode::Char('t'), KeyCode::Down, KeyCode::Char(' ')],
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Targets { cursor: 0 })));
         assert!(app.opts.target.is_empty());
     }
 
@@ -1065,12 +1303,12 @@ pub mod tests {
         press(&mut app, &[KeyCode::Tab]);
         assert_eq!(app.focus, Pane::Results);
         press(&mut app, &[KeyCode::Tab]);
-        assert_eq!(app.focus, Pane::Targets);
+        assert_eq!(app.focus, Pane::Steps);
         app.show_log = true;
         press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
         assert_eq!(app.focus, Pane::Log);
         press(&mut app, &[KeyCode::Tab]);
-        assert_eq!(app.focus, Pane::Targets);
+        assert_eq!(app.focus, Pane::Steps);
     }
 
     #[test]
@@ -1082,7 +1320,10 @@ pub mod tests {
         );
         assert_eq!((app.scroll, app.cursor), (1, 0));
         press(&mut app, &[KeyCode::Char(' ')]);
-        assert!(app.opts.target.is_empty(), "Space selects only in Targets");
+        assert!(
+            app.opts.target.is_empty(),
+            "Space selects only in the overlay"
+        );
     }
 
     #[test]
@@ -1129,7 +1370,7 @@ pub mod tests {
         assert!(app.running.is_none());
         assert!(matches!(
             app.shown_result(),
-            Some(RunResult::Apply { ok: Some(false), error: None, targets }) if targets.len() == 2
+            Some(RunResult::Apply { ok: Some(false), error: None, targets, .. }) if targets.len() == 2
         ));
     }
 
@@ -1338,7 +1579,7 @@ pub mod tests {
         assert_eq!(app.focus, Pane::Log);
         press(&mut app, &[KeyCode::Char('l')]);
         assert!(!app.show_log);
-        assert_eq!(app.focus, Pane::Targets);
+        assert_eq!(app.focus, Pane::Steps);
     }
 
     #[test]
@@ -1487,7 +1728,6 @@ pub mod tests {
     fn a_reload_keeps_the_selection_of_names_still_there() {
         let mut app = app();
         app.opts.target = vec!["pi".to_owned(), "mac".to_owned(), "home".to_owned()];
-        app.cursor = 4;
         let mut smaller = inventory();
         smaller.hosts.remove("mac");
         app.set_inventory(Ok(smaller));
@@ -1502,10 +1742,11 @@ pub mod tests {
             app.notice.as_deref(),
             Some("no longer in the inventory, unselected: mac")
         );
-        assert_eq!(app.cursor, 3, "kept inside the rows");
-        // A broken inventory shows its error and keeps the selection.
+        // A broken inventory shows its error, as a notice too, and keeps
+        // the selection.
         app.set_inventory(Err("bad".to_owned()));
         assert_eq!(app.inventory_error.as_deref(), Some("bad"));
+        assert_eq!(app.notice.as_deref(), Some("bad"));
         assert_eq!(app.opts.target, ["pi", "home"]);
         app.set_inventory(Ok(inventory()));
         assert_eq!(app.inventory_error, None);
