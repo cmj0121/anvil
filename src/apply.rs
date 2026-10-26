@@ -476,6 +476,7 @@ pub fn resolve(
         let sudo = packages.sudo_secret_for(target);
         let manager = packages::resolve(packages.choice_for(target), facts, sudo.is_some())
             .map_err(reason)?;
+        packages::check_pin(manager, packages).map_err(reason)?;
         if let Some(run) = packages::script(manager, packages, facts.is_root()) {
             let sudo_secret = sudo.filter(|_| packages::uses_password(manager, facts));
             match sudo_secret {
@@ -1371,6 +1372,8 @@ mod tests {
 
     const MAC: &str = "distro=macos\nuser=cmj\nsudo=binary\npkg=brew\nanvil-probe-end=1\n";
     const ARCH_ROOT: &str = "distro=arch\nuser=root\nsudo=none\npkg=pacman\nanvil-probe-end=1\n";
+    const DEBIAN_ROOT: &str = "distro=debian\nuser=root\nsudo=none\npkg=apt\nanvil-probe-end=1\n";
+    const ALPINE_ROOT: &str = "distro=alpine\nuser=root\nsudo=none\npkg=apk\nanvil-probe-end=1\n";
 
     fn packages(install: &[&str], upgrade: bool) -> Packages {
         Packages {
@@ -1433,6 +1436,32 @@ mod tests {
             &[],
         );
         assert_eq!(runs, [facts::PROBE, "pacman -Syu --noconfirm --needed"]);
+    }
+
+    #[test]
+    fn a_pin_fails_the_target_where_it_is_not_one_shot() {
+        for upgrade in [false, true] {
+            let pkgs = Packages {
+                pin: vec!["git".into(), "curl".into()],
+                ..packages(&["jq"], upgrade)
+            };
+            for (probe, manager) in [(MAC, "brew"), (DEBIAN_ROOT, "apt"), (ALPINE_ROOT, "apk")] {
+                let error = format!("packages: pin is not one-shot on {manager}: git, curl");
+                let (report, runs) = apply_packages("box", &pkgs, probe, &["one"]);
+                assert_eq!(runs, [facts::PROBE], "{manager}: nothing holds or installs");
+                assert_eq!(
+                    json(&report),
+                    serde_json::json!({"target": "box", "error": error, "ok": false})
+                );
+            }
+            let pacman = Packages {
+                manager: packages::Choice::Is(packages::Manager::Pacman),
+                ..pkgs.clone()
+            };
+            let (report, runs) = apply_packages("box", &pacman, ARCH_ROOT, &[]);
+            assert!(report.ok());
+            assert!(runs[1].contains("pacman -T"), "{runs:?}");
+        }
     }
 
     #[test]

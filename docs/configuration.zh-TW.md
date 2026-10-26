@@ -38,6 +38,8 @@ names = ["HOST_SUDO"]      # names `doctor` checks; default []
 manager = "auto"           # auto | brew | pacman | apt | dnf | apk; default auto
 local = "brew"             # optional; the choice for `local`, which has no inventory entry
 install = ["git", "curl"]  # default []
+pin = ["vim"]              # installed when missing, skipped by the upgrade; pacman and dnf only; default []
+remove = ["nano"]          # removed after the install when installed; default []
 upgrade = false            # upgrade every installed package first; default false
 local_sudo_secret = "LOCAL_SUDO" # optional; the secret holding this machine's sudo password
 timeout = 300              # seconds the package step may run, 1..=3600; default 300
@@ -130,6 +132,8 @@ program = "/opt/homebrew/bin/sops"             # optional; default sops on PATH
 manager = "auto"           # auto | brew | pacman | apt | dnf | apk; default "auto"
 local = "brew"             # optional; the choice for the local target; default: manager
 install = ["git", "curl"]  # names to install; default []
+pin = ["vim"]              # names this run never upgrades, installed when missing; brew, apt, apk refuse; default []
+remove = ["nano"]          # names to remove after the install, when installed; not in install or pin; default []
 upgrade = false            # upgrade every installed package first; default false
 local_sudo_secret = "LOCAL_SUDO" # optional: [A-Z][A-Z0-9_]*, the local target's sudo password secret
 timeout = 300              # seconds the package step may run, 1..=3600; default 300
@@ -160,6 +164,11 @@ run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
 PLAIN 與每個值都遵循 `install` 的規則與位元組上限，原名最多 256 個；違規時以 2 結束並指出原名，
 例如 ``packages.alias.fd `auto`: must be one of brew, pacman, apt, dnf, apk`` 或
 ``packages.alias.fd.apt `x y`: must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*``（完整列表見 [別名](packages.zh-TW.md#別名)）。
+`pin` 與 `remove` 遵循 `install` 的規則與上限，訊息中帶有欄位名稱
+（``packages.remove[1] `-rf`: must match ...``、`packages.pin: N entries exceeds the 256 entry limit`）；
+`remove` 名稱也在 `install` 或 `pin` 中時（依原名，或依某個管理器的別名），以 2 結束並顯示
+``packages.remove `nano`: also in install`` 或 ``packages.remove `fd-find`: also in install as `fd` on apt``；
+同時在 `install` 與 `pin` 中的名稱是允許的（[鎖定與移除](packages.zh-TW.md#鎖定與移除)）。
 套件管理器如何選定、會執行什麼，請見 [套件](packages.zh-TW.md)。
 
 必要的名稱已從 `[anvil].secrets` 移到 `[secrets].names`。帶有舊鍵的 config 仍照舊讀取（兩者同時設定則以 2 結束）。

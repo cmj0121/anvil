@@ -1,0 +1,3 @@
+[packages]
+install = ["git", "nano"]
+remove = ["nano"]

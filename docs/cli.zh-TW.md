@@ -143,16 +143,16 @@ target（目標）依序執行，先 `local`，再依名稱排序的 host（主�
 每個 target 上的每個 step 都以 0 結束時以 0 結束，否則為 1。
 apply 直接執行：不印出計畫，也不詢問確認；想先看它會執行什麼，請先執行 [`anvil plan`](#anvil-plan)。
 
-當 `[packages]` 有事可做（`install` 非空或 `upgrade = true`）時，每個 target 會先透過同一個傳輸執行 facts 探測、
-解析其套件管理器，並將產生的安裝/升級腳本作為 step 1 執行，排在 `[[steps]]` 之前。
+當 `[packages]` 有事可做（`install`、`pin` 或 `remove` 非空，或 `upgrade = true`）時，每個 target 會先透過同一個傳輸執行
+facts 探測、解析其套件管理器，並將產生的腳本作為 step 1 執行，排在 `[[steps]]` 之前。
 該 step 是一般的 step：它顯示為 `$ SCRIPT` 及其輸出，計入 `✔ ok · N steps` 與 `--json` 中的 `steps`，
 以非零結束時也像任何 step 一樣結束該 target。
 探測在傳輸中失敗時，target 以該錯誤原樣失敗；
-探測以非零結束或印出格式不正確的輸出，或套件管理器無法解析時，target 以 `packages: REASON` 失敗。
+探測以非零結束或印出格式不正確的輸出、套件管理器無法解析，或在 brew、apt 或 apk 上有 `pin` 時，target 以 `packages: REASON` 失敗。
 無論哪種情況，該 target 都不執行任何 step（見 [套件](packages.zh-TW.md)）。
 當 target 的 sudo 要求密碼且它有 sudo secret 時，該 step 在終端機上執行，
 anvil 會在 sudo 的提示處輸入密碼（[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)）；
-其 `$` 行仍是那行一行式腳本。沒有 `[packages]`，或沒有要安裝或升級的東西時，不會執行探測，apply 只執行 `[[steps]]`。
+其 `$` 行仍是那行一行式腳本。沒有 `[packages]`，或沒有要安裝、升級、鎖定或移除的東西時，不會執行探測，apply 只執行 `[[steps]]`。
 
 每個 `install` 名稱在腳本中會換成解析出的管理器的 `[packages.alias]` 項目，沒有則原樣使用（[別名](packages.zh-TW.md#別名)）。
 以下面的 config 而言，apt 與 dnf 安裝 `fd-find`，brew、pacman 與 apk 安裝 `fd`；`anvil plan` 顯示相同的腳本：
@@ -164,6 +164,21 @@ install = ["fd"]
 [packages.alias.fd]
 apt = "fd-find"
 dnf = "fd-find"
+```
+
+`pin` 與 `remove` 會加進同一行（[鎖定與移除](packages.zh-TW.md#鎖定與移除)）。以下面的 config 而言，pacman 以 `--ignore vim`、
+dnf 以 `--exclude=vim` 升級，接著各自只在缺少時才安裝 `vim`；每個管理器都會在安裝之後，於 `nano` 已安裝時移除它，
+使用 `brew uninstall`、`pacman -R --noconfirm`、`apt-get remove -y`、
+`dnf -y remove --setopt=clean_requirements_on_remove=False` 或 `apk del`，從不 purge 或 autoremove
+（確切的指令見[執行的指令](packages.zh-TW.md#執行的指令)）。
+brew、apt 與 apk 會在 step 之前以 `packages: pin is not one-shot on brew: vim`（或 `apt`、`apk`）使 target 失敗，
+`anvil plan` 也顯示相同的結果：
+
+```toml
+[packages]
+pin = ["vim"]
+remove = ["nano"]
+upgrade = true
 ```
 
 給人看的輸出是每個 target 一個區塊，每個區塊後有一個空行，最後是摘要：
@@ -228,7 +243,8 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 每個 target 都會透過其傳輸執行探測，即使 `[packages]` 沒有事可做也一樣，因此無法連線的 target 在這裡就會像在 apply 中一樣失敗。
 接著由 apply 使用的同一個解析函式列出 step：`[packages]` 有事可做時先是套件 step，再來是每個 `[[steps]]` 項目。
 不會執行任何套件指令或 `[[steps]]` 腳本。
-無法連線、探測或解析的 target 會以與 apply 相同的原因失敗（探測與套件管理器的問題為 `packages: REASON`），其他 target 仍會繼續規劃。
+無法連線、探測或解析的 target 會以與 apply 相同的原因失敗（探測、套件管理器，以及在 brew、apt 或 apk 上的 `pin` 為
+`packages: REASON`，例如 `packages: pin is not one-shot on brew: vim`），其他 target 仍會繼續規劃。
 
 plan 絕不開啟 secret store。會輸入 sudo 密碼的 step 會註明它要用哪個 secret；
 該 secret 是否已設定、是否不含控制字元則不檢查，因此 plan 可能通過，而 apply 接著以 `packages: secret NAME is not set` 失敗。
