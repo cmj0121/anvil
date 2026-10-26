@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -19,6 +20,39 @@ env:
   SOPS_SHA256: e5bec3346a873ae91d871550f3e698c1aad962aff462a080e40f25fde17fef6b
 
 jobs:
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # A v* tag must match Cargo.toml and point at a commit on main; any other ref gets <cargo version>-<short sha>.
+      - id: version
+        run: |
+          cargo_version=$(sed -n '/^\[package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)
+          if [ -z "$cargo_version" ]; then echo "::error::no [package] version in Cargo.toml"; exit 1; fi
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              version=${GITHUB_REF#refs/tags/}
+              if [ "$version" != "v$cargo_version" ]; then
+                echo "::error::tag $version does not match Cargo.toml version $cargo_version"
+                exit 1
+              fi
+              if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+                echo "::error::tag $version points at $GITHUB_SHA, which is not on main"
+                exit 1
+              fi
+              ;;
+            *)
+              version="$cargo_version-$(printf %.7s "$GITHUB_SHA")"
+              ;;
+          esac
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "version: $version"
+
   lint:
     name: pre-commit
     runs-on: ubuntu-latest
@@ -36,6 +70,7 @@ jobs:
 
   test:
     name: make test (${{ matrix.os }})
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -92,3 +127,55 @@ jobs:
           if grep -qx skip e2e.log; then echo "::error::e2e skipped: docker unavailable"; exit 1; fi
           exit $code
         shell: bash -o pipefail {0}
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: [version, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      # Release binaries are built from scratch, never from a restored cache.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target "$TARGET"
+      # The x86_64 macOS binary runs under Rosetta on arm64 runners; without it, skip that leg, but fail on a tag.
+      - name: Smoke test
+        run: |
+          bin="target/$TARGET/release/anvil"
+          if [ "$TARGET" = x86_64-apple-darwin ] && [ "$(uname -m)" = arm64 ] && ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+            case "$GITHUB_REF" in
+              refs/tags/*)
+                echo "::error::Rosetta unavailable; cannot smoke-test the $TARGET release binary"
+                exit 1
+                ;;
+            esac
+            echo "::notice::Rosetta unavailable; skipping the $TARGET smoke test"
+            exit 0
+          fi
+          "$bin" --version
+      - run: sh .github/package.sh "$TARGET" "$VERSION"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: anvil-${{ matrix.target }}
+          path: dist/*
+          retention-days: 14
+          if-no-files-found: error
