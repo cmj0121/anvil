@@ -263,6 +263,15 @@ impl Packages {
         Duration::from_secs(self.timeout)
     }
 
+    /// The name `manager` installs `plain` as: its `alias` entry, else
+    /// `plain`.
+    pub fn name_for<'a>(&'a self, plain: &'a str, manager: Manager) -> &'a str {
+        self.alias
+            .get(plain)
+            .and_then(|names| names.get(manager.as_str()))
+            .map_or(plain, String::as_str)
+    }
+
     /// Whether there is anything to install or upgrade.
     pub fn has_work(&self) -> bool {
         self.upgrade || !self.install.is_empty()
@@ -388,20 +397,26 @@ pub fn with_password(script: &str) -> String {
 }
 
 /// The one-line script that upgrades and installs `packages` with
-/// `manager`; `None` when there is nothing to do. `root`: run without
+/// `manager`, each under [`Packages::name_for`]; `None` when there is
+/// nothing to do. `root`: run without
 /// `sudo -n`. The names go into the script unquoted, so `packages` must
 /// have passed [`Packages::validate`]; panics otherwise, in every build.
 pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<String> {
     assert!(
         packages.validate().is_ok(),
-        "packages::script: install names must pass Packages::validate before they reach a shell line"
+        "packages::script: install and alias names must pass Packages::validate before they reach a shell line"
     );
     if !packages.has_work() {
         return None;
     }
     let install = !packages.install.is_empty();
     let s = if root { "" } else { "sudo -n " };
-    let p = packages.install.join(" ");
+    let p = packages
+        .install
+        .iter()
+        .map(|plain| packages.name_for(plain, manager))
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut parts: Vec<String> = Vec::new();
     match manager {
         Manager::Brew => {
@@ -582,6 +597,117 @@ mod tests {
             assert_eq!(got, want, "{manager} upgrade={upgrade} install={install}");
             assert!(!got.contains('\n'), "{got}");
         }
+    }
+
+    fn with_fd_alias(install: &[&str], upgrade: bool) -> Packages {
+        let fd_find = BTreeMap::from([
+            ("apt".to_string(), "fd-find".to_string()),
+            ("dnf".to_string(), "fd-find".to_string()),
+        ]);
+        Packages {
+            alias: BTreeMap::from([("fd".to_string(), fd_find)]),
+            ..packages(install, upgrade)
+        }
+    }
+
+    #[test]
+    fn scripts_install_the_name_the_manager_uses() {
+        let brew = BREW_PATH;
+        let apt = "sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive";
+        let cases = [
+            (Manager::Brew, false, format!("{brew}brew install git fd")),
+            (
+                Manager::Brew,
+                true,
+                format!("{brew}brew update && brew upgrade && brew install git fd"),
+            ),
+            (
+                Manager::Pacman,
+                false,
+                "sudo -n pacman -S --noconfirm --needed git fd".to_string(),
+            ),
+            (
+                Manager::Pacman,
+                true,
+                "sudo -n pacman -Syu --noconfirm --needed git fd".to_string(),
+            ),
+            (
+                Manager::Apt,
+                false,
+                format!("{apt} apt-get install -y git fd-find"),
+            ),
+            (
+                Manager::Apt,
+                true,
+                format!(
+                    "{apt} apt-get upgrade -y && sudo -n env DEBIAN_FRONTEND=noninteractive \
+                     apt-get install -y git fd-find"
+                ),
+            ),
+            (
+                Manager::Dnf,
+                false,
+                "sudo -n dnf -y install git fd-find".to_string(),
+            ),
+            (
+                Manager::Dnf,
+                true,
+                "sudo -n dnf -y upgrade && sudo -n dnf -y install git fd-find".to_string(),
+            ),
+            (
+                Manager::Apk,
+                false,
+                "sudo -n apk add --update-cache git fd".to_string(),
+            ),
+            (
+                Manager::Apk,
+                true,
+                "sudo -n apk update && sudo -n apk upgrade && sudo -n apk add --update-cache git fd"
+                    .to_string(),
+            ),
+        ];
+        for (manager, upgrade, want) in cases {
+            let p = with_fd_alias(&["git", "fd"], upgrade);
+            assert_eq!(
+                script(manager, &p, false).unwrap(),
+                want,
+                "{manager} {upgrade}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_alias_only_changes_its_own_name() {
+        for manager in Manager::ALL {
+            for upgrade in [true, false] {
+                let plain = packages(&["git", "curl"], upgrade);
+                let aliased = with_fd_alias(&["git", "curl"], upgrade);
+                assert_eq!(
+                    script(manager, &aliased, false),
+                    script(manager, &plain, false)
+                );
+            }
+        }
+        let p = with_fd_alias(&["fd"], false);
+        assert_eq!(p.name_for("fd", Manager::Apt), "fd-find");
+        assert_eq!(p.name_for("fd", Manager::Brew), "fd");
+        assert_eq!(p.name_for("git", Manager::Apt), "git");
+        assert_eq!(packages(&[], false).name_for("fd", Manager::Dnf), "fd");
+    }
+
+    #[test]
+    fn two_names_aliased_to_one_package_are_harmless() {
+        let mut p = with_fd_alias(&["fd", "fdfind"], false);
+        p.alias.insert("fdfind".into(), p.alias["fd"].clone());
+        assert_eq!(p.validate(), Ok(()));
+        assert_eq!(
+            script(Manager::Dnf, &p, false).unwrap(),
+            "sudo -n dnf -y install fd-find fd-find"
+        );
+        assert_eq!(
+            script(Manager::Brew, &p, false).unwrap(),
+            format!("{BREW_PATH}brew install fd fdfind")
+        );
     }
 
     #[test]
