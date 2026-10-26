@@ -20,7 +20,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::cli::{Cli, Failure, print_json};
-use crate::config::Step;
+use crate::config::{Config, Step};
 use crate::facts::{self, Facts};
 use crate::inventory::Target;
 use crate::logger::{BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, is_escaped, paint};
@@ -188,18 +188,19 @@ pub enum Progress<'a> {
     Done(&'a TargetReport),
 }
 
-/// Loads config + targets, applies each in order. Before each target and each
-/// step, `cancel` is checked; once set, the current target ends as Cancelled
-/// (keeping its completed steps) and every later target is Cancelled with no steps.
+/// Loads the targets and applies `config` to each in order. Before each target
+/// and each step, `cancel` is checked; once set, the current target ends as
+/// Cancelled (keeping its completed steps) and every later target is Cancelled
+/// with no steps.
 pub fn run_targets(
     opts: &Options,
+    config: &Config,
     cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
-    let config = opts.load_config()?;
     let targets = opts.targets()?;
     let packages = config.packages.as_ref().filter(|p| p.has_work());
-    let passwords = load_passwords(&targets, packages, || opts.secret_store(&config))?;
+    let passwords = load_passwords(&targets, packages, || opts.secret_store(config))?;
     Ok(apply_targets(
         &targets,
         |target| opts.transport(target),
@@ -301,7 +302,8 @@ fn apply_targets(
 pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
     let style = Style::detect();
     let cancel = AtomicBool::new(false);
-    let report = run_targets(opts, &cancel, &mut |progress| {
+    let config = opts.load_config()?;
+    let report = run_targets(opts, &config, &cancel, &mut |progress| {
         if let Progress::Done(report) = progress
             && !cli.json
         {

@@ -914,6 +914,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                steps: Vec::new(),
                 targets: vec![ran("local", Vec::new()), cancelled("pi")],
                 ok: Some(false),
                 error: None,
@@ -1052,7 +1053,7 @@ mod tests {
 
     #[test]
     fn an_inventory_error_is_drawn_escaped_instead_of_the_lists() {
-        let app = App::with_inventory(opts(), Err("bad \x1b[2J file".to_owned()));
+        let app = App::with_inventory(opts(), Err("bad \x1b[2J file".to_owned()), Ok(Vec::new()));
         let screen = render(&app, 60, 6);
         assert_eq!(
             screen[..2],
@@ -1080,6 +1081,7 @@ mod tests {
         app.edit_format = Some(crate::document::Format::Yaml);
         app.opts.verbose = 2;
         app.results.push(RunResult::Apply {
+            steps: Vec::new(),
             targets: Vec::new(),
             ok: Some(true),
             error: None,
@@ -1127,6 +1129,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                steps: Vec::new(),
                 targets: vec![
                     ran(
                         "local",
@@ -1194,6 +1197,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                steps: Vec::new(),
                 targets: vec![crate::apply::TargetReport::Failed {
                     target: "pi".to_owned(),
                     steps: Vec::new(),
@@ -1222,6 +1226,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                steps: Vec::new(),
                 targets: vec![crate::apply::TargetReport::Failed {
                     target: "pi".to_owned(),
                     steps: vec![step("sleep 40", None, "start\n", "warn\n")],
@@ -1251,6 +1256,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                steps: Vec::new(),
                 targets: vec![ran("local", Vec::new())],
                 ok: None,
                 error: None,
@@ -1268,6 +1274,7 @@ mod tests {
         );
         // The spinner goes with the newest result only.
         app.results.push(RunResult::Apply {
+            steps: Vec::new(),
             targets: Vec::new(),
             ok: None,
             error: None,
@@ -1387,6 +1394,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                steps: Vec::new(),
                 targets: vec![ran("local", Vec::new()), ran("pi", Vec::new())],
                 ok: Some(true),
                 error: None,
@@ -1620,6 +1628,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                steps: Vec::new(),
                 targets: vec![
                     ran("local", Vec::new()),
                     ran("pi", vec![step("false", Some(1), "", "")]),
@@ -1647,6 +1656,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                steps: Vec::new(),
                 targets: Vec::new(),
                 ok: Some(false),
                 error: Some("no config".to_owned()),
@@ -1678,6 +1688,7 @@ mod tests {
         show(
             &mut wide,
             RunResult::Apply {
+                steps: Vec::new(),
                 targets: vec![
                     ran("zz", Vec::new()),
                     ran("local checks", Vec::new()),
@@ -1697,6 +1708,7 @@ mod tests {
         show(
             &mut high,
             RunResult::Apply {
+                steps: Vec::new(),
                 targets: vec![
                     ran("a", Vec::new()),
                     ran("b", Vec::new()),

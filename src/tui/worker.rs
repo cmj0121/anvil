@@ -1,7 +1,7 @@
 //! Runs doctor or apply on a background thread and reports to the main loop
-//! as [`Msg`]s: `Start` and a per-target report as each target goes, then
-//! `DoctorDone` (doctor only) and `Finished`. A panic in the run becomes
-//! `Msg::Panicked`, caught by joining the run's thread.
+//! as [`Msg`]s: `Steps` (apply only), then `Start` and a per-target report as
+//! each target goes, then `DoctorDone` (doctor only) and `Finished`. A panic
+//! in the run becomes `Msg::Panicked`, caught by joining the run's thread.
 
 use std::any::Any;
 use std::cell::Cell;
@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 
-use super::app::{Msg, RunKind};
+use super::app::{self, Msg, RunKind};
 use crate::cli::Failure;
 use crate::options::Options;
 use crate::{apply, doctor};
@@ -86,9 +86,12 @@ fn run_doctor(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
 }
 
 /// As [`run_doctor`]: the config, and the secret store when a target types a
-/// sudo password, are opened by [`apply::run_targets`] here, on the worker.
+/// sudo password (in [`apply::run_targets`]), are opened here, on the worker.
+/// The steps sent are this config's, which may be newer than the app's.
 fn run_apply(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(), Failure> {
-    apply::run_targets(opts, cancel, &mut |progress| {
+    let config = opts.load_config()?;
+    let _ = tx.send(Msg::Steps(app::step_rows(&config)));
+    apply::run_targets(opts, &config, cancel, &mut |progress| {
         let _ = tx.send(match progress {
             apply::Progress::Start(target) => Msg::Start(target.name.clone()),
             apply::Progress::Done(report) => Msg::TargetDone(report.clone()),
@@ -111,9 +114,12 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
     use std::time::Duration;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
     use super::*;
     use crate::test_util::temp_dir;
-    use crate::tui::app::tests::opts;
+    use crate::tui::app::tests::{opts, row};
+    use crate::tui::app::{App, RunResult};
 
     /// Every message until `Finished` or `Panicked`, then the worker joined.
     fn collect(worker: Worker, rx: &Receiver<Msg>) -> Vec<Msg> {
@@ -195,10 +201,12 @@ mod tests {
     }
 
     #[cfg(debug_assertions)]
-    /// The messages as `start NAME` / `done NAME` lines, then the last one.
+    /// The messages as `steps N` / `start NAME` / `done NAME` lines, then
+    /// the last one.
     fn order(msgs: &[Msg]) -> Vec<String> {
         msgs.iter()
             .map(|msg| match msg {
+                Msg::Steps(rows) => format!("steps {}", rows.len()),
                 Msg::Start(name) => format!("start {name}"),
                 Msg::TargetDone(report) => format!("done {}", report.target()),
                 Msg::DoctorTarget(report) => format!("done {}", report.target),
@@ -222,6 +230,7 @@ mod tests {
         assert_eq!(
             order(&msgs),
             [
+                "steps 1",
                 "start down",
                 "done down",
                 "start up",
@@ -229,7 +238,7 @@ mod tests {
                 "finished Ok(())"
             ]
         );
-        match &msgs[1] {
+        match &msgs[2] {
             Msg::TargetDone(apply::TargetReport::Failed {
                 target,
                 steps,
@@ -242,7 +251,7 @@ mod tests {
             }
             _ => panic!("expected a Failed report for down"),
         }
-        match &msgs[3] {
+        match &msgs[4] {
             Msg::TargetDone(apply::TargetReport::Ran { target, steps, ok }) => {
                 assert_eq!((target.as_str(), *ok), ("up", true));
                 assert_eq!(steps[0].stdout, "hi\n");
@@ -285,21 +294,22 @@ mod tests {
     }
 
     #[test]
-    fn apply_sends_start_the_target_report_then_finished() {
+    fn apply_sends_its_steps_start_the_target_report_then_finished() {
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-apply", &["printf 'hi\\n'"]);
         let worker = spawn(RunKind::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
         let msgs = collect(worker, &rx);
-        assert_eq!(msgs.len(), 3);
-        assert!(matches!(&msgs[0], Msg::Start(name) if name == "local"));
-        match &msgs[1] {
+        assert_eq!(msgs.len(), 4);
+        assert!(matches!(&msgs[0], Msg::Steps(rows) if rows[..] == [row("printf 'hi\\n'")]));
+        assert!(matches!(&msgs[1], Msg::Start(name) if name == "local"));
+        match &msgs[2] {
             Msg::TargetDone(apply::TargetReport::Ran { target, steps, ok }) => {
                 assert_eq!((target.as_str(), *ok), ("local", true));
                 assert_eq!(steps[0].stdout, "hi\n");
             }
             _ => panic!("expected TargetDone"),
         }
-        assert!(matches!(&msgs[2], Msg::Finished(Ok(()))));
+        assert!(matches!(&msgs[3], Msg::Finished(Ok(()))));
     }
 
     #[test]
@@ -309,7 +319,7 @@ mod tests {
         let worker = spawn(RunKind::Apply, opts, Arc::new(AtomicBool::new(true)), tx);
         let msgs = collect(worker, &rx);
         assert!(matches!(
-            &msgs[1],
+            &msgs[2],
             Msg::TargetDone(apply::TargetReport::Cancelled { steps, .. }) if steps.is_empty()
         ));
     }
@@ -321,8 +331,49 @@ mod tests {
         opts.target = vec!["nosuch".to_owned()];
         let worker = spawn(RunKind::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
         let msgs = collect(worker, &rx);
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], Msg::Steps(_)));
+        assert!(matches!(&msgs[1], Msg::Finished(Err(err)) if err.contains("nosuch")));
+    }
+
+    #[test]
+    fn a_config_that_does_not_load_sends_no_steps() {
+        let (tx, rx) = mpsc::channel();
+        let opts = local_opts("tui-worker-badconfig", &[]);
+        fs::write(opts.config.as_ref().unwrap(), "[[steps]]\nnope = 1\n").unwrap();
+        let worker = spawn(RunKind::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
+        let msgs = collect(worker, &rx);
         assert_eq!(msgs.len(), 1);
-        assert!(matches!(&msgs[0], Msg::Finished(Err(err)) if err.contains("nosuch")));
+        assert!(matches!(&msgs[0], Msg::Finished(Err(_))));
+    }
+
+    #[test]
+    fn an_apply_result_keeps_the_steps_its_worker_loaded() {
+        let opts = local_opts("tui-worker-snapshot", &["echo old"]);
+        let config = opts.config.clone().unwrap();
+        let mut app = App::with_inventory(opts, Err("not loaded yet".to_owned()), Ok(Vec::new()));
+        app.reload();
+        assert_eq!(app.steps, [row("echo old")]);
+        // Edited between `r` and `a`: the run shows what it ran.
+        fs::write(&config, "[[steps]]\nrun = \"echo new\"\n").unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let (tx, rx) = mpsc::channel();
+        let cancel = app.running.as_ref().unwrap().cancel.clone();
+        let worker = spawn(RunKind::Apply, app.opts.clone(), cancel, tx);
+        for msg in collect(worker, &rx) {
+            app.on_msg(msg);
+        }
+        let result_steps = |app: &App| match app.shown_result() {
+            Some(RunResult::Apply { steps, .. }) => steps.clone(),
+            _ => panic!("expected an apply result"),
+        };
+        assert_eq!(result_steps(&app), [row("echo new")]);
+        assert_eq!(app.steps, [row("echo old")]);
+        // A later reload moves the app's list, not the result's.
+        fs::write(&config, "[[steps]]\nrun = \"echo newer\"\n").unwrap();
+        app.reload();
+        assert_eq!(app.steps, [row("echo newer")]);
+        assert_eq!(result_steps(&app), [row("echo new")]);
     }
 
     #[cfg(debug_assertions)]

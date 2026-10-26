@@ -1,5 +1,5 @@
 //! TUI state and its pure key and message handling: no terminal, and no
-//! I/O beyond [`load_inventory`].
+//! I/O beyond [`load_inventory`] and [`load_steps`].
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -9,6 +9,7 @@ use std::sync::mpsc::Sender;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::config::Config;
 use crate::document::Format;
 use crate::inventory::{Inventory, LOCAL, Sel, UnknownSel};
 use crate::options::Options;
@@ -36,6 +37,10 @@ pub struct App {
     pub tags: Vec<TagRow>,
     /// Shown instead of the lists.
     pub inventory_error: Option<String>,
+    /// The config's steps as of the last reload.
+    pub steps: Vec<StepRow>,
+    /// Shown instead of the steps.
+    pub config_error: Option<String>,
     pub focus: Pane,
     /// In the Targets pane: targets, then tags.
     pub cursor: usize,
@@ -78,6 +83,12 @@ pub struct TargetRow {
 pub struct TagRow {
     pub name: String,
     pub selected: bool,
+}
+
+/// One step apply runs: `packages`, or a `[[steps]]` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepRow {
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,8 +147,10 @@ pub enum RunResult {
         ok: Option<bool>,
         error: Option<String>,
     },
-    /// `ok` is `None` while running.
+    /// `ok` is `None` while running. `steps` are those of the config the
+    /// worker loaded for this run; empty until it has.
     Apply {
+        steps: Vec<StepRow>,
         targets: Vec<apply::TargetReport>,
         ok: Option<bool>,
         error: Option<String>,
@@ -203,6 +216,8 @@ pub enum Overlay {
 }
 
 pub enum Msg {
+    /// The steps of the config an apply run loaded, before its first target.
+    Steps(Vec<StepRow>),
     Start(String),
     DoctorDone(doctor::Report),
     TargetDone(apply::TargetReport),
@@ -221,7 +236,7 @@ pub enum Effect {
     Spawn(RunKind),
     /// Run an editor flow on the main thread, with the real terminal.
     Edit(EditKind),
-    /// Load the inventory again: [`App::reload`].
+    /// Load the inventory and the config again: [`App::reload`].
     Reload,
     Redraw,
 }
@@ -231,6 +246,25 @@ pub fn load_inventory(opts: &Options) -> Result<Inventory, String> {
     opts.inventory().map_err(|failure| failure.message)
 }
 
+/// The steps of the config `opts` names, or why it did not load.
+pub fn load_steps(opts: &Options) -> Result<Vec<StepRow>, String> {
+    opts.load_config()
+        .map(|config| step_rows(&config))
+        .map_err(|failure| failure.message)
+}
+
+/// The steps apply runs for `config`: `packages` first when it has work,
+/// then each step's command as its `$` line shows it.
+pub fn step_rows(config: &Config) -> Vec<StepRow> {
+    let packages = config.packages.as_ref().is_some_and(|p| p.has_work());
+    packages
+        .then(|| "packages".to_owned())
+        .into_iter()
+        .chain(config.steps.iter().map(|step| apply::command(&step.run)))
+        .map(|label| StepRow { label })
+        .collect()
+}
+
 /// Refuses a `--target` that names no target or tag, as the CLI does.
 pub fn check_targets(inventory: &Inventory, target: &[String]) -> Result<(), UnknownSel> {
     let sels: Vec<Sel> = target.iter().map(|sel| Sel::parse(sel)).collect();
@@ -238,9 +272,13 @@ pub fn check_targets(inventory: &Inventory, target: &[String]) -> Result<(), Unk
 }
 
 impl App {
-    /// The state for `opts` and an already loaded inventory (or why it did
-    /// not load). Rows named by `opts.target` start selected.
-    pub fn with_inventory(opts: Options, inventory: Result<Inventory, String>) -> App {
+    /// The state for `opts` and an already loaded inventory and step list
+    /// (or why each did not load). Rows named by `opts.target` start selected.
+    pub fn with_inventory(
+        opts: Options,
+        inventory: Result<Inventory, String>,
+        steps: Result<Vec<StepRow>, String>,
+    ) -> App {
         let (targets, tags, inventory_error) = match inventory {
             Ok(inventory) => {
                 let (targets, tags) = rows(&inventory, &opts.target);
@@ -248,11 +286,13 @@ impl App {
             }
             Err(err) => (Vec::new(), Vec::new(), Some(err)),
         };
-        App {
+        let mut app = App {
             opts,
             targets,
             tags,
             inventory_error,
+            steps: Vec::new(),
+            config_error: None,
             focus: Pane::Targets,
             cursor: 0,
             results: Vec::new(),
@@ -266,7 +306,9 @@ impl App {
             edit_format: None,
             notice: None,
             quit: false,
-        }
+        };
+        app.set_steps(steps);
+        app
     }
 
     /// `q` and Ctrl-C quit; while a run is going they cancel it first, and
@@ -433,10 +475,21 @@ impl App {
         self.show(Some(self.results.len() - 1));
     }
 
-    /// Loads the inventory `opts` names again: [`App::set_inventory`].
+    /// Loads the inventory `opts` names again ([`App::set_inventory`]), and
+    /// the config's steps.
     pub fn reload(&mut self) {
         let inventory = load_inventory(&self.opts);
         self.set_inventory(inventory);
+        let steps = load_steps(&self.opts);
+        self.set_steps(steps);
+    }
+
+    /// The steps of a config that loaded, or why it did not.
+    fn set_steps(&mut self, steps: Result<Vec<StepRow>, String>) {
+        (self.steps, self.config_error) = match steps {
+            Ok(steps) => (steps, None),
+            Err(err) => (Vec::new(), Some(err)),
+        };
     }
 
     /// Rebuilds the rows from `inventory`, keeping the selection of every
@@ -486,6 +539,11 @@ impl App {
 
     pub fn on_msg(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
+            Msg::Steps(rows) => {
+                if let Some(RunResult::Apply { steps, .. }) = self.results.last_mut() {
+                    *steps = rows;
+                }
+            }
             Msg::Start(name) => {
                 if let Some(running) = &mut self.running {
                     running.current = Some(name);
@@ -558,6 +616,7 @@ impl App {
                 error: None,
             },
             RunKind::Apply => RunResult::Apply {
+                steps: Vec::new(),
                 targets: Vec::new(),
                 ok: None,
                 error: None,
@@ -654,6 +713,7 @@ impl App {
                 targets,
                 ok,
                 error: slot,
+                ..
             }) => {
                 *ok = Some(error.is_none() && targets.iter().all(apply::TargetReport::ok));
                 *slot = error;
@@ -863,8 +923,14 @@ pub mod tests {
         }
     }
 
+    pub fn row(label: &str) -> StepRow {
+        StepRow {
+            label: label.to_owned(),
+        }
+    }
+
     pub fn app() -> App {
-        App::with_inventory(opts(), Ok(inventory()))
+        App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()))
     }
 
     pub fn step(run: &str, code: Option<i32>, stdout: &str, stderr: &str) -> apply::StepReport {
@@ -974,16 +1040,67 @@ pub mod tests {
 
     #[test]
     fn an_inventory_error_replaces_the_lists() {
-        let app = App::with_inventory(opts(), Err("bad inventory".to_owned()));
+        let app = App::with_inventory(opts(), Err("bad inventory".to_owned()), Ok(Vec::new()));
         assert!(app.targets.is_empty() && app.tags.is_empty());
         assert_eq!(app.inventory_error.as_deref(), Some("bad inventory"));
+    }
+
+    /// Options naming a config file holding `toml` and an empty inventory.
+    fn config_opts(tag: &str, toml: &str) -> Options {
+        let dir = crate::test_util::temp_dir(tag);
+        let (config, inventory) = (dir.join("config.toml"), dir.join("inventory.toml"));
+        std::fs::write(&config, toml).unwrap();
+        std::fs::write(&inventory, "").unwrap();
+        let mut opts = opts();
+        opts.config = Some(config);
+        opts.inventory = Some(inventory);
+        opts
+    }
+
+    #[test]
+    fn steps_are_packages_with_work_then_each_step_command() {
+        let toml = "[packages]\ninstall = [\"tree\"]\n\n\
+                    [[steps]]\nrun = \"hostname\"\n\n\
+                    [[steps]]\nrun = \"\"\"\nmkdir -p ~/.local\ntouch x\n\"\"\"\n";
+        let mut app = App::with_inventory(
+            config_opts("tui-steps", toml),
+            Ok(inventory()),
+            Ok(Vec::new()),
+        );
+        app.reload();
+        assert_eq!(
+            app.steps,
+            [row("packages"), row("hostname"), row("mkdir -p ~/.local …")]
+        );
+        assert_eq!(app.config_error, None);
+    }
+
+    #[test]
+    fn packages_without_work_and_no_steps_is_the_default_step() {
+        let opts = config_opts("tui-steps-default", "[packages]\ninstall = []\n");
+        assert_eq!(load_steps(&opts), Ok(vec![row("hostname")]));
+        assert_eq!(step_rows(&Config::default()), [row("hostname")]);
+    }
+
+    #[test]
+    fn a_broken_config_sets_config_error_and_keeps_the_inventory() {
+        let opts = config_opts("tui-steps-broken", "[[steps]]\nrun = \"ls\"\n");
+        let mut app = App::with_inventory(opts, Ok(inventory()), Ok(Vec::new()));
+        app.reload();
+        assert_eq!(app.steps, [row("ls")]);
+        std::fs::write(app.opts.config.as_ref().unwrap(), "[[steps]]\nnope = 1\n").unwrap();
+        app.reload();
+        assert!(app.steps.is_empty());
+        assert!(app.config_error.as_deref().unwrap().contains("nope"));
+        assert_eq!(app.inventory_error, None);
+        assert_eq!(app.targets.len(), 1, "only local: the inventory is empty");
     }
 
     #[test]
     fn the_initial_target_flags_preselect_rows() {
         let mut opts = opts();
         opts.target = vec!["pi".to_owned(), "dev".to_owned()];
-        let app = App::with_inventory(opts, Ok(inventory()));
+        let app = App::with_inventory(opts, Ok(inventory()), Ok(Vec::new()));
         let selected: Vec<_> = app.targets.iter().map(|r| r.selected).collect();
         assert_eq!(selected, [false, false, true]);
         assert!(app.tags[0].selected && !app.tags[1].selected);
@@ -1026,7 +1143,7 @@ pub mod tests {
 
     #[test]
     fn space_with_no_rows_does_nothing() {
-        let mut app = App::with_inventory(opts(), Err("x".to_owned()));
+        let mut app = App::with_inventory(opts(), Err("x".to_owned()), Ok(Vec::new()));
         press(&mut app, &[KeyCode::Down, KeyCode::Char(' ')]);
         assert!(app.opts.target.is_empty());
     }
@@ -1129,7 +1246,7 @@ pub mod tests {
         assert!(app.running.is_none());
         assert!(matches!(
             app.shown_result(),
-            Some(RunResult::Apply { ok: Some(false), error: None, targets }) if targets.len() == 2
+            Some(RunResult::Apply { ok: Some(false), error: None, targets, .. }) if targets.len() == 2
         ));
     }
 
