@@ -12,11 +12,11 @@ use crate::inventory::{Target, TargetKind};
 use crate::secret;
 use crate::transport::{SUDO_OK, TTY_READY};
 
-/// Most `install` entries.
+/// Most `install`, `remove` or `pin` entries.
 pub const MAX_INSTALL: usize = 256;
-/// Longest `install` entry, in bytes.
+/// Longest `install`, `remove` or `pin` entry, in bytes.
 pub const MAX_NAME_BYTES: usize = 128;
-/// The rule every `install` entry follows.
+/// The rule every `install`, `remove` and `pin` entry follows.
 pub const NAME_RULE: &str = "must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*";
 /// `timeout` when unset, in seconds.
 pub const DEFAULT_TIMEOUT: u64 = 300;
@@ -165,6 +165,12 @@ pub struct Packages {
     pub local: Option<Choice>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub install: Vec<String>,
+    /// Names to remove after the install.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<String>,
+    /// Names installed when missing and never upgraded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pin: Vec<String>,
     /// Per plain name, the name each manager uses instead.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub alias: BTreeMap<String, BTreeMap<String, String>>,
@@ -187,6 +193,8 @@ impl Default for Packages {
             manager: Choice::default(),
             local: None,
             install: Vec::new(),
+            remove: Vec::new(),
+            pin: Vec::new(),
             alias: BTreeMap::new(),
             upgrade: false,
             local_sudo_secret: None,
@@ -204,7 +212,8 @@ fn is_default_timeout(timeout: &u64) -> bool {
 }
 
 impl Packages {
-    /// Checks the `install` names, the `alias` table, `local_sudo_secret` and
+    /// Checks the `install`, `remove` and `pin` names, that `remove` shares
+    /// no name with `install` or `pin`, the `alias` table, `local_sudo_secret` and
     /// `timeout`; the error names the entry.
     pub fn validate(&self) -> Result<(), String> {
         if !(1..=MAX_TIMEOUT).contains(&self.timeout) {
@@ -231,6 +240,8 @@ impl Packages {
         for (i, name) in self.install.iter().enumerate() {
             check_name(name).map_err(|why| format!("packages.install[{i}] `{name}`: {why}"))?;
         }
+        check_names("remove", &self.remove)?;
+        check_names("pin", &self.pin)?;
         if self.alias.len() > MAX_INSTALL {
             return Err(format!(
                 "packages.alias: {} entries exceeds the {MAX_INSTALL} entry limit",
@@ -255,6 +266,38 @@ impl Packages {
                 })?;
             }
         }
+        self.check_remove_overlap()
+    }
+
+    /// No `remove` name is an `install` or `pin` name, plainly or as the
+    /// name some manager uses.
+    fn check_remove_overlap(&self) -> Result<(), String> {
+        let others = [("install", &self.install), ("pin", &self.pin)];
+        for name in &self.remove {
+            for (field, names) in others {
+                if names.contains(name) {
+                    return Err(format!(
+                        "packages.remove `{}`: also in {field}",
+                        secret::shown_name(name)
+                    ));
+                }
+            }
+        }
+        for manager in Manager::ALL {
+            for name in &self.remove {
+                let removed = self.name_for(name, manager);
+                for (field, names) in others {
+                    if let Some(other) = names.iter().find(|n| self.name_for(n, manager) == removed)
+                    {
+                        return Err(format!(
+                            "packages.remove `{}`: also in {field} as `{}` on {manager}",
+                            secret::shown_name(name),
+                            secret::shown_name(other)
+                        ));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -272,9 +315,9 @@ impl Packages {
             .map_or(plain, String::as_str)
     }
 
-    /// Whether there is anything to install or upgrade.
+    /// Whether there is anything to install, upgrade, remove or pin.
     pub fn has_work(&self) -> bool {
-        self.upgrade || !self.install.is_empty()
+        self.upgrade || !self.install.is_empty() || !self.remove.is_empty() || !self.pin.is_empty()
     }
 
     /// The choice for `target`: its inventory `pkg`, else `local` for the
@@ -304,6 +347,26 @@ impl Packages {
             .iter()
             .filter_map(|target| self.sudo_secret_for(target))
     }
+}
+
+/// The `field` list within the entry limit, each entry per [`check_name`];
+/// the error names the entry, escaped.
+fn check_names(field: &str, names: &[String]) -> Result<(), String> {
+    if names.len() > MAX_INSTALL {
+        return Err(format!(
+            "packages.{field}: {} entries exceeds the {MAX_INSTALL} entry limit",
+            names.len()
+        ));
+    }
+    for (i, name) in names.iter().enumerate() {
+        check_name(name).map_err(|why| {
+            format!(
+                "packages.{field}[{i}] `{}`: {why}",
+                secret::shown_name(name)
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// `name` within the byte limit and [`NAME_RULE`]; the error is the rule it
@@ -398,18 +461,18 @@ pub fn with_password(script: &str) -> String {
 
 /// The one-line script that upgrades and installs `packages` with
 /// `manager`, each under [`Packages::name_for`]; `None` when there is
-/// nothing to do. `root`: run without
+/// nothing to upgrade or install. `root`: run without
 /// `sudo -n`. The names go into the script unquoted, so `packages` must
 /// have passed [`Packages::validate`]; panics otherwise, in every build.
 pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<String> {
     assert!(
         packages.validate().is_ok(),
-        "packages::script: install and alias names must pass Packages::validate before they reach a shell line"
+        "packages::script: package names must pass Packages::validate before they reach a shell line"
     );
-    if !packages.has_work() {
+    let install = !packages.install.is_empty();
+    if !packages.upgrade && !install {
         return None;
     }
-    let install = !packages.install.is_empty();
     let s = if root { "" } else { "sudo -n " };
     let p = packages
         .install
@@ -909,6 +972,123 @@ mod tests {
     }
 
     #[test]
+    fn remove_and_pin_parse_in_both_formats_and_count_as_work() {
+        let toml = parse("remove = [\"nano\"]\npin = [\"git\", \"fd\"]\n").unwrap();
+        let yaml: Packages =
+            document::from_str("remove: [nano]\npin: [git, fd]\n", Format::Yaml).unwrap();
+        assert_eq!(toml, yaml);
+        assert_eq!(toml.remove, ["nano"]);
+        assert_eq!(toml.pin, ["git", "fd"]);
+        assert_eq!(toml.validate(), Ok(()));
+
+        assert!(!Packages::default().has_work());
+        for p in [
+            parse("remove = [\"nano\"]\n").unwrap(),
+            parse("pin = [\"git\"]\n").unwrap(),
+        ] {
+            assert!(p.has_work(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn remove_and_pin_names_are_validated() {
+        for field in ["remove", "pin"] {
+            for (text, err) in [
+                (
+                    format!("{field} = [\"git\", \"-rf\"]\n"),
+                    format!("packages.{field}[1] `-rf`: {NAME_RULE}"),
+                ),
+                (
+                    format!("{field} = [\"\"]\n"),
+                    format!("packages.{field}[0] ``: {NAME_RULE}"),
+                ),
+                (
+                    format!("{field} = [\"f\\u001b[2Jd\"]\n"),
+                    format!("packages.{field}[0] `f\\x1b[2Jd`: {NAME_RULE}"),
+                ),
+                (
+                    format!("{field} = [\"x\\ny\"]\n"),
+                    format!("packages.{field}[0] `x\\ny`: {NAME_RULE}"),
+                ),
+                (
+                    format!("{field} = [\"{}\"]\n", "x".repeat(129)),
+                    format!(
+                        "packages.{field}[0] `{}…`: 129 bytes exceeds the 128 byte limit",
+                        "x".repeat(64)
+                    ),
+                ),
+            ] {
+                assert_eq!(parse(&text).unwrap().validate(), Err(err), "{text}");
+            }
+            let names = |n: usize| format!("{field} = [{}]\n", vec!["\"x\""; n].join(", "));
+            assert_eq!(parse(&names(MAX_INSTALL)).unwrap().validate(), Ok(()));
+            assert_eq!(
+                parse(&names(MAX_INSTALL + 1)).unwrap().validate(),
+                Err(format!(
+                    "packages.{field}: 257 entries exceeds the 256 entry limit"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn remove_shares_no_plain_name_with_install_or_pin() {
+        for (text, err) in [
+            (
+                "install = [\"nano\"]\nremove = [\"nano\"]\n",
+                "packages.remove `nano`: also in install",
+            ),
+            (
+                "pin = [\"git\"]\nremove = [\"curl\", \"git\"]\n",
+                "packages.remove `git`: also in pin",
+            ),
+            (
+                "install = [\"fd\"]\nremove = [\"fd\"]\n[alias.fd]\napt = \"fd-find\"\n",
+                "packages.remove `fd`: also in install",
+            ),
+            (
+                "install = [\"fd\"]\nremove = [\"fd-find\"]\n[alias.fd]\napt = \"fd-find\"\n",
+                "packages.remove `fd-find`: also in install as `fd` on apt",
+            ),
+            (
+                "pin = [\"rg\"]\nremove = [\"ripgrep\"]\n[alias.rg]\nbrew = \"ripgrep\"\n",
+                "packages.remove `ripgrep`: also in pin as `rg` on brew",
+            ),
+            (
+                "install = [\"fd\"]\nremove = [\"fdfind\"]\n\
+                 [alias.fd]\ndnf = \"fd-find\"\n[alias.fdfind]\ndnf = \"fd-find\"\n",
+                "packages.remove `fdfind`: also in install as `fd` on dnf",
+            ),
+        ] {
+            assert_eq!(
+                parse(text).unwrap().validate(),
+                Err(err.to_string()),
+                "{text}"
+            );
+        }
+        for text in [
+            "install = [\"git\"]\npin = [\"git\"]\n",
+            "install = [\"fd\"]\nremove = [\"fd-find\"]\n",
+        ] {
+            assert_eq!(parse(text).unwrap().validate(), Ok(()), "{text}");
+        }
+    }
+
+    #[test]
+    fn remove_or_pin_alone_adds_no_script_line_yet() {
+        let p = parse("remove = [\"nano\"]\npin = [\"git\"]\n").unwrap();
+        for manager in Manager::ALL {
+            assert_eq!(script(manager, &p, true), None);
+            let mut with_install = p.clone();
+            with_install.install = vec!["curl".into()];
+            assert_eq!(
+                script(manager, &with_install, true),
+                script(manager, &packages(&["curl"], false), true)
+            );
+        }
+    }
+
+    #[test]
     fn aliases_parse_in_both_formats() {
         let toml = parse("install = [\"fd\"]\n[alias.fd]\napt = \"fd-find\"\ndnf = \"fd-find\"\n")
             .unwrap();
@@ -1046,6 +1226,8 @@ mod tests {
             manager: Choice::Is(Manager::Apt),
             local: Some(Choice::Auto),
             install: vec!["git".into(), "curl".into()],
+            remove: vec!["nano".into()],
+            pin: vec!["fd".into()],
             alias: BTreeMap::from([(
                 "fd".into(),
                 BTreeMap::from([("apt".into(), "fd-find".into())]),
@@ -1064,7 +1246,8 @@ mod tests {
         let text = document::to_string(&full, Format::Toml).unwrap();
         assert_eq!(
             text,
-            "manager = \"apt\"\nlocal = \"auto\"\ninstall = [\"git\", \"curl\"]\nupgrade = true\n\
+            "manager = \"apt\"\nlocal = \"auto\"\ninstall = [\"git\", \"curl\"]\n\
+             remove = [\"nano\"]\npin = [\"fd\"]\nupgrade = true\n\
              local_sudo_secret = \"LOCAL_SUDO\"\ntimeout = 600\n\n[alias.fd]\napt = \"fd-find\"\n"
         );
         assert_eq!(

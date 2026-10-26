@@ -512,6 +512,10 @@ mod tests {
                 "invalid/config-bad-alias.toml",
                 "packages.alias.fd `auto`: must be one of brew, pacman, apt, dnf, apk",
             ),
+            (
+                "invalid/config-remove-installed.toml",
+                "packages.remove `nano`: also in install",
+            ),
         ] {
             let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
             let message = err.to_string();
@@ -847,7 +851,13 @@ mod tests {
         let aliased =
             parse("[packages]\ninstall = [\"fd\"]\n\n[packages.alias.fd]\napt = \"fd-find\"\n");
         assert!(aliased.validate(Path::new("config.toml")).is_ok());
-        for config in [config, parse("[packages]\n"), longer, aliased] {
+        let pinned = parse("[packages]\nremove = [\"nano\"]\npin = [\"git\"]\n");
+        assert!(pinned.validate(Path::new("config.toml")).is_ok());
+        let yaml: Config =
+            document::from_str("packages:\n  remove: [nano]\n  pin: [git]\n", Format::Yaml)
+                .unwrap();
+        assert_eq!(yaml, pinned);
+        for config in [config, parse("[packages]\n"), longer, aliased, pinned] {
             for format in [Format::Toml, Format::Yaml] {
                 let text = document::to_string(&config, format).unwrap();
                 let back: Config = document::from_str(&text, format).unwrap();
@@ -856,6 +866,10 @@ mod tests {
                 assert_eq!(text.contains("timeout"), timeout != 300, "{text}");
                 let alias = !config.packages.as_ref().unwrap().alias.is_empty();
                 assert_eq!(text.contains("alias"), alias, "{text}");
+                let remove = !config.packages.as_ref().unwrap().remove.is_empty();
+                assert_eq!(text.contains("remove"), remove, "{text}");
+                let pin = !config.packages.as_ref().unwrap().pin.is_empty();
+                assert_eq!(text.contains("pin"), pin, "{text}");
             }
         }
         for timeout in [0, 3601] {
@@ -901,6 +915,21 @@ mod tests {
                 Format::Yaml,
                 "packages.alias `-x`: must match",
             ),
+            (
+                "[packages]\nremove = [\"git\", \"-rf\"]\n",
+                Format::Toml,
+                "packages.remove[1] `-rf`: must match",
+            ),
+            (
+                "packages:\n  pin: [\"-rf\"]\n",
+                Format::Yaml,
+                "packages.pin[0] `-rf`: must match",
+            ),
+            (
+                "packages:\n  pin: [git]\n  remove: [git]\n",
+                Format::Yaml,
+                "packages.remove `git`: also in pin",
+            ),
         ] {
             let config: Config = document::from_str(text, format).unwrap();
             let err = config.validate(Path::new("config.toml")).unwrap_err();
@@ -923,14 +952,11 @@ mod tests {
                 Format::Toml,
                 "packages.local `nix`",
             ),
-            ("[packages]\nremove = []\n", Format::Toml, "remove"),
+            ("[packages]\npurge = []\n", Format::Toml, "purge"),
         ] {
             let err = document::from_str::<Config>(text, format).unwrap_err();
             assert!(err.contains(needle), "{text}: {err}");
-            assert!(
-                err.contains("must be one of") || needle == "remove",
-                "{err}"
-            );
+            assert!(err.contains("must be one of") || needle == "purge", "{err}");
         }
     }
 
