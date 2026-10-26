@@ -1,0 +1,179 @@
+# 套件
+
+[English](packages.md) | 繁體中文
+
+設定了 `[packages]` 時，`anvil apply` 會探測每個 target（目標），選出它的套件管理器，
+並在 `[[steps]]` 之前執行一個產生出來的 step（步驟），升級（`upgrade = true` 時）並安裝 `install` 清單。
+選擇依序為 host（主機）的 `pkg`，`local` 則為 `[packages].local`，否則為 `[packages].manager`。
+`auto` 依照 `distro` fact（探測事實）：`macos` 用 brew，Arch 及其衍生版用 pacman，Debian 與 Ubuntu 用 apt，
+Fedora 與 RHEL 用 dnf，Alpine 用 apk；未知的 distro 取第一個找到且不是 brew 的管理器，否則用 brew。
+
+brew 以連線使用者的身分執行，並拒絕 root。其他所有管理器都需要 root：anvil 以 `root` 連線，或以 `sudo -n` 執行它。
+當 sudo 要求密碼時，指定一個存放該密碼的 secret（機密）：
+host 上的 `sudo_secret`（`local` 則為 `[packages].local_sudo_secret`），並以 `anvil secret NAME` 設定它：apply 便會在終端機上執行套件 step，
+並在 sudo 的提示出現時輸入一次密碼。沒有設定時，這類 target 會以 `packages: ...` 失敗。
+NOPASSWD 與 `root` 的 target 從不使用密碼。`anvil doctor` 會檢查這些 secret，
+並以 `manager` 列顯示每個 target 解析出的管理器，無法解析時即失敗。確切的指令與規則見[下文](#選擇哪個套件管理器)。
+
+config（設定檔）中的 `[packages]` 會用每個 target 各自的套件管理器，在所有 target 上安裝並升級套件。
+
+```toml
+[packages]
+install = ["git", "curl"]
+```
+
+## 選擇哪個套件管理器
+
+target 的選擇是它在 inventory（主機清單）中的 `pkg`，`local` target 則為 `[packages].local`，
+否則為 `[packages].manager`（預設為 `auto`）。它會依據探測所得的 target facts 解析：
+
+| `distro` fact                                      | `auto` 選擇 |
+| -------------------------------------------------- | ----------- |
+| `macos`                                            | brew        |
+| `arch`, `archarm`, `manjaro`, `endeavouros`        | pacman      |
+| `debian`, `ubuntu`, `raspbian`, `linuxmint`, `pop` | apt         |
+| `fedora`, `rhel`, `centos`, `rocky`, `almalinux`   | dnf         |
+| `alpine`                                           | apk         |
+
+其他 distro 取 `pkg` fact 中第一個不是 brew 的管理器，若有 brew 則用 brew，否則以 `no package manager found` 失敗。
+管理器必須在 `pkg` fact 中：否則指名的選擇會以 `` `pacman` is not installed on this target `` 失敗，
+`auto` 則以 `` `pacman`, the default for arch, is not installed `` 失敗。
+
+## Root 與 sudo
+
+brew 以連線使用者的身分執行，當該使用者是 `root` 時以 `brew refuses to run as root` 失敗。
+其他所有管理器都需要 root：當 facts 的 `user` 是 `root` 時，指令原樣執行，否則每個指令前面都加上永不提示的 `sudo -n`。
+`sudo` fact 為 `nopasswd` 時僅此而已。為 `binary`（sudo 會要求密碼）時，target 需要一個 sudo secret：
+它在 inventory 中的 `sudo_secret`，`local` 則為 `[packages].local_sudo_secret`（host 的 `sudo_secret` 屬於它自己；
+`local_sudo_secret` 只適用於 `local`）。有設定時，anvil 會從該 secret 輸入密碼（[輸入 sudo 密碼](#輸入-sudo-密碼)）；
+沒有設定時，
+target 會以 `` `pacman` needs root and sudo asks for a password; set sudo_secret (local_sudo_secret for local),
+set NOPASSWD, or connect as root `` 失敗，而 `none` 則以 `` `pacman` needs root and sudo is not installed `` 失敗。
+
+只有在以下條件全部成立時才會使用密碼：管理器不是 brew、facts 的 `user` 不是 `root`、`sudo` fact 為 `binary`，
+且 target 有 sudo secret。`root` 或 NOPASSWD 的 target 執行原本的單行腳本，其 secret 從不輸入，apply 也不檢查它。
+探測會測試 `sudo -n true`，因此 NOPASSWD 規則只涵蓋部分指令的 host 會被判為 `binary`：
+沒有 secret 時，即使套件管理器本身被允許也會被拒絕；有 secret 時則會輸入密碼。
+
+## 輸入 sudo 密碼
+
+```toml
+# inventory.toml
+[hosts.linode1]
+host = "203.0.113.10"
+sudo_secret = "HOST_SUDO"
+```
+
+```sh
+anvil secret HOST_SUDO   # store the password; one trailing newline is trimmed
+anvil doctor             # shows `secret HOST_SUDO ok` and the manager linode1 resolves to
+anvil apply
+```
+
+**載入。** 當 `[packages]` 有工作要做，且某個選定的 target 有 sudo secret 時，
+apply 會在任何 target 執行之前開啟機密儲存庫一次，並讀取每個不同的 secret；否則完全不開啟儲存庫。
+無法開啟的儲存庫會使指令失敗。值結尾的一個 `\n` 會被去除；其餘保持不變。
+需要密碼時，未設定的 secret 會使該 target 以 `packages: secret NAME is not set` 失敗，
+含有控制字元的值（任何小於 0x20 的位元組，或 0x7f；CRLF 結尾會留下一個 `\r`，也算在內），
+會使它以 `packages: secret NAME contains control characters` 失敗。其他 target 照常執行。
+
+**在終端機上。** 套件 step 在偽終端機上執行：對 host 而言，是作為 master 連線的 ssh 用戶端，
+以 `-o ControlMaster=no -o BatchMode=yes -o LogLevel=ERROR -tt -e none -- HOST 'echo BASE64 | base64 -d | sh'` 執行，
+腳本經 base64 編碼成一個只含 shell 中立字元的遠端指令（因此登入 shell 可以是 sh、bash、zsh、fish 或 csh；
+host 需要有 `base64`）；對 `local` 而言，則透過絕對路徑的 `script(1)`（`/usr/bin/script`，若不存在則為 `/bin/script`；
+從不在 `PATH` 中查找），並設定 `SHELL=/bin/sh`：在 macOS 與 BSD 上為 `/usr/bin/script -q /dev/null /bin/sh -c SCRIPT`，
+在 Linux 上為 `/usr/bin/script -qec SCRIPT /dev/null`（util-linux）。它執行的腳本是把單行腳本像這樣包裝起來：
+
+```sh
+export TERM=dumb
+mesg n </dev/tty 2>/dev/null; stty -echo </dev/tty; echo anvil-tty-ready
+IFS= read -r n </dev/tty
+trap 'sudo -k' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+LC_ALL=C SUDO_PROMPT="$n" sudo -v </dev/tty && echo anvil-sudo-ok && SCRIPT
+```
+
+**提示。** 每次執行時，anvil 都會產生一個新的提示：`anvil-sudo-` 後接 32 個取自 `/dev/urandom` 的十六進位數字，
+再加上 `:`。它從不出現在 argv 中：當腳本印出 `anvil-tty-ready`（此時 echo 已關閉）時，anvil 會在終端機上輸入該提示，
+腳本讀取它並以 `SUDO_PROMPT` 交給 `sudo -v`。只有當輸出恰好以該提示結尾、且 100 ms 內沒有更多輸出時，
+anvil 才會輸入密碼，而且只輸入一次。`sudo -v` 先驗證 ticket，接著單行腳本照常以其 `sudo -n` 執行，
+之後無論結果如何，`sudo -k` 都會丟棄該 ticket。若 ticket 已有快取，sudo 不會詢問任何東西，anvil 也不會輸入任何東西。
+
+**失敗。** target 會像傳輸錯誤（`✘ ERROR`）一樣失敗，只指名 secret，從不顯示其值；
+在前三種情況中，行程群組會被終止，這會掛斷終端機，並一併結束 sh 與 sudo：
+
+- 輸入密碼後提示再次出現：`packages: sudo rejected the password from secret NAME`（anvil 從不重試）；
+- 在 `anvil-tty-ready` 之後 15 s 內，提示與 `anvil-sudo-ok` 都沒有出現：
+  `packages: sudo did not show anvil's prompt (secret NAME)`；
+- 執行超過 30 s，與任何腳本相同：`timed out after 30 s`；
+- `script(1)` 或 `ssh` 無法啟動：`cannot start the transport: REASON`。
+
+**輸出。** step 的 stdout 是終端機的輸出，其中 CRLF 轉為 LF，
+`anvil-tty-ready` 與 `anvil-sudo-ok` 這兩行以及每一處提示都會被移除；在終端機上，腳本的 stderr 也會出現在其中。
+它的 stderr 是 ssh 自己的（`local` 則為 `script` 的）。`$` 行、報告與 `--json` 顯示的是單行腳本，而不是包裝後的腳本。
+
+**機密衛生。** anvil 在終端機上輸入密碼，從不把它放進 argv、環境變數、檔案、日誌行或錯誤訊息中；
+它會將記憶體中的副本清零。sudo 讀取密碼時，終端機的 echo 是關閉的。作為終端機仍然回顯密碼時的後備措施，
+step 輸出（因此 `--json` 也是）中任何 8 位元組以上的密碼都會被替換為 `***`；較短的密碼不會被清除。
+`-vv` 會記錄 target 使用哪個 secret，從不記錄其值。
+
+**限制。**
+
+- sudo 必須以 anvil 的提示詢問。若 PAM stack 詢問的是別的東西（2FA 代碼、指紋），就得不到回答，
+  target 會在 15 s 後以 `packages: sudo did not show anvil's prompt (secret NAME)` 失敗。
+- `sudo -v` 建立一個供各 step 的 `sudo -n` 使用的 ticket；若設定 `Defaults timestamp_timeout=0`，ticket 會立即過期，
+  之後的 `sudo -n` 會失敗，因此 step 以非零值結束。
+- 在 Linux 上，local target 需要 util-linux 的 `script`；busybox 的 `script` 沒有 `-e`，因此 local 執行會在那裡失敗。
+- 只有套件 step 在終端機上執行；`[[steps]]` 從不會拿到密碼。
+
+## 執行的指令
+
+step 只有一行：先是升級部分，然後是安裝部分，以 `&&` 連接。`S` 代表 `sudo -n` 後接一個空格（以 root 執行時為空），
+`P` 代表以空格連接的 `install` 名稱：
+
+| 管理器 | 部分 | 指令                                                             |
+| ------ | ---- | ---------------------------------------------------------------- |
+| brew   | 升級 | `brew update && brew upgrade`                                    |
+| brew   | 安裝 | `brew install P`                                                 |
+| pacman | 升級 | `S pacman -Syu --noconfirm --needed P`（單一指令，也會安裝 `P`） |
+| pacman | 安裝 | `S pacman -S --noconfirm --needed P`                             |
+| apt    | 先行 | `S apt-get update`（一律執行，一次）                             |
+| apt    | 升級 | `S env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y`        |
+| apt    | 安裝 | `S env DEBIAN_FRONTEND=noninteractive apt-get install -y P`      |
+| dnf    | 升級 | `S dnf -y upgrade`                                               |
+| dnf    | 安裝 | `S dnf -y install P`                                             |
+| apk    | 升級 | `S apk update && S apk upgrade`                                  |
+| apk    | 安裝 | `S apk add --update-cache P`                                     |
+
+- **索引更新。** apt 一律在升級與安裝之前先執行一次 `apt-get update`；apk 以 `--update-cache` 更新；
+  dnf 會自行更新過期的 metadata。pacman 以 `-S` 安裝，不加 `-y`：只用 `-Sy` 而不加 `-u` 是部分升級，Arch 不支援，
+  因此過期的資料庫只會由 `upgrade = true`（`-Syu`）更新。
+- **brew 的 PATH。** brew 那一行以 `export PATH=...;` 開頭，
+  把 `/opt/homebrew/bin`、`/usr/local/bin` 與 `/home/linuxbrew/.linuxbrew/bin` 附加到 `$PATH`，
+  因為非登入的 ssh shell 可能不會把 Homebrew 放進 `PATH`。它們放在 `$PATH` 之後，因此使用者自己的 `PATH` 優先，
+  其他帳號前綴下的執行檔永遠不會遮蔽它。全部是一行，所以 apply 的 `$` 行會顯示整個腳本。
+- **名稱原樣傳遞。** `install` 名稱原樣、不加引號地傳給管理器（名稱規則排除了 shell 語法）。
+  含有 `/` 的名稱是 brew tap：`owner/repo/formula` 會加入第三方 tap `owner/repo` 並從中安裝。
+  config 決定每個 target 安裝什麼、從哪裡安裝，因此只使用你信任的 config。
+
+`install = ["git", "curl"]` 分別在 Debian 上以 NOPASSWD 使用者、在 Arch 上以 root，以及在 Mac 上：
+
+```sh
+sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y git curl
+pacman -S --noconfirm --needed git curl
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; brew install git curl
+```
+
+再加上 `upgrade = true` 時，Mac 那一行的結尾是 `brew update && brew upgrade && brew install git curl`，
+而 Arch 的則是 `pacman -Syu --noconfirm --needed git curl`。
+
+套件只會被安裝或升級，從不會被移除或鎖定版本。
+
+## 失敗
+
+無法連上 target 的探測會以原樣的傳輸錯誤（`cannot connect: …`）使其失敗。
+在 step 之前的任何其他失敗，都會使 target 不執行任何 step，並以 `packages: REASON` 失敗：
+`packages: probe exited C`、`packages: probe was killed by a signal`、`packages: probe output has no end marker`，
+或上文的解析錯誤（`packages: brew refuses to run as root`），
+或[輸入 sudo 密碼](#輸入-sudo-密碼)中的 sudo 密碼失敗（`packages: secret NAME is not set`）。
+step 本身失敗時，顯示方式和任何 step 一樣，`✘ step 1 exited C`，且 `[[steps]]` 不會執行。
+`anvil doctor` 的 `manager` 列顯示相同的解析結果，因此它會在 apply 執行之前回報 apply 會拒絕的 target。
