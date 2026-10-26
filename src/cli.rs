@@ -69,6 +69,8 @@ pub enum Command {
     Doctor,
     /// Run the config's steps on every target
     Apply,
+    /// Show the steps apply would run on every target, running none
+    Plan,
     /// Edit one secret in the editor, or move every secret to another backend
     Secret {
         /// Secret name
@@ -101,6 +103,7 @@ impl Command {
             Command::Config { .. } => "config",
             Command::Doctor => "doctor",
             Command::Apply => "apply",
+            Command::Plan => "plan",
             Command::Secret { .. } => "secret",
             #[cfg(feature = "tui")]
             Command::Tui => "tui",
@@ -194,6 +197,7 @@ pub fn run(cli: &Cli) -> Result<(), Failure> {
             crate::doctor::run(cli, &opts, &config, store.as_ref())
         }
         Command::Apply => crate::apply::run(cli, &opts),
+        Command::Plan => crate::plan::run(cli, &opts),
         Command::Secret { to: Some(to), .. } => crate::commands::migrate(cli, &opts, *to),
         Command::Secret { name, .. } => {
             let config = opts.load_config()?;
@@ -240,6 +244,7 @@ mod tests {
         ));
         assert!(matches!(parse(&["doctor"]).command, Command::Doctor));
         assert!(matches!(parse(&["apply"]).command, Command::Apply));
+        assert!(matches!(parse(&["plan"]).command, Command::Plan));
         match parse(&["secret", "HOST_SUDO"]).command {
             Command::Secret {
                 name, migrate, to, ..

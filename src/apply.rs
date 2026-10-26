@@ -49,10 +49,12 @@ fn sudo_password<'a>(passwords: &'a Passwords, name: &str) -> Result<&'a [u8], S
 
 /// A step apply would run: its one-line script, the secret whose password
 /// is typed when it runs through sudo with a password, and its time limit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PlannedRun {
     pub run: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sudo_secret: Option<String>,
+    #[serde(skip)]
     pub timeout: Duration,
 }
 
@@ -151,8 +153,13 @@ impl TargetReport {
 
 /// The end of a passed target's block: `ok · N step(s)`.
 pub fn ok_text(steps: usize) -> String {
+    format!("ok · {}", steps_text(steps))
+}
+
+/// `N step` or `N steps`.
+pub fn steps_text(steps: usize) -> String {
     let plural = if steps == 1 { "" } else { "s" };
-    format!("ok · {steps} step{plural}")
+    format!("{steps} step{plural}")
 }
 
 #[derive(Debug, Serialize)]
@@ -495,7 +502,7 @@ pub fn resolve(
 
 /// When a line's text has its control characters escaped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Escape {
+pub(crate) enum Escape {
     /// anvil's own text.
     Never,
     /// Text from a host or the config.
@@ -508,7 +515,7 @@ enum Escape {
 /// says and painted in `colour`, then `end`. Stdout and stderr lines are kept
 /// in one list so they interleave in order.
 #[derive(Debug, PartialEq, Eq)]
-struct Line {
+pub(crate) struct Line {
     stderr: bool,
     lead: &'static str,
     text: String,
@@ -518,7 +525,7 @@ struct Line {
 }
 
 impl Line {
-    fn out(text: String, escape: Escape, colour: Option<&'static str>) -> Line {
+    pub(crate) fn out(text: String, escape: Escape, colour: Option<&'static str>) -> Line {
         Line {
             stderr: false,
             lead: "  ",
@@ -529,8 +536,24 @@ impl Line {
         }
     }
 
+    /// A target's `▶ target` header.
+    pub(crate) fn header(target: &str) -> Line {
+        Line {
+            lead: "",
+            ..Line::out(format!("▶ {target}"), Escape::Never, Some(BOLD_CYAN))
+        }
+    }
+
+    /// `self` as the end of a target's block, followed by a blank line.
+    pub(crate) fn last(self) -> Line {
+        Line {
+            end: "\n\n",
+            ..self
+        }
+    }
+
     /// The bytes written for this line: escaped first, then painted.
-    fn show(&self, style: Style) -> String {
+    pub(crate) fn show(&self, style: Style) -> String {
         let stream = if self.stderr { style.err } else { style.out };
         let escape = match self.escape {
             Escape::Never => false,
@@ -552,20 +575,20 @@ impl Line {
 
 /// What one output stream is attached to.
 #[derive(Debug, Clone, Copy)]
-struct Stream {
+pub(crate) struct Stream {
     tty: bool,
     colour: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Style {
+pub(crate) struct Style {
     out: Stream,
     err: Stream,
 }
 
 impl Style {
     /// Colour needs a terminal and an unset or empty `NO_COLOR`.
-    fn new(out_tty: bool, err_tty: bool, no_color: Option<&OsStr>) -> Style {
+    pub(crate) fn new(out_tty: bool, err_tty: bool, no_color: Option<&OsStr>) -> Style {
         let allowed = no_color.is_none_or(OsStr::is_empty);
         let stream = |tty: bool| Stream {
             tty,
@@ -577,17 +600,22 @@ impl Style {
         }
     }
 
-    fn detect() -> Style {
+    pub(crate) fn detect() -> Style {
         Style::new(
             std::io::stdout().is_terminal(),
             std::io::stderr().is_terminal(),
             std::env::var_os("NO_COLOR").as_deref(),
         )
     }
+
+    /// Whether stdout is painted.
+    pub(crate) fn out_colour(self) -> bool {
+        self.out.colour
+    }
 }
 
 /// Writes each line to its stream, flushing so a terminal shows them in order.
-fn print_lines(lines: &[Line], style: Style) {
+pub(crate) fn print_lines(lines: &[Line], style: Style) {
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
     for line in lines {
@@ -617,10 +645,7 @@ pub fn command(run: &str) -> String {
 /// a terminal.
 fn render(report: &TargetReport, style: Style) -> Vec<Line> {
     let (target, steps) = (report.target(), report.steps());
-    let mut lines = vec![Line {
-        lead: "",
-        ..Line::out(format!("▶ {target}"), Escape::Never, Some(BOLD_CYAN))
-    }];
+    let mut lines = vec![Line::header(target)];
     let prefix = if style.err.tty {
         String::new()
     } else {
@@ -653,7 +678,7 @@ fn render(report: &TargetReport, style: Style) -> Vec<Line> {
             Some(GREEN),
         ),
     };
-    lines.push(Line { end: "\n\n", ..end });
+    lines.push(end.last());
     lines
 }
 
