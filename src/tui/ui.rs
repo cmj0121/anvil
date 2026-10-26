@@ -1,7 +1,7 @@
 //! Draws [`App`]: Targets and Tags on the left, Results on the right, an
 //! optional log pane, the status bar and the overlays (help, the secret
-//! NAME prompt, the migrate choice, the options). Host and config text is
-//! escaped before it is drawn.
+//! NAME prompt, the migrate choice, the options, the targets). Host and
+//! config text is escaped before it is drawn.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -66,6 +66,7 @@ pub fn draw(app: &App, f: &mut Frame) {
         Some(Overlay::Input { text, invalid }) => draw_input(f, text, *invalid),
         Some(Overlay::Migrate { choice }) => draw_migrate(f, *choice),
         Some(Overlay::Options { field, texts }) => draw_options(f, *field, texts),
+        Some(Overlay::Targets { cursor }) => draw_targets(app, f, *cursor),
     }
 }
 
@@ -723,6 +724,61 @@ fn draw_migrate(f: &mut Frame, choice: usize) {
     popup(f, "Migrate secrets to", 46, lines);
 }
 
+/// `Hosts` then `Tags`, each row `[x]` marked, the cursor on row `cursor`
+/// of the targets then tags; the inventory error instead when it did not
+/// load. As wide as its widest line, up to the screen.
+fn draw_targets(app: &App, f: &mut Frame, cursor: usize) {
+    let mut lines = Vec::new();
+    if let Some(err) = &app.inventory_error {
+        lines.push(Line::from(format!(" {}", text(err))).style(Color::Red));
+    } else {
+        let names: Vec<String> = app.targets.iter().map(|row| text(&row.name)).collect();
+        let details: Vec<String> = app.targets.iter().map(|row| text(&row.detail)).collect();
+        let width = |texts: &[String]| texts.iter().map(|t| cols(t)).max().unwrap_or(0);
+        let (name_col, detail_col) = (width(&names), width(&details));
+        lines.push(Line::from(" Hosts").style(heading()));
+        for (i, row) in app.targets.iter().enumerate() {
+            let body = format!(
+                "{}  {}  {}",
+                pad_columns(&names[i], name_col),
+                pad_columns(&details[i], detail_col),
+                text(&row.tags.join(", "))
+            );
+            lines.push(popup_row(row.selected, body.trim_end(), i == cursor));
+        }
+        let tags: Vec<String> = app.tags.iter().map(|row| text(&row.name)).collect();
+        let tag_col = width(&tags);
+        lines.push(Line::from(" Tags").style(heading()));
+        for (i, row) in app.tags.iter().enumerate() {
+            let hosts = app
+                .targets
+                .iter()
+                .filter(|target| target.tags.contains(&row.name))
+                .count();
+            let noun = if hosts == 1 { "host" } else { "hosts" };
+            let body = format!("{}  {hosts} {noun}", pad_columns(&tags[i], tag_col));
+            lines.push(popup_row(
+                row.selected,
+                &body,
+                app.targets.len() + i == cursor,
+            ));
+        }
+    }
+    lines.push(Line::from(" ↑↓ move · Space select · Enter/Esc close").style(secondary()));
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = u16::try_from(widest + 3)
+        .unwrap_or(u16::MAX)
+        .min(f.area().width);
+    popup(f, "Targets", width, lines);
+}
+
+/// A [`marked_line`] indented one column, as popup rows are.
+fn popup_row(selected: bool, body: &str, under_cursor: bool) -> Line<'static> {
+    let mut line = marked_line(selected, body, under_cursor);
+    line.spans.insert(0, Span::raw(" "));
+    line
+}
+
 /// The three paths, the one being typed into marked; empty is the default.
 fn draw_options(f: &mut Frame, field: usize, texts: &[String; 3]) {
     let mut lines: Vec<Line> = OPTION_FLAGS
@@ -1049,6 +1105,48 @@ mod tests {
                 "└─────────────────└──────────────────────────────────────────┘─────────────────┘",
             ]
         );
+    }
+
+    #[test]
+    fn the_targets_overlay_lists_hosts_then_tags() {
+        let mut app = app();
+        app.targets[2].selected = true;
+        app.overlay = Some(Overlay::Targets { cursor: 3 });
+        let screen = render(&app, 80, 16);
+        assert_eq!(
+            screen[3..13]
+                .iter()
+                .map(|row| chars_at(row, 18, 62))
+                .collect::<Vec<_>>(),
+            [
+                "┌Targets───────────────────────────────────┐",
+                "│ Hosts                                    │",
+                "│ [ ] local  local                         │",
+                "│ [ ] mac    me@10.0.0.2:2222  dev         │",
+                "│ [x] pi     pi.lan            home, dev   │",
+                "│ Tags                                     │",
+                "│ [ ] dev   2 hosts                        │",
+                "│ [ ] home  1 host                         │",
+                "│ ↑↓ move · Space select · Enter/Esc close │",
+                "└──────────────────────────────────────────┘",
+            ]
+        );
+        let buf = buffer(&app, 80, 16);
+        let (x, y) = find(&buf, 80, 16, "dev   2 hosts");
+        assert_eq!(buf[(x, y)].fg, Color::LightBlue, "the cursor is on dev");
+        let (x, y) = find(&buf, 80, 16, "Hosts");
+        assert_eq!(buf[(x, y)].fg, Color::Cyan);
+    }
+
+    #[test]
+    fn the_targets_overlay_shows_the_inventory_error() {
+        let mut app =
+            App::with_inventory(opts(), Err("bad \x1b[2J file".to_owned()), Ok(Vec::new()));
+        app.overlay = Some(Overlay::Targets { cursor: 0 });
+        let buf = buffer(&app, 80, 12);
+        // The Inventory pane shows it too, unindented.
+        let (x, y) = find(&buf, 80, 12, "│ bad \\x1b[2J file");
+        assert_eq!(buf[(x + 2, y)].fg, Color::Red);
     }
 
     #[test]

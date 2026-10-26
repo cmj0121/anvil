@@ -69,13 +69,6 @@ pub struct TargetRow {
     pub name: String,
     /// `local` or `user@host:port`.
     pub detail: String,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "in the D7 row, but not drawn in the 28-column pane yet"
-        )
-    )]
     pub tags: Vec<String>,
     pub selected: bool,
 }
@@ -213,6 +206,11 @@ pub enum Overlay {
         field: usize,
         texts: [String; 3],
     },
+    /// The targets and tags to run on; `cursor` counts their rows as the
+    /// Targets pane's does, headings left out.
+    Targets {
+        cursor: usize,
+    },
 }
 
 pub enum Msg {
@@ -347,6 +345,7 @@ impl App {
                 });
             }
             KeyCode::Char('m') => self.overlay = Some(Overlay::Migrate { choice: 0 }),
+            KeyCode::Char('t') => self.overlay = Some(Overlay::Targets { cursor: 0 }),
             KeyCode::Char('o') => {
                 let text = |path: &Option<PathBuf>| {
                     path.as_ref()
@@ -389,7 +388,7 @@ impl App {
             KeyCode::Tab => self.focus = self.next_focus(),
             KeyCode::Up | KeyCode::Char('k') => self.step(false),
             KeyCode::Down | KeyCode::Char('j') => self.step(true),
-            KeyCode::Char(' ') if self.focus == Pane::Targets => self.toggle(),
+            KeyCode::Char(' ') if self.focus == Pane::Targets => self.toggle(self.cursor),
             _ if had_notice => {}
             _ => return Vec::new(),
         }
@@ -398,7 +397,8 @@ impl App {
 
     /// A key under `overlay`, which was taken out of `self.overlay`: it is
     /// put back unless the key closes it. Esc closes any overlay; Enter
-    /// confirms the Input, Migrate and Options overlays.
+    /// confirms the Input, Migrate and Options overlays, and closes Targets
+    /// as `t` does: its selection changes as Space is pressed.
     fn on_overlay_key(&mut self, mut overlay: Overlay, key: KeyEvent) -> Vec<Effect> {
         let mut effects = vec![Effect::Redraw];
         let keep = match (&mut overlay, key.code) {
@@ -432,6 +432,22 @@ impl App {
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     *choice = (*choice + 1).min(BACKENDS.len() - 1);
+                    true
+                }
+                _ => true,
+            },
+            (Overlay::Targets { cursor }, code) => match code {
+                KeyCode::Enter | KeyCode::Char('t') => false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *cursor = cursor.saturating_sub(1);
+                    true
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *cursor = (*cursor + 1).min(self.last_row());
+                    true
+                }
+                KeyCode::Char(' ') => {
+                    self.toggle(*cursor);
                     true
                 }
                 _ => true,
@@ -522,8 +538,7 @@ impl App {
                 self.inventory_error = Some(err);
             }
         }
-        let rows = self.targets.len() + self.tags.len();
-        self.cursor = self.cursor.min(rows.saturating_sub(1));
+        self.cursor = self.cursor.min(self.last_row());
     }
 
     /// Advances the spinner; the main loop calls it every tick.
@@ -778,9 +793,8 @@ impl App {
     fn step(&mut self, down: bool) {
         match self.focus {
             Pane::Targets => {
-                let last = (self.targets.len() + self.tags.len()).saturating_sub(1);
                 self.cursor = if down {
-                    (self.cursor + 1).min(last)
+                    (self.cursor + 1).min(self.last_row())
                 } else {
                     self.cursor.saturating_sub(1)
                 };
@@ -796,13 +810,18 @@ impl App {
         }
     }
 
-    /// Toggles the row under the cursor and rewrites `opts.target` to the
-    /// selected targets then tags; nothing selected means all targets.
-    fn toggle(&mut self) {
+    /// The index of the last target or tag row; 0 with none.
+    fn last_row(&self) -> usize {
+        (self.targets.len() + self.tags.len()).saturating_sub(1)
+    }
+
+    /// Toggles row `index` (targets, then tags) and rewrites `opts.target`
+    /// to the selected targets then tags; nothing selected means all targets.
+    fn toggle(&mut self, index: usize) {
         let n = self.targets.len();
-        if let Some(row) = self.targets.get_mut(self.cursor) {
+        if let Some(row) = self.targets.get_mut(index) {
             row.selected = !row.selected;
-        } else if let Some(row) = self.tags.get_mut(self.cursor - n) {
+        } else if let Some(row) = self.tags.get_mut(index - n) {
             row.selected = !row.selected;
         } else {
             return;
@@ -1145,6 +1164,67 @@ pub mod tests {
     fn space_with_no_rows_does_nothing() {
         let mut app = App::with_inventory(opts(), Err("x".to_owned()), Ok(Vec::new()));
         press(&mut app, &[KeyCode::Down, KeyCode::Char(' ')]);
+        assert!(app.opts.target.is_empty());
+    }
+
+    #[test]
+    fn t_opens_the_targets_overlay_and_enter_esc_or_t_close_it() {
+        for close in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('t')] {
+            let mut app = app();
+            assert_eq!(app.on_key(key(KeyCode::Char('t'))), [Effect::Redraw]);
+            assert!(matches!(app.overlay, Some(Overlay::Targets { cursor: 0 })));
+            assert_eq!(app.on_key(key(close)), [Effect::Redraw]);
+            assert!(app.overlay.is_none(), "{close:?} closes it");
+        }
+    }
+
+    #[test]
+    fn the_targets_overlay_moves_and_selects_like_the_pane() {
+        let mut app = app();
+        // local, pi, then the `home` tag: as in the pane test above.
+        press(
+            &mut app,
+            &[
+                KeyCode::Char('t'),
+                KeyCode::Char(' '),
+                KeyCode::Down,
+                KeyCode::Char('j'),
+                KeyCode::Char(' '),
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Char(' '),
+            ],
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Targets { cursor: 4 })));
+        assert_eq!(app.opts.target, ["local", "pi", "home"], "selected live");
+        press(&mut app, &[KeyCode::Down, KeyCode::Down]);
+        assert!(matches!(app.overlay, Some(Overlay::Targets { cursor: 4 })));
+        press(&mut app, &[KeyCode::Up; 9]);
+        press(&mut app, &[KeyCode::Char('k')]);
+        assert!(matches!(app.overlay, Some(Overlay::Targets { cursor: 0 })));
+        press(&mut app, &[KeyCode::Char(' '), KeyCode::Enter]);
+        assert_eq!(app.opts.target, ["pi", "home"]);
+        assert_eq!(app.cursor, 0, "the pane's cursor is its own");
+    }
+
+    #[test]
+    fn the_targets_overlay_opens_and_selects_while_running() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('a'), KeyCode::Char('t')]);
+        assert!(matches!(app.overlay, Some(Overlay::Targets { .. })));
+        press(&mut app, &[KeyCode::Down, KeyCode::Char(' ')]);
+        assert_eq!(app.opts.target, ["mac"]);
+        assert!(app.running.is_some());
+    }
+
+    #[test]
+    fn the_targets_overlay_with_an_inventory_error_has_no_rows() {
+        let mut app = App::with_inventory(opts(), Err("x".to_owned()), Ok(Vec::new()));
+        press(
+            &mut app,
+            &[KeyCode::Char('t'), KeyCode::Down, KeyCode::Char(' ')],
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Targets { cursor: 0 })));
         assert!(app.opts.target.is_empty());
     }
 
