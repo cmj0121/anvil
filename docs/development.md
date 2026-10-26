@@ -20,17 +20,34 @@ digest like the official one.
 ## CI
 
 GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs on every pull request, on pushes to
-`main` and by hand:
+`main`, by hand and as part of a release:
 
-| Job          | Runs on                | What it checks                                                                    |
-| ------------ | ---------------------- | --------------------------------------------------------------------------------- |
-| `pre-commit` | Ubuntu                 | `pre-commit run --all-files` (YAML, whitespace, gitleaks, markdownlint, prettier) |
-| `make test`  | Ubuntu and macOS       | `make test` with sops and python3 3.12, then a `--no-default-features` build      |
-| `MSRV`       | Ubuntu, Rust 1.89      | `cargo check --all-targets` on the `rust-version` in Cargo.toml                   |
-| `make e2e`   | Ubuntu, after the test | `make e2e` against the amd64 Arch image; a `skip` (no docker) fails the job       |
+| Job          | Runs on                | What it checks                                                                     |
+| ------------ | ---------------------- | ---------------------------------------------------------------------------------- |
+| `version`    | Ubuntu                 | On a `v*` tag, that the tag matches `version` in Cargo.toml; runs before the tests |
+| `pre-commit` | Ubuntu                 | `pre-commit run --all-files` (YAML, whitespace, gitleaks, markdownlint, prettier)  |
+| `make test`  | Ubuntu and macOS       | `make test` with sops and python3 3.12, then a `--no-default-features` build       |
+| `MSRV`       | Ubuntu, Rust 1.89      | `cargo check --all-targets` on the `rust-version` in Cargo.toml                    |
+| `make e2e`   | Ubuntu, after the test | `make e2e` against the amd64 Arch image; a `skip` (no docker) fails the job        |
+| `build`      | Ubuntu and macOS       | After the test, release binaries for three targets, kept as artifacts (below)      |
+
+`build` makes `cargo build --release --locked` binaries for `aarch64-apple-darwin`, `x86_64-apple-darwin` and
+`x86_64-unknown-linux-musl`. [`.github/package.sh`](../.github/package.sh) packages each as
+`anvil-<version>-<target>.tar.gz` plus a `.sha256`, uploaded as workflow artifacts kept for 14 days.
 
 Actions are pinned by commit SHA, and sops is a pinned release checked against its SHA-256 (`.github/install-sops.sh`).
 The keychain tests that write to the login keychain stay `#[ignore]` and do not run in CI.
+
+## Releases
+
+To release, bump `version` in Cargo.toml, run `cargo check` so Cargo.lock picks up the new version (`build` uses
+`--locked`), commit both files to `main`, and push a `vX.Y.Z` tag that matches it; the tag must point at a commit on
+`main`. [`.github/workflows/release.yml`](../.github/workflows/release.yml) runs the whole CI on the tag, then publishes
+a GitHub Release with the archives and their checksums. Re-running the workflow re-uploads the assets to that release.
+A tag containing `-` (e.g. `v0.2.0-rc.1`) becomes a prerelease. Nothing is signed or notarized.
+
+To withdraw a bad release, run `gh release delete vX.Y.Z --cleanup-tag --yes`, then fix the problem and tag a new
+patch version.
 
 Where anvil deliberately departs from the design issues is listed in [deviations.md](deviations.md).
 

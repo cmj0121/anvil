@@ -23,10 +23,14 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
 需要 Rust 1.89 或更新版本，以及 OpenSSH 用戶端（`PATH` 上的 `ssh`）。
 
 ```sh
+make install               # installs `anvil` into ~/.local/bin (PREFIX= to change)
+# or
 cargo install --path .     # installs `anvil` into ~/.cargo/bin
 # or
 make build                 # builds target/release/anvil
 ```
+
+預先建置的執行檔請見[入門](docs/getting-started.zh-TW.md#預先建置的執行檔)。
 
 ## 快速開始
 

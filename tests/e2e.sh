@@ -130,6 +130,15 @@ anvil() {
 
 DISTRO_JSON='"distro":"arch(arm)?"'
 DISTRO_LINE='^  distro +arch(arm)?$'
+# The local distro as the probe reports it: macos on Darwin, else os-release ID.
+if [ "$(uname -s)" = Darwin ]; then
+  LOCAL_DISTRO_JSON='"distro":"macos"'
+elif [ -r /etc/os-release ]; then
+  # shellcheck disable=SC1091 # the host's file, read at run time
+  LOCAL_DISTRO_JSON="\"distro\":\"$(. /etc/os-release && printf '%s' "$ID")\""
+else
+  LOCAL_DISTRO_JSON=''
+fi
 
 step "(a)+(g) doctor --json: arch and local connectable, whole run within 10 s"
 anvil doctor --json --target local --target arch
@@ -137,7 +146,7 @@ code=$?
 elapsed=$(($(date +%s) - started))
 if [ "$code" -eq 0 ] && [ "$elapsed" -le 10 ] \
   && grep -Eq "\"target\":\"arch\",\"connectable\":true,\"facts\":\{[^}]*$DISTRO_JSON" "$TMP/out" \
-  && grep -q '"target":"local","connectable":true,"facts":{[^}]*"distro":"macos"' "$TMP/out" \
+  && grep -Eq "\"target\":\"local\",\"connectable\":true,\"facts\":\{[^}]*$LOCAL_DISTRO_JSON" "$TMP/out" \
   && grep -q '"secrets":{}' "$TMP/out" && grep -q '"ok":true}$' "$TMP/out"; then
   pass "arch + local connectable, returned in ${elapsed}s"
 else
@@ -229,7 +238,7 @@ else
 fi
 
 step "(l) [packages] in a --config of its own: doctor resolves pacman, apply installs through sudo"
-# Never target `local` with this config: it would run brew on this host.
+# Never target `local` with this config: it would run this host's package manager.
 PKG_CONFIG="$TMP/packages.toml"
 # inetutils is preinstalled in the image, so `--needed` keeps pacman offline;
 # another package would need the network and a fresh sync db.
@@ -286,7 +295,7 @@ else
 fi
 
 step "(m) sudo password from an age secret: archpw installs through sudo over a tty"
-# Never target `local` with these files: it would run brew on this host.
+# Never target `local` with these files: it would run this host's package manager.
 if command -v python3 >/dev/null 2>&1; then
   # A HOME of its own, so this check signs archpw in itself.
   SUDO_HOME="$TMP/home-sudo"
