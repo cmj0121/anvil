@@ -1,6 +1,7 @@
 //! TUI state and its pure key and message handling: no terminal, and no
 //! I/O beyond [`load_inventory`] and [`load_steps`].
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,6 +16,8 @@ use crate::inventory::{Inventory, LOCAL, Sel, UnknownSel};
 use crate::options::Options;
 use crate::secret::{self, BackendKind};
 use crate::{apply, doctor};
+
+use super::ui;
 
 /// Log lines kept for the log pane; the oldest is dropped beyond this.
 pub const LOG_CAP: usize = 2000;
@@ -42,7 +45,7 @@ pub struct App {
     /// Shown instead of the steps.
     pub config_error: Option<String>,
     pub focus: Pane,
-    /// In the Steps pane: an index into `steps`.
+    /// In the Steps pane: an index into [`App::shown_steps`].
     pub cursor: usize,
     /// Session history, newest last.
     pub results: Vec<RunResult>,
@@ -53,6 +56,9 @@ pub struct App {
     pub tab: usize,
     /// Results pane.
     pub scroll: u16,
+    /// The Results body's width as last drawn; scrolling to a step wraps
+    /// the lines before it at this width.
+    pub results_width: Cell<u16>,
     pub running: Option<Running>,
     pub log: VecDeque<LogLine>,
     pub show_log: bool,
@@ -299,6 +305,7 @@ impl App {
             shown: None,
             tab: 0,
             scroll: 0,
+            results_width: Cell::new(0),
             running: None,
             log: VecDeque::new(),
             show_log: false,
@@ -388,6 +395,7 @@ impl App {
             KeyCode::Right => self.move_tab(true),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
             KeyCode::Tab => self.focus = self.next_focus(),
+            KeyCode::Enter => self.scroll_to_step(),
             KeyCode::Up | KeyCode::Char('k') => self.step(false),
             KeyCode::Down | KeyCode::Char('j') => self.step(true),
             _ if had_notice => {}
@@ -768,7 +776,8 @@ impl App {
         }
     }
 
-    /// Left or Right: one tab, no wrap. A move returns the body to the top.
+    /// Left or Right: one tab, no wrap. A move returns the body to the top,
+    /// or on an apply result to the cursor's step.
     fn move_tab(&mut self, right: bool) {
         let count = self.shown_result().map(RunResult::tab_count).unwrap_or(0);
         if count == 0 {
@@ -783,6 +792,39 @@ impl App {
         if next != current {
             self.tab = next;
             self.scroll = 0;
+            self.scroll_to_step();
+        }
+    }
+
+    /// The steps the Steps pane lists: those of the shown apply result's
+    /// config, else the config's as of the last reload.
+    pub fn shown_steps(&self) -> &[StepRow] {
+        match self.shown_result() {
+            Some(RunResult::Apply { steps, .. }) => steps,
+            _ => &self.steps,
+        }
+    }
+
+    /// `cursor` clamped into [`App::shown_steps`]; 0 with none.
+    pub(crate) fn step_cursor(&self) -> usize {
+        self.cursor.min(self.shown_steps().len().saturating_sub(1))
+    }
+
+    /// Scrolls Results so the cursor step's `$` line is the shown apply
+    /// tab's top row; a step the tab did not reach scrolls to its end line.
+    /// With no steps listed there is no step to go to.
+    fn scroll_to_step(&mut self) {
+        if self.shown_steps().is_empty() {
+            return;
+        }
+        let scroll = match self.shown_result() {
+            Some(RunResult::Apply { targets, .. }) => targets.get(self.shown_tab()).map(|report| {
+                ui::step_scroll(report, self.step_cursor(), self.results_width.get())
+            }),
+            _ => None,
+        };
+        if let Some(scroll) = scroll {
+            self.scroll = scroll;
         }
     }
 
@@ -797,11 +839,13 @@ impl App {
     fn step(&mut self, down: bool) {
         match self.focus {
             Pane::Steps => {
+                let cursor = self.step_cursor();
                 self.cursor = if down {
-                    (self.cursor + 1).min(self.steps.len().saturating_sub(1))
+                    (cursor + 1).min(self.shown_steps().len().saturating_sub(1))
                 } else {
-                    self.cursor.saturating_sub(1)
+                    cursor.saturating_sub(1)
                 };
+                self.scroll_to_step();
             }
             Pane::Results => {
                 self.scroll = if down {

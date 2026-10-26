@@ -123,7 +123,12 @@ fn header_line(app: &App, width: u16) -> Line<'static> {
             app.results.len()
         ));
     }
-    left.push_str(" · targets: ");
+    let mut spans = vec![Span::raw(left)];
+    if let Some(running) = shown_running(app) {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(spinner_text(running), Color::Cyan));
+    }
+    spans.push(Span::raw(" · targets: "));
     let selection = if app.inventory_error.is_some() {
         Span::styled("inventory error", Color::Red)
     } else {
@@ -153,7 +158,8 @@ fn header_line(app: &App, width: u16) -> Line<'static> {
         ],
         None => Vec::new(),
     };
-    spread(vec![Span::raw(left), selection], right, width)
+    spans.push(selection);
+    spread(spans, right, width)
 }
 
 /// The notice, else the keys that fit; `-v N · <format>` on the right.
@@ -221,8 +227,9 @@ fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16) -> Li
     Line::from(spans)
 }
 
-/// The config's steps, `N label`, the cursor row marked `▶`; the config
-/// error instead when it did not load.
+/// The steps, `N label`, the cursor row marked `▶`; an apply result's
+/// rows also get their D2 mark for the shown tab. The config error instead
+/// when it did not load.
 fn draw_steps(app: &App, f: &mut Frame, area: Rect) {
     let focused = app.focus == Pane::Steps;
     let border = block("Steps", focused);
@@ -233,26 +240,68 @@ fn draw_steps(app: &App, f: &mut Frame, area: Rect) {
         f.render_widget(error, area);
         return;
     }
-    let digits = app.steps.len().to_string().len();
-    // Columns left after the border and the `▶` column.
-    let room = usize::from(area.width.saturating_sub(2)).saturating_sub(1);
-    let lines: Vec<Line> = app
-        .steps
+    let steps = app.shown_steps();
+    // `Some` on an apply result: the shown tab's report, if it has one yet.
+    let report = match app.shown_result() {
+        Some(RunResult::Apply { targets, .. }) => Some(targets.get(app.shown_tab())),
+        _ => None,
+    };
+    let cursor = app.step_cursor();
+    let digits = steps.len().to_string().len();
+    // Columns left after the border, the `▶` column and a mark with its space.
+    let mark_cols = if report.is_some() { 2 } else { 0 };
+    let room = usize::from(area.width.saturating_sub(2)).saturating_sub(1 + mark_cols);
+    let lines: Vec<Line> = steps
         .iter()
         .enumerate()
         .map(|(i, step)| {
-            let at = i == app.cursor;
+            let at = i == cursor;
+            let style = if at && focused {
+                cursor_style()
+            } else {
+                Style::default()
+            };
             let body = format!("{:>digits$} {}", i + 1, text(&step.label));
-            let row = format!("{}{}", if at { "▶" } else { " " }, ellipsize(&body, room));
-            line(row, at && focused)
+            let mut spans = vec![Span::styled(if at { "▶" } else { " " }, style)];
+            if let Some(report) = report {
+                let (mark, mark_style) = step_mark(report, i);
+                spans.extend([Span::styled(mark, mark_style), Span::styled(" ", style)]);
+            }
+            spans.push(Span::styled(ellipsize(&body, room), style));
+            Line::from(spans)
         })
         .collect();
-    let skip = (app.cursor + 1).saturating_sub(usize::from(area.height.saturating_sub(2)));
+    let skip = (cursor + 1).saturating_sub(usize::from(area.height.saturating_sub(2)));
     let scroll = u16::try_from(skip).unwrap_or(u16::MAX);
     f.render_widget(
         Paragraph::new(lines).scroll((scroll, 0)).block(border),
         area,
     );
+}
+
+/// Step `index`'s mark in a target's apply `report` (D2): `✔` or `✘` by
+/// its exit code once reported; past the report `⊘` (not run), except the
+/// step a transport error ended with no timed-out step kept, `✘`; `·`
+/// before the target has a report.
+fn step_mark(report: Option<&TargetReport>, index: usize) -> (&'static str, Style) {
+    let failed = ("✘", Style::new().fg(Color::Red));
+    let skipped = ("⊘", secondary());
+    let Some(report) = report else {
+        return ("·", secondary());
+    };
+    let steps = report.steps();
+    if let Some(step) = steps.get(index) {
+        return if step.code == Some(0) {
+            ("✔", Style::new().fg(Color::Green))
+        } else {
+            failed
+        };
+    }
+    let kept_timeout = steps.last().is_some_and(|step| step.code != Some(0));
+    match report {
+        TargetReport::Failed { .. } if index == steps.len() && !kept_timeout => failed,
+        _ => skipped,
+    }
 }
 
 fn mark(selected: bool) -> &'static str {
@@ -335,6 +384,7 @@ fn draw_results(app: &App, f: &mut Frame, area: Rect) {
     let border = block("Results", app.focus == Pane::Results);
     let inner = border.inner(area);
     f.render_widget(border, area);
+    app.results_width.set(inner.width);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -381,15 +431,20 @@ fn body_paragraph(app: &App, lines: Vec<Line<'static>>) -> Paragraph<'static> {
         .scroll((app.scroll, 0))
 }
 
-/// The running result is the newest one. An edit has no spinner.
 fn running_line(app: &App) -> Option<Line<'static>> {
+    shown_running(app).map(|running| Line::from(spinner_text(running)).style(Color::Cyan))
+}
+
+/// The run going, when it is the shown result: the running result is the
+/// newest one. An edit has no spinner.
+fn shown_running(app: &App) -> Option<&Running> {
     let running = app.running.as_ref()?;
     if app.shown != Some(app.results.len() - 1)
         || matches!(app.shown_result(), Some(RunResult::Edit { .. }))
     {
         return None;
     }
-    Some(spinner(running))
+    Some(running)
 }
 
 fn result_error(result: &RunResult) -> Option<&str> {
@@ -598,10 +653,10 @@ fn tab_spans(tab: &StripTab, selected: bool, budget: usize) -> Vec<Span<'static>
     }
 }
 
-fn spinner(running: &Running) -> Line<'static> {
+fn spinner_text(running: &Running) -> String {
     let glyph = SPINNER[usize::from(running.tick) % SPINNER.len()];
     let what = running.current.as_deref().unwrap_or(running.kind.as_str());
-    Line::from(format!("{glyph} {}", escape_controls(what))).style(Color::Cyan)
+    format!("{glyph} {}", escape_controls(what))
 }
 
 fn text(text: &str) -> String {
@@ -611,9 +666,28 @@ fn text(text: &str) -> String {
 /// Like the CLI's block: `▶ target`, each step's `$ command` and indented
 /// output, then `✔ ok · N steps`, `✘ reason` or `⊘ cancelled`.
 fn apply_block(report: &TargetReport) -> Vec<Line<'static>> {
+    apply_lines(report).0
+}
+
+/// The wrapped row, at `width` columns, where step `index`'s `$` line is
+/// in [`apply_block`]; a step past the report's is its end line.
+pub(super) fn step_scroll(report: &TargetReport, index: usize, width: u16) -> u16 {
+    let (mut lines, starts) = apply_lines(report);
+    lines.truncate(starts[index.min(starts.len() - 1)]);
+    let rows = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .line_count(width);
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// [`apply_block`]'s lines, and the index of each step's `$` line followed
+/// by the end line's.
+fn apply_lines(report: &TargetReport) -> (Vec<Line<'static>>, Vec<usize>) {
     let steps = report.steps();
     let mut lines = vec![Line::from(format!("▶ {}", text(report.target()))).style(heading())];
+    let mut starts = Vec::new();
     for step in steps {
+        starts.push(lines.len());
         let command = format!("  $ {}", text(&apply::command(&step.run)));
         lines.push(Line::from(command).style(Modifier::DIM));
         lines.extend(
@@ -635,8 +709,9 @@ fn apply_block(report: &TargetReport) -> Vec<Line<'static>> {
             None => Line::from(format!("  ✔ {}", apply::ok_text(steps.len()))).style(Color::Green),
         }
     };
+    starts.push(lines.len());
     lines.extend([end, Line::default()]);
-    lines
+    (lines, starts)
 }
 
 fn row(key: &str, value: &str) -> Line<'static> {
@@ -932,13 +1007,27 @@ mod tests {
 
     #[test]
     fn the_frame_is_header_steps_results_and_status_bar() {
-        let steps = ["packages", "hostname", "install -m 0644 …"].map(step_row);
+        let steps = [
+            "packages",
+            "hostname",
+            "install -m 0644 …",
+            "mkdir -p ~/.local …",
+        ]
+        .map(step_row);
         let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(steps.to_vec()));
+        let local = ran(
+            "local",
+            vec![
+                step("brew install tree", Some(0), "", ""),
+                step("hostname", Some(0), "", ""),
+                step("install -m 0644 a b", Some(1), "", ""),
+            ],
+        );
         show(
             &mut app,
             RunResult::Apply {
-                steps: Vec::new(),
-                targets: vec![ran("local", Vec::new()), cancelled("pi")],
+                steps: steps.to_vec(),
+                targets: vec![local, cancelled("pi")],
                 ok: Some(false),
                 error: None,
             },
@@ -947,18 +1036,186 @@ mod tests {
         assert_eq!(
             screen[..6],
             [
-                " anvil · apply · run 1/1 · targets: all (3)                                                ✔ 1  ✘ 1",
+                " anvil · apply · run 1/1 · targets: all (3)                                                ✔ 0  ✘ 2",
                 "┌Steps─────────────────────┐┌Results───────────────────────────────────────────────────────────────┐",
-                "│▶1 packages               ││[✔ local]  ✘ pi                                                       │",
-                "│ 2 hostname               ││▶ local                                                               │",
-                "│ 3 install -m 0644 …      ││  ✔ ok · 0 steps                                                      │",
-                "│                          ││                                                                      │",
+                "│▶✔ 1 packages             ││[✘ local]  ✘ pi                                                       │",
+                "│ ✔ 2 hostname             ││▶ local                                                               │",
+                "│ ✘ 3 install -m 0644 …    ││  $ brew install tree                                                 │",
+                "│ ⊘ 4 mkdir -p ~/.local …  ││  $ hostname                                                          │",
             ]
         );
         assert_eq!(
             screen[29],
             " a apply · d doctor · t targets · ↑↓ step · ←→ target · ? help                       -v 0 · default"
         );
+    }
+
+    /// The marks of `rows` steps against `report`, as the Steps pane draws them.
+    fn marks(report: Option<&TargetReport>, rows: usize) -> String {
+        (0..rows).map(|i| step_mark(report, i).0).collect()
+    }
+
+    #[test]
+    fn step_marks_follow_the_report_of_the_shown_tab() {
+        let ok = step("true", Some(0), "", "");
+        let failed = Some(&ran("pi", vec![ok.clone(), step("false", Some(1), "", "")]));
+        assert_eq!(marks(failed, 4), "✔✘⊘⊘", "Ran failed: the rest did not run");
+        assert_eq!(marks(Some(&ran("pi", vec![ok.clone()])), 1), "✔");
+        let mut killed = ran("pi", vec![step("sleep 9", None, "", "")]);
+        assert_eq!(marks(Some(&killed), 2), "✘⊘", "no code is a failure");
+        killed = TargetReport::Cancelled {
+            target: "pi".to_owned(),
+            steps: vec![ok.clone()],
+            ok: false,
+        };
+        assert_eq!(marks(Some(&killed), 3), "✔⊘⊘");
+        assert_eq!(marks(Some(&cancelled("pi")), 2), "⊘⊘");
+        let transport = |steps: Vec<apply::StepReport>| TargetReport::Failed {
+            target: "pi".to_owned(),
+            steps,
+            error: "ssh: broken pipe".to_owned(),
+            ok: false,
+        };
+        assert_eq!(
+            marks(Some(&transport(vec![ok.clone()])), 3),
+            "✔✘⊘",
+            "the error ended the next step"
+        );
+        let timed_out = transport(vec![ok, step("sleep 40", None, "start\n", "")]);
+        assert_eq!(
+            marks(Some(&timed_out), 3),
+            "✔✘⊘",
+            "the kept timeout is the ✘"
+        );
+        assert_eq!(
+            marks(Some(&transport(Vec::new())), 2),
+            "✘⊘",
+            "a failed probe or connect is the first step's"
+        );
+        assert_eq!(marks(None, 3), "···", "no report yet");
+    }
+
+    #[test]
+    fn a_running_apply_marks_queued_steps_and_spins_in_the_header() {
+        let steps = vec![step_row("packages"), step_row("hostname")];
+        let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
+        show(
+            &mut app,
+            RunResult::Apply {
+                steps,
+                targets: Vec::new(),
+                ok: None,
+                error: None,
+            },
+        );
+        app.running = Some(Running {
+            kind: RunKind::Apply,
+            current: Some("pi".to_owned()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            tick: 1,
+        });
+        let buf = buffer(&app, 80, 8);
+        assert_eq!(
+            row_text(&buf, 0, 80).trim_end(),
+            " anvil · apply · run 1/1 · ⠙ pi · targets: all (3)                     ✔ 0  ✘ 0"
+        );
+        let (x, y) = find(&buf, 80, 8, "⠙ pi");
+        assert_eq!((buf[(x, y)].fg, y), (Color::Cyan, 0));
+        assert!(row_text(&buf, 2, 80).starts_with("│▶· 1 packages"));
+        assert!(row_text(&buf, 3, 80).starts_with("│ · 2 hostname"));
+        assert_eq!(buf[(2, 2)].fg, Color::DarkGray);
+        assert_eq!(results(&app, 8)[0], "⠙ pi", "no tab and a running line");
+    }
+
+    #[test]
+    fn marks_are_coloured_and_follow_the_tab() {
+        let steps = vec![step_row("a"), step_row("b"), step_row("c")];
+        let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
+        let pi = ran(
+            "pi",
+            vec![step("a", Some(0), "", ""), step("b", Some(2), "", "")],
+        );
+        show(
+            &mut app,
+            RunResult::Apply {
+                steps,
+                targets: vec![pi, cancelled("mac")],
+                ok: Some(false),
+                error: None,
+            },
+        );
+        let buf = buffer(&app, 60, 8);
+        let column: String = (2..5).map(|y| buf[(2, y)].symbol().to_owned()).collect();
+        assert_eq!(column, "✔✘⊘");
+        let colours: Vec<Color> = (2..5).map(|y| buf[(2, y)].fg).collect();
+        assert_eq!(colours, [Color::Green, Color::Red, Color::DarkGray]);
+        assert_eq!(buf[(1, 2)].fg, Color::LightBlue, "the focused cursor");
+        press(&mut app, KeyCode::Right);
+        let buf = buffer(&app, 60, 8);
+        let column: String = (2..5).map(|y| buf[(2, y)].symbol().to_owned()).collect();
+        assert_eq!(column, "⊘⊘⊘");
+    }
+
+    #[test]
+    fn a_doctor_result_lists_the_reloaded_steps_unmarked() {
+        let steps = Ok(vec![step_row("packages"), step_row("hostname")]);
+        let mut app = App::with_inventory(opts(), Ok(inventory()), steps);
+        show(
+            &mut app,
+            RunResult::Doctor {
+                local: Some(local_report()),
+                targets: Vec::new(),
+                ok: Some(true),
+                error: None,
+            },
+        );
+        let screen = render(&app, 60, 6);
+        assert!(screen[2].starts_with("│▶1 packages"), "{}", screen[2]);
+        assert!(screen[3].starts_with("│ 2 hostname"), "{}", screen[3]);
+    }
+
+    #[test]
+    fn moving_the_step_cursor_puts_its_command_at_the_top_after_wrapped_output() {
+        let steps = ["one", "two", "three"].map(step_row).to_vec();
+        let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
+        let long = "word ".repeat(12);
+        let pi = ran(
+            "pi",
+            vec![
+                step("one", Some(0), &format!("{long}\n{}\n", "x".repeat(40)), ""),
+                step("two", Some(0), "", &format!("{long}\n")),
+                step("three", Some(1), "", ""),
+            ],
+        );
+        show(
+            &mut app,
+            RunResult::Apply {
+                steps,
+                targets: vec![pi, cancelled("mac")],
+                ok: Some(false),
+                error: None,
+            },
+        );
+        // A 50-column screen leaves the Results body 20 columns.
+        let top = |app: &App| results_at(app, 50, 12)[1].clone();
+        assert_eq!(top(&app), "▶ pi");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(top(&app), "  $ two");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(top(&app), "  $ three");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(top(&app), "  $ two");
+        app.scroll = 0;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(top(&app), "  $ two", "Enter scrolls to the step too");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            top(&app),
+            "  ⊘ cancelled",
+            "a new tab scrolls to the step it did not reach"
+        );
+        press(&mut app, KeyCode::Left);
+        assert_eq!(top(&app), "  $ two", "and back to the step on its tab");
     }
 
     #[test]
