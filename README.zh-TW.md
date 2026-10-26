@@ -11,7 +11,9 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
 
 - **`anvil doctor`** 回報每個 target 的資訊（OS、發行版、套件管理器、sudo）以及是否可連線。
 - **`anvil apply`** 以每個 target 的套件管理器（brew、pacman、apt、dnf、apk）安裝 config 中的套件，
-  接著執行 config 中的 step。
+  接著執行 config 中的 step。它直接執行，不會詢問確認。
+- **`anvil plan`** 列出 apply 會在每個 target 上執行的 step，但一個都不執行；`--json` 的文件標記為
+  `"executed": false`。
 - **secret（機密）** 存放在 macOS keychain、age 檔案或 sops 檔案中，`anvil secret --migrate` 可在 backend 之間搬移它們。
 - **終端機介面**：`anvil tui` 在同一個畫面執行所有指令，並保留本次工作階段的結果供瀏覽。
 - **為 agent 打造**：`--json` 在 stdout 輸出一份可解析的文件；日誌只寫到 stderr。
@@ -39,6 +41,7 @@ anvil inventory            # add your hosts (opens $EDITOR, default nvim)
 anvil config               # edit the preferences, packages and steps
 anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secrets] says otherwise)
 anvil doctor               # local checks + every target's facts and reachability
+anvil plan                 # the steps apply would run on every target, running none
 anvil apply                # install packages and run the steps on every target
 anvil tui                  # all of the above in one terminal UI
 ```

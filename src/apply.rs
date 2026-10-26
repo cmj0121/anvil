@@ -20,7 +20,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::cli::{Cli, Failure, print_json};
-use crate::config::{Config, Step};
+use crate::config::Config;
 use crate::facts::{self, Facts};
 use crate::inventory::Target;
 use crate::logger::{BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, is_escaped, paint};
@@ -35,33 +35,27 @@ use zeroize::Zeroizing;
 /// Sudo passwords by secret name; a name that is not set is absent.
 type Passwords = BTreeMap<String, Zeroizing<Vec<u8>>>;
 
-/// A target's sudo secret: its name, and its value when set.
-#[derive(Clone, Copy)]
-struct Sudo<'a> {
-    name: &'a str,
-    password: Option<&'a [u8]>,
-}
-
-impl<'a> Sudo<'a> {
-    /// The value to type: set, and free of control characters.
-    fn password(self) -> Result<&'a [u8], String> {
-        let name = self.name;
-        match self.password {
-            None => Err(format!("packages: secret {name} is not set")),
-            Some(password) if has_control_bytes(password) => Err(format!(
-                "packages: secret {name} contains control characters"
-            )),
-            Some(password) => Ok(password),
-        }
+/// The value of secret `name` to type at sudo's prompt: set, and free of
+/// control characters.
+fn sudo_password<'a>(passwords: &'a Passwords, name: &str) -> Result<&'a [u8], String> {
+    match passwords.get(name) {
+        None => Err(format!("packages: secret {name} is not set")),
+        Some(password) if has_control_bytes(password) => Err(format!(
+            "packages: secret {name} contains control characters"
+        )),
+        Some(password) => Ok(password),
     }
 }
 
-/// The package step: its one-line script, the secret name and password
-/// to type when it runs through sudo with a password, and its time limit.
-struct PackageStep<'a> {
-    run: String,
-    password: Option<(&'a str, &'a [u8])>,
-    timeout: Duration,
+/// A step apply would run: its one-line script, the secret whose password
+/// is typed when it runs through sudo with a password, and its time limit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlannedRun {
+    pub run: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sudo_secret: Option<String>,
+    #[serde(skip)]
+    pub timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -159,8 +153,13 @@ impl TargetReport {
 
 /// The end of a passed target's block: `ok · N step(s)`.
 pub fn ok_text(steps: usize) -> String {
+    format!("ok · {}", steps_text(steps))
+}
+
+/// `N step` or `N steps`.
+pub fn steps_text(steps: usize) -> String {
     let plural = if steps == 1 { "" } else { "s" };
-    format!("ok · {steps} step{plural}")
+    format!("{steps} step{plural}")
 }
 
 #[derive(Debug, Serialize)]
@@ -199,14 +198,13 @@ pub fn run_targets(
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
     let targets = opts.targets()?;
-    let packages = config.packages.as_ref().filter(|p| p.has_work());
+    let packages = package_work(config);
     let passwords = load_passwords(&targets, packages, || opts.secret_store(config))?;
     Ok(apply_targets(
         &targets,
         |target| opts.transport(target),
-        packages,
+        config,
         &passwords,
-        &config.steps,
         cancel,
         on,
     ))
@@ -267,25 +265,18 @@ fn no_core_dumps() {
 fn apply_targets(
     targets: &[Target],
     transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError>,
-    packages: Option<&Packages>,
+    config: &Config,
     passwords: &Passwords,
-    steps: &[Step],
     cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Report {
     let mut reports = Vec::with_capacity(targets.len());
     for target in targets {
         on(Progress::Start(target));
-        let sudo = packages
-            .and_then(|packages| packages.sudo_secret_for(target))
-            .map(|name| Sudo {
-                name,
-                password: passwords.get(name).map(|password| password.as_slice()),
-            });
         let report = if cancel.load(Ordering::Relaxed) {
             cancelled(target, Vec::new())
         } else {
-            apply_target(target, transport(target), packages, sudo, steps, cancel)
+            apply_target(target, transport(target), config, passwords, cancel)
         };
         on(Progress::Done(&report));
         reports.push(report);
@@ -338,14 +329,13 @@ fn cancelled(target: &Target, steps: Vec<StepReport>) -> TargetReport {
     }
 }
 
-/// `packages` is `Some` only when it has work to do; `sudo` is the target's
-/// sudo secret.
+/// Probes `target` when `[packages]` has work, then runs the steps
+/// [`resolve`] lists; `passwords` holds the sudo passwords to type.
 fn apply_target(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
-    packages: Option<&Packages>,
-    sudo: Option<Sudo<'_>>,
-    steps: &[Step],
+    config: &Config,
+    passwords: &Passwords,
     cancel: &AtomicBool,
 ) -> TargetReport {
     log::info!("apply {}: start", target.name);
@@ -363,32 +353,35 @@ fn apply_target(
         Err(err) => return failed(Vec::new(), err.to_string()),
     };
     log::info!("apply {}: over {}", target.name, transport.name());
-    let package_step = match packages {
-        None => None,
-        Some(packages) => {
-            if cancel.load(Ordering::Relaxed) {
-                return cancelled(target, Vec::new());
-            }
-            match package_script(target, transport.as_ref(), packages, sudo) {
-                Ok(step) => step,
-                Err(error) => return failed(Vec::new(), error),
-            }
+    let facts = if package_work(config).is_some() {
+        if cancel.load(Ordering::Relaxed) {
+            return cancelled(target, Vec::new());
         }
+        match probe(transport.as_ref()) {
+            Ok(facts) => Some(facts),
+            Err(error) => return failed(Vec::new(), error),
+        }
+    } else {
+        None
     };
-    let runs = package_step
-        .iter()
-        .map(|step| (step.run.as_str(), step.password, step.timeout))
-        .chain(
-            steps
-                .iter()
-                .map(|step| (step.run.as_str(), None, RUN_TIMEOUT)),
-        );
-    let mut reports = Vec::with_capacity(steps.len() + 1);
+    let runs = match resolve(target, facts.as_ref(), config) {
+        Ok(runs) => runs,
+        Err(error) => return failed(Vec::new(), error),
+    };
+    let mut reports = Vec::with_capacity(runs.len());
     let mut ok = true;
-    for (run, password, timeout) in runs {
+    for planned in &runs {
         if cancel.load(Ordering::Relaxed) {
             return cancelled(target, reports);
         }
+        let password = match planned.sudo_secret.as_deref() {
+            None => None,
+            Some(name) => match sudo_password(passwords, name) {
+                Ok(password) => Some((name, password)),
+                Err(error) => return failed(reports, error),
+            },
+        };
+        let (run, timeout) = (planned.run.as_str(), planned.timeout);
         let output = match password {
             None => transport.run(run, timeout),
             Some((_, password)) => {
@@ -446,16 +439,14 @@ fn step_error(err: &TransportError, secret: Option<&str>) -> String {
     }
 }
 
-/// Probes `target` and builds the step that installs and upgrades
-/// `packages` with its package manager, typing `sudo`'s password when sudo
-/// asks for one. The error is the target's failure: a transport error as
-/// is, anything else as `packages: <reason>`.
-fn package_script<'a>(
-    target: &Target,
-    transport: &dyn Transport,
-    packages: &Packages,
-    sudo: Option<Sudo<'a>>,
-) -> Result<Option<PackageStep<'a>>, String> {
+/// `[packages]`, when it has work to do.
+fn package_work(config: &Config) -> Option<&Packages> {
+    config.packages.as_ref().filter(|p| p.has_work())
+}
+
+/// Runs the probe over `transport`. The error is the target's failure: a
+/// transport error as is, anything else as `packages: <reason>`.
+pub fn probe(transport: &dyn Transport) -> Result<Facts, String> {
     let output = transport
         .run(facts::PROBE, RUN_TIMEOUT)
         .map_err(|err| err.to_string())?;
@@ -465,36 +456,53 @@ fn package_script<'a>(
         Some(code) => return Err(reason(format!("probe exited {code}"))),
         None => return Err(reason("probe was killed by a signal".to_owned())),
     }
-    let facts = Facts::parse(&output.stdout).map_err(|err| reason(err.to_string()))?;
-    let manager =
-        packages::resolve(packages.choice_for(target), &facts, sudo.is_some()).map_err(reason)?;
-    let Some(run) = packages::script(manager, packages, facts.is_root()) else {
-        return Ok(None);
-    };
-    let password = match sudo {
-        Some(sudo) if packages::uses_password(manager, &facts) => {
-            log::info!(
-                "apply {}: packages with {manager}, sudo password from secret {}",
-                target.name,
-                sudo.name
-            );
-            Some((sudo.name, sudo.password()?))
+    Facts::parse(&output.stdout).map_err(|err| reason(err.to_string()))
+}
+
+/// The steps apply runs on `target`, in order: the step that installs and
+/// upgrades `[packages]` with the target's package manager (when it has
+/// work), then each `[[steps]]` entry. Runs nothing: `facts`, from
+/// [`probe`], is required only when `[packages]` has work. The error is the
+/// target's failure, as `packages: <reason>`.
+pub fn resolve(
+    target: &Target,
+    facts: Option<&Facts>,
+    config: &Config,
+) -> Result<Vec<PlannedRun>, String> {
+    let mut runs = Vec::with_capacity(config.steps.len() + 1);
+    if let Some(packages) = package_work(config) {
+        let facts = facts.ok_or("packages: the probe has not run")?;
+        let reason = |why: String| format!("packages: {why}");
+        let sudo = packages.sudo_secret_for(target);
+        let manager = packages::resolve(packages.choice_for(target), facts, sudo.is_some())
+            .map_err(reason)?;
+        if let Some(run) = packages::script(manager, packages, facts.is_root()) {
+            let sudo_secret = sudo.filter(|_| packages::uses_password(manager, facts));
+            match sudo_secret {
+                Some(name) => log::info!(
+                    "{}: packages with {manager}, sudo password from secret {name}",
+                    target.name
+                ),
+                None => log::info!("{}: packages with {manager}", target.name),
+            }
+            runs.push(PlannedRun {
+                run,
+                sudo_secret: sudo_secret.map(str::to_owned),
+                timeout: packages.timeout(),
+            });
         }
-        _ => {
-            log::info!("apply {}: packages with {manager}", target.name);
-            None
-        }
-    };
-    Ok(Some(PackageStep {
-        run,
-        password,
-        timeout: packages.timeout(),
-    }))
+    }
+    runs.extend(config.steps.iter().map(|step| PlannedRun {
+        run: step.run.clone(),
+        sudo_secret: None,
+        timeout: RUN_TIMEOUT,
+    }));
+    Ok(runs)
 }
 
 /// When a line's text has its control characters escaped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Escape {
+pub(crate) enum Escape {
     /// anvil's own text.
     Never,
     /// Text from a host or the config.
@@ -507,7 +515,7 @@ enum Escape {
 /// says and painted in `colour`, then `end`. Stdout and stderr lines are kept
 /// in one list so they interleave in order.
 #[derive(Debug, PartialEq, Eq)]
-struct Line {
+pub(crate) struct Line {
     stderr: bool,
     lead: &'static str,
     text: String,
@@ -517,7 +525,7 @@ struct Line {
 }
 
 impl Line {
-    fn out(text: String, escape: Escape, colour: Option<&'static str>) -> Line {
+    pub(crate) fn out(text: String, escape: Escape, colour: Option<&'static str>) -> Line {
         Line {
             stderr: false,
             lead: "  ",
@@ -528,8 +536,24 @@ impl Line {
         }
     }
 
+    /// A target's `▶ target` header.
+    pub(crate) fn header(target: &str) -> Line {
+        Line {
+            lead: "",
+            ..Line::out(format!("▶ {target}"), Escape::Never, Some(BOLD_CYAN))
+        }
+    }
+
+    /// `self` as the end of a target's block, followed by a blank line.
+    pub(crate) fn last(self) -> Line {
+        Line {
+            end: "\n\n",
+            ..self
+        }
+    }
+
     /// The bytes written for this line: escaped first, then painted.
-    fn show(&self, style: Style) -> String {
+    pub(crate) fn show(&self, style: Style) -> String {
         let stream = if self.stderr { style.err } else { style.out };
         let escape = match self.escape {
             Escape::Never => false,
@@ -551,20 +575,20 @@ impl Line {
 
 /// What one output stream is attached to.
 #[derive(Debug, Clone, Copy)]
-struct Stream {
+pub(crate) struct Stream {
     tty: bool,
     colour: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Style {
+pub(crate) struct Style {
     out: Stream,
     err: Stream,
 }
 
 impl Style {
     /// Colour needs a terminal and an unset or empty `NO_COLOR`.
-    fn new(out_tty: bool, err_tty: bool, no_color: Option<&OsStr>) -> Style {
+    pub(crate) fn new(out_tty: bool, err_tty: bool, no_color: Option<&OsStr>) -> Style {
         let allowed = no_color.is_none_or(OsStr::is_empty);
         let stream = |tty: bool| Stream {
             tty,
@@ -576,17 +600,22 @@ impl Style {
         }
     }
 
-    fn detect() -> Style {
+    pub(crate) fn detect() -> Style {
         Style::new(
             std::io::stdout().is_terminal(),
             std::io::stderr().is_terminal(),
             std::env::var_os("NO_COLOR").as_deref(),
         )
     }
+
+    /// Whether stdout is painted.
+    pub(crate) fn out_colour(self) -> bool {
+        self.out.colour
+    }
 }
 
 /// Writes each line to its stream, flushing so a terminal shows them in order.
-fn print_lines(lines: &[Line], style: Style) {
+pub(crate) fn print_lines(lines: &[Line], style: Style) {
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
     for line in lines {
@@ -616,10 +645,7 @@ pub fn command(run: &str) -> String {
 /// a terminal.
 fn render(report: &TargetReport, style: Style) -> Vec<Line> {
     let (target, steps) = (report.target(), report.steps());
-    let mut lines = vec![Line {
-        lead: "",
-        ..Line::out(format!("▶ {target}"), Escape::Never, Some(BOLD_CYAN))
-    }];
+    let mut lines = vec![Line::header(target)];
     let prefix = if style.err.tty {
         String::new()
     } else {
@@ -652,7 +678,7 @@ fn render(report: &TargetReport, style: Style) -> Vec<Line> {
             Some(GREEN),
         ),
     };
-    lines.push(Line { end: "\n\n", ..end });
+    lines.push(end.last());
     lines
 }
 
@@ -671,6 +697,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::config::Step;
     use crate::inventory::TargetKind;
     use crate::test_util::{json, keys};
 
@@ -782,6 +809,15 @@ mod tests {
             .collect()
     }
 
+    /// `[packages]` (when `Some`) and the `[[steps]]` `runs`.
+    fn config(packages: Option<&Packages>, runs: &[&str]) -> Config {
+        Config {
+            packages: packages.cloned(),
+            steps: steps(runs),
+            ..Config::default()
+        }
+    }
+
     /// Applies `runs` to target `name`; returns the report and the scripts run.
     fn apply(
         name: &str,
@@ -807,9 +843,8 @@ mod tests {
         let report = apply_target(
             &target(name),
             Ok(Box::new(fake)),
-            None,
-            None,
-            &steps(runs),
+            &config(None, runs),
+            &Passwords::new(),
             &AtomicBool::new(false),
         );
         let runs = log.borrow().clone();
@@ -908,9 +943,8 @@ mod tests {
         let report = apply_target(
             &target("box"),
             Err(TransportError::Spawn("HOME is not set".to_owned())),
-            None,
-            None,
-            &steps(&["one"]),
+            &config(None, &["one"]),
+            &Passwords::new(),
             &AtomicBool::new(false),
         );
         assert_eq!(
@@ -1251,9 +1285,8 @@ mod tests {
                     cancel: Rc::clone(&cancel),
                 }))
             },
-            None,
+            &config(None, runs),
             &Passwords::new(),
-            &steps(runs),
             &cancel,
             &mut |progress| {
                 events.push(match progress {
@@ -1363,9 +1396,8 @@ mod tests {
         let report = apply_target(
             &target(name),
             Ok(Box::new(fake)),
-            Some(packages),
-            None,
-            &steps(runs),
+            &config(Some(packages), runs),
+            &Passwords::new(),
             &AtomicBool::new(false),
         );
         let runs = log.borrow().clone();
@@ -1413,9 +1445,8 @@ mod tests {
                 probe_code: Some(2),
                 ..Fake::new(&log)
             })),
-            Some(&packages(&["git"], false)),
-            None,
-            &steps(&["one"]),
+            &config(Some(&packages(&["git"], false)), &["one"]),
+            &Passwords::new(),
             &AtomicBool::new(false),
         );
         assert_eq!(*log.borrow(), [facts::PROBE]);
@@ -1456,9 +1487,8 @@ mod tests {
                 fail_with: Some(TransportError::HostKey),
                 ..Fake::new(&log)
             })),
-            Some(&pkgs),
-            None,
-            &steps(&["one"]),
+            &config(Some(&pkgs), &["one"]),
+            &Passwords::new(),
             &AtomicBool::new(false),
         );
         assert_eq!(*log.borrow(), [facts::PROBE]);
@@ -1489,9 +1519,8 @@ mod tests {
                     ..Fake::new(&log)
                 }))
             },
-            Some(packages),
+            &config(Some(packages), runs),
             &Passwords::new(),
-            &steps(runs),
             &AtomicBool::new(cancelled),
             &mut |_| {},
         );
@@ -1539,9 +1568,8 @@ mod tests {
         let report = apply_target(
             &target("a"),
             Ok(Box::new(Fake::new(&log))),
-            Some(&pkgs),
-            None,
-            &steps(&["one"]),
+            &config(Some(&pkgs), &["one"]),
+            &Passwords::new(),
             &AtomicBool::new(true),
         );
         assert!(log.borrow().is_empty(), "the probe does not run");
@@ -1566,6 +1594,21 @@ mod tests {
         "distro=arch\nuser=cmj\nsudo=nopasswd\npkg=pacman\nanvil-probe-end=1\n";
     const PASSWORD: &str = "hunter2-secret";
 
+    /// `packages` with sudo secret `LOCAL_SUDO` for the local target.
+    fn local_sudo(packages: Packages) -> Packages {
+        Packages {
+            local_sudo_secret: Some("LOCAL_SUDO".to_owned()),
+            ..packages
+        }
+    }
+
+    /// `LOCAL_SUDO` holding `password`; empty when `None`.
+    fn local_passwords(password: Option<&[u8]>) -> Passwords {
+        password
+            .map(|password| Passwords::from([("LOCAL_SUDO".to_owned(), password.to_vec().into())]))
+            .unwrap_or_default()
+    }
+
     /// Applies `["one"]` with `packages(["git"])` to `local` probing as
     /// `probe`, with sudo secret `LOCAL_SUDO` holding `password` (unset when
     /// `None`) and `run_tty` failing with `tty_fail`; returns the report, the
@@ -1585,12 +1628,8 @@ mod tests {
         let report = apply_target(
             &target("local"),
             Ok(Box::new(fake)),
-            Some(&packages(&["git"], false)),
-            Some(Sudo {
-                name: "LOCAL_SUDO",
-                password,
-            }),
-            &steps(&["one"]),
+            &config(Some(&local_sudo(packages(&["git"], false))), &["one"]),
+            &local_passwords(password),
             &AtomicBool::new(false),
         );
         let runs = log.borrow().clone();
@@ -1606,6 +1645,11 @@ mod tests {
         };
         let package_step = Duration::from_secs(900);
         for (probe, password) in [(ARCH_ROOT, None), (ARCH_SUDO, Some(PASSWORD.as_bytes()))] {
+            let pkgs = match password {
+                None => pkgs.clone(),
+                Some(_) => local_sudo(pkgs.clone()),
+            };
+            let passwords = local_passwords(password);
             let log = Rc::new(RefCell::new(Vec::new()));
             let fake = Fake {
                 probe,
@@ -1616,12 +1660,8 @@ mod tests {
             let report = apply_target(
                 &target("local"),
                 Ok(Box::new(fake)),
-                Some(&pkgs),
-                password.map(|password| Sudo {
-                    name: "LOCAL_SUDO",
-                    password: Some(password),
-                }),
-                &steps(&["one", "two"]),
+                &config(Some(&pkgs), &["one", "two"]),
+                &passwords,
                 &AtomicBool::new(false),
             );
             assert!(report.ok(), "{probe}");
@@ -1793,9 +1833,8 @@ mod tests {
         let report = apply_target(
             &target("local"),
             Ok(Box::new(fake)),
-            Some(&packages(&["git"], false)),
-            None,
-            &steps(&["one"]),
+            &config(Some(&packages(&["git"], false)), &["one"]),
+            &Passwords::new(),
             &AtomicBool::new(false),
         );
         assert_eq!(
@@ -1815,6 +1854,91 @@ mod tests {
                 .contains("sudo asks for a password"),
             "{report:?}"
         );
+    }
+
+    fn facts(probe: &str) -> Facts {
+        Facts::parse(probe.as_bytes()).unwrap()
+    }
+
+    fn planned(run: &str, sudo_secret: Option<&str>, timeout: Duration) -> PlannedRun {
+        PlannedRun {
+            run: run.to_owned(),
+            sudo_secret: sudo_secret.map(str::to_owned),
+            timeout,
+        }
+    }
+
+    #[test]
+    fn resolve_lists_the_package_step_then_each_step_without_running_anything() {
+        let none = config(None, &["one", "two"]);
+        assert_eq!(
+            resolve(&target("box"), None, &none).unwrap(),
+            [
+                planned("one", None, RUN_TIMEOUT),
+                planned("two", None, RUN_TIMEOUT)
+            ],
+            "without package work no facts are needed"
+        );
+
+        let pkgs = Packages {
+            timeout: 900,
+            ..packages(&["git"], false)
+        };
+        let one_liner = "sudo -n pacman -S --noconfirm --needed git";
+        let slow = Duration::from_secs(900);
+        for (pkgs, probe, step) in [
+            (
+                local_sudo(pkgs.clone()),
+                ARCH_SUDO,
+                planned(one_liner, Some("LOCAL_SUDO"), slow),
+            ),
+            (
+                local_sudo(pkgs.clone()),
+                ARCH_NOPASSWD,
+                planned(one_liner, None, slow),
+            ),
+            (
+                pkgs.clone(),
+                ARCH_ROOT,
+                planned("pacman -S --noconfirm --needed git", None, slow),
+            ),
+        ] {
+            assert_eq!(
+                resolve(
+                    &target("local"),
+                    Some(&facts(probe)),
+                    &config(Some(&pkgs), &["one"])
+                )
+                .unwrap(),
+                [step, planned("one", None, RUN_TIMEOUT)],
+                "{probe}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_without_facts_for_package_work_is_an_error() {
+        let config = config(Some(&packages(&["git"], false)), &["one"]);
+        assert_eq!(
+            resolve(&target("box"), None, &config).unwrap_err(),
+            "packages: the probe has not run"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_manager_fails_apply_with_the_resolve_error_after_only_the_probe() {
+        let pkgs = packages(&["git"], false);
+        let error = resolve(
+            &target("box"),
+            Some(&facts(ARCH_SUDO)),
+            &config(Some(&pkgs), &["one"]),
+        )
+        .unwrap_err();
+        assert!(error.contains("sudo asks for a password"), "{error}");
+        let (report, runs) = apply_packages("box", &pkgs, ARCH_SUDO, &["one"]);
+        assert_eq!(runs, [facts::PROBE], "nothing but the probe ran");
+        assert_eq!(report.failure(), Some(error));
+        assert!(report.steps().is_empty());
     }
 
     #[test]
@@ -1846,9 +1970,8 @@ mod tests {
                     ..Fake::new(&log)
                 }))
             },
-            Some(&pkgs),
+            &config(Some(&pkgs), &[]),
             &passwords,
-            &[],
             &AtomicBool::new(false),
             &mut |_| {},
         );

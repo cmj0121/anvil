@@ -1,5 +1,5 @@
-//! Runs doctor or apply on a background thread and reports to the main loop
-//! as [`Msg`]s: `Steps` (apply only), then `Start` and a per-target report as
+//! Runs doctor, apply or plan on a background thread and reports to the main
+//! loop as [`Msg`]s: `Steps` (apply only), then `Start` and a per-target report as
 //! each target goes, then `DoctorDone` (doctor only) and `Finished`. A panic
 //! in the run becomes `Msg::Panicked`, caught by joining the run's thread.
 
@@ -13,7 +13,7 @@ use std::thread::{self, JoinHandle};
 use super::app::{self, Msg, RunKind};
 use crate::cli::Failure;
 use crate::options::Options;
-use crate::{apply, doctor};
+use crate::{apply, doctor, plan};
 
 /// A run in progress; [`Worker::join`] waits for it, which is quick once
 /// `Finished` or `Panicked` has arrived.
@@ -31,11 +31,12 @@ impl Worker {
 }
 
 /// Starts `kind` with `opts` (its targets already selected); `cancel` stops
-/// apply between targets and steps.
+/// apply between targets and steps, and plan between targets.
 pub fn spawn(kind: RunKind, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) -> Worker {
     match kind {
         RunKind::Doctor => spawn_job(tx, move |tx| run_doctor(&opts, tx)),
         RunKind::Apply => spawn_job(tx, move |tx| run_apply(&opts, &cancel, tx)),
+        RunKind::Plan => spawn_job(tx, move |tx| run_plan(&opts, &cancel, tx)),
     }
 }
 
@@ -95,6 +96,18 @@ fn run_apply(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<()
         let _ = tx.send(match progress {
             apply::Progress::Start(target) => Msg::Start(target.name.clone()),
             apply::Progress::Done(report) => Msg::TargetDone(report.clone()),
+        });
+    })?;
+    Ok(())
+}
+
+/// Plan opens no secret store; the steps pane keeps the app's list.
+fn run_plan(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(), Failure> {
+    let config = opts.load_config()?;
+    plan::run_targets(opts, &config, cancel, &mut |progress| {
+        let _ = tx.send(match progress {
+            plan::Progress::Start(target) => Msg::Start(target.name.clone()),
+            plan::Progress::Done(report) => Msg::PlanDone(report.clone()),
         });
     })?;
     Ok(())
@@ -209,6 +222,7 @@ mod tests {
                 Msg::Steps(rows) => format!("steps {}", rows.len()),
                 Msg::Start(name) => format!("start {name}"),
                 Msg::TargetDone(report) => format!("done {}", report.target()),
+                Msg::PlanDone(report) => format!("done {}", report.target()),
                 Msg::DoctorTarget(report) => format!("done {}", report.target),
                 Msg::DoctorDone(_) => "doctor done".to_owned(),
                 Msg::Finished(result) => format!("finished {result:?}"),
@@ -310,6 +324,41 @@ mod tests {
             _ => panic!("expected TargetDone"),
         }
         assert!(matches!(&msgs[3], Msg::Finished(Ok(()))));
+    }
+
+    #[test]
+    fn plan_sends_start_the_target_plan_then_finished_and_runs_nothing() {
+        let (tx, rx) = mpsc::channel();
+        let opts = local_opts("tui-worker-plan", &["touch ran"]);
+        let ran = opts.config.as_ref().unwrap().with_file_name("ran");
+        let config = opts.config.clone().unwrap();
+        fs::write(
+            &config,
+            format!("[[steps]]\nrun = \"touch {}\"\n", ran.display()),
+        )
+        .unwrap();
+        let worker = spawn(RunKind::Plan, opts, Arc::new(AtomicBool::new(false)), tx);
+        let msgs = collect(worker, &rx);
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(&msgs[0], Msg::Start(name) if name == "local"));
+        match &msgs[1] {
+            Msg::PlanDone(plan::PlanReport::Planned { target, steps, ok }) => {
+                assert_eq!((target.as_str(), *ok), ("local", true));
+                assert_eq!(steps[0].run, format!("touch {}", ran.display()));
+            }
+            _ => panic!("expected PlanDone"),
+        }
+        assert!(matches!(&msgs[2], Msg::Finished(Ok(()))));
+        assert!(!ran.exists(), "the step did not run");
+
+        let (tx, rx) = mpsc::channel();
+        let opts = local_opts("tui-worker-plan-cancel", &["true"]);
+        let worker = spawn(RunKind::Plan, opts, Arc::new(AtomicBool::new(true)), tx);
+        let msgs = collect(worker, &rx);
+        assert!(matches!(
+            &msgs[1],
+            Msg::PlanDone(plan::PlanReport::Cancelled { .. })
+        ));
     }
 
     #[test]

@@ -15,6 +15,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   config [--format toml|yaml]    edit the config; --format picks the edit view, saved as TOML
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
+  plan                           show the steps apply would run on every target, running none
   secret <NAME>                  edit one secret in the editor
   secret --migrate --to BACKEND  move every secret to keychain, age or sops and select it
   tui                            run every command and browse the results in a terminal UI
@@ -140,6 +141,7 @@ target（目標）依序執行，先 `local`，再依名稱排序的 host（主�
 在每個選定的 target 上依序執行 config 的 `[[steps]]`：每個 step（步驟）的 `run` 會送到 target 上的 `sh -s`（`local` 則為 `/bin/sh -s`）。
 以非零結束的 step 會結束該 target；其他 target 仍會執行。
 每個 target 上的每個 step 都以 0 結束時以 0 結束，否則為 1。
+apply 直接執行：不印出計畫，也不詢問確認；想先看它會執行什麼，請先執行 [`anvil plan`](#anvil-plan)。
 
 當 `[packages]` 有事可做（`install` 非空或 `upgrade = true`）時，每個 target 會先透過同一個傳輸執行 facts 探測、
 解析其套件管理器，並將產生的安裝/升級腳本作為 step 1 執行，排在 `[[steps]]` 之前。
@@ -207,6 +209,73 @@ anvil 會在 sudo 的提示處輸入密碼（[輸入 sudo 密碼](packages.zh-TW
 target 要嘛執行了它的 step（`steps` 與 `ok`；失敗的 step 會顯示其 `code`，且 `ok` 為 false），
 要嘛在傳輸中失敗（`error`、`ok: false`，只有在錯誤前已完成某些 step 時才有 `steps`）。
 step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 的最後一項，與 `error` 並列。
+
+### `anvil plan`
+
+列出 `anvil apply` 會在每個選定 target 上執行的 step，但一個都不執行。
+每個 target 都會透過其傳輸執行探測，即使 `[packages]` 沒有事可做也一樣，因此無法連線的 target 在這裡就會像在 apply 中一樣失敗。
+接著由 apply 使用的同一個解析函式列出 step：`[packages]` 有事可做時先是套件 step，再來是每個 `[[steps]]` 項目。
+不會執行任何套件指令或 `[[steps]]` 腳本。
+無法連線、探測或解析的 target 會以與 apply 相同的原因失敗（探測與套件管理器的問題為 `packages: REASON`），其他 target 仍會繼續規劃。
+
+plan 絕不開啟 secret store。會輸入 sudo 密碼的 step 會註明它要用哪個 secret；
+該 secret 是否已設定、是否不含控制字元則不檢查，因此 plan 可能通過，而 apply 接著以 `packages: secret NAME is not set` 失敗。
+secret 由 `anvil doctor` 檢查。
+
+```text
+▶ local
+  would $ export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; brew install git
+  would $ hostname
+  ✔ 2 steps
+
+▶ linode1
+  would $ sudo -n pacman -S --noconfirm --needed git (sudo password from secret LINODE1_SUDO)
+  would $ hostname
+  ✔ 2 steps
+
+2 targets, nothing executed
+```
+
+- 每個 step 是一行 `would $ RUN`（多行的 `run` 顯示第一行加上 `…`）；
+  apply 會在 sudo 的提示輸入某個 secret 的值時，後面再加上 `(sudo password from secret NAME)`。
+- 區塊以 `✔ N steps` 結尾，失敗的 target 則為 `✘ REASON`。
+  摘要為 `N targets, nothing executed`，有 target 失敗時在 `nothing executed` 前加上 `M failed`（`2 targets, 1 failed, nothing executed`）。
+- 顏色與跳脫規則與 apply 相同。
+
+`--json` 是 apply 的文件，最前面加上 `"executed": false`；
+step 只有 `run`，以及 apply 會輸入 sudo 密碼時的 `sudo_secret`，絕不會有 `code`、`stdout` 或 `stderr`：
+
+```json
+{
+  "executed": false,
+  "targets": [
+    {
+      "target": "local",
+      "steps": [{ "run": "hostname" }],
+      "ok": true
+    },
+    {
+      "target": "linode1",
+      "steps": [
+        {
+          "run": "sudo -n pacman -S --noconfirm --needed git",
+          "sudo_secret": "LINODE1_SUDO"
+        },
+        { "run": "hostname" }
+      ],
+      "ok": true
+    },
+    {
+      "target": "pi",
+      "error": "cannot connect: ssh: connect to host pi port 22: Connection refused",
+      "ok": false
+    }
+  ],
+  "ok": false
+}
+```
+
+每個選定的 target 都解析成功時以 0 結束，任一個無法連線或解析時為 1，用法或設定錯誤為 2。
 
 ### `anvil secret NAME`
 
@@ -289,6 +358,7 @@ TUI 照常啟動，在標頭以紅色顯示 `inventory error`，錯誤本身則�
 
 - **0**：對 `doctor` 而言，`missing` 的 secret 或無法解析的編輯器只是警告。
 - **1**：`doctor`/`apply`：某個 target 或檢查失敗（包括 `locked` 或 `error` 的 secret，以及有 `[packages]` 時無法解析的套件管理器）。
+  `plan`：某個 target 無法連線、探測或解析。
   `inventory`/`config`/`secret`：編輯器以非零結束（中止）、檔案寫入失敗，或 secret store 失敗、被鎖住或其密語提示被取消。
 - **2**：錯誤的旗標或引數（包括不以 `.toml` 結尾的 `--inventory` 或 `--config` 路徑）、未知的 `--target`、
   無效、無法讀取或模稜兩可的檔案、沒有 `$HOME`、找不到編輯器、三次嘗試後仍無效的緩衝區，或大於 1 MiB 的 secret。

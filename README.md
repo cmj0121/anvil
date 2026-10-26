@@ -12,7 +12,9 @@ system OpenSSH client.
 
 - **`anvil doctor`** reports each target's facts (OS, distro, package manager, sudo) and whether it is reachable.
 - **`anvil apply`** installs the config's packages with each target's package manager (brew, pacman, apt, dnf, apk),
-  then runs the config's steps.
+  then runs the config's steps. It runs directly, with no prompt.
+- **`anvil plan`** shows the steps apply would run on each target and runs none of them; `--json` marks the document
+  `"executed": false`.
 - **Secrets** live in the macOS keychain, an age file or a sops file, and `anvil secret --migrate` moves them between
   backends.
 - **Terminal UI**: `anvil tui` runs every command in one screen and keeps the session's results for browsing.
@@ -41,6 +43,7 @@ anvil inventory            # add your hosts (opens $EDITOR, default nvim)
 anvil config               # edit the preferences, packages and steps
 anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secrets] says otherwise)
 anvil doctor               # local checks + every target's facts and reachability
+anvil plan                 # the steps apply would run on every target, running none
 anvil apply                # install packages and run the steps on every target
 anvil tui                  # all of the above in one terminal UI
 ```

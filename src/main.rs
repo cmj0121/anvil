@@ -13,6 +13,7 @@ mod logger;
 mod options;
 mod packages;
 mod paths;
+mod plan;
 mod secret;
 mod ssh;
 mod term;

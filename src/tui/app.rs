@@ -15,7 +15,7 @@ use crate::document::Format;
 use crate::inventory::{Inventory, LOCAL, Sel, UnknownSel};
 use crate::options::Options;
 use crate::secret::{self, BackendKind};
-use crate::{apply, doctor};
+use crate::{apply, doctor, plan};
 
 use super::ui;
 
@@ -108,6 +108,7 @@ pub struct Running {
 pub enum RunKind {
     Doctor,
     Apply,
+    Plan,
 }
 
 impl RunKind {
@@ -115,6 +116,7 @@ impl RunKind {
         match self {
             RunKind::Doctor => "doctor",
             RunKind::Apply => "apply",
+            RunKind::Plan => "plan",
         }
     }
 }
@@ -154,6 +156,12 @@ pub enum RunResult {
         ok: Option<bool>,
         error: Option<String>,
     },
+    /// `ok` is `None` while running.
+    Plan {
+        targets: Vec<plan::PlanReport>,
+        ok: Option<bool>,
+        error: Option<String>,
+    },
     Edit {
         /// `inventory`, `config`, `secret NAME` or `migrate → age`.
         what: String,
@@ -171,19 +179,23 @@ impl RunResult {
             RunResult::Apply { targets, .. } => {
                 (targets.iter().filter(|t| t.ok()).count(), targets.len())
             }
+            RunResult::Plan { targets, .. } => {
+                (targets.iter().filter(|t| t.ok()).count(), targets.len())
+            }
             RunResult::Edit { .. } => return None,
         };
         Some((ok, all - ok))
     }
 
     /// Doctor: checks when `local` is present, then one tab per target.
-    /// Apply: one tab per target. An edit always has its one tab.
+    /// Apply and plan: one tab per target. An edit always has its one tab.
     pub fn tab_count(&self) -> usize {
         match self {
             RunResult::Doctor { local, targets, .. } => {
                 usize::from(local.is_some()) + targets.len()
             }
             RunResult::Apply { targets, .. } => targets.len(),
+            RunResult::Plan { targets, .. } => targets.len(),
             RunResult::Edit { .. } => 1,
         }
     }
@@ -225,6 +237,7 @@ pub enum Msg {
     Start(String),
     DoctorDone(doctor::Report),
     TargetDone(apply::TargetReport),
+    PlanDone(plan::PlanReport),
     DoctorTarget(doctor::TargetReport),
     Finished(Result<(), String>),
     Panicked(String),
@@ -342,6 +355,7 @@ impl App {
         match key.code {
             KeyCode::Char('d') => return self.start(RunKind::Doctor),
             KeyCode::Char('a') => return self.start(RunKind::Apply),
+            KeyCode::Char('p') => return self.start(RunKind::Plan),
             KeyCode::Char('i' | 'c' | 's' | 'm' | 'o') if self.running.is_some() => {
                 self.notice = self.busy();
             }
@@ -588,6 +602,12 @@ impl App {
                     targets.push(report);
                 }
             }
+            Msg::PlanDone(report) => {
+                self.target_ended();
+                if let Some(RunResult::Plan { targets, .. }) = self.results.last_mut() {
+                    targets.push(report);
+                }
+            }
             Msg::DoctorDone(report) => self.doctor_done(report),
             Msg::Finished(result) => self.finish(result.err()),
             Msg::Panicked(message) => {
@@ -648,6 +668,11 @@ impl App {
                 ok: None,
                 error: None,
             },
+            RunKind::Plan => RunResult::Plan {
+                targets: Vec::new(),
+                ok: None,
+                error: None,
+            },
         });
         self.show(Some(self.results.len() - 1));
         vec![Effect::Spawn(kind), Effect::Redraw]
@@ -663,7 +688,7 @@ impl App {
     }
 
     /// Sets the cancel flag: apply stops before its next target or step,
-    /// doctor runs to the end (D3).
+    /// plan before its next target, doctor runs to the end (D3).
     fn cancel(&mut self) {
         let Some(running) = &self.running else {
             return;
@@ -671,6 +696,7 @@ impl App {
         running.cancel.store(true, Ordering::Relaxed);
         self.notice = Some(match running.kind {
             RunKind::Apply => "cancelling: the running step finishes first".to_owned(),
+            RunKind::Plan => "cancelling: the running target finishes first".to_owned(),
             RunKind::Doctor => "doctor cannot be cancelled; it ends with its probes".to_owned(),
         });
     }
@@ -743,6 +769,14 @@ impl App {
                 ..
             }) => {
                 *ok = Some(error.is_none() && targets.iter().all(apply::TargetReport::ok));
+                *slot = error;
+            }
+            Some(RunResult::Plan {
+                targets,
+                ok,
+                error: slot,
+            }) => {
+                *ok = Some(error.is_none() && targets.iter().all(plan::PlanReport::ok));
                 *slot = error;
             }
             Some(RunResult::Edit { .. }) | None => {}
@@ -1371,6 +1405,50 @@ pub mod tests {
         assert!(matches!(
             app.shown_result(),
             Some(RunResult::Apply { ok: Some(false), error: None, targets, .. }) if targets.len() == 2
+        ));
+    }
+
+    #[test]
+    fn p_starts_a_plan_that_fills_and_finishes_like_apply() {
+        let mut app = app();
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('p'))),
+            [Effect::Spawn(RunKind::Plan), Effect::Redraw]
+        );
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Plan { ok: None, .. })
+        ));
+        press(&mut app, &[KeyCode::Char('a')]);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("busy: plan is running (Esc cancels)")
+        );
+        assert_eq!(app.results.len(), 1);
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.running.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+        app.on_msg(Msg::Start("local".to_owned()));
+        app.on_msg(Msg::PlanDone(plan::PlanReport::Planned {
+            target: "local".to_owned(),
+            steps: Vec::new(),
+            ok: true,
+        }));
+        assert_eq!(app.running.as_ref().unwrap().current, None);
+        app.on_msg(Msg::PlanDone(plan::PlanReport::Cancelled {
+            target: "pi".to_owned(),
+            ok: false,
+        }));
+        app.on_msg(Msg::Finished(Ok(())));
+        assert!(app.running.is_none());
+        let result = app.shown_result().unwrap();
+        assert_eq!((result.counts(), result.tab_count()), (Some((1, 1)), 2));
+        assert!(matches!(
+            result,
+            RunResult::Plan {
+                ok: Some(false),
+                error: None,
+                ..
+            }
         ));
     }
 

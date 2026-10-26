@@ -15,6 +15,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   config [--format toml|yaml]    edit the config; --format picks the edit view, saved as TOML
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
+  plan                           show the steps apply would run on every target, running none
   secret <NAME>                  edit one secret in the editor
   secret --migrate --to BACKEND  move every secret to keychain, age or sops and select it
   tui                            run every command and browse the results in a terminal UI
@@ -141,7 +142,8 @@ the probe reported (abridged above). `manager` (the resolved manager) or `manage
 
 Runs the config's `[[steps]]` in order on every selected target: each step's `run` is sent to `sh -s` on the target
 (`/bin/sh -s` for `local`). A step that exits non-zero ends that target; the other targets still run. Exit 0 when
-every step on every target exited 0, else 1.
+every step on every target exited 0, else 1. apply runs directly: it prints no plan and asks for no confirmation; run
+[`anvil plan`](#anvil-plan) first to see what it would run.
 
 With `[packages]` that has work to do (a non-empty `install` or `upgrade = true`), each target first runs the facts
 probe over the same transport, resolves its package manager and runs the generated install/upgrade script as step 1,
@@ -212,6 +214,74 @@ Human output is one block per target, a blank line after each, then a summary:
 A target either ran its steps (`steps` and `ok`; a failed step shows its `code`, and `ok` is false) or failed in the
 transport (`error`, `ok: false`, and `steps` only when some steps completed before the error). `code` is `null` when
 the step was killed by a signal or timed out; a timed-out step is the last `steps` entry, next to `error`.
+
+### `anvil plan`
+
+Shows the steps `anvil apply` would run on every selected target, and runs none of them. Each target is probed over its
+transport, even without `[packages]` work, so a target that cannot be reached fails here as it would under apply. Its
+steps then come from the same resolver apply uses: the package step when `[packages]` has work, then each `[[steps]]`
+entry. No package command and no `[[steps]]` script runs. A target that cannot be reached, probed or resolved fails
+with the same reason apply gives (`packages: REASON` for the probe and the manager), and the other targets are still
+planned.
+
+plan never opens the secret store. A step that would type a sudo password says which secret it would use; whether that
+secret is set and free of control characters is not checked, so plan can pass where apply then fails with
+`packages: secret NAME is not set`. `anvil doctor` checks the secrets.
+
+```text
+▶ local
+  would $ export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; brew install git
+  would $ hostname
+  ✔ 2 steps
+
+▶ linode1
+  would $ sudo -n pacman -S --noconfirm --needed git (sudo password from secret LINODE1_SUDO)
+  would $ hostname
+  ✔ 2 steps
+
+2 targets, nothing executed
+```
+
+- Each step is a `would $ RUN` line (a multi-line `run` shows its first line and `…`), followed by
+  `(sudo password from secret NAME)` when apply would type that secret's value at sudo's prompt.
+- The block ends with `✔ N steps`, or `✘ REASON` for a target that failed. The summary is `N targets, nothing executed`,
+  with `M failed` before `nothing executed` when any target failed (`2 targets, 1 failed, nothing executed`).
+- Colour and escaping follow apply's rules.
+
+`--json` is apply's document with `"executed": false` first; a step has its `run` and, when apply would type a sudo
+password, its `sudo_secret`, but never `code`, `stdout` or `stderr`:
+
+```json
+{
+  "executed": false,
+  "targets": [
+    {
+      "target": "local",
+      "steps": [{ "run": "hostname" }],
+      "ok": true
+    },
+    {
+      "target": "linode1",
+      "steps": [
+        {
+          "run": "sudo -n pacman -S --noconfirm --needed git",
+          "sudo_secret": "LINODE1_SUDO"
+        },
+        { "run": "hostname" }
+      ],
+      "ok": true
+    },
+    {
+      "target": "pi",
+      "error": "cannot connect: ssh: connect to host pi port 22: Connection refused",
+      "ok": false
+    }
+  ],
+  "ok": false
+}
+```
+
+Exit 0 when every selected target resolves, 1 when any cannot be reached or resolved, 2 for usage or config.
 
 ### `anvil secret NAME`
 
@@ -299,6 +369,7 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 - **0**: for `doctor`, a `missing` secret or an unresolved editor is only a warning.
 - **1**: `doctor`/`apply`: a target or a check failed (including a `locked` or `error` secret, and, with `[packages]`, a
   package manager that cannot be resolved).
+  `plan`: a target could not be reached, probed or resolved.
   `inventory`/`config`/`secret`: the editor exited non-zero (aborted), a file write failed, or the secret store failed,
   is locked or its passphrase prompt was cancelled.
 - **2**: a bad flag or argument (including an `--inventory` or `--config` path not ending in `.toml`), an unknown

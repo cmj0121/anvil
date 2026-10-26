@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use super::app::{App, BACKENDS, OPTION_FLAGS, Overlay, Pane, RunResult, Running};
 use crate::doctor::{self, SecretStatus};
 use crate::logger::escape_controls;
+use crate::plan::{self, PlanReport};
 use crate::secret;
 use crate::{apply, apply::TargetReport};
 
@@ -33,7 +34,15 @@ const STATUS_KEYS: &[&str] = &[
 /// The `?` overlay: one row per group of `(key, what)` pairs. Every key
 /// [`App::on_key`] handles is listed once.
 const HELP: &[(&str, &[(&str, &str)])] = &[
-    ("Run", &[("a", "apply"), ("d", "doctor"), ("Esc", "cancel")]),
+    (
+        "Run",
+        &[
+            ("a", "apply"),
+            ("p", "plan"),
+            ("d", "doctor"),
+            ("Esc", "cancel"),
+        ],
+    ),
     ("Targets", &[("t", "pick"), ("Space", "select")]),
     (
         "Move",
@@ -132,6 +141,7 @@ fn header_line(app: &App, width: u16) -> Line<'static> {
         let kind = match result {
             RunResult::Doctor { .. } => "doctor".to_owned(),
             RunResult::Apply { .. } => "apply".to_owned(),
+            RunResult::Plan { .. } => "plan".to_owned(),
             RunResult::Edit { what, .. } => text(what),
         };
         left.push_str(&format!(
@@ -466,7 +476,9 @@ fn shown_running(app: &App) -> Option<&Running> {
 
 fn result_error(result: &RunResult) -> Option<&str> {
     match result {
-        RunResult::Doctor { error, .. } | RunResult::Apply { error, .. } => error.as_deref(),
+        RunResult::Doctor { error, .. }
+        | RunResult::Apply { error, .. }
+        | RunResult::Plan { error, .. } => error.as_deref(),
         RunResult::Edit { .. } => None,
     }
 }
@@ -499,6 +511,13 @@ fn result_tabs(result: &RunResult) -> Vec<StripTab> {
                 label: text(target.target()),
             })
             .collect(),
+        RunResult::Plan { targets, .. } => targets
+            .iter()
+            .map(|target| StripTab {
+                ok: target.ok(),
+                label: text(target.target()),
+            })
+            .collect(),
         RunResult::Edit { what, outcome } => vec![StripTab {
             ok: outcome.is_ok(),
             label: text(what),
@@ -514,6 +533,7 @@ fn section_lines(result: &RunResult, index: usize) -> Vec<Line<'static>> {
             None => doctor_block(&targets[index]),
         },
         RunResult::Apply { targets, .. } => apply_block(&targets[index]),
+        RunResult::Plan { targets, .. } => plan_block(&targets[index]),
         RunResult::Edit { what, outcome } => edit_lines(what, outcome),
     }
 }
@@ -729,6 +749,27 @@ fn apply_lines(report: &TargetReport) -> (Vec<Line<'static>>, Vec<usize>) {
     starts.push(lines.len());
     lines.extend([end, Line::default()]);
     (lines, starts)
+}
+
+/// Like the CLI's plan block: `▶ target`, a `would $ command` line per
+/// step, then `✔ N steps`, `✘ reason` or `⊘ cancelled`.
+fn plan_block(report: &PlanReport) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(format!("▶ {}", text(report.target()))).style(heading())];
+    let end = match report {
+        PlanReport::Planned { steps, .. } => {
+            for step in steps {
+                let command = format!("  {}", text(&plan::would_text(step)));
+                lines.push(Line::from(command).style(Modifier::DIM));
+            }
+            Line::from(format!("  ✔ {}", apply::steps_text(steps.len()))).style(Color::Green)
+        }
+        PlanReport::Failed { error, .. } => {
+            Line::from(format!("  ✘ {}", text(error))).style(Color::Red)
+        }
+        PlanReport::Cancelled { .. } => Line::from("  ⊘ cancelled").style(Color::Red),
+    };
+    lines.extend([end, Line::default()]);
+    lines
 }
 
 fn row(key: &str, value: &str) -> Line<'static> {
@@ -1435,7 +1476,7 @@ mod tests {
             screen[8..17],
             [
                 "│    ┌Help────────────────────────────────────────────────────────────────┐    │",
-                "│    │ Run      a apply  d doctor  Esc cancel                             │    │",
+                "│    │ Run      a apply  p plan  d doctor  Esc cancel                     │    │",
                 "│    │ Targets  t pick  Space select                                      │    │",
                 "│    │ Move     ↑↓/jk step/scroll  ←→ target  Enter go to step  Tab focus │    │",
                 "│    │ History  [ ] run                                                   │    │",
@@ -1716,6 +1757,73 @@ mod tests {
         assert_eq!(results(&app, 8)[1], "▶ mac", "Right on the last tab stays");
         press(&mut app, KeyCode::Left);
         assert_eq!(results(&app, 8)[1], "▶ pi\\x1b]0;x");
+    }
+
+    #[test]
+    fn the_plan_view_shows_would_lines_and_lists_the_steps_unmarked() {
+        use crate::apply::PlannedRun;
+        use crate::plan::PlanReport;
+        use crate::transport::RUN_TIMEOUT;
+
+        let steps = Ok(vec![step_row("packages"), step_row("hostname")]);
+        let mut app = App::with_inventory(opts(), Ok(inventory()), steps);
+        show(
+            &mut app,
+            RunResult::Plan {
+                targets: vec![
+                    PlanReport::Planned {
+                        target: "local".to_owned(),
+                        steps: vec![
+                            PlannedRun {
+                                run: "pacman -S git".to_owned(),
+                                sudo_secret: Some("LOCAL_SUDO".to_owned()),
+                                timeout: RUN_TIMEOUT,
+                            },
+                            PlannedRun {
+                                run: "hostname".to_owned(),
+                                sudo_secret: None,
+                                timeout: RUN_TIMEOUT,
+                            },
+                        ],
+                        ok: true,
+                    },
+                    PlanReport::Failed {
+                        target: "pi".to_owned(),
+                        error: "packages: probe exited 2".to_owned(),
+                        ok: false,
+                    },
+                    PlanReport::Cancelled {
+                        target: "mac".to_owned(),
+                        ok: false,
+                    },
+                ],
+                ok: Some(false),
+                error: None,
+            },
+        );
+        let screen = render(&app, 100, 20);
+        assert!(screen[0].contains("plan"), "{}", screen[0]);
+        assert!(screen[0].ends_with("✔ 1  ✘ 2"), "{}", screen[0]);
+        assert!(screen[2].starts_with("│▶1 packages"), "{}", screen[2]);
+        assert!(screen[3].starts_with("│ 2 hostname"), "{}", screen[3]);
+        assert_eq!(
+            &results_at(&app, 100, 20)[..6],
+            [
+                "[✔ local]  ✘ pi  ✘ mac",
+                "▶ local",
+                "  would $ pacman -S git (sudo password from secret LOCAL_SUDO)",
+                "  would $ hostname",
+                "  ✔ 2 steps",
+                "",
+            ]
+        );
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            &results(&app, 8)[1..3],
+            ["▶ pi", "  ✘ packages: probe exited 2"]
+        );
+        press(&mut app, KeyCode::Right);
+        assert_eq!(&results(&app, 8)[1..3], ["▶ mac", "  ⊘ cancelled"]);
     }
 
     #[test]
