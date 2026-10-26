@@ -315,6 +315,18 @@ impl Packages {
             .map_or(plain, String::as_str)
     }
 
+    /// [`Self::name_for`] of each of `plains`.
+    fn names_for<'a>(
+        &'a self,
+        plains: impl IntoIterator<Item = &'a String>,
+        manager: Manager,
+    ) -> Vec<&'a str> {
+        plains
+            .into_iter()
+            .map(|plain| self.name_for(plain, manager))
+            .collect()
+    }
+
     /// Whether there is anything to install, upgrade, remove or pin.
     pub fn has_work(&self) -> bool {
         self.upgrade || !self.install.is_empty() || !self.remove.is_empty() || !self.pin.is_empty()
@@ -459,70 +471,116 @@ pub fn with_password(script: &str) -> String {
     )
 }
 
-/// The one-line script that upgrades and installs `packages` with
-/// `manager`, then removes the `remove` names that are installed, each
-/// under [`Packages::name_for`]; `None` when there is nothing to upgrade,
-/// install or remove. `root`: run without
-/// `sudo -n`. The names go into the script unquoted, so `packages` must
-/// have passed [`Packages::validate`]; panics otherwise, in every build.
+/// Fails when `packages` pins a name and `manager` cannot skip it for one
+/// run (brew, apt, apk); the error names the pins `manager` uses.
+pub fn check_pin(manager: Manager, packages: &Packages) -> Result<(), String> {
+    if packages.pin.is_empty() || matches!(manager, Manager::Pacman | Manager::Dnf) {
+        return Ok(());
+    }
+    Err(format!(
+        "pin is not one-shot on {manager}: {}",
+        packages.names_for(&packages.pin, manager).join(", ")
+    ))
+}
+
+/// The brace group that runs `command` once on the `names` whose `check`
+/// passes (`keep` `&&`) or fails (`keep` `||`), and nothing when none do;
+/// its status is `command`'s, or 0.
+fn guarded(var: char, names: &str, check: &str, keep: &str, command: &str) -> String {
+    format!(
+        "{{ {var}=$(for n in {names}; do {check} \"$n\" >/dev/null 2>&1 {keep} printf '%s ' \"$n\"; done); \
+         [ -z \"${var}\" ] || {command} ${var}; }}"
+    )
+}
+
+/// The one-line script that upgrades `packages` with `manager` (skipping
+/// the `pin` names), installs the missing pins and the `install` names
+/// whose resolved name is not a pin's, then removes the `remove` names that are
+/// installed, each under [`Packages::name_for`]; `None` when there is
+/// nothing to do. `root`: run without `sudo -n`. The names go into the
+/// script unquoted, so `packages` must have passed [`Packages::validate`]
+/// and [`check_pin`]; panics otherwise, in every build.
 pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<String> {
     assert!(
         packages.validate().is_ok(),
         "packages::script: package names must pass Packages::validate before they reach a shell line"
     );
-    let install = !packages.install.is_empty();
+    assert!(
+        check_pin(manager, packages).is_ok(),
+        "packages::script: pins must pass check_pin before they reach a shell line"
+    );
     let s = if root { "" } else { "sudo -n " };
-    let names = |list: &[String]| {
-        list.iter()
-            .map(|plain| packages.name_for(plain, manager))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let p = names(&packages.install);
+    let pins = packages.names_for(&packages.pin, manager);
+    let mut p = packages.names_for(&packages.install, manager);
+    p.retain(|name| !pins.contains(name));
+    let p = p.join(" ");
+    let install = !p.is_empty();
+    let pin = !pins.is_empty();
+    let (k, k_list) = (pins.join(" "), pins.join(","));
     let mut parts: Vec<String> = Vec::new();
-    if packages.upgrade || install {
-        match manager {
-            Manager::Brew => {
-                if packages.upgrade {
-                    parts.push("brew update && brew upgrade".to_string());
-                }
-                if install {
-                    parts.push(format!("brew install {p}"));
-                }
+    match manager {
+        Manager::Brew => {
+            if packages.upgrade {
+                parts.push("brew update && brew upgrade".to_string());
             }
-            Manager::Pacman => {
+            if install {
+                parts.push(format!("brew install {p}"));
+            }
+        }
+        Manager::Pacman => {
+            if packages.upgrade || install {
                 let flags = if packages.upgrade { "-Syu" } else { "-S" };
-                let command = format!("{s}pacman {flags} --noconfirm --needed {p}");
+                let ignore = if packages.upgrade && pin {
+                    format!(" --ignore {k_list}")
+                } else {
+                    String::new()
+                };
+                let command = format!("{s}pacman {flags} --noconfirm --needed{ignore} {p}");
                 parts.push(command.trim_end().to_string());
             }
-            Manager::Apt => {
+            if pin {
+                let command = format!("{s}pacman -S --noconfirm");
+                parts.push(guarded('m', &k, "pacman -T", "||", &command));
+            }
+        }
+        Manager::Apt => {
+            if packages.upgrade || install {
                 parts.push(format!("{s}apt-get update"));
-                if packages.upgrade {
-                    parts.push(format!(
-                        "{s}env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
-                    ));
-                }
-                if install {
-                    parts.push(format!(
-                        "{s}env DEBIAN_FRONTEND=noninteractive apt-get install -y {p}"
-                    ));
-                }
             }
-            Manager::Dnf => {
-                if packages.upgrade {
-                    parts.push(format!("{s}dnf -y upgrade"));
-                }
-                if install {
-                    parts.push(format!("{s}dnf -y install {p}"));
-                }
+            if packages.upgrade {
+                parts.push(format!(
+                    "{s}env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
+                ));
             }
-            Manager::Apk => {
-                if packages.upgrade {
-                    parts.push(format!("{s}apk update && {s}apk upgrade"));
-                }
-                if install {
-                    parts.push(format!("{s}apk add --update-cache {p}"));
-                }
+            if install {
+                parts.push(format!(
+                    "{s}env DEBIAN_FRONTEND=noninteractive apt-get install -y {p}"
+                ));
+            }
+        }
+        Manager::Dnf => {
+            let exclude = if pin {
+                format!(" --exclude={k_list}")
+            } else {
+                String::new()
+            };
+            if packages.upgrade {
+                parts.push(format!("{s}dnf -y upgrade{exclude}"));
+            }
+            if pin {
+                let command = format!("{s}dnf -y install");
+                parts.push(guarded('m', &k, "rpm -q --whatprovides", "||", &command));
+            }
+            if install {
+                parts.push(format!("{s}dnf -y install{exclude} {p}"));
+            }
+        }
+        Manager::Apk => {
+            if packages.upgrade {
+                parts.push(format!("{s}apk update && {s}apk upgrade"));
+            }
+            if install {
+                parts.push(format!("{s}apk add --update-cache {p}"));
             }
         }
     }
@@ -540,11 +598,8 @@ pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<Strin
             ),
             Manager::Apk => ("apk info -e", format!("{s}apk del")),
         };
-        let r = names(&packages.remove);
-        parts.push(format!(
-            "{{ r=$(for n in {r}; do {check} \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); \
-             [ -z \"$r\" ] || {command} $r; }}"
-        ));
+        let r = packages.names_for(&packages.remove, manager).join(" ");
+        parts.push(guarded('r', &r, check, "&&", &command));
     }
     if parts.is_empty() {
         return None;
@@ -1101,12 +1156,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pin_alone_adds_no_script_line_yet() {
-        let p = parse("pin = [\"git\"]\n").unwrap();
-        for manager in Manager::ALL {
-            assert_eq!(script(manager, &p, true), None);
-        }
+    /// The brace group `guarded` should build, written out independently.
+    fn expected_group(var: char, keep: &str, check: &str, names: &str, command: &str) -> String {
+        format!(
+            "{{ {var}=$(for n in {names}; do {check} \"$n\" >/dev/null 2>&1 {keep} printf '%s ' \"$n\"; done); \
+             [ -z \"${var}\" ] || {command} ${var}; }}"
+        )
     }
 
     fn removing(install: &[&str], upgrade: bool) -> Packages {
@@ -1119,12 +1174,8 @@ mod tests {
     #[test]
     fn remove_alone_removes_the_installed_names_per_manager() {
         let brew = BREW_PATH;
-        let group = |check: &str, r: &str, command: &str| {
-            format!(
-                "{{ r=$(for n in {r}; do {check} \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); \
-                 [ -z \"$r\" ] || {command} $r; }}"
-            )
-        };
+        let group =
+            |check: &str, r: &str, command: &str| expected_group('r', "&&", check, r, command);
         let cases = [
             (
                 Manager::Brew,
@@ -1235,14 +1286,19 @@ mod tests {
         );
     }
 
-    /// Runs `line` under `/bin/sh` with a stub `pacman`: `-S`/`-Syu` exit
-    /// `$SYNC`, `-Q` succeeds for the names in `$HAVE`, `-R` prints its
-    /// arguments and exits `$DEL`; the exit code and the output.
+    /// Runs `line` under `/bin/sh` with a stub `pacman`: `-Syu` and
+    /// `-S --needed` exit `$SYNC`, `-Q` and `-T` succeed for the names in
+    /// `$HAVE`, `-R` prints its arguments and exits `$DEL`, any other `-S`
+    /// prints its arguments and exits `$INS` (default 0); the exit code and
+    /// the output.
     fn run_with_stub_pacman(line: &str, sync: u8, have: &str, del: u8) -> (Option<i32>, String) {
         let stub = "pacman() { case $1 in \
                     -Q) case \" $HAVE \" in *\" $2 \"*) return 0;; esac; return 1;; \
+                    -T) case \" $HAVE \" in *\" $2 \"*) return 0;; esac; return 127;; \
                     -R) shift; echo \"removed $*\"; return $DEL;; \
-                    *) return $SYNC;; esac; }";
+                    -Syu) return $SYNC;; esac; \
+                    case \" $* \" in *\" --needed \"*) return $SYNC;; esac; \
+                    shift; echo \"installed $*\"; return ${INS:-0}; }";
         let out = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(format!("{stub}\n{line}"))
@@ -1283,6 +1339,219 @@ mod tests {
         assert_eq!(
             run_with_stub_pacman(&alone, 0, "", 0),
             (Some(0), String::new())
+        );
+    }
+
+    fn pinning(install: &[&str], upgrade: bool) -> Packages {
+        Packages {
+            pin: vec!["vim".into(), "fd".into()],
+            ..with_fd_alias(install, upgrade)
+        }
+    }
+
+    fn pin_group(check: &str, k: &str, command: &str) -> String {
+        expected_group('m', "||", check, k, command)
+    }
+
+    #[test]
+    fn an_install_name_pinned_under_another_plain_name_is_left_to_the_pin() {
+        let p = parse(
+            "install = [\"git\", \"fd\"]\npin = [\"fdfind\"]\n\
+             [alias.fd]\ndnf = \"fd-find\"\npacman = \"fd-find\"\n\
+             [alias.fdfind]\ndnf = \"fd-find\"\npacman = \"fd-find\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script(Manager::Dnf, &p, true).as_deref(),
+            Some(
+                "{ m=$(for n in fd-find; do rpm -q --whatprovides \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); \
+                 [ -z \"$m\" ] || dnf -y install $m; } && dnf -y install --exclude=fd-find git"
+            )
+        );
+        assert_eq!(
+            script(Manager::Pacman, &p, true).as_deref(),
+            Some(
+                "pacman -S --noconfirm --needed git && \
+                 { m=$(for n in fd-find; do pacman -T \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); \
+                 [ -z \"$m\" ] || pacman -S --noconfirm $m; }"
+            )
+        );
+    }
+
+    #[test]
+    fn pacman_skips_pins_in_the_upgrade_and_installs_missing_ones() {
+        let group = pin_group("pacman -T", "vim fd", "sudo -n pacman -S --noconfirm");
+        for (install, upgrade, expected) in [
+            (
+                &["git", "fd"][..],
+                true,
+                format!("sudo -n pacman -Syu --noconfirm --needed --ignore vim,fd git && {group}"),
+            ),
+            (
+                &[],
+                true,
+                format!("sudo -n pacman -Syu --noconfirm --needed --ignore vim,fd && {group}"),
+            ),
+            (
+                &["git", "fd"],
+                false,
+                format!("sudo -n pacman -S --noconfirm --needed git && {group}"),
+            ),
+            (&["fd"], false, group.clone()),
+            (&[], false, group.clone()),
+        ] {
+            assert_eq!(
+                script(Manager::Pacman, &pinning(install, upgrade), false),
+                Some(expected),
+                "{install:?} {upgrade}"
+            );
+        }
+        assert_eq!(
+            script(Manager::Pacman, &pinning(&[], true), true).as_deref(),
+            Some(
+                "pacman -Syu --noconfirm --needed --ignore vim,fd && \
+                 { m=$(for n in vim fd; do pacman -T \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); \
+                 [ -z \"$m\" ] || pacman -S --noconfirm $m; }"
+            )
+        );
+    }
+
+    #[test]
+    fn dnf_excludes_pins_from_the_upgrade_and_installs_missing_ones() {
+        let group = pin_group(
+            "rpm -q --whatprovides",
+            "vim fd-find",
+            "sudo -n dnf -y install",
+        );
+        for (install, upgrade, expected) in [
+            (
+                &["git", "fd"][..],
+                true,
+                format!(
+                    "sudo -n dnf -y upgrade --exclude=vim,fd-find && {group} && \
+                     sudo -n dnf -y install --exclude=vim,fd-find git"
+                ),
+            ),
+            (
+                &[],
+                true,
+                format!("sudo -n dnf -y upgrade --exclude=vim,fd-find && {group}"),
+            ),
+            (
+                &["git", "fd"],
+                false,
+                format!("{group} && sudo -n dnf -y install --exclude=vim,fd-find git"),
+            ),
+            (&["fd"], false, group.clone()),
+        ] {
+            assert_eq!(
+                script(Manager::Dnf, &pinning(install, upgrade), false),
+                Some(expected),
+                "{install:?} {upgrade}"
+            );
+        }
+    }
+
+    #[test]
+    fn pins_install_before_the_remove_group() {
+        let p = Packages {
+            remove: vec!["nano".into()],
+            ..pinning(&["git"], true)
+        };
+        assert_eq!(
+            script(Manager::Pacman, &p, true).as_deref(),
+            Some(
+                "pacman -Syu --noconfirm --needed --ignore vim,fd git && \
+                 { m=$(for n in vim fd; do pacman -T \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); \
+                 [ -z \"$m\" ] || pacman -S --noconfirm $m; } && \
+                 { r=$(for n in nano; do pacman -Q \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); \
+                 [ -z \"$r\" ] || pacman -R --noconfirm $r; }"
+            )
+        );
+        assert_eq!(
+            script(Manager::Dnf, &p, true).as_deref(),
+            Some(
+                "dnf -y upgrade --exclude=vim,fd-find && \
+                 { m=$(for n in vim fd-find; do rpm -q --whatprovides \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); \
+                 [ -z \"$m\" ] || dnf -y install $m; } && dnf -y install --exclude=vim,fd-find git && \
+                 { r=$(for n in nano; do rpm -q --whatprovides \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); \
+                 [ -z \"$r\" ] || dnf -y remove --setopt=clean_requirements_on_remove=False $r; }"
+            )
+        );
+    }
+
+    #[test]
+    fn a_wrapped_pin_runs_after_sudo_validates() {
+        let one_liner = script(Manager::Dnf, &pinning(&["git"], true), false).unwrap();
+        assert_eq!(
+            with_password(&one_liner),
+            "export TERM=dumb\n\
+             mesg n </dev/tty 2>/dev/null; stty -echo </dev/tty; echo anvil-tty-ready\n\
+             IFS= read -r n </dev/tty\n\
+             trap 'sudo -k' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM\n\
+             LC_ALL=C SUDO_PROMPT=\"$n\" sudo -v </dev/tty && echo anvil-sudo-ok && \
+             sudo -n dnf -y upgrade --exclude=vim,fd-find && \
+             { m=$(for n in vim fd-find; do rpm -q --whatprovides \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); \
+             [ -z \"$m\" ] || sudo -n dnf -y install $m; } && \
+             sudo -n dnf -y install --exclude=vim,fd-find git\n"
+        );
+    }
+
+    #[test]
+    fn pins_are_refused_where_they_are_not_one_shot() {
+        for upgrade in [false, true] {
+            let p = pinning(&["git"], upgrade);
+            for (manager, err) in [
+                (Manager::Brew, "pin is not one-shot on brew: vim, fd"),
+                (Manager::Apt, "pin is not one-shot on apt: vim, fd-find"),
+                (Manager::Apk, "pin is not one-shot on apk: vim, fd"),
+            ] {
+                assert_eq!(check_pin(manager, &p), Err(err.to_string()));
+            }
+            for manager in [Manager::Pacman, Manager::Dnf] {
+                assert_eq!(check_pin(manager, &p), Ok(()));
+            }
+            for manager in Manager::ALL {
+                assert_eq!(
+                    check_pin(manager, &with_fd_alias(&["git"], upgrade)),
+                    Ok(())
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must pass check_pin")]
+    fn script_refuses_pins_on_brew() {
+        script(Manager::Brew, &pinning(&[], false), false);
+    }
+
+    #[test]
+    fn a_pin_is_installed_only_when_missing() {
+        let line = script(Manager::Pacman, &pinning(&["git"], true), true).unwrap();
+        // Both pins installed: nothing is reinstalled.
+        assert_eq!(
+            run_with_stub_pacman(&line, 0, "vim fd", 0),
+            (Some(0), String::new())
+        );
+        // Only the missing pin is installed, once.
+        assert_eq!(
+            run_with_stub_pacman(&line, 0, "fd", 0),
+            (Some(0), "installed --noconfirm vim\n".to_string())
+        );
+        assert_eq!(
+            run_with_stub_pacman(&line, 0, "", 0),
+            (Some(0), "installed --noconfirm vim fd\n".to_string())
+        );
+        // A failed upgrade fails the line before any pin is installed.
+        assert_eq!(
+            run_with_stub_pacman(&line, 1, "", 0),
+            (Some(1), String::new())
+        );
+        // A failed pin install fails the line.
+        assert_eq!(
+            run_with_stub_pacman(&format!("INS=1; {line}"), 0, "fd", 0).0,
+            Some(1)
         );
     }
 

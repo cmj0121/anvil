@@ -253,6 +253,7 @@ mod tests {
     use crate::transport::{Output, RUN_TIMEOUT};
 
     const ARCH_SUDO: &str = "distro=arch\nuser=cmj\nsudo=binary\npkg=pacman\nanvil-probe-end=1\n";
+    const MAC: &str = "distro=macos\nuser=cmj\nsudo=binary\npkg=brew\nanvil-probe-end=1\n";
 
     /// Records every script; the probe prints `probe`, anything else would
     /// be a step that ran.
@@ -449,6 +450,34 @@ mod tests {
         assert_eq!(
             json(&plan.targets[0]),
             serde_json::json!({"target": "local", "error": error, "ok": false})
+        );
+    }
+
+    #[test]
+    fn a_pin_that_is_not_one_shot_fails_the_plan_with_the_apply_reason() {
+        let config = config(
+            Some(Packages {
+                pin: vec!["git".to_owned(), "curl".to_owned()],
+                ..Packages::default()
+            }),
+            &["one"],
+        );
+        let (plan, runs) = plan(&["local"], None, MAC, &config, false);
+        assert_eq!(runs, [facts::PROBE]);
+        assert!(!plan.ok);
+        let error = "packages: pin is not one-shot on brew: git, curl";
+        let facts = facts::Facts::parse(MAC.as_bytes()).unwrap();
+        assert_eq!(
+            apply::resolve(&target("local"), Some(&facts), &config),
+            Err(error.to_owned())
+        );
+        assert_eq!(
+            json(&plan.targets[0]),
+            serde_json::json!({"target": "local", "error": error, "ok": false})
+        );
+        assert_eq!(
+            screen(&plan.targets[0]),
+            format!("▶ local\n  ✘ {error}\n\n")
         );
     }
 
