@@ -128,10 +128,51 @@ step 輸出（因此 `--json` 也是）中任何 8 位元組以上的密碼都�
 - 在 Linux 上，local target 需要 util-linux 的 `script`；busybox 的 `script` 沒有 `-e`，因此 local 執行會在那裡失敗。
 - 只有套件 step 在終端機上執行；`[[steps]]` 從不會拿到密碼。
 
+## 別名
+
+有些套件在某些管理器下名稱不同：`fd` 在 apt 與 dnf 上是 `fd-find`。在 `install` 中只寫一次原名（plain name），
+再於 `[packages.alias.PLAIN]` 下寫出其他名稱，每個管理器一個鍵：
+
+```toml
+[packages]
+install = ["fd"]
+
+[packages.alias.fd]
+apt = "fd-find"
+dnf = "fd-find"
+```
+
+step 會以解析出的管理器的項目取代原名來安裝，該管理器沒有項目時則安裝原名：
+此例中 apt 與 dnf 安裝 `fd-find`，brew、pacman 與 apk 安裝 `fd`。在 Debian 上以 NOPASSWD 使用者執行時：
+
+```sh
+sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y fd-find
+```
+
+`anvil plan` 會以 `would $ ...` 印出同一行，因此在 apply 執行之前就能看到每個 target 會安裝的名稱。
+沒有 `[packages.alias]` 時，step 與以往相同。
+
+- **鍵。** `brew`、`pacman`、`apt`、`dnf` 與 `apk`；`auto` 不是鍵。
+- **名稱。** 原名與每個值都遵循 `install` 的名稱規則 `[A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*`，
+  且至多 128 位元組；原名最多 256 個。
+- **接受的情況。** 空的 `[packages.alias.fd]`（所有管理器都用原名），以及不在 `install` 中的名稱的別名（會被忽略）。
+  兩個原名指向同一個套件時，會在同一個指令中安裝它兩次，這並無害處。
+- **空的不儲存。** `anvil config` 不會寫入空的 `[packages.alias]`。
+
+違規時以 2 結束，並指出原名：
+
+- ``packages.alias.fd `auto`: must be one of brew, pacman, apt, dnf, apk``（其他任何鍵亦同）；
+- ``packages.alias.fd.apt `x y`: must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*``；
+- ``packages.alias `-x`: must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*``；
+- ``packages.alias.fd.apt `NAME`: N bytes exceeds the 128 byte limit``（原名則為 ``packages.alias `NAME`: ...``）；
+- `packages.alias: N entries exceeds the 256 entry limit`。
+
+反引號之間的名稱會跳脫控制字元，並截斷為 64 個字元。不是字串的值（`apt = 3`）是解析錯誤，同樣以 2 結束。
+
 ## 執行的指令
 
 step 只有一行：先是升級部分，然後是安裝部分，以 `&&` 連接。`S` 代表 `sudo -n` 後接一個空格（以 root 執行時為空），
-`P` 代表以空格連接的 `install` 名稱：
+`P` 代表以空格連接的 `install` 名稱，有該管理器的[別名](#別名)時以別名取代：
 
 | 管理器 | 部分 | 指令                                                             |
 | ------ | ---- | ---------------------------------------------------------------- |

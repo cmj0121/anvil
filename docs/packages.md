@@ -135,10 +135,53 @@ replaced with `***`; a shorter one is not scrubbed. `-vv` logs which secret a ta
 - On Linux the local target needs util-linux `script`; busybox `script` has no `-e`, so the local run fails there.
 - Only the package step runs on a terminal; `[[steps]]` never get a password.
 
+## Aliases
+
+A package can have another name under some managers: `fd` is `fd-find` on apt and dnf. Write the plain name once in
+`install` and give the other names under `[packages.alias.PLAIN]`, one key per manager:
+
+```toml
+[packages]
+install = ["fd"]
+
+[packages.alias.fd]
+apt = "fd-find"
+dnf = "fd-find"
+```
+
+The step installs the resolved manager's entry in place of the plain name, and the plain name when that manager has no
+entry: here apt and dnf install `fd-find`, and brew, pacman and apk install `fd`. On Debian as a NOPASSWD user:
+
+```sh
+sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y fd-find
+```
+
+`anvil plan` prints that same line as `would $ ...`, so it shows the name each target would install before apply runs.
+Without `[packages.alias]` the step is the same as before.
+
+- **Keys.** `brew`, `pacman`, `apt`, `dnf` and `apk`; `auto` is not a key.
+- **Names.** The plain name and each value follow the `install` name rule, `[A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*`, and
+  are at most 128 bytes; at most 256 plain names.
+- **Accepted.** An empty `[packages.alias.fd]` (the plain name everywhere), and an alias for a name that is not in
+  `install` (it is ignored). Two plain names aliased to one package install it twice in one command, which is harmless.
+- **Not saved empty.** `anvil config` does not write an empty `[packages.alias]`.
+
+A violation is exit 2 and names the plain name:
+
+- ``packages.alias.fd `auto`: must be one of brew, pacman, apt, dnf, apk`` (any other key too);
+- ``packages.alias.fd.apt `x y`: must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*``;
+- ``packages.alias `-x`: must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*``;
+- ``packages.alias.fd.apt `NAME`: N bytes exceeds the 128 byte limit`` (``packages.alias `NAME`: ...`` for a plain name);
+- `packages.alias: N entries exceeds the 256 entry limit`.
+
+The name between backticks has control characters escaped and is cut to 64 characters. A value that is not a string
+(`apt = 3`) is a parse error, also exit 2.
+
 ## What runs
 
 The step is one line: the upgrade part, then the install part, joined with `&&`. `S` stands for `sudo -n` followed by
-a space (nothing as root) and `P` for the `install` names joined by spaces:
+a space (nothing as root) and `P` for the `install` names joined by spaces, each replaced by its
+[alias](#aliases) for the manager when it has one:
 
 | Manager | Part    | Command                                                                   |
 | ------- | ------- | ------------------------------------------------------------------------- |

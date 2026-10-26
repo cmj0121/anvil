@@ -154,6 +154,18 @@ apply 直接執行：不印出計畫，也不詢問確認；想先看它會執�
 anvil 會在 sudo 的提示處輸入密碼（[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)）；
 其 `$` 行仍是那行一行式腳本。沒有 `[packages]`，或沒有要安裝或升級的東西時，不會執行探測，apply 只執行 `[[steps]]`。
 
+每個 `install` 名稱在腳本中會換成解析出的管理器的 `[packages.alias]` 項目，沒有則原樣使用（[別名](packages.zh-TW.md#別名)）。
+以下面的 config 而言，apt 與 dnf 安裝 `fd-find`，brew、pacman 與 apk 安裝 `fd`；`anvil plan` 顯示相同的腳本：
+
+```toml
+[packages]
+install = ["fd"]
+
+[packages.alias.fd]
+apt = "fd-find"
+dnf = "fd-find"
+```
+
 給人看的輸出是每個 target 一個區塊，每個區塊後有一個空行，最後是摘要：
 
 ```text

@@ -508,6 +508,10 @@ mod tests {
                 "invalid/config-bad-timeout.toml",
                 "packages.timeout `0`: must be 1..=3600",
             ),
+            (
+                "invalid/config-bad-alias.toml",
+                "packages.alias.fd `auto`: must be one of brew, pacman, apt, dnf, apk",
+            ),
         ] {
             let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
             let message = err.to_string();
@@ -840,13 +844,18 @@ mod tests {
         let longer = parse("[packages]\ntimeout = 3600\n");
         assert_eq!(longer.packages.as_ref().unwrap().timeout, 3600);
         assert!(longer.validate(Path::new("config.toml")).is_ok());
-        for config in [config, parse("[packages]\n"), longer] {
+        let aliased =
+            parse("[packages]\ninstall = [\"fd\"]\n\n[packages.alias.fd]\napt = \"fd-find\"\n");
+        assert!(aliased.validate(Path::new("config.toml")).is_ok());
+        for config in [config, parse("[packages]\n"), longer, aliased] {
             for format in [Format::Toml, Format::Yaml] {
                 let text = document::to_string(&config, format).unwrap();
                 let back: Config = document::from_str(&text, format).unwrap();
                 assert_eq!(back, config, "{text}");
                 let timeout = config.packages.as_ref().unwrap().timeout;
                 assert_eq!(text.contains("timeout"), timeout != 300, "{text}");
+                let alias = !config.packages.as_ref().unwrap().alias.is_empty();
+                assert_eq!(text.contains("alias"), alias, "{text}");
             }
         }
         for timeout in [0, 3601] {
@@ -876,6 +885,28 @@ mod tests {
                 .contains("packages.local_sudo_secret `sudo`: must match [A-Z][A-Z0-9_]*"),
             "{err}"
         );
+        for (text, format, needle) in [
+            (
+                "[packages.alias.fd]\napt = \"x y\"\n",
+                Format::Toml,
+                "packages.alias.fd.apt `x y`: must match",
+            ),
+            (
+                "packages:\n  alias:\n    fd:\n      auto: x\n",
+                Format::Yaml,
+                "packages.alias.fd `auto`: must be one of brew, pacman, apt, dnf, apk",
+            ),
+            (
+                "packages:\n  alias:\n    -x: {}\n",
+                Format::Yaml,
+                "packages.alias `-x`: must match",
+            ),
+        ] {
+            let config: Config = document::from_str(text, format).unwrap();
+            let err = config.validate(Path::new("config.toml")).unwrap_err();
+            assert!(matches!(err, DocumentError::Invalid { .. }), "{err}");
+            assert!(err.to_string().contains(needle), "{text}: {err}");
+        }
         for (text, format, needle) in [
             (
                 "[packages]\nmanager = \"yum\"\n",
