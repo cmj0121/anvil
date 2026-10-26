@@ -40,6 +40,7 @@ local = "brew"             # optional; the choice for `local`, which has no inve
 install = ["git", "curl"]  # default []
 upgrade = false            # upgrade every installed package first; default false
 local_sudo_secret = "LOCAL_SUDO" # optional; the secret holding this machine's sudo password
+timeout = 300              # seconds the package step may run, 1..=3600; default 300
 
 [[steps]]
 run = "hostname"           # placeholder: a POSIX sh script run on every target
@@ -127,6 +128,7 @@ local = "brew"             # optional; the choice for the local target; default:
 install = ["git", "curl"]  # names to install; default []
 upgrade = false            # upgrade every installed package first; default false
 local_sudo_secret = "LOCAL_SUDO" # optional: [A-Z][A-Z0-9_]*, the local target's sudo password secret
+timeout = 300              # seconds the package step may run, 1..=3600; default 300
 
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
@@ -145,6 +147,7 @@ run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
 最多 256 個項目。違規時以 2 結束：``packages.install[1] `-rf`: must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*``、
 ``packages.install[I] `NAME`: N bytes exceeds the 128 byte limit`` 或 `packages.install: N entries exceeds the 256 entry limit`。
 `local_sudo_secret` 必須是 secret 名稱，否則以 2 結束並顯示 ``packages.local_sudo_secret `VALUE`: must match [A-Z][A-Z0-9_]*``。
+`timeout` 必須介於 1 到 3600 之間，否則以 2 結束並顯示 ``packages.timeout `N`: must be 1..=3600``。
 套件管理器如何選定、會執行什麼，請見 [套件](packages.zh-TW.md)。
 
 必要的名稱已從 `[anvil].secrets` 移到 `[secrets].names`。帶有舊鍵的 config 仍照舊讀取（兩者同時設定則以 2 結束）。

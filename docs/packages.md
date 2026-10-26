@@ -23,6 +23,9 @@ target resolves to, as a `manager` row, and fails when one cannot be resolved. T
 install = ["git", "curl"]
 ```
 
+The package step may run for `timeout` seconds (default 300, 1..=3600), where a `[[steps]]` script gets 30 s. Cancel
+(TUI `Esc` or `q`) waits for a running package step, up to `timeout`.
+
 ## Which manager
 
 The choice for a target is its inventory `pkg`, else `[packages].local` for the `local` target, else
@@ -109,7 +112,8 @@ three cases the process group is killed, which hangs up the terminal and ends sh
 - the prompt again after the password: `packages: sudo rejected the password from secret NAME` (anvil never retries);
 - neither the prompt nor `anvil-sudo-ok` within 15 s of `anvil-tty-ready`:
   `packages: sudo did not show anvil's prompt (secret NAME)`;
-- a run longer than 30 s, as for any script: `timed out after 30 s`;
+- a run longer than the package step's `timeout`: `timed out after N s`, after the step's `$` line and the output it
+  printed so far (cleaned as below);
 - `script(1)` or `ssh` that cannot start: `cannot start the transport: REASON`.
 
 **Output.** The step's stdout is the terminal's output with CRLF turned into LF, the `anvil-tty-ready` and

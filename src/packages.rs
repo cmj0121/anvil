@@ -2,6 +2,7 @@
 //! script that installs or upgrades packages with it.
 
 use std::fmt;
+use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -16,6 +17,10 @@ pub const MAX_INSTALL: usize = 256;
 pub const MAX_NAME_BYTES: usize = 128;
 /// The rule every `install` entry follows.
 pub const NAME_RULE: &str = "must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*";
+/// `timeout` when unset, in seconds.
+pub const DEFAULT_TIMEOUT: u64 = 300;
+/// Longest `timeout`, in seconds.
+pub const MAX_TIMEOUT: u64 = 3600;
 
 const CHOICES: &str = "auto, brew, pacman, apt, dnf, apk";
 const BREW_PATH: &str =
@@ -135,7 +140,7 @@ pub fn de_pkg<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Choice>, D::Erro
 }
 
 /// `[packages]` in the config.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Packages {
     #[serde(
@@ -158,12 +163,45 @@ pub struct Packages {
     /// The secret holding the sudo password of the `local` target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_sudo_secret: Option<String>,
+    /// Seconds the package step may run.
+    #[serde(
+        default = "default_timeout",
+        skip_serializing_if = "is_default_timeout"
+    )]
+    pub timeout: u64,
+}
+
+impl Default for Packages {
+    fn default() -> Self {
+        Self {
+            manager: Choice::default(),
+            local: None,
+            install: Vec::new(),
+            upgrade: false,
+            local_sudo_secret: None,
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+}
+
+fn default_timeout() -> u64 {
+    DEFAULT_TIMEOUT
+}
+
+fn is_default_timeout(timeout: &u64) -> bool {
+    *timeout == DEFAULT_TIMEOUT
 }
 
 impl Packages {
-    /// Checks the `install` names and `local_sudo_secret`; the error names
-    /// the entry.
+    /// Checks the `install` names, `local_sudo_secret` and `timeout`; the
+    /// error names the entry.
     pub fn validate(&self) -> Result<(), String> {
+        if !(1..=MAX_TIMEOUT).contains(&self.timeout) {
+            return Err(format!(
+                "packages.timeout `{}`: must be 1..={MAX_TIMEOUT}",
+                self.timeout
+            ));
+        }
         if let Some(name) = &self.local_sudo_secret
             && !secret::is_name(name)
         {
@@ -191,6 +229,11 @@ impl Packages {
             }
         }
         Ok(())
+    }
+
+    /// How long the package step may run.
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout)
     }
 
     /// Whether there is anything to install or upgrade.
@@ -747,6 +790,7 @@ mod tests {
             install: vec!["git".into(), "curl".into()],
             upgrade: true,
             local_sudo_secret: Some("LOCAL_SUDO".into()),
+            timeout: 600,
         };
         for format in [Format::Toml, Format::Yaml] {
             for p in [full.clone(), Packages::default()] {
@@ -759,7 +803,7 @@ mod tests {
         assert_eq!(
             text,
             "manager = \"apt\"\nlocal = \"auto\"\ninstall = [\"git\", \"curl\"]\nupgrade = true\n\
-             local_sudo_secret = \"LOCAL_SUDO\"\n"
+             local_sudo_secret = \"LOCAL_SUDO\"\ntimeout = 600\n"
         );
         assert_eq!(
             document::to_string(&Packages::default(), Format::Toml).unwrap(),
@@ -890,7 +934,7 @@ mod tests {
         let out = crate::transport::run_tty_with(
             &mut command,
             b"hunter2-secret",
-            crate::transport::TtyLimits::DEFAULT,
+            crate::transport::TtyLimits::with_run(crate::transport::RUN_TIMEOUT),
         )
         .unwrap();
         let logged = std::fs::read_to_string(&log).unwrap();

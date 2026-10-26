@@ -1217,6 +1217,35 @@ mod tests {
     }
 
     #[test]
+    fn a_timed_out_step_shows_its_run_and_output_before_the_error() {
+        let mut app = app();
+        show(
+            &mut app,
+            RunResult::Apply {
+                targets: vec![crate::apply::TargetReport::Failed {
+                    target: "pi".to_owned(),
+                    steps: vec![step("sleep 40", None, "start\n", "warn\n")],
+                    error: "timed out after 30 s".to_owned(),
+                    ok: false,
+                }],
+                ok: Some(false),
+                error: None,
+            },
+        );
+        assert_eq!(
+            &results(&app, 10)[..6],
+            [
+                "[✘ pi]",
+                "▶ pi",
+                "  $ sleep 40",
+                "    start",
+                "    warn",
+                "  ✘ timed out after 30 s",
+            ]
+        );
+    }
+
+    #[test]
     fn the_running_target_has_a_spinner() {
         let mut app = app();
         show(

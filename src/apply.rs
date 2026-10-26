@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -26,7 +27,9 @@ use crate::logger::{BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, is_esca
 use crate::options::Options;
 use crate::packages::{self, Packages};
 use crate::secret::Store;
-use crate::transport::{Output, Transport, TransportError, has_control_bytes, into_string};
+use crate::transport::{
+    Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
+};
 use zeroize::Zeroizing;
 
 /// Sudo passwords by secret name; a name that is not set is absent.
@@ -53,17 +56,18 @@ impl<'a> Sudo<'a> {
     }
 }
 
-/// The package step: its one-line script, and the secret name and password
-/// to type when it runs through sudo with a password.
+/// The package step: its one-line script, the secret name and password
+/// to type when it runs through sudo with a password, and its time limit.
 struct PackageStep<'a> {
     run: String,
     password: Option<(&'a str, &'a [u8])>,
+    timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StepReport {
     pub run: String,
-    /// `None` when the script was killed by a signal.
+    /// `None` when the script was killed by a signal or at the time limit.
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
@@ -89,7 +93,8 @@ pub enum TargetReport {
         ok: bool,
     },
     /// A transport error ended the target; `steps` holds the ones that ran
-    /// before it (omitted when none did).
+    /// before it, then a step that timed out with what it printed (omitted
+    /// when none did).
     Failed {
         target: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -370,21 +375,38 @@ fn apply_target(
     };
     let runs = package_step
         .iter()
-        .map(|step| (step.run.as_str(), step.password))
-        .chain(steps.iter().map(|step| (step.run.as_str(), None)));
+        .map(|step| (step.run.as_str(), step.password, step.timeout))
+        .chain(
+            steps
+                .iter()
+                .map(|step| (step.run.as_str(), None, RUN_TIMEOUT)),
+        );
     let mut reports = Vec::with_capacity(steps.len() + 1);
     let mut ok = true;
-    for (run, password) in runs {
+    for (run, password, timeout) in runs {
         if cancel.load(Ordering::Relaxed) {
             return cancelled(target, reports);
         }
         let output = match password {
-            None => transport.run(run).map_err(|err| err.to_string()),
-            Some((name, password)) => run_with_password(transport.as_ref(), run, name, password),
+            None => transport.run(run, timeout),
+            Some((_, password)) => {
+                transport.run_tty(&packages::with_password(run), password, timeout)
+            }
         };
         let output = match output {
             Ok(output) => output,
-            Err(error) => return failed(reports, error),
+            Err(err) => {
+                let error = step_error(&err, password.map(|(name, _)| name));
+                // A step killed at the limit still shows what it printed.
+                if let TransportError::Timeout {
+                    output: Some(output),
+                    ..
+                } = err
+                {
+                    reports.push(StepReport::from_output(run, *output));
+                }
+                return failed(reports, error);
+            }
         };
         let succeeded = output.code == Some(0);
         if succeeded && output.truncated {
@@ -408,26 +430,18 @@ fn apply_target(
     }
 }
 
-/// Runs the package step `run` on a terminal through [`packages::with_password`],
-/// typing `password` from secret `name` at sudo's prompt. The error names
-/// the secret, never its value.
-fn run_with_password(
-    transport: &dyn Transport,
-    run: &str,
-    name: &str,
-    password: &[u8],
-) -> Result<Output, String> {
-    transport
-        .run_tty(&packages::with_password(run), password)
-        .map_err(|err| match err {
-            TransportError::PasswordRejected => {
-                format!("packages: sudo rejected the password from secret {name}")
-            }
-            TransportError::NoPrompt => {
-                format!("packages: sudo did not show anvil's prompt (secret {name})")
-            }
-            err => err.to_string(),
-        })
+/// The failure of a step: for the package step run on a terminal with the
+/// password from secret `secret`, sudo's refusals name the secret, never its value.
+fn step_error(err: &TransportError, secret: Option<&str>) -> String {
+    match (err, secret) {
+        (TransportError::PasswordRejected, Some(name)) => {
+            format!("packages: sudo rejected the password from secret {name}")
+        }
+        (TransportError::NoPrompt, Some(name)) => {
+            format!("packages: sudo did not show anvil's prompt (secret {name})")
+        }
+        (err, _) => err.to_string(),
+    }
 }
 
 /// Probes `target` and builds the step that installs and upgrades
@@ -440,7 +454,9 @@ fn package_script<'a>(
     packages: &Packages,
     sudo: Option<Sudo<'a>>,
 ) -> Result<Option<PackageStep<'a>>, String> {
-    let output = transport.run(facts::PROBE).map_err(|err| err.to_string())?;
+    let output = transport
+        .run(facts::PROBE, RUN_TIMEOUT)
+        .map_err(|err| err.to_string())?;
     let reason = |why: String| format!("packages: {why}");
     match output.code {
         Some(0) => {}
@@ -467,7 +483,11 @@ fn package_script<'a>(
             None
         }
     };
-    Ok(Some(PackageStep { run, password }))
+    Ok(Some(PackageStep {
+        run,
+        password,
+        timeout: packages.timeout(),
+    }))
 }
 
 /// When a line's text has its control characters escaped.
@@ -666,6 +686,8 @@ mod tests {
         typed: Rc<RefCell<Vec<Vec<u8>>>>,
         /// Returned from `run_tty`.
         tty_fail: Option<TransportError>,
+        /// The timeout of each `run` and `run_tty`, in order.
+        timeouts: Rc<RefCell<Vec<Duration>>>,
     }
 
     impl Fake {
@@ -678,6 +700,7 @@ mod tests {
                 probe_code: Some(0),
                 typed: Rc::default(),
                 tty_fail: None,
+                timeouts: Rc::default(),
             }
         }
     }
@@ -687,7 +710,8 @@ mod tests {
             "fake"
         }
 
-        fn run(&self, script: &str) -> Result<Output, TransportError> {
+        fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
+            self.timeouts.borrow_mut().push(timeout);
             let ran = {
                 let mut log = self.log.borrow_mut();
                 log.push(script.to_owned());
@@ -718,7 +742,13 @@ mod tests {
             })
         }
 
-        fn run_tty(&self, script: &str, password: &[u8]) -> Result<Output, TransportError> {
+        fn run_tty(
+            &self,
+            script: &str,
+            password: &[u8],
+            timeout: Duration,
+        ) -> Result<Output, TransportError> {
+            self.timeouts.borrow_mut().push(timeout);
             self.log.borrow_mut().push(script.to_owned());
             self.typed.borrow_mut().push(password.to_vec());
             match &self.tty_fail {
@@ -893,7 +923,10 @@ mod tests {
             "box",
             &["one", "two", "three"],
             1,
-            Some(TransportError::Timeout(crate::transport::RUN_TIMEOUT)),
+            Some(TransportError::Timeout {
+                after: RUN_TIMEOUT,
+                output: None,
+            }),
         );
         assert_eq!(runs, ["one", "two"]);
         assert!(!report.ok());
@@ -911,6 +944,42 @@ mod tests {
         assert_eq!(
             screen(&report, piped()),
             "▶ box\n  $ one\n  one-out\n  ✘ timed out after 30 s\n\n"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_step_keeps_its_run_and_partial_output() {
+        let (report, runs) = apply_after(
+            "box",
+            &["one", "slow", "three"],
+            1,
+            Some(TransportError::Timeout {
+                after: RUN_TIMEOUT,
+                output: Some(Box::new(Output {
+                    stdout: b"start\n".to_vec(),
+                    stderr: b"warn\n".to_vec(),
+                    ..Output::default()
+                })),
+            }),
+        );
+        assert_eq!(runs, ["one", "slow"]);
+        assert!(!report.ok());
+        let value = json(&report);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "target": "box",
+                "steps": [
+                    {"run": "one", "code": 0, "stdout": "one-out\n", "stderr": ""},
+                    {"run": "slow", "code": null, "stdout": "start\n", "stderr": "warn\n"},
+                ],
+                "error": "timed out after 30 s",
+                "ok": false,
+            })
+        );
+        assert_eq!(
+            screen(&report, piped()),
+            "▶ box\n  $ one\n  one-out\n  $ slow\n  start\n  box: warn\n  ✘ timed out after 30 s\n\n"
         );
     }
 
@@ -1138,7 +1207,7 @@ mod tests {
             "stopper"
         }
 
-        fn run(&self, script: &str) -> Result<Output, TransportError> {
+        fn run(&self, script: &str, _timeout: Duration) -> Result<Output, TransportError> {
             self.log.borrow_mut().push(script.to_owned());
             if script == "stop" {
                 self.cancel.store(true, Ordering::Relaxed);
@@ -1150,7 +1219,12 @@ mod tests {
             })
         }
 
-        fn run_tty(&self, _script: &str, _password: &[u8]) -> Result<Output, TransportError> {
+        fn run_tty(
+            &self,
+            _script: &str,
+            _password: &[u8],
+            _timeout: Duration,
+        ) -> Result<Output, TransportError> {
             unreachable!("no tty script in these tests")
         }
     }
@@ -1522,6 +1596,42 @@ mod tests {
         (report, runs, typed)
     }
 
+    #[test]
+    fn only_the_package_step_runs_with_the_packages_timeout() {
+        let pkgs = Packages {
+            timeout: 900,
+            ..packages(&["git"], false)
+        };
+        let package_step = Duration::from_secs(900);
+        for (probe, password) in [(ARCH_ROOT, None), (ARCH_SUDO, Some(PASSWORD.as_bytes()))] {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let fake = Fake {
+                probe,
+                ..Fake::new(&log)
+            };
+            let timeouts = Rc::clone(&fake.timeouts);
+            let typed = Rc::clone(&fake.typed);
+            let report = apply_target(
+                &target("local"),
+                Ok(Box::new(fake)),
+                Some(&pkgs),
+                password.map(|password| Sudo {
+                    name: "LOCAL_SUDO",
+                    password: Some(password),
+                }),
+                &steps(&["one", "two"]),
+                &AtomicBool::new(false),
+            );
+            assert!(report.ok(), "{probe}");
+            assert_eq!(typed.borrow().len(), usize::from(password.is_some()));
+            assert_eq!(
+                *timeouts.borrow(),
+                [RUN_TIMEOUT, package_step, RUN_TIMEOUT, RUN_TIMEOUT],
+                "{probe}"
+            );
+        }
+    }
+
     /// Fails when `PASSWORD` shows up in the human output or the JSON.
     fn assert_hidden(report: &TargetReport) {
         for style in [piped(), terminal()] {
@@ -1615,7 +1725,10 @@ mod tests {
                 "packages: sudo did not show anvil's prompt (secret LOCAL_SUDO)",
             ),
             (
-                TransportError::Timeout(crate::transport::RUN_TIMEOUT),
+                TransportError::Timeout {
+                    after: RUN_TIMEOUT,
+                    output: None,
+                },
                 "timed out after 30 s",
             ),
         ] {
@@ -1632,6 +1745,61 @@ mod tests {
             );
             assert_hidden(&report);
         }
+    }
+
+    #[test]
+    fn a_timed_out_password_step_shows_the_one_line_run_and_its_output() {
+        let timeout = TransportError::Timeout {
+            after: RUN_TIMEOUT,
+            output: Some(Box::new(Output {
+                stdout: b"resolving\n".to_vec(),
+                ..Output::default()
+            })),
+        };
+        let (report, runs, _) = apply_sudo(ARCH_SUDO, Some(PASSWORD.as_bytes()), Some(timeout));
+        assert_eq!(runs.len(), 2, "the steps do not run: {runs:?}");
+        let one_liner = "sudo -n pacman -S --noconfirm --needed git";
+        assert_eq!(
+            json(&report),
+            serde_json::json!({
+                "target": "local",
+                "steps": [{"run": one_liner, "code": null, "stdout": "resolving\n", "stderr": ""}],
+                "error": "timed out after 30 s",
+                "ok": false,
+            })
+        );
+        assert_eq!(
+            screen(&report, piped()),
+            format!("▶ local\n  $ {one_liner}\n  resolving\n  ✘ timed out after 30 s\n\n")
+        );
+        assert_hidden(&report);
+    }
+
+    #[test]
+    fn a_timed_out_probe_shows_no_step() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let fake = Fake {
+            fail_with: Some(TransportError::Timeout {
+                after: RUN_TIMEOUT,
+                output: Some(Box::new(Output {
+                    stdout: b"distro=arch\n".to_vec(),
+                    ..Output::default()
+                })),
+            }),
+            ..Fake::new(&log)
+        };
+        let report = apply_target(
+            &target("local"),
+            Ok(Box::new(fake)),
+            Some(&packages(&["git"], false)),
+            None,
+            &steps(&["one"]),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            json(&report),
+            serde_json::json!({"target": "local", "error": "timed out after 30 s", "ok": false})
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use crate::options::Options;
 use crate::packages::{self, Choice};
 use crate::paths;
 use crate::secret::{SecretError, Store};
-use crate::transport::{Output, Transport, TransportError};
+use crate::transport::{Output, RUN_TIMEOUT, Transport, TransportError};
 
 const SH: &str = "/bin/sh";
 
@@ -276,7 +276,7 @@ fn check_target(
     let result = transport
         .and_then(|transport| {
             log::info!("doctor {}: probing over {}", target.name, transport.name());
-            transport.run(PROBE)
+            transport.run(PROBE, RUN_TIMEOUT)
         })
         .map_err(|err| err.to_string())
         .and_then(|output| match output.code {
@@ -407,6 +407,8 @@ fn render(report: &Report) -> String {
 mod tests {
     use super::*;
 
+    use std::time::Duration;
+
     use crate::secret::Memory;
     use crate::test_util::{Unopenable, json, keys};
 
@@ -421,7 +423,7 @@ mod tests {
             "exits"
         }
 
-        fn run(&self, _script: &str) -> Result<Output, TransportError> {
+        fn run(&self, _script: &str, _timeout: Duration) -> Result<Output, TransportError> {
             Ok(Output {
                 stderr: self.1.as_bytes().to_vec(),
                 code: self.0,
@@ -429,7 +431,12 @@ mod tests {
             })
         }
 
-        fn run_tty(&self, _script: &str, _password: &[u8]) -> Result<Output, TransportError> {
+        fn run_tty(
+            &self,
+            _script: &str,
+            _password: &[u8],
+            _timeout: Duration,
+        ) -> Result<Output, TransportError> {
             unreachable!("no tty script in these tests")
         }
     }
@@ -439,7 +446,7 @@ mod tests {
             "fake"
         }
 
-        fn run(&self, _script: &str) -> Result<Output, TransportError> {
+        fn run(&self, _script: &str, _timeout: Duration) -> Result<Output, TransportError> {
             self.0.clone().map(|stdout| Output {
                 stdout: stdout.as_bytes().to_vec(),
                 code: Some(0),
@@ -447,7 +454,12 @@ mod tests {
             })
         }
 
-        fn run_tty(&self, _script: &str, _password: &[u8]) -> Result<Output, TransportError> {
+        fn run_tty(
+            &self,
+            _script: &str,
+            _password: &[u8],
+            _timeout: Duration,
+        ) -> Result<Output, TransportError> {
             unreachable!("no tty script in these tests")
         }
     }

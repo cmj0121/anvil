@@ -264,7 +264,7 @@ impl Runner<'_> {
             collect_capped(child, Some(sops.timeout), [limit, STDERR_LIMIT])
         })
         .map_err(|err| match err {
-            TransportError::Timeout(after) => fail(format!("timed out after {after:?}")),
+            TransportError::Timeout { after, .. } => fail(format!("timed out after {after:?}")),
             TransportError::Spawn(reason) => fail(reason),
             other => fail(other.to_string()),
         })?;

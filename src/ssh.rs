@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::paths::{self, PrivateDirError};
 use crate::term;
 use crate::transport::{
-    Output, RUN_TIMEOUT, Transport, TransportError, TtyLimits, collect, into_string, run_tty_with,
+    Output, Transport, TransportError, TtyLimits, collect, into_string, run_tty_with,
     run_with_script,
 };
 
@@ -281,18 +281,23 @@ impl Transport for Ssh {
         &self.host
     }
 
-    fn run(&self, script: &str) -> Result<Output, TransportError> {
+    fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
         let control_dir = self.connected()?;
         // Auth happened in the master; any client exit, 255 included, is the
         // script's (a nested ssh, say) and comes back as its output.
         let mut command = self.command(&self.client_args(control_dir));
-        run_with_script(&mut command, script, RUN_TIMEOUT)
+        run_with_script(&mut command, script, timeout)
     }
 
-    fn run_tty(&self, script: &str, password: &[u8]) -> Result<Output, TransportError> {
+    fn run_tty(
+        &self,
+        script: &str,
+        password: &[u8],
+        timeout: Duration,
+    ) -> Result<Output, TransportError> {
         let control_dir = self.connected()?;
         let mut command = self.command(&self.tty_client_args(control_dir, script));
-        run_tty_with(&mut command, password, TtyLimits::DEFAULT)
+        run_tty_with(&mut command, password, TtyLimits::with_run(timeout))
     }
 }
 
@@ -394,6 +399,7 @@ mod tests {
     use crate::facts::{Facts, PROBE};
     use crate::term::testing::{Event, Recorder};
     use crate::test_util::{temp_dir, write_knobs};
+    use crate::transport::RUN_TIMEOUT;
     use std::os::unix::fs::PermissionsExt;
 
     const CONTROL: &str = "/tmp/h/.ssh/anvil";
@@ -657,7 +663,7 @@ mod tests {
         let (recorder, _guard) = Recorder::install();
         let home = temp_home();
         let (ssh, log) = fake_with(&home, &[]);
-        let out = ssh.run("echo hi").unwrap();
+        let out = ssh.run("echo hi", RUN_TIMEOUT).unwrap();
         assert!(recorder.events().is_empty());
         assert_eq!(out.stdout, b"hi\n");
         let calls = invocations(&log);
@@ -687,7 +693,7 @@ mod tests {
     fn a_live_master_skips_the_master_attempt() {
         let home = temp_home();
         let (ssh, log) = fake_with(&home, &[("FAKE_SSH_CHECK_EXIT", "0")]);
-        ssh.run("true").unwrap();
+        ssh.run("true", RUN_TIMEOUT).unwrap();
         let calls = invocations(&log);
         assert_eq!(calls.len(), 2, "{calls:?}");
         assert!(!calls.iter().any(|c| c.contains(" -M ")), "{calls:?}");
@@ -697,7 +703,7 @@ mod tests {
     fn probe_runs_through_the_fake() {
         let home = temp_home();
         let (ssh, _) = fake_with(&home, &[]);
-        let out = ssh.run(PROBE).unwrap();
+        let out = ssh.run(PROBE, RUN_TIMEOUT).unwrap();
         let facts = Facts::parse(&out.stdout).unwrap();
         assert!(facts.get("hostname").is_some());
     }
@@ -715,7 +721,7 @@ mod tests {
                 ),
             ],
         );
-        let err = ssh.run("true").unwrap_err();
+        let err = ssh.run("true", RUN_TIMEOUT).unwrap_err();
         assert_eq!(
             err,
             TransportError::AuthDenied {
@@ -749,7 +755,7 @@ mod tests {
         };
         let (recorder, _guard) = Recorder::install();
         // The retry (FAKE_SSH_RETRY_EXIT unset) succeeds, so the client runs.
-        let out = ssh.run("echo hi").unwrap();
+        let out = ssh.run("echo hi", RUN_TIMEOUT).unwrap();
         // Only the interactive retry gets the terminal.
         assert_eq!(recorder.events(), [Event::Suspend, Event::Resume]);
         assert_eq!(out.stdout, b"hi\n");
@@ -789,7 +795,7 @@ mod tests {
             can_prompt: true,
             ..ssh
         };
-        let err = ssh.run("true").unwrap_err();
+        let err = ssh.run("true", RUN_TIMEOUT).unwrap_err();
         assert_eq!(err, TransportError::AuthDenied { after_prompt: true });
         assert_eq!(
             err.to_string(),
@@ -811,7 +817,7 @@ mod tests {
                 ),
             ],
         );
-        let err = ssh.run("true").unwrap_err();
+        let err = ssh.run("true", RUN_TIMEOUT).unwrap_err();
         assert_eq!(
             err,
             TransportError::Connect {
@@ -836,7 +842,7 @@ mod tests {
                 &home,
                 &[("FAKE_SSH_EXIT", "255"), ("FAKE_SSH_STDERR", stderr)],
             );
-            let err = ssh.run("true").unwrap_err();
+            let err = ssh.run("true", RUN_TIMEOUT).unwrap_err();
             assert_eq!(err, TransportError::HostKey);
             assert!(err.to_string().contains("run `ssh <host>` once"), "{err}");
             assert_eq!(invocations(&log).len(), 2, "no retry");
@@ -858,13 +864,13 @@ mod tests {
                 ),
             ],
         );
-        let out = ssh.run("true").unwrap();
+        let out = ssh.run("true", RUN_TIMEOUT).unwrap();
         assert_eq!(out.code, Some(255));
         assert_eq!(out.stdout, b"");
         assert_eq!(out.stderr, b"me@inner: Permission denied (publickey).\n");
 
         let (ssh, _) = fake_with(&home, &[("FAKE_SSH_CHECK_EXIT", "0")]);
-        let out = ssh.run("echo kept; exit 255").unwrap();
+        let out = ssh.run("echo kept; exit 255", RUN_TIMEOUT).unwrap();
         assert_eq!(out.code, Some(255));
         assert_eq!(out.stdout, b"kept\n");
         assert_eq!(out.stderr, b"");
@@ -873,15 +879,15 @@ mod tests {
             &home,
             &[("FAKE_SSH_CHECK_EXIT", "0"), ("FAKE_SSH_CLIENT_EXIT", "3")],
         );
-        assert_eq!(ssh.run("true").unwrap().code, Some(3));
+        assert_eq!(ssh.run("true", RUN_TIMEOUT).unwrap().code, Some(3));
     }
 
     #[test]
     fn the_master_is_checked_before_every_client() {
         let home = temp_home();
         let (ssh, log) = fake_with(&home, &[("FAKE_SSH_CHECK_EXIT", "0")]);
-        ssh.run("true").unwrap();
-        ssh.run("true").unwrap();
+        ssh.run("true", RUN_TIMEOUT).unwrap();
+        ssh.run("true", RUN_TIMEOUT).unwrap();
         let calls = invocations(&log);
         assert_eq!(calls.len(), 4, "{calls:?}");
         assert!(calls[2].ends_with("-O check -- box"), "{}", calls[2]);
@@ -897,8 +903,14 @@ mod tests {
             ..ssh
         };
         let started = std::time::Instant::now();
-        let err = ssh.run("true").unwrap_err();
-        assert_eq!(err, TransportError::Timeout(Duration::from_millis(200)));
+        let err = ssh.run("true", RUN_TIMEOUT).unwrap_err();
+        assert_eq!(
+            err,
+            TransportError::Timeout {
+                after: Duration::from_millis(200),
+                output: None
+            }
+        );
         // Well under the fake's 30 s sleep; generous because macOS scans a freshly
         // written script on its first exec, which is slow under a loaded suite.
         assert!(started.elapsed() < Duration::from_secs(15));
@@ -922,7 +934,7 @@ mod tests {
             ..ssh
         };
         let started = std::time::Instant::now();
-        let out = ssh.run("echo hi").unwrap();
+        let out = ssh.run("echo hi", RUN_TIMEOUT).unwrap();
         assert_eq!(out.stdout, b"hi\n");
         // Well under the fake's 30 s sleep; generous because macOS scans a freshly
         // written script on its first exec, which is slow under a loaded suite.
@@ -945,7 +957,7 @@ mod tests {
                 ("FAKE_SSH_STDERR_BYTES", "3000000"),
             ],
         );
-        match ssh.run("true").unwrap_err() {
+        match ssh.run("true", RUN_TIMEOUT).unwrap_err() {
             TransportError::Connect { stderr } => {
                 assert_eq!(stderr.len(), crate::transport::OUTPUT_CAP);
             }
@@ -960,7 +972,7 @@ mod tests {
         let control = control_dir(&home, uid()).unwrap();
         chmod(&control, 0o770);
         assert!(matches!(
-            ssh.run("true").unwrap_err(),
+            ssh.run("true", RUN_TIMEOUT).unwrap_err(),
             TransportError::Spawn(_)
         ));
         assert!(invocations(&log).is_empty());
@@ -974,7 +986,7 @@ mod tests {
             ..fake(&home)
         };
         assert!(matches!(
-            ssh.run("true").unwrap_err(),
+            ssh.run("true", RUN_TIMEOUT).unwrap_err(),
             TransportError::Spawn(_)
         ));
     }
@@ -1080,7 +1092,7 @@ mod tests {
                       IFS= read -r n </dev/tty\n\
                       printf %s \"$n\" >/dev/tty; IFS= read -r pw </dev/tty\n\
                       echo anvil-sudo-ok; echo \"got:${#pw}\"; exit 5\n";
-        let out = ssh.run_tty(script, b"pw-secret").unwrap();
+        let out = ssh.run_tty(script, b"pw-secret", RUN_TIMEOUT).unwrap();
         assert_eq!(out.stdout, b"got:9\n");
         assert_eq!(out.code, Some(5));
         let calls = invocations(&log);

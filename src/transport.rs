@@ -42,8 +42,13 @@ pub struct Output {
 pub enum TransportError {
     /// The process could not be started.
     Spawn(String),
-    /// The process did not finish within this timeout and was killed.
-    Timeout(Duration),
+    /// The process did not finish within this timeout and was killed. `output`
+    /// is what a script printed before the kill (`code` is `None`); runs that
+    /// keep nothing on a timeout leave it `None`.
+    Timeout {
+        after: Duration,
+        output: Option<Box<Output>>,
+    },
     /// Authentication failed: with `after_prompt` false the key was refused and
     /// no terminal was there for a password; true means the interactive attempt
     /// was refused too.
@@ -64,10 +69,10 @@ impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Spawn(reason) => write!(f, "cannot start the transport: {reason}"),
-            Self::Timeout(after) if after.subsec_millis() == 0 => {
+            Self::Timeout { after, .. } if after.subsec_millis() == 0 => {
                 write!(f, "timed out after {} s", after.as_secs())
             }
-            Self::Timeout(after) => write!(f, "timed out after {} ms", after.as_millis()),
+            Self::Timeout { after, .. } => write!(f, "timed out after {} ms", after.as_millis()),
             Self::AuthDenied {
                 after_prompt: false,
             } => {
@@ -97,13 +102,18 @@ impl std::error::Error for TransportError {}
 
 pub trait Transport {
     fn name(&self) -> &str;
-    /// Runs `script`; a script that ran to completion is `Ok` whatever its
-    /// exit code, which the caller judges.
-    fn run(&self, script: &str) -> Result<Output, TransportError>;
+    /// Runs `script`, killed after `timeout`; a script that ran to completion
+    /// is `Ok` whatever its exit code, which the caller judges.
+    fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError>;
     /// Runs `script` on a terminal and types `password` once at sudo's prompt,
-    /// per [`run_tty_with`]. The output's stdout is the
-    /// cleaned terminal output.
-    fn run_tty(&self, script: &str, password: &[u8]) -> Result<Output, TransportError>;
+    /// per [`run_tty_with`] with `timeout` as [`TtyLimits::run`]. The output's
+    /// stdout is the cleaned terminal output.
+    fn run_tty(
+        &self,
+        script: &str,
+        password: &[u8],
+        timeout: Duration,
+    ) -> Result<Output, TransportError>;
 }
 
 /// Runs scripts on this machine with `/bin/sh -s`.
@@ -115,14 +125,23 @@ impl Transport for Local {
         "local"
     }
 
-    fn run(&self, script: &str) -> Result<Output, TransportError> {
+    fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
         let mut command = Command::new("/bin/sh");
         command.arg("-s");
-        run_with_script(&mut command, script, RUN_TIMEOUT)
+        run_with_script(&mut command, script, timeout)
     }
 
-    fn run_tty(&self, script: &str, password: &[u8]) -> Result<Output, TransportError> {
-        run_tty_with(&mut local_tty_command(script), password, TtyLimits::DEFAULT)
+    fn run_tty(
+        &self,
+        script: &str,
+        password: &[u8],
+        timeout: Duration,
+    ) -> Result<Output, TransportError> {
+        run_tty_with(
+            &mut local_tty_command(script),
+            password,
+            TtyLimits::with_run(timeout),
+        )
     }
 }
 
@@ -150,7 +169,8 @@ fn script_program() -> &'static str {
 }
 
 /// Spawns `command` with piped stdio, writes the script to stdin, closes it and
-/// collects the output within `timeout`. On timeout the child is killed.
+/// collects the output within `timeout`. On timeout the child is killed and the
+/// error carries the output read so far.
 pub fn run_with_script(
     command: &mut Command,
     script: &str,
@@ -175,7 +195,7 @@ pub fn run_with_script(
         let _ = stdin.write_all(script.as_bytes());
     });
 
-    collect(child, Some(timeout))
+    gather(child, Some(timeout), [OUTPUT_CAP, OUTPUT_CAP], true)
 }
 
 /// The line the tty script prints once the terminal no longer echoes; the
@@ -229,7 +249,7 @@ pub fn has_control_bytes(bytes: &[u8]) -> bool {
 /// The deadlines of [`run_tty_with`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TtyLimits {
-    /// The whole run, as [`RUN_TIMEOUT`] for [`run_with_script`].
+    /// The whole run, as the timeout of [`run_with_script`].
     pub run: Duration,
     /// From the ready line until the prompt or the sudo-ok marker.
     pub prompt: Duration,
@@ -238,11 +258,14 @@ pub struct TtyLimits {
 }
 
 impl TtyLimits {
-    pub const DEFAULT: Self = Self {
-        run: RUN_TIMEOUT,
-        prompt: Duration::from_secs(15),
-        quiet: Duration::from_millis(100),
-    };
+    /// The default prompt deadlines, with the whole run limited to `run`.
+    pub const fn with_run(run: Duration) -> Self {
+        Self {
+            run,
+            prompt: Duration::from_secs(15),
+            quiet: Duration::from_millis(100),
+        }
+    }
 }
 
 /// Runs `command`, which puts a script on a terminal, and speaks the sudo
@@ -301,10 +324,15 @@ pub fn run_tty_with(
         prompt_deadline: None,
         answered_at: None,
     };
-    let status = session.drive(&mut child, &chunks);
-
-    let status = match status {
-        Ok(status) => status,
+    let mut timed_out = None;
+    let code = match session.drive(&mut child, &chunks) {
+        Ok(status) => status.code(),
+        // Killed at the run limit: the output so far is still returned, cleaned.
+        Err(TransportError::Timeout { after, .. }) => {
+            kill_and_reap(&mut child);
+            timed_out = Some(after);
+            None
+        }
         Err(err) => {
             kill_and_reap(&mut child);
             session.stdin = None;
@@ -337,13 +365,20 @@ pub fn run_tty_with(
     discard(&chunks);
     let stdout = clean_tty_output(&session.raw, session.nonce, password);
     session.raw.zeroize();
-    Ok(Output {
+    let output = Output {
         stdout,
         stderr: std::mem::take(&mut stderr.bytes),
-        code: status.code(),
+        code,
         truncated: session.cut || stderr.cut || abandoned,
         abandoned,
-    })
+    };
+    match timed_out {
+        Some(after) => Err(TransportError::Timeout {
+            after,
+            output: Some(Box::new(output)),
+        }),
+        None => Ok(output),
+    }
 }
 
 /// Zeroes the chunks still queued in `chunks`, which the run no longer keeps.
@@ -420,7 +455,10 @@ impl TtySession<'_> {
             }
             let now = Instant::now();
             if now >= run_deadline {
-                return Err(TransportError::Timeout(self.limits.run));
+                return Err(TransportError::Timeout {
+                    after: self.limits.run,
+                    output: None,
+                });
             }
             if self.prompt_deadline.is_some_and(|deadline| now >= deadline) {
                 return Err(TransportError::NoPrompt);
@@ -625,9 +663,20 @@ pub fn collect(child: Child, timeout: Option<Duration>) -> Result<Output, Transp
 /// abandoned, and whatever arrives later discarded. On an error the output
 /// read so far is zeroed before it is dropped.
 pub fn collect_capped(
+    child: Child,
+    timeout: Option<Duration>,
+    caps: [usize; 2],
+) -> Result<Output, TransportError> {
+    gather(child, timeout, caps, false)
+}
+
+/// [`collect_capped`]; with `keep_on_timeout` a timeout carries the output read
+/// so far instead of zeroing it.
+fn gather(
     mut child: Child,
     timeout: Option<Duration>,
     [stdout_cap, stderr_cap]: [usize; 2],
+    keep_on_timeout: bool,
 ) -> Result<Output, TransportError> {
     let (done, finished) = mpsc::channel();
     let streams = [
@@ -665,8 +714,21 @@ pub fn collect_capped(
     }
     let mut stdout = take_captured(streams[0].as_ref());
     let mut stderr = take_captured(streams[1].as_ref());
+    let truncated = stdout.cut || stderr.cut || abandoned;
     let status = match status {
         Ok(status) => status,
+        Err(TransportError::Timeout { after, .. }) if keep_on_timeout => {
+            return Err(TransportError::Timeout {
+                after,
+                output: Some(Box::new(Output {
+                    stdout: stdout.bytes,
+                    stderr: stderr.bytes,
+                    code: None,
+                    truncated,
+                    abandoned,
+                })),
+            });
+        }
         Err(err) => {
             stdout.bytes.zeroize();
             stderr.bytes.zeroize();
@@ -677,7 +739,7 @@ pub fn collect_capped(
         stdout: stdout.bytes,
         stderr: stderr.bytes,
         code: status.code(),
-        truncated: stdout.cut || stderr.cut || abandoned,
+        truncated,
         abandoned,
     })
 }
@@ -746,7 +808,10 @@ fn wait_with_timeout(
             Ok(Some(status)) => return Ok(status),
             Ok(None) if Instant::now() >= deadline => {
                 kill_and_reap(child);
-                return Err(TransportError::Timeout(timeout));
+                return Err(TransportError::Timeout {
+                    after: timeout,
+                    output: None,
+                });
             }
             Ok(None) => thread::sleep(Duration::from_millis(10)),
             Err(err) => return Err(TransportError::Spawn(err.to_string())),
@@ -782,7 +847,7 @@ mod tests {
 
     #[test]
     fn local_runs_the_script_and_returns_its_output() {
-        let out = Local.run("echo out; echo err >&2").unwrap();
+        let out = Local.run("echo out; echo err >&2", RUN_TIMEOUT).unwrap();
         assert_eq!(out.stdout, b"out\n");
         assert_eq!(out.stderr, b"err\n");
         assert_eq!(out.code, Some(0));
@@ -792,7 +857,7 @@ mod tests {
 
     #[test]
     fn output_over_the_cap_is_cut_and_flagged() {
-        let out = Local.run("yes | head -c 3000000").unwrap();
+        let out = Local.run("yes | head -c 3000000", RUN_TIMEOUT).unwrap();
         assert_eq!(out.stdout.len(), OUTPUT_CAP);
         assert!(out.truncated);
         assert!(!out.abandoned);
@@ -818,14 +883,19 @@ mod tests {
     #[test]
     fn stdin_is_closed_after_the_script() {
         let out = Local
-            .run("if read -r line; then echo \"got $line\"; else echo eof; fi")
+            .run(
+                "if read -r line; then echo \"got $line\"; else echo eof; fi",
+                RUN_TIMEOUT,
+            )
             .unwrap();
         assert_eq!(out.stdout, b"eof\n");
     }
 
     #[test]
     fn non_zero_exit_is_output_with_its_code() {
-        let out = Local.run("echo out; echo nope >&2; exit 3").unwrap();
+        let out = Local
+            .run("echo out; echo nope >&2; exit 3", RUN_TIMEOUT)
+            .unwrap();
         assert_eq!(out.code, Some(3));
         assert_eq!(out.stdout, b"out\n");
         assert_eq!(out.stderr, b"nope\n");
@@ -857,8 +927,51 @@ mod tests {
             Duration::from_millis(200),
         )
         .unwrap_err();
-        assert_eq!(err, TransportError::Timeout(Duration::from_millis(200)));
+        assert!(
+            matches!(err, TransportError::Timeout { after, .. } if after == Duration::from_millis(200)),
+            "{err:?}"
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_timed_out_script_keeps_what_it_printed() {
+        let err = run_with_script(
+            Command::new("/bin/sh").arg("-s"),
+            "echo start; echo warn >&2; sleep 30; echo end",
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        let TransportError::Timeout {
+            output: Some(output),
+            ..
+        } = err
+        else {
+            panic!("{err:?}");
+        };
+        assert_eq!(output.stdout, b"start\n");
+        assert_eq!(output.stderr, b"warn\n");
+        assert_eq!(output.code, None);
+        assert!(!output.truncated);
+    }
+
+    #[test]
+    fn collect_capped_keeps_nothing_on_a_timeout() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "echo secret; sleep 30"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let err = collect_capped(child, Some(Duration::from_millis(300)), [64, 64]).unwrap_err();
+        assert_eq!(
+            err,
+            TransportError::Timeout {
+                after: Duration::from_millis(300),
+                output: None
+            }
+        );
     }
 
     /// A background process that leaves the script's process group (so the
@@ -904,14 +1017,17 @@ mod tests {
             Duration::from_millis(200),
         )
         .unwrap_err();
-        assert_eq!(err, TransportError::Timeout(Duration::from_millis(200)));
+        assert!(
+            matches!(err, TransportError::Timeout { after, .. } if after == Duration::from_millis(200)),
+            "{err:?}"
+        );
         assert_eq!(err.to_string(), "timed out after 200 ms");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
     fn probe_runs_locally_on_this_mac() {
-        let out = Local.run(PROBE).unwrap();
+        let out = Local.run(PROBE, RUN_TIMEOUT).unwrap();
         let facts = Facts::parse(&out.stdout).unwrap();
         let uname = if cfg!(target_os = "macos") {
             "Darwin"
@@ -935,7 +1051,11 @@ mod tests {
     #[test]
     fn error_messages_are_readable() {
         assert_eq!(
-            TransportError::Timeout(RUN_TIMEOUT).to_string(),
+            TransportError::Timeout {
+                after: RUN_TIMEOUT,
+                output: None
+            }
+            .to_string(),
             "timed out after 30 s"
         );
         assert_eq!(
@@ -1004,7 +1124,11 @@ mod tests {
     #[test]
     fn local_run_tty_uses_the_default_limits() {
         let out = Local
-            .run_tty(&wrapped("fake_sudo && echo anvil-sudo-ok"), PASSWORD)
+            .run_tty(
+                &wrapped("fake_sudo && echo anvil-sudo-ok"),
+                PASSWORD,
+                RUN_TIMEOUT,
+            )
             .unwrap();
         assert_eq!(text(&out), "got:14\n");
         assert_eq!(out.code, Some(0));
@@ -1099,7 +1223,10 @@ mod tests {
             limits,
         )
         .unwrap_err();
-        assert_eq!(err, TransportError::Timeout(Duration::from_millis(500)));
+        assert!(
+            matches!(err, TransportError::Timeout { after, .. } if after == Duration::from_millis(500)),
+            "{err:?}"
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
         let pids: Vec<i32> = std::fs::read_to_string(&pid_file)
             .unwrap()
@@ -1115,6 +1242,31 @@ mod tests {
             assert!(!alive(pid), "pid {pid} survived the timeout");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_tty_timeout_keeps_the_cleaned_output() {
+        let limits = TtyLimits {
+            run: Duration::from_millis(1500),
+            ..fast()
+        };
+        let err = tty(
+            "fake_sudo && echo anvil-sudo-ok && echo start; sleep 30",
+            limits,
+        )
+        .unwrap_err();
+        let TransportError::Timeout {
+            output: Some(output),
+            ..
+        } = err
+        else {
+            panic!("{err:?}");
+        };
+        let shown = text(&output);
+        assert_eq!(shown, "got:14\nstart\n");
+        assert!(!shown.contains("anvil-sudo-") && !shown.contains(TTY_READY));
+        assert!(!shown.contains("hunter2"));
+        assert_eq!(output.code, None);
     }
 
     #[test]

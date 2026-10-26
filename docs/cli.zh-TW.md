@@ -176,6 +176,7 @@ anvil 會在 sudo 的提示處輸入密碼（[輸入 sudo 密碼](packages.zh-TW
 - step 的 stderr 行送到 stderr，以相同方式縮排，讓它們在終端機上就地交錯；
   當 stderr 不是終端機時，每行前面加上 `TARGET:`（上例的 `local: warn`）。
 - 區塊以 `✔ ok · N steps` 結尾，失敗的 step 則為 `✘ step K exited C`，傳輸錯誤則為 `✘ ERROR`（排在錯誤發生前已完成的 step 之後）。
+  逾時的 step 仍會顯示其 `$` 行與被終止前印出的輸出，接著是 `✘ timed out after 30 s`（套件 step 則在其 `[packages].timeout` 之後）。
 - 顏色（粗體青色標頭、暗色指令、黃色 stderr、綠色 `✔`、紅色 `✘` 與失敗計數）只在該串流是終端機，
   且 `NO_COLOR` 未設定或為空時使用。
 - host 送來的控制字元（例如跳脫序列）在 stderr 與 `✘` 行中一律顯示為可見的 `\x1b` 式跳脫，
@@ -205,7 +206,7 @@ anvil 會在 sudo 的提示處輸入密碼（[輸入 sudo 密碼](packages.zh-TW
 
 target 要嘛執行了它的 step（`steps` 與 `ok`；失敗的 step 會顯示其 `code`，且 `ok` 為 false），
 要嘛在傳輸中失敗（`error`、`ok: false`，只有在錯誤前已完成某些 step 時才有 `steps`）。
-step 被訊號終止時 `code` 為 `null`。
+step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 的最後一項，與 `error` 並列。
 
 ### `anvil secret NAME`
 
@@ -316,7 +317,8 @@ anvil 以 argv 陣列執行系統的 `ssh`，絕不使用 shell 字串，因此 
 - **絕不自動接受 host key。**
   未知或已變更的 host key 會讓 target 以 ``host key unknown or changed; run `ssh <host>` once to verify the fingerprint`` 失敗。
 - **帶 sudo 密碼的套件 step** 改以 `-tt` 用戶端執行；見 [輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)。
-- **腳本**以 master 的用戶端執行（`-o ControlMaster=no -o BatchMode=yes ... sh -s`），腳本經 stdin 傳入，逾時 30 秒；
+- **腳本**以 master 的用戶端執行（`-o ControlMaster=no -o BatchMode=yes ... sh -s`），腳本經 stdin 傳入，
+  逾時 30 秒（套件 step 有自己的 `[packages].timeout`）；
   用戶端絕不提示。每個串流最多保留 1 MiB。
   離開腳本的行程群組並持續開著其輸出的背景行程，在腳本結束後有 1 秒時間；之後 anvil 停止讀取並回報已取得的內容。
 - **控制目錄** `~/.ssh/anvil`：以 mode 0700 建立（缺少 `~/.ssh` 時也以 0700 建立）；

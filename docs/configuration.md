@@ -40,6 +40,7 @@ local = "brew"             # optional; the choice for `local`, which has no inve
 install = ["git", "curl"]  # default []
 upgrade = false            # upgrade every installed package first; default false
 local_sudo_secret = "LOCAL_SUDO" # optional; the secret holding this machine's sudo password
+timeout = 300              # seconds the package step may run, 1..=3600; default 300
 
 [[steps]]
 run = "hostname"           # placeholder: a POSIX sh script run on every target
@@ -126,6 +127,7 @@ local = "brew"             # optional; the choice for the local target; default:
 install = ["git", "curl"]  # names to install; default []
 upgrade = false            # upgrade every installed package first; default false
 local_sudo_secret = "LOCAL_SUDO" # optional: [A-Z][A-Z0-9_]*, the local target's sudo password secret
+timeout = 300              # seconds the package step may run, 1..=3600; default 300
 
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
@@ -144,8 +146,8 @@ entry must match `[A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*` (so none starts with `-` or
 most 256 entries. A violation is exit 2: ``packages.install[1] `-rf`: must match [A-Za-z0-9@+_][A-Za-z0-9@+._/:-]*``,
 ``packages.install[I] `NAME`: N bytes exceeds the 128 byte limit`` or
 `packages.install: N entries exceeds the 256 entry limit`. `local_sudo_secret` must be a secret name, else exit 2 with
-``packages.local_sudo_secret `VALUE`: must match [A-Z][A-Z0-9_]*``. How the manager is chosen and what runs is
-in [Packages](packages.md).
+``packages.local_sudo_secret `VALUE`: must match [A-Z][A-Z0-9_]*``. `timeout` must be 1..=3600, else exit 2 with
+``packages.timeout `N`: must be 1..=3600``. How the manager is chosen and what runs is in [Packages](packages.md).
 
 The required names moved from `[anvil].secrets` to `[secrets].names`. A config with the legacy key is still read as
 before (setting both is exit 2). The next `anvil config` save writes it as `[secrets].names` and drops
