@@ -14,10 +14,33 @@ sops file. The full command reference is in [cli.md](cli.md).
 Requires Rust 1.89 or newer and the OpenSSH client (`ssh` on `PATH`).
 
 ```sh
+make install               # installs `anvil` into ~/.local/bin (PREFIX= to change)
+# or
 cargo install --path .     # installs `anvil` into ~/.cargo/bin
 # or
 make build                 # builds target/release/anvil
 ```
+
+`make install` installs into `~/.local/bin`; set `PREFIX` or `BINDIR` to change that, e.g.
+`make install PREFIX=/usr/local`, and pass the same to `make uninstall` to remove it. It prints the installed version
+and warns when the `anvil` found on `PATH` is not the one just installed (for example when `BINDIR` is not on `PATH`).
+
+### Pre-built binaries
+
+The [Releases](https://github.com/mini-poc/anvil/releases) page has an `anvil-<version>-<target>.tar.gz` archive and a
+`.sha256` file for each `<target>`: `aarch64-apple-darwin`, `x86_64-apple-darwin` and `x86_64-unknown-linux-musl`.
+Download both, check the archive, unpack it and put the binary on `PATH`:
+
+```sh
+shasum -a 256 -c anvil-<version>-<target>.tar.gz.sha256   # macOS
+sha256sum -c anvil-<version>-<target>.tar.gz.sha256       # Linux
+tar -xzf anvil-<version>-<target>.tar.gz                  # unpacks anvil-<version>-<target>/anvil
+install -d ~/.local/bin
+install -m 0755 anvil-<version>-<target>/anvil ~/.local/bin/
+```
+
+On macOS the binary is not signed. Download it with `curl`, which sets no quarantine flag; if a browser downloaded it,
+clear the flag with `xattr -d com.apple.quarantine anvil-<version>-<target>/anvil` before installing it.
 
 ## Quick start
 

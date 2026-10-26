@@ -25,10 +25,14 @@ system OpenSSH client.
 Requires Rust 1.89 or newer and the OpenSSH client (`ssh` on `PATH`).
 
 ```sh
+make install               # installs `anvil` into ~/.local/bin (PREFIX= to change)
+# or
 cargo install --path .     # installs `anvil` into ~/.cargo/bin
 # or
 make build                 # builds target/release/anvil
 ```
+
+Pre-built binaries: see [Getting started](docs/getting-started.md#pre-built-binaries).
 
 ## Quick start
 
