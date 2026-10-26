@@ -1776,11 +1776,13 @@ mod tests {
                         steps: vec![
                             PlannedRun {
                                 run: "pacman -S git".to_owned(),
+                                label: None,
                                 sudo_secret: Some("LOCAL_SUDO".to_owned()),
                                 timeout: RUN_TIMEOUT,
                             },
                             PlannedRun {
                                 run: "hostname".to_owned(),
+                                label: None,
                                 sudo_secret: None,
                                 timeout: RUN_TIMEOUT,
                             },

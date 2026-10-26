@@ -33,7 +33,7 @@ use crate::transport::{
 use zeroize::Zeroizing;
 
 /// Sudo passwords by secret name; a name that is not set is absent.
-type Passwords = BTreeMap<String, Zeroizing<Vec<u8>>>;
+pub(crate) type Passwords = BTreeMap<String, Zeroizing<Vec<u8>>>;
 
 /// The value of secret `name` to type at sudo's prompt: set, and free of
 /// control characters.
@@ -52,6 +52,10 @@ fn sudo_password<'a>(passwords: &'a Passwords, name: &str) -> Result<&'a [u8], S
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PlannedRun {
     pub run: String,
+    /// What the step's report shows instead of `run`, when what is sent
+    /// differs from what the user wrote.
+    #[serde(skip)]
+    pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sudo_secret: Option<String>,
     #[serde(skip)]
@@ -270,13 +274,26 @@ fn apply_targets(
     cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Report {
+    for_each_target(targets, cancel, on, |target| {
+        apply_target(target, transport(target), config, passwords, cancel)
+    })
+}
+
+/// Runs `one` on each of `targets` in order, reporting each as it starts
+/// and ends. Once `cancel` is set, every later target is Cancelled.
+pub(crate) fn for_each_target(
+    targets: &[Target],
+    cancel: &AtomicBool,
+    on: &mut dyn FnMut(Progress<'_>),
+    mut one: impl FnMut(&Target) -> TargetReport,
+) -> Report {
     let mut reports = Vec::with_capacity(targets.len());
     for target in targets {
         on(Progress::Start(target));
         let report = if cancel.load(Ordering::Relaxed) {
             cancelled(target, Vec::new())
         } else {
-            apply_target(target, transport(target), config, passwords, cancel)
+            one(target)
         };
         on(Progress::Done(&report));
         reports.push(report);
@@ -291,10 +308,20 @@ fn apply_targets(
 /// `anvil apply`: prints each target's block as it ends (or one JSON
 /// document), then the summary.
 pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
-    let style = Style::detect();
     let cancel = AtomicBool::new(false);
     let config = opts.load_config()?;
-    let report = run_targets(opts, &config, &cancel, &mut |progress| {
+    print_report(cli, "apply", |on| run_targets(opts, &config, &cancel, on))
+}
+
+/// Prints each target's block as `targets` reports it ends (or one JSON
+/// document), then the summary; any failed target fails `command`.
+pub(crate) fn print_report(
+    cli: &Cli,
+    command: &str,
+    targets: impl FnOnce(&mut dyn FnMut(Progress<'_>)) -> Result<Report, Failure>,
+) -> Result<(), Failure> {
+    let style = Style::detect();
+    let report = targets(&mut |progress| {
         if let Progress::Done(report) = progress
             && !cli.json
         {
@@ -314,13 +341,13 @@ pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
         Ok(())
     } else {
         Err(Failure::failed(format!(
-            "apply: {failed} of {} targets failed",
+            "{command}: {failed} of {} targets failed",
             report.targets.len()
         )))
     }
 }
 
-fn cancelled(target: &Target, steps: Vec<StepReport>) -> TargetReport {
+pub(crate) fn cancelled(target: &Target, steps: Vec<StepReport>) -> TargetReport {
     log::info!("apply {}: cancelled", target.name);
     TargetReport::Cancelled {
         target: target.name.clone(),
@@ -339,18 +366,9 @@ fn apply_target(
     cancel: &AtomicBool,
 ) -> TargetReport {
     log::info!("apply {}: start", target.name);
-    let failed = |steps: Vec<StepReport>, error: String| {
-        log::info!("apply {}: failed: {error}", target.name);
-        TargetReport::Failed {
-            target: target.name.clone(),
-            steps,
-            error,
-            ok: false,
-        }
-    };
     let transport = match transport {
         Ok(transport) => transport,
-        Err(err) => return failed(Vec::new(), err.to_string()),
+        Err(err) => return failed(target, Vec::new(), err.to_string()),
     };
     log::info!("apply {}: over {}", target.name, transport.name());
     let facts = if package_work(config).is_some() {
@@ -359,18 +377,41 @@ fn apply_target(
         }
         match probe(transport.as_ref()) {
             Ok(facts) => Some(facts),
-            Err(error) => return failed(Vec::new(), error),
+            Err(error) => return failed(target, Vec::new(), error),
         }
     } else {
         None
     };
-    let runs = match resolve(target, facts.as_ref(), config) {
-        Ok(runs) => runs,
-        Err(error) => return failed(Vec::new(), error),
-    };
+    match resolve(target, facts.as_ref(), config) {
+        Ok(runs) => execute(target, transport.as_ref(), &runs, passwords, cancel),
+        Err(error) => failed(target, Vec::new(), error),
+    }
+}
+
+/// `target` ended by a transport error, after `steps`.
+pub(crate) fn failed(target: &Target, steps: Vec<StepReport>, error: String) -> TargetReport {
+    log::info!("apply {}: failed: {error}", target.name);
+    TargetReport::Failed {
+        target: target.name.clone(),
+        steps,
+        error,
+        ok: false,
+    }
+}
+
+/// Runs `runs` over `transport` in order, stopping at the first that fails;
+/// `cancel` is checked before each, and `passwords` holds the sudo
+/// passwords to type.
+pub(crate) fn execute(
+    target: &Target,
+    transport: &dyn Transport,
+    runs: &[PlannedRun],
+    passwords: &Passwords,
+    cancel: &AtomicBool,
+) -> TargetReport {
     let mut reports = Vec::with_capacity(runs.len());
     let mut ok = true;
-    for planned in &runs {
+    for planned in runs {
         if cancel.load(Ordering::Relaxed) {
             return cancelled(target, reports);
         }
@@ -378,10 +419,11 @@ fn apply_target(
             None => None,
             Some(name) => match sudo_password(passwords, name) {
                 Ok(password) => Some((name, password)),
-                Err(error) => return failed(reports, error),
+                Err(error) => return failed(target, reports, error),
             },
         };
         let (run, timeout) = (planned.run.as_str(), planned.timeout);
+        let label = planned.label.as_deref().unwrap_or(run);
         let output = match password {
             None => transport.run(run, timeout),
             Some((_, password)) => {
@@ -398,16 +440,16 @@ fn apply_target(
                     ..
                 } = err
                 {
-                    reports.push(StepReport::from_output(run, *output));
+                    reports.push(StepReport::from_output(label, *output));
                 }
-                return failed(reports, error);
+                return failed(target, reports, error);
             }
         };
         let succeeded = output.code == Some(0);
         if succeeded && output.truncated {
             log::warn!("apply {}: step output cut at 1 MiB", target.name);
         }
-        reports.push(StepReport::from_output(run, output));
+        reports.push(StepReport::from_output(label, output));
         if !succeeded {
             ok = false;
             break;
@@ -488,6 +530,7 @@ pub fn resolve(
             }
             runs.push(PlannedRun {
                 run,
+                label: None,
                 sudo_secret: sudo_secret.map(str::to_owned),
                 timeout: packages.timeout(),
             });
@@ -495,6 +538,7 @@ pub fn resolve(
     }
     runs.extend(config.steps.iter().map(|step| PlannedRun {
         run: step.run.clone(),
+        label: None,
         sudo_secret: None,
         timeout: RUN_TIMEOUT,
     }));
@@ -1892,6 +1936,7 @@ mod tests {
     fn planned(run: &str, sudo_secret: Option<&str>, timeout: Duration) -> PlannedRun {
         PlannedRun {
             run: run.to_owned(),
+            label: None,
             sudo_secret: sudo_secret.map(str::to_owned),
             timeout,
         }

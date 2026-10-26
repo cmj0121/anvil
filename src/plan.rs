@@ -380,16 +380,19 @@ mod tests {
             steps: vec![
                 PlannedRun {
                     run: one_liner.to_owned(),
+                    label: None,
                     sudo_secret: Some("LOCAL_SUDO".to_owned()),
                     timeout: git().timeout(),
                 },
                 PlannedRun {
                     run: "one".to_owned(),
+                    label: None,
                     sudo_secret: None,
                     timeout: RUN_TIMEOUT,
                 },
                 PlannedRun {
                     run: "two".to_owned(),
+                    label: None,
                     sudo_secret: None,
                     timeout: RUN_TIMEOUT,
                 },
