@@ -11,8 +11,8 @@ use std::sync::mpsc::Sender;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::Config;
-use crate::document::Format;
-use crate::inventory::{Inventory, LOCAL, Sel, UnknownSel};
+use crate::document::{Format, MAX_BYTES};
+use crate::inventory::{Inventory, LOCAL, Sel, Target, UnknownSel};
 use crate::options::Options;
 use crate::secret::{self, BackendKind};
 use crate::{apply, doctor, plan};
@@ -34,12 +34,17 @@ pub const INTERRUPTED: &str = "interrupted at a prompt";
 /// The options overlay's fields, in order: the flag each one stands for.
 pub const OPTION_FLAGS: [&str; 3] = ["--inventory", "--config", "--ssh-config"];
 
+/// The target names `x`'s confirmation lists before it cuts the rest to `…`.
+pub const CONFIRM_NAMES: usize = 5;
+
 pub struct App {
     pub opts: Options,
     pub targets: Vec<TargetRow>,
     pub tags: Vec<TagRow>,
     /// Shown in the targets overlay instead of the rows, and in the header.
     pub inventory_error: Option<String>,
+    /// The inventory the rows were built from; `None` with `inventory_error`.
+    inventory: Option<Inventory>,
     /// The config's steps as of the last reload.
     pub steps: Vec<StepRow>,
     /// Shown instead of the steps.
@@ -69,6 +74,8 @@ pub struct App {
     pub notice: Option<String>,
     /// Set by `q`; while a run is going, the loop ends only once it ends.
     pub quit: bool,
+    /// `x`'s script as last edited, for this session only; empty at first.
+    pub last_script: String,
 }
 
 pub struct TargetRow {
@@ -109,6 +116,8 @@ pub enum RunKind {
     Doctor,
     Apply,
     Plan,
+    /// `x`: the session's last script.
+    Run,
 }
 
 impl RunKind {
@@ -117,6 +126,28 @@ impl RunKind {
             RunKind::Doctor => "doctor",
             RunKind::Apply => "apply",
             RunKind::Plan => "plan",
+            RunKind::Run => "run",
+        }
+    }
+}
+
+/// What a worker runs: a [`RunKind`] and what it needs, which for a run is
+/// its script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Job {
+    Doctor,
+    Apply,
+    Plan,
+    Run(String),
+}
+
+impl Job {
+    pub fn kind(&self) -> RunKind {
+        match self {
+            Job::Doctor => RunKind::Doctor,
+            Job::Apply => RunKind::Apply,
+            Job::Plan => RunKind::Plan,
+            Job::Run(_) => RunKind::Run,
         }
     }
 }
@@ -149,8 +180,12 @@ pub enum RunResult {
         error: Option<String>,
     },
     /// `ok` is `None` while running. `steps` are those of the config the
-    /// worker loaded for this run; empty until it has.
+    /// worker loaded for this run, or a run's one script; empty until the
+    /// worker sends them.
     Apply {
+        /// [`RunKind::Apply`] for `a` on the config's steps, [`RunKind::Run`]
+        /// for `x` on a script.
+        kind: RunKind,
         steps: Vec<StepRow>,
         targets: Vec<apply::TargetReport>,
         ok: Option<bool>,
@@ -229,10 +264,15 @@ pub enum Overlay {
     Targets {
         cursor: usize,
     },
+    /// `x`'s question before it runs the last script on `targets`.
+    Confirm {
+        targets: Vec<String>,
+    },
 }
 
 pub enum Msg {
-    /// The steps of the config an apply run loaded, before its first target.
+    /// The steps of the config an apply run loaded, or a run's one script,
+    /// before its first target.
     Steps(Vec<StepRow>),
     Start(String),
     DoctorDone(doctor::Report),
@@ -250,9 +290,12 @@ pub enum Msg {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    Spawn(RunKind),
+    Spawn(Job),
     /// Run an editor flow on the main thread, with the real terminal.
     Edit(EditKind),
+    /// Edit the last script on the main thread, with the real terminal:
+    /// [`App::script_edited`].
+    EditScript,
     /// Load the inventory and the config again: [`App::reload`].
     Reload,
     Redraw,
@@ -284,8 +327,13 @@ pub fn step_rows(config: &Config) -> Vec<StepRow> {
 
 /// Refuses a `--target` that names no target or tag, as the CLI does.
 pub fn check_targets(inventory: &Inventory, target: &[String]) -> Result<(), UnknownSel> {
+    select(inventory, target).map(drop)
+}
+
+/// The targets `target` selects from `inventory`, as the CLI picks them.
+fn select(inventory: &Inventory, target: &[String]) -> Result<Vec<Target>, UnknownSel> {
     let sels: Vec<Sel> = target.iter().map(|sel| Sel::parse(sel)).collect();
-    inventory.select(&sels).map(drop)
+    inventory.select(&sels)
 }
 
 impl App {
@@ -297,12 +345,12 @@ impl App {
         inventory: Result<Inventory, String>,
         steps: Result<Vec<StepRow>, String>,
     ) -> App {
-        let (targets, tags, inventory_error) = match inventory {
+        let (targets, tags, inventory, inventory_error) = match inventory {
             Ok(inventory) => {
                 let (targets, tags) = rows(&inventory, &opts.target);
-                (targets, tags, None)
+                (targets, tags, Some(inventory), None)
             }
-            Err(err) => (Vec::new(), Vec::new(), Some(err)),
+            Err(err) => (Vec::new(), Vec::new(), None, Some(err)),
         };
         let notice = inventory_error.clone();
         let mut app = App {
@@ -310,6 +358,7 @@ impl App {
             targets,
             tags,
             inventory_error,
+            inventory,
             steps: Vec::new(),
             config_error: None,
             focus: Pane::Steps,
@@ -326,6 +375,7 @@ impl App {
             edit_format: None,
             notice,
             quit: false,
+            last_script: String::new(),
         };
         app.set_steps(steps);
         app
@@ -353,14 +403,15 @@ impl App {
             return self.on_overlay_key(overlay, key);
         }
         match key.code {
-            KeyCode::Char('d') => return self.start(RunKind::Doctor),
-            KeyCode::Char('a') => return self.start(RunKind::Apply),
-            KeyCode::Char('p') => return self.start(RunKind::Plan),
-            KeyCode::Char('i' | 'c' | 's' | 'm' | 'o') if self.running.is_some() => {
+            KeyCode::Char('d') => return self.start(Job::Doctor),
+            KeyCode::Char('a') => return self.start(Job::Apply),
+            KeyCode::Char('p') => return self.start(Job::Plan),
+            KeyCode::Char('i' | 'c' | 's' | 'm' | 'o' | 'x') if self.running.is_some() => {
                 self.notice = self.busy();
             }
             KeyCode::Char('i') => return vec![Effect::Edit(EditKind::Inventory), Effect::Redraw],
             KeyCode::Char('c') => return vec![Effect::Edit(EditKind::Config), Effect::Redraw],
+            KeyCode::Char('x') => return vec![Effect::EditScript, Effect::Redraw],
             KeyCode::Char('s') => {
                 self.overlay = Some(Overlay::Input {
                     text: String::new(),
@@ -420,13 +471,18 @@ impl App {
 
     /// A key under `overlay`, which was taken out of `self.overlay`: it is
     /// put back unless the key closes it. Esc closes any overlay; Enter
-    /// confirms the Input, Migrate and Options overlays, and closes Targets
-    /// as `t` does: its selection changes as Space is pressed.
+    /// confirms the Input, Migrate, Options and Confirm overlays, and closes
+    /// Targets as `t` does: its selection changes as Space is pressed.
     fn on_overlay_key(&mut self, mut overlay: Overlay, key: KeyEvent) -> Vec<Effect> {
         let mut effects = vec![Effect::Redraw];
         let keep = match (&mut overlay, key.code) {
-            (_, KeyCode::Esc) | (Overlay::Help, KeyCode::Char('?')) => false,
-            (Overlay::Help, _) => {
+            (_, KeyCode::Esc)
+            | (Overlay::Help, KeyCode::Char('?'))
+            | (Overlay::Confirm { .. }, KeyCode::Char('n')) => false,
+            (Overlay::Confirm { .. }, KeyCode::Enter | KeyCode::Char('y')) => {
+                return self.start(Job::Run(self.last_script.clone()));
+            }
+            (Overlay::Help | Overlay::Confirm { .. }, _) => {
                 self.overlay = Some(overlay);
                 return Vec::new();
             }
@@ -514,6 +570,52 @@ impl App {
         self.show(Some(self.results.len() - 1));
     }
 
+    /// `x`'s editor returned: `None` keeps the last script, an edit replaces
+    /// it unless refused as `anvil run` would (over 1 MiB, not UTF-8). A
+    /// blank script runs nothing; otherwise the Confirm overlay asks first.
+    /// Every refusal, and the editor's own error, is the notice.
+    pub fn script_edited(&mut self, edited: Result<Option<Vec<u8>>, String>) {
+        match edited {
+            Err(err) => {
+                self.notice = Some(err);
+                return;
+            }
+            // The read-back stops one byte past the limit.
+            Ok(Some(bytes)) if bytes.len() as u64 > MAX_BYTES => {
+                self.notice = Some("run: the script is over the 1 MiB limit".to_owned());
+                return;
+            }
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(script) => self.last_script = script,
+                Err(_) => {
+                    self.notice = Some("run: the script is not UTF-8".to_owned());
+                    return;
+                }
+            },
+            Ok(None) => {}
+        }
+        if self.last_script.trim().is_empty() {
+            self.notice = Some("run: nothing to run".to_owned());
+            return;
+        }
+        match self.chosen_targets() {
+            Ok(targets) => self.overlay = Some(Overlay::Confirm { targets }),
+            Err(err) => self.notice = Some(err),
+        }
+    }
+
+    /// The names of the targets a run goes to: [`Inventory::select`] on
+    /// `opts.target`, as the worker's `opts.targets()` picks them; else the
+    /// inventory's error.
+    fn chosen_targets(&self) -> Result<Vec<String>, String> {
+        let Some(inventory) = &self.inventory else {
+            return Err(self.inventory_error.clone().unwrap_or_default());
+        };
+        let targets = select(inventory, &self.opts.target)
+            .map_err(|err| crate::cli::Failure::from(err).message)?;
+        Ok(targets.into_iter().map(|target| target.name).collect())
+    }
+
     /// Loads the inventory `opts` names again ([`App::set_inventory`]), and
     /// the config's steps.
     pub fn reload(&mut self) {
@@ -543,6 +645,7 @@ impl App {
                 let (targets, tags) = rows(&inventory, &self.opts.target);
                 self.targets = targets;
                 self.tags = tags;
+                self.inventory = Some(inventory);
                 self.inventory_error = None;
                 let before = std::mem::take(&mut self.opts.target);
                 self.sync_target();
@@ -561,6 +664,7 @@ impl App {
             Err(err) => {
                 self.targets.clear();
                 self.tags.clear();
+                self.inventory = None;
                 self.notice = Some(err.clone());
                 self.inventory_error = Some(err);
             }
@@ -644,11 +748,12 @@ impl App {
     }
 
     /// Starts a run as a new, shown result, unless one is going already.
-    fn start(&mut self, kind: RunKind) -> Vec<Effect> {
+    fn start(&mut self, job: Job) -> Vec<Effect> {
         if self.running.is_some() {
             self.notice = self.busy();
             return vec![Effect::Redraw];
         }
+        let kind = job.kind();
         self.running = Some(Running {
             kind,
             current: None,
@@ -662,7 +767,8 @@ impl App {
                 ok: None,
                 error: None,
             },
-            RunKind::Apply => RunResult::Apply {
+            RunKind::Apply | RunKind::Run => RunResult::Apply {
+                kind,
                 steps: Vec::new(),
                 targets: Vec::new(),
                 ok: None,
@@ -675,7 +781,7 @@ impl App {
             },
         });
         self.show(Some(self.results.len() - 1));
-        vec![Effect::Spawn(kind), Effect::Redraw]
+        vec![Effect::Spawn(job), Effect::Redraw]
     }
 
     /// Why a key is refused while a run is going.
@@ -687,15 +793,17 @@ impl App {
         ))
     }
 
-    /// Sets the cancel flag: apply stops before its next target or step,
-    /// plan before its next target, doctor runs to the end (D3).
+    /// Sets the cancel flag: apply and run stop before their next target or
+    /// step, plan before its next target, doctor runs to the end (D3).
     fn cancel(&mut self) {
         let Some(running) = &self.running else {
             return;
         };
         running.cancel.store(true, Ordering::Relaxed);
         self.notice = Some(match running.kind {
-            RunKind::Apply => "cancelling: the running step finishes first".to_owned(),
+            RunKind::Apply | RunKind::Run => {
+                "cancelling: the running step finishes first".to_owned()
+            }
             RunKind::Plan => "cancelling: the running target finishes first".to_owned(),
             RunKind::Doctor => "doctor cannot be cancelled; it ends with its probes".to_owned(),
         });
@@ -917,6 +1025,24 @@ impl App {
         let tags = self.tags.iter().filter(|r| r.selected).map(|r| &r.name);
         self.opts.target = targets.chain(tags).cloned().collect();
     }
+}
+
+/// `run on N targets: a, b, c?`, the names after [`CONFIRM_NAMES`] cut to `…`.
+pub fn confirm_prompt(names: &[String]) -> String {
+    let noun = if names.len() == 1 {
+        "target"
+    } else {
+        "targets"
+    };
+    let mut shown: Vec<&str> = names
+        .iter()
+        .take(CONFIRM_NAMES)
+        .map(String::as_str)
+        .collect();
+    if names.len() > CONFIRM_NAMES {
+        shown.push("…");
+    }
+    format!("run on {} {noun}: {}?", names.len(), shown.join(", "))
 }
 
 /// An options-overlay path: empty is the default (`None`); a leading `~/`
@@ -1366,7 +1492,7 @@ pub mod tests {
         app.scroll = 4;
         assert_eq!(
             app.on_key(key(KeyCode::Char('a'))),
-            [Effect::Spawn(RunKind::Apply), Effect::Redraw]
+            [Effect::Spawn(Job::Apply), Effect::Redraw]
         );
         let running = app.running.as_ref().unwrap();
         assert_eq!(
@@ -1413,7 +1539,7 @@ pub mod tests {
         let mut app = app();
         assert_eq!(
             app.on_key(key(KeyCode::Char('p'))),
-            [Effect::Spawn(RunKind::Plan), Effect::Redraw]
+            [Effect::Spawn(Job::Plan), Effect::Redraw]
         );
         assert!(matches!(
             app.shown_result(),
@@ -1511,7 +1637,7 @@ pub mod tests {
     fn a_second_run_and_the_editor_keys_are_refused_while_running() {
         let mut app = app();
         press(&mut app, &[KeyCode::Char('d')]);
-        for c in ['d', 'a', 'i', 'c', 's', 'm', 'o'] {
+        for c in ['d', 'a', 'i', 'c', 's', 'm', 'o', 'x'] {
             assert_eq!(app.on_key(key(KeyCode::Char(c))), [Effect::Redraw], "{c}");
             assert_eq!(
                 app.notice.as_deref(),
@@ -1520,13 +1646,232 @@ pub mod tests {
         }
         assert_eq!(app.results.len(), 1);
         // The notice goes with the next key.
-        assert_eq!(app.on_key(key(KeyCode::Char('x'))), [Effect::Redraw]);
+        assert_eq!(app.on_key(key(KeyCode::Char('z'))), [Effect::Redraw]);
         assert_eq!(app.notice, None);
         app.on_msg(Msg::Finished(Ok(())));
         assert_eq!(
             app.on_key(key(KeyCode::Char('a'))),
-            [Effect::Spawn(RunKind::Apply), Effect::Redraw]
+            [Effect::Spawn(Job::Apply), Effect::Redraw]
         );
+    }
+
+    /// `x` then the editor returning `edited`, as the main loop does.
+    fn edit_script(app: &mut App, edited: Result<Option<&str>, &str>) -> Vec<Effect> {
+        let effects = app.on_key(key(KeyCode::Char('x')));
+        app.script_edited(
+            edited
+                .map(|text| text.map(|t| t.as_bytes().to_vec()))
+                .map_err(str::to_owned),
+        );
+        effects
+    }
+
+    fn confirming(app: &App) -> Option<&[String]> {
+        match &app.overlay {
+            Some(Overlay::Confirm { targets }) => Some(targets),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn x_edits_the_script_then_confirms_on_every_target_with_none_selected() {
+        let mut app = app();
+        assert_eq!(
+            edit_script(&mut app, Ok(Some("uptime\n"))),
+            [Effect::EditScript, Effect::Redraw]
+        );
+        assert_eq!(app.last_script, "uptime\n");
+        assert_eq!(
+            confirming(&app),
+            Some(&["local", "mac", "pi"].map(String::from)[..])
+        );
+        assert_eq!(
+            confirm_prompt(&["local", "mac", "pi"].map(String::from)),
+            "run on 3 targets: local, mac, pi?"
+        );
+        assert!(app.results.is_empty() && app.running.is_none());
+    }
+
+    #[test]
+    fn the_confirmation_names_the_selection_and_cuts_a_long_list() {
+        let mut app = app();
+        // `home` tags pi; local is picked by name.
+        press(
+            &mut app,
+            &[KeyCode::Char('t'), KeyCode::Char(' '), KeyCode::Down],
+        );
+        press(&mut app, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+        press(&mut app, &[KeyCode::Char(' '), KeyCode::Enter]);
+        assert_eq!(app.opts.target, ["local", "home"]);
+        edit_script(&mut app, Ok(Some("true")));
+        assert_eq!(
+            confirming(&app),
+            Some(&["local", "pi"].map(String::from)[..])
+        );
+        assert_eq!(confirm_prompt(&["pi".to_owned()]), "run on 1 target: pi?");
+        let many: Vec<String> = (1..=7).map(|i| format!("h{i}")).collect();
+        assert_eq!(
+            confirm_prompt(&many),
+            "run on 7 targets: h1, h2, h3, h4, h5, …?"
+        );
+    }
+
+    #[test]
+    fn the_confirmed_targets_are_those_the_inventory_selects() {
+        let names = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        for (selection, want) in [
+            (&[][..], &["local", "mac", "pi"][..]),
+            (&["local"], &["local"]),
+            (&["mac"], &["mac"]),
+            (&["home"], &["pi"]),
+            (&["dev", "local"], &["local", "mac", "pi"]),
+        ] {
+            let mut opts = opts();
+            opts.target = names(selection);
+            let mut app = App::with_inventory(opts, Ok(inventory()), Ok(Vec::new()));
+            edit_script(&mut app, Ok(Some("true")));
+            assert_eq!(confirming(&app), Some(&names(want)[..]), "{selection:?}");
+        }
+    }
+
+    #[test]
+    fn y_or_enter_runs_the_script_and_n_or_esc_cancels() {
+        for run in [KeyCode::Char('y'), KeyCode::Enter] {
+            let mut app = app();
+            edit_script(&mut app, Ok(Some("echo hi\n")));
+            assert_eq!(
+                app.on_key(key(run)),
+                [
+                    Effect::Spawn(Job::Run("echo hi\n".to_owned())),
+                    Effect::Redraw
+                ],
+                "{run:?}"
+            );
+            assert!(app.overlay.is_none());
+            assert_eq!(app.running.as_ref().unwrap().kind, RunKind::Run);
+            assert!(matches!(
+                app.shown_result(),
+                Some(RunResult::Apply {
+                    kind: RunKind::Run,
+                    ok: None,
+                    ..
+                })
+            ));
+        }
+        for cancel in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut app = app();
+            edit_script(&mut app, Ok(Some("echo hi\n")));
+            assert_eq!(app.on_key(key(cancel)), [Effect::Redraw], "{cancel:?}");
+            assert!(app.overlay.is_none() && app.running.is_none());
+            assert!(app.results.is_empty());
+            assert_eq!(app.last_script, "echo hi\n", "kept for the next x");
+        }
+        // Any other key leaves the question up; q still quits.
+        let mut app = app();
+        edit_script(&mut app, Ok(Some("echo hi\n")));
+        assert!(app.on_key(key(KeyCode::Char('a'))).is_empty());
+        assert!(confirming(&app).is_some() && app.running.is_none());
+        press(&mut app, &[KeyCode::Char('q')]);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn an_empty_script_runs_nothing() {
+        for edited in [Ok(None), Ok(Some("")), Ok(Some("  \n\t\n"))] {
+            let mut app = app();
+            edit_script(&mut app, edited);
+            assert_eq!(
+                app.notice.as_deref(),
+                Some("run: nothing to run"),
+                "{edited:?}"
+            );
+            assert!(app.overlay.is_none() && app.results.is_empty());
+        }
+        // Emptied after a run: nothing is rerun.
+        let mut app = app();
+        app.last_script = "echo old".to_owned();
+        edit_script(&mut app, Ok(Some("")));
+        assert_eq!(app.notice.as_deref(), Some("run: nothing to run"));
+    }
+
+    #[test]
+    fn an_unchanged_last_script_is_run_again() {
+        let mut app = app();
+        edit_script(&mut app, Ok(Some("echo again")));
+        press(&mut app, &[KeyCode::Char('y')]);
+        app.on_msg(Msg::Finished(Ok(())));
+        edit_script(&mut app, Ok(None));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('y'))),
+            [
+                Effect::Spawn(Job::Run("echo again".to_owned())),
+                Effect::Redraw
+            ]
+        );
+        assert_eq!(app.results.len(), 2);
+    }
+
+    #[test]
+    fn a_refused_or_failed_edit_is_a_notice_and_keeps_the_last_script() {
+        let mut app = app();
+        app.last_script = "echo old".to_owned();
+        app.script_edited(Ok(Some(vec![0xff, b'\n'])));
+        assert_eq!(app.notice.as_deref(), Some("run: the script is not UTF-8"));
+        app.script_edited(Ok(Some(vec![b'#'; MAX_BYTES as usize + 1])));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("run: the script is over the 1 MiB limit")
+        );
+        app.script_edited(Err(
+            "run: editor exited with status 1, nothing written".to_owned()
+        ));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("run: editor exited with status 1, nothing written")
+        );
+        assert!(app.overlay.is_none() && app.results.is_empty());
+        assert_eq!(app.last_script, "echo old");
+    }
+
+    #[test]
+    fn an_inventory_error_is_the_notice_instead_of_the_question() {
+        let mut app = App::with_inventory(opts(), Err("bad inventory".to_owned()), Ok(Vec::new()));
+        edit_script(&mut app, Ok(Some("true")));
+        assert_eq!(app.notice.as_deref(), Some("bad inventory"));
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn a_running_script_is_busy_and_cancels_like_apply() {
+        let mut app = app();
+        edit_script(&mut app, Ok(Some("sleep 1")));
+        press(&mut app, &[KeyCode::Char('y')]);
+        for c in ['a', 'x', 'i'] {
+            assert_eq!(app.on_key(key(KeyCode::Char(c))), [Effect::Redraw], "{c}");
+            assert_eq!(
+                app.notice.as_deref(),
+                Some("busy: run is running (Esc cancels)")
+            );
+        }
+        assert!(app.overlay.is_none());
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(cancel_flag(&app));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("cancelling: the running step finishes first")
+        );
+        app.on_msg(Msg::Steps(vec![row("sleep 1")]));
+        app.on_msg(Msg::TargetDone(cancelled("local")));
+        app.on_msg(Msg::Finished(Ok(())));
+        assert_eq!(app.shown_steps(), [row("sleep 1")]);
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Apply {
+                kind: RunKind::Run,
+                ok: Some(false),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1558,7 +1903,7 @@ pub mod tests {
         ));
         assert_eq!(
             app.on_key(key(KeyCode::Char('d'))),
-            [Effect::Spawn(RunKind::Doctor), Effect::Redraw]
+            [Effect::Spawn(Job::Doctor), Effect::Redraw]
         );
     }
 

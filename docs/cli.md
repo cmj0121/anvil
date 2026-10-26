@@ -16,6 +16,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
   plan                           show the steps apply would run on every target, running none
+  run [--timeout SECS] <FILE|->  run a POSIX sh script on every target, read from FILE or stdin
   secret <NAME>                  edit one secret in the editor
   secret --migrate --to BACKEND  move every secret to keychain, age or sops and select it
   tui                            run every command and browse the results in a terminal UI
@@ -310,6 +311,53 @@ password, its `sudo_secret`, but never `code`, `stdout` or `stderr`:
 
 Exit 0 when every selected target resolves, 1 when any cannot be reached or resolved, 2 for usage or config.
 
+### `anvil run [--timeout SECS] <FILE|->`
+
+Runs one ad-hoc POSIX sh script on every selected target, read from `FILE` or, with `-`, from stdin to EOF:
+
+```sh
+anvil run fix.sh
+printf 'df -h /\nuptime\n' | anvil run --target pi -
+```
+
+Targets are chosen as for apply (`--target`; none means `local` plus every host) and run one after another; a failing
+target does not stop the others. The script is each target's one step, sent on its stdin to `sh -s` (`/bin/sh -s` for
+`local`), never on an argv. It is always POSIX sh: a shebang line is only a comment. run asks for no confirmation.
+
+- **No config.** run never loads the config, so a broken `[packages]` or `[[steps]]` cannot block it. Nothing is probed,
+  the secret store is never opened and no sudo password is typed. For root work call `sudo -n` in the script, or use a
+  target whose sudo is NOPASSWD.
+- **stdin.** The script is sent wrapped in `{ :` … `}`, so sh reads all of it before running any of it: a command that
+  reads stdin (`cat`, `read`, `ssh`) sees EOF and cannot eat the lines after it. A heredoc left open on the last line
+  swallows the closing `}`, and the step fails with sh's syntax error.
+- **`--timeout SECS`.** Each target's run is killed after SECS seconds, 1..=3600, default 300; out of range is exit 2
+  with ``--timeout `N`: must be 1..=3600``. A run that times out keeps the output it printed and ends with
+  `✘ timed out after N s`.
+- **Limits.** The script must be non-empty, at most 1 MiB and UTF-8; otherwise the exit is 2 and nothing runs:
+
+  | Script                       | Message                                            |
+  | ---------------------------- | -------------------------------------------------- |
+  | empty or only whitespace     | `run: the script is empty`                         |
+  | a file over 1 MiB            | `run: the script is N bytes, over the 1 MiB limit` |
+  | stdin over 1 MiB             | `run: the script on stdin is over the 1 MiB limit` |
+  | not UTF-8                    | `run: the script is not UTF-8`                     |
+  | `FILE` (or stdin) unreadable | `run: cannot read FILE: REASON` (`stdin` for `-`)  |
+
+Human output, `--json` and the exit codes are apply's: one block per target with the script as its one `$` line (the
+first line and `…` when it has more), then the summary. In `--json` the step's `run` is the script as given, without the
+wrapper. Exit 0 when the script exited 0 on every target, 1 when any target failed, 2 for usage.
+`printf 'hostname\nuname -s\n' | anvil run --target local -` on a Mac:
+
+```text
+▶ local
+  $ hostname …
+  mac.local
+  Darwin
+  ✔ ok · 1 step
+
+1 ok, 0 failed
+```
+
 ### `anvil secret NAME`
 
 Opens the secret store, then the secret's current value (empty when unset) in the editor as a plain-text file. On
@@ -397,11 +445,13 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 - **1**: `doctor`/`apply`: a target or a check failed (including a `locked` or `error` secret, and, with `[packages]`, a
   package manager that cannot be resolved).
   `plan`: a target could not be reached, probed or resolved.
+  `run`: a target failed or could not be reached.
   `inventory`/`config`/`secret`: the editor exited non-zero (aborted), a file write failed, or the secret store failed,
   is locked or its passphrase prompt was cancelled.
 - **2**: a bad flag or argument (including an `--inventory` or `--config` path not ending in `.toml`), an unknown
   `--target`, an invalid, unreadable or ambiguous file, no `$HOME`, editor not found, an invalid buffer after three
-  attempts, or a secret larger than 1 MiB. For `tui`, see below.
+  attempts, or a secret larger than 1 MiB. For `run`, also a script that is empty, over 1 MiB, not UTF-8 or
+  unreadable, or a `--timeout` outside 1..=3600. For `tui`, see below.
 - **`tui`**: 0 on quit, whatever the results. 2 when stdin or stdout is not a terminal, for `--json`, or for an unknown
   `--target` (checked only when the inventory loads); an inventory that does not load (any load error, including an
   `--inventory` path not ending in `.toml`) is shown in the header, the status bar and the `t` overlay instead. 1 when
@@ -432,7 +482,7 @@ from `--ssh-config`; `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE` and `DISPLAY` are remo
 - **Package step with a sudo password** runs as a `-tt` client instead; see
   [Typing the sudo password](packages.md#typing-the-sudo-password).
 - **Scripts** run as clients of the master (`-o ControlMaster=no -o BatchMode=yes ... sh -s`), with the script on stdin
-  and a 30 s timeout (the package step has its own `[packages].timeout`);
+  and a 30 s timeout (the package step has its own `[packages].timeout`, `anvil run` its `--timeout`);
   a client never prompts. Each stream is kept up to 1 MiB. A background process that leaves the script's process group
   and keeps its output open is given 1 s after the script ends; then anvil stops reading and reports what it has.
 - **Control directory** `~/.ssh/anvil`: created with mode 0700 (and `~/.ssh` 0700 if missing); refused when owned by

@@ -1,5 +1,5 @@
-//! Runs doctor, apply or plan on a background thread and reports to the main
-//! loop as [`Msg`]s: `Steps` (apply only), then `Start` and a per-target report as
+//! Runs doctor, apply, plan or run on a background thread and reports to the main
+//! loop as [`Msg`]s: `Steps` (apply and run), then `Start` and a per-target report as
 //! each target goes, then `DoctorDone` (doctor only) and `Finished`. A panic
 //! in the run becomes `Msg::Panicked`, caught by joining the run's thread.
 
@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use super::app::{self, Msg, RunKind};
+use super::app::{self, Job, Msg};
 use crate::cli::Failure;
 use crate::options::Options;
-use crate::{apply, doctor, plan};
+use crate::{apply, doctor, plan, run};
 
 /// A run in progress; [`Worker::join`] waits for it, which is quick once
 /// `Finished` or `Panicked` has arrived.
@@ -30,13 +31,14 @@ impl Worker {
     }
 }
 
-/// Starts `kind` with `opts` (its targets already selected); `cancel` stops
-/// apply between targets and steps, and plan between targets.
-pub fn spawn(kind: RunKind, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) -> Worker {
-    match kind {
-        RunKind::Doctor => spawn_job(tx, move |tx| run_doctor(&opts, tx)),
-        RunKind::Apply => spawn_job(tx, move |tx| run_apply(&opts, &cancel, tx)),
-        RunKind::Plan => spawn_job(tx, move |tx| run_plan(&opts, &cancel, tx)),
+/// Starts `job` with `opts` (its targets already selected); `cancel` stops
+/// apply and run between targets and steps, and plan between targets.
+pub fn spawn(job: Job, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) -> Worker {
+    match job {
+        Job::Doctor => spawn_job(tx, move |tx| run_doctor(&opts, tx)),
+        Job::Apply => spawn_job(tx, move |tx| run_apply(&opts, &cancel, tx)),
+        Job::Plan => spawn_job(tx, move |tx| run_plan(&opts, &cancel, tx)),
+        Job::Run(script) => spawn_job(tx, move |tx| run_script(&opts, script, &cancel, tx)),
     }
 }
 
@@ -92,12 +94,32 @@ fn run_doctor(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
 fn run_apply(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(), Failure> {
     let config = opts.load_config()?;
     let _ = tx.send(Msg::Steps(app::step_rows(&config)));
-    apply::run_targets(opts, &config, cancel, &mut |progress| {
+    apply::run_targets(opts, &config, cancel, &mut send_progress(tx))?;
+    Ok(())
+}
+
+/// Sends each of apply's (or run's) progress events to the main loop.
+fn send_progress(tx: &Sender<Msg>) -> impl FnMut(apply::Progress<'_>) + '_ {
+    |progress| {
         let _ = tx.send(match progress {
             apply::Progress::Start(target) => Msg::Start(target.name.clone()),
             apply::Progress::Done(report) => Msg::TargetDone(report.clone()),
         });
-    })?;
+    }
+}
+
+/// As `anvil run`: no config and no secret store, the default timeout. The
+/// one step sent is the script, as its `$` line shows it.
+fn run_script(
+    opts: &Options,
+    script: String,
+    cancel: &AtomicBool,
+    tx: &Sender<Msg>,
+) -> Result<(), Failure> {
+    let label = apply::command(&script);
+    let _ = tx.send(Msg::Steps(vec![app::StepRow { label }]));
+    let timeout = Duration::from_secs(run::DEFAULT_TIMEOUT);
+    run::run_targets(opts, script, timeout, cancel, &mut send_progress(tx))?;
     Ok(())
 }
 
@@ -238,7 +260,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let opts = fake_ssh_opts("tw-a", &["printf 'hi\\n'"]);
         let control = opts.ssh_home.clone().unwrap().join(".ssh/anvil");
-        let worker = spawn(RunKind::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
         let msgs = collect(worker, &rx);
         assert!(control.is_dir(), "ssh runs under the temp home");
         assert_eq!(
@@ -279,7 +301,7 @@ mod tests {
     fn doctor_over_fake_ssh_reports_each_host_in_order() {
         let (tx, rx) = mpsc::channel();
         let opts = fake_ssh_opts("tw-d", &[]);
-        let worker = spawn(RunKind::Doctor, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Doctor, opts, Arc::new(AtomicBool::new(false)), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(
             order(&msgs),
@@ -311,7 +333,7 @@ mod tests {
     fn apply_sends_its_steps_start_the_target_report_then_finished() {
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-apply", &["printf 'hi\\n'"]);
-        let worker = spawn(RunKind::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(msgs.len(), 4);
         assert!(matches!(&msgs[0], Msg::Steps(rows) if rows[..] == [row("printf 'hi\\n'")]));
@@ -327,6 +349,44 @@ mod tests {
     }
 
     #[test]
+    fn run_sends_its_script_as_the_one_step_and_ignores_a_broken_config() {
+        let (tx, rx) = mpsc::channel();
+        let opts = local_opts("tui-worker-run", &[]);
+        fs::write(opts.config.as_ref().unwrap(), "[[steps]]\nnope = 1\n").unwrap();
+        let script = "printf 'one\\n'\nprintf 'two\\n'\n";
+        let worker = spawn(
+            Job::Run(script.to_owned()),
+            opts,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let msgs = collect(worker, &rx);
+        assert_eq!(msgs.len(), 4);
+        assert!(matches!(&msgs[0], Msg::Steps(rows) if rows[..] == [row("printf 'one\\n' …")]));
+        assert!(matches!(&msgs[1], Msg::Start(name) if name == "local"));
+        match &msgs[2] {
+            Msg::TargetDone(apply::TargetReport::Ran { target, steps, ok }) => {
+                assert_eq!((target.as_str(), *ok), ("local", true));
+                assert_eq!(
+                    (steps[0].run.as_str(), steps[0].stdout.as_str()),
+                    (script, "one\ntwo\n")
+                );
+            }
+            _ => panic!("expected TargetDone"),
+        }
+        assert!(matches!(&msgs[3], Msg::Finished(Ok(()))));
+
+        let (tx, rx) = mpsc::channel();
+        let opts = local_opts("tui-worker-run-cancel", &[]);
+        let cancel = Arc::new(AtomicBool::new(true));
+        let worker = spawn(Job::Run("true".to_owned()), opts, cancel, tx);
+        assert!(matches!(
+            &collect(worker, &rx)[2],
+            Msg::TargetDone(apply::TargetReport::Cancelled { .. })
+        ));
+    }
+
+    #[test]
     fn plan_sends_start_the_target_plan_then_finished_and_runs_nothing() {
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-plan", &["touch ran"]);
@@ -337,7 +397,7 @@ mod tests {
             format!("[[steps]]\nrun = \"touch {}\"\n", ran.display()),
         )
         .unwrap();
-        let worker = spawn(RunKind::Plan, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Plan, opts, Arc::new(AtomicBool::new(false)), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(msgs.len(), 3);
         assert!(matches!(&msgs[0], Msg::Start(name) if name == "local"));
@@ -353,7 +413,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-plan-cancel", &["true"]);
-        let worker = spawn(RunKind::Plan, opts, Arc::new(AtomicBool::new(true)), tx);
+        let worker = spawn(Job::Plan, opts, Arc::new(AtomicBool::new(true)), tx);
         let msgs = collect(worker, &rx);
         assert!(matches!(
             &msgs[1],
@@ -365,7 +425,7 @@ mod tests {
     fn a_set_cancel_flag_cancels_the_target() {
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-cancel", &["printf hi"]);
-        let worker = spawn(RunKind::Apply, opts, Arc::new(AtomicBool::new(true)), tx);
+        let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(true)), tx);
         let msgs = collect(worker, &rx);
         assert!(matches!(
             &msgs[2],
@@ -378,7 +438,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut opts = local_opts("tui-worker-fail", &[]);
         opts.target = vec!["nosuch".to_owned()];
-        let worker = spawn(RunKind::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(msgs.len(), 2);
         assert!(matches!(&msgs[0], Msg::Steps(_)));
@@ -390,7 +450,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-badconfig", &[]);
         fs::write(opts.config.as_ref().unwrap(), "[[steps]]\nnope = 1\n").unwrap();
-        let worker = spawn(RunKind::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Msg::Finished(Err(_))));
@@ -408,7 +468,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         let (tx, rx) = mpsc::channel();
         let cancel = app.running.as_ref().unwrap().cancel.clone();
-        let worker = spawn(RunKind::Apply, app.opts.clone(), cancel, tx);
+        let worker = spawn(Job::Apply, app.opts.clone(), cancel, tx);
         for msg in collect(worker, &rx) {
             app.on_msg(msg);
         }
@@ -431,7 +491,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut opts = local_opts("tui-worker-doctor", &[]);
         opts.secret_store = Some(crate::options::SecretStoreKind::Memory);
-        let worker = spawn(RunKind::Doctor, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Doctor, opts, Arc::new(AtomicBool::new(false)), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(msgs.len(), 4);
         assert!(matches!(&msgs[0], Msg::Start(name) if name == "local"));

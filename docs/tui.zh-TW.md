@@ -26,8 +26,8 @@ anvil tui                  # or: anvil tui --target linode1
  a apply · d doctor · t targets · ↑↓ step · ←→ target · ? help                       -v 0 · default
 ```
 
-`d` 對以 `t` 挑選的 target（目標）執行 doctor，`a` 執行 apply，`p` 執行 plan（沒有挑選時為全部）；`i`、`c` 與 `s` 開啟編輯器，
-`m` 遷移 secret。Steps 窗格列出 apply 會執行的 step（步驟），每個 step 依顯示中的 target 標上記號，
+`d` 對以 `t` 挑選的 target（目標）執行 doctor，`a` 執行 apply，`p` 執行 plan（沒有挑選時為全部），
+`x` 則像 `anvil run` 一樣執行你編輯的 sh 腳本；`i`、`c` 與 `s` 開啟編輯器，`m` 遷移 secret。Steps 窗格列出 apply 會執行的 step（步驟），每個 step 依顯示中的 target 標上記號，
 Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 apply 結果上也會把 Results 捲動到該 step 的 `$` 行。
 `←` 與 `→` 切換分頁，`[` 與 `]` 切換歷史紀錄。`?` 列出所有按鍵，`q` 結束。
 編輯器、ssh 的密碼提示與 age 密碼短語提示（`m` 期間也是）在執行時會取得真正的終端機。
@@ -38,7 +38,7 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
 
 ## 畫面
 
-- **標頭。** `anvil · <kind> · run N/M · targets: <selection>`：顯示中結果的種類（`doctor`、`apply`、`plan` 或 edit 編輯的對象）
+- **標頭。** `anvil · <kind> · run N/M · targets: <selection>`：顯示中結果的種類（`doctor`、`apply`、`plan`、`run` 或 edit 編輯的對象）
   與它在歷史紀錄中的位置，接著是挑選的 target 與 `tag:NAME`，沒有挑選時為 `all (N)`。
   顯示中的結果正在執行時，它的 spinner 與正在執行的 target（`· ⠙ linode1`）會出現在 `targets:` 之前。
   右側的 `✔ ok  ✘ failed` 計算顯示中結果的 target。放不下的文字以 `…` 截斷。
@@ -50,12 +50,14 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
   傳輸錯誤結束 target 時，被它結束的 step 為 `✘`（尚未執行任何 step 時為第一個：連線或探測失敗），
   但若有逾時的 step 保留了輸出，則該列為 `✘`；其餘為 `⊘`。target 還沒有報告時（排隊中或執行中）每列皆為 `·`；
   正在執行的 target 在結束前沒有分頁，它的 spinner 在標頭與 Results 的最後一行。
-  在 doctor、edit 與 plan 結果上，列表是上次重新載入時 config 的 step，沒有記號。config 載入失敗時改以紅色顯示錯誤。
+  在 doctor、edit 與 plan 結果上，列表是上次重新載入時 config 的 step，沒有記號。
+  run 結果（`x`）只列出一個 step，即它的腳本（第一行，還有更多行時加上 `…`），記號與 apply 相同。
+  config 載入失敗時改以紅色顯示錯誤。
 - **Results。** 顯示中結果的每個區段一個分頁，而不是每次過去的執行一個分頁。
-  doctor 結果在有本機檢查時有一個 `local checks` 分頁，接著依序每個 target 一個分頁；apply 與 plan 依序每個 target 一個分頁；
+  doctor 結果在有本機檢查時有一個 `local checks` 分頁，接著依序每個 target 一個分頁；apply、plan 與 run 依序每個 target 一個分頁；
   edit 只有一個分頁，以它編輯的對象命名（`inventory`、`config`、`secret NAME`、`migrate → age`）。
   `←` 與 `→` 在任何窗格都能切換分頁（overlay 開啟時除外），到兩端就停止。
-  apply 區段讀起來像 CLI 的區塊（`▶ name`、`$ command`、它的輸出、`✔ ok · N steps`、`✘ reason` 或 `⊘ cancelled`）；
+  apply 與 run 區段讀起來像 CLI 的區塊（`▶ name`、`$ command`、它的輸出、`✔ ok · N steps`、`✘ reason` 或 `⊘ cancelled`）；
   plan 區段像 `anvil plan` 的區塊（`▶ name`、`would $ command`、`✔ N steps`、`✘ reason` 或 `⊘ cancelled`）；
   doctor 區段讀起來像它的人類可讀輸出，包含 `[packages]` 的 `manager` 列（無法解析 manager 的 target 算作失敗）。
   長行會換行。執行本身的錯誤（config、inventory、panic）是每個分頁的最後一行。
@@ -79,6 +81,7 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
 | `d`          | 對選擇執行 doctor                                       | `anvil doctor`                            |
 | `a`          | 對選擇執行 apply                                        | `anvil apply`                             |
 | `p`          | 對選擇執行 plan：列出 apply 會執行的 step，一個都不執行 | `anvil plan`                              |
+| `x`          | 編輯 sh 腳本，確認後在選擇上執行                        | `anvil run FILE`                          |
 | `Esc`        | 取消執行；關閉 overlay                                  | —                                         |
 | `i`          | 編輯 inventory，然後重新載入 inventory 與 config        | `anvil inventory`                         |
 | `c`          | 編輯 config，然後重新載入 inventory 與 config           | `anvil config`                            |
@@ -100,15 +103,27 @@ Enter 套用三個路徑（開頭的 `~/` 或單獨的 `~` 為 `$HOME`）並重�
 `s` 會拒絕不符合 `[A-Z][A-Z0-9_]*` 的 NAME，並顯示該規則。在文字欄位中（`s` 的 NAME 提示、`o` 的路徑），
 `q` 會被輸入到欄位裡；Ctrl-C 仍會結束。`anvil tui --version` 會印出 `anvil-tui VERSION`。
 
+`x` 以編輯器（`[anvil].editor`，否則 `$VISUAL`，否則 `$EDITOR`，否則 `nvim`；無法載入的 config 會被略過）
+開啟本次工作階段的上一份腳本（一開始為空），檔案為 `.sh`。存檔後緩衝區成為上一份腳本；未修改時再次執行上一份腳本。
+空的或只有空白的腳本什麼都不執行（`run: nothing to run`）。
+超過 1 MiB（`run: the script is over the 1 MiB limit`）或不是 UTF-8（`run: the script is not UTF-8`）的腳本會以該通知被拒絕，
+並保留上一份腳本。否則 `x` 會詢問 `run on N targets: a, b, c?`，列出選擇的名稱
+（沒有挑選時為每個 target；超過五個名稱時其餘以 `…` 表示）：`y` 或 `Enter` 執行，`n` 或 `Esc` 不執行，並保留腳本給下一次 `x`。
+執行方式與 `anvil run` 相同，使用預設的 300 秒逾時：不讀 config、不探測、不開啟 secret store，也不輸入 sudo 密碼，
+因此需要 root 的工作要用 `sudo -n` 或 NOPASSWD 的 target。上一份腳本只保留在本次工作階段的記憶體中；
+要保留的腳本請放進 `[[steps]]`。
+
 ## 規則
 
-- **一次一個執行。** doctor、apply 或 plan 執行期間，`d`、`a`、`p`、`i`、`c`、`s`、`m` 與 `o` 會被拒絕，
+- **一次一個執行。** doctor、apply、plan 或 run 執行期間，`d`、`a`、`p`、`x`、`i`、`c`、`s`、`m` 與 `o` 會被拒絕，
   狀態列顯示 `busy: <run> is running (Esc cancels)`。執行會保留它開始時的選擇與路徑。
 - **Esc 在 step 之間取消。** apply 在每個 target 與每個 step（步驟）之前檢查：正在執行的 step 會跑完，
   該 target 剩下的部分以及之後的每個 target 都以 `⊘ cancelled` 結束。
-  plan 在每個 target 之前檢查：正在執行的探測會跑完，之後的每個 target 都以 `⊘ cancelled` 結束。遠端 step 從不被終止。
+  run（`x`）以相同方式取消：它的腳本是唯一的 step，因此正在執行的腳本會先跑完，之後的每個 target 都以 `⊘ cancelled` 結束。
+  plan 在每個 target 之前檢查：正在執行的探測會跑完，之後的每個 target 都以 `⊘ cancelled` 結束。
+  Esc 從不終止正在執行的 step，不論本機或遠端；只有該 step 的逾時會結束它（`x` 為 300 秒）。
   doctor 無法取消；它的探測受 [ssh 逾時](cli.zh-TW.md#ssh-行為)限制。
-- **交接。** 編輯器（`i`、`c`、`s`）、遷移（`m`，讓它的 age 密碼短語提示能運作）、
+- **交接。** 編輯器（`i`、`c`、`s`、`x`）、遷移（`m`，讓它的 age 密碼短語提示能運作）、
   ssh 的互動式重試（密碼、密碼短語或 PIN，見 [SSH 行為](cli.zh-TW.md#ssh-行為)），
   與 [age 密碼短語提示](secrets.zh-TW.md#密碼短語提示)會取得真正的終端機：TUI 離開它的畫面，
   程式像在 CLI 中一樣執行，然後 TUI 回來並顯示結果。ssh 的提示來自 doctor 或 apply 執行；它等待時 TUI 不讀取任何按鍵，

@@ -17,6 +17,8 @@ system OpenSSH client.
   out of the upgrade on pacman and dnf (brew, apt and apk refuse it).
 - **`anvil plan`** shows the steps apply would run on each target and runs none of them; `--json` marks the document
   `"executed": false`.
+- **`anvil run FILE`** (or `-` for stdin) runs one ad-hoc POSIX sh script on every target, one after another, with
+  apply's output, `--json` and exit codes. It loads no config, asks for no confirmation and types no sudo password.
 - **Secrets** live in the macOS keychain, an age file or a sops file, and `anvil secret --migrate` moves them between
   backends.
 - **Terminal UI**: `anvil tui` runs every command in one screen and keeps the session's results for browsing.
@@ -47,6 +49,7 @@ anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secre
 anvil doctor               # local checks + every target's facts and reachability
 anvil plan                 # the steps apply would run on every target, running none
 anvil apply                # install packages and run the steps on every target
+anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
 anvil tui                  # all of the above in one terminal UI
 ```
 

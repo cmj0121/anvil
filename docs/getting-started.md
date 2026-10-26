@@ -52,6 +52,7 @@ anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secre
 anvil doctor               # local checks + every target's facts and reachability
 anvil plan                 # the steps apply would run on every target, running none
 anvil apply                # install packages and run the steps on every target
+anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
 anvil tui                  # all of the above in one terminal UI
 ```
 

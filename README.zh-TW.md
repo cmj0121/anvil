@@ -16,6 +16,8 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
   （brew、apt 與 apk 拒絕）。
 - **`anvil plan`** 列出 apply 會在每個 target 上執行的 step，但一個都不執行；`--json` 的文件標記為
   `"executed": false`。
+- **`anvil run FILE`**（或以 `-` 讀 stdin）在每個 target 上逐一執行一份臨時的 POSIX sh 腳本，
+  輸出、`--json` 與結束碼都與 apply 相同。它不載入 config、不詢問確認，也不輸入 sudo 密碼。
 - **secret（機密）** 存放在 macOS keychain、age 檔案或 sops 檔案中，`anvil secret --migrate` 可在 backend 之間搬移它們。
 - **終端機介面**：`anvil tui` 在同一個畫面執行所有指令，並保留本次工作階段的結果供瀏覽。
 - **為 agent 打造**：`--json` 在 stdout 輸出一份可解析的文件；日誌只寫到 stderr。
@@ -45,6 +47,7 @@ anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secre
 anvil doctor               # local checks + every target's facts and reachability
 anvil plan                 # the steps apply would run on every target, running none
 anvil apply                # install packages and run the steps on every target
+anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
 anvil tui                  # all of the above in one terminal UI
 ```
 

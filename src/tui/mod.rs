@@ -24,6 +24,7 @@ use signal_hook::consts::SIGINT;
 use crate::cli::Failure;
 use crate::commands;
 use crate::document::Format;
+use crate::editor::{Buffer, Editor, Fallback};
 use crate::logger::{self, Sink};
 use crate::options::Options;
 use crate::term;
@@ -123,13 +124,14 @@ fn event_loop(
         for effect in effects {
             match effect {
                 Effect::Redraw => redraw = true,
-                Effect::Spawn(kind) => {
+                Effect::Spawn(job) => {
                     if let Some(running) = &app.running {
-                        runs.spawn(kind, &app, running.cancel.clone());
+                        runs.spawn(job, &app, running.cancel.clone());
                     }
                 }
                 // The busy rule keeps a worker from running meanwhile.
                 Effect::Edit(kind) => run_edit(&mut app, &kind),
+                Effect::EditScript => edit_script(&mut app),
                 Effect::Reload => app.reload(),
             }
         }
@@ -152,6 +154,18 @@ fn run_edit(app: &mut App, kind: &EditKind) {
     }
 }
 
+/// `x`'s editor on the session's last script, on this (the main) thread
+/// with the real terminal, as a `.sh` file. The config is read for
+/// `[anvil].editor` only; one that does not load falls back as `anvil
+/// config` does, so a broken config cannot block a run.
+fn edit_script(app: &mut App) {
+    let preference = app.opts.load_config().ok().and_then(|c| c.anvil.editor);
+    let edited = Editor::resolve(preference.as_deref(), Fallback::Lenient)
+        .and_then(|editor| editor.edit(app.last_script.as_bytes(), "sh", Buffer::Document))
+        .map_err(|err| format!("run: {err}"));
+    app.script_edited(edited);
+}
+
 /// The CLI's editor flow for `kind`, its outcome as the CLI words it.
 fn edit(opts: &Options, format: Option<Format>, kind: &EditKind) -> Result<String, Failure> {
     match kind {
@@ -166,7 +180,7 @@ fn edit(opts: &Options, format: Option<Format>, kind: &EditKind) -> Result<Strin
     }
 }
 
-/// The worker running doctor or apply, if any. Dropping it (teardown, a
+/// The worker running doctor, apply, plan or run, if any. Dropping it (teardown, a
 /// terminal error) cancels the run and joins the worker before the session
 /// drops, serving its handoffs meanwhile: a suspend that failed because the
 /// session was gone would still run ssh or the editor on the raw screen.
@@ -179,8 +193,8 @@ struct Runs<'a, S: Screen> {
 }
 
 impl<S: Screen> Runs<'_, S> {
-    fn spawn(&mut self, kind: app::RunKind, app: &App, cancel: Arc<AtomicBool>) {
-        let worker = worker::spawn(kind, app.opts.clone(), cancel.clone(), self.tx.clone());
+    fn spawn(&mut self, job: app::Job, app: &App, cancel: Arc<AtomicBool>) {
+        let worker = worker::spawn(job, app.opts.clone(), cancel.clone(), self.tx.clone());
         self.worker = Some((worker, cancel));
     }
 
@@ -451,6 +465,20 @@ mod tests {
         );
         let seen = fs::read_to_string(edits.dir.join("seen")).unwrap();
         assert!(seen.trim_end().ends_with(".yaml"), "{seen}");
+    }
+
+    #[test]
+    fn x_edits_the_last_script_in_one_handoff_then_asks_to_run_it() {
+        let mut edits = Edits::new("script", "printf 'echo hi\\n' > \"$1\"");
+        let _lock = term::test_lock();
+        let (recorder, _guard) = Recorder::install();
+        edit_script(&mut edits.app);
+        assert_eq!(recorder.events(), [Event::Suspend, Event::Resume]);
+        assert_eq!(edits.app.last_script, "echo hi\n");
+        assert!(matches!(
+            &edits.app.overlay,
+            Some(app::Overlay::Confirm { targets }) if targets[..] == ["local", "pi"]
+        ));
     }
 
     #[test]
