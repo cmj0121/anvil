@@ -1,10 +1,12 @@
 # anvil command line
 
-The contract of the MVP ([#3](https://github.com/mini-poc/anvil/issues/3)), following the CLI design in
-[#2](https://github.com/mini-poc/anvil/issues/2). For an introduction see the [README](../README.md).
+English | [繁體中文](cli.zh-TW.md)
+
+The full command contract, following the CLI design in [#2](https://github.com/mini-poc/anvil/issues/2). For an
+introduction see the [README](../README.md).
 
 Topic guides: [Getting started](getting-started.md), [Configuration](configuration.md),
-[Packages](packages.md), [Secrets](secrets.md), [Terminal UI](tui.md), [Good to know](security.md),
+[Packages](packages.md), [Secrets](secrets.md), [Terminal UI](tui.md), [Security notes](security.md),
 [Development](development.md).
 
 ```text

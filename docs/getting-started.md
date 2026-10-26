@@ -1,14 +1,13 @@
 # Getting started
 
-anvil is a secure, single-binary Rust tool that sets up the local machine and remote hosts from one declarative config,
-for both humans and agents. It is agentless: a target needs only POSIX `sh`, and remote hosts are reached through the
-system OpenSSH client.
+English | [繁體中文](getting-started.zh-TW.md)
 
-This is the MVP ([#3](https://github.com/mini-poc/anvil/issues/3)): `doctor` reports facts and reachability for this Mac
-and the hosts in the inventory, `apply` installs the config's `[packages]` with each target's package manager and
-runs its `[[steps]]` (by default the placeholder `hostname`) on each of them, and `secret` keeps a value in the secret
-backend the config selects: the macOS keychain, an age file or a sops file. The full command reference is in
-[cli.md](cli.md).
+For what anvil is, see the overview in the [README](../README.md).
+
+`doctor` reports facts and reachability for this Mac and the hosts in the inventory, `apply` installs the config's
+`[packages]` with each target's package manager and runs its `[[steps]]` (by default the placeholder `hostname`) on
+each of them, and `secret` keeps a value in the secret backend the config selects: the macOS keychain, an age file or a
+sops file. The full command reference is in [cli.md](cli.md).
 
 ## Install
 

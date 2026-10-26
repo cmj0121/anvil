@@ -1,5 +1,7 @@
 # Configuration
 
+English | [繁體中文](configuration.zh-TW.md)
+
 ## Quick look
 
 ### `inventory.toml`
