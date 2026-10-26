@@ -1,6 +1,7 @@
 //! Draws [`App`]: the header, Steps on the left, Results on the right, an
 //! optional log pane, the status bar and the overlays (help, the secret
-//! NAME prompt, the migrate choice, the options, the targets). Host and
+//! NAME prompt, the migrate choice, the options, the targets, the run
+//! confirmation). Host and
 //! config text is escaped before it is drawn.
 
 use ratatui::Frame;
@@ -9,7 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use super::app::{App, BACKENDS, OPTION_FLAGS, Overlay, Pane, RunResult, Running};
+use super::app::{self, App, BACKENDS, OPTION_FLAGS, Overlay, Pane, RunResult, Running};
 use crate::doctor::{self, SecretStatus};
 use crate::logger::escape_controls;
 use crate::plan::{self, PlanReport};
@@ -40,6 +41,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("a", "apply"),
             ("p", "plan"),
             ("d", "doctor"),
+            ("x", "run script"),
             ("Esc", "cancel"),
         ],
     ),
@@ -103,6 +105,7 @@ pub fn draw(app: &App, f: &mut Frame) {
         Some(Overlay::Migrate { choice }) => draw_migrate(f, *choice),
         Some(Overlay::Options { field, texts }) => draw_options(f, *field, texts),
         Some(Overlay::Targets { cursor }) => draw_targets(app, f, *cursor),
+        Some(Overlay::Confirm { targets }) => draw_confirm(f, targets),
     }
 }
 
@@ -140,7 +143,7 @@ fn header_line(app: &App, width: u16) -> Line<'static> {
     if let (Some(index), Some(result)) = (app.shown, app.shown_result()) {
         let kind = match result {
             RunResult::Doctor { .. } => "doctor".to_owned(),
-            RunResult::Apply { .. } => "apply".to_owned(),
+            RunResult::Apply { kind, .. } => kind.as_str().to_owned(),
             RunResult::Plan { .. } => "plan".to_owned(),
             RunResult::Edit { what, .. } => text(what),
         };
@@ -964,10 +967,7 @@ fn draw_targets(app: &App, f: &mut Frame, cursor: usize) {
         }
     }
     lines.push(Line::from(" ↑↓ move · Space select · Enter/Esc close").style(secondary()));
-    let widest = lines.iter().map(Line::width).max().unwrap_or(0);
-    let width = u16::try_from(widest + 3)
-        .unwrap_or(u16::MAX)
-        .min(f.area().width);
+    let width = fitted_width(f, &lines);
     // Line 0 is the `Hosts` heading; the `Tags` heading sits before the tags.
     let keep = if app.inventory_error.is_some() {
         0
@@ -975,6 +975,25 @@ fn draw_targets(app: &App, f: &mut Frame, cursor: usize) {
         cursor + 1 + usize::from(cursor >= app.targets.len())
     };
     popup_showing(f, "Targets", width, lines, keep);
+}
+
+/// `x`'s question, its target names escaped; as wide as it is, up to the
+/// screen.
+fn draw_confirm(f: &mut Frame, targets: &[String]) {
+    let names: Vec<String> = targets.iter().map(|name| text(name)).collect();
+    let lines = vec![
+        Line::from(format!(" {}", app::confirm_prompt(&names))),
+        Line::from(" y/Enter run · n/Esc cancel").style(secondary()),
+    ];
+    popup(f, "Run script", fitted_width(f, &lines), lines);
+}
+
+/// A popup as wide as its widest line and its border, up to the screen.
+fn fitted_width(f: &Frame, lines: &[Line]) -> u16 {
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+    u16::try_from(widest + 3)
+        .unwrap_or(u16::MAX)
+        .min(f.area().width)
 }
 
 /// The three paths, the one being typed into marked; empty is the default.
@@ -1088,6 +1107,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps: steps.to_vec(),
                 targets: vec![local, cancelled("pi")],
                 ok: Some(false),
@@ -1164,6 +1184,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps,
                 targets: Vec::new(),
                 ok: None,
@@ -1200,6 +1221,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps,
                 targets: vec![pi, cancelled("mac")],
                 ok: Some(false),
@@ -1252,6 +1274,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps,
                 targets: vec![pi, cancelled("mac")],
                 ok: Some(false),
@@ -1300,12 +1323,59 @@ mod tests {
     }
 
     #[test]
+    fn a_script_run_is_named_run_in_the_header_and_lists_its_one_step() {
+        let mut app = app();
+        show(
+            &mut app,
+            RunResult::Apply {
+                kind: RunKind::Run,
+                steps: vec![step_row("uptime …")],
+                targets: vec![ran("local", vec![step("uptime\nw", Some(0), "up\n", "")])],
+                ok: Some(true),
+                error: None,
+            },
+        );
+        let screen = render(&app, 80, 8);
+        assert!(
+            screen[0].starts_with(" anvil · run · run 1/1 · targets: all (3)"),
+            "{}",
+            screen[0]
+        );
+        assert!(
+            screen.iter().any(|row| row.contains("✔ 1 uptime …")),
+            "{screen:#?}"
+        );
+        assert!(
+            screen.iter().any(|row| row.contains("$ uptime …")),
+            "{screen:#?}"
+        );
+    }
+
+    #[test]
+    fn the_run_confirmation_asks_with_the_escaped_names() {
+        let mut app = app();
+        app.overlay = Some(Overlay::Confirm {
+            targets: vec!["local".to_owned(), "p\x1bi".to_owned()],
+        });
+        assert_eq!(
+            render(&app, 80, 10)[3..7],
+            [
+                "│                     ┌Run script────────────────────────┐                     │",
+                "│                     │ run on 2 targets: local, p\\x1bi? │                     │",
+                "│                     │ y/Enter run · n/Esc cancel       │                     │",
+                "│                     └──────────────────────────────────┘                     │",
+            ]
+        );
+    }
+
+    #[test]
     fn a_tiny_screen_draws_without_panicking() {
         let steps = Ok(vec![step_row("a very long step label that cannot fit")]);
         let mut app = App::with_inventory(opts(), Err("bad inventory".to_owned()), steps);
         show(
             &mut app,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps: Vec::new(),
                 targets: vec![ran("local", vec![step("true", Some(0), "x", "")])],
                 ok: Some(true),
@@ -1367,6 +1437,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps: Vec::new(),
                 targets: vec![ran("local", Vec::new()), cancelled("pi")],
                 ok: Some(false),
@@ -1476,7 +1547,7 @@ mod tests {
             screen[8..17],
             [
                 "│    ┌Help────────────────────────────────────────────────────────────────┐    │",
-                "│    │ Run      a apply  p plan  d doctor  Esc cancel                     │    │",
+                "│    │ Run      a apply  p plan  d doctor  x run script  Esc cancel       │    │",
                 "│    │ Targets  t pick  Space select                                      │    │",
                 "│    │ Move     ↑↓/jk step/scroll  ←→ target  Enter go to step  Tab focus │    │",
                 "│    │ History  [ ] run                                                   │    │",
@@ -1646,6 +1717,7 @@ mod tests {
         app.edit_format = Some(crate::document::Format::Yaml);
         app.opts.verbose = 2;
         app.results.push(RunResult::Apply {
+            kind: RunKind::Apply,
             steps: Vec::new(),
             targets: Vec::new(),
             ok: Some(true),
@@ -1697,6 +1769,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps: Vec::new(),
                 targets: vec![
                     ran(
@@ -1834,6 +1907,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps: Vec::new(),
                 targets: vec![crate::apply::TargetReport::Failed {
                     target: "pi".to_owned(),
@@ -1863,6 +1937,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps: Vec::new(),
                 targets: vec![crate::apply::TargetReport::Failed {
                     target: "pi".to_owned(),
@@ -1893,6 +1968,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps: Vec::new(),
                 targets: vec![ran("local", Vec::new())],
                 ok: None,
@@ -1911,6 +1987,7 @@ mod tests {
         );
         // The spinner goes with the newest result only.
         app.results.push(RunResult::Apply {
+            kind: RunKind::Apply,
             steps: Vec::new(),
             targets: Vec::new(),
             ok: None,
@@ -2031,6 +2108,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps: Vec::new(),
                 targets: vec![ran("local", Vec::new()), ran("pi", Vec::new())],
                 ok: Some(true),
@@ -2265,6 +2343,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps: Vec::new(),
                 targets: vec![
                     ran("local", Vec::new()),
@@ -2293,6 +2372,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps: Vec::new(),
                 targets: Vec::new(),
                 ok: Some(false),
@@ -2325,6 +2405,7 @@ mod tests {
         show(
             &mut wide,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps: Vec::new(),
                 targets: vec![
                     ran("zz", Vec::new()),
@@ -2345,6 +2426,7 @@ mod tests {
         show(
             &mut high,
             RunResult::Apply {
+                kind: RunKind::Apply,
                 steps: Vec::new(),
                 targets: vec![
                     ran("a", Vec::new()),
