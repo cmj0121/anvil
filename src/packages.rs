@@ -460,8 +460,9 @@ pub fn with_password(script: &str) -> String {
 }
 
 /// The one-line script that upgrades and installs `packages` with
-/// `manager`, each under [`Packages::name_for`]; `None` when there is
-/// nothing to upgrade or install. `root`: run without
+/// `manager`, then removes the `remove` names that are installed, each
+/// under [`Packages::name_for`]; `None` when there is nothing to upgrade,
+/// install or remove. `root`: run without
 /// `sudo -n`. The names go into the script unquoted, so `packages` must
 /// have passed [`Packages::validate`]; panics otherwise, in every build.
 pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<String> {
@@ -470,63 +471,89 @@ pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<Strin
         "packages::script: package names must pass Packages::validate before they reach a shell line"
     );
     let install = !packages.install.is_empty();
-    if !packages.upgrade && !install {
+    let s = if root { "" } else { "sudo -n " };
+    let names = |list: &[String]| {
+        list.iter()
+            .map(|plain| packages.name_for(plain, manager))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let p = names(&packages.install);
+    let mut parts: Vec<String> = Vec::new();
+    if packages.upgrade || install {
+        match manager {
+            Manager::Brew => {
+                if packages.upgrade {
+                    parts.push("brew update && brew upgrade".to_string());
+                }
+                if install {
+                    parts.push(format!("brew install {p}"));
+                }
+            }
+            Manager::Pacman => {
+                let flags = if packages.upgrade { "-Syu" } else { "-S" };
+                let command = format!("{s}pacman {flags} --noconfirm --needed {p}");
+                parts.push(command.trim_end().to_string());
+            }
+            Manager::Apt => {
+                parts.push(format!("{s}apt-get update"));
+                if packages.upgrade {
+                    parts.push(format!(
+                        "{s}env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
+                    ));
+                }
+                if install {
+                    parts.push(format!(
+                        "{s}env DEBIAN_FRONTEND=noninteractive apt-get install -y {p}"
+                    ));
+                }
+            }
+            Manager::Dnf => {
+                if packages.upgrade {
+                    parts.push(format!("{s}dnf -y upgrade"));
+                }
+                if install {
+                    parts.push(format!("{s}dnf -y install {p}"));
+                }
+            }
+            Manager::Apk => {
+                if packages.upgrade {
+                    parts.push(format!("{s}apk update && {s}apk upgrade"));
+                }
+                if install {
+                    parts.push(format!("{s}apk add --update-cache {p}"));
+                }
+            }
+        }
+    }
+    if !packages.remove.is_empty() {
+        let (check, command) = match manager {
+            Manager::Brew => ("brew list", "brew uninstall".to_string()),
+            Manager::Pacman => ("pacman -Q", format!("{s}pacman -R --noconfirm")),
+            Manager::Apt => (
+                "dpkg -s",
+                format!("{s}env DEBIAN_FRONTEND=noninteractive apt-get remove -y"),
+            ),
+            Manager::Dnf => (
+                "rpm -q --whatprovides",
+                format!("{s}dnf -y remove --setopt=clean_requirements_on_remove=False"),
+            ),
+            Manager::Apk => ("apk info -e", format!("{s}apk del")),
+        };
+        let r = names(&packages.remove);
+        parts.push(format!(
+            "{{ r=$(for n in {r}; do {check} \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); \
+             [ -z \"$r\" ] || {command} $r; }}"
+        ));
+    }
+    if parts.is_empty() {
         return None;
     }
-    let s = if root { "" } else { "sudo -n " };
-    let p = packages
-        .install
-        .iter()
-        .map(|plain| packages.name_for(plain, manager))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut parts: Vec<String> = Vec::new();
-    match manager {
-        Manager::Brew => {
-            if packages.upgrade {
-                parts.push("brew update && brew upgrade".to_string());
-            }
-            if install {
-                parts.push(format!("brew install {p}"));
-            }
-            return Some(format!("{BREW_PATH}{}", parts.join(" && ")));
-        }
-        Manager::Pacman => {
-            let flags = if packages.upgrade { "-Syu" } else { "-S" };
-            let command = format!("{s}pacman {flags} --noconfirm --needed {p}");
-            parts.push(command.trim_end().to_string());
-        }
-        Manager::Apt => {
-            parts.push(format!("{s}apt-get update"));
-            if packages.upgrade {
-                parts.push(format!(
-                    "{s}env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
-                ));
-            }
-            if install {
-                parts.push(format!(
-                    "{s}env DEBIAN_FRONTEND=noninteractive apt-get install -y {p}"
-                ));
-            }
-        }
-        Manager::Dnf => {
-            if packages.upgrade {
-                parts.push(format!("{s}dnf -y upgrade"));
-            }
-            if install {
-                parts.push(format!("{s}dnf -y install {p}"));
-            }
-        }
-        Manager::Apk => {
-            if packages.upgrade {
-                parts.push(format!("{s}apk update && {s}apk upgrade"));
-            }
-            if install {
-                parts.push(format!("{s}apk add --update-cache {p}"));
-            }
-        }
-    }
-    Some(parts.join(" && "))
+    let line = parts.join(" && ");
+    Some(match manager {
+        Manager::Brew => format!("{BREW_PATH}{line}"),
+        _ => line,
+    })
 }
 
 #[cfg(test)]
@@ -1075,17 +1102,188 @@ mod tests {
     }
 
     #[test]
-    fn remove_or_pin_alone_adds_no_script_line_yet() {
-        let p = parse("remove = [\"nano\"]\npin = [\"git\"]\n").unwrap();
+    fn pin_alone_adds_no_script_line_yet() {
+        let p = parse("pin = [\"git\"]\n").unwrap();
         for manager in Manager::ALL {
             assert_eq!(script(manager, &p, true), None);
-            let mut with_install = p.clone();
-            with_install.install = vec!["curl".into()];
+        }
+    }
+
+    fn removing(install: &[&str], upgrade: bool) -> Packages {
+        Packages {
+            remove: vec!["nano".into(), "fd".into()],
+            ..with_fd_alias(install, upgrade)
+        }
+    }
+
+    #[test]
+    fn remove_alone_removes_the_installed_names_per_manager() {
+        let brew = BREW_PATH;
+        let group = |check: &str, r: &str, command: &str| {
+            format!(
+                "{{ r=$(for n in {r}; do {check} \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); \
+                 [ -z \"$r\" ] || {command} $r; }}"
+            )
+        };
+        let cases = [
+            (
+                Manager::Brew,
+                format!("{brew}{}", group("brew list", "nano fd", "brew uninstall")),
+            ),
+            (
+                Manager::Pacman,
+                group("pacman -Q", "nano fd", "sudo -n pacman -R --noconfirm"),
+            ),
+            (
+                Manager::Apt,
+                group(
+                    "dpkg -s",
+                    "nano fd-find",
+                    "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get remove -y",
+                ),
+            ),
+            (
+                Manager::Dnf,
+                group(
+                    "rpm -q --whatprovides",
+                    "nano fd-find",
+                    "sudo -n dnf -y remove --setopt=clean_requirements_on_remove=False",
+                ),
+            ),
+            (
+                Manager::Apk,
+                group("apk info -e", "nano fd", "sudo -n apk del"),
+            ),
+        ];
+        for (manager, expected) in cases {
             assert_eq!(
-                script(manager, &with_install, true),
-                script(manager, &packages(&["curl"], false), true)
+                script(manager, &removing(&[], false), false).as_deref(),
+                Some(expected.as_str()),
+                "{manager}"
+            );
+            let as_root = script(manager, &removing(&[], false), true).unwrap();
+            assert!(!as_root.contains("sudo"), "{as_root}");
+            assert!(
+                !as_root.starts_with(" &&") && !as_root.contains("} &&"),
+                "{as_root}"
             );
         }
+        assert_eq!(
+            script(Manager::Pacman, &removing(&[], false), true).as_deref(),
+            Some(
+                "{ r=$(for n in nano fd; do pacman -Q \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); \
+                 [ -z \"$r\" ] || pacman -R --noconfirm $r; }"
+            )
+        );
+    }
+
+    #[test]
+    fn remove_runs_after_the_install_and_upgrade() {
+        assert_eq!(
+            script(Manager::Apt, &removing(&["git", "curl"], true), false).as_deref(),
+            Some(
+                "sudo -n apt-get update && \
+                 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && \
+                 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y git curl && \
+                 { r=$(for n in nano fd-find; do dpkg -s \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); \
+                 [ -z \"$r\" ] || sudo -n env DEBIAN_FRONTEND=noninteractive apt-get remove -y $r; }"
+            )
+        );
+        for manager in Manager::ALL {
+            for root in [true, false] {
+                let alone = script(manager, &removing(&[], false), root).unwrap();
+                let group = alone.strip_prefix(BREW_PATH).unwrap_or(&alone);
+                for (install, upgrade) in [(&["git"][..], false), (&[], true), (&["git"], true)] {
+                    let before = script(manager, &with_fd_alias(install, upgrade), root).unwrap();
+                    assert_eq!(
+                        script(manager, &removing(install, upgrade), root).unwrap(),
+                        format!("{before} && {group}"),
+                        "{manager} {install:?} {upgrade}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remove_never_purges_or_autoremoves() {
+        for manager in Manager::ALL {
+            let line = script(manager, &removing(&[], false), true).unwrap();
+            for flag in ["purge", "autoremove", "-Rs", "-Rc", "-Rn", "--zap", " -r "] {
+                assert!(!line.contains(flag), "{manager}: {line}");
+            }
+        }
+        let dnf = script(Manager::Dnf, &removing(&[], false), true).unwrap();
+        assert!(
+            dnf.contains("--setopt=clean_requirements_on_remove=False"),
+            "{dnf}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_remove_runs_after_sudo_validates() {
+        let one_liner = script(Manager::Pacman, &removing(&[], false), false).unwrap();
+        assert_eq!(
+            with_password(&one_liner),
+            "export TERM=dumb\n\
+             mesg n </dev/tty 2>/dev/null; stty -echo </dev/tty; echo anvil-tty-ready\n\
+             IFS= read -r n </dev/tty\n\
+             trap 'sudo -k' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM\n\
+             LC_ALL=C SUDO_PROMPT=\"$n\" sudo -v </dev/tty && echo anvil-sudo-ok && \
+             { r=$(for n in nano fd; do pacman -Q \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); \
+             [ -z \"$r\" ] || sudo -n pacman -R --noconfirm $r; }\n"
+        );
+    }
+
+    /// Runs `line` under `/bin/sh` with a stub `pacman`: `-S`/`-Syu` exit
+    /// `$SYNC`, `-Q` succeeds for the names in `$HAVE`, `-R` prints its
+    /// arguments and exits `$DEL`; the exit code and the output.
+    fn run_with_stub_pacman(line: &str, sync: u8, have: &str, del: u8) -> (Option<i32>, String) {
+        let stub = "pacman() { case $1 in \
+                    -Q) case \" $HAVE \" in *\" $2 \"*) return 0;; esac; return 1;; \
+                    -R) shift; echo \"removed $*\"; return $DEL;; \
+                    *) return $SYNC;; esac; }";
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{stub}\n{line}"))
+            .env("SYNC", sync.to_string())
+            .env("HAVE", have)
+            .env("DEL", del.to_string())
+            .output()
+            .unwrap();
+        (out.status.code(), String::from_utf8(out.stdout).unwrap())
+    }
+
+    #[test]
+    fn the_remove_group_keeps_the_chain_status_and_is_idempotent() {
+        let line = script(Manager::Pacman, &removing(&["git"], false), true).unwrap();
+        // A failed install fails the line, and nothing is removed.
+        assert_eq!(
+            run_with_stub_pacman(&line, 1, "nano fd", 0),
+            (Some(1), String::new())
+        );
+        // Only the installed names are removed, in one command.
+        assert_eq!(
+            run_with_stub_pacman(&line, 0, "fd git", 0),
+            (Some(0), "removed --noconfirm fd\n".to_string())
+        );
+        assert_eq!(
+            run_with_stub_pacman(&line, 0, "nano fd", 0),
+            (Some(0), "removed --noconfirm nano fd\n".to_string())
+        );
+        // A re-run with everything already removed succeeds without removing.
+        assert_eq!(
+            run_with_stub_pacman(&line, 0, "git", 0),
+            (Some(0), String::new())
+        );
+        // A failed remove fails the line.
+        assert_eq!(run_with_stub_pacman(&line, 0, "nano", 1).0, Some(1));
+        // Remove alone, already removed: exit 0.
+        let alone = script(Manager::Pacman, &removing(&[], false), true).unwrap();
+        assert_eq!(
+            run_with_stub_pacman(&alone, 0, "", 0),
+            (Some(0), String::new())
+        );
     }
 
     #[test]
