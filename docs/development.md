@@ -17,6 +17,21 @@ touches `~/.ssh`, the keychain or a real host. The official `archlinux` image is
 silicon) the e2e builds from the third-party `lopsided/archlinux` image (Arch Linux ARM, `distro=archarm`), pinned by
 digest like the official one.
 
+## CI
+
+GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs on every pull request, on pushes to
+`main` and by hand:
+
+| Job          | Runs on                | What it checks                                                                    |
+| ------------ | ---------------------- | --------------------------------------------------------------------------------- |
+| `pre-commit` | Ubuntu                 | `pre-commit run --all-files` (YAML, whitespace, gitleaks, markdownlint, prettier) |
+| `make test`  | Ubuntu and macOS       | `make test` with sops and python3 3.12, then a `--no-default-features` build      |
+| `MSRV`       | Ubuntu, Rust 1.89      | `cargo check --all-targets` on the `rust-version` in Cargo.toml                   |
+| `make e2e`   | Ubuntu, after the test | `make e2e` against the amd64 Arch image; a `skip` (no docker) fails the job       |
+
+Actions are pinned by commit SHA, and sops is a pinned release checked against its SHA-256 (`.github/install-sops.sh`).
+The keychain tests that write to the login keychain stay `#[ignore]` and do not run in CI.
+
 Where anvil deliberately departs from the design issues is listed in [deviations.md](deviations.md).
 
 ## Documentation

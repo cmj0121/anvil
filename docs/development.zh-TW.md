@@ -18,6 +18,21 @@ make e2e    # doctor, apply and the ssh auth paths against an Arch sshd containe
 因此在 arm64（Apple silicon）上，e2e 會改從第三方的 `lopsided/archlinux` 映像檔（Arch Linux ARM，`distro=archarm`）建置，
 並與官方映像檔一樣以 digest 固定版本。
 
+## CI
+
+GitHub Actions（[`.github/workflows/ci.yml`](../.github/workflows/ci.yml)）會在每個 pull request、
+推送到 `main` 時執行，也可以手動觸發：
+
+| Job          | 執行環境             | 檢查內容                                                                         |
+| ------------ | -------------------- | -------------------------------------------------------------------------------- |
+| `pre-commit` | Ubuntu               | `pre-commit run --all-files`（YAML、空白字元、gitleaks、markdownlint、prettier） |
+| `make test`  | Ubuntu 與 macOS      | 搭配 sops 與 python3 3.12 執行 `make test`，再以 `--no-default-features` 建置    |
+| `MSRV`       | Ubuntu、Rust 1.89    | 以 Cargo.toml 的 `rust-version` 執行 `cargo check --all-targets`                 |
+| `make e2e`   | Ubuntu，在測試通過後 | 對 amd64 的 Arch 映像檔執行 `make e2e`；出現 `skip`（沒有 docker）時該 job 失敗  |
+
+各個 action 都以 commit SHA 固定版本，sops 則是固定版本的 release，並比對其 SHA-256（`.github/install-sops.sh`）。
+會寫入登入 keychain 的測試維持 `#[ignore]`，不在 CI 中執行。
+
 anvil 刻意偏離設計 issue 之處，列在[偏離設計之處](deviations.zh-TW.md)。
 
 ## 文件
