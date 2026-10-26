@@ -100,7 +100,7 @@ with `sudo -n`. When sudo asks for a password, name a secret that holds it, `sud
 terminal and types the password once at sudo's prompt. Without one, such a target fails with `packages: ...`.
 NOPASSWD and `root` targets never use the password. `anvil doctor` checks those secrets and shows the manager each
 target resolves to, as a `manager` row, and fails when one cannot be resolved. The exact commands and rules are in
-[docs/cli.md](docs/cli.md#packages).
+[docs/packages.md](docs/packages.md).
 
 ### Secrets
 
@@ -126,7 +126,7 @@ anvil secret --migrate --to age   # copies every secret, checks the copy, sets b
 The migration replaces whatever the target held, leaves the old store as it was, and rewrites config.toml without its
 comments. An age or sops store is decrypted before anything else happens, so a wrong key fails up front; an identity
 with a passphrase has its passphrase asked for on the terminal, and without one the store reports `locked`. Setup for
-each backend, the passphrase prompt and the sops environment are in [docs/cli.md](docs/cli.md#secret-backends).
+each backend, the passphrase prompt and the sops environment are in [docs/secrets.md](docs/secrets.md#secret-backends).
 
 ## Output
 
@@ -241,7 +241,7 @@ anvil tui                  # or: anvil tui --target linode1
 the secrets. Doctor, apply, and edit show one section per tab. `←` and `→` switch tabs.
 `[` and `]` still switch history. `?` lists every key and `q` quits. The editor, ssh's password prompt and the age
 passphrase prompt (also during `m`) get the real terminal while they run. The key table and the rules are
-in [docs/cli.md](docs/cli.md#anvil-tui). The TUI is the default-on cargo feature `tui`; `cargo install --path .
+in [docs/tui.md](docs/tui.md#keys). The TUI is the default-on cargo feature `tui`; `cargo install --path .
 --no-default-features` builds anvil without it.
 
 ## Logging and exit codes
@@ -288,7 +288,7 @@ contents are never logged.
   echo off, and never puts it in argv, the environment, a file, a log line or an error. As a backstop, step output (and
   so `--json`) has any occurrence of a password of 8 bytes or more replaced with `***`; a shorter one is not scrubbed.
   sudo must show anvil's own prompt; a PAM prompt of another kind (2FA, fingerprint) fails the target after 15 s. See
-  [docs/cli.md](docs/cli.md#typing-the-sudo-password).
+  [docs/packages.md](docs/packages.md#typing-the-sudo-password).
 
 ## Development
 
