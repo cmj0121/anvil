@@ -145,10 +145,6 @@ pub fn verify_where(config: &Config, keep: impl Fn(&Plugin) -> bool) -> Result<P
 
 /// [`verify_where`], but each entry `keep` accepts on its own: one that
 /// fails keeps its error and the others are still checked.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "doctor verifies from #19 U5 on")
-)]
 pub fn verify_each(
     config: &Config,
     keep: impl Fn(&Plugin) -> bool,
@@ -367,10 +363,6 @@ const MAX_FINDING_TEXT: usize = 256;
 
 /// What a doctor plugin reads on stdin, as one line of JSON. Each sha256 is
 /// replaced by its [`tag`].
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "doctor runs plugins from #19 U5 on")
-)]
 #[derive(Debug, Serialize)]
 pub struct DoctorRequest<'a> {
     pub target: &'a str,
@@ -385,10 +377,6 @@ pub struct DoctorRequest<'a> {
 }
 
 /// What doctor found at a recorded dest; `tag` only for a `file`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "doctor runs plugins from #19 U5 on")
-)]
 #[derive(Debug, Serialize)]
 pub struct CurrentFile {
     pub dest: String,
@@ -448,7 +436,6 @@ pub const FILE_WORDS: &[&str] = &[
 /// Runs the doctor plugin `pin` with `request`, whose `last_apply` lists
 /// `dests`, and returns its checked findings. More than
 /// [`MAX_FILES`] dests is this plugin's error on this target.
-#[expect(dead_code, reason = "doctor runs plugins from #19 U5 on")]
 pub fn run_doctor(
     pin: &Pin,
     request: &DoctorRequest,
@@ -591,7 +578,6 @@ fn has_hex_run(s: &str) -> bool {
 }
 
 /// A doctor run's key for [`tag`]: 32 bytes of `/dev/urandom`.
-#[cfg_attr(not(test), expect(dead_code, reason = "doctor tags from #19 U5 on"))]
 pub fn tag_key() -> io::Result<Zeroizing<[u8; 32]>> {
     let mut key = Zeroizing::new([0; 32]);
     fs::File::open("/dev/urandom")?.read_exact(&mut key[..])?;
@@ -600,7 +586,6 @@ pub fn tag_key() -> io::Result<Zeroizing<[u8; 32]>> {
 
 /// What a doctor plugin sees in place of the sha256 `sha256_hex`: the
 /// lowercase hex HMAC-SHA256 of it under this run's `key`.
-#[cfg_attr(not(test), expect(dead_code, reason = "doctor tags from #19 U5 on"))]
 pub fn tag(key: &[u8; 32], sha256_hex: &str) -> String {
     files::hex(&hmac_sha256(key, sha256_hex.as_bytes()))
 }

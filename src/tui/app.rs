@@ -1435,6 +1435,8 @@ pub mod tests {
             manager: None,
             manager_error: None,
             transport: format!("ssh {target}"),
+            plugins: Vec::new(),
+            drift: None,
         }
     }
 
@@ -1444,6 +1446,9 @@ pub mod tests {
             sh: true,
             editor: Ok("/usr/bin/vi".into()),
             secrets: [("API".to_owned(), doctor::SecretStatus::Missing)].into(),
+            plugins: Default::default(),
+            record: None,
+            tag_key: None,
         }
     }
 
@@ -1920,6 +1925,7 @@ pub mod tests {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", Some("timeout"))],
             ok: false,
+            cancelled: false,
         }));
         app.on_msg(Msg::Finished(Ok(())));
         assert!(app.running.is_none());
@@ -2816,6 +2822,7 @@ pub mod tests {
             local: local_report(),
             targets,
             ok: true,
+            cancelled: false,
         }));
     }
 
@@ -2978,6 +2985,7 @@ pub mod tests {
                 probed("extra", None),
             ],
             ok: false,
+            cancelled: false,
         }));
         assert_eq!(shown.tab, 2, "mac stays on screen; checks is tab 0");
         assert!(matches!(
@@ -2992,6 +3000,7 @@ pub mod tests {
             local: local_report(),
             targets: vec![probed("mac", None)],
             ok: true,
+            cancelled: false,
         }));
         assert_eq!(
             gone.tab, 0,
@@ -3017,6 +3026,7 @@ pub mod tests {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", None)],
             ok: true,
+            cancelled: false,
         }));
         assert_eq!((app.shown, app.tab), (Some(0), 0));
         assert!(matches!(

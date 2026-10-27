@@ -908,7 +908,6 @@ impl Captured {
 }
 
 /// What [`hash_script`] found at one dest.
-#[cfg_attr(not(test), expect(dead_code, reason = "doctor hashes from #19 U5 on"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileState {
@@ -961,7 +960,6 @@ impl FileState {
 
 /// A dest to hash, and whether the write runs as root (a root login or a
 /// `sudo` entry), so the hash does too, after the write's root checks.
-#[cfg_attr(not(test), expect(dead_code, reason = "doctor hashes from #19 U5 on"))]
 #[derive(Debug, Clone, Copy)]
 pub struct HashDest<'a> {
     pub dest: &'a str,
@@ -969,7 +967,6 @@ pub struct HashDest<'a> {
 }
 
 /// The lines [`hash_script`] prints start with this.
-#[cfg_attr(not(test), expect(dead_code, reason = "doctor hashes from #19 U5 on"))]
 const HASH_MARK: &str = "anvil-hash ";
 
 /// The whole hash run for one target: one `anvil-hash I STATE [HEX]` line
@@ -986,14 +983,12 @@ const HASH_MARK: &str = "anvil-hash ";
 /// only ever a quoted
 /// argument, never printed, so its name cannot forge a line; the run reads
 /// no bytes but the hash tool's.
-#[cfg_attr(not(test), expect(dead_code, reason = "doctor hashes from #19 U5 on"))]
 pub(crate) fn hash_script(dests: &[HashDest], sudo: &str) -> Result<String, String> {
     hash_run(dests, sudo, Path::new("/"), "0")
 }
 
 /// [`hash_script`] with the as-root directory checks from `top` down, each
 /// owned by `owner`.
-#[cfg_attr(not(test), expect(dead_code, reason = "doctor hashes from #19 U5 on"))]
 fn hash_run(dests: &[HashDest], sudo: &str, top: &Path, owner: &str) -> Result<String, String> {
     let setup = format!(
         "umask 077; LC_ALL=C; export LC_ALL; set -f\n{hash}{state}",
@@ -1142,7 +1137,6 @@ else anvil_state \"$2\" \"$3\"; fi
 /// cannot be searched, then `not_regular`, else its hash through [`HASH`].
 /// `anvil_hidden FILE` walks up from FILE to the first directory it can
 /// enter (FILE was missing: absent), or one it cannot (unreadable).
-#[cfg_attr(not(test), expect(dead_code, reason = "doctor hashes from #19 U5 on"))]
 const HASH_STATE: &str = "anvil_hidden() {
 anvil_p=$1
 while :; do
@@ -1171,7 +1165,6 @@ fi
 /// the first `anvil-hash ` line are skipped; from it on, each index must
 /// come exactly once with a known state, `file` with a 64 hex sha256 and
 /// the others with none.
-#[cfg_attr(not(test), expect(dead_code, reason = "doctor hashes from #19 U5 on"))]
 pub(crate) fn parse_hashes(
     count: usize,
     stdout: &[u8],

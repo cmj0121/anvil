@@ -2997,6 +2997,7 @@ mod tests {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", Some("down"))],
             ok: false,
+            cancelled: false,
         }));
         let rows = results(&shown, 12);
         assert_eq!(rows[0], "✔ local checks  ✔ pi  [✘ mac]");
@@ -3015,6 +3016,7 @@ mod tests {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", None)],
             ok: true,
+            cancelled: false,
         }));
         assert_eq!((older.shown, older.tab), (Some(0), 0));
         let rows = results(&older, 10);

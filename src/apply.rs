@@ -699,10 +699,12 @@ pub(crate) fn cancelled(command: &str, target: &Target, steps: Vec<StepReport>) 
 }
 
 /// Whether apply probes each target: `[packages]` has work, a step is a
-/// plugin, or there are `[[files]]` or `[[services]]`.
+/// plugin, a doctor plugin is configured (its drift needs the facts), or
+/// there are `[[files]]` or `[[services]]`.
 fn needs_facts(config: &Config) -> bool {
     package_work(config).is_some()
         || config.steps.iter().any(|s| s.plugin.is_some())
+        || config.plugins.values().any(Plugin::is_doctor)
         || !config.files.is_empty()
         || !config.services.is_empty()
 }
