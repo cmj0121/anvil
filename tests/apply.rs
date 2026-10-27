@@ -415,7 +415,16 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
             "the temp name is not logged before the stage: {}",
             text(&out.stderr)
         );
-        assert_eq!(temp_files(), before, "no temp file left");
+        // Other tests in this binary stage and remove their own temp files at the
+        // same time, so a new name may be theirs: only one that stays fails.
+        let gone = (0..20).any(|_| {
+            let left = temp_files().iter().any(|name| !before.contains(name));
+            if left {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            !left
+        });
+        assert!(gone, "no temp file left: {:?}", temp_files());
     };
 
     let out = apply(&["-vvv"], common::VALUE);
