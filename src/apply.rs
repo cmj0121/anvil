@@ -1042,8 +1042,7 @@ fn render_summary(ok: usize, failed: usize, style: Style) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::config::{FileEntry, ModeValue, ServiceEntry, Step};
@@ -1054,36 +1053,36 @@ mod tests {
     /// exits 3, anything else echoes `<script>-out`; every script is
     /// recorded in the shared log.
     struct Fake {
-        log: Rc<RefCell<Vec<String>>>,
+        log: Arc<Mutex<Vec<String>>>,
         /// Returned from the run after `succeed` scripts have run.
         fail_with: Option<TransportError>,
         succeed: usize,
         probe: &'static str,
         probe_code: Option<i32>,
         /// The password of each `run_tty`, which logs its script too.
-        typed: Rc<RefCell<Vec<Vec<u8>>>>,
+        typed: Arc<Mutex<Vec<Vec<u8>>>>,
         /// Returned from `run_tty`.
         tty_fail: Option<TransportError>,
         /// The timeout of each `run` and `run_tty`, in order.
-        timeouts: Rc<RefCell<Vec<Duration>>>,
+        timeouts: Arc<Mutex<Vec<Duration>>>,
         /// A `run` script containing the text prints `shell-err` on stderr
         /// and exits with the code.
         exits: &'static [(&'static str, i32)],
         /// Set once a `run` script containing the text has run.
-        cancel_on: Option<(&'static str, Rc<AtomicBool>)>,
+        cancel_on: Option<(&'static str, Arc<AtomicBool>)>,
     }
 
     impl Fake {
-        fn new(log: &Rc<RefCell<Vec<String>>>) -> Fake {
+        fn new(log: &Arc<Mutex<Vec<String>>>) -> Fake {
             Fake {
-                log: Rc::clone(log),
+                log: Arc::clone(log),
                 fail_with: None,
                 succeed: 0,
                 probe: "",
                 probe_code: Some(0),
-                typed: Rc::default(),
+                typed: Arc::default(),
                 tty_fail: None,
-                timeouts: Rc::default(),
+                timeouts: Arc::default(),
                 exits: &[],
                 cancel_on: None,
             }
@@ -1096,9 +1095,9 @@ mod tests {
         }
 
         fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
-            self.timeouts.borrow_mut().push(timeout);
+            self.timeouts.lock().unwrap().push(timeout);
             let ran = {
-                let mut log = self.log.borrow_mut();
+                let mut log = self.log.lock().unwrap();
                 log.push(script.to_owned());
                 log.len()
             };
@@ -1149,9 +1148,9 @@ mod tests {
             password: &[u8],
             timeout: Duration,
         ) -> Result<Output, TransportError> {
-            self.timeouts.borrow_mut().push(timeout);
-            self.log.borrow_mut().push(script.to_owned());
-            self.typed.borrow_mut().push(password.to_vec());
+            self.timeouts.lock().unwrap().push(timeout);
+            self.log.lock().unwrap().push(script.to_owned());
+            self.typed.lock().unwrap().push(password.to_vec());
             match &self.tty_fail {
                 Some(err) => Err(err.clone()),
                 None => Ok(Output {
@@ -1203,7 +1202,7 @@ mod tests {
         succeed: usize,
         fail_with: Option<TransportError>,
     ) -> (TargetReport, Vec<String>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             fail_with,
             succeed,
@@ -1218,8 +1217,25 @@ mod tests {
             &Passwords::new(),
             &AtomicBool::new(false),
         );
-        let runs = log.borrow().clone();
+        let runs = log.lock().unwrap().clone();
         (report, runs)
+    }
+
+    #[test]
+    fn the_runner_inputs_are_shareable_across_threads() {
+        fn assert_sync<T: Sync + ?Sized>() {}
+        fn assert_send<T: Send>() {}
+        assert_sync::<Target>();
+        assert_sync::<Config>();
+        assert_sync::<Sources>();
+        assert_sync::<dyn Plugins>();
+        assert_sync::<plugin::Pins>();
+        assert_sync::<Passwords>();
+        assert_sync::<Options>();
+        assert_sync::<AtomicBool>();
+        assert_sync::<FakePlugins>();
+        assert_send::<TargetReport>();
+        assert_send::<crate::plan::PlanReport>();
     }
 
     /// Neither stream is a terminal, as under a pipe or in CI.
@@ -1608,8 +1624,8 @@ mod tests {
 
     /// Like [`Fake`], but running `stop` sets the shared cancel flag.
     struct Stopper {
-        log: Rc<RefCell<Vec<String>>>,
-        cancel: Rc<AtomicBool>,
+        log: Arc<Mutex<Vec<String>>>,
+        cancel: Arc<AtomicBool>,
     }
 
     impl Transport for Stopper {
@@ -1618,7 +1634,7 @@ mod tests {
         }
 
         fn run(&self, script: &str, _timeout: Duration) -> Result<Output, TransportError> {
-            self.log.borrow_mut().push(script.to_owned());
+            self.log.lock().unwrap().push(script.to_owned());
             if script == "stop" {
                 self.cancel.store(true, Ordering::Relaxed);
             }
@@ -1647,16 +1663,16 @@ mod tests {
         runs: &[&str],
         cancelled: bool,
     ) -> (Report, Vec<String>, Vec<String>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let cancel = Rc::new(AtomicBool::new(cancelled));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cancel = Arc::new(AtomicBool::new(cancelled));
         let targets: Vec<Target> = names.iter().map(|name| target(name)).collect();
         let mut events = Vec::new();
         let report = apply_targets(
             &targets,
             |_| {
                 Ok(Box::new(Stopper {
-                    log: Rc::clone(&log),
-                    cancel: Rc::clone(&cancel),
+                    log: Arc::clone(&log),
+                    cancel: Arc::clone(&cancel),
                 }))
             },
             &config(None, runs),
@@ -1673,7 +1689,7 @@ mod tests {
                 })
             },
         );
-        let runs = log.borrow().clone();
+        let runs = log.lock().unwrap().clone();
         (report, runs, events)
     }
 
@@ -1766,7 +1782,7 @@ mod tests {
         probe: &'static str,
         runs: &[&str],
     ) -> (TargetReport, Vec<String>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             probe,
             ..Fake::new(&log)
@@ -1780,7 +1796,7 @@ mod tests {
             &Passwords::new(),
             &AtomicBool::new(false),
         );
-        let runs = log.borrow().clone();
+        let runs = log.lock().unwrap().clone();
         (report, runs)
     }
 
@@ -1843,7 +1859,7 @@ mod tests {
 
     #[test]
     fn a_probe_exiting_non_zero_fails_the_target() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let report = apply_target(
             &target("box"),
             Ok(Box::new(Fake {
@@ -1857,7 +1873,7 @@ mod tests {
             &Passwords::new(),
             &AtomicBool::new(false),
         );
-        assert_eq!(*log.borrow(), [facts::PROBE]);
+        assert_eq!(*log.lock().unwrap(), [facts::PROBE]);
         assert_eq!(
             json(&report),
             serde_json::json!({"target": "box", "error": "packages: probe exited 2", "ok": false})
@@ -1888,7 +1904,7 @@ mod tests {
             assert_eq!(screen(&report, piped()), format!("▶ box\n  ✘ {error}\n\n"));
         }
 
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let report = apply_target(
             &target("box"),
             Ok(Box::new(Fake {
@@ -1901,7 +1917,7 @@ mod tests {
             &Passwords::new(),
             &AtomicBool::new(false),
         );
-        assert_eq!(*log.borrow(), [facts::PROBE]);
+        assert_eq!(*log.lock().unwrap(), [facts::PROBE]);
         assert_eq!(
             json(&report),
             serde_json::json!({"target": "box", "error": TransportError::HostKey.to_string(), "ok": false}),
@@ -1918,14 +1934,14 @@ mod tests {
         runs: &[&str],
         cancelled: bool,
     ) -> (Report, Vec<String>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let next = RefCell::new(probes.iter());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let next = Mutex::new(probes.iter());
         let targets: Vec<Target> = names.iter().map(|name| target(name)).collect();
         let report = apply_targets(
             &targets,
             |_| {
                 Ok(Box::new(Fake {
-                    probe: next.borrow_mut().next().unwrap(),
+                    probe: next.lock().unwrap().next().unwrap(),
                     ..Fake::new(&log)
                 }))
             },
@@ -1936,7 +1952,7 @@ mod tests {
             &AtomicBool::new(cancelled),
             &mut |_| {},
         );
-        let runs = log.borrow().clone();
+        let runs = log.lock().unwrap().clone();
         (report, runs)
     }
 
@@ -1976,7 +1992,7 @@ mod tests {
         assert!(runs.is_empty());
         assert_eq!(report.targets[0].failure().as_deref(), Some("cancelled"));
 
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let report = apply_target(
             &target("a"),
             Ok(Box::new(Fake::new(&log))),
@@ -1986,7 +2002,7 @@ mod tests {
             &Passwords::new(),
             &AtomicBool::new(true),
         );
-        assert!(log.borrow().is_empty(), "the probe does not run");
+        assert!(log.lock().unwrap().is_empty(), "the probe does not run");
         assert_eq!(
             report,
             TargetReport::Cancelled {
@@ -2032,13 +2048,13 @@ mod tests {
         password: Option<&[u8]>,
         tty_fail: Option<TransportError>,
     ) -> (TargetReport, Vec<String>, Vec<Vec<u8>>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             probe,
             tty_fail,
             ..Fake::new(&log)
         };
-        let typed = Rc::clone(&fake.typed);
+        let typed = Arc::clone(&fake.typed);
         let report = apply_target(
             &target("local"),
             Ok(Box::new(fake)),
@@ -2048,8 +2064,8 @@ mod tests {
             &local_passwords(password),
             &AtomicBool::new(false),
         );
-        let runs = log.borrow().clone();
-        let typed = typed.borrow().clone();
+        let runs = log.lock().unwrap().clone();
+        let typed = typed.lock().unwrap().clone();
         (report, runs, typed)
     }
 
@@ -2066,13 +2082,13 @@ mod tests {
                 Some(_) => local_sudo(pkgs.clone()),
             };
             let passwords = local_passwords(password);
-            let log = Rc::new(RefCell::new(Vec::new()));
+            let log = Arc::new(Mutex::new(Vec::new()));
             let fake = Fake {
                 probe,
                 ..Fake::new(&log)
             };
-            let timeouts = Rc::clone(&fake.timeouts);
-            let typed = Rc::clone(&fake.typed);
+            let timeouts = Arc::clone(&fake.timeouts);
+            let typed = Arc::clone(&fake.typed);
             let report = apply_target(
                 &target("local"),
                 Ok(Box::new(fake)),
@@ -2083,9 +2099,9 @@ mod tests {
                 &AtomicBool::new(false),
             );
             assert!(report.ok(), "{probe}");
-            assert_eq!(typed.borrow().len(), usize::from(password.is_some()));
+            assert_eq!(typed.lock().unwrap().len(), usize::from(password.is_some()));
             assert_eq!(
-                *timeouts.borrow(),
+                *timeouts.lock().unwrap(),
                 [RUN_TIMEOUT, package_step, RUN_TIMEOUT, RUN_TIMEOUT],
                 "{probe}"
             );
@@ -2237,7 +2253,7 @@ mod tests {
 
     #[test]
     fn a_timed_out_probe_shows_no_step() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             fail_with: Some(TransportError::Timeout {
                 after: RUN_TIMEOUT,
@@ -2425,7 +2441,7 @@ mod tests {
         );
         assert_eq!(runs[1].run, crate::run::wrap("hostname"));
         assert_eq!(
-            *plugins.seen.borrow(),
+            *plugins.seen.lock().unwrap(),
             [(
                 "harden".to_owned(),
                 serde_json::json!({
@@ -2448,7 +2464,7 @@ mod tests {
             &cancel,
         )
         .unwrap();
-        let (_, request) = &plugins.seen.borrow()[0];
+        let (_, request) = &plugins.seen.lock().unwrap()[0];
         assert_eq!(request["tags"], serde_json::json!([]));
         assert_eq!(request["args"], serde_json::json!({}), "no args is {{}}");
     }
@@ -2474,7 +2490,7 @@ mod tests {
 
     #[test]
     fn a_plugin_only_config_probes_then_runs_the_returned_script() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let report = apply_target(
             &target("box"),
             Ok(Box::new(Fake {
@@ -2487,7 +2503,7 @@ mod tests {
             &Passwords::new(),
             &AtomicBool::new(false),
         );
-        assert_eq!(*log.borrow(), [facts::PROBE, "{ :\nhostname\n}\n"]);
+        assert_eq!(*log.lock().unwrap(), [facts::PROBE, "{ :\nhostname\n}\n"]);
         assert!(report.ok());
         assert_eq!(
             report.steps()[0].run,
@@ -2498,7 +2514,7 @@ mod tests {
 
     #[test]
     fn a_plugin_failure_fails_only_its_target_before_any_of_its_steps() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let error = "plugin harden: exited 3: no profile";
         let plugins = FakePlugins::new(move |_, request| match request.target {
             "a" => Err(error.to_owned()),
@@ -2521,7 +2537,7 @@ mod tests {
         );
         let wrapped = crate::run::wrap("hostname");
         assert_eq!(
-            *log.borrow(),
+            *log.lock().unwrap(),
             [facts::PROBE, facts::PROBE, "one", wrapped.as_str()],
             "a ran only its probe"
         );
@@ -2534,9 +2550,9 @@ mod tests {
 
     #[test]
     fn cancel_before_a_plugin_step_spawns_nothing_more() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let cancel = Rc::new(AtomicBool::new(false));
-        let stop = Rc::clone(&cancel);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
         // Cancelled while the first plugin runs: the second never starts.
         let plugins = FakePlugins::new(move |_, _| {
             stop.store(true, Ordering::Relaxed);
@@ -2556,12 +2572,13 @@ mod tests {
         );
         let seen: Vec<String> = plugins
             .seen
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
         assert_eq!(seen, ["harden"]);
-        assert_eq!(*log.borrow(), [facts::PROBE], "no step ran");
+        assert_eq!(*log.lock().unwrap(), [facts::PROBE], "no step ran");
         assert_eq!(
             report,
             TargetReport::Cancelled {
@@ -2596,7 +2613,7 @@ mod tests {
                 "probe: probe output has no end marker",
             ),
         ] {
-            let log = Rc::new(RefCell::new(Vec::new()));
+            let log = Arc::new(Mutex::new(Vec::new()));
             let report = apply_target(
                 &target("box"),
                 Ok(Box::new(Fake {
@@ -2610,7 +2627,7 @@ mod tests {
                 &Passwords::new(),
                 &AtomicBool::new(false),
             );
-            assert_eq!(*log.borrow(), [facts::PROBE]);
+            assert_eq!(*log.lock().unwrap(), [facts::PROBE]);
             assert_eq!(report.failure().as_deref(), Some(error));
         }
     }
@@ -2653,8 +2670,8 @@ mod tests {
 
     #[test]
     fn apply_targets_hands_each_target_its_own_secret() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let typed = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let typed = Arc::new(Mutex::new(Vec::new()));
         let mut a = target("a");
         a.sudo_secret = Some("A_SUDO".to_owned());
         let mut b = target("b");
@@ -2676,7 +2693,7 @@ mod tests {
             |_| {
                 Ok(Box::new(Fake {
                     probe: ARCH_SUDO,
-                    typed: Rc::clone(&typed),
+                    typed: Arc::clone(&typed),
                     ..Fake::new(&log)
                 }))
             },
@@ -2687,7 +2704,7 @@ mod tests {
             &AtomicBool::new(false),
             &mut |_| {},
         );
-        assert_eq!(*typed.borrow(), [&b"pw-local"[..], b"pw-a"]);
+        assert_eq!(*typed.lock().unwrap(), [&b"pw-local"[..], b"pw-a"]);
         assert_eq!(report.counts(), (2, 1));
         assert_eq!(
             report.targets[2].failure().unwrap(),
@@ -2816,12 +2833,12 @@ mod tests {
         probe: &'static str,
         passwords: &Passwords,
     ) -> (TargetReport, Vec<String>, Vec<Vec<u8>>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             probe,
             ..Fake::new(&log)
         };
-        let typed = Rc::clone(&fake.typed);
+        let typed = Arc::clone(&fake.typed);
         let report = apply_target(
             target,
             Ok(Box::new(fake)),
@@ -2831,8 +2848,8 @@ mod tests {
             passwords,
             &AtomicBool::new(false),
         );
-        let runs = log.borrow().clone();
-        let typed = typed.borrow().clone();
+        let runs = log.lock().unwrap().clone();
+        let typed = typed.lock().unwrap().clone();
         (report, runs, typed)
     }
 
@@ -2945,16 +2962,16 @@ mod tests {
     /// as `ARCH_SUDO`, with `LOCAL_SUDO` holding `password` (unset when
     /// `None`); returns the report, the scripts run and the passwords typed.
     fn apply_password_file(
-        log: &Rc<RefCell<Vec<String>>>,
+        log: &Arc<Mutex<Vec<String>>>,
         fake: Fake,
         password: Option<&[u8]>,
     ) -> (TargetReport, Vec<String>, Vec<Vec<u8>>) {
         let (local, config) = password_file();
-        let typed = Rc::clone(&fake.typed);
+        let typed = Arc::clone(&fake.typed);
         let cancel = fake
             .cancel_on
             .as_ref()
-            .map_or_else(Rc::default, |(_, flag)| Rc::clone(flag));
+            .map_or_else(Arc::default, |(_, flag)| Arc::clone(flag));
         let report = apply_target(
             &local,
             Ok(Box::new(Fake {
@@ -2967,8 +2984,8 @@ mod tests {
             &local_passwords(password),
             &cancel,
         );
-        let runs = log.borrow().clone();
-        let typed = typed.borrow().clone();
+        let runs = log.lock().unwrap().clone();
+        let typed = typed.lock().unwrap().clone();
         (report, runs, typed)
     }
 
@@ -2984,7 +3001,7 @@ mod tests {
 
     #[test]
     fn a_password_file_is_staged_then_installed_on_a_terminal_then_removed() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let (report, runs, typed) =
             apply_password_file(&log, Fake::new(&log), Some(PASSWORD.as_bytes()));
         assert!(report.ok(), "{report:?}");
@@ -3021,7 +3038,7 @@ mod tests {
 
     #[test]
     fn a_failed_stage_installs_nothing_and_still_removes_the_temp_file() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             exits: &[("set -C", 1)],
             ..Fake::new(&log)
@@ -3042,7 +3059,7 @@ mod tests {
         temp_of(&runs[2]);
         assert!(typed.is_empty());
 
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             fail_with: Some(TransportError::HostKey),
             succeed: 1,
@@ -3061,9 +3078,9 @@ mod tests {
 
     #[test]
     fn a_cancel_after_the_stage_removes_the_temp_file_and_installs_nothing() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
-            cancel_on: Some(("set -C", Rc::new(AtomicBool::new(false)))),
+            cancel_on: Some(("set -C", Arc::new(AtomicBool::new(false)))),
             ..Fake::new(&log)
         };
         let (report, runs, typed) = apply_password_file(&log, fake, Some(PASSWORD.as_bytes()));
@@ -3094,7 +3111,7 @@ mod tests {
             ),
             (timeout.clone(), timeout.to_string()),
         ] {
-            let log = Rc::new(RefCell::new(Vec::new()));
+            let log = Arc::new(Mutex::new(Vec::new()));
             let fake = Fake {
                 tty_fail: Some(err),
                 ..Fake::new(&log)
@@ -3110,7 +3127,7 @@ mod tests {
 
     #[test]
     fn a_cleanup_on_a_dead_transport_keeps_the_step_result() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         // The probe, the stage and the terminal run pass; the cleanup and
         // `one` hit the dead transport.
         let fake = Fake {
@@ -3133,7 +3150,7 @@ mod tests {
 
     #[test]
     fn an_unset_secret_fails_its_target_before_staging_and_the_others_run() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let (report, runs, _) = apply_password_file(&log, Fake::new(&log), None);
         assert_eq!(
             report.failure().unwrap(),
@@ -3144,7 +3161,7 @@ mod tests {
         let (local, config) = password_file();
         let mut unset = target("b");
         unset.sudo_secret = Some("B_SUDO".to_owned());
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let report = apply_targets(
             &[unset, local],
             |_| {
@@ -3250,12 +3267,12 @@ mod tests {
             ],
             &["one"],
         );
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             probe: ARCH_ROOT,
             ..Fake::new(&log)
         };
-        let timeouts = Rc::clone(&fake.timeouts);
+        let timeouts = Arc::clone(&fake.timeouts);
         let report = apply_target(
             &target("local"),
             Ok(Box::new(fake)),
@@ -3266,7 +3283,7 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert!(report.ok(), "{report:?}");
-        let runs = log.borrow().clone();
+        let runs = log.lock().unwrap().clone();
         assert_eq!(
             runs.len(),
             5,
@@ -3282,8 +3299,8 @@ mod tests {
         assert!(!runs[3].contains("sudo"), "root runs systemctl itself");
         assert_eq!(runs[4], "one");
         assert!(!runs.iter().any(|run| run.contains("cron")), "{runs:?}");
-        assert_eq!(timeouts.borrow()[3], services::SERVICE_TIMEOUT);
-        assert_eq!(timeouts.borrow()[4], RUN_TIMEOUT);
+        assert_eq!(timeouts.lock().unwrap()[3], services::SERVICE_TIMEOUT);
+        assert_eq!(timeouts.lock().unwrap()[4], RUN_TIMEOUT);
 
         let shown: Vec<(&str, bool)> = report
             .steps()
@@ -3364,13 +3381,13 @@ mod tests {
             ),
             (no_sudo, "services: needs root and sudo is not installed"),
         ] {
-            let log = Rc::new(RefCell::new(Vec::new()));
-            let next = RefCell::new([probe, ARCH_ROOT].into_iter());
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let next = Mutex::new([probe, ARCH_ROOT].into_iter());
             let report = apply_targets(
                 &[target("a"), target("b")],
                 |_| {
                     Ok(Box::new(Fake {
-                        probe: next.borrow_mut().next().unwrap(),
+                        probe: next.lock().unwrap().next().unwrap(),
                         ..Fake::new(&log)
                     }))
                 },
@@ -3384,7 +3401,7 @@ mod tests {
             assert_eq!(report.counts(), (1, 1), "{report:?}");
             assert_eq!(report.targets[0].failure().unwrap(), error);
             assert!(report.targets[0].steps().is_empty());
-            let runs = log.borrow().clone();
+            let runs = log.lock().unwrap().clone();
             assert_eq!(runs.len(), 4, "probe a; probe b, service, one: {runs:?}");
             assert_eq!(runs[3], "one");
         }
@@ -3414,7 +3431,7 @@ mod tests {
             ],
             &["one"],
         );
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let report = apply_target(
             &target("local"),
             Ok(Box::new(Fake {
@@ -3435,7 +3452,7 @@ mod tests {
             (steps[0].run.as_str(), steps[0].code),
             ("service sshd", Some(1))
         );
-        assert_eq!(log.borrow().len(), 2, "cron and one never run");
+        assert_eq!(log.lock().unwrap().len(), 2, "cron and one never run");
     }
 
     /// Applies one `sshd` entry to `local`, whose sudo asks for a password
@@ -3451,13 +3468,13 @@ mod tests {
             vec![service_entry("sshd", "started", Some(true), &[])],
             &["one"],
         );
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             probe: ARCH_SUDO,
             tty_fail,
             ..Fake::new(&log)
         };
-        let typed = Rc::clone(&fake.typed);
+        let typed = Arc::clone(&fake.typed);
         let report = apply_target(
             &local,
             Ok(Box::new(fake)),
@@ -3467,8 +3484,8 @@ mod tests {
             &local_passwords(password),
             &AtomicBool::new(false),
         );
-        let runs = log.borrow().clone();
-        let typed = typed.borrow().clone();
+        let runs = log.lock().unwrap().clone();
+        let typed = typed.lock().unwrap().clone();
         (report, runs, typed, config)
     }
 

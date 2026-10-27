@@ -88,7 +88,7 @@ struct Reply {
 
 /// Turns a plugin step into the script it runs; the error is the target's
 /// failure, as `plugin <name>: <reason>`.
-pub trait Plugins {
+pub trait Plugins: Sync {
     fn script(&self, name: &str, request: &Request) -> Result<String, String>;
 }
 

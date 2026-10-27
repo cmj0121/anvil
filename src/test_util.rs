@@ -1,10 +1,11 @@
 //! Helpers shared by the unit tests.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::Serialize;
 
@@ -133,20 +134,22 @@ pub fn write_knobs(path: &Path, vars: &[(&str, &str)]) {
 }
 
 /// How [`FakePlugins`] replies to plugin `name`.
-type Reply = dyn Fn(&str, &Request) -> Result<String, String>;
+type Reply = dyn Fn(&str, &Request) -> Result<String, String> + Send + Sync;
 
 /// Plugins that reply as `reply` says, recording each call's plugin name
 /// and request.
 pub struct FakePlugins {
     reply: Box<Reply>,
-    pub seen: RefCell<Vec<(String, serde_json::Value)>>,
+    pub seen: Mutex<Vec<(String, serde_json::Value)>>,
 }
 
 impl FakePlugins {
-    pub fn new(reply: impl Fn(&str, &Request) -> Result<String, String> + 'static) -> FakePlugins {
+    pub fn new(
+        reply: impl Fn(&str, &Request) -> Result<String, String> + Send + Sync + 'static,
+    ) -> FakePlugins {
         FakePlugins {
             reply: Box::new(reply),
-            seen: RefCell::default(),
+            seen: Mutex::default(),
         }
     }
 
@@ -159,7 +162,8 @@ impl FakePlugins {
 impl Plugins for FakePlugins {
     fn script(&self, name: &str, request: &Request) -> Result<String, String> {
         self.seen
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((name.to_owned(), json(request)));
         (self.reply)(name, request)
     }

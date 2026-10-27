@@ -268,8 +268,7 @@ fn render_summary(targets: usize, failed: usize, style: Style) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::config::Step;
@@ -285,7 +284,7 @@ mod tests {
     /// Records every script; the probe prints `probe`, anything else would
     /// be a step that ran.
     struct Recorder {
-        log: Rc<RefCell<Vec<String>>>,
+        log: Arc<Mutex<Vec<String>>>,
         probe: &'static str,
     }
 
@@ -299,7 +298,7 @@ mod tests {
             script: &str,
             _timeout: std::time::Duration,
         ) -> Result<Output, TransportError> {
-            self.log.borrow_mut().push(script.to_owned());
+            self.log.lock().unwrap().push(script.to_owned());
             Ok(Output {
                 stdout: self.probe.as_bytes().to_vec(),
                 code: Some(0),
@@ -313,7 +312,7 @@ mod tests {
             _password: &[u8],
             _timeout: std::time::Duration,
         ) -> Result<Output, TransportError> {
-            self.log.borrow_mut().push(script.to_owned());
+            self.log.lock().unwrap().push(script.to_owned());
             Ok(Output::default())
         }
     }
@@ -404,7 +403,7 @@ mod tests {
         plugins: &dyn Plugins,
         cancelled: bool,
     ) -> (Plan, Vec<String>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let targets: Vec<Target> = names.iter().map(|name| target(name)).collect();
         let mut events = Vec::new();
         let plan = plan_targets(
@@ -414,7 +413,7 @@ mod tests {
                     return Err(TransportError::HostKey);
                 }
                 Ok(Box::new(Recorder {
-                    log: Rc::clone(&log),
+                    log: Arc::clone(&log),
                     probe,
                 }))
             },
@@ -434,7 +433,7 @@ mod tests {
             .flat_map(|name| [format!("start {name}"), format!("done {name}")])
             .collect();
         assert_eq!(events, order, "start then done per target, in order");
-        let runs = log.borrow().clone();
+        let runs = log.lock().unwrap().clone();
         (plan, runs)
     }
 
@@ -668,7 +667,7 @@ mod tests {
         });
         let (plan, runs) = plan_with(&["a", "b"], None, ARCH_SUDO, &config, &plugins, false);
         assert_eq!(runs, [facts::PROBE, facts::PROBE], "no step ran");
-        assert_eq!(plugins.seen.borrow().len(), 2);
+        assert_eq!(plugins.seen.lock().unwrap().len(), 2);
         assert_eq!(
             screen(&plan.targets[0]),
             "▶ a\n  would $ one\n  would $ hostname … (from plugin harden)\n  ✔ 2 steps\n\n"
