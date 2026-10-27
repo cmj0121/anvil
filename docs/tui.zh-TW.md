@@ -43,10 +43,11 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
   顯示中的結果正在執行時，它的 spinner 與正在執行的 target（`· ⠙ linode1`）會出現在 `targets:` 之前。
   右側的 `✔ ok  ✘ failed` 計算顯示中結果的 target。放不下的文字以 `…` 截斷。
   inventory 載入失敗時，選擇的位置改以紅色顯示 `inventory error`，錯誤本身則顯示為通知。
-- **Steps。** apply 會執行的 step，附編號：`[packages]` 有工作時為 `packages`，接著是每個 `[[steps]]` 的指令
-  （第一行，還有更多行時加上 `…`）；兩者都沒有的 config 執行預設的 `hostname` step。游標所在列標記為 `▶`。
+- **Steps。** apply 會執行的 step，附編號：`[packages]` 有工作時為 `packages`，接著是每個 `[[files]]` 項目的 `file DEST`
+  與每個 `[[services]]` 項目的 `service NAME`，然後是每個 `[[steps]]` 的指令
+  （第一行，還有更多行時加上 `…`）；沒有 `[[steps]]` 的 config 執行預設的 `hostname` step。游標所在列標記為 `▶`。
   在 apply 結果上，列表是該次執行載入的 config 的 step，每列依顯示中分頁的 target 標上記號：
-  `✔` 結束碼為 0，`✘` 結束碼非 0 或被終止，`⊘` 未執行（在失敗的 step 或取消之後）。
+  `✔` 結束碼為 0，`✘` 結束碼非 0 或被終止，`⊘` 未執行（在失敗的 step 或取消之後，或因 target 不符合而被略過的 file 或 service step）。
   傳輸錯誤結束 target 時，被它結束的 step 為 `✘`（尚未執行任何 step 時為第一個：連線或探測失敗），
   但若有逾時的 step 保留了輸出，則該列為 `✘`；其餘為 `⊘`。target 還沒有報告時（排隊中或執行中）每列皆為 `·`；
   正在執行的 target 在結束前沒有分頁，它的 spinner 在標頭與 Results 的最後一行。

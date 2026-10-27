@@ -78,8 +78,9 @@ anvil apply
 ```
 
 **Loading.** When `[packages]` has work to do and a selected target has a sudo secret, apply opens the secret store
-once, before any target runs, and reads each distinct secret; otherwise the store is not opened at all. A store that
-cannot be opened fails the command. One trailing `\n` of the value is trimmed; anything else stays. When the password
+once, before any target runs, and reads each distinct secret. A `[[files]]` or `[[services]]` entry may open it too
+([Files](configuration.md#files), [Service steps](cli.md#service-steps)); otherwise the store is not opened at all. A
+store that cannot be opened fails the command. One trailing `\n` of the value is trimmed; anything else stays. When the password
 is needed, a secret that is not set fails that target with `packages: secret NAME is not set`, and a value with a
 control character (any byte below 0x20, or 0x7f; a CRLF ending leaves a `\r`, which counts) fails it with
 `packages: secret NAME contains control characters`. The other targets still run.
@@ -135,7 +136,8 @@ replaced with `***`; a shorter one is not scrubbed. `-vv` logs which secret a ta
 - `sudo -v` creates a ticket that the steps' `sudo -n` use; with `Defaults timestamp_timeout=0` the ticket expires at
   once and the later `sudo -n` fails, so the step exits non-zero.
 - On Linux the local target needs util-linux `script`; busybox `script` has no `-e`, so the local run fails there.
-- Only the package step runs on a terminal; `[[steps]]` never get a password.
+- Only the package step, and a file or service step that takes the password path, run on a terminal; `[[steps]]`
+  never get a password.
 
 ## Aliases
 

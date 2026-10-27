@@ -55,6 +55,12 @@ mode = "0644"              # required, quoted
 tags = ["linode"]          # optional; the target must carry every tag
 facts = { distro = "arch" } # optional; pkg matches by list membership
 
+[[services]]               # optional; after files, before [[steps]]; see Services
+name = "sshd"              # the unit, OpenRC service or launchd label
+state = "started"          # required: started | stopped
+enabled = true             # optional; omit to leave enablement alone
+tags = ["linode"]          # optional; matched like [[files]]
+
 [[steps]]
 run = "hostname"           # placeholder: a POSIX sh script run on every target
 ```
@@ -156,6 +162,13 @@ mode = "0644"              # required: a quoted string of 3 or 4 octal digits
 tags = ["linode"]          # optional; every tag must be on the target
 facts = { distro = "arch" } # optional; each value equals that fact
 sudo = true                # optional; default true. false writes as the connecting user
+
+[[services]]               # optional; one service brought to a state per matching target; see Services
+name = "sshd"              # required: [A-Za-z0-9:_@.-]+, at most 255 bytes
+state = "started"          # required: "started" | "stopped"
+enabled = true             # optional; true enables, false disables, omitted leaves enablement alone
+tags = ["linode"]          # optional; every tag must be on the target
+facts = { distro = "arch" } # optional; each value equals that fact
 
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
@@ -354,6 +367,106 @@ dest 是目錄時 step 失敗並顯示 `files: DEST is a directory`（`/etc/a` �
 則是上層目錄的群組。`sudo = false` 時新檔案屬於連線使用者。
 `install`（密碼路徑）放上一個新檔案：它屬於 root、群組同上，舊檔案的 ACL 與 SELinux 標籤會被捨棄。
 `install` 會把 symlink 換成一般檔案；上面的 symlink 拒絕會先執行。
+
+## Services
+
+`[[services]]` 項目在每個 tag 與 fact 全部符合的選定 target 上，把一個服務帶到指定的狀態；設定了 `enabled` 時，也帶到該啟用狀態。
+它先詢問 target 的 init，只變更不同之處，因此服務已在該狀態時再次執行會印出 `unchanged service NAME`。
+符合的項目依 config 順序執行，排在 `[[files]]` step 之後、`[[steps]]` 之前；
+不符合的項目仍是一個 step，回報為 `skipped service NAME: no match`，該 target 的其他 step 仍會執行
+（[Service steps](cli.zh-TW.md#service-steps)）。
+
+```toml
+[[services]]
+name = "sshd"                    # required: the systemd unit, OpenRC service or launchd label
+state = "started"                # required: started | stopped
+enabled = true                   # optional; omit to leave enablement as it is
+tags = ["linode"]                # optional; [A-Za-z0-9_-]+; every one must be on the target
+facts = { distro = "arch" }      # optional; a probe key, equal to that fact
+```
+
+config 依此順序檢查，第一個失敗就以 2 結束。最多 64 個項目：多一個就是
+`services: N entries exceeds the 64 entry limit`（65 個時為 `services: 65 entries exceeds the 64 entry limit`）。
+接著依序檢查每個項目：名稱、狀態、tag 與 fact，最後是重複規則。
+未知的鍵、缺少或不是字串的 `name`，或不是布林值的 `enabled`，以 2 結束並顯示解析器的訊息，其中會指出該鍵與行號。
+下列訊息中引用的值會在 64 個字元處截斷（以 `…` 標示），控制字元則顯示為 `\x1b` 形式的跳脫序列。
+
+**`name`。** target 的 init 認得的服務名稱：systemd unit（`sshd` 或 `sshd.service`）、OpenRC 服務，或 launchd 的 job label
+（[Inits](#inits)）。至多 255 位元組（systemd 的 unit 名稱上限）；只能使用 `[A-Za-z0-9:_@.-]`；不得以 `-` 或 `.` 開頭；
+且不得以 `.target`、`.mount`、`.automount`、`.swap`、`.slice`、`.scope` 或 `.device` 結尾（這些 systemd unit 類型不是服務）。以 2 結束：
+
+- ``services[0].name `aaa…`: 256 bytes exceeds the 255 byte limit``（引用的名稱是前 64 個字元加上 `…`）
+- ``services[0].name `ss hd`: must match [A-Za-z0-9:_@.-]+``（空名稱也是）
+- ``services[0].name `-sshd`: must not start with - or .``
+- ``services[0].name `multi-user.target`: must name a service, not a .target``（訊息會指出該後綴）
+
+**`state`。** 必填：小寫的 `started` 或 `stopped`。以 2 結束：
+
+- `services[0].state: required`
+- ``services[0].state `running`: must be started or stopped``（`Started` 也是）
+
+**`enabled`。** 選填。`true` 讓服務開機時啟動，`false` 則停用。省略時，該項目在每個 init 上都不更動啟用狀態，只處理狀態。
+
+**`tags` 與 `facts`。** 規則與訊息同 [Files](#files)，前綴改為 `services[I]`：列出的每個 tag 都必須在 target 上，
+`local` target 帶有 `local`，列出的每個 fact 都必須等於探測的值，`pkg` 則依成員關係比對。
+沒有 `tags` 也沒有 `facts` 時符合每個選定的 target，包括 `local`。
+不在任何 target 上的 tag 什麼都不符合，因此每個 target 都顯示 `skipped service NAME: no match`。以 2 結束：
+
+- ``services[0].tags[1] `bad tag`: must match [A-Za-z0-9_-]+``
+- `services[0].facts.x: unknown fact; must be one of hostname, os, kernel, arch, distro, distro_version, user, shell,
+pkg, sudo`
+- `services[0].facts.distro: is empty`、`services[0].facts.distro: 257 bytes exceeds the 256 byte limit` 與
+  `services[0].facts.distro: contains a control character`
+
+**重複。** 名稱、tag（不論順序）與 fact 都和前面某個項目相同的項目以 2 結束：
+`services[2]: same name, tags and facts as services[0]`。
+同一個名稱、但 tag 或 fact 不同的項目是允許的。每個都是自己的 step，在兩者都符合的 target 上兩者都會執行，依 config 順序。
+兩者不一致時（一個 `started`、一個 `stopped`），後面的勝出，而每次 apply 服務都可能變更兩次。
+
+**root。** 每個 init 指令都需要 root，且沒有 `sudo` 鍵。`user` fact 為 `root` 的登入直接執行這些指令。
+其他登入則每個指令都透過 `sudo -n` 執行，sudo 要求密碼時以 target 的 sudo secret 輸入：
+host 的 `sudo_secret`，有 `[packages]` 時 `local` 則用 `[packages].local_sudo_secret`。
+有項目符合、卻沒有辦法取得 root 的 target，會在執行任何 step 之前失敗（[Service steps](cli.zh-TW.md#service-steps)）。
+
+### Inits
+
+init 依 target 的 `distro` fact 選擇：
+
+| `distro`                                           | Init               |
+| -------------------------------------------------- | ------------------ |
+| `macos`                                            | launchd            |
+| `alpine`                                           | OpenRC             |
+| `arch`, `archarm`, `manjaro`, `endeavouros`        | systemd            |
+| `debian`, `ubuntu`, `raspbian`, `linuxmint`, `pop` | systemd            |
+| `fedora`, `rhel`, `centos`, `rocky`, `almalinux`   | systemd            |
+| 其他任何值，或沒有 `distro`                        | 無：該 target 失敗 |
+
+systemd 的各列就是 `[packages]` 以 pacman、apt 或 dnf 安裝的發行版。這些是假設，不是檢查：
+
+- systemd 發行版以 systemd 開機。PID 1 不是 systemd 的容器預期會在第一個 `systemctl` 處讓 step 失敗，
+  並顯示 systemctl 自己的訊息；
+- Alpine 執行 OpenRC。沒有 OpenRC 的容器會在第一個 `rc-service` 處讓 step 失敗，回報為
+  `services: NAME: not found by OpenRC`：`rc-service --exists` 無法分辨是缺少 `rc-service` 還是缺少服務；
+- 每個 macOS 都執行 launchd。
+
+其他任何 `distro`，或沒有 `distro`，就沒有已知的 init。此時若有項目符合該 target，它會在執行任何 step 之前失敗
+（包括套件與檔案），並顯示 ``services: no init known for distro `gentoo` ``（探測的值；沒有值時為空的反引號）。
+其他 target 仍會執行。沒有任何項目符合的 target 永遠不需要 init，因此它的項目都被略過，其他 step 照常執行。
+
+**launchd。** 只支援 `system` domain。`name` 同時是 job label 與 plist 檔名：
+`/Library/LaunchDaemons/NAME.plist`，其 `Label` 必須等於 `name`；anvil 不讀取 plist。
+名稱不要加 `.plist`：`name = "com.example.agent.plist"` 會去找 `com.example.agent.plist.plist`。
+已載入的 job 視為已啟動，啟用狀態則是 launchd 的 disabled 覆寫（`launchctl enable` 與 `disable`）。有兩種情況會讓 step 失敗：
+
+- `state = "started"` 搭配 `enabled = false` 在 launchd 上無法維持，step 在執行任何東西之前就失敗並顯示
+  `services: NAME: started with enabled = false cannot last on launchd`；
+- 已停用且未載入的 job，除非項目設定 `enabled = true`，否則不會啟動；省略 `enabled` 時 step 失敗並顯示
+  `services: NAME is disabled; set enabled = true to start it`，因此 anvil 絕不更動 config 未指定的啟用狀態。
+
+plist 本身的 `Disabled` 鍵為 true 時不會被偵測到，因為 anvil 不讀取 plist；預期 bootstrap 會以 launchctl 自己的錯誤失敗。
+launchd 的變更是以替身工具測試的，而非實際的 launchd；只有 `print-disabled` 的格式在 macOS 26 上以唯讀方式確認過。
+
+各 init 執行什麼，以及找不到服務時的訊息，見 [Service steps](cli.zh-TW.md#service-steps)。
 
 ## Plugins
 

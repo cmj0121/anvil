@@ -55,6 +55,12 @@ mode = "0644"              # required, quoted
 tags = ["linode"]          # optional; the target must carry every tag
 facts = { distro = "arch" } # optional; pkg matches by list membership
 
+[[services]]               # optional; after files, before [[steps]]; see Services
+name = "sshd"              # the unit, OpenRC service or launchd label
+state = "started"          # required: started | stopped
+enabled = true             # optional; omit to leave enablement alone
+tags = ["linode"]          # optional; matched like [[files]]
+
 [[steps]]
 run = "hostname"           # placeholder: a POSIX sh script run on every target
 ```
@@ -155,6 +161,13 @@ mode = "0644"              # required: a quoted string of 3 or 4 octal digits
 tags = ["linode"]          # optional; every tag must be on the target
 facts = { distro = "arch" } # optional; each value equals that fact
 sudo = true                # optional; default true. false writes as the connecting user
+
+[[services]]               # optional; one service brought to a state per matching target; see Services
+name = "sshd"              # required: [A-Za-z0-9:_@.-]+, at most 255 bytes
+state = "started"          # required: "started" | "stopped"
+enabled = true             # optional; true enables, false disables, omitted leaves enablement alone
+tags = ["linode"]          # optional; every tag must be on the target
+facts = { distro = "arch" } # optional; each value equals that fact
 
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
@@ -361,6 +374,115 @@ group on Linux, and the parent directory's group on macOS and the BSDs or under 
 `sudo = false` it is owned by the connecting user. `install` (the password path) puts a new file in place, owned by
 root with the group as above, and the old file's ACLs and SELinux label are dropped. `install` would replace a symlink
 with a regular file; the symlink refusal above runs first.
+
+## Services
+
+A `[[services]]` entry brings one service to a state, and to an enablement when `enabled` is set, on each selected
+target whose tags and facts all match. It asks the target's init first and changes only what differs, so a rerun on a
+service already there prints `unchanged service NAME`. Matching entries run in config order, after the `[[files]]`
+steps and before `[[steps]]`; an entry that does not match is still a step, reported as
+`skipped service NAME: no match`, and the target's other steps still run ([Service steps](cli.md#service-steps)).
+
+```toml
+[[services]]
+name = "sshd"                    # required: the systemd unit, OpenRC service or launchd label
+state = "started"                # required: started | stopped
+enabled = true                   # optional; omit to leave enablement as it is
+tags = ["linode"]                # optional; [A-Za-z0-9_-]+; every one must be on the target
+facts = { distro = "arch" }      # optional; a probe key, equal to that fact
+```
+
+The config is checked in this order, and the first failure is exit 2. At most 64 entries: one more is
+`services: N entries exceeds the 64 entry limit` (`services: 65 entries exceeds the 64 entry limit` for 65). Then
+each entry, in order: its name, its state, its tags and facts, then the duplicate rule. An unknown key, a `name`
+that is missing or not a string, or an `enabled` that is not a boolean is exit 2 with the parser's message, which
+names the key and the line. A value quoted in a message below is cut at 64 characters (the cut marked with `…`) and a
+control character is shown as a `\x1b`-style escape.
+
+**`name`.** The name the target's init knows the service by: a systemd unit (`sshd` or `sshd.service`), an OpenRC
+service, or a launchd job label ([Inits](#inits)). At most 255 bytes, systemd's unit name limit; only
+`[A-Za-z0-9:_@.-]`; it must not start with `-` or `.`; and it must not end in `.target`, `.mount`, `.automount`,
+`.swap`, `.slice`, `.scope` or `.device`, systemd unit types that are not services. Exit 2:
+
+- ``services[0].name `aaa…`: 256 bytes exceeds the 255 byte limit`` (the quoted name is the first 64 characters plus
+  `…`)
+- ``services[0].name `ss hd`: must match [A-Za-z0-9:_@.-]+`` (an empty name too)
+- ``services[0].name `-sshd`: must not start with - or .``
+- ``services[0].name `multi-user.target`: must name a service, not a .target`` (the message names the suffix)
+
+**`state`.** Required: `started` or `stopped`, in lower case. Exit 2:
+
+- `services[0].state: required`
+- ``services[0].state `running`: must be started or stopped`` (`Started` too)
+
+**`enabled`.** Optional. `true` enables the service at boot and `false` disables it. Left out, the entry leaves the
+enablement as it is, on every init, and asks only for the state.
+
+**`tags` and `facts`.** The [Files](#files) rules and messages, with the prefix `services[I]`: every listed tag must be
+on the target, the `local` target carries `local`, every listed fact must equal the probe's value, and `pkg` matches
+by membership. No `tags` and no `facts` matches every selected target, `local` included. A tag that is on no target
+matches nothing, so every target shows `skipped service NAME: no match`. Exit 2:
+
+- ``services[0].tags[1] `bad tag`: must match [A-Za-z0-9_-]+``
+- `services[0].facts.x: unknown fact; must be one of hostname, os, kernel, arch, distro, distro_version, user, shell,
+pkg, sudo`
+- `services[0].facts.distro: is empty`, `services[0].facts.distro: 257 bytes exceeds the 256 byte limit` and
+  `services[0].facts.distro: contains a control character`
+
+**Duplicates.** An entry with the same name, the same tags (in any order) and the same facts as an earlier one is exit
+2: `services[2]: same name, tags and facts as services[0]`. Entries for one name that differ in tags or facts are
+allowed. Each is its own step, and on a target both match both run, in config order. When they disagree (one
+`started`, one `stopped`), the later one wins, and the service may change twice on every apply.
+
+**Root.** Every init command needs root, and there is no `sudo` key. A login whose `user` fact is `root` runs the
+commands as they are. Any other login runs each of them through `sudo -n`, with the sudo password typed from the
+target's sudo secret when sudo asks for one: the host's `sudo_secret`, or `[packages].local_sudo_secret` for `local`
+when `[packages]` is present. A target that an entry matches but that has no way to root fails before any of its
+steps ([Service steps](cli.md#service-steps)).
+
+### Inits
+
+The init is chosen from the target's `distro` fact:
+
+| `distro`                                           | Init                   |
+| -------------------------------------------------- | ---------------------- |
+| `macos`                                            | launchd                |
+| `alpine`                                           | OpenRC                 |
+| `arch`, `archarm`, `manjaro`, `endeavouros`        | systemd                |
+| `debian`, `ubuntu`, `raspbian`, `linuxmint`, `pop` | systemd                |
+| `fedora`, `rhel`, `centos`, `rocky`, `almalinux`   | systemd                |
+| anything else, or no `distro`                      | none: the target fails |
+
+The systemd rows are the distros that `[packages]` installs with pacman, apt or dnf. These are assumptions, not checks:
+
+- a systemd distro boots systemd. A container whose PID 1 is not systemd is expected to fail the step at the first
+  `systemctl`, with systemctl's own message;
+- Alpine runs OpenRC. A container without it fails the step at the first `rc-service`, reported as
+  `services: NAME: not found by OpenRC`: `rc-service --exists` cannot tell a missing `rc-service` from a missing
+  service;
+- every macOS runs launchd.
+
+Any other `distro`, or none, has no known init. A target where some entry matches then fails before any of its steps,
+packages and files included, with ``services: no init known for distro `gentoo` `` (the probe's value; empty backticks
+when there is none). The other targets still run. A target that no entry matches never needs an init, so its
+entries are skipped and its other steps run.
+
+**launchd.** Only the `system` domain. `name` is both the job label and the plist file name:
+`/Library/LaunchDaemons/NAME.plist`, whose `Label` must equal `name`; anvil does not read the plist. Write the name
+without `.plist`: `name = "com.example.agent.plist"` looks for `com.example.agent.plist.plist`. A loaded job counts as
+started, and enablement is launchd's disabled override (`launchctl enable` and `disable`). Two cases fail the step:
+
+- `state = "started"` with `enabled = false` cannot hold on launchd, and the step fails before running anything with
+  `services: NAME: started with enabled = false cannot last on launchd`;
+- a job that is disabled and not loaded is not started unless the entry sets `enabled = true`; with `enabled` left
+  out the step fails with `services: NAME is disabled; set enabled = true to start it`, so anvil never changes an
+  enablement the config left alone.
+
+A plist whose own `Disabled` key is true is not detected, since anvil does not read the plist; expect the bootstrap to
+fail with launchctl's own error. The launchd changes are tested against stand-in tools, not a live launchd; only the
+`print-disabled` format was checked, read-only, on macOS 26.
+
+What each init runs, and the messages of a service it cannot find, are in [Service steps](cli.md#service-steps).
 
 ## Plugins
 

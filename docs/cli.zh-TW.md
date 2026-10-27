@@ -155,10 +155,13 @@ facts 探測、解析其套件管理器，並將產生的腳本作為 step 1 執
 當 target 的 sudo 要求密碼且它有 sudo secret 時，該 step 在終端機上執行，
 anvil 會在 sudo 的提示處輸入密碼（[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)）；
 其 `$` 行仍是那行一行式腳本。沒有 `[packages]`，或沒有要安裝、升級、鎖定或移除的東西時，不會執行探測，apply 只執行 `[[steps]]`，
-除非有 step 指定 plugin（[Plugin steps](#plugin-steps)），或 config 含有 `[[files]]`。
+除非有 step 指定 plugin（[Plugin steps](#plugin-steps)），或 config 含有 `[[files]]` 或 `[[services]]`。
 
 每個 `[[files]]` 項目在每個 target 上都是一個 step，排在套件 step 之後、`[[steps]]` 之前：
 target 的 tag 與 fact 符合時複製檔案，不符合時顯示為略過（[File steps](#file-steps)）。
+
+每個 `[[services]]` 項目在每個 target 上都是一個 step，排在 file step 之後、`[[steps]]` 之前：
+target 的 tag 與 fact 符合時以 target 的 init 把服務帶到其狀態，不符合時顯示為略過（[Service steps](#service-steps)）。
 
 每個 `install` 名稱在腳本中會換成解析出的管理器的 `[packages.alias]` 項目，沒有則原樣使用（[別名](packages.zh-TW.md#別名)）。
 以下面的 config 而言，apt 與 dnf 安裝 `fd-find`，brew、pacman 與 apk 安裝 `fd`；`anvil plan` 顯示相同的腳本：
@@ -248,7 +251,8 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 列出 `anvil apply` 會在每個選定 target 上執行的 step，但一個都不執行。
 每個 target 都會透過其傳輸執行探測，即使 `[packages]` 沒有事可做也一樣，因此無法連線的 target 在這裡就會像在 apply 中一樣失敗。
 接著由 apply 使用的同一個解析函式列出 step：`[packages]` 有事可做時先是套件 step，再來是每個 `[[files]]` 項目，
-然後是每個 `[[steps]]` 項目。不會執行任何套件指令、不會寫入任何檔案，也不會執行任何 `[[steps]]` 腳本。
+然後是每個 `[[services]]` 項目，最後是每個 `[[steps]]` 項目。
+不會執行任何套件指令、不會寫入任何檔案、不會執行任何服務指令，也不會執行任何 `[[steps]]` 腳本。
 無法連線、探測或解析的 target 會以與 apply 相同的原因失敗（探測、套件管理器，以及在 brew、apt 或 apk 上的 `pin` 為
 `packages: REASON`，例如 `packages: pin is not one-shot on brew: vim`；`[packages]` 沒有事可做時，探測失敗為 `probe: REASON`），
 其他 target 仍會繼續規劃。plan 會像 apply 一樣，在控制端執行每個 plugin step 的 plugin，以列出它回傳的腳本
@@ -484,6 +488,153 @@ ERROR anvil: files[0].src `../nope`: cannot read: No such file or directory (os 
 ```
 
 拒絕條件、比對規則，以及寫到 target 上的結果（擁有者、symlink、不存在的上層目錄）見 [Files](configuration.zh-TW.md#files)。
+
+### Service steps
+
+`[[services]]` 項目在每個 tag 與 fact 都符合的選定 target 上，以其 `distro` fact 指定的 init，把一個服務帶到指定的狀態
+（[Services](configuration.zh-TW.md#services)）：
+
+```toml
+[[services]]
+name = "sshd"
+state = "started"
+enabled = true
+facts = { distro = "arch" }
+
+[[services]]
+name = "cron"
+state = "stopped"
+tags = ["web"]
+```
+
+每個項目在每個 target 上都是一個 step，依 config 順序排在 `[[files]]` step 之後、`[[steps]]` 之前，
+因此順序是套件、檔案、服務、step。在符合的 target 上，該 step 顯示為 `$ service NAME`。
+它先詢問 init，只變更不同之處，並依變更的順序每項變更印出一行：`enabled service NAME`、
+`disabled service NAME`、`started service NAME`、`stopped service NAME`。沒有要變更的東西時印出
+`unchanged service NAME`，因此再次執行不會有任何動作。在不符合的 target 上，它是沒有輸出的
+`$ skipped service NAME: no match`：它不執行任何東西，計入 `✔ ok · N steps`，該 target 的其他 step 仍會執行。
+
+```text
+▶ linode1
+  $ service sshd
+  enabled service sshd
+  started service sshd
+  $ skipped service cron: no match
+  $ hostname
+  linode1
+  ✔ ok · 3 steps
+```
+
+step 的 stdout 只有這些行。init 工具自己印出的東西（例如 systemctl 的 `Created symlink` 行）會送到 stderr，
+像任何 step 的 stderr 一樣顯示。走密碼路徑時 step 在終端機上執行，此時 stderr 也會出現在 stdout 中
+（[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)）。
+
+init 指令失敗時（顯示該指令自己的訊息與結束碼），或在 stderr 顯示下列其中之一並以 1 結束時，step 失敗，
+並像任何 step 一樣結束該 target：
+
+- `services: NAME: not found by systemd`、`services: NAME: not found by OpenRC` 或
+  `services: NAME: not found by launchd (no /Library/LaunchDaemons/NAME.plist)`，不論哪種狀態，都在任何變更之前；
+- `services: NAME is masked`，在 systemd 上 `state = "started"` 或 `enabled = true` 時；
+- `services: NAME: started with enabled = false cannot last on launchd`，在執行任何東西之前；
+- `services: NAME is disabled; set enabled = true to start it`，在 launchd 上。
+
+每個 service step 最多可執行 120 s；`[packages].timeout` 不適用。執行更久的 step 會被終止，
+target 以 `✘ timed out after 120 s` 結束。120 s 涵蓋 systemd 預設 90 s 的啟動逾時再加上密碼交換。略過的 step 不執行任何東西。
+
+在 `--json` 中，service step 的 `run` 就是該標籤。略過的 step 帶有 `"skipped": true`、`code` 為 0 且輸出為空：
+
+```json
+{ "run": "service sshd", "code": 0, "stdout": "unchanged service sshd\n", "stderr": "" }
+{ "run": "skipped service cron: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true }
+```
+
+`anvil plan` 顯示 `would $ service NAME`（apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
+與 `would $ skipped service NAME: no match`。在 `plan --json` 中 `run` 是同一個標籤，走密碼路徑時另有 `sudo_secret`。
+腳本本身絕不會顯示，apply、`--json` 與 plan 都不會。`-vv` 會記錄 `TARGET: services[I] NAME with INIT`
+（走密碼路徑時加上 `, sudo password from secret NAME`；INIT 為 `systemd`、`OpenRC` 或 `launchd`）
+與 `TARGET: services[I] NAME: no match`。
+
+**init。** 第一個符合 target 的項目會查詢該 target 的 init 與取得 root 的方式，只查一次。
+沒有已知 init 的 `distro` 會讓該 target 在執行任何 step 之前失敗（包括套件與檔案），並顯示
+``services: no init known for distro `gentoo` ``；其他 target 仍會執行。沒有任何項目符合的 target 兩者都不需要。
+對照表及其假設見 [Inits](configuration.zh-TW.md#inits)。
+
+**root 與 sudo。** 每個 init 指令都需要 root。`user` fact 為 `root` 的登入直接執行這些指令。
+其他登入則每個指令（包括查詢）都以 `sudo -n COMMAND` 執行，且 step 先執行 `sudo -n true`，
+因此 sudo 失敗只回報一次，以 sudo 自己的訊息呈現，其他什麼都不執行。依 `sudo` fact：
+
+- `nopasswd`：僅此而已；
+- `binary` 且有 sudo secret（host 的 `sudo_secret`，有 `[packages]` 時 `local` 則用 `[packages].local_sudo_secret`）：
+  step 在終端機上執行，anvil 在 sudo 的提示處輸入密碼，與套件 step 相同（[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)）；
+  在那次 `sudo -v` 之後，每個 `sudo -n` 都使用該 ticket。secret 失敗的前綴為 `services`：
+  `services: secret NAME is not set`、`services: secret NAME contains control characters`、
+  `services: sudo rejected the password from secret NAME`、`services: sudo did not show anvil's prompt (secret NAME)`；
+- `binary` 但沒有 secret：target 在執行任何 step 之前失敗並顯示
+  `services: sudo asks for a password; set sudo_secret (local_sudo_secret for local), set NOPASSWD, or connect as root`；
+- `none`：target 在執行任何 step 之前失敗並顯示 `services: needs root and sudo is not installed`。
+
+只有當某個選定的 target 有 sudo secret，且帶有某個 `[[services]]` 項目的每個 tag 時（此時還不知道 fact，
+因此以 root 登入時也成立），`apply` 才會為服務開啟 secret store。`plan` 絕不開啟它。
+
+**執行什麼。** 每個 step 一份 sh 腳本：先查詢，再只做需要的變更。登入者不是 root 時，下列每個指令前面都會加上 `sudo -n`。
+
+**systemd。** 每個 `systemctl` 呼叫都帶有 `--no-ask-password`，因此絕不等待 polkit 提示，並以 `-- NAME` 結尾。
+沒有 `--no-block`：啟動會等待 unit，啟動失敗就讓 step 失敗。
+
+1. `systemctl --no-ask-password show --property=LoadState -- NAME`：`LoadState=not-found` 為找不到，
+   `LoadState=masked` 為 masked（`state = "started"` 或 `enabled = true` 時拒絕）。沒有以 systemd 開機的 host 預期會在這裡失敗，
+   並顯示 systemctl 的訊息。
+2. `systemctl --no-ask-password is-active --quiet -- NAME`：是否執行中。
+3. 只有設定 `enabled` 時才執行 `systemctl --no-ask-password is-enabled -- NAME`。`enabled = true` 在
+   `enabled`、`static`、`indirect`、`generated` 或 `alias` 時已滿足；其他任何狀態都以 `enable` 啟用。
+   `enabled = false` 會停用 `enabled`，以及以 `--runtime` 停用 `enabled-runtime`，因為一般的 `disable` 會留下它在 `/run` 的連結；
+   `static`、`masked` 與其他狀態則保持不動。
+
+| 變更              | 指令                                                    |
+| ----------------- | ------------------------------------------------------- |
+| 啟用並啟動        | `systemctl --no-ask-password enable --now -- NAME`      |
+| 停用並停止        | `systemctl --no-ask-password disable --now -- NAME`     |
+| 啟用              | `systemctl --no-ask-password enable -- NAME`            |
+| 停用              | `systemctl --no-ask-password disable -- NAME`           |
+| 停用 runtime 啟用 | `systemctl --no-ask-password disable --runtime -- NAME` |
+| 啟動              | `systemctl --no-ask-password start -- NAME`             |
+| 停止              | `systemctl --no-ask-password stop -- NAME`              |
+
+啟用狀態與狀態朝同一方向變更時使用 `enable --now` 與 `disable --now`。否則先變更啟用狀態，再變更狀態：
+`enable` 後 `stop`、`disable` 後 `start`，以及 `disable --runtime` 後 `stop`。
+`enable` 印出 `enabled service NAME`，`disable`（兩種形式）印出 `disabled service NAME`，`start` 印出 `started service NAME`，
+`stop` 印出 `stopped service NAME`；`enable --now` 先印出 `enabled service NAME` 再印出 `started service NAME`，
+`disable --now` 先印出 `disabled service NAME` 再印出 `stopped service NAME`。
+
+**OpenRC。**
+
+1. `rc-service --exists NAME` 失敗：找不到。沒有 `rc-service` 的 target 也會在這裡失敗，顯示同樣的
+   `services: NAME: not found by OpenRC`，因為 `--exists` 無法分辨是缺少 `rc-service` 還是缺少服務。
+2. `rc-service NAME status`：結束碼 0 為執行中。anvil 把結束碼 32（OpenRC 的 crashed 狀態）視為未執行。
+3. 只有設定 `enabled` 時才執行 `rc-update show default`，並以第一個欄位精確比對 NAME（因此 `sshd` 不會符合 `sshd-extra`）。
+4. 先處理啟用狀態：`rc-update add NAME default`（`enabled service NAME`）或 `rc-update del NAME default`
+   （`disabled service NAME`）。再處理狀態：`rc-service NAME start`（`started service NAME`）或
+   `rc-service NAME stop`（`stopped service NAME`）。一般的 `start` 會拒絕 crashed 的服務，因此對 crashed 的服務，
+   anvil 會在 `rc-service NAME start` 之前先執行 `rc-service NAME zap`，並印出 `started service NAME`；
+   `state = "stopped"` 則保持不動並印出 `unchanged service NAME`。crashed 的路徑是以替身工具測試的，而非實際的 OpenRC。
+
+**launchd。** `system` domain，plist 為 `/Library/LaunchDaemons/NAME.plist`。
+
+1. `launchctl print system/NAME` 成功：job 已載入，視為已啟動。
+2. `launchctl print-disabled system` 列出 `"NAME" => disabled`（macOS 26）或 `"NAME" => true`：job 已停用。
+   每種形式都以整行比對（行首空白除外），所以只是包含 NAME 的 label 不算。
+   `true` 的形式是為較舊版本而接受的，但沒有在較舊版本上測試過。
+3. 未載入，且 `test -f /Library/LaunchDaemons/NAME.plist` 失敗：找不到，不論哪種狀態。
+4. 依此順序，每項只在需要時執行：
+   - `enabled = true` 且已停用：`launchctl enable system/NAME`（`enabled service NAME`），在 bootstrap 之前，
+     因為已停用的 job 無法 bootstrap；
+   - `state = "started"` 且未載入：`launchctl bootstrap system /Library/LaunchDaemons/NAME.plist`
+     （`started service NAME`），job 仍為停用時拒絕；
+   - `state = "stopped"`、`enabled = false` 且未停用：`launchctl disable system/NAME`（`disabled service NAME`）；
+   - `state = "stopped"` 且已載入：`launchctl bootout system/NAME`（`stopped service NAME`）。
+
+plist 本身的 `Disabled` 鍵為 true 時不會被偵測到（anvil 不讀取 plist）；預期 bootstrap 會以 launchctl 自己的錯誤失敗。
+這些 launchd 的變更是以替身工具測試的，而非實際的 launchd；只有 `print-disabled` 的格式在 macOS 26 上以唯讀方式確認過。
 
 ### `anvil run [--timeout SECS] <FILE|->`
 

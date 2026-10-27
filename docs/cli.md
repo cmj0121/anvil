@@ -157,10 +157,14 @@ cannot be resolved, or a `pin` on brew, apt or apk, fails it with `packages: REA
 terminal and anvil types the password at sudo's prompt ([Typing the sudo password](packages.md#typing-the-sudo-password)); its
 `$` line is still the one-line script. Without `[packages]`, or with nothing to install, upgrade, pin or remove, no
 probe runs and apply runs only the `[[steps]]`, unless a step names a plugin ([Plugin steps](#plugin-steps)) or the
-config has `[[files]]`.
+config has `[[files]]` or `[[services]]`.
 
 Each `[[files]]` entry is one step on every target, after the package step and before the `[[steps]]`: it copies the
 file when the target's tags and facts match and shows as skipped when they do not ([File steps](#file-steps)).
+
+Each `[[services]]` entry is one step on every target, after the file steps and before the `[[steps]]`: it brings the
+service to its state under the target's init when the target's tags and facts match, and shows as skipped when they
+do not ([Service steps](#service-steps)).
 
 Each `install` name goes into the script as the resolved manager's `[packages.alias]` entry, else as is
 ([Aliases](packages.md#aliases)). With this config apt and dnf install `fd-find`, and brew, pacman and apk `fd`; `anvil
@@ -253,7 +257,8 @@ the step was killed by a signal or timed out; a timed-out step is the last `step
 Shows the steps `anvil apply` would run on every selected target, and runs none of them. Each target is probed over its
 transport, even without `[packages]` work, so a target that cannot be reached fails here as it would under apply. Its
 steps then come from the same resolver apply uses: the package step when `[packages]` has work, then each `[[files]]`
-entry, then each `[[steps]]` entry. No package command, no file write and no `[[steps]]` script runs. A target that
+entry, then each `[[services]]` entry, then each `[[steps]]` entry. No package command, no file write, no service
+command and no `[[steps]]` script runs. A target that
 cannot be reached, probed or resolved fails with the same reason apply gives (`packages: REASON` for the probe, the
 manager and a `pin` on brew, apt or apk, such as `packages: pin is not one-shot on brew: vim`; without `[packages]` work
 a failed probe reads `probe: REASON`), and the other targets are still planned. plan runs each plugin step's plugin on
@@ -500,6 +505,162 @@ ERROR anvil: files[0].src `../nope`: cannot read: No such file or directory (os 
 
 The refusals, the matching rules and what lands on the target (owner, symlinks, a missing parent directory) are in
 [Files](configuration.md#files).
+
+### Service steps
+
+A `[[services]]` entry brings one service to a state on each selected target whose tags and facts match, under the
+init its `distro` fact names ([Services](configuration.md#services)):
+
+```toml
+[[services]]
+name = "sshd"
+state = "started"
+enabled = true
+facts = { distro = "arch" }
+
+[[services]]
+name = "cron"
+state = "stopped"
+tags = ["web"]
+```
+
+Every entry is one step on every target, in config order, after the `[[files]]` steps and before the `[[steps]]`, so
+the order is packages, files, services, steps. On a target that matches, the step shows as `$ service NAME`. It asks
+the init first, changes only what differs and prints one line per change, in the order made: `enabled service NAME`,
+`disabled service NAME`, `started service NAME`, `stopped service NAME`. With nothing to change it prints
+`unchanged service NAME`, so a rerun is a no-op. On a target that does not match, it is
+`$ skipped service NAME: no match` with no output: it runs nothing, counts in `✔ ok · N steps`, and the target's
+other steps still run.
+
+```text
+▶ linode1
+  $ service sshd
+  enabled service sshd
+  started service sshd
+  $ skipped service cron: no match
+  $ hostname
+  linode1
+  ✔ ok · 3 steps
+```
+
+The step's stdout holds only those lines. What the init tools print themselves (systemctl's `Created symlink` line,
+say) goes to stderr, shown as any step's stderr. On the password path the step runs on a terminal, where stderr
+arrives in stdout too ([Typing the sudo password](packages.md#typing-the-sudo-password)).
+
+A step fails, and ends the target like any step, when an init command fails (with that command's own message and exit
+code) or with one of these on stderr and exit 1:
+
+- `services: NAME: not found by systemd`, `services: NAME: not found by OpenRC` or
+  `services: NAME: not found by launchd (no /Library/LaunchDaemons/NAME.plist)`, in either state, before any change;
+- `services: NAME is masked`, on systemd when `state = "started"` or `enabled = true`;
+- `services: NAME: started with enabled = false cannot last on launchd`, before anything runs;
+- `services: NAME is disabled; set enabled = true to start it`, on launchd.
+
+Each service step may run for 120 s; `[packages].timeout` does not apply. A step that runs longer is killed and the
+target ends with `✘ timed out after 120 s`. 120 s covers systemd's default 90 s start timeout plus the password
+exchange. A skipped step runs nothing.
+
+In `--json` a service step's `run` is that label. A skipped step has `"skipped": true`, `code` 0 and empty output:
+
+```json
+{ "run": "service sshd", "code": 0, "stdout": "unchanged service sshd\n", "stderr": "" }
+{ "run": "skipped service cron: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true }
+```
+
+`anvil plan` shows `would $ service NAME`, with `(sudo password from secret NAME)` when apply would take the password
+path, and `would $ skipped service NAME: no match`. In `plan --json` the `run` is the same label, with `sudo_secret`
+for the password path. The script itself is never shown, not by apply, `--json` or plan. `-vv` logs
+`TARGET: services[I] NAME with INIT` (with `, sudo password from secret NAME` on the password path, INIT being
+`systemd`, `OpenRC` or `launchd`) and `TARGET: services[I] NAME: no match`.
+
+**The init.** The first entry that matches a target looks up its init and its way to root, once. A `distro` with no
+known init fails that target before any of its steps, packages and files included, with
+``services: no init known for distro `gentoo` ``; the other targets still run. A target that no entry matches needs
+neither. The table and its assumptions are in [Inits](configuration.md#inits).
+
+**Root and sudo.** Every init command needs root. On a login whose `user` fact is `root` the commands run as they are.
+On any other login every command, queries included, runs as `sudo -n COMMAND`, and the step first runs
+`sudo -n true`, so a sudo failure is reported once, in sudo's own words, and nothing else runs. By the `sudo` fact:
+
+- `nopasswd`: that is all;
+- `binary` with a sudo secret (the host's `sudo_secret`, or `[packages].local_sudo_secret` for `local` when
+  `[packages]` is present): the step runs on a terminal and anvil types the password at sudo's prompt, as for the
+  package step ([Typing the sudo password](packages.md#typing-the-sudo-password)); after that `sudo -v`, each
+  `sudo -n` uses the ticket. The secret failures carry the prefix `services`: `services: secret NAME is not set`,
+  `services: secret NAME contains control characters`, `services: sudo rejected the password from secret NAME`,
+  `services: sudo did not show anvil's prompt (secret NAME)`;
+- `binary` with no secret: the target fails before any of its steps with
+  `services: sudo asks for a password; set sudo_secret (local_sudo_secret for local), set NOPASSWD, or connect as root`;
+- `none`: the target fails before any of its steps with `services: needs root and sudo is not installed`.
+
+`apply` opens the secret store for services only when some selected target has a sudo secret and carries every tag of
+a `[[services]]` entry (facts are not known yet, so this holds for a root login too). `plan` never opens it.
+
+**What runs.** One sh script per step: queries first, then only the changes needed. Each command below is prefixed
+with `sudo -n` when the login is not root.
+
+**systemd.** Every `systemctl` call carries `--no-ask-password`, so it never waits for a polkit prompt, and ends
+`-- NAME`. There is no `--no-block`: a start waits for the unit, and a failed start fails the step.
+
+1. `systemctl --no-ask-password show --property=LoadState -- NAME`: `LoadState=not-found` is not found, and
+   `LoadState=masked` is masked (refused when `state = "started"` or `enabled = true`). A host not booted with systemd
+   is expected to fail here, with systemctl's message.
+2. `systemctl --no-ask-password is-active --quiet -- NAME`: running or not.
+3. Only when `enabled` is set, `systemctl --no-ask-password is-enabled -- NAME`. `enabled = true` is already met by
+   `enabled`, `static`, `indirect`, `generated` or `alias`; any other state is enabled with `enable`. `enabled = false` disables
+   `enabled`, and `enabled-runtime` with `--runtime`, since a plain `disable` leaves its `/run` link; `static`, `masked`
+   and the rest are left alone.
+
+| Change                   | Command                                                 |
+| ------------------------ | ------------------------------------------------------- |
+| enable and start         | `systemctl --no-ask-password enable --now -- NAME`      |
+| disable and stop         | `systemctl --no-ask-password disable --now -- NAME`     |
+| enable                   | `systemctl --no-ask-password enable -- NAME`            |
+| disable                  | `systemctl --no-ask-password disable -- NAME`           |
+| disable a runtime enable | `systemctl --no-ask-password disable --runtime -- NAME` |
+| start                    | `systemctl --no-ask-password start -- NAME`             |
+| stop                     | `systemctl --no-ask-password stop -- NAME`              |
+
+`enable --now` and `disable --now` are used when the enablement and the state both change the same way. Otherwise the
+enablement change comes first and the state change after it: `enable` then `stop`, `disable` then `start`, and
+`disable --runtime` then `stop`. `enable` prints `enabled service NAME`, `disable` (either form)
+`disabled service NAME`, `start` `started service NAME` and `stop` `stopped service NAME`; `enable --now` prints
+`enabled service NAME` then `started service NAME`, and `disable --now` prints `disabled service NAME` then
+`stopped service NAME`.
+
+**OpenRC.**
+
+1. `rc-service --exists NAME` fails: not found. A target without `rc-service` fails here too, with the same
+   `services: NAME: not found by OpenRC`, since `--exists` cannot tell a missing `rc-service` from a missing service.
+2. `rc-service NAME status`: exit 0 is running. anvil counts exit 32, OpenRC's crashed status, as not running.
+3. Only when `enabled` is set, `rc-update show default`, with NAME matched exactly on the first field (so `sshd` does
+   not match `sshd-extra`).
+4. Enablement first: `rc-update add NAME default` (`enabled service NAME`) or `rc-update del NAME default`
+   (`disabled service NAME`). Then the state: `rc-service NAME start` (`started service NAME`) or
+   `rc-service NAME stop` (`stopped service NAME`). A plain `start` refuses a crashed service, so for a crashed one
+   anvil runs `rc-service NAME zap` before `rc-service NAME start` and prints `started service NAME`;
+   `state = "stopped"` leaves it as it is and prints `unchanged service NAME`. The crashed path is tested against
+   stand-in tools, not a live OpenRC.
+
+**launchd.** The `system` domain, with the plist `/Library/LaunchDaemons/NAME.plist`.
+
+1. `launchctl print system/NAME` succeeds: the job is loaded, which counts as started.
+2. `launchctl print-disabled system` lists `"NAME" => disabled` (macOS 26) or `"NAME" => true`: the job is disabled.
+   Each is matched as a whole line (leading whitespace aside), so a label that only contains NAME does not count. The
+   `true` form is accepted for older releases but not tested on one.
+3. Not loaded, and `test -f /Library/LaunchDaemons/NAME.plist` fails: not found, in either state.
+4. In this order, each only when needed:
+   - `enabled = true` and disabled: `launchctl enable system/NAME` (`enabled service NAME`), before the bootstrap,
+     since a disabled job does not bootstrap;
+   - `state = "started"` and not loaded: `launchctl bootstrap system /Library/LaunchDaemons/NAME.plist`
+     (`started service NAME`), refused when the job is still disabled;
+   - `state = "stopped"`, `enabled = false` and not disabled: `launchctl disable system/NAME`
+     (`disabled service NAME`);
+   - `state = "stopped"` and loaded: `launchctl bootout system/NAME` (`stopped service NAME`).
+
+A plist whose own `Disabled` key is true is not detected (anvil does not read the plist); expect the bootstrap to fail
+with launchctl's own error. These launchd changes are tested against stand-in tools, not a live launchd; only the
+`print-disabled` format was checked, read-only, on macOS 26.
 
 ### `anvil run [--timeout SECS] <FILE|->`
 
