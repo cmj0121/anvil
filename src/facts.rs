@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The probe, sent on the transport's stdin as the script of `sh -s`.
 pub const PROBE: &str = include_str!("probe.sh");
@@ -27,7 +27,7 @@ pub const KEYS: &[&str] = &[
 ];
 
 /// Facts reported by one target, keyed as the probe prints them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts(pub BTreeMap<String, String>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]

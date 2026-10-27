@@ -55,7 +55,6 @@ impl fmt::Display for LockError {
 /// Creates `dir` 0700 (and its missing parents) when missing, then refuses
 /// it unless it is a directory the current user owns that no one else may
 /// write to. Checked even when just made: someone else may have made it first.
-#[cfg_attr(not(test), expect(dead_code, reason = "record.rs from #18 U3 on"))]
 pub fn ensure_dir(dir: &Path) -> io::Result<()> {
     create_dir(dir)?;
     let meta = fs::metadata(dir)?;

@@ -699,9 +699,10 @@ fn check_src(src: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// A `[[files]]` dest: absolute, in a charset that needs no shell quoting
-/// beyond single quotes, with no `.` or `..` component.
-fn check_dest(dest: &str) -> Result<(), String> {
+/// A `[[files]]` dest: absolute (so never read as an option), in a charset
+/// that needs no shell quoting beyond single quotes, with no `.` or `..`
+/// component. `last-apply.json` holds each dest to the same rule.
+pub(crate) fn check_dest(dest: &str) -> Result<(), String> {
     if dest.len() > MAX_DEST_BYTES {
         return Err(format!(
             "{} bytes exceeds the {MAX_DEST_BYTES} byte limit",
