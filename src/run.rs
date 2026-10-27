@@ -77,6 +77,7 @@ fn run_target(
                 runs,
                 &apply::Passwords::new(),
                 cancel,
+                None,
             )
         }
         Err(err) => apply::failed(target, Vec::new(), err.to_string()),

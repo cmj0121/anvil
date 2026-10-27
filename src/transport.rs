@@ -43,6 +43,8 @@ pub struct Output {
 pub enum TransportError {
     /// The process could not be started.
     Spawn(String),
+    /// Waiting on the started process failed: it may have run in part.
+    Wait(String),
     /// The process did not finish within this timeout and was killed. `output`
     /// is what a script printed before the kill (`code` is `None`); runs that
     /// keep nothing on a timeout leave it `None`.
@@ -72,6 +74,7 @@ impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Spawn(reason) => write!(f, "cannot start the transport: {reason}"),
+            Self::Wait(reason) => write!(f, "cannot wait for the transport: {reason}"),
             Self::Timeout { after, .. } if after.subsec_millis() == 0 => {
                 write!(f, "timed out after {} s", after.as_secs())
             }
@@ -674,7 +677,7 @@ impl TtySession<'_> {
             match try_reap(child, tracked) {
                 Ok(Some(status)) => return Ok(status),
                 Ok(None) => {}
-                Err(err) => return Err(TransportError::Spawn(err.to_string())),
+                Err(err) => return Err(TransportError::Wait(err.to_string())),
             }
             let now = Instant::now();
             if now >= run_deadline {
@@ -939,9 +942,7 @@ fn gather(
 
     let status = match timeout {
         Some(timeout) => wait_with_timeout(&mut child, &mut tracked, timeout),
-        None => {
-            reap(&mut child, &mut tracked).map_err(|err| TransportError::Spawn(err.to_string()))
-        }
+        None => reap(&mut child, &mut tracked).map_err(|err| TransportError::Wait(err.to_string())),
     };
 
     let pending = streams.iter().flatten().count();
@@ -1061,7 +1062,7 @@ fn wait_with_timeout(
                 });
             }
             Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(err) => return Err(TransportError::Spawn(err.to_string())),
+            Err(err) => return Err(TransportError::Wait(err.to_string())),
         }
     }
 }

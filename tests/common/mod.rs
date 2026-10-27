@@ -138,6 +138,18 @@ impl Sandbox {
         self.root.join("x/anvil")
     }
 
+    /// `$XDG_STATE_HOME`, where apply keeps `anvil/last-apply.json`.
+    pub fn state_home(&self) -> PathBuf {
+        self.root.join("s")
+    }
+
+    /// The apply record, parsed; `None` when apply has not written one.
+    pub fn last_apply(&self) -> Option<serde_json::Value> {
+        let path = self.state_home().join("anvil/last-apply.json");
+        let bytes = fs::read(path).ok()?;
+        Some(serde_json::from_slice(&bytes).unwrap())
+    }
+
     /// `$TMPDIR`.
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.join("t")
@@ -257,6 +269,7 @@ impl Sandbox {
         let mut command = Command::new(program);
         command
             .env("XDG_CONFIG_HOME", self.root.join("x"))
+            .env("XDG_STATE_HOME", self.state_home())
             .env("HOME", self.root.join("h"))
             .env("TMPDIR", self.tmp_dir())
             .env("EDITOR", fixture("fake-editor.sh"))

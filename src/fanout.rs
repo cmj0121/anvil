@@ -21,20 +21,8 @@ use crate::inventory::Target;
 /// result is also reported once as `Ordered`, in the order of the targets,
 /// right after the `Done` that leaves every earlier target ended.
 pub enum Event<'a, R> {
-    #[cfg_attr(
-        not(any(test, feature = "tui")),
-        expect(dead_code, reason = "read by the TUI")
-    )]
     Begin(&'a [Target]),
-    #[cfg_attr(
-        not(any(test, feature = "tui")),
-        expect(dead_code, reason = "read by the TUI")
-    )]
     Start(&'a Target),
-    #[cfg_attr(
-        not(any(test, feature = "tui")),
-        expect(dead_code, reason = "read by the TUI")
-    )]
     Done(usize, &'a R),
     Ordered(&'a R),
 }

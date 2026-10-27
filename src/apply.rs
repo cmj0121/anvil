@@ -26,6 +26,11 @@
 //! script that brings the service to its state under the target's init when
 //! the target matches, else a skip. A target where an entry matches but no
 //! init is known for its distro fails before any of its steps.
+//!
+//! An apply that probes keeps `last-apply.json` ([`crate::record`]): each
+//! target the probe reached is saved as it ends, with its facts and, per
+//! file written, what DEST held before, read back by a capture run right
+//! before the write, which then refuses to write if DEST changed meanwhile.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,12 +53,13 @@ use crate::logger::{BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, is_esca
 use crate::options::Options;
 use crate::packages::{self, Packages};
 use crate::plugin::{self, Plugins, Request};
+use crate::record::{self, FileRecord, Session, TargetRecord};
 use crate::secret::Store;
 use crate::services;
 use crate::transport::{
     Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Sudo passwords by secret name; a name that is not set is absent.
 pub(crate) type Passwords = BTreeMap<String, Zeroizing<Vec<u8>>>;
@@ -308,6 +314,10 @@ pub fn steps_text(steps: usize) -> String {
 pub struct Report {
     pub targets: Vec<TargetReport>,
     pub ok: bool,
+    /// Printed on stderr after the blocks: each file the record had no
+    /// room for.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
 }
 
 impl Report {
@@ -328,6 +338,10 @@ pub type Progress<'a> = Event<'a, TargetReport>;
 /// completed steps) and every target not started is Cancelled with no steps.
 /// A `[[files]]` src that cannot be read fails the command before any
 /// target.
+///
+/// When apply probes, the record ([`record::path`]) is locked and loaded
+/// before any target, and each target the probe reached is saved into it
+/// as it ends; a record that cannot be opened or saved fails the command.
 pub fn run_targets(
     opts: &Options,
     config: &Config,
@@ -337,7 +351,11 @@ pub fn run_targets(
     let pins = plugin::verify(config).map_err(Failure::usage)?;
     let sources = files::load(config).map_err(Failure::usage)?;
     let passwords = load_passwords(&targets, config, || opts.secret_store(config))?;
-    Ok(apply_targets(
+    let session = match needs_facts(config) {
+        true => Some(open_record("apply")?),
+        false => None,
+    };
+    apply_targets(
         &targets,
         opts.parallel,
         |target| opts.transport(target),
@@ -346,8 +364,18 @@ pub fn run_targets(
         &pins,
         &passwords,
         &opts.cancel,
+        session,
         on,
-    ))
+    )
+    .map_err(|err| Failure::failed(format!("apply: {err}")))
+}
+
+/// Locks and loads the record for `command`; any failure is exit 1. Core
+/// dumps are turned off first: the record holds the previous texts.
+pub(crate) fn open_record(command: &str) -> Result<Session, Failure> {
+    no_core_dumps();
+    let path = record::path().map_err(|err| Failure::failed(format!("{command}: {err}")))?;
+    Session::open(&path).map_err(|err| Failure::failed(format!("{command}: {err}")))
 }
 
 /// The sudo password of each of `targets` with a sudo secret that a step may
@@ -415,6 +443,14 @@ fn no_core_dumps() {
     }
 }
 
+/// Applies to each of `targets`, as [`for_each_target`] runs them. With a
+/// `session`, each target the probe reached is merged into the record and
+/// saved as soon as it ends, then [`Session::finish`] shares the record's
+/// room out in the order of `targets`. Once a save fails, `cancel` is set,
+/// so no further target starts, but every target that ends is still merged
+/// and saved, and so is the finish: a later save that succeeds records the
+/// earlier ones too. The error is then the first save's, followed by every
+/// target the record still lacks ([`Saves`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one input of apply_target, passed through"
@@ -428,19 +464,136 @@ fn apply_targets(
     plugins: &dyn Plugins,
     passwords: &Passwords,
     cancel: &AtomicBool,
+    mut session: Option<Session>,
     on: &mut dyn FnMut(Progress<'_>),
-) -> Report {
-    for_each_target(targets, parallel, cancel, on, |target| {
-        apply_target(
-            target,
-            transport(target),
-            config,
-            sources,
-            plugins,
-            passwords,
-            cancel,
-        )
+) -> Result<Report, String> {
+    let mut saves = Saves::default();
+    let results = fanout::fan_out(
+        targets,
+        parallel,
+        cancel,
+        &mut |event: Event<'_, Applied>| match event {
+            Event::Begin(targets) => on(Event::Begin(targets)),
+            Event::Start(target) => on(Event::Start(target)),
+            Event::Done(index, applied) => {
+                if let (Some(session), Some(reached)) = (session.as_mut(), &applied.reached) {
+                    let name = &targets[index].name;
+                    let saved = save(session, name, reached.clone());
+                    saves.note(name, saved, cancel);
+                }
+                on(Event::Done(index, &applied.report));
+            }
+            Event::Ordered(applied) => on(Event::Ordered(&applied.report)),
+        },
+        |target| {
+            apply_target(
+                target,
+                transport(target),
+                config,
+                sources,
+                plugins,
+                passwords,
+                cancel,
+            )
+        },
+        |target| Applied::unrecorded(cancelled(target, Vec::new())),
+        |target, message| {
+            let error = format!("internal error: {message}");
+            Applied::unrecorded(failed(target, Vec::new(), error))
+        },
+    );
+    let order: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
+    let warnings = match session {
+        Some(session) => saves.finish(session.finish(&order))?,
+        None => Vec::new(),
+    };
+    let reports: Vec<TargetReport> = results.into_iter().map(|a| a.report).collect();
+    let ok = reports.iter().all(TargetReport::ok);
+    Ok(Report {
+        targets: reports,
+        ok,
+        warnings,
     })
+}
+
+/// The saves of one run's targets into the record. Each save writes the
+/// whole record as merged so far, so one that succeeds records every target
+/// whose own save failed before it.
+#[derive(Default)]
+pub(crate) struct Saves {
+    /// The first save error.
+    first: Option<String>,
+    /// The targets whose save failed since the last one that succeeded.
+    unrecorded: Vec<String>,
+}
+
+impl Saves {
+    /// Notes how `name`'s save went; the first failure sets `cancel`, so no
+    /// further target starts.
+    pub(crate) fn note(&mut self, name: &str, saved: Result<(), String>, cancel: &AtomicBool) {
+        match saved {
+            Ok(()) => self.unrecorded.clear(),
+            Err(err) => {
+                cancel.store(true, Ordering::Relaxed);
+                self.first.get_or_insert(err);
+                self.unrecorded.push(name.to_owned());
+            }
+        }
+    }
+
+    /// The last save's value when every save succeeded; else
+    /// [`Saves::result`]'s error, without the targets `last` recorded.
+    pub(crate) fn finish<T>(mut self, last: Result<T, String>) -> Result<T, String> {
+        if last.is_ok() {
+            self.unrecorded.clear();
+        }
+        self.result().and(last)
+    }
+
+    /// `Ok` when every save succeeded; else the first error, then `; not
+    /// recorded: a, b` for the targets the record still lacks.
+    pub(crate) fn result(self) -> Result<(), String> {
+        let Some(first) = self.first else {
+            return Ok(());
+        };
+        Err(match self.unrecorded.as_slice() {
+            [] => first,
+            names => format!("{first}; not recorded: {}", names.join(", ")),
+        })
+    }
+}
+
+/// Merges `reached` into the record as `name`'s entry and saves it.
+fn save(session: &mut Session, name: &str, reached: Reached) -> Result<(), String> {
+    match reached.wrote {
+        true => session.merge(name, reached.record),
+        false => session.refresh(name, reached.record),
+    }
+    session.save().map(drop)
+}
+
+/// One target's report, and what the record keeps of it.
+struct Applied {
+    report: TargetReport,
+    /// `None` when the probe did not reach the target.
+    reached: Option<Reached>,
+}
+
+impl Applied {
+    fn unrecorded(report: TargetReport) -> Applied {
+        Applied {
+            report,
+            reached: None,
+        }
+    }
+}
+
+/// The record of a target the probe reached; `wrote`: a `[[files]]` write
+/// started on it, so `record` replaces its entry, else only refreshes it.
+#[derive(Clone)]
+struct Reached {
+    record: TargetRecord,
+    wrote: bool,
 }
 
 /// Runs `one` on each of `targets`, `parallel` at a time, reporting each as
@@ -466,6 +619,7 @@ pub(crate) fn for_each_target(
     Report {
         targets: reports,
         ok,
+        warnings: Vec::new(),
     }
 }
 
@@ -492,6 +646,9 @@ pub(crate) fn print_report(
             print(progress);
         }
     })?;
+    for warning in &report.warnings {
+        eprintln!("{warning}");
+    }
     let (ok, failed) = report.counts();
     if cli.json {
         print_json(&report, Failure::failed)?;
@@ -520,9 +677,19 @@ pub(crate) fn cancelled(target: &Target, steps: Vec<StepReport>) -> TargetReport
     }
 }
 
-/// Probes `target` when `[packages]` has work, a step is a plugin or there
-/// are `[[files]]` or `[[services]]`, then runs the steps [`resolve`] lists; `passwords` holds
-/// the sudo passwords to type.
+/// Whether apply probes each target: `[packages]` has work, a step is a
+/// plugin, or there are `[[files]]` or `[[services]]`.
+fn needs_facts(config: &Config) -> bool {
+    package_work(config).is_some()
+        || config.steps.iter().any(|s| s.plugin.is_some())
+        || !config.files.is_empty()
+        || !config.services.is_empty()
+}
+
+/// Probes `target` when [`needs_facts`], then runs the steps [`resolve`]
+/// lists; `passwords` holds the sudo passwords to type. A target the probe
+/// reached comes back with its record: its facts, each file written with
+/// what DEST held before, and the steps that ran but cannot be undone.
 fn apply_target(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
@@ -531,32 +698,112 @@ fn apply_target(
     plugins: &dyn Plugins,
     passwords: &Passwords,
     cancel: &AtomicBool,
-) -> TargetReport {
+) -> Applied {
     log::info!("apply {}: start", target.name);
     let transport = match transport {
         Ok(transport) => transport,
-        Err(err) => return failed(target, Vec::new(), err.to_string()),
+        Err(err) => return Applied::unrecorded(failed(target, Vec::new(), err.to_string())),
     };
     log::info!("apply {}: over {}", target.name, transport.name());
-    let needs_facts = package_work(config).is_some()
-        || config.steps.iter().any(|s| s.plugin.is_some())
-        || !config.files.is_empty()
-        || !config.services.is_empty();
-    let facts = if needs_facts {
+    let facts = if needs_facts(config) {
         if cancel.load(Ordering::Relaxed) {
-            return cancelled(target, Vec::new());
+            return Applied::unrecorded(cancelled(target, Vec::new()));
         }
-        probe(transport.as_ref(), config).map(Some)
+        match probe(transport.as_ref(), config) {
+            Ok(facts) => Some(facts),
+            Err(Unresolved::Failed(error)) => {
+                return Applied::unrecorded(failed(target, Vec::new(), error));
+            }
+            Err(Unresolved::Cancelled) => {
+                return Applied::unrecorded(cancelled(target, Vec::new()));
+            }
+        }
     } else {
-        Ok(None)
+        None
     };
-    let runs =
-        facts.and_then(|facts| resolve(target, facts.as_ref(), config, sources, plugins, cancel));
-    match runs {
-        Ok(runs) => execute(target, transport.as_ref(), &runs, passwords, cancel),
-        Err(Unresolved::Failed(error)) => failed(target, Vec::new(), error),
-        Err(Unresolved::Cancelled) => cancelled(target, Vec::new()),
+    let mut recorder = Recorder::new(config, sources);
+    let (report, runs) = match resolve(target, facts.as_ref(), config, sources, plugins, cancel) {
+        Ok(runs) => {
+            let report = execute(
+                target,
+                transport.as_ref(),
+                &runs,
+                passwords,
+                cancel,
+                Some(&mut recorder),
+            );
+            (report, runs)
+        }
+        Err(Unresolved::Failed(error)) => (failed(target, Vec::new(), error), Vec::new()),
+        Err(Unresolved::Cancelled) => (cancelled(target, Vec::new()), Vec::new()),
+    };
+    let reached = facts.map(|facts| {
+        let cannot_undo = cannot_undo(config, &runs, report.steps());
+        recorder.finish(facts, report.ok(), cannot_undo)
+    });
+    Applied { report, reached }
+}
+
+/// What a target's `[[files]]` steps wrote, for the record.
+pub(crate) struct Recorder<'a> {
+    config: &'a Config,
+    sources: &'a Sources,
+    files: Vec<FileRecord>,
+    /// Whether a write started: its capture ran, then the write did.
+    wrote: bool,
+}
+
+impl<'a> Recorder<'a> {
+    fn new(config: &'a Config, sources: &'a Sources) -> Recorder<'a> {
+        Recorder {
+            config,
+            sources,
+            files: Vec::new(),
+            wrote: false,
+        }
     }
+
+    /// The target's record, stamped now.
+    fn finish(self, facts: Facts, ok: bool, cannot_undo: Vec<String>) -> Reached {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Reached {
+            record: TargetRecord {
+                at,
+                anvil: env!("CARGO_PKG_VERSION").to_owned(),
+                ok,
+                facts,
+                files: self.files,
+                cannot_undo,
+                rolled_back: None,
+            },
+            wrote: self.wrote,
+        }
+    }
+}
+
+/// The steps among `runs` that ran (one report each, in order) and that a
+/// rollback cannot undo: `packages`, `service NAME` and `step N` (1-based
+/// among `[[steps]]`), never a skip. `runs` is [`resolve`]'s list: the
+/// package step, if any, then one step per `[[files]]`, `[[services]]` and
+/// `[[steps]]` entry.
+fn cannot_undo(config: &Config, runs: &[PlannedRun], steps: &[StepReport]) -> Vec<String> {
+    let entries = config.files.len() + config.services.len() + config.steps.len();
+    let packages = runs.len().saturating_sub(entries);
+    let services = packages + config.files.len();
+    let entries = services + config.services.len();
+    steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| !step.skipped)
+        .filter_map(|(i, _)| match i {
+            _ if i < packages => Some("packages".to_owned()),
+            _ if i < services => None,
+            _ if i < entries => Some(format!("service {}", config.services[i - services].name)),
+            _ => Some(format!("step {}", i - entries + 1)),
+        })
+        .collect()
 }
 
 /// `target` ended by a transport error, after `steps`.
@@ -574,13 +821,16 @@ pub(crate) fn failed(target: &Target, steps: Vec<StepReport>, error: String) -> 
 /// `cancel` is checked before each, and `passwords` holds the sudo
 /// passwords to type. A skipped `[[files]]` or `[[services]]` step runs
 /// nothing; a file step that needs a sudo password goes through
-/// [`send_file`].
+/// [`send_file`]. With a `recorder`, each file step first captures DEST
+/// ([`capture`]), then writes only if DEST still holds what it captured,
+/// and the recorder keeps both and how the write ended.
 pub(crate) fn execute(
     target: &Target,
     transport: &dyn Transport,
     runs: &[PlannedRun],
     passwords: &Passwords,
     cancel: &AtomicBool,
+    mut recorder: Option<&mut Recorder<'_>>,
 ) -> TargetReport {
     let mut reports = Vec::with_capacity(runs.len());
     let mut ok = true;
@@ -607,8 +857,42 @@ pub(crate) fn execute(
                 Err(error) => return failed(target, reports, error),
             },
         };
-        let (run, timeout) = (planned.run.as_str(), planned.timeout);
-        let upload = planned.file.as_ref().and_then(|file| file.upload.as_ref());
+        let (mut run, timeout) = (planned.run.as_str(), planned.timeout);
+        let mut upload = planned.file.as_ref().and_then(|file| file.upload.as_ref());
+        let write = planned.file.as_ref().and_then(|file| file.write.as_ref());
+        let rebuilt;
+        let mut captured = None;
+        if let (Some(recorder), Some(write)) = (recorder.as_deref_mut(), write) {
+            let found = match capture(target, transport, write, password.map(|(_, p)| p)) {
+                Ok(found) => found,
+                Err(Uncaptured::Step(step)) => {
+                    reports.push(StepReport {
+                        run: label.to_owned(),
+                        ..step
+                    });
+                    ok = false;
+                    break;
+                }
+                Err(Uncaptured::Transport(TransportError::Cancelled)) => {
+                    return cancelled(target, reports);
+                }
+                Err(Uncaptured::Transport(err)) => {
+                    let error = step_error(&err, password.map(|(name, _)| name), prefix);
+                    return failed(target, reports, error);
+                }
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return cancelled(target, reports);
+            }
+            rebuilt = match files::write_script(write, recorder.sources, &found.expected()) {
+                Ok(rebuilt) => rebuilt,
+                Err(error) => return failed(target, reports, error),
+            };
+            (run, upload) = (rebuilt.0.as_str(), rebuilt.1.as_ref());
+            recorder.wrote = true;
+            captured = Some(found);
+        }
+        let mut staged = true;
         let output = match (password, upload) {
             (None, None) => transport.run(run, timeout),
             (None, Some(_)) => {
@@ -620,11 +904,44 @@ pub(crate) fn execute(
             }
             (Some((_, password)), Some(upload)) => {
                 match send_file(target, transport, upload, run, password, timeout, cancel) {
-                    Some(output) => output,
-                    None => return cancelled(target, reports),
+                    Sent::Installed(output) => output,
+                    Sent::Unstaged(output) => {
+                        staged = false;
+                        output
+                    }
+                    Sent::Cancelled => return cancelled(target, reports),
                 }
             }
         };
+        if let (Some(recorder), Some(write), Some(found)) =
+            (recorder.as_deref_mut(), write, captured)
+        {
+            // Only a write that may have changed DEST failed midway: a
+            // failed stage, a refusal (root checks, hash guard), a password
+            // sudo -v rejected, and a run that never reached the target (no
+            // master: cancelled, refused, an unknown host key, a denied key,
+            // ssh not spawned) all left it as it was.
+            let ended = match &output {
+                _ if !staged => record::Write::Refused,
+                Ok(output) if output.code == Some(0) => record::Write::Written,
+                Ok(output) if output.code == Some(files::REFUSED) => record::Write::Refused,
+                Err(
+                    TransportError::PasswordRejected
+                    | TransportError::Cancelled
+                    | TransportError::Connect { .. }
+                    | TransportError::HostKey
+                    | TransportError::AuthDenied { .. }
+                    | TransportError::Spawn(_),
+                ) => record::Write::Refused,
+                // NoPrompt: sudo asked some other way, or took the password
+                // without anvil's prompt, so the write may have started
+                // unseen. A timeout, a lost transport or a failed wait on
+                // the running ssh (Wait) may have cut it.
+                _ => record::Write::FailedMidway,
+            };
+            let file = write.record(recorder.config, recorder.sources, found, ended);
+            recorder.files.push(file);
+        }
         let output = match output {
             Ok(output) => output,
             // ssh would have had to open a master after cancel.
@@ -664,13 +981,87 @@ pub(crate) fn execute(
     }
 }
 
+/// Why [`capture`] found nothing: the step that failed, without what the
+/// capture printed on stdout, or the transport's error.
+enum Uncaptured {
+    Step(StepReport),
+    Transport(TransportError),
+}
+
+/// Runs `write`'s capture of DEST through the write's own path: on a
+/// terminal typing `password` on the password path, else plainly. Turns
+/// core dumps off first. Its stdout holds DEST's bytes, so it is parsed and
+/// dropped, never reported or logged; a failed capture keeps only stderr,
+/// or on a terminal, which shares one stream, the `files:` lines.
+fn capture(
+    target: &Target,
+    transport: &dyn Transport,
+    write: &files::FileWrite,
+    password: Option<&[u8]>,
+) -> Result<files::Captured, Uncaptured> {
+    no_core_dumps();
+    let script = write.capture();
+    let output = match password {
+        Some(password) => {
+            transport.run_tty(&packages::with_password(&script), password, RUN_TIMEOUT)
+        }
+        None => transport.run(&script, RUN_TIMEOUT),
+    };
+    let output = output.map_err(|err| match err {
+        // What a timed-out capture printed may be DEST's bytes.
+        TransportError::Timeout { after, output } => {
+            if let Some(mut output) = output {
+                output.stdout.zeroize();
+                output.stderr.zeroize();
+            }
+            Uncaptured::Transport(TransportError::Timeout {
+                after,
+                output: None,
+            })
+        }
+        err => Uncaptured::Transport(err),
+    })?;
+    // The buffer itself, moved rather than copied, so it is zeroed on drop.
+    let stdout = Zeroizing::new(output.stdout);
+    let failure = |code, stderr: String| {
+        Uncaptured::Step(StepReport {
+            run: String::new(),
+            code,
+            stdout: String::new(),
+            stderr,
+            skipped: false,
+        })
+    };
+    if output.code != Some(0) {
+        let stderr = match password {
+            None => into_string(output.stderr),
+            // Line by line, so that no lossy copy of the whole output, which
+            // may hold DEST's bytes, is ever made.
+            Some(_) => stdout
+                .split(|&byte| byte == b'\n')
+                .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+                .filter(|line| line.starts_with(b"files: "))
+                .map(|line| format!("{}\n", String::from_utf8_lossy(line)))
+                .collect(),
+        };
+        return Err(failure(output.code, stderr));
+    }
+    let found = files::parse_capture(&write.dest, &stdout)
+        .map_err(|error| failure(Some(1), format!("{error}\n")))?;
+    log::info!(
+        "apply {}: capture {}: {}",
+        target.name,
+        write.dest,
+        found.summary()
+    );
+    Ok(found)
+}
+
 /// The password path of a `[[files]]` step: `upload.stage` writes the bytes
 /// to the temp file over a plain run; unless it failed or `cancel` was set
 /// meanwhile, `run` then installs it on a terminal, typing `password`.
 /// `upload.cleanup` runs after, whatever happened and even once cancelled,
-/// and its failure is only logged. The result is the terminal run's; a failed stage is a fixed
-/// message instead of what the shell printed, which names the temp file.
-/// `None` when cancelled.
+/// and its failure is only logged.
 fn send_file(
     target: &Target,
     transport: &dyn Transport,
@@ -679,23 +1070,31 @@ fn send_file(
     password: &[u8],
     timeout: Duration,
     cancel: &AtomicBool,
-) -> Option<Result<Output, TransportError>> {
-    let result = match transport.run(&upload.stage, timeout) {
+) -> Sent {
+    let sent = match transport.run(&upload.stage, timeout) {
         Ok(staged) if staged.code == Some(0) => {
             log::debug!("apply {}: file staged", target.name);
-            (!cancel.load(Ordering::Relaxed))
-                .then(|| transport.run_tty(&packages::with_password(run), password, timeout))
+            match cancel.load(Ordering::Relaxed) {
+                true => Sent::Cancelled,
+                false => Sent::Installed(transport.run_tty(
+                    &packages::with_password(run),
+                    password,
+                    timeout,
+                )),
+            }
         }
-        Ok(staged) => Some(Ok(Output {
+        Ok(staged) => Sent::Unstaged(Ok(Output {
             code: staged.code,
             stderr: b"files: could not stage the file\n".to_vec(),
             ..Output::default()
         })),
-        Err(TransportError::Timeout { after, .. }) => Some(Err(TransportError::Timeout {
-            after,
-            output: None,
-        })),
-        Err(err) => Some(Err(err)),
+        Err(TransportError::Timeout { after, .. }) => {
+            Sent::Unstaged(Err(TransportError::Timeout {
+                after,
+                output: None,
+            }))
+        }
+        Err(err) => Sent::Unstaged(Err(err)),
     };
     match transport.run_uncancelled(&upload.cleanup, RUN_TIMEOUT) {
         Ok(output) if output.code == Some(0) => {}
@@ -706,7 +1105,19 @@ fn send_file(
         ),
         Err(err) => log::debug!("apply {}: cannot remove the temp file: {err}", target.name),
     }
-    result
+    sent
+}
+
+/// How [`send_file`] ended.
+enum Sent {
+    /// The install ran on a terminal; its result.
+    Installed(Result<Output, TransportError>),
+    /// The stage failed, so nothing was installed: a fixed message instead
+    /// of what the shell printed, which names the temp file, or the
+    /// transport's error.
+    Unstaged(Result<Output, TransportError>),
+    /// Cancelled after the stage, before the install.
+    Cancelled,
 }
 
 /// The failure of a step: for a step run on a terminal with the password
@@ -1072,6 +1483,9 @@ mod tests {
     use crate::inventory::TargetKind;
     use crate::test_util::{FakePlugins, Meet, json, keys};
 
+    /// Each `[[files]]` capture script, and the password typed for it.
+    type Captures = Vec<(String, Option<Vec<u8>>)>;
+
     /// Runs nothing: the probe prints `probe` (exiting `probe_code`), `fail`
     /// exits 3, anything else echoes `<script>-out`; every script is
     /// recorded in the shared log.
@@ -1096,7 +1510,18 @@ mod tests {
         /// Once that flag is set, `run` (not `run_uncancelled`) fails with
         /// `Cancelled`, as ssh does when it would open a master.
         refuse_once_cancelled: bool,
+        /// Each `[[files]]` capture, kept apart from `log`, and the password
+        /// typed for it on a terminal.
+        captures: Arc<Mutex<Captures>>,
+        /// What a capture prints, and its exit code.
+        capture: &'static str,
+        capture_code: Option<i32>,
+        /// A `run` script containing the text sets the first flag, if any,
+        /// then waits up to 5 s for the second.
+        hold: Option<Hold>,
     }
+
+    type Hold = (&'static str, Option<Arc<AtomicBool>>, Arc<AtomicBool>);
 
     impl Fake {
         fn new(log: &Arc<Mutex<Vec<String>>>) -> Fake {
@@ -1112,11 +1537,46 @@ mod tests {
                 exits: &[],
                 cancel_on: None,
                 refuse_once_cancelled: false,
+                captures: Arc::default(),
+                capture: "anvil-capture absent\n",
+                capture_code: Some(0),
+                hold: None,
             }
         }
 
+        /// The answer to a `[[files]]` capture, when `script` is one.
+        fn captured(&self, script: &str, password: Option<&[u8]>) -> Option<Output> {
+            if !script.contains("anvil-capture ") {
+                return None;
+            }
+            let typed = password.map(<[u8]>::to_vec);
+            self.captures
+                .lock()
+                .unwrap()
+                .push((script.to_owned(), typed));
+            Some(Output {
+                stdout: self.capture.as_bytes().to_vec(),
+                code: self.capture_code,
+                ..Output::default()
+            })
+        }
+
         fn answer(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
+            if let Some(output) = self.captured(script, None) {
+                return Ok(output);
+            }
             self.timeouts.lock().unwrap().push(timeout);
+            if let Some((needle, entered, release)) = &self.hold
+                && script.contains(needle)
+            {
+                if let Some(entered) = entered {
+                    entered.store(true, Ordering::Relaxed);
+                }
+                let since = std::time::Instant::now();
+                while !release.load(Ordering::Relaxed) && since.elapsed() < Duration::from_secs(5) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
             let ran = {
                 let mut log = self.log.lock().unwrap();
                 log.push(script.to_owned());
@@ -1192,6 +1652,9 @@ mod tests {
             password: &[u8],
             timeout: Duration,
         ) -> Result<Output, TransportError> {
+            if let Some(output) = self.captured(script, Some(password)) {
+                return Ok(output);
+            }
             self.timeouts.lock().unwrap().push(timeout);
             self.log.lock().unwrap().push(script.to_owned());
             self.typed.lock().unwrap().push(password.to_vec());
@@ -1260,7 +1723,8 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
-        );
+        )
+        .report;
         let runs = log.lock().unwrap().clone();
         (report, runs)
     }
@@ -1380,7 +1844,8 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
-        );
+        )
+        .report;
         assert_eq!(
             json(&report),
             serde_json::json!({"target": "box", "error": "cannot start the transport: HOME is not set", "ok": false})
@@ -1460,6 +1925,7 @@ mod tests {
         let report = Report {
             targets: vec![good, bad],
             ok: false,
+            warnings: Vec::new(),
         };
         let value = json(&report);
         assert_eq!(keys(&value), ["ok", "targets"]);
@@ -1725,13 +2191,15 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &cancel,
+            None,
             &mut |progress| match progress {
                 Progress::Begin(targets) => events.push(format!("begin {}", targets.len())),
                 Progress::Start(target) => events.push(format!("start {}", target.name)),
                 Progress::Done(_, report) => events.push(format!("done {}", report.target())),
                 Progress::Ordered(_) => {}
             },
-        );
+        )
+        .unwrap();
         let runs = log.lock().unwrap().clone();
         (report, runs, events)
     }
@@ -1806,6 +2274,7 @@ mod tests {
         let report = Report {
             targets: vec![good, bad],
             ok: false,
+            warnings: Vec::new(),
         };
         assert_eq!(report.counts(), (1, 1));
     }
@@ -1844,7 +2313,8 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
-        );
+        )
+        .report;
         let runs = log.lock().unwrap().clone();
         (report, runs)
     }
@@ -1921,7 +2391,8 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
-        );
+        )
+        .report;
         assert_eq!(*log.lock().unwrap(), [facts::PROBE]);
         assert_eq!(
             json(&report),
@@ -1965,7 +2436,8 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
-        );
+        )
+        .report;
         assert_eq!(*log.lock().unwrap(), [facts::PROBE]);
         assert_eq!(
             json(&report),
@@ -2000,8 +2472,10 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(cancelled),
+            None,
             &mut |_| {},
-        );
+        )
+        .unwrap();
         let runs = log.lock().unwrap().clone();
         (report, runs)
     }
@@ -2051,7 +2525,8 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(true),
-        );
+        )
+        .report;
         assert!(log.lock().unwrap().is_empty(), "the probe does not run");
         assert_eq!(
             report,
@@ -2113,7 +2588,8 @@ mod tests {
             &FakePlugins::none(),
             &local_passwords(password),
             &AtomicBool::new(false),
-        );
+        )
+        .report;
         let runs = log.lock().unwrap().clone();
         let typed = typed.lock().unwrap().clone();
         (report, runs, typed)
@@ -2147,7 +2623,8 @@ mod tests {
                 &FakePlugins::none(),
                 &passwords,
                 &AtomicBool::new(false),
-            );
+            )
+            .report;
             assert!(report.ok(), "{probe}");
             assert_eq!(typed.lock().unwrap().len(), usize::from(password.is_some()));
             assert_eq!(
@@ -2322,7 +2799,8 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
-        );
+        )
+        .report;
         assert_eq!(
             json(&report),
             serde_json::json!({"target": "local", "error": "timed out after 30 s", "ok": false})
@@ -2552,7 +3030,8 @@ mod tests {
             &FakePlugins::new(|_, _| Ok("hostname".to_owned())),
             &Passwords::new(),
             &AtomicBool::new(false),
-        );
+        )
+        .report;
         assert_eq!(*log.lock().unwrap(), [facts::PROBE, "{ :\nhostname\n}\n"]);
         assert!(report.ok());
         assert_eq!(
@@ -2584,8 +3063,10 @@ mod tests {
             &plugins,
             &Passwords::new(),
             &AtomicBool::new(false),
+            None,
             &mut |_| {},
-        );
+        )
+        .unwrap();
         let wrapped = crate::run::wrap("hostname");
         assert_eq!(
             *log.lock().unwrap(),
@@ -2620,7 +3101,8 @@ mod tests {
             &plugins,
             &Passwords::new(),
             &cancel,
-        );
+        )
+        .report;
         let seen: Vec<String> = plugins
             .seen
             .lock()
@@ -2677,7 +3159,8 @@ mod tests {
                 &FakePlugins::none(),
                 &Passwords::new(),
                 &AtomicBool::new(false),
-            );
+            )
+            .report;
             assert_eq!(*log.lock().unwrap(), [facts::PROBE]);
             assert_eq!(report.failure().as_deref(), Some(error));
         }
@@ -2754,8 +3237,10 @@ mod tests {
             &FakePlugins::none(),
             &passwords,
             &AtomicBool::new(false),
+            None,
             &mut |_| {},
-        );
+        )
+        .unwrap();
         assert_eq!(*typed.lock().unwrap(), [&b"pw-local"[..], b"pw-a"]);
         assert_eq!(report.counts(), (2, 1));
         assert_eq!(
@@ -2900,7 +3385,8 @@ mod tests {
             &FakePlugins::none(),
             passwords,
             &AtomicBool::new(false),
-        );
+        )
+        .report;
         let runs = log.lock().unwrap().clone();
         let typed = typed.lock().unwrap().clone();
         (report, runs, typed)
@@ -3036,7 +3522,8 @@ mod tests {
             &FakePlugins::none(),
             &local_passwords(password),
             &cancel,
-        );
+        )
+        .report;
         let runs = log.lock().unwrap().clone();
         let typed = typed.lock().unwrap().clone();
         (report, runs, typed)
@@ -3184,6 +3671,7 @@ mod tests {
             ],
             &Passwords::new(),
             &AtomicBool::new(false),
+            None,
         );
         assert_eq!(
             report,
@@ -3211,7 +3699,8 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
-        );
+        )
+        .report;
         assert_eq!(
             report,
             TargetReport::Cancelled {
@@ -3305,8 +3794,10 @@ mod tests {
             &FakePlugins::none(),
             &local_passwords(Some(PASSWORD.as_bytes())),
             &AtomicBool::new(false),
+            None,
             &mut |_| {},
-        );
+        )
+        .unwrap();
         assert_eq!(report.counts(), (1, 1), "{report:?}");
         assert_eq!(
             report.targets[0].failure().unwrap(),
@@ -3411,7 +3902,8 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
-        );
+        )
+        .report;
         assert!(report.ok(), "{report:?}");
         let runs = log.lock().unwrap().clone();
         assert_eq!(
@@ -3527,8 +4019,10 @@ mod tests {
                 &FakePlugins::none(),
                 &Passwords::new(),
                 &AtomicBool::new(false),
+                None,
                 &mut |_| {},
-            );
+            )
+            .unwrap();
             assert_eq!(report.counts(), (1, 1), "{report:?}");
             assert_eq!(report.targets[0].failure().unwrap(), error);
             assert!(report.targets[0].steps().is_empty());
@@ -3575,7 +4069,8 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
-        );
+        )
+        .report;
         assert!(!report.ok());
         let steps = report.steps();
         assert_eq!(steps.len(), 1, "{steps:?}");
@@ -3614,7 +4109,8 @@ mod tests {
             &FakePlugins::none(),
             &local_passwords(password),
             &AtomicBool::new(false),
-        );
+        )
+        .report;
         let runs = log.lock().unwrap().clone();
         let typed = typed.lock().unwrap().clone();
         (report, runs, typed, config)
@@ -3801,8 +4297,10 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             cancel,
+            None,
             on,
-        );
+        )
+        .unwrap();
         (report, built.into_inner())
     }
 
@@ -3949,7 +4447,7 @@ mod tests {
                 };
                 let secret = format!("{}_SUDO", t.name.to_uppercase());
                 let runs = [planned("install", Some(&secret), RUN_TIMEOUT)];
-                execute(t, &transport, &runs, &passwords, &cancel)
+                execute(t, &transport, &runs, &passwords, &cancel, None)
             },
         );
         assert!(report.ok, "{report:?}");
@@ -4048,7 +4546,7 @@ mod tests {
             RUN_TIMEOUT,
             &cancel,
         );
-        assert!(result.is_none(), "cancelled");
+        assert!(matches!(result, Sent::Cancelled), "cancelled");
         assert!(!temp.exists(), "the cleanup removed the temp file");
         let masters = std::fs::read_to_string(&log)
             .unwrap()
@@ -4057,5 +4555,671 @@ mod tests {
             .count();
         assert_eq!(masters, 2, "the cleanup opened a new master");
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// Applies `config` to `target` over `fake` (probing as `probe`) with
+    /// `passwords`; returns what apply returned, the scripts run, and each
+    /// capture with the password it typed.
+    fn apply_recorded(
+        target: &Target,
+        config: &Config,
+        fake: Fake,
+        passwords: &Passwords,
+    ) -> (Applied, Vec<String>, Captures) {
+        let (log, captures) = (Arc::clone(&fake.log), Arc::clone(&fake.captures));
+        let applied = apply_target(
+            target,
+            Ok(Box::new(fake)),
+            config,
+            &file_sources(config),
+            &FakePlugins::none(),
+            passwords,
+            &AtomicBool::new(false),
+        );
+        let runs = log.lock().unwrap().clone();
+        let captures = captures.lock().unwrap().clone();
+        (applied, runs, captures)
+    }
+
+    fn sha256_hex(text: &str) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// A capture of a 0640 root file holding `v0\n`.
+    const CAPTURED_V0: &str = "sudo: a warning first\r\n\
+        anvil-capture file -rw-r----- 1 0 42 3 Jan 1 00:00 /etc/a.conf\n\
+        anvil-capture bytes\n 76 30 0a\nanvil-capture end\n";
+
+    #[test]
+    fn a_file_step_captures_dest_then_writes_only_if_it_is_still_absent() {
+        let config = with_files(None, vec![file_entry("/etc/a.conf", &[], true)], &[]);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let fake = Fake {
+            probe: ARCH_NOPASSWD,
+            ..Fake::new(&log)
+        };
+        let (applied, runs, captures) =
+            apply_recorded(&target("local"), &config, fake, &Passwords::new());
+        assert!(applied.report.ok(), "{:?}", applied.report);
+        assert_eq!(captures.len(), 1);
+        let (capture, typed) = &captures[0];
+        assert!(
+            capture.contains("sudo -n ls -lLdn '/etc/a.conf'"),
+            "{capture}"
+        );
+        assert_eq!(*typed, None, "a plain run");
+        assert!(
+            runs[1].contains("! sudo -n test -e '/etc/a.conf' ||"),
+            "the write refuses a dest that appeared: {}",
+            runs[1]
+        );
+        let reached = applied.reached.unwrap();
+        assert!(reached.wrote);
+        let record = reached.record;
+        assert!(record.ok);
+        assert_eq!(record.facts.get("user"), Some("cmj"));
+        assert_eq!(record.anvil, env!("CARGO_PKG_VERSION"));
+        assert!(record.at > 1_700_000_000, "{}", record.at);
+        assert_eq!(
+            record.files,
+            [FileRecord {
+                dest: "/etc/a.conf".to_owned(),
+                mode: "0644".to_owned(),
+                sudo: true,
+                written_sha256: sha256_hex(FILE_TEXT),
+                write: record::Write::Written,
+                previous: record::Previous::Absent,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_replaced_file_records_its_text_mode_owner_and_hash() {
+        for rollback in [true, false] {
+            let mut entry = file_entry("/etc/a.conf", &[], true);
+            entry.mode = Some(ModeValue::Text("640".to_owned()));
+            entry.rollback = rollback;
+            let config = with_files(None, vec![entry], &[]);
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let fake = Fake {
+                probe: ARCH_NOPASSWD,
+                capture: CAPTURED_V0,
+                ..Fake::new(&log)
+            };
+            let (applied, runs, _) =
+                apply_recorded(&target("local"), &config, fake, &Passwords::new());
+            assert!(applied.report.ok(), "{:?}", applied.report);
+            let v0 = sha256_hex("v0\n");
+            assert!(runs[1].contains(&format!("= '{v0}' ]")), "{}", runs[1]);
+            let file = &applied.reached.unwrap().record.files[0];
+            assert_eq!(file.mode, "0640", "4 digits");
+            let record::Previous::File(previous) = &file.previous else {
+                panic!("{:?}", file.previous);
+            };
+            assert_eq!(
+                (previous.mode.as_str(), previous.uid, previous.gid),
+                ("0640", 0, 42)
+            );
+            assert_eq!(previous.sha256, v0);
+            match rollback {
+                true => {
+                    assert!(previous.kept);
+                    assert_eq!(previous.text.as_deref().map(String::as_str), Some("v0\n"));
+                    assert_eq!(previous.reason, None);
+                }
+                false => {
+                    assert!(!previous.kept);
+                    assert_eq!(previous.text, None, "the hash only");
+                    assert_eq!(previous.reason.as_deref(), Some("rollback = false"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_binary_previous_file_keeps_only_its_hash() {
+        for (bytes, reason) in [
+            (" ff fe 0a", "not UTF-8 text"),
+            (" 61 00 0a", "contains NUL"),
+        ] {
+            let config = with_files(None, vec![file_entry("/etc/a.conf", &[], true)], &[]);
+            let capture: &'static str = Box::leak(
+                format!(
+                    "anvil-capture file -rw-r--r-- 1 0 0 3 x /etc/a.conf\n\
+                     anvil-capture bytes\n{bytes}\nanvil-capture end\n"
+                )
+                .into_boxed_str(),
+            );
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let fake = Fake {
+                probe: ARCH_NOPASSWD,
+                capture,
+                ..Fake::new(&log)
+            };
+            let (applied, _, _) =
+                apply_recorded(&target("local"), &config, fake, &Passwords::new());
+            let file = &applied.reached.unwrap().record.files[0];
+            let record::Previous::File(previous) = &file.previous else {
+                panic!("{:?}", file.previous);
+            };
+            assert_eq!(
+                (previous.kept, previous.reason.as_deref()),
+                (false, Some(reason))
+            );
+            assert_eq!(previous.sha256.len(), 64);
+        }
+    }
+
+    #[test]
+    fn how_the_write_ended_is_recorded() {
+        for (fake, write, ok) in [
+            (
+                Fake {
+                    exits: &[("tee", 1)],
+                    ..Fake::new(&Arc::default())
+                },
+                record::Write::FailedMidway,
+                false,
+            ),
+            (
+                Fake {
+                    exits: &[("tee", files::REFUSED)],
+                    ..Fake::new(&Arc::default())
+                },
+                record::Write::Refused,
+                false,
+            ),
+            (
+                Fake {
+                    fail_with: Some(TransportError::Timeout {
+                        after: Duration::from_secs(1),
+                        output: None,
+                    }),
+                    succeed: 1,
+                    ..Fake::new(&Arc::default())
+                },
+                record::Write::FailedMidway,
+                false,
+            ),
+        ] {
+            let config = with_files(None, vec![file_entry("/etc/a.conf", &[], true)], &[]);
+            let fake = Fake {
+                probe: ARCH_NOPASSWD,
+                ..fake
+            };
+            let (applied, _, _) =
+                apply_recorded(&target("local"), &config, fake, &Passwords::new());
+            assert_eq!(applied.report.ok(), ok);
+            let reached = applied.reached.unwrap();
+            assert!(reached.wrote, "the write started");
+            assert!(
+                !reached.record.ok,
+                "the failed step makes the entry ok:false"
+            );
+            assert_eq!(reached.record.files[0].write, write);
+        }
+    }
+
+    #[test]
+    fn a_failed_wait_on_the_write_is_failed_midway() {
+        // ssh was spawned and the tee may have run; only the wait failed.
+        let config = with_files(None, vec![file_entry("/etc/a.conf", &[], true)], &[]);
+        let fake = Fake {
+            probe: ARCH_NOPASSWD,
+            fail_with: Some(TransportError::Wait("No child processes".to_owned())),
+            succeed: 1,
+            ..Fake::new(&Arc::default())
+        };
+        let (applied, runs, _) = apply_recorded(&target("local"), &config, fake, &Passwords::new());
+        assert!(!applied.report.ok());
+        assert_eq!(runs.len(), 2, "probe, then the write: {runs:?}");
+        let reached = applied.reached.unwrap();
+        assert!(reached.wrote, "the write started");
+        assert_eq!(reached.record.files[0].write, record::Write::FailedMidway);
+
+        let shown = TransportError::Wait("No child processes".to_owned()).to_string();
+        assert_eq!(shown, "cannot wait for the transport: No child processes");
+    }
+
+    #[test]
+    fn a_write_that_never_reached_dest_is_refused() {
+        let (local, config) = password_file();
+        let password = local_passwords(Some(PASSWORD.as_bytes()));
+        for (what, fake) in [
+            (
+                "sudo -v rejected the install's password",
+                Fake {
+                    tty_fail: Some(TransportError::PasswordRejected),
+                    ..Fake::new(&Arc::default())
+                },
+            ),
+            (
+                "the stage failed",
+                Fake {
+                    exits: &[("set -C", 1)],
+                    ..Fake::new(&Arc::default())
+                },
+            ),
+            (
+                "the stage lost the transport",
+                Fake {
+                    fail_with: Some(TransportError::HostKey),
+                    succeed: 1,
+                    ..Fake::new(&Arc::default())
+                },
+            ),
+        ] {
+            let fake = Fake {
+                probe: ARCH_SUDO,
+                capture: CAPTURED_V0,
+                ..fake
+            };
+            let (applied, _, captures) = apply_recorded(&local, &config, fake, &password);
+            assert_eq!(captures.len(), 1, "{what}");
+            assert!(!applied.report.ok(), "{what}");
+            let reached = applied.reached.unwrap();
+            assert_eq!(
+                reached.record.files[0].write,
+                record::Write::Refused,
+                "{what}"
+            );
+        }
+
+        // The tee never reached the target: ssh had no master to run it in.
+        let config = with_files(None, vec![file_entry("/etc/a.conf", &[], true)], &[]);
+        for err in [
+            TransportError::Cancelled,
+            TransportError::Connect {
+                stderr: "ssh: connect to host h port 22: Connection refused".to_owned(),
+            },
+            TransportError::HostKey,
+            TransportError::AuthDenied {
+                after_prompt: false,
+            },
+            TransportError::Spawn("no such file".to_owned()),
+        ] {
+            let fake = Fake {
+                probe: ARCH_NOPASSWD,
+                fail_with: Some(err.clone()),
+                succeed: 1,
+                ..Fake::new(&Arc::default())
+            };
+            let (applied, runs, _) =
+                apply_recorded(&target("local"), &config, fake, &Passwords::new());
+            assert!(!applied.report.ok(), "{err:?}");
+            assert_eq!(runs.len(), 2, "probe, then the write: {runs:?}");
+            let reached = applied.reached.unwrap();
+            assert_eq!(
+                reached.record.files[0].write,
+                record::Write::Refused,
+                "{err:?}"
+            );
+        }
+
+        // sudo took the password some other way: the install may have run.
+        let (local, config) = password_file();
+        let fake = Fake {
+            probe: ARCH_SUDO,
+            capture: CAPTURED_V0,
+            tty_fail: Some(TransportError::NoPrompt),
+            ..Fake::new(&Arc::default())
+        };
+        let password = local_passwords(Some(PASSWORD.as_bytes()));
+        let (applied, _, _) = apply_recorded(&local, &config, fake, &password);
+        let reached = applied.reached.unwrap();
+        assert_eq!(reached.record.files[0].write, record::Write::FailedMidway);
+    }
+
+    #[test]
+    fn a_failed_capture_fails_the_step_writes_nothing_and_shows_no_bytes() {
+        for (capture, code, stderr) in [
+            (
+                "anvil-capture file -rw-r--r-- 1 0 0 3 x /etc/a.conf\nanvil-capture bytes\n 76 30\n",
+                Some(0),
+                "files: cannot read /etc/a.conf before writing it\n",
+            ),
+            ("anvil-capture bytes\n 76 30 0a\n", Some(1), ""),
+        ] {
+            let config = with_files(None, vec![file_entry("/etc/a.conf", &[], true)], &["one"]);
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let fake = Fake {
+                probe: ARCH_NOPASSWD,
+                capture,
+                capture_code: code,
+                ..Fake::new(&log)
+            };
+            let (applied, runs, captures) =
+                apply_recorded(&target("local"), &config, fake, &Passwords::new());
+            assert_eq!(captures.len(), 1);
+            assert_eq!(runs, [facts::PROBE], "no write, no later step");
+            assert_eq!(
+                applied.report.steps(),
+                [StepReport {
+                    run: "file /etc/a.conf".to_owned(),
+                    code: Some(code.unwrap_or(0).max(1)),
+                    stdout: String::new(),
+                    stderr: stderr.to_owned(),
+                    skipped: false,
+                }]
+            );
+            let reached = applied.reached.unwrap();
+            assert!(!reached.wrote, "no write started");
+            assert!(reached.record.files.is_empty());
+            let shown = format!("{:?}{}", applied.report, json(&applied.report));
+            assert!(!shown.contains("76 30"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn the_password_path_captures_on_a_terminal_typing_the_password() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (local, config) = password_file();
+        let fake = Fake {
+            probe: ARCH_SUDO,
+            capture: CAPTURED_V0,
+            ..Fake::new(&log)
+        };
+        let (applied, runs, captures) = apply_recorded(
+            &local,
+            &config,
+            fake,
+            &local_passwords(Some(PASSWORD.as_bytes())),
+        );
+        assert!(applied.report.ok(), "{:?}", applied.report);
+        let (capture, typed) = &captures[0];
+        assert!(capture.starts_with("export TERM=dumb\n"), "{capture}");
+        assert!(capture.contains("sudo ls -lLdn '/etc/b.conf'"), "{capture}");
+        assert_eq!(typed.as_deref(), Some(PASSWORD.as_bytes()));
+        assert!(
+            runs[2].contains(&sha256_hex("v0\n")),
+            "the install is guarded: {}",
+            runs[2]
+        );
+        let record = applied.reached.unwrap().record;
+        assert!(record.files[0].sudo);
+        let shown = format!("{record:?}");
+        assert!(
+            !shown.contains("v0") && !shown.contains(PASSWORD),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn every_reached_target_is_recorded_with_its_steps_that_cannot_be_undone() {
+        let config = with_services(
+            Some(&packages(&["git"], false)),
+            vec![file_entry("/etc/a.conf", &[], true)],
+            vec![
+                service_entry("sshd", "started", Some(true), &["local"]),
+                service_entry("cron", "stopped", None, &["web"]),
+            ],
+            &["one", "fail", "never"],
+        );
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let fake = Fake {
+            probe: ARCH_ROOT,
+            ..Fake::new(&log)
+        };
+        let (applied, _, _) = apply_recorded(&target("local"), &config, fake, &Passwords::new());
+        let record = applied.reached.unwrap().record;
+        assert!(!record.ok);
+        assert_eq!(
+            record.cannot_undo,
+            ["packages", "service sshd", "step 1", "step 2"],
+            "the skip and the step that never ran are left out"
+        );
+
+        let config = self::config(Some(&packages(&["git"], false)), &["one"]);
+        let fake = Fake {
+            probe: ARCH_ROOT,
+            ..Fake::new(&log)
+        };
+        let (applied, _, captures) =
+            apply_recorded(&target("local"), &config, fake, &Passwords::new());
+        assert!(captures.is_empty());
+        let reached = applied.reached.unwrap();
+        assert!(!reached.wrote, "no [[files]]: only refreshed");
+        assert_eq!(reached.record.facts.get("distro"), Some("arch"));
+        assert!(reached.record.files.is_empty());
+
+        let fake = Fake {
+            probe: ARCH_ROOT,
+            probe_code: Some(1),
+            ..Fake::new(&log)
+        };
+        let (applied, _, _) = apply_recorded(&target("local"), &config, fake, &Passwords::new());
+        assert!(applied.reached.is_none(), "the probe did not reach it");
+
+        let plain = self::config(None, &["one"]);
+        let (applied, _, _) =
+            apply_recorded(&target("local"), &plain, Fake::new(&log), &Passwords::new());
+        assert!(applied.reached.is_none(), "no probe, no facts to record");
+    }
+
+    /// Two targets, `a` writing `/etc/a.conf` and `b` matching no file,
+    /// applied one at a time with a session on the record at `path`; `b`
+    /// connects only once `a`'s end was handled. Returns what apply returned
+    /// and each target's report as it ended.
+    fn apply_with_session(path: &std::path::Path) -> (Result<Report, String>, Vec<TargetReport>) {
+        let config = with_files(
+            Some(&packages(&["git"], false)),
+            vec![file_entry("/etc/a.conf", &["web"], true)],
+            &[],
+        );
+        let mut a = target("a");
+        a.tags = vec!["web".to_owned()];
+        let session = Session::open(path).unwrap();
+        let mut done = Vec::new();
+        let a_handled = AtomicBool::new(false);
+        let result = apply_targets(
+            &[a, target("b")],
+            ONE,
+            |target| {
+                let waited = std::time::Instant::now();
+                while target.name == "b"
+                    && !a_handled.load(Ordering::Relaxed)
+                    && waited.elapsed() < Duration::from_secs(5)
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(Box::new(Fake {
+                    probe: ARCH_ROOT,
+                    ..Fake::new(&Arc::default())
+                }))
+            },
+            &config,
+            &file_sources(&config),
+            &FakePlugins::none(),
+            &Passwords::new(),
+            &AtomicBool::new(false),
+            Some(session),
+            &mut |event| {
+                if let Event::Done(_, report) = event {
+                    done.push(report.clone());
+                    a_handled.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        (result, done)
+    }
+
+    #[test]
+    fn each_target_is_saved_into_the_record_as_it_ends() {
+        let root = crate::test_util::temp_dir("apply-record");
+        let path = root.join("state/anvil/last-apply.json");
+        let report = apply_with_session(&path).0.unwrap();
+        assert!(report.ok, "{report:?}");
+        let record = record::load(&path).unwrap().unwrap();
+        assert_eq!(record.targets["a"].files[0].dest, "/etc/a.conf");
+        assert!(record.targets["b"].files.is_empty());
+        assert_eq!(record.targets["b"].cannot_undo, ["packages"]);
+
+        // b's entry is refreshed, not replaced, when it again writes nothing.
+        let mut edited = record.clone();
+        let b = edited.targets.get_mut("b").unwrap();
+        b.at = 1;
+        b.files = record.targets["a"].files.clone();
+        std::fs::write(&path, serde_json::to_vec(&edited).unwrap()).unwrap();
+        apply_with_session(&path).0.unwrap();
+        let again = record::load(&path).unwrap().unwrap();
+        assert!(again.targets["b"].at > 1);
+        assert_eq!(again.targets["b"].files, record.targets["a"].files);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn saves_report_the_first_error_and_the_targets_still_unrecorded() {
+        let cancel = AtomicBool::new(false);
+        let err = || Err::<(), _>("cannot write last-apply.json: denied".to_owned());
+        let saves = Saves::default();
+        assert_eq!(saves.finish(Ok(7)), Ok(7));
+        assert!(!cancel.load(Ordering::Relaxed));
+
+        let mut saves = Saves::default();
+        saves.note("a", err(), &cancel);
+        assert!(cancel.load(Ordering::Relaxed), "the first failure cancels");
+        saves.note("b", Err("second".to_owned()), &cancel);
+        assert_eq!(
+            saves.finish(Err::<(), _>("third".to_owned())),
+            Err("cannot write last-apply.json: denied; not recorded: a, b".to_owned())
+        );
+
+        // A later save writes the whole record: a is in it after all.
+        let mut saves = Saves::default();
+        saves.note("a", err(), &cancel);
+        saves.note("b", Ok(()), &cancel);
+        saves.note("c", Err("x".to_owned()), &cancel);
+        assert_eq!(
+            saves.finish(Err::<(), _>("y".to_owned())),
+            Err("cannot write last-apply.json: denied; not recorded: c".to_owned())
+        );
+        let mut saves = Saves::default();
+        saves.note("a", err(), &cancel);
+        assert_eq!(
+            saves.finish(Ok(())),
+            Err("cannot write last-apply.json: denied".to_owned()),
+            "the finish recorded a, but the run still fails"
+        );
+        assert_eq!(
+            Saves::default().finish(Err::<(), _>("only the finish".to_owned())),
+            Err("only the finish".to_owned())
+        );
+
+        // Without a last save, as rollback ends.
+        assert_eq!(Saves::default().result(), Ok(()));
+        let mut saves = Saves::default();
+        saves.note("a", err(), &cancel);
+        assert_eq!(
+            saves.result(),
+            Err("cannot write last-apply.json: denied; not recorded: a".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_target_mid_write_when_a_save_fails_is_still_saved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for writable_again in [true, false] {
+            let root = crate::test_util::temp_dir("apply-record-inflight");
+            let dir = root.join("state/anvil");
+            let path = dir.join("last-apply.json");
+            crate::private::ensure_dir(&dir).unwrap();
+            let session = Session::open(&path).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let config = with_files(
+                None,
+                vec![
+                    file_entry("/etc/a.conf", &["a"], true),
+                    file_entry("/etc/b.conf", &["b"], true),
+                ],
+                &[],
+            );
+            let (mut a, mut b) = (target("a"), target("b"));
+            a.tags = vec!["a".to_owned()];
+            b.tags = vec!["b".to_owned()];
+            // a writes only once b is writing; b ends only once a's failed
+            // save was handled.
+            let (b_writing, a_handled) = (Arc::new(AtomicBool::new(false)), AtomicBool::new(false));
+            let a_handled = Arc::new(a_handled);
+            let result = apply_targets(
+                &[a, b],
+                NonZeroU8::new(2).unwrap(),
+                |target| {
+                    let hold: Hold = match target.name.as_str() {
+                        "a" => ("/etc/a.conf", None, Arc::clone(&b_writing)),
+                        _ => (
+                            "/etc/b.conf",
+                            Some(Arc::clone(&b_writing)),
+                            Arc::clone(&a_handled),
+                        ),
+                    };
+                    Ok(Box::new(Fake {
+                        probe: ARCH_ROOT,
+                        hold: Some(hold),
+                        ..Fake::new(&Arc::default())
+                    }))
+                },
+                &config,
+                &file_sources(&config),
+                &FakePlugins::none(),
+                &Passwords::new(),
+                &AtomicBool::new(false),
+                Some(session),
+                &mut |event| {
+                    if let Event::Done(0, _) = event {
+                        if writable_again {
+                            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                                .unwrap();
+                        }
+                        a_handled.store(true, Ordering::Relaxed);
+                    }
+                },
+            );
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let err = result.unwrap_err();
+            assert!(err.starts_with("cannot write last-apply.json: "), "{err}");
+            match writable_again {
+                true => {
+                    assert!(!err.contains("not recorded"), "{err}");
+                    let record = record::load(&path).unwrap().unwrap();
+                    assert_eq!(record.targets["b"].files[0].dest, "/etc/b.conf");
+                    assert_eq!(record.targets["a"].files[0].dest, "/etc/a.conf");
+                }
+                false => {
+                    assert!(err.ends_with("; not recorded: a, b"), "{err}");
+                    assert!(record::load(&path).unwrap().is_none());
+                }
+            }
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_saved_fails_apply() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = crate::test_util::temp_dir("apply-record-ro");
+        let dir = root.join("state/anvil");
+        let path = dir.join("last-apply.json");
+        crate::private::ensure_dir(&dir).unwrap();
+        let session = Session::open(&path).unwrap();
+        drop(session);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (err, done) = apply_with_session(&path);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = err.unwrap_err();
+        assert!(err.starts_with("cannot write last-apply.json: "), "{err}");
+        assert!(err.ends_with("; not recorded: a"), "{err}");
+        assert!(done[0].ok(), "a ran: {:?}", done[0]);
+        assert_eq!(
+            done[1],
+            cancelled(&target("b"), Vec::new()),
+            "b never started once a could not be saved"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

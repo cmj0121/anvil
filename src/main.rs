@@ -19,7 +19,6 @@ mod paths;
 mod plan;
 mod plugin;
 mod private;
-#[cfg_attr(not(test), expect(dead_code, reason = "apply records from #18 U7 on"))]
 mod record;
 mod run;
 mod secret;

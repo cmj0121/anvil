@@ -22,15 +22,9 @@ pub const EXTENSIONS: [&str; 3] = ["toml", "yaml", "yml"];
 #[derive(Debug, PartialEq, Eq)]
 pub enum PathsError {
     NoHome,
-    #[cfg_attr(not(test), expect(dead_code, reason = "apply records from #18 U7 on"))]
     NoStateHome,
-    Ambiguous {
-        name: String,
-        paths: Vec<PathBuf>,
-    },
-    NotToml {
-        path: PathBuf,
-    },
+    Ambiguous { name: String, paths: Vec<PathBuf> },
+    NotToml { path: PathBuf },
 }
 
 impl fmt::Display for PathsError {
@@ -94,7 +88,6 @@ pub fn config_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Result<Path
 
 /// The state directory from the process environment, where anvil keeps
 /// what it must remember between runs, such as the last apply's record.
-#[expect(dead_code, reason = "apply records from #18 U7 on")]
 pub fn state_dir() -> Result<PathBuf, PathsError> {
     state_dir_from(
         std::env::var_os("XDG_STATE_HOME").as_deref(),
@@ -106,7 +99,6 @@ pub fn state_dir() -> Result<PathBuf, PathsError> {
 /// variable counts as unset, and so does a relative `$XDG_STATE_HOME`, as
 /// the XDG spec says. Never the config directory, so neither
 /// `$XDG_CONFIG_HOME` nor `--config` moves it.
-#[cfg_attr(not(test), expect(dead_code, reason = "apply records from #18 U7 on"))]
 pub fn state_dir_from(
     xdg_state: Option<&OsStr>,
     home: Option<&OsStr>,

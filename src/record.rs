@@ -67,7 +67,8 @@ impl Default for Record {
     }
 }
 
-/// One target's last apply that wrote files.
+/// One target's last apply: the facts of the last one that reached it,
+/// and what the last one that wrote files there wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetRecord {
     /// Seconds since the epoch.
@@ -191,6 +192,10 @@ impl Record {
     /// The record without any previous state, for plugins: per target its
     /// `at`, facts, `rolled_back`, and each file's dest, mode, written hash
     /// and how the write ended.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the doctor plugins read it from #19 on")
+    )]
     pub fn audit_view(&self) -> serde_json::Value {
         let targets: serde_json::Map<String, serde_json::Value> = self
             .targets
@@ -222,7 +227,6 @@ impl Record {
 }
 
 /// `last-apply.json` in the state directory from the environment.
-#[expect(dead_code, reason = "apply records from #18 U7 on")]
 pub fn path() -> Result<PathBuf, PathsError> {
     Ok(paths::state_dir()?.join(FILE_NAME))
 }
@@ -444,7 +448,31 @@ impl Session {
         }
     }
 
+    /// Records that this apply reached `name` but wrote no file there:
+    /// its entry's `at`, anvil version and facts become `target`'s, while
+    /// its files, `ok` and `cannot_undo` stay, as a rollback still needs
+    /// them; with no entry, `target` becomes it. A `rolled_back` newer than
+    /// the old `at` moves to the new one, as no write has come since.
+    pub fn refresh(&mut self, name: &str, target: TargetRecord) {
+        let Some(old) = self.record.targets.get_mut(name) else {
+            self.record.targets.insert(name.to_owned(), target);
+            return;
+        };
+        if let Some(rolled_back) = &mut old.rolled_back
+            && rolled_back.at >= old.at
+        {
+            rolled_back.at = rolled_back.at.max(target.at);
+        }
+        old.at = target.at;
+        old.anvil = target.anvil;
+        old.facts = target.facts;
+    }
+
     /// Sets `rolled_back` on `name`'s entry, the only change a rollback makes.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "anvil rollback marks from #18 U8 on")
+    )]
     pub fn mark_rolled_back(&mut self, name: &str, rolled_back: RolledBack) {
         if let Some(target) = self.record.targets.get_mut(name) {
             target.rolled_back = Some(rolled_back);
@@ -989,6 +1017,65 @@ mod tests {
             "ok: untouched dests drop"
         );
         assert_eq!(session.record.targets["db1"], old_db);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn refresh_moves_at_and_facts_and_keeps_the_files() {
+        let mut old = target(
+            1,
+            false,
+            vec![file("/etc/a", &sha('a'), Write::Written, Previous::Absent)],
+        );
+        old.rolled_back = Some(RolledBack {
+            at: 3,
+            dests: vec!["/etc/a".to_owned()],
+        });
+        let (mut session, root) = session_with("record-refresh", vec![("web1", old.clone())]);
+        let mut new = target(5, true, Vec::new());
+        new.anvil = "0.2.0".to_owned();
+        new.facts = Facts(BTreeMap::from([("kernel".to_owned(), "6.2".to_owned())]));
+        new.cannot_undo = Vec::new();
+        session.refresh("web1", new.clone());
+        session.refresh("db1", new.clone());
+        let web1 = &session.record.targets["web1"];
+        assert_eq!((web1.at, web1.anvil.as_str()), (5, "0.2.0"));
+        assert_eq!(web1.facts, new.facts);
+        assert_eq!((&web1.files, web1.ok), (&old.files, false));
+        assert_eq!(web1.cannot_undo, old.cannot_undo);
+        assert_eq!(
+            web1.rolled_back.as_ref().unwrap().at,
+            5,
+            "still rolled back"
+        );
+        assert_eq!(
+            session.record.targets["db1"], new,
+            "a new entry is the target"
+        );
+        assert!(
+            session.merged.is_empty(),
+            "a refresh adds no texts to share"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn refresh_leaves_a_rollback_older_than_the_apply() {
+        let mut old = target(4, true, Vec::new());
+        old.rolled_back = Some(RolledBack {
+            at: 3,
+            dests: vec!["/etc/a".to_owned()],
+        });
+        let (mut session, root) = session_with("record-refresh-old", vec![("web1", old)]);
+        session.refresh("web1", target(5, true, Vec::new()));
+        assert_eq!(
+            session.record.targets["web1"]
+                .rolled_back
+                .as_ref()
+                .unwrap()
+                .at,
+            3
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 

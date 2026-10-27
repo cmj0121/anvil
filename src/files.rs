@@ -234,9 +234,75 @@ pub(crate) struct FileWrite {
     pub password: bool,
 }
 
+impl FileWrite {
+    /// Whether the write runs as root, through sudo or on a root login:
+    /// only then does it carry [`root_checks`].
+    pub(crate) fn as_root(&self) -> bool {
+        !self.checks.is_empty()
+    }
+
+    /// The run before the write that reports what DEST holds.
+    pub(crate) fn capture(&self) -> String {
+        capture_script(&self.dest, &self.sudo, &self.checks, self.as_root())
+    }
+
+    /// The record of this write, from what the capture saw before it and
+    /// how it ended: `previous` keeps the bytes as text unless the entry
+    /// says `rollback = false` or they are not text.
+    pub(crate) fn record(
+        &self,
+        config: &Config,
+        sources: &Sources,
+        captured: Captured,
+        write: Write,
+    ) -> FileRecord {
+        let entry = &config.files[self.index];
+        let written = sources.0.get(self.index).map_or("", |s| s.text.as_str());
+        let previous = match captured {
+            Captured::Absent => Previous::Absent,
+            Captured::Dangling { target } => Previous::Dangling { target },
+            Captured::File {
+                mode,
+                uid,
+                gid,
+                sha256,
+                bytes,
+                reason,
+                ..
+            } => {
+                let text = match bytes {
+                    _ if !entry.rollback => Err("rollback = false"),
+                    None => Err(reason.unwrap_or("unreadable")),
+                    Some(bytes) => match std::str::from_utf8(&bytes) {
+                        Err(_) => Err("not UTF-8 text"),
+                        Ok(text) if text.contains('\0') => Err("contains NUL"),
+                        Ok(text) => Ok(Zeroizing::new(text.to_owned())),
+                    },
+                };
+                Previous::File(PreviousFile {
+                    mode,
+                    uid,
+                    gid,
+                    sha256,
+                    kept: text.is_ok(),
+                    reason: text.as_ref().err().map(|why| (*why).to_owned()),
+                    text: text.ok(),
+                })
+            }
+        };
+        FileRecord {
+            dest: self.dest.clone(),
+            mode: format!("{:0>4}", self.mode),
+            sudo: entry.sudo,
+            written_sha256: hex(&Sha256::digest(written.as_bytes())),
+            write,
+            previous,
+        }
+    }
+}
+
 /// What DEST must hold when the write starts, as the capture saw it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
 pub(crate) enum Expected {
     /// No check.
     Unchecked,
@@ -555,7 +621,6 @@ fn install_script(temp: &str, dest: &str, mode: &str, checks: &str, expected: &E
 
 /// The most bytes of a dest that the capture reads back and the apply
 /// record keeps, so that it can restore them.
-#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
 pub(crate) const MAX_KEPT: u64 = 256 * 1024;
 
 /// Defines `anvil_sha256 FILE`, which prints FILE's sha256 in hex through
@@ -580,7 +645,6 @@ fn hash_fn(sudo: &str) -> String {
 }
 
 /// The lines [`capture_script`] prints start with this.
-#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
 const MARK: &str = "anvil-capture ";
 
 /// The run before a write that reports what DEST holds, through the same
@@ -601,7 +665,6 @@ const MARK: &str = "anvil-capture ";
 /// On the password path stderr shares the terminal with stdout, so the
 /// probes whose failure is an answer, not an error, send theirs to
 /// `/dev/null`: a stray sudo warning cannot break [`parse_capture`].
-#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
 pub(crate) fn capture_script(dest: &str, sudo: &str, checks: &str, as_root: bool) -> String {
     let d = quote(dest);
     let ready = match sudo {
@@ -651,7 +714,6 @@ pub(crate) fn capture_script(dest: &str, sudo: &str, checks: &str, as_root: bool
 }
 
 /// What [`capture_script`] found at DEST.
-#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
 pub(crate) enum Captured {
     Absent,
     /// A symlink, on the user path, whose target does not exist.
@@ -710,7 +772,6 @@ impl fmt::Debug for Captured {
 /// may come first, while the data only ever follows a marker. From the
 /// first marker on, anything but the exact shape the script prints, a
 /// missing `end` included, is an error.
-#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
 pub(crate) fn parse_capture(dest: &str, stdout: &[u8]) -> Result<Captured, String> {
     let unread = || format!("files: cannot read {dest} before writing it");
     let text = std::str::from_utf8(stdout).map_err(|_| unread())?;
@@ -806,8 +867,31 @@ pub(crate) fn parse_capture(dest: &str, stdout: &[u8]) -> Result<Captured, Strin
     }
 }
 
+impl Captured {
+    /// What the write must find at DEST: nothing, or this file.
+    pub(crate) fn expected(&self) -> Expected {
+        match self {
+            Captured::Absent | Captured::Dangling { .. } => Expected::Absent,
+            Captured::File { sha256, .. } => Expected::Sha256(sha256.clone()),
+        }
+    }
+
+    /// What the log may say of it: never its bytes.
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            Captured::Absent => "absent".to_owned(),
+            Captured::Dangling { .. } => "a dangling link".to_owned(),
+            Captured::File {
+                bytes: Some(bytes), ..
+            } => format!("{} bytes", bytes.len()),
+            Captured::File { reason, .. } => {
+                format!("kept:false ({})", reason.unwrap_or("not read"))
+            }
+        }
+    }
+}
+
 /// `bytes` in lowercase hex.
-#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -816,7 +900,6 @@ fn hex(bytes: &[u8]) -> String {
 /// uid, gid, size, and the type character (`-` for a regular file). The
 /// permissions may end in one `@`, `+` or `.`; `s`/`S` and `t`/`T` are the
 /// setuid, setgid and sticky bits with or without the execute bit.
-#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
 pub(crate) fn parse_ls(line: &str) -> Result<(String, u32, u32, u64, char), String> {
     let bad = || format!("not an ls -ln line: {line:?}");
     let mut fields = line.split_whitespace();
@@ -861,7 +944,6 @@ pub(crate) fn parse_ls(line: &str) -> Result<(String, u32, u32, u64, char), Stri
 
 /// The bytes of `od -An -v -tx1` output: every token exactly two hex
 /// digits, blank lines ignored, and exactly `size` of them.
-#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
 pub(crate) fn parse_od(text: &str, size: u64) -> Result<Zeroizing<Vec<u8>>, String> {
     let mut bytes = Zeroizing::new(Vec::with_capacity(size.min(MAX_KEPT) as usize));
     for token in text.split_whitespace() {
