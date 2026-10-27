@@ -837,7 +837,7 @@ fn check_fact(key: &str, value: &str) -> Result<(), String> {
 }
 
 /// 64 lowercase hex digits, as `sha256sum` prints them.
-fn is_sha256(s: &str) -> bool {
+pub(crate) fn is_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 

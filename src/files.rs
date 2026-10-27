@@ -19,9 +19,10 @@ use std::io::Read;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::apply::{FileRun, PlannedRun, Upload};
-use crate::config::{Config, ModeValue, is_mode};
+use crate::config::{Config, ModeValue, is_mode, is_sha256};
 use crate::document;
 use crate::facts::Facts;
 use crate::inventory::{self, Target, TargetKind};
@@ -342,13 +343,18 @@ fn root_checks(sudo: &str, dest: &str) -> String {
     checks(sudo, dest, &dirs, "0")
 }
 
-/// Whether `cmp` is on the PATH that `sudo` (`""` or `"sudo -n "`) runs it
-/// with, quietly; without it every run rewrites DEST.
-fn has_cmp(sudo: &str) -> String {
+/// Whether `tool` is on the PATH that `sudo` (`""`, `"sudo -n "` or
+/// `"sudo "`) runs it with, quietly.
+fn has_tool(sudo: &str, tool: &str) -> String {
     match sudo {
-        "" => "command -v cmp >/dev/null 2>&1".to_owned(),
-        _ => format!("{sudo}sh -c 'command -v cmp' >/dev/null 2>&1"),
+        "" => format!("command -v {tool} >/dev/null 2>&1"),
+        _ => format!("{sudo}sh -c 'command -v {tool}' >/dev/null 2>&1"),
     }
+}
+
+/// Whether `cmp` is on `sudo`'s PATH; without it every run rewrites DEST.
+fn has_cmp(sudo: &str) -> String {
+    has_tool(sudo, "cmp")
 }
 
 /// One plain run under `umask 077` that runs `checks` first, then refuses a
@@ -412,6 +418,335 @@ fn install_script(temp: &str, dest: &str, mode: &str, checks: &str) -> String {
          else sudo install -m {mode} {t} {d} && echo {wrote}; fi\n\
          }}\n"
     )
+}
+
+/// The most bytes of a dest that the capture reads back and the apply
+/// record keeps, so that it can restore them.
+#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
+pub(crate) const MAX_KEPT: u64 = 256 * 1024;
+
+/// Defines `anvil_sha256 FILE`, which prints FILE's sha256 in hex through
+/// `$anvil_sudo` (unquoted, so `sudo -n` is two words): with `sha256sum`,
+/// else `shasum -a 256`. It returns 1 when the tool cannot read FILE and 2,
+/// printing nothing, when the target has neither tool.
+#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
+pub(crate) const HASH: &str = "anvil_sha256() {
+if $anvil_sudo sh -c 'command -v sha256sum' >/dev/null 2>&1; then
+anvil_h=$($anvil_sudo sha256sum \"$1\" 2>/dev/null) || return 1
+elif $anvil_sudo sh -c 'command -v shasum' >/dev/null 2>&1; then
+anvil_h=$($anvil_sudo shasum -a 256 \"$1\" 2>/dev/null) || return 1
+else return 2
+fi
+anvil_h=${anvil_h#\\\\}
+printf '%s\\n' \"${anvil_h%% *}\"
+}
+";
+
+/// [`HASH`] with `$anvil_sudo` set to `sudo`.
+#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
+fn hash_fn(sudo: &str) -> String {
+    format!("anvil_sudo={}\n{HASH}", quote(sudo.trim_end()))
+}
+
+/// The lines [`capture_script`] prints start with this.
+#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
+const MARK: &str = "anvil-capture ";
+
+/// The run before a write that reports what DEST holds, through the same
+/// `sudo` (`""`, `"sudo -n "`, or `"sudo "` on the password path) and after
+/// the same `checks` as the write. `as_root`: the write runs as root, so a
+/// symlink DEST is refused; as the user it is followed, as `tee` would, and
+/// a dangling one is reported as such; [`root_checks`] already refuse a
+/// symlink, so the refusal is added only when `checks` is empty.
+///
+/// It prints `anvil-capture absent`, `anvil-capture dangling TARGET`, or
+/// `anvil-capture file <ls -lLdn line>` and then, for a file of at most
+/// [`MAX_KEPT`] bytes, its bytes in `od` hex between `anvil-capture bytes`
+/// and `anvil-capture end`. When it sends no bytes (too large, no `od`,
+/// unreadable) it adds `anvil-capture sha256 HEX` if a hash tool exists. A
+/// DEST that is not a regular file fails the run, so the write never starts.
+/// `tr -s` squeezes the hex to three characters a byte, as BSD `od` pads
+/// it wider, so [`MAX_KEPT`] bytes stay under the transport's output cap.
+/// On the password path stderr shares the terminal with stdout, so the
+/// probes whose failure is an answer, not an error, send theirs to
+/// `/dev/null`: a stray sudo warning cannot break [`parse_capture`].
+#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
+pub(crate) fn capture_script(dest: &str, sudo: &str, checks: &str, as_root: bool) -> String {
+    let d = quote(dest);
+    let ready = match sudo {
+        "" => String::new(),
+        _ => format!("{sudo}true || exit 1\n"),
+    };
+    let quiet = if sudo == "sudo " { " 2>/dev/null" } else { "" };
+    let (symlink, dangling) = if as_root {
+        let symlink = match checks {
+            "" => not_a_symlink(sudo, &d, dest),
+            _ => String::new(),
+        };
+        (symlink, String::new())
+    } else {
+        (
+            String::new(),
+            format!(
+                "if test -L {d}; then printf '{MARK}dangling %s\\n' \"$(readlink {d})\"; exit 0; fi\n"
+            ),
+        )
+    };
+    let irregular = quote(&format!("files: {dest} is not a regular file"));
+    // `od` itself, not `command -v od`: the probe runs what the read runs,
+    // with its flags.
+    let has_od = format!("{sudo}od -An -tx1 </dev/null >/dev/null 2>&1");
+    format!(
+        "{{ umask 077; LC_ALL=C; export LC_ALL; set -f\n\
+         {hash}\
+         anvil_sent() {{ anvil_s=$(anvil_sha256 {d}) && echo \"{MARK}sha256 $anvil_s\"; :; }}\n\
+         {ready}{checks}{symlink}: || exit 1\n\
+         if ! {sudo}test -e {d}{quiet}; then\n\
+         {dangling}echo '{MARK}absent'; exit 0\n\
+         fi\n\
+         anvil_line=$({sudo}ls -lLdn {d}) || exit 1\n\
+         case $anvil_line in -*) ;; *) echo {irregular} >&2; exit 1 ;; esac\n\
+         printf '{MARK}file %s\\n' \"$anvil_line\"\n\
+         set -- $anvil_line\n\
+         if [ \"$5\" -gt {MAX_KEPT} ]; then anvil_sent\n\
+         elif ! {has_od}; then echo '{MARK}no-od'; anvil_sent\n\
+         else echo '{MARK}bytes'\n\
+         {{ if {sudo}od -An -v -tx1 {d} 2>/dev/null; then echo '{MARK}end'\n\
+         else echo '{MARK}unreadable'; anvil_sent; fi; }} | tr -s ' '\n\
+         fi\n\
+         }}\n",
+        hash = hash_fn(sudo),
+    )
+}
+
+/// What [`capture_script`] found at DEST.
+#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
+pub(crate) enum Captured {
+    Absent,
+    /// A symlink, on the user path, whose target does not exist.
+    Dangling {
+        target: String,
+    },
+    /// `sha256` is from `bytes` when read, else the target's own hash, else
+    /// `""` (no hash tool). `reason` says why `bytes` is `None`.
+    File {
+        mode: String,
+        uid: u32,
+        gid: u32,
+        size: u64,
+        sha256: String,
+        bytes: Option<Zeroizing<Vec<u8>>>,
+        reason: Option<&'static str>,
+    },
+}
+
+/// By hand: the bytes as their length only.
+impl fmt::Debug for Captured {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Captured::Absent => f.write_str("Absent"),
+            Captured::Dangling { target } => {
+                f.debug_struct("Dangling").field("target", target).finish()
+            }
+            Captured::File {
+                mode,
+                uid,
+                gid,
+                size,
+                sha256,
+                bytes,
+                reason,
+            } => f
+                .debug_struct("File")
+                .field("mode", mode)
+                .field("uid", uid)
+                .field("gid", gid)
+                .field("size", size)
+                .field("sha256", sha256)
+                .field(
+                    "bytes",
+                    &bytes.as_ref().map(|b| format!("<{} bytes>", b.len())),
+                )
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
+/// Parses [`capture_script`]'s stdout for `dest`. Lines before the first
+/// `anvil-capture` line are skipped: on the password path stderr shares the
+/// terminal, so sudo's own warnings (from `sudo -v`, the checks, `sudo ls`)
+/// may come first, while the data only ever follows a marker. From the
+/// first marker on, anything but the exact shape the script prints, a
+/// missing `end` included, is an error.
+#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
+pub(crate) fn parse_capture(dest: &str, stdout: &[u8]) -> Result<Captured, String> {
+    let unread = || format!("files: cannot read {dest} before writing it");
+    let text = std::str::from_utf8(stdout).map_err(|_| unread())?;
+    let mut lines = Vec::new();
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        let start = at;
+        at += line.len();
+        let line = line.trim_end_matches(['\n', '\r']);
+        if !line.trim().is_empty() {
+            lines.push((start, line));
+        }
+    }
+    let mut rest = lines
+        .iter()
+        .map(|&(start, line)| (start, line, line.strip_prefix(MARK)))
+        .skip_while(|&(_, _, marker)| marker.is_none());
+    let Some((_, _, Some(first))) = rest.next() else {
+        return Err(unread());
+    };
+    if first == "absent" {
+        return match rest.next() {
+            None => Ok(Captured::Absent),
+            Some(_) => Err(unread()),
+        };
+    }
+    if let Some(target) = first.strip_prefix("dangling ") {
+        return match rest.next() {
+            None => Ok(Captured::Dangling {
+                target: target.to_owned(),
+            }),
+            Some(_) => Err(unread()),
+        };
+    }
+    let Some(ls) = first.strip_prefix("file ") else {
+        return Err(unread());
+    };
+    let (mode, uid, gid, size, kind) =
+        parse_ls(ls).map_err(|_| format!("files: cannot parse ls output for {dest}"))?;
+    if kind != '-' {
+        return Err(format!("files: {dest} is not a regular file"));
+    }
+    let file = |sha256: String, bytes, reason| Captured::File {
+        mode: mode.clone(),
+        uid,
+        gid,
+        size,
+        sha256,
+        bytes,
+        reason,
+    };
+    // The target's own hash, on the last line when it has one.
+    let remote = |rest: &mut dyn Iterator<Item = (usize, &str, Option<&str>)>| {
+        let sha = match rest.next() {
+            None => return Ok(String::new()),
+            Some((_, _, Some(line))) => line.strip_prefix("sha256 ").filter(|sha| is_sha256(sha)),
+            Some(_) => None,
+        };
+        match (sha, rest.next()) {
+            (Some(sha), None) => Ok(sha.to_owned()),
+            _ => Err(unread()),
+        }
+    };
+    if size > MAX_KEPT {
+        return Ok(file(remote(&mut rest)?, None, Some("over 256 KiB")));
+    }
+    match rest.next() {
+        Some((_, _, Some("no-od"))) => {
+            Ok(file(remote(&mut rest)?, None, Some("no od on the target")))
+        }
+        Some((start, line, Some("bytes"))) => {
+            let from = start + line.len();
+            for (start, _, marker) in rest.by_ref() {
+                match marker {
+                    None => continue,
+                    Some("end") => {
+                        if rest.next().is_some() {
+                            return Err(unread());
+                        }
+                        let bytes = parse_od(&text[from..start], size).map_err(|_| unread())?;
+                        let sha256 = hex(&Sha256::digest(&bytes[..]));
+                        return Ok(file(sha256, Some(bytes), None));
+                    }
+                    Some("unreadable") => {
+                        return Ok(file(remote(&mut rest)?, None, Some("unreadable")));
+                    }
+                    Some(_) => return Err(unread()),
+                }
+            }
+            Err(unread())
+        }
+        _ => Err(unread()),
+    }
+}
+
+/// `bytes` in lowercase hex.
+#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The first five fields of an `ls -ln` line: the mode as 4 octal digits,
+/// uid, gid, size, and the type character (`-` for a regular file). The
+/// permissions may end in one `@`, `+` or `.`; `s`/`S` and `t`/`T` are the
+/// setuid, setgid and sticky bits with or without the execute bit.
+#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
+pub(crate) fn parse_ls(line: &str) -> Result<(String, u32, u32, u64, char), String> {
+    let bad = || format!("not an ls -ln line: {line:?}");
+    let mut fields = line.split_whitespace();
+    let mut field = || fields.next().ok_or_else(bad);
+    let perms = field()?;
+    let (_links, uid, gid, size) = (field()?, field()?, field()?, field()?);
+    let perms = perms.strip_suffix(['@', '+', '.']).unwrap_or(perms);
+    let perms: Vec<char> = perms.chars().collect();
+    if perms.len() != 10 {
+        return Err(bad());
+    }
+    let mut mode = 0u32;
+    for (i, &c) in perms[1..].iter().enumerate() {
+        let (shift, special) = (8 - i as u32, [0o4000, 0o2000, 0o1000][i / 3]);
+        let bit = 1 << shift;
+        mode |= match (i % 3, c) {
+            (_, '-') => 0,
+            (0, 'r') | (1, 'w') | (2, 'x') => bit,
+            (2, 's') if i < 6 => bit | special,
+            (2, 'S') if i < 6 => special,
+            (2, 't') if i == 8 => bit | special,
+            (2, 'T') if i == 8 => special,
+            _ => return Err(bad()),
+        };
+    }
+    let number = |s: &str| {
+        if s.bytes().all(|b| b.is_ascii_digit()) {
+            s.parse::<u64>().map_err(|_| bad())
+        } else {
+            Err(bad())
+        }
+    };
+    let id = |s: &str| u32::try_from(number(s)?).map_err(|_| bad());
+    Ok((
+        format!("{mode:04o}"),
+        id(uid)?,
+        id(gid)?,
+        number(size)?,
+        perms[0],
+    ))
+}
+
+/// The bytes of `od -An -v -tx1` output: every token exactly two hex
+/// digits, blank lines ignored, and exactly `size` of them.
+#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
+pub(crate) fn parse_od(text: &str, size: u64) -> Result<Zeroizing<Vec<u8>>, String> {
+    let mut bytes = Zeroizing::new(Vec::with_capacity(size.min(MAX_KEPT) as usize));
+    for token in text.split_whitespace() {
+        let byte = (token.len() == 2 && token.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| u8::from_str_radix(token, 16).ok())
+            .flatten()
+            .ok_or_else(|| "od output has a token that is not one byte".to_owned())?;
+        if bytes.len() as u64 == size {
+            return Err(format!("od output has more than {size} bytes"));
+        }
+        bytes.push(byte);
+    }
+    if bytes.len() as u64 != size {
+        return Err(format!("od output has {} bytes, not {size}", bytes.len()));
+    }
+    Ok(bytes)
 }
 
 /// A new `/tmp/anvil-<32 hex>` from 16 bytes of `/dev/urandom`; there is no
@@ -1323,6 +1658,623 @@ mod tests {
             fs::remove_file(&temp).unwrap();
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The capture of `dest` as the user would run it, parsed.
+    fn capture(dest: &Path) -> Result<Captured, String> {
+        let d = dest.to_str().unwrap();
+        let out = Local
+            .run(&capture_script(d, "", "", false), RUN_TIMEOUT)
+            .unwrap();
+        match out.code {
+            Some(0) => parse_capture(d, &out.stdout),
+            _ => Err(String::from_utf8(out.stderr).unwrap()),
+        }
+    }
+
+    type Fields = (
+        String,
+        u32,
+        u32,
+        u64,
+        String,
+        Option<Vec<u8>>,
+        Option<&'static str>,
+    );
+
+    /// The fields of a captured file, the bytes as a `Vec`.
+    fn file_of(captured: Captured) -> Fields {
+        match captured {
+            Captured::File {
+                mode,
+                uid,
+                gid,
+                size,
+                sha256,
+                bytes,
+                reason,
+            } => (
+                mode,
+                uid,
+                gid,
+                size,
+                sha256,
+                bytes.map(|b| b.to_vec()),
+                reason,
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn sha_hex(bytes: &[u8]) -> String {
+        hex(&Sha256::digest(bytes))
+    }
+
+    /// The uid and gid of `path`.
+    fn ids(path: &Path) -> (u32, u32) {
+        let meta = fs::metadata(path).unwrap();
+        (meta.uid(), meta.gid())
+    }
+
+    #[test]
+    fn the_capture_reports_absent_text_empty_and_binary_files() {
+        let dir = dir("files-capture");
+        assert!(matches!(capture(&dir.join("none")), Ok(Captured::Absent)));
+        let (uid, gid) = ids(&dir);
+        for (name, bytes, mode) in [
+            ("text", SECRET_TEXT.as_bytes(), 0o640),
+            ("empty", b"".as_slice(), 0o600),
+            ("binary", b"\x00\xff\x01\n\x7f".as_slice(), 0o4755),
+        ] {
+            let path = dir.join(name);
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                file_of(capture(&path).unwrap()),
+                (
+                    format!("{mode:04o}"),
+                    uid,
+                    gid,
+                    bytes.len() as u64,
+                    sha_hex(bytes),
+                    Some(bytes.to_vec()),
+                    None
+                ),
+                "{name}"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_capture_follows_a_user_symlink_and_reports_a_dangling_one() {
+        let dir = dir("files-capture-link");
+        let (real, link) = (dir.join("real"), dir.join("link"));
+        fs::write(&real, "old\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&real, &link).unwrap();
+        let (mode, .., bytes, _) = file_of(capture(&link).unwrap());
+        assert_eq!(
+            (mode.as_str(), bytes.as_deref()),
+            ("0644", Some(b"old\n".as_slice()))
+        );
+
+        let missing = dir.join("missing");
+        let dangling = dir.join("dangling");
+        symlink(&missing, &dangling).unwrap();
+        match capture(&dangling).unwrap() {
+            Captured::Dangling { target } => assert_eq!(target, missing.to_str().unwrap()),
+            other => panic!("{other:?}"),
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_capture_refuses_a_fifo_or_a_directory_without_reading_it() {
+        let dir = dir("files-capture-fifo");
+        let fifo = dir.join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let sub = dir.join("sub");
+        fs::create_dir(&sub).unwrap();
+        for path in [fifo, sub] {
+            assert_eq!(
+                capture(&path).unwrap_err(),
+                format!("files: {} is not a regular file\n", path.display())
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_over_the_limit_sends_only_its_hash() {
+        let dir = dir("files-capture-big");
+        let path = dir.join("big");
+        let text = "a".repeat(MAX_KEPT as usize + 1);
+        fs::write(&path, &text).unwrap();
+        let (_, _, _, size, sha256, bytes, reason) = file_of(capture(&path).unwrap());
+        assert_eq!(
+            (size, bytes, reason),
+            (MAX_KEPT + 1, None, Some("over 256 KiB"))
+        );
+        assert_eq!(sha256, sha_hex(text.as_bytes()));
+
+        let fits = dir.join("fits");
+        fs::write(&fits, &text[1..]).unwrap();
+        let (.., bytes, reason) = file_of(capture(&fits).unwrap());
+        assert_eq!(
+            (bytes.map(|b| b.len()), reason),
+            (Some(MAX_KEPT as usize), None)
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A bin dir holding links to `tools` from PATH, plus a script for each
+    /// of `scripts`.
+    fn bin_with(dir: &Path, tools: &[&str], scripts: &[(&str, &str)]) -> PathBuf {
+        let bin = dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let path = std::env::var("PATH").unwrap();
+        for tool in tools {
+            if let Some(found) = std::env::split_paths(&path)
+                .map(|p| p.join(tool))
+                .find(|p| p.is_file())
+            {
+                symlink(found, bin.join(tool)).unwrap();
+            }
+        }
+        for (name, body) in scripts {
+            let script = bin.join(name);
+            fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        bin
+    }
+
+    /// Runs `script` with `/bin/sh -s` and only `bin` on PATH.
+    fn sh_only(bin: &Path, script: &str) -> crate::transport::Output {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-s").env("PATH", bin);
+        crate::transport::run_with_script(&mut command, script, RUN_TIMEOUT).unwrap()
+    }
+
+    const BASE: [&str; 4] = ["ls", "sh", "readlink", "tr"];
+    const HASHERS: [&str; 2] = ["sha256sum", "shasum"];
+
+    #[test]
+    fn without_od_or_a_readable_file_the_capture_sends_the_hash_only() {
+        let dir = dir("files-capture-nood");
+        let path = dir.join("conf");
+        fs::write(&path, SECRET_TEXT).unwrap();
+        let script = capture_script(path.to_str().unwrap(), "", "", false);
+        let tools: Vec<&str> = BASE.iter().chain(&HASHERS).copied().collect();
+        // An od that answers the probe, then fails partway through DEST.
+        let partial = "[ $# -eq 2 ] && exit 0; printf ' 74 6f\\n'; exit 1";
+        let bin = bin_with(&dir, &tools, &[("od", partial)]);
+        let unreadable = sh_only(&bin, &script);
+        assert_eq!(unreadable.code, Some(0));
+        let (.., sha256, bytes, reason) =
+            file_of(parse_capture(path.to_str().unwrap(), &unreadable.stdout).unwrap());
+        assert_eq!(
+            (bytes, reason),
+            (None, Some("unreadable")),
+            "partial hex dropped"
+        );
+        assert_eq!(sha256, sha_hex(SECRET_TEXT.as_bytes()));
+
+        // An od on PATH that cannot run is no od, as is none at all.
+        fs::write(bin.join("od"), "#!/bin/sh\nexit 1\n").unwrap();
+        let broken = sh_only(&bin, &script);
+        let (.., bytes, reason) =
+            file_of(parse_capture(path.to_str().unwrap(), &broken.stdout).unwrap());
+        assert_eq!((bytes, reason), (None, Some("no od on the target")));
+        fs::remove_file(bin.join("od")).unwrap();
+        let no_od = sh_only(&bin, &script);
+        let (.., sha256, bytes, reason) =
+            file_of(parse_capture(path.to_str().unwrap(), &no_od.stdout).unwrap());
+        assert_eq!((bytes, reason), (None, Some("no od on the target")));
+        assert_eq!(sha256, sha_hex(SECRET_TEXT.as_bytes()));
+
+        for tool in HASHERS {
+            let _ = fs::remove_file(bin.join(tool));
+        }
+        let no_hash = sh_only(&bin, &script);
+        let (.., sha256, _, reason) =
+            file_of(parse_capture(path.to_str().unwrap(), &no_hash.stdout).unwrap());
+        assert_eq!((sha256.as_str(), reason), ("", Some("no od on the target")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_the_user_cannot_read_is_unreadable() {
+        if rustix::process::getuid().is_root() {
+            return;
+        }
+        let dir = dir("files-capture-0000");
+        let path = dir.join("conf");
+        fs::write(&path, SECRET_TEXT).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let (mode, .., sha256, bytes, reason) = file_of(capture(&path).unwrap());
+        assert_eq!(mode, "0000");
+        assert_eq!(
+            (sha256.as_str(), bytes, reason),
+            ("", None, Some("unreadable"))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_capture_as_root_runs_the_writes_checks_and_refuses_a_symlink() {
+        let dir = dir("files-capture-root");
+        let bin = passthrough_sudo(&dir);
+        let run = |dest: &Path| {
+            let d = dest.to_str().unwrap();
+            let checks = user_checks("sudo -n ", dest, &dir);
+            sh_with(&bin, &capture_script(d, "sudo -n ", &checks, true))
+        };
+        let sub = dir.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        let conf = sub.join("conf");
+        fs::write(&conf, "x").unwrap();
+        let out = run(&conf);
+        assert_eq!(out.code, Some(0));
+        let (.., bytes, _) = file_of(parse_capture(conf.to_str().unwrap(), &out.stdout).unwrap());
+        assert_eq!(bytes.as_deref(), Some(b"x".as_slice()));
+
+        let link = sub.join("link");
+        symlink(&conf, &link).unwrap();
+        let out = run(&link);
+        assert_ne!(out.code, Some(0));
+        assert!(out.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!(
+                "files: {} is a symlink; point dest at the real file\n",
+                link.display()
+            )
+        );
+
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o775)).unwrap();
+        let out = run(&conf);
+        assert_ne!(out.code, Some(0));
+        assert!(out.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!(
+                "files: {} is not root-only; root will not write under it\n",
+                sub.display()
+            )
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failing_sudo_is_not_reported_as_absent() {
+        let dir = dir("files-capture-nosudo");
+        let bin = bin_with(
+            &dir,
+            &[],
+            &[("sudo", "echo 'sudo: a password is required' >&2; exit 1")],
+        );
+        let dest = dir.join("conf");
+        fs::write(&dest, "x").unwrap();
+        let out = sh_with(
+            &bin,
+            &capture_script(dest.to_str().unwrap(), "sudo -n ", "", true),
+        );
+        assert_ne!(out.code, Some(0));
+        assert!(out.stdout.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_ls_maps_the_permissions_to_four_octal_digits() {
+        for (perms, mode, kind) in [
+            ("-rw-r--r--", "0644", '-'),
+            ("-rw-r--r--@", "0644", '-'),
+            ("-rw-r--r--+", "0644", '-'),
+            ("-rw-r--r--.", "0644", '-'),
+            ("-rwsr-xr-x", "4755", '-'),
+            ("-rwxr-sr-x", "2755", '-'),
+            ("drwxrwxrwt", "1777", 'd'),
+            ("-rwSr--r--", "4644", '-'),
+            ("-rwxr-Sr-T", "3744", '-'),
+            ("----------", "0000", '-'),
+            ("prw-------", "0600", 'p'),
+        ] {
+            let line = format!("{perms}  1 0 20  12 Oct 27 10:00 /etc/a b");
+            assert_eq!(
+                parse_ls(&line).unwrap(),
+                (mode.to_owned(), 0, 20, 12, kind),
+                "{perms}"
+            );
+        }
+        for line in [
+            "",
+            "-rw-r--r-- 1 0 0",
+            "-rw-r--r--@+ 1 0 0 1 x",
+            "-rw-r--r-- 1 root 0 1 x",
+            "-rw-r--r-- 1 0 0 -1 x",
+            "-rw-r--r-- 1 0 0 1k x",
+            "-rw-r--r-- 1 4294967296 0 1 x",
+            "-rw-r--r- 1 0 0 1 x",
+            "-rw-r--r--x 1 0 0 1 x",
+            "-rwtr--r-- 1 0 0 1 x",
+            "-rw-r--r-s 1 0 0 1 x",
+            "-wr-r--r-- 1 0 0 1 x",
+        ] {
+            assert!(parse_ls(line).is_err(), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn parse_od_takes_exactly_size_two_digit_tokens() {
+        assert_eq!(*parse_od(" 61 0a ff\n\n 00\n", 4).unwrap(), b"a\n\xff\x00");
+        assert_eq!(*parse_od("\n", 0).unwrap(), b"");
+        assert_eq!(*parse_od(" 41\r\n", 1).unwrap(), b"A");
+        for (text, size) in [
+            (" 061", 1),
+            (" 6", 1),
+            (" zz", 1),
+            (" +1", 1),
+            (" 61 62", 1),
+            (" 61", 2),
+            ("", 1),
+            // The password path scrubs the password from the transcript.
+            (" ***", 1),
+            (" 61 *** 62", 3),
+            (" 61***", 1),
+        ] {
+            assert!(parse_od(text, size).is_err(), "{text:?} {size}");
+        }
+    }
+
+    #[test]
+    fn parse_capture_refuses_anything_but_the_exact_shape() {
+        let file = "anvil-capture file -rw------- 1 0 0 2 Oct 1 10:00 /etc/a\n";
+        let sha = format!("anvil-capture sha256 {}\n", "a".repeat(64));
+        let ok = [
+            format!("{file}anvil-capture bytes\n 68 69\nanvil-capture end\n"),
+            format!("{file}anvil-capture bytes\r\n 68 69\r\nanvil-capture end\r\n"),
+            format!("{file}anvil-capture no-od\n{sha}"),
+            format!("{file}anvil-capture bytes\n 68\nanvil-capture unreadable\n{sha}"),
+        ];
+        for out in &ok {
+            assert!(parse_capture("/etc/a", out.as_bytes()).is_ok(), "{out}");
+        }
+        let unread = "files: cannot read /etc/a before writing it";
+        for out in [
+            String::new(),
+            "hello\n".to_owned(),
+            "anvil-capture absent\nanvil-capture absent\n".to_owned(),
+            "anvil-capture what\n".to_owned(),
+            file.to_owned(),
+            format!("{file}anvil-capture bytes\n 68 69\n"),
+            format!("{file}anvil-capture bytes\n 68\nanvil-capture end\n"),
+            format!("{file}anvil-capture bytes\n 68 69\nanvil-capture end\nx\n"),
+            format!("{file}anvil-capture bytes\n 68 69\nanvil-capture other\n"),
+            format!("{file}anvil-capture no-od\nanvil-capture sha256 abc\n"),
+            format!("{file}anvil-capture no-od\n{sha}{sha}"),
+            format!("{file}{sha}"),
+            format!("{file}anvil-capture unreadable\n"),
+            // The password path scrubs the password from the transcript.
+            "***\n".to_owned(),
+            "anvil-capture ***\n".to_owned(),
+            format!("***{file}anvil-capture bytes\n 68 69\nanvil-capture end\n"),
+            format!("{file}anvil-capture bytes\n 68 ***\nanvil-capture end\n"),
+            format!("{file}anvil-capture bytes\n 68 69\nanvil-capture ***\n"),
+            format!("{file}anvil-capture no-od\nanvil-capture sha256 ***\n"),
+        ] {
+            assert_eq!(
+                parse_capture("/etc/a", out.as_bytes()).unwrap_err(),
+                unread,
+                "{out:?}"
+            );
+        }
+        for ls in [
+            "anvil-capture file -rw------- 1 0 x 2 y\n",
+            "anvil-capture file -rw------- 1 *** 0 2 y\n",
+            "anvil-capture file *** 1 0 0 2 y\n",
+        ] {
+            assert_eq!(
+                parse_capture("/etc/a", ls.as_bytes()).unwrap_err(),
+                "files: cannot parse ls output for /etc/a",
+                "{ls:?}"
+            );
+        }
+        assert_eq!(
+            parse_capture("/etc/a", b"anvil-capture file prw------- 1 0 0 0 y\n").unwrap_err(),
+            "files: /etc/a is not a regular file"
+        );
+        let big = format!(
+            "anvil-capture file -rw------- 1 0 0 {} y\n{sha}",
+            MAX_KEPT + 1
+        );
+        let (.., sha256, bytes, reason) = file_of(parse_capture("/etc/a", big.as_bytes()).unwrap());
+        assert_eq!(
+            (sha256, bytes, reason),
+            ("a".repeat(64), None, Some("over 256 KiB"))
+        );
+    }
+
+    /// Collects every log line while `f` runs, with the logger at its most
+    /// verbose (it stops at debug: nothing in anvil logs at trace).
+    fn logged<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Lines(Mutex<Vec<String>>);
+        impl crate::logger::Sink for Lines {
+            fn line(&self, level: log::Level, target: &str, message: &str) {
+                let line = format!("{level} {target}: {message}");
+                self.0.lock().unwrap().push(line);
+            }
+        }
+        let _lock = crate::logger::test_lock();
+        let before = log::max_level();
+        crate::logger::Logger::install(u8::MAX);
+        crate::logger::set_verbosity(u8::MAX);
+        log::set_max_level(log::LevelFilter::Trace);
+        let lines = Arc::new(Lines::default());
+        crate::logger::set_sink(Some(lines.clone()));
+        let out = f();
+        crate::logger::set_sink(None);
+        log::set_max_level(before);
+        let lines = std::mem::take(&mut *lines.0.lock().unwrap());
+        (out, lines)
+    }
+
+    /// Builds, and so logs, the `ssh` command that would run `script`: on
+    /// stdin, or on the password path inside the remote command, as
+    /// `run_tty` sends it.
+    fn spawn_for(script: &str, password: bool) {
+        use crate::ssh::{CHECK_TIMEOUT, KEY_TIMEOUT, Ssh, SshSettings};
+
+        let settings = SshSettings {
+            program: PathBuf::from("ssh"),
+            can_prompt: false,
+            key_timeout: KEY_TIMEOUT,
+            check_timeout: CHECK_TIMEOUT,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let ssh = Ssh::new(settings, None, "web1", None, None).unwrap();
+        let control = Path::new("/tmp/anvil-control");
+        let args = match password {
+            true => ssh.tty_client_args(control, &crate::packages::with_password(script)),
+            false => ssh.client_args(control),
+        };
+        drop(ssh.command(&args));
+    }
+
+    /// Fails when a log line carries the secret text, or when no `spawn`
+    /// line was logged at all.
+    fn assert_no_leak(lines: &[String]) {
+        assert!(
+            lines.iter().any(|line| line.contains(": spawn ssh ")),
+            "{lines:?}"
+        );
+        for line in lines {
+            assert!(!line.contains("hunter2-file-content"), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_capture_never_carries_or_shows_the_bytes() {
+        let dir = dir("files-capture-leak");
+        let path = dir.join("conf");
+        fs::write(&path, SECRET_TEXT).unwrap();
+        let d = path.to_str().unwrap();
+        let (captured, lines) = logged(|| {
+            for (sudo, as_root) in [("", false), ("sudo -n ", true), ("sudo ", true)] {
+                let script = capture_script(d, sudo, &root_checks(sudo, d), as_root);
+                assert!(!script.contains("hunter2"), "{script}");
+                spawn_for(&script, sudo == "sudo ");
+            }
+            capture(&path).unwrap()
+        });
+        assert_no_leak(&lines);
+        let shown = format!("{captured:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(
+            shown.contains(&format!("<{} bytes>", SECRET_TEXT.len())),
+            "{shown}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_root_checks_refuse_a_symlink_once() {
+        let checks = root_checks("sudo -n ", "/etc/a");
+        for checks in ["", checks.as_str()] {
+            let script = capture_script("/etc/a", "sudo -n ", checks, true);
+            assert_eq!(script.matches("is a symlink").count(), 1, "{script}");
+        }
+    }
+
+    #[test]
+    fn a_sudo_warning_on_the_password_path_does_not_break_the_capture() {
+        let dir = dir("files-capture-warn");
+        let bin = dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        // The probes' sudo warns, as one that cannot resolve the host does.
+        let sudo = "#!/bin/sh\n\
+                    case $1 in test|od) echo 'sudo: unable to resolve host web1' >&2 ;; esac\n\
+                    exec \"$@\"\n";
+        fs::write(bin.join("sudo"), sudo).unwrap();
+        fs::set_permissions(bin.join("sudo"), fs::Permissions::from_mode(0o755)).unwrap();
+        let dest = dir.join("conf");
+        let d = dest.to_str().unwrap();
+        // On a terminal stderr is stdout.
+        let run = || {
+            let script = capture_script(d, "sudo ", "", false);
+            let out = sh_with(&bin, &format!("{{\n{script}}} 2>&1\n"));
+            assert_eq!(out.code, Some(0));
+            parse_capture(d, &out.stdout)
+        };
+        assert!(matches!(run(), Ok(Captured::Absent)));
+        fs::write(&dest, "hi\n").unwrap();
+        let (.., bytes, reason) = file_of(run().unwrap());
+        assert_eq!((bytes.as_deref(), reason), (Some(b"hi\n".as_slice()), None));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lines_before_the_first_marker_are_skipped() {
+        let warn = "sudo: unable to resolve host web1\n";
+        let out = format!(
+            "{warn}{warn}anvil-capture file -rw------- 1 0 0 2 y\n\
+             anvil-capture bytes\n 68 69\nanvil-capture end\n"
+        );
+        let (.., bytes, _) = file_of(parse_capture("/etc/a", out.as_bytes()).unwrap());
+        assert_eq!(bytes.as_deref(), Some(b"hi".as_slice()));
+        let after = format!("anvil-capture absent\n{warn}");
+        assert!(
+            parse_capture("/etc/a", after.as_bytes()).is_err(),
+            "only before"
+        );
+    }
+
+    #[test]
+    fn a_sudo_that_warns_on_every_call_does_not_break_the_capture() {
+        let dir = dir("files-capture-warn-all");
+        let bin = dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let sudo = "#!/bin/sh\n\
+                    echo 'sudo: unable to resolve host web1' >&2\n\
+                    exec \"$@\"\n";
+        fs::write(bin.join("sudo"), sudo).unwrap();
+        fs::set_permissions(bin.join("sudo"), fs::Permissions::from_mode(0o755)).unwrap();
+        let dest = dir.join("conf");
+        let d = dest.to_str().unwrap();
+        let checks = user_checks("sudo ", &dest, &dir);
+        // On a terminal stderr is stdout; `sudo -v` warns first, as
+        // `with_password` runs it before the script.
+        let run = || {
+            let script = capture_script(d, "sudo ", &checks, true);
+            let out = sh_with(&bin, &format!("{{\nsudo true\n{script}}} 2>&1\n"));
+            assert_eq!(out.code, Some(0));
+            parse_capture(d, &out.stdout)
+        };
+        assert!(matches!(run(), Ok(Captured::Absent)));
+        fs::write(&dest, "hi\n").unwrap();
+        let (.., bytes, reason) = file_of(run().unwrap());
+        assert_eq!((bytes.as_deref(), reason), (Some(b"hi\n".as_slice()), None));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_capture_script_is_valid_sh_on_the_password_path() {
+        let script = capture_script("/etc/a", "sudo ", &root_checks("sudo ", "/etc/a"), true);
+        let wrapped = crate::packages::with_password(&script);
+        let syntax = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", &wrapped])
+            .status()
+            .unwrap();
+        assert!(syntax.success(), "{wrapped}");
     }
 
     #[test]
