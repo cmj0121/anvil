@@ -170,9 +170,9 @@ pub fn update(cli: &Cli, opts: &Options) -> Result<(), Failure> {
 }
 
 /// The TUI's `u`: this version against the latest release, printing
-/// nothing.
+/// nothing. No test calls it, so only the TUI keeps it alive.
 #[cfg_attr(
-    not(any(test, feature = "tui")),
+    not(feature = "tui"),
     expect(dead_code, reason = "called by the TUI front end")
 )]
 pub fn latest(opts: &Options) -> Result<Check, Failure> {
