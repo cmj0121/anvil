@@ -161,13 +161,11 @@ pub fn runs(
                 FileRun {
                     upload: None,
                     skip: true,
+                    write: None,
                 },
             ));
             continue;
         }
-        let Some(Source { text }) = sources.0.get(i) else {
-            return Err(format!("files[{i}]: src was not loaded"));
-        };
         let Some(ModeValue::Text(mode)) = &entry.mode else {
             return Err(format!("files[{i}].mode: required"));
         };
@@ -177,22 +175,22 @@ pub fn runs(
                 secret::shown_name(mode)
             ));
         }
-        let heredoc = Heredoc::new(text).map_err(|why| format!("files[{i}].src: {why}"))?;
         let secret =
             sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
-        let (script, upload) = match secret {
+        let write = match secret {
             Some(name) => {
-                let temp = temp_path()?;
                 log::info!(
                     "{}: files[{i}] {dest}, sudo password from secret {name}",
                     target.name
                 );
-                let upload = Upload {
-                    stage: stage_script(&heredoc, &temp),
-                    cleanup: format!("rm -f {}", quote(&temp)),
-                };
-                let script = install_script(&temp, dest, mode, &root_checks("sudo ", dest));
-                (script, Some(upload))
+                FileWrite {
+                    index: i,
+                    dest: dest.clone(),
+                    mode: mode.clone(),
+                    sudo: "sudo ".to_owned(),
+                    checks: root_checks("sudo ", dest),
+                    password: true,
+                }
             }
             None => {
                 log::info!("{}: files[{i}] {dest}", target.name);
@@ -202,9 +200,17 @@ pub fn runs(
                 } else {
                     String::new()
                 };
-                (tee_script(&heredoc, dest, mode, sudo, &checks), None)
+                FileWrite {
+                    index: i,
+                    dest: dest.clone(),
+                    mode: mode.clone(),
+                    sudo: sudo.to_owned(),
+                    checks,
+                    password: false,
+                }
             }
         };
+        let (script, upload) = write_script(&write, sources, &Expected::Unchecked)?;
         runs.push(file_run(
             script,
             format!("file {dest}"),
@@ -212,10 +218,94 @@ pub fn runs(
             FileRun {
                 upload,
                 skip: false,
+                write: Some(write),
             },
         ));
     }
     Ok(runs)
+}
+
+/// How one `[[files]]` entry is written on one target, so that the write
+/// can be built again once the capture says what DEST holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileWrite {
+    /// The entry's index, which is also its src's in [`Sources`].
+    pub index: usize,
+    pub dest: String,
+    pub mode: String,
+    /// `""`, `"sudo -n "`, or `"sudo "` on the password path.
+    pub sudo: String,
+    /// [`root_checks`] when the write runs as root, else empty.
+    pub checks: String,
+    /// Whether the bytes are staged in a temp file and installed by a
+    /// terminal run that types the sudo password.
+    pub password: bool,
+}
+
+/// What DEST must hold when the write starts, as the capture saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
+pub(crate) enum Expected {
+    /// No check.
+    Unchecked,
+    /// No file at DEST (a dangling link counts as none).
+    Absent,
+    /// A file with this sha256; `""` (no hash tool at capture) is no check.
+    Sha256(String),
+}
+
+/// The write script of `step` from its src in `sources`, refusing to write
+/// when DEST no longer holds what `expected` says; with the password path's
+/// stage and cleanup around it, under a fresh temp name.
+pub(crate) fn write_script(
+    step: &FileWrite,
+    sources: &Sources,
+    expected: &Expected,
+) -> Result<(String, Option<Upload>), String> {
+    let i = step.index;
+    let Some(Source { text }) = sources.0.get(i) else {
+        return Err(format!("files[{i}]: src was not loaded"));
+    };
+    let heredoc = Heredoc::new(text).map_err(|why| format!("files[{i}].src: {why}"))?;
+    let (dest, mode) = (step.dest.as_str(), step.mode.as_str());
+    if !step.password {
+        let script = tee_script(&heredoc, dest, mode, &step.sudo, &step.checks, expected);
+        return Ok((script, None));
+    }
+    let temp = temp_path()?;
+    let upload = Upload {
+        stage: stage_script(&heredoc, &temp),
+        cleanup: format!("rm -f {}", quote(&temp)),
+    };
+    let script = install_script(&temp, dest, mode, &step.checks, expected);
+    Ok((script, Some(upload)))
+}
+
+/// The status of a write script that refused before writing anything:
+/// a root check, a directory DEST, or [`guard`].
+pub(crate) const REFUSED: i32 = 4;
+
+/// The lines that refuse the write, exit [`REFUSED`], when DEST no longer
+/// holds what `expected` says, hashed through `sudo`; nothing when there is
+/// nothing to check. A target without a hash tool is not checked.
+fn guard(sudo: &str, dest: &str, expected: &Expected) -> String {
+    let d = quote(dest);
+    let refuse = format!(
+        "{{ echo {} >&2; exit {REFUSED}; }}",
+        quote(&format!(
+            "files: {dest} changed while anvil was writing it; re-run apply"
+        ))
+    );
+    match expected {
+        Expected::Unchecked => String::new(),
+        Expected::Sha256(sha) if sha.is_empty() => String::new(),
+        Expected::Absent => format!("! {sudo}test -e {d} || {refuse}\n"),
+        Expected::Sha256(sha) => format!(
+            "{}anvil_now=$(anvil_sha256 {d}); [ $? -eq 2 ] || [ \"$anvil_now\" = {} ] || {refuse}\n",
+            hash_fn(sudo),
+            quote(sha)
+        ),
+    }
 }
 
 fn file_run(run: String, label: String, sudo_secret: Option<String>, file: FileRun) -> PlannedRun {
@@ -362,10 +452,18 @@ fn has_cmp(sudo: &str) -> String {
 /// a regular DEST 0600 (creating a missing one empty), write the bytes, then
 /// `chmod`. `sudo` is `""` or `"sudo -n "`; `checks` is [`root_checks`] when
 /// the write runs as root, through `sudo` or on a root login, else empty.
-fn tee_script(heredoc: &Heredoc<'_>, dest: &str, mode: &str, sudo: &str, checks: &str) -> String {
+fn tee_script(
+    heredoc: &Heredoc<'_>,
+    dest: &str,
+    mode: &str,
+    sudo: &str,
+    checks: &str,
+    expected: &Expected,
+) -> String {
     debug_assert!(is_mode(mode), "{mode}");
     let (head, body) = (heredoc.head(), heredoc.body());
     let d = quote(dest);
+    let guard = guard(sudo, dest, expected);
     let directory = not_a_directory(sudo, &d, dest);
     let has_cmp = has_cmp(sudo);
     let (unchanged, wrote) = (
@@ -374,7 +472,8 @@ fn tee_script(heredoc: &Heredoc<'_>, dest: &str, mode: &str, sudo: &str, checks:
     );
     format!(
         "{{ umask 077\n\
-         {checks}{directory} && if {head} | {{ {has_cmp} && {sudo}cmp -s - {d}; }}\n\
+         {checks}{directory} || exit {REFUSED}\n\
+         {guard}if {head} | {{ {has_cmp} && {sudo}cmp -s - {d}; }}\n\
          {body}\
          then {sudo}chmod {mode} {d} && echo {unchanged}\n\
          else {{ {sudo}test -f {d} && {sudo}chmod 600 {d} || : | {sudo}tee -a {d} >/dev/null; }} \
@@ -401,9 +500,10 @@ fn stage_script(heredoc: &Heredoc<'_>, temp: &str) -> String {
 /// `checks` ([`root_checks`] with `"sudo "`), refuse a directory DEST, then
 /// `chmod` an unchanged DEST or `install` over it. The trap keeps
 /// [`crate::packages::with_password`]'s `sudo -k`, which it replaces.
-fn install_script(temp: &str, dest: &str, mode: &str, checks: &str) -> String {
+fn install_script(temp: &str, dest: &str, mode: &str, checks: &str, expected: &Expected) -> String {
     debug_assert!(is_mode(mode), "{mode}");
     let (t, d) = (quote(temp), quote(dest));
+    let guard = guard("sudo ", dest, expected);
     let directory = not_a_directory("sudo ", &d, dest);
     let has_cmp = has_cmp("sudo ");
     let (unchanged, wrote) = (
@@ -414,7 +514,8 @@ fn install_script(temp: &str, dest: &str, mode: &str, checks: &str) -> String {
         "{{ trap \"rm -f {t}; sudo -k\" EXIT\n\
          [ -f {t} ] && [ ! -L {t} ] && [ -O {t} ] \
          || {{ echo 'files: temp file check failed' >&2; exit 1; }}\n\
-         {checks}{directory} && if {has_cmp} && sudo cmp -s {t} {d}; then sudo chmod {mode} {d} && echo {unchanged}\n\
+         {checks}{directory} || exit {REFUSED}\n\
+         {guard}if {has_cmp} && sudo cmp -s {t} {d}; then sudo chmod {mode} {d} && echo {unchanged}\n\
          else sudo install -m {mode} {t} {d} && echo {wrote}; fi\n\
          }}\n"
     )
@@ -429,7 +530,6 @@ pub(crate) const MAX_KEPT: u64 = 256 * 1024;
 /// `$anvil_sudo` (unquoted, so `sudo -n` is two words): with `sha256sum`,
 /// else `shasum -a 256`. It returns 1 when the tool cannot read FILE and 2,
 /// printing nothing, when the target has neither tool.
-#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
 pub(crate) const HASH: &str = "anvil_sha256() {
 if $anvil_sudo sh -c 'command -v sha256sum' >/dev/null 2>&1; then
 anvil_h=$($anvil_sudo sha256sum \"$1\" 2>/dev/null) || return 1
@@ -443,7 +543,6 @@ printf '%s\\n' \"${anvil_h%% *}\"
 ";
 
 /// [`HASH`] with `$anvil_sudo` set to `sudo`.
-#[cfg_attr(not(test), expect(dead_code, reason = "apply captures from #18 U7 on"))]
 fn hash_fn(sudo: &str) -> String {
     format!("anvil_sudo={}\n{HASH}", quote(sudo.trim_end()))
 }
@@ -1026,7 +1125,8 @@ mod tests {
             files[1],
             FileRun {
                 upload: None,
-                skip: true
+                skip: true,
+                write: None,
             }
         );
         assert!(runs[1].run.is_empty());
@@ -1155,6 +1255,7 @@ mod tests {
             "/etc/a",
             "0640",
             &root_checks("sudo ", "/etc/a"),
+            &Expected::Unchecked,
         );
         assert!(
             run.starts_with("{ trap \"rm -f '/tmp/anvil-00'; sudo -k\" EXIT\n"),
@@ -1164,11 +1265,16 @@ mod tests {
         let lines: Vec<_> = run.lines().collect();
         assert_eq!(lines.iter().filter(|line| **line == "}").count(), 1);
         assert!(
-            lines[2].starts_with(&format!(
-                "{}{{ ! sudo test -d '/etc/a' || {{ echo 'files: /etc/a is a directory' >&2; false; }}; }} \
-                 && if sudo sh -c 'command -v cmp' >/dev/null 2>&1 && sudo cmp -s ",
-                root_checks("sudo ", "/etc/a")
-            )),
+            lines[2]
+                == format!(
+                    "{}{{ ! sudo test -d '/etc/a' || {{ echo 'files: /etc/a is a directory' >&2; false; }}; }} \
+                     || exit 4",
+                    root_checks("sudo ", "/etc/a")
+                ),
+            "{run}"
+        );
+        assert!(
+            lines[3].starts_with("if sudo sh -c 'command -v cmp' >/dev/null 2>&1 && sudo cmp -s "),
             "{run}"
         );
         let wrapped = crate::packages::with_password(&run);
@@ -1224,7 +1330,14 @@ mod tests {
         {
             let dest = dir.join(format!("out{n}"));
             let dest_str = dest.to_str().unwrap();
-            let script = tee_script(&Heredoc::new(text).unwrap(), dest_str, "0640", "", "");
+            let script = tee_script(
+                &Heredoc::new(text).unwrap(),
+                dest_str,
+                "0640",
+                "",
+                "",
+                &Expected::Unchecked,
+            );
             assert_eq!(
                 sh(&script),
                 (Some(0), format!("wrote {dest_str}\n")),
@@ -1250,6 +1363,7 @@ mod tests {
                 mode,
                 "",
                 "",
+                &Expected::Unchecked,
             ))
         };
         assert_eq!(
@@ -1308,6 +1422,7 @@ mod tests {
                 "0640",
                 sudo,
                 &checks,
+                &Expected::Unchecked,
             );
             let case = format!("{sudo:?} run {run}");
             let mut command = std::process::Command::new("/bin/sh");
@@ -1399,13 +1514,22 @@ mod tests {
                 "0644",
                 "sudo -n ",
                 &user_checks("sudo -n ", dest, top),
+                &Expected::Unchecked,
             ),
-            tee_script(&heredoc, d, "0644", "", &user_checks("", dest, top)),
+            tee_script(
+                &heredoc,
+                d,
+                "0644",
+                "",
+                &user_checks("", dest, top),
+                &Expected::Unchecked,
+            ),
             install_script(
                 temp.to_str().unwrap(),
                 d,
                 "0644",
                 &user_checks("sudo ", dest, top),
+                &Expected::Unchecked,
             ),
         ]
     }
@@ -1419,7 +1543,7 @@ mod tests {
         for (n, script) in root_scripts(dest, dir, &temp).iter().enumerate() {
             fs::write(&temp, "new\n").unwrap();
             let out = sh_with(&bin, script);
-            assert_ne!(out.code, Some(0), "script {n}");
+            assert_eq!(out.code, Some(REFUSED), "script {n}");
             assert!(out.stdout.is_empty(), "script {n}");
             assert_eq!(
                 String::from_utf8(out.stderr).unwrap(),
@@ -1507,6 +1631,7 @@ mod tests {
             "0644",
             "sudo -n ",
             &root_checks("sudo -n ", dest.to_str().unwrap()),
+            &Expected::Unchecked,
         );
         let out = sh_with(&bin, &script);
         assert_ne!(out.code, Some(0));
@@ -1540,6 +1665,7 @@ mod tests {
                 "0644",
                 "sudo -n ",
                 &user_checks("sudo -n ", &link, &dir),
+                &Expected::Unchecked,
             ),
             tee_script(
                 &heredoc,
@@ -1547,12 +1673,14 @@ mod tests {
                 "0644",
                 "",
                 &user_checks("", &link, &dir),
+                &Expected::Unchecked,
             ),
             install_script(
                 temp.to_str().unwrap(),
                 link_str,
                 "0644",
                 &user_checks("sudo ", &link, &dir),
+                &Expected::Unchecked,
             ),
         ];
         for (n, script) in scripts.iter().enumerate() {
@@ -1582,7 +1710,14 @@ mod tests {
         fs::write(&real, "old\n").unwrap();
         symlink(&real, &link).unwrap();
         let link_str = link.to_str().unwrap();
-        let script = tee_script(&Heredoc::new("new\n").unwrap(), link_str, "0640", "", "");
+        let script = tee_script(
+            &Heredoc::new("new\n").unwrap(),
+            link_str,
+            "0640",
+            "",
+            "",
+            &Expected::Unchecked,
+        );
         assert_eq!(sh(&script), (Some(0), format!("wrote {link_str}\n")));
         assert_eq!(fs::read_link(&link).unwrap(), real);
         assert_eq!(fs::read_to_string(&real).unwrap(), "new\n");
@@ -1597,9 +1732,16 @@ mod tests {
         fs::create_dir(&dest).unwrap();
         fs::set_permissions(&dest, fs::Permissions::from_mode(0o751)).unwrap();
         let dest_str = dest.to_str().unwrap();
-        let script = tee_script(&Heredoc::new("a\n").unwrap(), dest_str, "0600", "", "");
+        let script = tee_script(
+            &Heredoc::new("a\n").unwrap(),
+            dest_str,
+            "0600",
+            "",
+            "",
+            &Expected::Unchecked,
+        );
         let out = Local.run(&script, RUN_TIMEOUT).unwrap();
-        assert_ne!(out.code, Some(0));
+        assert_eq!(out.code, Some(REFUSED));
         assert!(out.stdout.is_empty());
         assert_eq!(
             String::from_utf8(out.stderr).unwrap(),
@@ -1627,6 +1769,7 @@ mod tests {
             "0644",
             "sudo -n ",
             &user_checks("sudo -n ", &dest, &dir),
+            &Expected::Unchecked,
         );
         let mut command = std::process::Command::new("/bin/sh");
         command.arg("-s").env(
@@ -2275,6 +2418,168 @@ mod tests {
             .status()
             .unwrap();
         assert!(syntax.success(), "{wrapped}");
+    }
+
+    /// The three write scripts over `dest` under `dir`, each writing
+    /// "new\n" and expecting `expected`: tee as the user, tee through sudo
+    /// with the checks, and the password path's install.
+    fn guarded_scripts(dir: &Path, dest: &Path, temp: &Path, expected: &Expected) -> [String; 3] {
+        let (heredoc, d) = (Heredoc::new("new\n").unwrap(), dest.to_str().unwrap());
+        [
+            tee_script(&heredoc, d, "0644", "", "", expected),
+            tee_script(
+                &heredoc,
+                d,
+                "0644",
+                "sudo -n ",
+                &user_checks("sudo -n ", dest, dir),
+                expected,
+            ),
+            install_script(
+                temp.to_str().unwrap(),
+                d,
+                "0644",
+                &user_checks("sudo ", dest, dir),
+                expected,
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_dest_changed_since_the_capture_is_refused_untouched() {
+        let dir = dir("files-guard");
+        let bin = passthrough_sudo(&dir);
+        let (dest, temp) = (dir.join("conf"), dir.join("temp"));
+        let refused = format!(
+            "files: {} changed while anvil was writing it; re-run apply\n",
+            dest.display()
+        );
+        let captured = sha_hex(b"old\n");
+        for (expected, case) in [
+            (Expected::Sha256(sha_hex(b"other\n")), "another hash"),
+            (Expected::Absent, "absent at capture"),
+        ] {
+            for (n, script) in guarded_scripts(&dir, &dest, &temp, &expected)
+                .iter()
+                .enumerate()
+            {
+                fs::write(&dest, "old\n").unwrap();
+                fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::write(&temp, "new\n").unwrap();
+                let out = sh_with(&bin, script);
+                let case = format!("{case}, script {n}");
+                assert_eq!(out.code, Some(REFUSED), "{case}");
+                assert!(out.stdout.is_empty(), "{case}");
+                assert_eq!(String::from_utf8(out.stderr).unwrap(), refused, "{case}");
+                assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n", "{case}");
+                assert_eq!(mode_of(&dest), 0o600, "{case}");
+            }
+        }
+        for (expected, before) in [
+            (Expected::Sha256(captured), Some("old\n")),
+            (Expected::Absent, None),
+            (Expected::Sha256(String::new()), Some("other\n")),
+        ] {
+            for (n, script) in guarded_scripts(&dir, &dest, &temp, &expected)
+                .iter()
+                .enumerate()
+            {
+                match before {
+                    Some(text) => fs::write(&dest, text).unwrap(),
+                    None => {
+                        let _ = fs::remove_file(&dest);
+                    }
+                }
+                fs::write(&temp, "new\n").unwrap();
+                let out = sh_with(&bin, script);
+                let case = format!("{expected:?}, script {n}");
+                assert_eq!(String::from_utf8(out.stderr).unwrap(), "", "{case}");
+                assert_eq!(out.code, Some(0), "{case}");
+                assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n", "{case}");
+            }
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_a_hash_tool_the_write_is_not_checked() {
+        let dir = dir("files-guard-nohash");
+        let bin = bin_with(&dir, &["head", "tee", "chmod", "sh", "cmp"], &[]);
+        let dest = dir.join("conf");
+        fs::write(&dest, "changed\n").unwrap();
+        let expected = Expected::Sha256(sha_hex(b"old\n"));
+        let script = tee_script(
+            &Heredoc::new("new\n").unwrap(),
+            dest.to_str().unwrap(),
+            "0644",
+            "",
+            "",
+            &expected,
+        );
+        let out = sh_only(&bin, &script);
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+        assert_eq!(out.code, Some(0));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_script_rebuilds_the_planned_write_with_the_guard() {
+        let config = config_in(Path::new("/c"), vec![entry("a", "/etc/a")]);
+        let sources = Sources::of(&[SECRET_TEXT]);
+        for (secret, facts) in [
+            (None, user_facts("nopasswd")),
+            (Some("WEB"), user_facts("binary")),
+        ] {
+            let run = runs(&config, &sources, &host(&[], secret), Some(&facts))
+                .unwrap()
+                .remove(0);
+            let write = run.file.as_ref().unwrap().write.clone().unwrap();
+            assert_eq!(write.password, secret.is_some());
+            let (script, upload) = write_script(&write, &sources, &Expected::Unchecked).unwrap();
+            assert_eq!(upload.is_some(), secret.is_some());
+            if secret.is_none() {
+                assert_eq!(script, run.run, "Unchecked is the planned script");
+            }
+            assert!(!script.contains("anvil_sha256"));
+            let (guarded, _) =
+                write_script(&write, &sources, &Expected::Sha256(sha_hex(b"x"))).unwrap();
+            assert!(
+                guarded.contains(&format!("= '{}' ] ||", sha_hex(b"x"))),
+                "{guarded}"
+            );
+            let prefix = if secret.is_some() {
+                "sudo "
+            } else {
+                "sudo -n "
+            };
+            assert!(guarded.contains(&format!("anvil_sudo='{}'", prefix.trim_end())));
+            assert_eq!(
+                guarded.contains("hunter2"),
+                secret.is_none(),
+                "bytes only in tee's heredoc"
+            );
+        }
+        let missing = FileWrite {
+            index: 1,
+            ..runs(
+                &config,
+                &sources,
+                &host(&[], None),
+                Some(&user_facts("nopasswd")),
+            )
+            .unwrap()[0]
+                .file
+                .as_ref()
+                .unwrap()
+                .write
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(
+            write_script(&missing, &sources, &Expected::Unchecked).unwrap_err(),
+            "files[1]: src was not loaded"
+        );
     }
 
     #[test]

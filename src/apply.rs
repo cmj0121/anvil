@@ -118,6 +118,9 @@ impl std::fmt::Debug for PlannedRun {
 pub struct FileRun {
     pub upload: Option<Upload>,
     pub skip: bool,
+    /// How the step writes, to build it again with what the capture saw;
+    /// `None` for a skip.
+    pub write: Option<files::FileWrite>,
 }
 
 /// A `[[services]]` step: whether the entry matched no tag or fact of the target.
