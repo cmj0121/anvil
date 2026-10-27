@@ -18,6 +18,7 @@ use crate::config::Config;
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, YELLOW, paint};
 use crate::options::Options;
+use crate::plugin;
 use crate::transport::{Transport, TransportError};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -83,6 +84,7 @@ pub fn run_targets(
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Plan, Failure> {
     let targets = opts.targets()?;
+    plugin::verify(config).map_err(Failure::usage)?;
     Ok(plan_targets(
         &targets,
         |target| opts.transport(target),
@@ -303,14 +305,29 @@ mod tests {
     fn config(packages: Option<Packages>, runs: &[&str]) -> Config {
         Config {
             packages,
-            steps: runs
-                .iter()
-                .map(|run| Step {
-                    run: (*run).to_owned(),
-                })
-                .collect(),
+            steps: runs.iter().map(|run| Step::script(*run)).collect(),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn a_bad_pin_is_exit_two_before_any_target() {
+        let (dir, opts, config) = crate::test_util::bad_pin("plan");
+        let mut started = 0;
+        let failure = run_targets(&opts, &config, &AtomicBool::new(false), &mut |progress| {
+            if let Progress::Start(_) = progress {
+                started += 1;
+            }
+        })
+        .unwrap_err();
+        assert_eq!(failure.code, 2, "{}", failure.message);
+        assert!(
+            failure.message.starts_with("plugins.harden.path `"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(started, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn git() -> Packages {

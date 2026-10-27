@@ -8,7 +8,11 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::cli::Cli;
+use crate::config::Config;
+use crate::document::{self, Format};
 use crate::editor::random;
+use crate::options::Options;
 use crate::paths::DocPath;
 use crate::secret::{BackendKind, SecretError, Store, Vault};
 
@@ -90,6 +94,31 @@ pub fn assert_no_plaintext(dir: &Path, needle: &str) {
             file.display()
         );
     }
+}
+
+/// A new temp dir, options for `command` over an inventory of one host
+/// in it, and a config whose `[plugins.harden]` names a missing file there.
+pub fn bad_pin(command: &str) -> (PathBuf, Options, Config) {
+    let dir = temp_dir("bad-pin");
+    let inventory = dir.join("inventory.toml");
+    fs::write(&inventory, "[hosts.fake]\nhost = \"fakehost\"\n").unwrap();
+    let cli = <Cli as clap::Parser>::try_parse_from([
+        "anvil",
+        "--inventory",
+        inventory.to_str().unwrap(),
+        command,
+    ])
+    .unwrap();
+    let config = document::from_str(
+        &format!(
+            "[plugins.harden]\npath = \"{}\"\nsha256 = \"{}\"\n",
+            dir.join("missing").display(),
+            "0".repeat(64)
+        ),
+        Format::Toml,
+    )
+    .unwrap();
+    (dir, Options::from_cli(&cli), config)
 }
 
 /// Writes a fake's knobs to `path` as shell assignments, for a fake that

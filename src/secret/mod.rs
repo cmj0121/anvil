@@ -25,6 +25,7 @@ pub mod migrate;
 mod prompt;
 mod sops;
 
+pub(crate) use file_store::{check_dir, check_owner, open_regular};
 pub use keychain::Keychain;
 #[cfg(any(test, debug_assertions))]
 pub use memory::Memory;

@@ -674,6 +674,7 @@ mod tests {
         let config = Config {
             secrets: None,
             packages: None,
+            plugins: Default::default(),
             anvil: crate::config::AnvilPrefs {
                 secrets: Some(vec!["HOST_SUDO".to_owned()]),
                 ..Default::default()
@@ -707,6 +708,7 @@ mod tests {
         let config = Config {
             secrets: None,
             packages: None,
+            plugins: Default::default(),
             anvil: Default::default(),
             steps: vec![],
         };
@@ -916,6 +918,7 @@ mod tests {
         let mut config = Config {
             secrets: None,
             packages: None,
+            plugins: Default::default(),
             anvil: crate::config::AnvilPrefs {
                 secrets: Some(vec!["API_KEY".to_owned(), "BOX_SUDO".to_owned()]),
                 ..Default::default()
@@ -983,6 +986,7 @@ mod tests {
                 ..Default::default()
             }),
             anvil: Default::default(),
+            plugins: Default::default(),
             steps: vec![],
         };
         let store = Memory::with(&[("LOCAL_SUDO", b"hunter2-secret")]);

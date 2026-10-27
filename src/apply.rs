@@ -20,12 +20,13 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::cli::{Cli, Failure, print_json};
-use crate::config::Config;
+use crate::config::{Config, StepKind};
 use crate::facts::{self, Facts};
 use crate::inventory::Target;
 use crate::logger::{BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, is_escaped, paint};
 use crate::options::Options;
 use crate::packages::{self, Packages};
+use crate::plugin;
 use crate::secret::Store;
 use crate::transport::{
     Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
@@ -202,6 +203,7 @@ pub fn run_targets(
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
     let targets = opts.targets()?;
+    plugin::verify(config).map_err(Failure::usage)?;
     let packages = package_work(config);
     let passwords = load_passwords(&targets, packages, || opts.secret_store(config))?;
     Ok(apply_targets(
@@ -505,7 +507,7 @@ pub fn probe(transport: &dyn Transport) -> Result<Facts, String> {
 /// upgrades `[packages]` with the target's package manager (when it has
 /// work), then each `[[steps]]` entry. Runs nothing: `facts`, from
 /// [`probe`], is required only when `[packages]` has work. The error is the
-/// target's failure, as `packages: <reason>`.
+/// target's failure, as `packages: <reason>` or `plugin <name>: <reason>`.
 pub fn resolve(
     target: &Target,
     facts: Option<&Facts>,
@@ -536,12 +538,19 @@ pub fn resolve(
             });
         }
     }
-    runs.extend(config.steps.iter().map(|step| PlannedRun {
-        run: step.run.clone(),
-        label: None,
-        sudo_secret: None,
-        timeout: RUN_TIMEOUT,
-    }));
+    for step in &config.steps {
+        match step.kind() {
+            StepKind::Plugin(name) => {
+                return Err(format!("plugin {name}: plugin steps are not supported yet"));
+            }
+            StepKind::Run(run) => runs.push(PlannedRun {
+                run: run.to_owned(),
+                label: None,
+                sudo_secret: None,
+                timeout: RUN_TIMEOUT,
+            }),
+        }
+    }
     Ok(runs)
 }
 
@@ -847,11 +856,7 @@ mod tests {
     }
 
     fn steps(runs: &[&str]) -> Vec<Step> {
-        runs.iter()
-            .map(|run| Step {
-                run: (*run).to_owned(),
-            })
-            .collect()
+        runs.iter().map(|run| Step::script(*run)).collect()
     }
 
     /// `[packages]` (when `Some`) and the `[[steps]]` `runs`.
@@ -1997,6 +2002,52 @@ mod tests {
             resolve(&target("box"), None, &config).unwrap_err(),
             "packages: the probe has not run"
         );
+    }
+
+    #[test]
+    fn a_plugin_step_fails_its_target_before_any_step_runs() {
+        let mut config = config(None, &["one"]);
+        config.steps.push(Step {
+            plugin: Some("harden".to_owned()),
+            ..Step::default()
+        });
+        assert_eq!(
+            resolve(&target("box"), None, &config).unwrap_err(),
+            "plugin harden: plugin steps are not supported yet"
+        );
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let report = apply_target(
+            &target("box"),
+            Ok(Box::new(Fake::new(&log))),
+            &config,
+            &Passwords::new(),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            report.failure().as_deref(),
+            Some("plugin harden: plugin steps are not supported yet")
+        );
+        assert!(log.borrow().is_empty(), "nothing ran: {:?}", log.borrow());
+    }
+
+    #[test]
+    fn a_bad_pin_is_exit_two_before_any_target() {
+        let (dir, opts, config) = crate::test_util::bad_pin("apply");
+        let mut started = 0;
+        let failure = run_targets(&opts, &config, &AtomicBool::new(false), &mut |progress| {
+            if let Progress::Start(_) = progress {
+                started += 1;
+            }
+        })
+        .unwrap_err();
+        assert_eq!(failure.code, 2, "{}", failure.message);
+        assert!(
+            failure.message.starts_with("plugins.harden.path `"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(started, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

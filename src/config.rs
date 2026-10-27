@@ -1,18 +1,25 @@
 //! The config document: `[anvil]` preferences, the `[secrets]` backend, the
-//! `[packages]` to install and the `[[steps]]` that `anvil apply` runs.
+//! `[packages]` to install, the pinned `[plugins]` and the `[[steps]]` that
+//! `anvil apply` runs.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::document::{self, DocumentError, Format};
+use crate::logger::escape_controls;
 use crate::packages::Packages;
 use crate::paths::{self, DocPath};
 use crate::secret::{self, BackendKind, SERVICE};
 
 /// Longest `run` script, in bytes.
 pub const MAX_RUN_BYTES: usize = 4 << 10;
+
+/// Longest step `args`, in bytes as JSON: leaves room for the facts in the
+/// request a plugin reads.
+pub const ARGS_LIMIT: usize = 32 << 10;
 
 /// Whether this build can use the keychain.
 const MACOS: bool = cfg!(target_os = "macos");
@@ -25,6 +32,8 @@ pub struct Config {
     pub secrets: Option<Secrets>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packages: Option<Packages>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugins: BTreeMap<String, Plugin>,
     pub steps: Vec<Step>,
 }
 
@@ -34,9 +43,8 @@ impl Default for Config {
             anvil: AnvilPrefs::default(),
             secrets: None,
             packages: None,
-            steps: vec![Step {
-                run: "hostname".to_string(),
-            }],
+            plugins: BTreeMap::new(),
+            steps: vec![Step::script("hostname")],
         }
     }
 }
@@ -168,10 +176,41 @@ fn check_apart(backend: &Backend) -> Result<(), String> {
     }
 }
 
+/// `[plugins.<name>]`: a program on the controller that a step names, run
+/// only when its file passes the checks and hashes to `sha256`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Plugin {
+    pub path: String,
+    pub sha256: String,
+    #[serde(
+        default = "Plugin::default_on",
+        skip_serializing_if = "Plugin::is_default_on"
+    )]
+    pub on: String,
+}
+
+impl Plugin {
+    fn default_on() -> String {
+        "step".to_string()
+    }
+
+    fn is_default_on(on: &str) -> bool {
+        on == "step"
+    }
+}
+
+/// A `[[steps]]` entry: a `run` script, or a `plugin` that returns one,
+/// given `args`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Step {
-    pub run: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl Config {
@@ -200,21 +239,78 @@ impl Config {
                 .validate()
                 .map_err(|message| DocumentError::invalid(path, message))?;
         }
-        for (i, step) in self.steps.iter().enumerate() {
-            if step.run.trim().is_empty() {
-                return Err(DocumentError::invalid(
-                    path,
-                    format!("steps[{i}].run: is empty or blank"),
+        self.check_plugins(std::env::var_os("HOME").as_deref())
+            .map_err(|message| DocumentError::invalid(path, message))?;
+        self.check_steps()
+            .map_err(|message| DocumentError::invalid(path, message))
+    }
+
+    /// The `[plugins]` schema rules; the files are checked by
+    /// [`crate::plugin::verify`] only before a command runs any target.
+    fn check_plugins(&self, home: Option<&OsStr>) -> Result<(), String> {
+        for (name, plugin) in &self.plugins {
+            if !is_plugin_name(name) {
+                return Err(format!(
+                    "plugins `{}`: must match [a-z][a-z0-9_-]*",
+                    secret::shown_name(name)
                 ));
             }
-            if step.run.len() > MAX_RUN_BYTES {
-                return Err(DocumentError::invalid(
-                    path,
-                    format!(
-                        "steps[{i}].run: {} bytes exceeds the {MAX_RUN_BYTES} byte limit",
-                        step.run.len()
-                    ),
+            plugin.path(name, home)?;
+            if !is_sha256(&plugin.sha256) {
+                return Err(format!(
+                    "plugins.{name}.sha256 `{}`: must be 64 lowercase hex digits",
+                    secret::shown_name(&plugin.sha256)
                 ));
+            }
+            if plugin.on != "step" {
+                return Err(format!(
+                    "plugins.{name}.on `{}`: must be step",
+                    secret::shown_name(&plugin.on)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The `[[steps]]` rules: `run` or `plugin`, and the limits on each.
+    fn check_steps(&self) -> Result<(), String> {
+        for (i, step) in self.steps.iter().enumerate() {
+            match (&step.run, &step.plugin) {
+                (Some(_), Some(_)) => {
+                    return Err(format!("steps[{i}]: has both run and plugin; keep one"));
+                }
+                (None, None) => return Err(format!("steps[{i}]: needs run or plugin")),
+                _ => {}
+            }
+            if let Some(args) = &step.args {
+                if step.plugin.is_none() {
+                    return Err(format!("steps[{i}].args: needs plugin"));
+                }
+                let len = serde_json::to_vec(args).map_or(usize::MAX, |json| json.len());
+                if len > ARGS_LIMIT {
+                    return Err(format!(
+                        "steps[{i}].args: {len} bytes as JSON exceeds the {ARGS_LIMIT} byte limit"
+                    ));
+                }
+            }
+            if let Some(plugin) = &step.plugin
+                && !self.plugins.contains_key(plugin)
+            {
+                return Err(format!(
+                    "steps[{i}].plugin `{}`: must name a [plugins] entry",
+                    secret::shown_name(plugin)
+                ));
+            }
+            if let Some(run) = &step.run {
+                if run.trim().is_empty() {
+                    return Err(format!("steps[{i}].run: is empty or blank"));
+                }
+                if run.len() > MAX_RUN_BYTES {
+                    return Err(format!(
+                        "steps[{i}].run: {} bytes exceeds the {MAX_RUN_BYTES} byte limit",
+                        run.len()
+                    ));
+                }
             }
         }
         Ok(())
@@ -307,6 +403,52 @@ impl Config {
     }
 }
 
+impl Step {
+    /// A step that runs `run`.
+    pub fn script(run: impl Into<String>) -> Step {
+        Step {
+            run: Some(run.into()),
+            ..Step::default()
+        }
+    }
+
+    /// What the step does: its `run` script, or the `plugin` that returns
+    /// one; [`Config::validate`] has ensured it is exactly one.
+    pub fn kind(&self) -> StepKind<'_> {
+        match (&self.plugin, &self.run) {
+            (Some(name), _) => StepKind::Plugin(name),
+            (None, Some(run)) => StepKind::Run(run),
+            (None, None) => unreachable!("Config::validate requires run or plugin"),
+        }
+    }
+}
+
+/// A [`Step`]'s `run` or `plugin`, as [`Step::kind`] returns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepKind<'a> {
+    Run(&'a str),
+    Plugin(&'a str),
+}
+
+impl Plugin {
+    /// `path` expanded against `home`; must be absolute or start with `~/`.
+    pub fn path(&self, name: &str, home: Option<&OsStr>) -> Result<PathBuf, String> {
+        expand(&format!("plugins.{name}.path"), &self.path, home)
+    }
+}
+
+/// `[a-z][a-z0-9_-]*`: the rule for a `[plugins]` name.
+fn is_plugin_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// 64 lowercase hex digits, as `sha256sum` prints them.
+fn is_sha256(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 impl Secrets {
     fn new(backend: BackendKind) -> Secrets {
         Secrets {
@@ -388,16 +530,17 @@ fn resolve(
 /// `value` with a leading `~/` resolved against `home`; the result must be
 /// absolute.
 fn expand(key: &str, value: &str, home: Option<&OsStr>) -> Result<PathBuf, String> {
+    let shown = escape_controls(value);
     let path = match value.strip_prefix("~/") {
         Some(rest) => match home.filter(|home| !home.is_empty()).map(Path::new) {
             Some(home) if home.is_absolute() => home.join(rest),
             Some(home) => {
                 return Err(format!(
-                    "{key} `{value}`: $HOME `{}` is not absolute",
+                    "{key} `{shown}`: $HOME `{}` is not absolute",
                     home.display()
                 ));
             }
-            None => return Err(format!("{key} `{value}`: $HOME is not set")),
+            None => return Err(format!("{key} `{shown}`: $HOME is not set")),
         },
         None => PathBuf::from(value),
     };
@@ -405,7 +548,7 @@ fn expand(key: &str, value: &str, home: Option<&OsStr>) -> Result<PathBuf, Strin
         Ok(path)
     } else {
         Err(format!(
-            "{key} `{value}`: must be an absolute path or start with ~/"
+            "{key} `{shown}`: must be an absolute path or start with ~/"
         ))
     }
 }
@@ -428,12 +571,7 @@ mod tests {
         for path in [None, Some(fixture_doc("nonexistent.yaml"))] {
             let config = Config::load(path.as_ref()).unwrap();
             assert_eq!(config, Config::default());
-            assert_eq!(
-                config.steps,
-                [Step {
-                    run: "hostname".into()
-                }]
-            );
+            assert_eq!(config.steps, [Step::script("hostname")]);
             assert!(config.names().is_empty());
             assert_eq!(config.secrets, None);
             assert_eq!(config.anvil.editor, None);
@@ -458,14 +596,7 @@ mod tests {
         );
         assert_eq!(
             toml.steps,
-            [
-                Step {
-                    run: "hostname".into()
-                },
-                Step {
-                    run: "uname -a".into()
-                }
-            ]
+            [Step::script("hostname"), Step::script("uname -a")]
         );
     }
 
@@ -632,6 +763,11 @@ mod tests {
                 "path = \"/s\"\nconfig = \".sops.yaml\"",
                 home(),
                 "secrets.sops.config `.sops.yaml`",
+            ),
+            (
+                "path = \"\\u001bs\"",
+                home(),
+                "secrets.sops.path `\\x1bs`: must be an absolute path",
             ),
             ("path = \"~/s.json\"", None, "$HOME is not set"),
             (
@@ -960,21 +1096,151 @@ mod tests {
         }
     }
 
+    const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// `[plugins.harden]` with `extra` lines, then `steps`.
+    fn plugin_config(extra: &str, steps: &str) -> String {
+        format!("[plugins.harden]\npath = \"~/p/harden\"\nsha256 = \"{SHA}\"\n{extra}\n{steps}")
+    }
+
+    #[test]
+    fn plugins_and_plugin_steps_load_validate_and_round_trip() {
+        let config = parse(&plugin_config(
+            "",
+            "[[steps]]\nrun = \"hostname\"\n\n[[steps]]\nplugin = \"harden\"\n\n\
+             [steps.args]\nprofile = \"ssh\"\nlevel = 2\n",
+        ));
+        config.check_plugins(home()).unwrap();
+        config.check_steps().unwrap();
+        let plugin = &config.plugins["harden"];
+        assert_eq!(plugin.on, "step");
+        assert_eq!(
+            plugin.path("harden", home()).unwrap(),
+            Path::new("/home/u/p/harden")
+        );
+        assert_eq!(config.steps[0], Step::script("hostname"));
+        assert_eq!(config.steps[1].plugin.as_deref(), Some("harden"));
+        assert_eq!(
+            serde_json::Value::Object(config.steps[1].args.clone().unwrap()),
+            serde_json::json!({"profile": "ssh", "level": 2})
+        );
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&config, format).unwrap();
+            let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(back, config, "{text}");
+            assert!(!text.contains("on =") && !text.contains("on:"), "{text}");
+        }
+        let text = document::to_string(&Config::default(), Format::Toml).unwrap();
+        assert!(!text.contains("plugins"), "{text}");
+        assert!(!text.contains("plugin ="), "{text}");
+    }
+
+    #[test]
+    fn a_plugin_entry_needs_path_and_sha256_and_no_other_key() {
+        for (text, needle) in [
+            (format!("[plugins.harden]\nsha256 = \"{SHA}\"\n"), "path"),
+            ("[plugins.harden]\npath = \"/p\"\n".to_owned(), "sha256"),
+            (plugin_config("timeout = 3", ""), "timeout"),
+            (
+                plugin_config("", "[[steps]]\nplugin = \"harden\"\nenv = {}\n"),
+                "env",
+            ),
+        ] {
+            let err = document::from_str::<Config>(&text, Format::Toml).unwrap_err();
+            assert!(err.contains(needle), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn bad_plugin_entries_and_plugin_steps_are_refused_naming_the_key() {
+        let step = "[[steps]]\nplugin = \"harden\"\n";
+        let big = "x".repeat(ARGS_LIMIT);
+        for (text, needle) in [
+            (
+                format!("[plugins.Harden]\npath = \"/p\"\nsha256 = \"{SHA}\"\n"),
+                "plugins `Harden`: must match [a-z][a-z0-9_-]*".to_owned(),
+            ),
+            (
+                format!("[plugins.\"a\\u001b\"]\npath = \"/p\"\nsha256 = \"{SHA}\"\n"),
+                "plugins `a\\x1b`: must match".to_owned(),
+            ),
+            (
+                format!("[plugins.harden]\npath = \"p/harden\"\nsha256 = \"{SHA}\"\n"),
+                "plugins.harden.path `p/harden`: must be an absolute path or start with ~/"
+                    .to_owned(),
+            ),
+            (
+                "[plugins.harden]\npath = \"/p\"\nsha256 = \"ABC\"\n".to_owned(),
+                "plugins.harden.sha256 `ABC`: must be 64 lowercase hex digits".to_owned(),
+            ),
+            (
+                format!(
+                    "[plugins.harden]\npath = \"/p\"\nsha256 = \"{}\"\n",
+                    SHA.to_uppercase()
+                ),
+                "plugins.harden.sha256 `0123456789ABCDEF".to_owned(),
+            ),
+            (
+                format!("[plugins.harden]\npath = \"/p\"\nsha256 = \"{SHA}0\"\n"),
+                "must be 64 lowercase hex digits".to_owned(),
+            ),
+            (
+                plugin_config("on = \"doctor\"", step),
+                "plugins.harden.on `doctor`: must be step".to_owned(),
+            ),
+            (
+                plugin_config("", "[[steps]]\nrun = \"ls\"\nplugin = \"harden\"\n"),
+                "steps[0]: has both run and plugin; keep one".to_owned(),
+            ),
+            (
+                plugin_config("", "[[steps]]\n[steps.args]\na = 1\n"),
+                "steps[0]: needs run or plugin".to_owned(),
+            ),
+            (
+                plugin_config("", "[[steps]]\nrun = \"ls\"\n[steps.args]\na = 1\n"),
+                "steps[0].args: needs plugin".to_owned(),
+            ),
+            (
+                plugin_config("", &format!("{step}[steps.args]\na = \"{big}\"\n")),
+                format!(
+                    "steps[0].args: {} bytes as JSON exceeds the 32768 byte limit",
+                    ARGS_LIMIT + 8
+                ),
+            ),
+            (
+                plugin_config(
+                    "",
+                    "[[steps]]\nrun = \"ls\"\n\n[[steps]]\nplugin = \"tidy\"\n",
+                ),
+                "steps[1].plugin `tidy`: must name a [plugins] entry".to_owned(),
+            ),
+        ] {
+            let config = parse(&text);
+            let err = config.validate(Path::new("config.toml")).unwrap_err();
+            assert!(
+                matches!(err, DocumentError::Invalid { .. }),
+                "{text}: {err}"
+            );
+            assert!(err.to_string().contains(&needle), "{text}: {err}");
+        }
+        let fits = format!(
+            "{step}[steps.args]\na = \"{}\"\n",
+            "x".repeat(ARGS_LIMIT - 8)
+        );
+        assert!(parse(&plugin_config("", &fits)).check_steps().is_ok());
+    }
+
     #[test]
     fn long_run_and_unknown_keys_are_refused() {
         let long = Config {
-            steps: vec![Step {
-                run: "x".repeat(MAX_RUN_BYTES + 1),
-            }],
+            steps: vec![Step::script("x".repeat(MAX_RUN_BYTES + 1))],
             ..Config::default()
         };
         let err = long.validate(Path::new("config.toml")).unwrap_err();
         assert!(err.to_string().contains("steps[0].run"), "{err}");
         assert!(
             Config {
-                steps: vec![Step {
-                    run: "x".repeat(MAX_RUN_BYTES)
-                }],
+                steps: vec![Step::script("x".repeat(MAX_RUN_BYTES))],
                 ..Config::default()
             }
             .validate(Path::new("config.toml"))
