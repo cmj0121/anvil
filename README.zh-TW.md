@@ -22,11 +22,14 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
   因此再次執行會印出 `unchanged service NAME`。
 - **`anvil plan`** 列出 apply 會在每個 target 上執行的 step，但一個都不執行；`--json` 的文件標記為
   `"executed": false`。
-- **`anvil run FILE`**（或以 `-` 讀 stdin）在每個 target 上逐一執行一份臨時的 POSIX sh 腳本，
+- **`anvil run FILE`**（或以 `-` 讀 stdin）在每個 target 上執行一份臨時的 POSIX sh 腳本，
   輸出、`--json` 與結束碼都與 apply 相同。它不載入 config、不詢問確認，也不輸入 sudo 密碼。
 - **plugin step**：step 可以指定一個 plugin，也就是控制端上以路徑與 sha256 釘選的程式，
   它以 JSON 讀取 target 的 facts，並回覆要在該 target 上執行的 sh 腳本。它在清空的環境中執行，拿不到任何 secret。
 - **secret（機密）** 存放在 macOS keychain、age 檔案或 sops 檔案中，`anvil secret --migrate` 可在 backend 之間搬移它們。
+- **`--parallel N`** 讓 apply、plan 與 run 同時處理最多 N 個 target（1..=32，預設 1）。
+  輸出與 `--json` 維持 inventory 順序，Ctrl-C 會讓執行中的 step 跑完；第二次 Ctrl-C 立刻停止
+  （[平行執行](docs/cli.zh-TW.md#平行執行)）。
 - **終端機介面**：`anvil tui` 在同一個畫面執行所有指令，並保留本次工作階段的結果供瀏覽。
 - **`anvil update`** 以最新的 release 取代執行檔：先以編入 anvil 的公開金鑰檢查它的 `.sha256` 與 `.minisig` 簽章，
   並把先前的執行檔保留為 `anvil.prev`。金鑰要等專案 owner 加入後才會編入；在那之前，`anvil update` 會回報 `no release key compiled in`。
@@ -58,6 +61,7 @@ anvil doctor               # local checks + every target's facts and reachabilit
 anvil plan                 # the steps apply would run on every target, running none
 anvil apply                # install packages, copy files, set services, run the steps
 anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
+anvil --parallel 4 apply   # apply on up to 4 targets at once
 anvil tui                  # all of the above in one terminal UI
 anvil update --check       # is a newer release out? `anvil update` installs it
 ```

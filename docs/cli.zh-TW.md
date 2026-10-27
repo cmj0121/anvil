@@ -10,7 +10,7 @@
 [開發](development.zh-TW.md)。
 
 ```text
-anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [--target SEL]... <COMMAND>
+anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [--target SEL]... [--parallel N] <COMMAND>
   inventory [--format toml|yaml] edit the inventory; --format picks the edit view, saved as TOML
   config [--format toml|yaml]    edit the config; --format picks the edit view, saved as TOML
   doctor                         local checks + every target's facts and reachability
@@ -35,13 +35,54 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
 | `--ssh-config PATH` | 以 `-F PATH` 傳給每個 `ssh`                                                                   |
 | `--json`            | 在 stdout 印出恰好一份 JSON 文件，取代給人看的輸出                                            |
 | `--target SEL`      | `local`、host 名稱或 tag；可重複以取聯集；未指定表示 `local` 加上所有 host                    |
+| `--parallel N`      | `apply`、`plan` 與 `run` 同時處理的 target 數，1..=32，預設 1（[平行執行](#平行執行)）        |
 | `-h`, `--help`      | 說明                                                                                          |
 | `-V`, `--version`   | 版本                                                                                          |
 
 下方的 JSON 範例經過排版；anvil 會將每份文件印成一行。
 未知的 `--target` 是用法錯誤（以 2 結束；對 `tui` 而言僅在 inventory 載入成功時）。
 `inventory`、`config` 與 `secret` 會忽略 `--target` 並發出警告。
-target（目標）依序執行，先 `local`，再依名稱排序的 host（主機）；某個 target 失敗不會中止其他 target。
+超出 1..=32 的 `--parallel` 以 2 結束（`invalid value '0' for '--parallel <N>': 0 is not in 1..=32`）；
+`inventory`、`config`、`secret`、`doctor` 與 `update` 會忽略它，N 不為 1 時記錄警告
+``--parallel is ignored by `doctor` ``（帶該指令的名稱），從 `-v` 起顯示。
+target（目標）依序啟動，先 `local`，再依名稱排序的 host（主機），同時最多 `--parallel N` 個（預設一個接一個）；
+某個 target 失敗不會中止其他 target。
+
+## 平行執行
+
+`--parallel N` 讓 `apply`、`plan` 與 `run` 同時處理最多 N 個 target；
+`anvil tui` 把它當作其 apply、plan 與 run（`x`）的起始值，doctor 則一次一個 target，且不發出警告：
+
+```sh
+anvil --parallel 4 apply
+anvil plan --parallel 8 --target linode
+anvil run --parallel 4 fix.sh
+```
+
+- **順序。** target 的啟動順序與 `--parallel 1` 相同：先 `local`，再依名稱排序的 host。
+  給人看的輸出也維持這個順序：某個 target 的區塊要等它與它之前的每個 target 都結束後才印出，
+  因此較慢的第一個 target 會壓住後面的區塊（而不是它們的工作），期間 stdout 上不會出現新內容。摘要最後印出。
+  `--parallel 1` 印出的內容與這個旗標出現之前完全相同。
+- **JSON。** `--json` 以同樣順序、同樣結構列出 target；不會註明同時執行了幾個。
+- **日誌即時輸出。** 在 `-v` 以上，日誌行在發生時即寫到 stderr，每次一整行，且每行都標出它的 target
+  （`-vv` 時如 `apply linode1: start`），因此區塊被壓住時仍看得出什麼正在執行。
+- **Ctrl-C** 與單一 target 時相同：第一次按下讓執行中的 step 跑完且不再啟動其他 target，第二次立刻停止一切（[Ctrl-C](#ctrl-c)）。
+- **結束碼**不變：任一 target 失敗或被取消時為 1；失敗的 target 絕不會中止其他 target。
+
+限制：
+
+- **N 大時第一次連線較慢。** ssh master 一次只開一個（見 [SSH 行為](#ssh-行為)）。
+  master 存活的 target 絕不等待，但每個需要新 master 的 target 都要等排在它前面的開啟完成，
+  而對沒有回應的 host，每次開啟最多可花 40 秒（10 秒的 `ssh -O check`，接著 30 秒的金鑰嘗試）。
+  互動式重試則在有人輸入的期間一直讓它們等待。
+- **同一台機器的兩個 inventory 項目會同時執行。** anvil 不知道它們是同一台 host，
+  因此它們的套件 step 可能撞上套件管理器的鎖（例如 pacman 的資料庫鎖），其 file 與 step 也可能同時寫入相同路徑。
+  請以 `--target` 只選其中一個，或使用 `--parallel 1`。
+- **plugin 會平行執行。** apply 與 plan 在控制端為每個 target 執行一次 plugin，現在最多同時 N 個，
+  因此 plugin 必須能安全地同時執行多份（[Plugin steps](#plugin-steps)）。
+- **第二次 Ctrl-C 只停止本機上執行的東西。** 它會終止 anvil 的本機行程，包括 ssh 用戶端。
+  沒有終端機而啟動的遠端指令，在其 ssh 用戶端死亡後仍會在 host 上繼續執行。
+  以這種方式停止的 `[[files]]` step 可能在 target 上留下其 `/tmp/anvil-` 暫存檔（[File steps](#file-steps)）。
 
 ## 指令
 
@@ -246,12 +287,23 @@ target 要嘛執行了它的 step（`steps` 與 `ok`；失敗的 step 會顯示�
 要嘛在傳輸中失敗（`error`、`ok: false`，只有在錯誤前已完成某些 step 時才有 `steps`）。
 step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 的最後一項，與 `error` 並列。
 
-**Ctrl-C。** `apply`、`plan` 與 `run` 對 Ctrl-C 的處理相同。第一次按下會取消：anvil 在 stderr 印出
-`interrupted: running targets stop after their current step; Ctrl-C again stops now`，
-每個執行中的 target 在目前的 step 結束後以 `⊘ cancelled` 結束（保留已完成的 step），不再啟動其他 target，指令以 1 結束。
-`--parallel 1` 也是如此：以前 Ctrl-C 會立刻停止 anvil，現在會等目前的 step 結束，最多等到該 step 的逾時。
-第二次按下會終止所有仍在執行的 step，anvil 因 SIGINT 結束（shell 顯示 130），不印摘要也不印 JSON。
-兩次按得非常接近時，可能只以一個訊號送達 anvil，此時算作第一次。
+#### Ctrl-C
+
+`apply`、`plan` 與 `run` 對 Ctrl-C 的處理相同，不論 `--parallel` 為何：
+
+- **第一次按下會取消。** anvil 在 stderr 印出
+  `interrupted: running targets stop after their current step; Ctrl-C again stops now`，不論 `-v` 為何。
+  每個執行中的 target 跑完目前的 step 後以 `⊘ cancelled` 結束，保留已完成的 step；不再啟動其他 target，
+  每個尚未啟動的 target 以沒有 step 的 `⊘ cancelled` 結束。摘要與 `--json` 照常印出，指令以 1 結束。
+  plan 執行中的探測也同樣會跑完。
+- **`--parallel 1` 也會等待。** 以前 Ctrl-C 會立刻停止 anvil，現在第一次按下會等目前的 step 結束，最多等到該 step 的逾時
+  （`[[steps]]`、`[[files]]` 或 plugin step 為 30 秒（使用密碼的 `[[files]]` step 最多可能花上三個 30 秒）、
+  套件 step 為 `[packages].timeout`、service step 120 秒、`anvil run` 為 `--timeout`）。
+  再按一次即立刻停止。
+- **第二次按下會立刻停止一切。** anvil 終止所有仍在執行的 step，記錄 `ERROR anvil::interrupt: interrupted`，
+  並因 SIGINT 結束（shell 顯示 130），不印摘要也不印 JSON。
+  沒有終端機的遠端指令會在 host 上繼續執行，也可能留下 `[[files]]` 暫存檔（[平行執行](#平行執行)）。
+- **快速連按兩次可能只算一次。** 兩次按得非常接近時，可能只以一個訊號送達 anvil，此時算作第一次；請再按一次。
 
 ### `anvil plan`
 
@@ -652,7 +704,8 @@ anvil run fix.sh
 printf 'df -h /\nuptime\n' | anvil run --target pi -
 ```
 
-target 的選法與 apply 相同（`--target`；未指定表示 `local` 加上所有 host），並逐一執行；失敗的 target 不會中止其他 target。
+target 的選法與 apply 相同（`--target`；未指定表示 `local` 加上所有 host），並像 apply 一樣執行，
+同時最多 `--parallel N` 個（[平行執行](#平行執行)）；失敗的 target 不會中止其他 target。
 腳本是每個 target 唯一的 step，經其 stdin 送到 `sh -s`（`local` 則為 `/bin/sh -s`），絕不放在 argv 上。
 它一律是 POSIX sh：shebang 行只是註解。run 不詢問確認。
 
@@ -744,7 +797,8 @@ keychain 目標在中途失敗時會列出已寫入的名稱。值絕不會出�
 單獨執行 `anvil` 仍印出說明，因此腳本或 agent 絕不會掉進 TUI。
 stdin 與 stdout 必須是終端機（否則以 2 結束，`anvil tui needs a terminal`），
 且 `--json` 會被拒絕（以 2 結束，`anvil tui: --json is not available`），儘管 `anvil tui --help` 將它列在全域旗標中。
-全域旗標是起始狀態：`--target` 預先選取 `t` overlay 中的列，`-v` 設定 Log pane 的層級，`--inventory`、`--config` 與 `--ssh-config` 設定路徑。
+全域旗標是起始狀態：`--target` 預先選取 `t` overlay 中的列，`-v` 設定 Log pane 的層級，
+`--parallel` 設定其 apply、plan 與 run 同時處理的 target 數，`--inventory`、`--config` 與 `--ssh-config` 設定路徑。
 無法載入的 inventory（任何載入錯誤：無法讀取，例如權限不足或是目錄、無效或模稜兩可、
 不以 `.toml` 結尾的 `--inventory` 路徑，或沒有 `$HOME`）不會以 2 結束：
 TUI 照常啟動，在標頭以紅色顯示 `inventory error`，錯誤本身則顯示為狀態列通知，並在 `t` overlay 中取代它的列；
@@ -881,6 +935,7 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
   `plan`：某個 target 無法連線、探測或解析。
   `apply`/`plan`：某個 plugin step 的 plugin 在某個 target 上失敗（[Plugin steps](#plugin-steps)）。
   `run`：某個 target 失敗或無法連線。
+  `apply`/`plan`/`run`：第一次 Ctrl-C 取消了執行（[Ctrl-C](#ctrl-c)）；第二次則讓 anvil 因 SIGINT 結束，shell 回報為 130。
   `inventory`/`config`/`secret`：編輯器以非零結束（中止）、檔案寫入失敗，或 secret store 失敗、被鎖住或其密語提示被取消。
 - **2**：錯誤的旗標或引數（包括不以 `.toml` 結尾的 `--inventory` 或 `--config` 路徑）、未知的 `--target`、
   無效、無法讀取或模稜兩可的檔案、沒有 `$HOME`、找不到編輯器、三次嘗試後仍無效的緩衝區，或大於 1 MiB 的 secret。
@@ -912,6 +967,8 @@ anvil 以 argv 陣列執行系統的 `ssh`，絕不使用 shell 字串，因此 
   互動式重試沒有 anvil 逾時，因為有人正在輸入。
   沒有終端機時，target 以 `key auth failed; run interactively for password sign-in` 失敗。
   被拒絕的互動式嘗試回報 `authentication failed after the interactive attempt`。
+- **master 依序開啟。** 使用 `--parallel` 時，master 存活的 target 立刻執行；需要新 master 的 target
+  要等正在進行的開啟完成後才開啟自己的，且同一時間只有一個互動式重試會提示。Ctrl-C 之後，不會再有 step 開啟新的 master；`[[files]]` 的清理仍可能開啟。
 - **絕不自動接受 host key。**
   未知或已變更的 host key 會讓 target 以 ``host key unknown or changed; run `ssh <host>` once to verify the fingerprint`` 失敗。
 - **帶 sudo 密碼的套件 step** 改以 `-tt` 用戶端執行；見 [輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)。
@@ -927,6 +984,7 @@ anvil 以 argv 陣列執行系統的 `ssh`，絕不使用 shell 字串，因此 
 
 日誌以 `LEVEL target: message` 的形式寫到 stderr（在 `anvil tui` 中則改寫到其 [Log 窗格](tui.zh-TW.md)）；
 stdout 上的 `--json` 輸出維持單一文件。預設只顯示錯誤；`-v` 加上警告、`-vv` info、`-vvv` debug，
-其中包含每次 `ssh` 與編輯器啟動的 argv。致命錯誤是非零結束前的最後一行。
+其中包含每次 `ssh` 與編輯器啟動的 argv。使用 `--parallel` 時，同時執行的 target 的日誌行會交錯，
+每行完整且標出它的 target（[平行執行](#平行執行)）。致命錯誤是非零結束前的最後一行。
 訊息中的控制字元（ssh 或 host 的文字）顯示為 `\x1b` 式跳脫；`doctor` 給人看的輸出也會跳脫它們。
 secret 值、探測輸出與檔案內容在任何層級都絕不記錄。沒有日誌檔案，也沒有 `RUST_LOG`。

@@ -23,12 +23,15 @@ system OpenSSH client.
   on macOS. It changes only what differs, so a rerun prints `unchanged service NAME`.
 - **`anvil plan`** shows the steps apply would run on each target and runs none of them; `--json` marks the document
   `"executed": false`.
-- **`anvil run FILE`** (or `-` for stdin) runs one ad-hoc POSIX sh script on every target, one after another, with
-  apply's output, `--json` and exit codes. It loads no config, asks for no confirmation and types no sudo password.
+- **`anvil run FILE`** (or `-` for stdin) runs one ad-hoc POSIX sh script on every target, with apply's output,
+  `--json` and exit codes. It loads no config, asks for no confirmation and types no sudo password.
 - **Plugin steps**: a step can name a plugin, a program on the controller pinned by its path and sha256, that reads
   the target's facts as JSON and replies with the sh script to run there. It gets a cleared environment and no secrets.
 - **Secrets** live in the macOS keychain, an age file or a sops file, and `anvil secret --migrate` moves them between
   backends.
+- **`--parallel N`** lets apply, plan and run work on up to N targets at once (1..=32, default 1). Output and
+  `--json` stay in inventory order, and Ctrl-C lets the running steps finish; a second Ctrl-C stops at once
+  ([Running in parallel](docs/cli.md#running-in-parallel)).
 - **Terminal UI**: `anvil tui` runs every command in one screen and keeps the session's results for browsing.
 - **`anvil update`** replaces the binary with the latest release after checking its `.sha256` and its `.minisig`
   signature against a public key compiled into anvil, and keeps the previous binary as `anvil.prev`. The keys are
@@ -61,6 +64,7 @@ anvil doctor               # local checks + every target's facts and reachabilit
 anvil plan                 # the steps apply would run on every target, running none
 anvil apply                # install packages, copy files, set services, run the steps
 anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
+anvil --parallel 4 apply   # apply on up to 4 targets at once
 anvil tui                  # all of the above in one terminal UI
 anvil update --check       # is a newer release out? `anvil update` installs it
 ```
