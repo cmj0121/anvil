@@ -1,0 +1,7 @@
+[[services]]
+name = "sshd"
+state = "started"
+
+[[services]]
+name = "ss hd"
+state = "started"

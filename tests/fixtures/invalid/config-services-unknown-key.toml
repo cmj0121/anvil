@@ -1,0 +1,5 @@
+[[services]]
+name = "sshd"
+state = "started"
+enabled = true
+restart = true

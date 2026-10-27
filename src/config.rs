@@ -1,8 +1,9 @@
 //! The config document: `[anvil]` preferences, the `[secrets]` backend, the
-//! `[packages]` to install, the pinned `[plugins]`, the `[[files]]` to copy
-//! and the `[[steps]]` that `anvil apply` runs.
+//! `[packages]` to install, the pinned `[plugins]`, the `[[files]]` to copy,
+//! the `[[services]]` to bring to a state and the `[[steps]]` that
+//! `anvil apply` runs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,12 @@ pub const MAX_FILES: usize = 64;
 /// Longest `[[files]]` dest, in bytes: Linux's `PATH_MAX`.
 const MAX_DEST_BYTES: usize = 4096;
 
+/// Most `[[services]]` entries in one config.
+pub const MAX_SERVICES: usize = 64;
+
+/// Longest service name, in bytes: systemd's unit name limit.
+const MAX_SERVICE_NAME_BYTES: usize = 255;
+
 /// Whether this build can use the keychain.
 const MACOS: bool = cfg!(target_os = "macos");
 
@@ -46,6 +53,8 @@ pub struct Config {
     pub plugins: BTreeMap<String, Plugin>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<FileEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<ServiceEntry>,
     /// The loaded file, canonicalized by [`Config::load`]; `None` for defaults.
     #[serde(skip)]
     pub path: Option<PathBuf>,
@@ -60,6 +69,7 @@ impl Default for Config {
             packages: None,
             plugins: BTreeMap::new(),
             files: Vec::new(),
+            services: Vec::new(),
             path: None,
             steps: vec![Step::script("hostname")],
         }
@@ -265,6 +275,43 @@ impl std::fmt::Debug for FileEntry {
     }
 }
 
+/// A `[[services]]` entry: `name` brought to `state`, and to `enabled` when
+/// set, on each target whose tags and facts all match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceEntry {
+    pub name: String,
+    /// Required; `Option<String>` so a missing or unknown state gets its own
+    /// message from [`Config::validate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// `None` leaves enablement alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facts: BTreeMap<String, String>,
+}
+
+/// The state a `[[services]]` entry asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceState {
+    Started,
+    Stopped,
+}
+
+impl ServiceEntry {
+    /// The validated state; `None` only before `validate`.
+    pub fn state(&self) -> Option<ServiceState> {
+        match self.state.as_deref()? {
+            "started" => Some(ServiceState::Started),
+            "stopped" => Some(ServiceState::Stopped),
+            _ => None,
+        }
+    }
+}
+
 /// A `[[files]]` mode as written: a quoted string, or the number an unquoted
 /// one parses as.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -365,6 +412,8 @@ impl Config {
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_files()
             .map_err(|message| DocumentError::invalid(path, message))?;
+        self.check_services()
+            .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_steps()
             .map_err(|message| DocumentError::invalid(path, message))
     }
@@ -389,19 +438,50 @@ impl Config {
                 )
             })?;
             check_mode(entry.mode.as_ref()).map_err(|why| format!("files[{i}].mode{why}"))?;
-            for (j, tag) in entry.tags.iter().enumerate() {
-                if !inventory::is_word(tag) {
+            check_selector(&format!("files[{i}]"), &entry.tags, &entry.facts)?;
+        }
+        Ok(())
+    }
+
+    /// The `[[services]]` syntax rules; whether a target has the service is
+    /// asked only when `apply` runs.
+    fn check_services(&self) -> Result<(), String> {
+        if self.services.len() > MAX_SERVICES {
+            return Err(format!(
+                "services: {} entries exceeds the {MAX_SERVICES} entry limit",
+                self.services.len()
+            ));
+        }
+        let mut seen: Vec<(&str, BTreeSet<&String>, &BTreeMap<String, String>)> = Vec::new();
+        for (i, entry) in self.services.iter().enumerate() {
+            check_service_name(&entry.name).map_err(|why| {
+                format!(
+                    "services[{i}].name `{}`: {why}",
+                    secret::shown_name(&entry.name)
+                )
+            })?;
+            match (&entry.state, entry.state()) {
+                (None, _) => return Err(format!("services[{i}].state: required")),
+                (Some(state), None) => {
                     return Err(format!(
-                        "files[{i}].tags[{j}] `{}`: must match [A-Za-z0-9_-]+",
-                        secret::shown_name(tag)
+                        "services[{i}].state `{}`: must be started or stopped",
+                        secret::shown_name(state)
                     ));
                 }
+                (Some(_), Some(_)) => {}
             }
-            for (key, value) in &entry.facts {
-                check_fact(key, value).map_err(|why| {
-                    format!("files[{i}].facts.{}: {why}", secret::shown_name(key))
-                })?;
+            check_selector(&format!("services[{i}]"), &entry.tags, &entry.facts)?;
+            let key = (
+                entry.name.as_str(),
+                entry.tags.iter().collect(),
+                &entry.facts,
+            );
+            if let Some(earlier) = seen.iter().position(|other| *other == key) {
+                return Err(format!(
+                    "services[{i}]: same name, tags and facts as services[{earlier}]"
+                ));
             }
+            seen.push(key);
         }
         Ok(())
     }
@@ -662,12 +742,72 @@ fn check_mode(mode: Option<&ModeValue>) -> Result<(), String> {
     Ok(())
 }
 
+/// The systemd unit types that are not services; a name ending in one would
+/// have `systemctl` start or enable that unit instead.
+const NON_SERVICE_UNITS: [&str; 7] = [
+    ".target",
+    ".mount",
+    ".automount",
+    ".swap",
+    ".slice",
+    ".scope",
+    ".device",
+];
+
+/// A service name: at most systemd's unit name limit, in a charset that
+/// needs no shell quoting, not read as an option or a hidden file, and not
+/// a systemd unit of another type.
+fn check_service_name(name: &str) -> Result<(), String> {
+    if name.len() > MAX_SERVICE_NAME_BYTES {
+        return Err(format!(
+            "{} bytes exceeds the {MAX_SERVICE_NAME_BYTES} byte limit",
+            name.len()
+        ));
+    }
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ":_@.-".contains(c))
+    {
+        return Err("must match [A-Za-z0-9:_@.-]+".to_string());
+    }
+    if name.starts_with(['-', '.']) {
+        return Err("must not start with - or .".to_string());
+    }
+    if let Some(suffix) = NON_SERVICE_UNITS.iter().find(|&&s| name.ends_with(s)) {
+        return Err(format!("must name a service, not a {suffix}"));
+    }
+    Ok(())
+}
+
+/// The tags and facts that select the targets of a `[[files]]` or
+/// `[[services]]` entry; `prefix` names the entry, as `files[0]`.
+fn check_selector(
+    prefix: &str,
+    tags: &[String],
+    facts: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    for (j, tag) in tags.iter().enumerate() {
+        if !inventory::is_word(tag) {
+            return Err(format!(
+                "{prefix}.tags[{j}] `{}`: must match [A-Za-z0-9_-]+",
+                secret::shown_name(tag)
+            ));
+        }
+    }
+    for (key, value) in facts {
+        check_fact(key, value)
+            .map_err(|why| format!("{prefix}.facts.{}: {why}", secret::shown_name(key)))?;
+    }
+    Ok(())
+}
+
 /// Whether `mode` is 3 or 4 octal digits.
 pub(crate) fn is_mode(mode: &str) -> bool {
     (3..=4).contains(&mode.len()) && mode.bytes().all(|b| matches!(b, b'0'..=b'7'))
 }
 
-/// A `[[files]]` fact: a key the probe reports, and a value it could report.
+/// A selector fact: a key the probe reports, and a value it could report.
 fn check_fact(key: &str, value: &str) -> Result<(), String> {
     if !facts::KEYS.contains(&key) {
         return Err(format!(
@@ -1152,6 +1292,321 @@ mod tests {
             ("invalid/config-files-unknown-key.toml", "owner", "line 5"),
             ("invalid/config-files-sudo-not-bool.toml", "sudo", "line 5"),
             ("invalid/config-files-unknown-key.yaml", "owner", "line 5"),
+        ] {
+            let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                matches!(err, DocumentError::Parse { .. }),
+                "{file}: {message}"
+            );
+            assert!(message.contains(file), "{file}: {message}");
+            assert!(message.contains(key), "{file}: {message}");
+            assert!(message.contains(line), "{file}: {message}");
+        }
+    }
+
+    fn service_entry(keys: &str) -> Config {
+        parse(&format!("[[services]]\n{keys}\n"))
+    }
+
+    const SERVICE: &str = "name = \"sshd\"\nstate = \"started\"";
+
+    #[test]
+    fn a_services_entry_parses_in_both_formats() {
+        for (enabled, want) in [
+            ("", None),
+            ("enabled = true", Some(true)),
+            ("enabled = false", Some(false)),
+        ] {
+            let config = service_entry(&format!(
+                "name = \"sshd\"\nstate = \"stopped\"\n{enabled}\ntags = [\"web\", \"local\"]\n\
+                 facts = {{ distro = \"arch\" }}"
+            ));
+            assert_eq!(config.check_services(), Ok(()), "{enabled}");
+            let [entry] = config.services.as_slice() else {
+                panic!("{:?}", config.services);
+            };
+            assert_eq!(entry.name, "sshd");
+            assert_eq!(entry.state(), Some(ServiceState::Stopped));
+            assert_eq!(entry.enabled, want);
+            assert_eq!(entry.tags, ["web", "local"]);
+            assert_eq!(entry.facts["distro"], "arch");
+
+            for format in [Format::Toml, Format::Yaml] {
+                let text = document::to_string(&config, format).unwrap();
+                assert_eq!(text.contains("enabled"), want.is_some(), "{text}");
+                let back: Config = document::from_str(&text, format).unwrap();
+                assert_eq!(back, config);
+            }
+        }
+        let yaml = "services:\n  - name: sshd\n    state: started\n    enabled: true\n";
+        let config: Config = document::from_str(yaml, Format::Yaml).unwrap();
+        assert_eq!(config.check_services(), Ok(()));
+        assert_eq!(config.services[0].state(), Some(ServiceState::Started));
+        assert_eq!(config.services[0].enabled, Some(true));
+        assert!(
+            !document::to_string(&Config::default(), Format::Toml)
+                .unwrap()
+                .contains("services")
+        );
+    }
+
+    #[test]
+    fn service_names_within_the_rules_pass() {
+        let longest = "a".repeat(MAX_SERVICE_NAME_BYTES);
+        for name in [
+            "sshd",
+            "sshd.service",
+            "getty@tty1.service",
+            "com.example.agent",
+            "a:b_c-d",
+            "9",
+            longest.as_str(),
+        ] {
+            let config = service_entry(&format!("name = {name:?}\nstate = \"started\""));
+            assert_eq!(config.check_services(), Ok(()), "{name}");
+        }
+    }
+
+    #[test]
+    fn services_refusals_name_the_entry_and_the_key() {
+        let long_name = "a".repeat(MAX_SERVICE_NAME_BYTES + 1);
+        let long_fact = "a".repeat(257);
+        for (keys, message) in [
+            (
+                format!("name = \"{long_name}\"\nstate = \"started\""),
+                format!(
+                    "services[0].name `{}…`: 256 bytes exceeds the 255 byte limit",
+                    "a".repeat(64)
+                ),
+            ),
+            (
+                "name = \"ss hd\"\nstate = \"started\"".to_string(),
+                "services[0].name `ss hd`: must match [A-Za-z0-9:_@.-]+".to_string(),
+            ),
+            (
+                "name = \"\"\nstate = \"started\"".to_string(),
+                "services[0].name ``: must match [A-Za-z0-9:_@.-]+".to_string(),
+            ),
+            (
+                "name = \"$(id)\"\nstate = \"started\"".to_string(),
+                "services[0].name `$(id)`: must match [A-Za-z0-9:_@.-]+".to_string(),
+            ),
+            (
+                "name = \"ssh/d\"\nstate = \"started\"".to_string(),
+                "services[0].name `ssh/d`: must match [A-Za-z0-9:_@.-]+".to_string(),
+            ),
+            (
+                "name = \"sshd\\u001b[2J\"\nstate = \"started\"".to_string(),
+                "services[0].name `sshd\\x1b[2J`: must match [A-Za-z0-9:_@.-]+".to_string(),
+            ),
+            (
+                "name = \"sshé\"\nstate = \"started\"".to_string(),
+                "services[0].name `sshé`: must match [A-Za-z0-9:_@.-]+".to_string(),
+            ),
+            (
+                "name = \"-sshd\"\nstate = \"started\"".to_string(),
+                "services[0].name `-sshd`: must not start with - or .".to_string(),
+            ),
+            (
+                "name = \".sshd\"\nstate = \"started\"".to_string(),
+                "services[0].name `.sshd`: must not start with - or .".to_string(),
+            ),
+            (
+                "name = \"multi-user.target\"\nstate = \"started\"".to_string(),
+                "services[0].name `multi-user.target`: must name a service, not a .target".to_string(),
+            ),
+            (
+                "name = \"home.mount\"\nstate = \"started\"".to_string(),
+                "services[0].name `home.mount`: must name a service, not a .mount".to_string(),
+            ),
+            (
+                "name = \"proc-sys-fs-binfmt_misc.automount\"\nstate = \"started\"".to_string(),
+                "services[0].name `proc-sys-fs-binfmt_misc.automount`: must name a service, not a .automount".to_string(),
+            ),
+            (
+                "name = \"dev-sda2.swap\"\nstate = \"started\"".to_string(),
+                "services[0].name `dev-sda2.swap`: must name a service, not a .swap".to_string(),
+            ),
+            (
+                "name = \"user.slice\"\nstate = \"started\"".to_string(),
+                "services[0].name `user.slice`: must name a service, not a .slice".to_string(),
+            ),
+            (
+                "name = \"session-1.scope\"\nstate = \"started\"".to_string(),
+                "services[0].name `session-1.scope`: must name a service, not a .scope".to_string(),
+            ),
+            (
+                "name = \"dev-sda.device\"\nstate = \"started\"".to_string(),
+                "services[0].name `dev-sda.device`: must name a service, not a .device".to_string(),
+            ),
+            (
+                "name = \"sshd\"".to_string(),
+                "services[0].state: required".to_string(),
+            ),
+            (
+                "name = \"sshd\"\nstate = \"running\"".to_string(),
+                "services[0].state `running`: must be started or stopped".to_string(),
+            ),
+            (
+                "name = \"sshd\"\nstate = \"Started\"".to_string(),
+                "services[0].state `Started`: must be started or stopped".to_string(),
+            ),
+            (
+                "name = \"sshd\"\nstate = \"up\\n\"".to_string(),
+                "services[0].state `up\\n`: must be started or stopped".to_string(),
+            ),
+            (
+                format!("{SERVICE}\ntags = [\"web\", \"bad tag\"]"),
+                "services[0].tags[1] `bad tag`: must match [A-Za-z0-9_-]+".to_string(),
+            ),
+            (
+                format!("{SERVICE}\nfacts = {{ distribution = \"arch\" }}"),
+                "services[0].facts.distribution: unknown fact; must be one of hostname, os, \
+                 kernel, arch, distro, distro_version, user, shell, pkg, sudo"
+                    .to_string(),
+            ),
+            (
+                format!("{SERVICE}\nfacts = {{ distro = \"\" }}"),
+                "services[0].facts.distro: is empty".to_string(),
+            ),
+            (
+                format!("{SERVICE}\nfacts = {{ distro = \"{long_fact}\" }}"),
+                "services[0].facts.distro: 257 bytes exceeds the 256 byte limit".to_string(),
+            ),
+            (
+                format!("{SERVICE}\nfacts = {{ distro = \"arch\\n\" }}"),
+                "services[0].facts.distro: contains a control character".to_string(),
+            ),
+        ] {
+            assert_eq!(
+                service_entry(&keys).check_services().unwrap_err(),
+                message,
+                "{keys}"
+            );
+        }
+
+        // The index is the entry's, after a valid one.
+        let config = parse(&format!(
+            "[[services]]\n{SERVICE}\n\n[[services]]\nname = \"-x\"\nstate = \"started\"\n"
+        ));
+        assert_eq!(
+            config.check_services().unwrap_err(),
+            "services[1].name `-x`: must not start with - or ."
+        );
+    }
+
+    #[test]
+    fn more_than_64_services_entries_are_refused() {
+        let table = |i: usize| format!("[[services]]\nname = \"s{i}\"\nstate = \"started\"\n");
+        let many = |n: usize| (0..n).map(table).collect::<String>();
+        assert_eq!(parse(&many(MAX_SERVICES)).check_services(), Ok(()));
+        assert_eq!(
+            parse(&many(MAX_SERVICES + 1)).check_services().unwrap_err(),
+            "services: 65 entries exceeds the 64 entry limit"
+        );
+    }
+
+    #[test]
+    fn a_service_repeated_with_the_same_selector_is_refused() {
+        let services = |entries: &[&str]| {
+            parse(
+                &entries
+                    .iter()
+                    .map(|keys| format!("[[services]]\nname = \"sshd\"\n{keys}\n"))
+                    .collect::<String>(),
+            )
+        };
+        // Tags compare as a set; state and enabled are not part of the key.
+        let config = services(&[
+            "state = \"started\"\ntags = [\"a\", \"b\"]\nfacts = { distro = \"arch\" }",
+            "state = \"started\"\ntags = [\"c\"]",
+            "state = \"stopped\"\nenabled = false\ntags = [\"b\", \"a\"]\nfacts = { distro = \"arch\" }",
+        ]);
+        assert_eq!(
+            config.check_services().unwrap_err(),
+            "services[2]: same name, tags and facts as services[0]"
+        );
+        assert_eq!(
+            services(&["state = \"started\"", "state = \"stopped\""])
+                .check_services()
+                .unwrap_err(),
+            "services[1]: same name, tags and facts as services[0]"
+        );
+        // A different name, tag or fact is another entry, run in config order.
+        for other in [
+            "state = \"stopped\"\ntags = [\"a\"]",
+            "state = \"stopped\"\nfacts = { distro = \"arch\" }",
+            "state = \"stopped\"\ntags = [\"a\", \"b\"]\nfacts = { distro = \"debian\" }",
+        ] {
+            let config = services(&[
+                "state = \"started\"\ntags = [\"a\", \"b\"]\nfacts = { distro = \"arch\" }",
+                other,
+            ]);
+            assert_eq!(config.check_services(), Ok(()), "{other}");
+        }
+        let config = parse(&format!(
+            "[[services]]\n{SERVICE}\n\n[[services]]\nname = \"cron\"\nstate = \"started\"\n"
+        ));
+        assert_eq!(config.check_services(), Ok(()));
+    }
+
+    #[test]
+    fn services_fixtures_are_refused_naming_the_entry_and_the_key() {
+        for (file, field) in [
+            (
+                "invalid/config-services-bad-name.toml",
+                "services[1].name `ss hd`: must match [A-Za-z0-9:_@.-]+",
+            ),
+            (
+                "invalid/config-services-not-a-service.toml",
+                "services[1].name `multi-user.target`: must name a service, not a .target",
+            ),
+            (
+                "invalid/config-services-bad-state.yaml",
+                "services[0].state `running`: must be started or stopped",
+            ),
+            (
+                "invalid/config-services-unknown-fact.yaml",
+                "services[0].facts.distribution: unknown fact",
+            ),
+        ] {
+            let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                matches!(err, DocumentError::Invalid { .. }),
+                "{file}: {message}"
+            );
+            assert!(message.contains(file), "{file}: {message}");
+            assert!(message.contains(field), "{file}: {message}");
+        }
+        // Serde refuses these while parsing; its message names the key.
+        for (file, key, line) in [
+            (
+                "invalid/config-services-unknown-key.toml",
+                "restart",
+                "line 5",
+            ),
+            (
+                "invalid/config-services-unknown-key.yaml",
+                "restart",
+                "line 5",
+            ),
+            (
+                "invalid/config-services-enabled-not-bool.toml",
+                "enabled",
+                "line 4",
+            ),
+            (
+                "invalid/config-services-missing-name.toml",
+                "missing field `name`",
+                "line 5",
+            ),
+            (
+                "invalid/config-services-name-not-string.toml",
+                "name = 1",
+                "line 3",
+            ),
         ] {
             let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
             let message = err.to_string();

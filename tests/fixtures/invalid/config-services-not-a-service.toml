@@ -1,0 +1,7 @@
+[[services]]
+name = "sshd.service"
+state = "started"
+
+[[services]]
+name = "multi-user.target"
+state = "started"
