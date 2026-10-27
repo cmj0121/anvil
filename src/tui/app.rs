@@ -15,6 +15,7 @@ use crate::document::{Format, MAX_BYTES};
 use crate::inventory::{Inventory, LOCAL, Sel, Target, UnknownSel};
 use crate::options::Options;
 use crate::secret::{self, BackendKind};
+use crate::update::{Check, Status};
 use crate::{apply, doctor, plan};
 
 use super::ui;
@@ -76,6 +77,11 @@ pub struct App {
     pub quit: bool,
     /// `x`'s script as last edited, for this session only; empty at first.
     pub last_script: String,
+    /// The version `u` installed; `u` then only says to restart.
+    pub updated: Option<String>,
+    /// An available version whose check came back under another overlay:
+    /// the next `u` asks to install it without checking again.
+    pub available: Option<String>,
 }
 
 pub struct TargetRow {
@@ -118,6 +124,8 @@ pub enum RunKind {
     Plan,
     /// `x`: the session's last script.
     Run,
+    /// `u`: the check, then the update it confirmed.
+    Update,
 }
 
 impl RunKind {
@@ -127,18 +135,21 @@ impl RunKind {
             RunKind::Apply => "apply",
             RunKind::Plan => "plan",
             RunKind::Run => "run",
+            RunKind::Update => "update",
         }
     }
 }
 
 /// What a worker runs: a [`RunKind`] and what it needs, which for a run is
-/// its script.
+/// its script and for an update the version confirmed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Job {
     Doctor,
     Apply,
     Plan,
     Run(String),
+    UpdateCheck,
+    Update(String),
 }
 
 impl Job {
@@ -148,6 +159,7 @@ impl Job {
             Job::Apply => RunKind::Apply,
             Job::Plan => RunKind::Plan,
             Job::Run(_) => RunKind::Run,
+            Job::UpdateCheck | Job::Update(_) => RunKind::Update,
         }
     }
 }
@@ -268,6 +280,10 @@ pub enum Overlay {
     Confirm {
         targets: Vec<String>,
     },
+    /// `u`'s question before it replaces anvil with release `version`.
+    ConfirmUpdate {
+        version: String,
+    },
 }
 
 pub enum Msg {
@@ -286,6 +302,10 @@ pub enum Msg {
     Interrupted,
     /// A worker's handoff: the main loop leaves the screen and acks (D6).
     Suspend(Sender<()>),
+    /// `u`'s check, in place of `Finished`.
+    UpdateChecked(Result<Check, String>),
+    /// The version a confirmed `u` installed, in place of `Finished`.
+    Updated(Result<String, String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +408,8 @@ impl App {
             notice,
             quit: false,
             last_script: String::new(),
+            updated: None,
+            available: None,
         };
         app.set_steps(steps);
         app
@@ -418,9 +440,16 @@ impl App {
             KeyCode::Char('d') => return self.start(Job::Doctor),
             KeyCode::Char('a') => return self.start(Job::Apply),
             KeyCode::Char('p') => return self.start(Job::Plan),
-            KeyCode::Char('i' | 'c' | 's' | 'm' | 'o' | 'x') if self.running.is_some() => {
+            KeyCode::Char('u') if self.updated.is_some() => {
+                self.notice = self.updated.as_deref().map(restart_notice);
+            }
+            KeyCode::Char('i' | 'c' | 's' | 'm' | 'o' | 'x' | 'u') if self.running.is_some() => {
                 self.notice = self.busy();
             }
+            KeyCode::Char('u') => match self.available.take() {
+                Some(version) => self.overlay = Some(Overlay::ConfirmUpdate { version }),
+                None => return self.start(Job::UpdateCheck),
+            },
             KeyCode::Char('i') => return vec![Effect::Edit(EditKind::Inventory), Effect::Redraw],
             KeyCode::Char('c') => return vec![Effect::Edit(EditKind::Config), Effect::Redraw],
             KeyCode::Char('x') => return vec![Effect::EditScript, Effect::Redraw],
@@ -483,18 +512,23 @@ impl App {
 
     /// A key under `overlay`, which was taken out of `self.overlay`: it is
     /// put back unless the key closes it. Esc closes any overlay; Enter
-    /// confirms the Input, Migrate, Options and Confirm overlays, and closes
-    /// Targets as `t` does: its selection changes as Space is pressed.
+    /// confirms the Input, Migrate, Options and both Confirm overlays, and
+    /// closes Targets as `t` does: its selection changes as Space is pressed.
     fn on_overlay_key(&mut self, mut overlay: Overlay, key: KeyEvent) -> Vec<Effect> {
         let mut effects = vec![Effect::Redraw];
         let keep = match (&mut overlay, key.code) {
             (_, KeyCode::Esc)
             | (Overlay::Help, KeyCode::Char('?'))
-            | (Overlay::Confirm { .. }, KeyCode::Char('n')) => false,
+            | (Overlay::Confirm { .. } | Overlay::ConfirmUpdate { .. }, KeyCode::Char('n')) => {
+                false
+            }
             (Overlay::Confirm { .. }, KeyCode::Enter | KeyCode::Char('y')) => {
                 return self.start(Job::Run(self.last_script.clone()));
             }
-            (Overlay::Help | Overlay::Confirm { .. }, _) => {
+            (Overlay::ConfirmUpdate { version }, KeyCode::Enter | KeyCode::Char('y')) => {
+                return self.start(Job::Update(std::mem::take(version)));
+            }
+            (Overlay::Help | Overlay::Confirm { .. } | Overlay::ConfirmUpdate { .. }, _) => {
                 self.overlay = Some(overlay);
                 return Vec::new();
             }
@@ -748,6 +782,46 @@ impl App {
             }
             // Served by the main loop before it reaches the app.
             Msg::Suspend(_) => return Vec::new(),
+            Msg::UpdateChecked(checked) => {
+                self.running = None;
+                match checked {
+                    Ok(check) => match check.status {
+                        // A key meant for the open overlay must not answer it.
+                        Status::Available if self.overlay.is_some() => {
+                            self.notice = Some(format!(
+                                "anvil {} is available; press u to update",
+                                check.latest
+                            ));
+                            self.available = Some(check.latest);
+                        }
+                        Status::Available => {
+                            self.overlay = Some(Overlay::ConfirmUpdate {
+                                version: check.latest,
+                            });
+                        }
+                        Status::Current => {
+                            self.notice = Some(format!("anvil {} is up to date", check.current));
+                        }
+                        Status::Ahead => {
+                            self.notice = Some(format!(
+                                "anvil {} is ahead of the latest release {}",
+                                check.current, check.latest
+                            ));
+                        }
+                    },
+                    Err(err) => self.notice = Some(err),
+                }
+            }
+            Msg::Updated(updated) => {
+                self.running = None;
+                match updated {
+                    Ok(version) => {
+                        self.notice = Some(restart_notice(&version));
+                        self.updated = Some(version);
+                    }
+                    Err(err) => self.notice = Some(err),
+                }
+            }
         }
         vec![Effect::Redraw]
     }
@@ -760,49 +834,61 @@ impl App {
     }
 
     /// Starts a run as a new, shown result, unless one is going already.
+    /// An update has no result: the status bar shows it going.
     fn start(&mut self, job: Job) -> Vec<Effect> {
         if self.running.is_some() {
             self.notice = self.busy();
             return vec![Effect::Redraw];
         }
         let kind = job.kind();
+        let current = match &job {
+            Job::UpdateCheck => Some("checking for an update".to_owned()),
+            Job::Update(version) => Some(format!("updating anvil to {version}")),
+            _ => None,
+        };
         self.running = Some(Running {
             kind,
-            current: None,
+            current,
             cancel: Arc::new(AtomicBool::new(false)),
             tick: 0,
         });
-        self.results.push(match kind {
-            RunKind::Doctor => RunResult::Doctor {
+        let result = match kind {
+            RunKind::Update => None,
+            RunKind::Doctor => Some(RunResult::Doctor {
                 local: None,
                 targets: Vec::new(),
                 ok: None,
                 error: None,
-            },
-            RunKind::Apply | RunKind::Run => RunResult::Apply {
+            }),
+            RunKind::Apply | RunKind::Run => Some(RunResult::Apply {
                 kind,
                 steps: Vec::new(),
                 targets: Vec::new(),
                 ok: None,
                 error: None,
-            },
-            RunKind::Plan => RunResult::Plan {
+            }),
+            RunKind::Plan => Some(RunResult::Plan {
                 targets: Vec::new(),
                 ok: None,
                 error: None,
-            },
-        });
-        self.show(Some(self.results.len() - 1));
+            }),
+        };
+        if let Some(result) = result {
+            self.results.push(result);
+            self.show(Some(self.results.len() - 1));
+        }
         vec![Effect::Spawn(job), Effect::Redraw]
     }
 
-    /// Why a key is refused while a run is going.
+    /// Why a key is refused while a run is going; Esc is offered only for
+    /// a run it cancels.
     fn busy(&self) -> Option<String> {
         let running = self.running.as_ref()?;
-        Some(format!(
-            "busy: {} is running (Esc cancels)",
-            running.kind.as_str()
-        ))
+        let hint = match running.kind {
+            RunKind::Apply | RunKind::Plan | RunKind::Run => " (Esc cancels)",
+            RunKind::Doctor | RunKind::Update => "",
+        };
+        Some(format!("busy: {} is running{hint}", running.kind.as_str()))
     }
 
     /// Sets the cancel flag: apply and run stop before their next target or
@@ -818,6 +904,7 @@ impl App {
             }
             RunKind::Plan => "cancelling: the running target finishes first".to_owned(),
             RunKind::Doctor => "doctor cannot be cancelled; it ends with its probes".to_owned(),
+            RunKind::Update => "update cannot be cancelled; it ends on its own".to_owned(),
         });
     }
 
@@ -870,8 +957,12 @@ impl App {
 
     /// Ends the run: the result's `ok` is settled, `error` recorded, and a
     /// notice about the run cleared, so the key hints come back.
+    /// An update's only outcome is the notice.
     fn finish(&mut self, error: Option<String>) {
-        self.running = None;
+        if self.running.take().map(|r| r.kind) == Some(RunKind::Update) {
+            self.notice = error;
+            return;
+        }
         self.notice = None;
         match self.results.last_mut() {
             Some(RunResult::Doctor {
@@ -1039,6 +1130,11 @@ impl App {
     }
 }
 
+/// What the status bar says once `u` installed `version`, until restart.
+pub fn restart_notice(version: &str) -> String {
+    format!("updated anvil to {version}; restart anvil to use it")
+}
+
 /// `run on N targets: a, b, c?`, the names after [`CONFIRM_NAMES`] cut to `…`.
 pub fn confirm_prompt(names: &[String]) -> String {
     let noun = if names.len() == 1 {
@@ -1137,6 +1233,10 @@ pub mod tests {
             ssh_program: None,
             #[cfg(debug_assertions)]
             ssh_home: None,
+            #[cfg(debug_assertions)]
+            release_url: None,
+            #[cfg(debug_assertions)]
+            release_keys: Vec::new(),
         }
     }
 
@@ -1666,12 +1766,9 @@ pub mod tests {
     fn a_second_run_and_the_editor_keys_are_refused_while_running() {
         let mut app = app();
         press(&mut app, &[KeyCode::Char('d')]);
-        for c in ['d', 'a', 'i', 'c', 's', 'm', 'o', 'x'] {
+        for c in ['d', 'a', 'i', 'c', 's', 'm', 'o', 'x', 'u'] {
             assert_eq!(app.on_key(key(KeyCode::Char(c))), [Effect::Redraw], "{c}");
-            assert_eq!(
-                app.notice.as_deref(),
-                Some("busy: doctor is running (Esc cancels)")
-            );
+            assert_eq!(app.notice.as_deref(), Some("busy: doctor is running"));
         }
         assert_eq!(app.results.len(), 1);
         // The notice goes with the next key.
@@ -1901,6 +1998,180 @@ pub mod tests {
                 ..
             })
         ));
+    }
+
+    fn check(status: Status) -> Check {
+        Check {
+            current: "0.1.0".to_owned(),
+            latest: "0.2.0".to_owned(),
+            asset: "anvil-v0.2.0-aarch64-apple-darwin.tar.gz".to_owned(),
+            status,
+        }
+    }
+
+    /// `u` and its check arriving with `checked`.
+    fn checked(app: &mut App, checked: Result<Check, String>) {
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('u'))),
+            [Effect::Spawn(Job::UpdateCheck), Effect::Redraw]
+        );
+        assert_eq!(app.running.as_ref().unwrap().kind, RunKind::Update);
+        app.on_msg(Msg::UpdateChecked(checked));
+        assert!(app.running.is_none());
+    }
+
+    fn confirming_update(app: &App) -> Option<&str> {
+        match &app.overlay {
+            Some(Overlay::ConfirmUpdate { version }) => Some(version),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn u_checks_then_y_or_enter_updates_and_n_or_esc_cancels() {
+        for yes in [KeyCode::Char('y'), KeyCode::Enter] {
+            let mut app = app();
+            checked(&mut app, Ok(check(Status::Available)));
+            assert_eq!(confirming_update(&app), Some("0.2.0"));
+            assert_eq!(
+                app.on_key(key(yes)),
+                [
+                    Effect::Spawn(Job::Update("0.2.0".to_owned())),
+                    Effect::Redraw
+                ],
+                "{yes:?}"
+            );
+            assert!(app.overlay.is_none());
+            assert_eq!(app.running.as_ref().unwrap().kind, RunKind::Update);
+            assert!(app.results.is_empty(), "an update is no result");
+        }
+        for no in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut app = app();
+            checked(&mut app, Ok(check(Status::Available)));
+            assert_eq!(app.on_key(key(no)), [Effect::Redraw], "{no:?}");
+            assert!(app.overlay.is_none() && app.running.is_none());
+            assert!(app.results.is_empty() && app.updated.is_none());
+        }
+        // Any other key leaves the question up.
+        let mut app = app();
+        checked(&mut app, Ok(check(Status::Available)));
+        assert!(app.on_key(key(KeyCode::Char('a'))).is_empty());
+        assert!(confirming_update(&app).is_some() && app.running.is_none());
+    }
+
+    #[test]
+    fn an_available_update_under_another_overlay_waits_for_the_next_u() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('u'), KeyCode::Char('?')]);
+        app.on_msg(Msg::UpdateChecked(Ok(check(Status::Available))));
+        assert!(matches!(app.overlay, Some(Overlay::Help)), "help stays up");
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("anvil 0.2.0 is available; press u to update")
+        );
+        // Enter meant for help answers nothing; the next `u` asks.
+        press(&mut app, &[KeyCode::Enter, KeyCode::Esc]);
+        assert!(app.overlay.is_none() && app.running.is_none());
+        assert_eq!(app.on_key(key(KeyCode::Char('u'))), [Effect::Redraw]);
+        assert_eq!(confirming_update(&app), Some("0.2.0"));
+        // Cancelled, the next `u` checks again.
+        press(&mut app, &[KeyCode::Char('n')]);
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('u'))),
+            [Effect::Spawn(Job::UpdateCheck), Effect::Redraw]
+        );
+    }
+
+    #[test]
+    fn an_up_to_date_ahead_or_failed_check_is_a_notice() {
+        for (result, notice) in [
+            (Ok(check(Status::Current)), "anvil 0.1.0 is up to date"),
+            (
+                Ok(check(Status::Ahead)),
+                "anvil 0.1.0 is ahead of the latest release 0.2.0",
+            ),
+            (
+                Err("anvil update: no release published".to_owned()),
+                "anvil update: no release published",
+            ),
+        ] {
+            let mut app = app();
+            checked(&mut app, result);
+            assert_eq!(app.notice.as_deref(), Some(notice));
+            assert!(app.overlay.is_none() && app.results.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_update_is_busy_like_a_run_and_cannot_be_cancelled() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('a')]);
+        assert_eq!(app.on_key(key(KeyCode::Char('u'))), [Effect::Redraw]);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("busy: apply is running (Esc cancels)")
+        );
+        app.on_msg(Msg::Finished(Ok(())));
+
+        press(&mut app, &[KeyCode::Char('u')]);
+        for c in ['u', 'd', 'a', 'p', 'x', 'i', 'c'] {
+            assert_eq!(app.on_key(key(KeyCode::Char(c))), [Effect::Redraw], "{c}");
+            assert_eq!(app.notice.as_deref(), Some("busy: update is running"));
+        }
+        press(&mut app, &[KeyCode::Esc]);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("update cannot be cancelled; it ends on its own")
+        );
+        // A panic is the notice; the apply result is left as it was.
+        app.on_msg(Msg::Panicked("boom".to_owned()));
+        assert!(app.running.is_none());
+        assert_eq!(app.notice.as_deref(), Some("update panicked: boom"));
+        assert_eq!(app.results.len(), 1);
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Apply {
+                ok: Some(true),
+                error: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn after_an_update_u_only_says_to_restart() {
+        let mut app = app();
+        checked(&mut app, Ok(check(Status::Available)));
+        press(&mut app, &[KeyCode::Char('y')]);
+        app.on_msg(Msg::Updated(Ok("0.2.0".to_owned())));
+        assert!(app.running.is_none());
+        assert_eq!(app.updated.as_deref(), Some("0.2.0"));
+        let restart = "updated anvil to 0.2.0; restart anvil to use it";
+        assert_eq!(app.notice.as_deref(), Some(restart));
+        for _ in 0..2 {
+            press(&mut app, &[KeyCode::Char('z')]);
+            assert_eq!(app.on_key(key(KeyCode::Char('u'))), [Effect::Redraw]);
+            assert_eq!(app.notice.as_deref(), Some(restart));
+            assert!(app.running.is_none() && app.overlay.is_none());
+        }
+        // Inert while another run goes too.
+        press(&mut app, &[KeyCode::Char('d'), KeyCode::Char('u')]);
+        assert_eq!(app.notice.as_deref(), Some(restart));
+    }
+
+    #[test]
+    fn a_failed_update_is_a_notice_and_u_checks_again() {
+        let mut app = app();
+        checked(&mut app, Ok(check(Status::Available)));
+        press(&mut app, &[KeyCode::Enter]);
+        let err = "anvil update: the latest release is now 0.3.0, not 0.2.0; check again";
+        app.on_msg(Msg::Updated(Err(err.to_owned())));
+        assert!(app.running.is_none() && app.updated.is_none());
+        assert_eq!(app.notice.as_deref(), Some(err));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('u'))),
+            [Effect::Spawn(Job::UpdateCheck), Effect::Redraw]
+        );
     }
 
     #[test]

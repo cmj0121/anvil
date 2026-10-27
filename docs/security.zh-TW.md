@@ -50,3 +50,47 @@
     只有最後一個非空行會放進失敗訊息，截至 64 個字元，控制字元會被跳脫。
     該訊息會被顯示，也會以 info 層級（`-vv`）寫入日誌，因此 plugin 不應把 secret 寫到 stderr。
   - `anvil plan` 也會執行 plugin，因此 plugin 不可以有副作用。
+
+## anvil update
+
+`anvil update`（[cli.zh-TW.md](cli.zh-TW.md#anvil-update---check)）只在 release 的 tarball 帶有
+由正在執行的執行檔所編入金鑰做出的 minisign 簽章時，才會安裝它。
+
+- **兩把金鑰。** release 建置會嵌入 `keys/minisign.pub`（目前的金鑰，用來簽署）與 `keys/minisign-next.pub`（下一把金鑰）。
+  在專案的金鑰加入原始碼樹之前，建置中沒有任何金鑰，`anvil update` 會在下載任何東西之前以 `no release key compiled in` 停止；
+  `anvil update --check` 仍可使用。
+- **簽章涵蓋的範圍。** tarball 的位元組，以及透過它的 trusted comment `anvil vX.Y.Z <target>` 涵蓋的 tag 與 target：
+  較舊的已簽署 tarball 無法被安裝成較新的 tag 或另一個 target。`.sha256` 檔案沒有簽署；
+  它只是把損毀的下載變成 `checksum mismatch for NAME`。檢查的順序請見 [cli.zh-TW.md](cli.zh-TW.md#anvil-update---check)；
+  在簽章與 comment 通過之前，不會解開或執行任何東西。
+- **它不涵蓋的範圍。** anvil 執行在 `PATH` 上找到的系統 `curl` 與 `tar`，並信任它們。curl 以 `-q` 啟動，
+  因此會忽略 `~/.curlrc`，但它會繼承環境變數：你設定的 proxy（`https_proxy`、`ALL_PROXY`）或 CA bundle
+  （`CURL_CA_BUNDLE`、`SSL_CERT_FILE`）都會生效。控制這些設定的人可以扣住最新的 release 或讓下載失敗，
+  但無法讓 anvil 安裝 release 金鑰沒有簽署的檔案。GitHub API 的回應只指出 tag 與檔案；
+  每個下載 URL 都必須是固定的 `github.com/mini-poc/anvil` URL。
+- **金鑰輪替。** workflow 以目前的金鑰簽署。輪替時，owner 把簽署用的 secret 換成下一把金鑰，
+  並發布一個以該金鑰為目前金鑰、另帶一把新的下一把金鑰的 release。落後一次輪替的執行檔信任新的簽署者（它原本就是其下一把金鑰），
+  照常更新。落後兩次輪替的執行檔兩把金鑰都不信任：它的更新會以 `signature check failed for NAME: unknown key id` 停止，
+  必須手動重新安裝一次。
+- **輪替能撤銷什麼，不能撤銷什麼。** 輪替讓新的 release 不再以舊金鑰簽署，更新越過輪替的執行檔只信任新的那組金鑰。
+  它碰不到已安裝的執行檔：每個執行檔在更新之前都繼續信任建置時帶的金鑰，包括已外洩的那把，
+  因此在那之前，以外洩金鑰簽署的 release 仍能安裝到它上面。若下一把金鑰外洩，owner 絕不輪替到它：
+  改以一組新的下一把金鑰對取代它，目前的金鑰繼續簽署，執行檔更新後就不再信任外洩的金鑰。
+- **手動重新安裝。** 從 [`main` 上的 `keys/minisign.pub`](https://github.com/mini-poc/anvil/blob/main/keys/minisign.pub)
+  第二行取得金鑰，然後：
+
+  ```sh
+  base=https://github.com/mini-poc/anvil/releases/download/vX.Y.Z
+  curl -fLO "$base/anvil-vX.Y.Z-<target>.tar.gz" -fLO "$base/anvil-vX.Y.Z-<target>.tar.gz.minisig"
+  minisign -Vm anvil-vX.Y.Z-<target>.tar.gz -P <key>   # must print: Trusted comment: anvil vX.Y.Z <target>
+  tar -xzf anvil-vX.Y.Z-<target>.tar.gz
+  install -m 0755 anvil-vX.Y.Z-<target>/anvil ~/.local/bin/anvil   # the path `command -v anvil` prints
+  ```
+
+- **被盜的 owner token 可以簽署。** secret key 只有 release job 讀得到，而它只在 owner 能推送的 `v*` tag 上、
+  且在 owner 核准 `release` environment 之後才執行。被盜的 owner GitHub token 或工作階段兩者都做得到，
+  因此能讓一個 release 被簽署，而每個 `anvil update` 都會安裝它。owner 帳號以 2FA 與短期 token 保護，
+  外洩時以金鑰輪替處理，並受上述限制。
+- **不使用 sudo。** anvil 只取代屬於你、位於屬於你、你能寫入且沒有其他人能寫入之目錄中的執行檔，
+  並拒絕套件管理器與版本管理器管理的路徑
+  （[拒絕情形](cli.zh-TW.md#anvil-update---check)）。先前的執行檔保留在 `PATH.prev`。

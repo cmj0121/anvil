@@ -52,3 +52,48 @@ English | [繁體中文](security.zh-TW.md)
     only its last non-empty line goes into a failure's message, cut to 64 characters with control characters escaped.
     That message is shown, and logged at info level (`-vv`), so a plugin should not write a secret to stderr.
   - `anvil plan` runs plugins too, so a plugin must have no side effects.
+
+## anvil update
+
+`anvil update` ([cli.md](cli.md#anvil-update---check)) installs a release only when its tarball carries a minisign
+signature by a key compiled into the running binary.
+
+- **Two keys.** A release build embeds `keys/minisign.pub` (the current key, which signs) and `keys/minisign-next.pub`
+  (the next one). Until the project's keys are added to the source tree a build embeds none, and `anvil update` stops
+  with `no release key compiled in` before it downloads anything; `anvil update --check` still works.
+- **What the signature covers.** The tarball's bytes, and through its trusted comment `anvil vX.Y.Z <target>`, the tag
+  and the target: an older signed tarball cannot be installed as a newer tag or another target. The `.sha256` file is
+  not signed; it only turns a corrupt download into `checksum mismatch for NAME`. The order of the checks is in
+  [cli.md](cli.md#anvil-update---check); nothing is unpacked or run before the signature and comment pass.
+- **What it does not cover.** anvil runs the system `curl` and `tar` found on `PATH` and trusts them. curl is started
+  with `-q`, so `~/.curlrc` is ignored, but it inherits the environment: a proxy (`https_proxy`, `ALL_PROXY`) or a CA
+  bundle (`CURL_CA_BUNDLE`, `SSL_CERT_FILE`) you set applies. Whoever controls those can withhold the newest release
+  or fail the download, but cannot make anvil install a file the release keys did not sign. The GitHub API answer
+  only names the tag and the files; each download URL must be the fixed `github.com/mini-poc/anvil` one.
+- **Key rotation.** The workflow signs with the current key. To rotate, the owner moves the signing secret to the next
+  key and ships a release that embeds that key as current and a new next key. A binary one rotation behind trusts the
+  new signer (it was its next key) and updates as usual. A binary two rotations behind trusts neither key: its update
+  stops with `signature check failed for NAME: unknown key id`, and it must be reinstalled by hand once.
+- **What a rotation undoes, and what it does not.** A rotation stops new releases being signed with the old key, and
+  a binary that updates past it trusts only the new pair. It does not reach binaries already installed: each keeps
+  trusting the keys it was built with, a leaked one included, until it updates, so a release signed with a leaked key
+  still installs on it until then. If the next key leaks, the owner never rotates to it: a fresh next pair replaces
+  it, the current key keeps signing, and binaries stop trusting the leaked key once they update.
+- **Reinstalling by hand.** Take the key from the second line of
+  [`keys/minisign.pub` on `main`](https://github.com/mini-poc/anvil/blob/main/keys/minisign.pub), then:
+
+  ```sh
+  base=https://github.com/mini-poc/anvil/releases/download/vX.Y.Z
+  curl -fLO "$base/anvil-vX.Y.Z-<target>.tar.gz" -fLO "$base/anvil-vX.Y.Z-<target>.tar.gz.minisig"
+  minisign -Vm anvil-vX.Y.Z-<target>.tar.gz -P <key>   # must print: Trusted comment: anvil vX.Y.Z <target>
+  tar -xzf anvil-vX.Y.Z-<target>.tar.gz
+  install -m 0755 anvil-vX.Y.Z-<target>/anvil ~/.local/bin/anvil   # the path `command -v anvil` prints
+  ```
+
+- **A stolen owner token can sign.** The secret key is readable only by the release job, which runs only for a `v*`
+  tag the owner may push and only after the owner approves the `release` environment. A stolen owner GitHub token or
+  session can do both, so it can get a release signed that every `anvil update` would install. The owner account is
+  protected with 2FA and short-lived tokens, and a leak is treated as a key rotation, with the limits above.
+- **No sudo.** anvil replaces only a binary you own in a directory you own, can write, and no one else can write, and
+  refuses package-managed and version-manager paths
+  ([Refusals](cli.md#anvil-update---check)). The previous binary stays at `PATH.prev`.

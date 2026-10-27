@@ -27,6 +27,9 @@ system OpenSSH client.
 - **Secrets** live in the macOS keychain, an age file or a sops file, and `anvil secret --migrate` moves them between
   backends.
 - **Terminal UI**: `anvil tui` runs every command in one screen and keeps the session's results for browsing.
+- **`anvil update`** replaces the binary with the latest release after checking its `.sha256` and its `.minisig`
+  signature against a public key compiled into anvil, and keeps the previous binary as `anvil.prev`. The keys are
+  compiled in only once the project owner adds them; until then `anvil update` reports `no release key compiled in`.
 - **Built for agents**: `--json` prints one parseable document on stdout; logs go to stderr only.
 - **Secure by default**: host keys are never auto-accepted, sudo passwords never reach argv, the environment or a log,
   and secrets are written to disk only encrypted, apart from the private editor temp file while you edit one.
@@ -56,6 +59,7 @@ anvil plan                 # the steps apply would run on every target, running 
 anvil apply                # install packages, copy matching files and run the steps
 anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
 anvil tui                  # all of the above in one terminal UI
+anvil update --check       # is a newer release out? `anvil update` installs it
 ```
 
 A config that installs `fd` on every target, as `fd-find` where apt or dnf is the manager

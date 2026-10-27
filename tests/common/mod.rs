@@ -10,11 +10,14 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -282,3 +285,119 @@ pub const CONNECT_REFUSED: [(&str, &str); 2] = [
 
 pub const CONNECT_REFUSED_MESSAGE: &str =
     "cannot connect: ssh: connect to host fakehost port 22: Connection refused";
+
+/// One answer of a [`FixtureServer`].
+#[derive(Clone)]
+pub struct Route {
+    pub path: String,
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// Whether a `Content-Length` header is sent; without one the body
+    /// ends when the connection closes.
+    pub length: bool,
+}
+
+impl Route {
+    pub fn new(path: &str, status: u16, body: impl Into<Vec<u8>>) -> Route {
+        Route {
+            path: path.to_owned(),
+            status,
+            headers: Vec::new(),
+            body: body.into(),
+            length: true,
+        }
+    }
+
+    pub fn header(mut self, name: &str, value: &str) -> Route {
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    pub fn without_length(mut self) -> Route {
+        self.length = false;
+        self
+    }
+}
+
+/// An HTTP/1.1 server on `127.0.0.1` answering each request from its
+/// routes (404 for any other path) on one thread, `Connection: close`.
+/// It records each request's head; [`FixtureServer::route`] adds a route
+/// once the base URL is known.
+pub struct FixtureServer {
+    pub base: String,
+    routes: Arc<Mutex<Vec<Route>>>,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl FixtureServer {
+    pub fn start(routes: Vec<Route>) -> FixtureServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let routes = Arc::new(Mutex::new(routes));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (served, seen) = (Arc::clone(&routes), Arc::clone(&requests));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut reader = BufReader::new(&stream);
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let path = head.split(' ').nth(1).unwrap_or_default().to_owned();
+                seen.lock().unwrap().push(head);
+                let route = served
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.path == path)
+                    .cloned()
+                    .unwrap_or_else(|| Route::new(&path, 404, "{\"message\":\"Not Found\"}"));
+                let mut answer =
+                    format!("HTTP/1.1 {} Fixture\r\nConnection: close\r\n", route.status);
+                if route.length {
+                    answer += &format!("Content-Length: {}\r\n", route.body.len());
+                }
+                for (name, value) in &route.headers {
+                    answer += &format!("{name}: {value}\r\n");
+                }
+                answer += "\r\n";
+                let _ = stream
+                    .write_all(answer.as_bytes())
+                    .and_then(|()| stream.write_all(&route.body));
+            }
+        });
+        FixtureServer {
+            base,
+            routes,
+            requests,
+        }
+    }
+
+    /// A base URL on a port nothing listens on: bound once, then closed.
+    pub fn closed() -> FixtureServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        FixtureServer {
+            base,
+            routes: Arc::default(),
+            requests: Arc::default(),
+        }
+    }
+
+    pub fn route(&self, route: Route) {
+        self.routes.lock().unwrap().push(route);
+    }
+
+    /// The head of each request so far, request line first.
+    pub fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}

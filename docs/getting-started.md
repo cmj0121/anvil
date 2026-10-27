@@ -27,9 +27,9 @@ and warns when the `anvil` found on `PATH` is not the one just installed (for ex
 
 ### Pre-built binaries
 
-The [Releases](https://github.com/mini-poc/anvil/releases) page has an `anvil-<version>-<target>.tar.gz` archive and a
-`.sha256` file for each `<target>`: `aarch64-apple-darwin`, `x86_64-apple-darwin` and `x86_64-unknown-linux-musl`.
-Download both, check the archive, unpack it and put the binary on `PATH`:
+The [Releases](https://github.com/mini-poc/anvil/releases) page has an `anvil-<version>-<target>.tar.gz` archive, a
+`.sha256` file and a `.minisig` signature for each `<target>`: `aarch64-apple-darwin`, `x86_64-apple-darwin` and
+`x86_64-unknown-linux-musl`. Download them, check the archive, unpack it and put the binary on `PATH`:
 
 ```sh
 shasum -a 256 -c anvil-<version>-<target>.tar.gz.sha256   # macOS
@@ -39,8 +39,27 @@ install -d ~/.local/bin
 install -m 0755 anvil-<version>-<target>/anvil ~/.local/bin/
 ```
 
-On macOS the binary is not signed. Download it with `curl`, which sets no quarantine flag; if a browser downloaded it,
-clear the flag with `xattr -d com.apple.quarantine anvil-<version>-<target>/anvil` before installing it.
+The checksum only catches a corrupt download. To check who made the archive, verify its signature with
+[minisign](https://jedisct1.github.io/minisign/) and the key on the second line of
+[`keys/minisign.pub`](https://github.com/mini-poc/anvil/blob/main/keys/minisign.pub):
+
+```sh
+minisign -Vm anvil-<version>-<target>.tar.gz -P <key>   # reads anvil-<version>-<target>.tar.gz.minisig
+```
+
+It must end with `Trusted comment: anvil <version> <target>`, the version and target you downloaded.
+
+On macOS the binary is not code-signed or notarized. Download it with `curl`, which sets no quarantine flag; if a
+browser downloaded it, clear the flag with `xattr -d com.apple.quarantine anvil-<version>-<target>/anvil` before
+installing it.
+
+### Updating
+
+Once installed, `anvil update --check` says whether a newer release exists, and `anvil update` downloads it, checks
+the checksum and the signature, and replaces the binary, keeping the previous one as `anvil.prev` beside it. Restart
+any running anvil, such as `anvil tui`, to use the new version. It refuses a binary a package manager owns, one you do
+not own, and one in a directory you cannot write; the details are in [cli.md](cli.md#anvil-update---check). Until the
+release keys are compiled in, `anvil update` stops with `no release key compiled in`.
 
 ## Quick start
 

@@ -11,6 +11,8 @@ use crate::paths;
 use crate::secret::{self, Store};
 use crate::ssh::{self, Ssh, SshSettings};
 use crate::transport::{Local, Transport, TransportError};
+use crate::update::Source;
+use crate::update::keys::TrustedKeys;
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -33,6 +35,10 @@ pub struct Options {
     /// Replaces `$HOME` for ssh's control directory; set only by tests.
     #[cfg(debug_assertions)]
     pub ssh_home: Option<PathBuf>,
+    #[cfg(debug_assertions)]
+    pub release_url: Option<String>,
+    #[cfg(debug_assertions)]
+    pub release_keys: Vec<PathBuf>,
 }
 
 #[cfg(debug_assertions)]
@@ -59,6 +65,10 @@ impl Options {
             ssh_program: cli.ssh_program.clone(),
             #[cfg(debug_assertions)]
             ssh_home: None,
+            #[cfg(debug_assertions)]
+            release_url: cli.release_url.clone(),
+            #[cfg(debug_assertions)]
+            release_keys: cli.release_key.clone(),
         }
     }
 
@@ -80,6 +90,27 @@ impl Options {
             return program.clone();
         }
         PathBuf::from("ssh")
+    }
+
+    /// Where `update` looks for releases: GitHub, or the debug-only
+    /// `--release-url`.
+    pub fn release_source(&self) -> Source {
+        #[cfg(debug_assertions)]
+        if let Some(base) = &self.release_url {
+            return Source::at(base);
+        }
+        Source::github()
+    }
+
+    /// The keys `update` trusts: the compiled-in ones, or the debug-only
+    /// `--release-key` files (exit 2 when one cannot be used).
+    pub fn trusted_keys(&self) -> Result<TrustedKeys, Failure> {
+        #[cfg(debug_assertions)]
+        if !self.release_keys.is_empty() {
+            return TrustedKeys::from_files(&self.release_keys)
+                .map_err(|err| Failure::usage(format!("anvil update: --release-key: {err}")));
+        }
+        Ok(TrustedKeys::compiled())
     }
 
     /// How ssh runs: [`Options::ssh_program`], a password prompt only when
@@ -211,6 +242,57 @@ mod tests {
         assert_eq!(
             parse(&["doctor", "--ssh-program", "/x/fake-ssh"]).ssh_program(),
             PathBuf::from("/x/fake-ssh")
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn hidden_release_url_replaces_github() {
+        assert_eq!(parse(&["update"]).release_source(), Source::github());
+        assert_eq!(
+            parse(&["update", "--release-url", "http://127.0.0.1:9"]).release_source(),
+            Source::at("http://127.0.0.1:9")
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn hidden_release_keys_replace_the_compiled_ones() {
+        assert_eq!(
+            parse(&["update"]).trusted_keys().unwrap(),
+            TrustedKeys::compiled()
+        );
+        let pubs: Vec<String> = ["a.pub", "b.pub", "c.pub"]
+            .iter()
+            .map(|name| {
+                crate::test_util::fixture(&format!("update/{name}"))
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        let two = parse(&[
+            "update",
+            "--release-key",
+            &pubs[0],
+            "--release-key",
+            &pubs[1],
+        ]);
+        assert_eq!(two.trusted_keys().unwrap().as_slice().len(), 2);
+        let three = parse(&[
+            "update",
+            "--release-key",
+            &pubs[0],
+            "--release-key",
+            &pubs[1],
+            "--release-key",
+            &pubs[2],
+        ]);
+        let err = three.trusted_keys().unwrap_err();
+        assert_eq!(err.code, 2);
+        assert_eq!(
+            err.message,
+            "anvil update: --release-key: at most 2 release keys"
         );
     }
 }

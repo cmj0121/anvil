@@ -20,6 +20,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   secret <NAME>                  edit one secret in the editor
   secret --migrate --to BACKEND  move every secret to keychain, age or sops and select it
   tui                            run every command and browse the results in a terminal UI
+  update [--check]               replace this binary with the latest release once it verifies
 ```
 
 ## 通用旗標
@@ -594,6 +595,113 @@ TUI 照常啟動，在標頭以紅色顯示 `inventory error`，錯誤本身則�
 
 畫面、按鍵表與 TUI 的規則請見 [終端機介面](tui.zh-TW.md)。
 
+### `anvil update [--check]`
+
+在最新的 GitHub release 通過驗證後，以它取代正在執行的 `anvil`。`--check` 只做比較：
+
+```sh
+anvil update --check       # current, latest and a verdict; exit 1 when an update is available
+anvil update               # download, verify and replace this binary
+```
+
+`--check` 在 stdout 印出三行：
+
+```text
+current 0.1.0
+latest  0.2.0 (anvil-v0.2.0-aarch64-apple-darwin.tar.gz)
+update available
+```
+
+最後一行是 `update available`、`up to date` 或 `ahead of the latest release`。
+有可用的更新時，它還會記錄 ``anvil update: anvil 0.2.0 is available; run `anvil update` `` 並以 1 結束，讓腳本能據此判斷。
+`--json` 以一份文件印出相同內容；`status` 為 `available`、`current` 或 `ahead`：
+
+```json
+{
+  "current": "0.1.0",
+  "latest": "0.2.0",
+  "asset": "anvil-v0.2.0-aarch64-apple-darwin.tar.gz",
+  "status": "available"
+}
+```
+
+沒有更新的版本時，`anvil update` 印出結論那一行（`up to date` 或 `ahead of the latest release`；
+搭配 `--json` 時為 `--check` 的文件），不下載任何東西，並以 0 結束。它從不降版。
+更新後印出 `updated anvil 0.1.0 → 0.2.0 at PATH (previous kept at PATH.prev)`，或搭配 `--json`：
+
+```json
+{
+  "from": "0.1.0",
+  "to": "0.2.0",
+  "path": "/home/me/.local/bin/anvil",
+  "prev": "/home/me/.local/bin/anvil.prev"
+}
+```
+
+`PATH` 是執行檔本身：以符號連結安裝的 `anvil` 會更新連結指向的檔案。新的執行檔從下一次啟動起才會使用；
+已在執行的 `anvil`（例如開著的 `anvil tui`）在重新啟動前仍執行舊的執行檔。
+TUI 的 `u` 鍵執行相同的檢查與更新（[終端機介面](tui.zh-TW.md)）。
+和 `inventory` 與 `config` 一樣，`--target` 會被忽略並顯示警告。
+
+**最新的 release。** anvil 執行系統的 `curl`（否則為 `curl not found on PATH`），第一個引數是 `-q`，因此不讀取 `~/.curlrc`，
+且不帶 token：設定了 `GITHUB_TOKEN` 也會被忽略。curl 仍會繼承環境變數，因此
+`https_proxy`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 與 CA 設定（`CURL_CA_BUNDLE`、`SSL_CERT_FILE`、`SSL_CERT_DIR`）都會生效。
+它查詢 `https://api.github.com/repos/mini-poc/anvil/releases/latest`，此端點會略過草稿與 prerelease；
+回應最多 1 MiB（`GitHub API answer over 1 MiB`）。沒有 token 時，API 每個 IP 每小時允許 60 次請求；
+超過後為 `GitHub API rate limit reached (60 requests an hour without a token); try again after HH:MM UTC`。
+其他回應：`no release published`（404）與 `GitHub API answered HTTP N`。
+
+**release 檔案。** 對 tag `vX.Y.Z` 與本機的 target（`aarch64-apple-darwin`、`x86_64-apple-darwin`，
+或任何 x86_64 Linux 都用 `x86_64-unknown-linux-musl`），release 必須包含 `anvil-vX.Y.Z-<target>.tar.gz`、
+它的 `.tar.gz.sha256` 與 `.tar.gz.minisig`（否則為 `release vX.Y.Z has no asset NAME`）；
+其他作業系統或架構為 `no release asset for <os>-<arch>`。每個 URL 都必須恰好是
+`https://github.com/mini-poc/anvil/releases/download/vX.Y.Z/NAME`（否則為 `unexpected download URL for NAME`）。
+下載只用 https，且不重試；tarball 最多 64 MiB（`NAME is N bytes, over the 64 MiB limit`）、300 秒，
+兩個小檔案各最多 4 KiB、30 秒，且每個檔案都必須是 release 列出的大小；
+release 列為空的檔案會被拒絕（`release vX.Y.Z lists NAME as 0 bytes`）。
+8.4 之前的 curl 對 chunked 回應可能不會強制 `--max-filesize`；傳輸後的大小檢查仍會拒絕這樣的檔案。
+它們存放在 `$TMPDIR` 下的私有 0700 目錄 `anvil-update-<16 hex>`，anvil 正常結束時會移除。
+
+**檢查的順序。** 每一項都在解開任何東西之前執行，任何失敗都以 1 結束，執行檔保持不變：
+
+1. 已編入 release 金鑰（`no release key compiled in`），在任何下載之前；
+2. 執行檔可以被取代（見下方的拒絕情形），在任何下載之前；
+3. `.sha256` 檔案是一行 `<64 hex>  NAME`，且與 tarball 的 SHA-256 相符（`checksum mismatch for NAME`）；
+4. tarball 上的 `.minisig` 簽章出自兩把已編入金鑰之一，且驗證通過
+   （`signature check failed for NAME: unknown key id`、`bad signature` 或 `legacy signature`）；
+5. 它的 trusted comment 恰好是 `anvil vX.Y.Z <target>`（`signature is for "<comment>", not NAME`），
+   因此較舊的已簽署 tarball 無法冒充較新的 tag 或另一個 target；
+6. `tar` 只從已驗證的位元組解開 `anvil-vX.Y.Z-<target>/anvil`，它必須是最多 128 MiB 的一般檔案；
+7. 該執行檔以舊檔案的 mode 複製到舊執行檔旁的 `.anvil.new-<pid>`，並在 10 秒內執行完 `--version`
+   （`downloaded binary did not exit in 10 s`），印出 `anvil X.Y.Z`
+   （`downloaded binary reports "<out>", not anvil X.Y.Z`）。
+
+簽章涵蓋 tarball 本身；`.sha256` 檔案只是附帶清楚訊息的損毀檢查。
+release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的金鑰與下一把金鑰（[安全須知](security.zh-TW.md#anvil-update)）。
+金鑰要等專案 owner 把它們加入原始碼樹後才會編入；在那之前，`anvil update` 會回報 `no release key compiled in`。
+`--check` 不需要金鑰，因此在沒有金鑰的建置中也能使用。
+
+**取代。** 舊執行檔先以硬連結保留為 `.anvil.prev-<pid>`，`.anvil.new-<pid>` 被重新命名覆蓋 `PATH`，
+保留的那份再重新命名為 `PATH.prev`，取代先前的 `.prev`。`PATH` 從不消失，即使只是一瞬間。
+檔案系統或政策拒絕硬連結時，改為複製舊執行檔，並保留它的 mode。
+若最後的重新命名失敗，更新仍算成功，`previous kept at` 改為指出 `.anvil.prev-<pid>`。只保留一份 `.prev`；
+要退回時，請手動把它移回 `PATH`。先前執行留下、屬於你且其行程已不存在的 `.anvil.new-<pid>` 會被移除。
+
+**拒絕情形。** 這些檢查在解析符號連結之後的路徑上、任何下載之前進行；每一項都以 1 結束：
+
+- `PATH is managed by a package manager; update it there`：路徑位於 `/usr/` 或 `/opt/local/` 之下、
+  含有 `Cellar` 這個路徑元件（Homebrew 與 Linuxbrew），或位於 `.local/share/mise/installs/` 或 `.asdf/installs/` 樹中。
+  `/usr/` 包含 `/usr/local/bin`，因此屬於你的 `/usr/local/bin/anvil` 也會被拒絕；
+  請安裝到 `~/.local/bin`（`make install`），或使用套件管理器。`~/.cargo/bin`（`cargo install`）是允許的。
+- `PATH is owned by uid N, not you; anvil does not use sudo`：執行檔本身。
+- `DIR is owned by uid N, not you; anvil does not use sudo`：存放它的目錄。
+- `DIR is writable by group or others; run chmod go-w on it`：其他人可能替換其中的檔案。
+- `DIR is not writable: <reason>`：該目錄，包括唯讀的檔案系統。
+
+**Ctrl-C。** curl 在自己的 process group 中執行，因此 Ctrl-C 會停止 anvil，但可能讓下載繼續到它的時間上限，
+並在 `$TMPDIR` 留下 `anvil-update-<16 hex>` 目錄；請手動刪除。最後的重新命名之前，已安裝的執行檔都不會被變更，
+留在它旁邊的 `.anvil.new-<pid>` 會在下一次 `anvil update` 時被移除。
+
 ### 編輯器
 
 `[anvil].editor`，否則 `$VISUAL`，否則 `$EDITOR`，否則 `nvim`；以空白切成 argv（絕不經過 shell）；
@@ -621,6 +729,9 @@ TUI 照常啟動，在標頭以紅色顯示 `inventory error`，錯誤本身則�
   對 `apply` 與 `plan` 而言，還有釘選檢查失敗的 `[plugins]` 項目（[Plugin steps](#plugin-steps)）。
   對 `run` 而言，還有空的、超過 1 MiB、不是 UTF-8 或無法讀取的腳本，以及超出 1..=3600 的 `--timeout`。
   `tui` 見下方。
+- **`update`**：已是最新、比最新 release 更新或已更新時為 0。
+  搭配 `--check` 且有可用的更新時為 1，任何失敗也為 1：查詢、下載、檢查、拒絕情形，或 `no release key compiled in`；
+  此時已安裝的執行檔保持不變。錯誤的旗標或引數為 2。
 - **`tui`**：離開時為 0，不論結果為何。
   stdin 或 stdout 不是終端機、使用 `--json`，或未知的 `--target`（只在 inventory 載入成功時檢查）時為 2；
   無法載入的 inventory（任何載入錯誤，包括不以 `.toml` 結尾的 `--inventory` 路徑）改為顯示在標頭、狀態列與 `t` overlay 中。
