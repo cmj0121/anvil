@@ -21,6 +21,13 @@ system OpenSSH client.
 - **`[[services]]`** starts or stops a service, and enables or disables it, on each selected target whose tags and
   facts match, after the files and before `[[steps]]`. It uses the target's init: systemd, OpenRC on Alpine, or launchd
   on macOS. It changes only what differs, so a rerun prints `unchanged service NAME`.
+- **`anvil rollback`** puts back the files the last apply wrote: each dest gets its previous text, mode and owner
+  back, and a dest that did not exist before is removed. A dest changed since that apply is refused unless
+  `--force DEST`. A file whose previous text was not kept (binary, over 256 KiB, `rollback = false`, …) shows as
+  `cannot undo: DEST (REASON)`, and the owner comes back only on a root write. Packages, services and steps cannot be
+  undone; rollback lists them as `cannot undo: …`. The record
+  is `last-apply.json` in `$XDG_STATE_HOME/anvil` (mode 0600, plain text), never beside the config
+  ([anvil rollback](docs/cli.md#anvil-rollback)).
 - **`anvil plan`** shows the steps apply would run on each target and runs none of them; `--json` marks the document
   `"executed": false`.
 - **`anvil run FILE`** (or `-` for stdin) runs one ad-hoc POSIX sh script on every target, with apply's output,
@@ -29,7 +36,7 @@ system OpenSSH client.
   the target's facts as JSON and replies with the sh script to run there. It gets a cleared environment and no secrets.
 - **Secrets** live in the macOS keychain, an age file or a sops file, and `anvil secret --migrate` moves them between
   backends.
-- **`--parallel N`** lets apply, plan and run work on up to N targets at once (1..=32, default 1). Output and
+- **`--parallel N`** lets apply, plan, run and rollback work on up to N targets at once (1..=32, default 1). Output and
   `--json` stay in inventory order, and Ctrl-C lets the running steps finish; a second Ctrl-C stops at once
   ([Running in parallel](docs/cli.md#running-in-parallel)).
 - **Terminal UI**: `anvil tui` runs every command in one screen and keeps the session's results for browsing.
@@ -38,7 +45,9 @@ system OpenSSH client.
   compiled in only once the project owner adds them; until then `anvil update` reports `no release key compiled in`.
 - **Built for agents**: `--json` prints one parseable document on stdout; logs go to stderr only.
 - **Secure by default**: host keys are never auto-accepted, sudo passwords never reach argv, the environment or a log,
-  and secrets are written to disk only encrypted, apart from the private editor temp file while you edit one.
+  and secrets are written to disk only encrypted, apart from the private editor temp file while you edit one. The
+  apply record keeps the previous text of each file apply replaced, unencrypted at mode 0600; `rollback = false` on a
+  `[[files]]` entry keeps only its hash ([Security notes](docs/security.md)).
 
 ## Install
 
@@ -64,6 +73,7 @@ anvil doctor               # local checks + every target's facts and reachabilit
 anvil plan                 # the steps apply would run on every target, running none
 anvil apply                # install packages, copy files, set services, run the steps
 anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
+anvil rollback --dry-run   # what rollback would put back; `anvil rollback` restores the last apply's files
 anvil --parallel 4 apply   # apply on up to 4 targets at once
 anvil tui                  # all of the above in one terminal UI
 anvil update --check       # is a newer release out? `anvil update` installs it

@@ -17,7 +17,26 @@
   因為未簽署的執行檔沒有固定的身分。
   `anvil doctor` 只檢查項目是否存在，從不跳出提示；與 age 和 sops 不同，keychain 不會先被解密。
 - **磁碟上的明文**。secret 一律只以加密形式寫入，
-  唯一例外是你編輯值時 `anvil secret` 使用的編輯器暫存檔案。
+  例外是你編輯值時 `anvil secret` 使用的編輯器暫存檔案；apply 紀錄是另一個例外，見下一項。
+- **apply 紀錄以明文保存檔案先前的文字**。`$XDG_STATE_HOME/anvil`（否則為 `~/.local/state/anvil`）中的
+  `last-apply.json` 保存每次 `[[files]]` 寫入所取代的文字，讓 `anvil rollback` 能把它放回去
+  （[apply 紀錄](cli.zh-TW.md#apply-紀錄)）。它沒有加密：保護它的是你擁有的 0700 目錄中的 mode 0600，
+  每次執行都會檢查兩者，anvil 會拒絕對他人開放的紀錄或目錄。任何能以你的身分讀取你的檔案的人，或能讀取其備份的人，都能讀到它。
+  dest 保存 secret 的 `[[files]]` 項目請設定 `rollback = false`：紀錄就只保存它的 sha256（[Files](configuration.zh-TW.md#files)）。
+  絕不要把 `$XDG_STATE_HOME` 指進 dotfiles 或其他共用的 repository，也絕不要 commit 這份紀錄。
+  這些文字絕不會印出或記錄，且讀取紀錄前會先關閉 core dump。紀錄只是你擁有的一個檔案，因此 rollback 絕不讓它決定路徑：
+  dest 或 mode 不可能由 apply 寫出的紀錄會被拒絕，且只還原目前 config 的 `[[files]]` 仍列出、`sudo` 相同、
+  且該項目適用於該 target 的 dest（[anvil rollback](cli.zh-TW.md#anvil-rollback)）。
+- **紀錄與 config 受到同等的信任**。它沒有簽章，也沒有驗證。在 config 列出的 dest 上，rollback 放回的位元組、owner
+  與 mode 由紀錄決定，因此能寫入紀錄的人，就能讓 rollback（透過 sudo、以 root）在那裡寫入任意文字、任意 owner 與 mode。
+  請讓它與 config 一樣私密：同一個使用者、0700 的狀態目錄，不要有共用或同步的副本。
+- **讀取與寫入之間的變更**。每次 `[[files]]` 寫入之前 apply 會讀取 DEST，若 DEST 的 sha256 在那之後改變，寫入就會拒絕：
+  `files: DEST changed while anvil was writing it; re-run apply`。這項檢查需要 target 上有 `sha256sum` 或 `shasum`。
+  兩者都沒有時就沒有檢查，因此在讀取與寫入之間做的變更會被覆寫，而紀錄保存的是較舊的狀態。
+  rollback 無法判斷 DEST 是否改變，因此除非強制，否則會拒絕這樣的檔案（除非它的寫入中途失敗）（[anvil rollback](cli.zh-TW.md#anvil-rollback)）。
+- **每份紀錄一次只能有一個 apply 或 rollback**。紀錄透過旁邊的 `last-apply.json.lock` 上鎖；第二個 anvil 會直接以
+  `PATH is in use by another anvil` 失敗，而不會等待。這個鎖需要 `flock`，NFS 可能不提供：
+  `PATH: the filesystem does not support locking (NFS?); set $XDG_STATE_HOME to a local disk`。
 - **每個儲存區只能有一個 anvil**。開啟中的 age 或 sops 儲存區會透過旁邊的 `<store>.lock` 上鎖；
   對同一個儲存區執行第二個 anvil 會直接以 `another anvil is using <store>` 失敗，而不會等待。
 - **sops 看到的是清空的環境**。你環境中的雲端 KMS 憑證不會傳給 sops；請改用 age 或 PGP 金鑰。

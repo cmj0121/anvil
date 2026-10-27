@@ -16,6 +16,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
   plan                           show the steps apply would run on every target, running none
+  rollback [--force DEST]...     restore the files the last apply wrote on every target
   run [--timeout SECS] <FILE|->  run a POSIX sh script on every target, read from FILE or stdin
   secret <NAME>                  edit one secret in the editor
   secret --migrate --to BACKEND  move every secret to keychain, age or sops and select it
@@ -35,7 +36,7 @@ Every flag is global: it may come before or after the command.
 | `--ssh-config PATH` | passed to every `ssh` as `-F PATH`                                                                    |
 | `--json`            | print exactly one JSON document on stdout instead of human output                                     |
 | `--target SEL`      | `local`, a host name or a tag; repeat to take the union; none means `local` plus every host           |
-| `--parallel N`      | targets at once for `apply`, `plan`, `run`: 1..=32, default 1 ([parallel](#running-in-parallel))      |
+| `--parallel N`      | targets at once (apply, plan, run, rollback): 1..=32, default 1 ([parallel](#running-in-parallel))    |
 | `-h`, `--help`      | help                                                                                                  |
 | `-V`, `--version`   | version                                                                                               |
 
@@ -49,7 +50,7 @@ default); a failing target does not stop the others.
 
 ## Running in parallel
 
-`--parallel N` lets `apply`, `plan` and `run` work on up to N targets at once; `anvil tui` takes it as the starting
+`--parallel N` lets `apply`, `plan`, `run` and `rollback` work on up to N targets at once; `anvil tui` takes it as the starting
 value for its apply, plan and run (`x`), and runs doctor one target at a time without a warning:
 
 ```sh
@@ -295,7 +296,7 @@ the step was killed by a signal or timed out; a timed-out step is the last `step
 
 #### Ctrl-C
 
-`apply`, `plan` and `run` handle Ctrl-C the same way, with any `--parallel`:
+`apply`, `plan`, `run` and `rollback` handle Ctrl-C the same way, with any `--parallel`:
 
 - **The first press cancels.** anvil prints
   `interrupted: running targets stop after their current step; Ctrl-C again stops now` on stderr, whatever `-v`. Each
@@ -312,6 +313,119 @@ the step was killed by a signal or timed out; a timed-out step is the last `step
   ([Running in parallel](#running-in-parallel)).
 - **A fast double press may count as one.** Two presses very close together can reach anvil as one signal and then
   count as the first; press again.
+
+#### The apply record
+
+An apply that probes its targets (`[packages]` with work, a plugin step, `[[files]]` or `[[services]]`) keeps
+`last-apply.json`, which [`anvil rollback`](#anvil-rollback) reads. An apply of plain `[[steps]]` only does not open
+it.
+
+- **Where.** `$XDG_STATE_HOME/anvil/last-apply.json`, else `~/.local/state/anvil/last-apply.json`; an empty or relative
+  `$XDG_STATE_HOME` counts as unset. `--config` and `$XDG_CONFIG_HOME` never move it, so it never sits beside
+  the config. Keep it out of a dotfiles repository: do not point `$XDG_STATE_HOME` into one or commit the file, since it
+  holds the previous text of the files apply replaced. The directory is created with mode 0700 and the file is written with mode
+  0600; both are checked on every run. With neither variable set the command fails, exit 1, with
+  `apply: neither $XDG_STATE_HOME nor $HOME is set: cannot find the state directory` (`rollback: …` for a rollback),
+  before any target.
+- **One entry per target.** Each target is merged into the record and saved as soon as it ends, by an atomic rename. A
+  target's entry is replaced only when a `[[files]]` write started there. A target the apply reached without writing a
+  file keeps its files and gets the new facts. Targets this apply did not select keep their entries.
+- **What it keeps.** Per target: when (`at`), the anvil version, whether every step passed (`ok`), the probe's facts,
+  each file written, the steps that cannot be undone (`cannot_undo`) and, after a rollback, `rolled_back`. Per file:
+  the dest, the mode and `sudo` it was written with, the sha256 of the bytes written, how the write ended (`write`) and
+  what was there before (`previous`). It never keeps a secret value, a step's script or a package list.
+
+```json
+{
+  "version": 1,
+  "targets": {
+    "web1": {
+      "at": 1730000000,
+      "anvil": "0.4.0",
+      "ok": true,
+      "facts": { "hostname": "web1", "distro": "arch" },
+      "files": [
+        {
+          "dest": "/etc/app.conf",
+          "mode": "0644",
+          "sudo": true,
+          "written_sha256": "<64 hex>",
+          "write": "written",
+          "previous": {
+            "state": "file",
+            "mode": "0600",
+            "uid": 0,
+            "gid": 0,
+            "sha256": "<64 hex>",
+            "kept": true,
+            "text": "…"
+          }
+        },
+        {
+          "dest": "/etc/new.conf",
+          "mode": "0644",
+          "sudo": true,
+          "written_sha256": "<64 hex>",
+          "write": "written",
+          "previous": { "state": "absent" }
+        }
+      ],
+      "cannot_undo": ["packages", "service nginx", "step 1"]
+    }
+  }
+}
+```
+
+anvil writes it on one line. `previous` is `{"state": "absent"}` for a dest that did not exist,
+`{"state": "dangling", "target": "…"}` for a `sudo = false` dest that was a symlink to a missing file, or a `file`
+with its mode, owner, sha256 and, when `kept` is true, its `text`. `write` is `written` (the step exited 0) or
+`failed_midway` (it started, then failed, timed out or lost the connection, so DEST may hold part of the bytes). A
+write `refused` before it wrote anything (a root check, a directory DEST or a DEST changed since the read, all exit 4)
+is never stored: the dest keeps its entry from the apply before, if any.
+
+**Kept or not.** The previous text is kept only when it is UTF-8 text with no NUL byte, at most 256 KiB, and the entry
+does not set `rollback = false`. Otherwise `kept` is false and `reason` says why: `rollback = false`, `over 256 KiB`,
+`not UTF-8 text`, `contains NUL`, `unreadable`, `no od on the target` or `record full`. The write goes ahead either
+way; only its undo is lost, and rollback shows the file as `cannot undo: DEST (REASON)`. `rollback = false` keeps the
+hash only: use it for a dest that holds a secret ([Files](configuration.md#files)).
+
+**Retries keep the first state.** A rerun whose dest already holds the bytes keeps the entry of the apply that wrote
+them, so its `previous` is still the state from before that apply. A write that failed midway keeps the `previous` from
+before it on the next try. A failed apply (`ok: false`) keeps the entries of dests it did not reach, so a retry that
+stops early loses nothing; a successful one drops them.
+
+**16 MiB.** The saved record is at most 16 MiB (16777216 bytes). When it would be larger, previous texts are dropped
+from the saved copy, largest first, and each dropped one is a warning on stderr:
+`apply: last-apply.json is full; DEST on TARGET cannot be rolled back`. Entries of targets this apply did not select
+count first, so they can leave no room for this apply's texts; among this apply's targets, earlier ones in target
+order keep theirs first. A record that would be over the limit even without any text fails with
+`apply: cannot write last-apply.json: over the 16777216 byte limit even without the texts`.
+
+**One apply or rollback at a time.** The record is locked through `last-apply.json.lock` beside it, from before the
+first target until the last save; an apply with only `[packages]` or `[[services]]` work takes the lock too. A second
+anvil fails at once, exit 1, with `apply: PATH is in use by another anvil` (PATH is the record's path; `rollback: …`
+for a rollback). A filesystem without `flock`, as NFS can be, fails with
+`apply: PATH: the filesystem does not support locking (NFS?); set $XDG_STATE_HOME to a local disk`.
+
+**Save errors.** A save that fails stops the apply from starting further targets; every target already running still
+ends, and its save is tried too. The command then fails, exit 1, after the blocks print, with the first error and the targets
+the record still lacks: `apply: cannot write last-apply.json: REASON; not recorded: web1, web2`. A record that cannot
+be read fails apply before any target, with `apply: PATH: REASON`: `a symlink, refused`, `not a regular file`,
+`mode 640 lets others in; run chmod 600 on it`, `larger than the 16777216 byte limit`, `version N is not supported` or
+`cannot parse`. Its content is never quoted.
+
+**What is lost.** A target that fails with `internal error: …` (a bug in anvil) is not recorded and keeps its earlier
+entry. A first Ctrl-C lets the running targets end, and they are saved. A second Ctrl-C, or anvil killed, keeps every
+target that had ended; a target still running is not recorded, though its files may have been written.
+
+**Reading DEST first.** Before each `[[files]]` write, a separate run reads DEST through the same path as the write
+(`ls -lLdn` and `od`). Its output is never printed or logged. A dest that is not a regular file fails the step with
+`files: DEST is not a regular file`, and a read that comes back incomplete fails it with
+`files: cannot read DEST before writing it` or `files: cannot parse ls output for DEST`; nothing is written. The write
+then hashes DEST again and refuses when it changed since that read:
+`files: DEST changed while anvil was writing it; re-run apply`. That check needs `sha256sum` or `shasum` on the
+target. Without either, nothing checks DEST between the read and the write, so a change made in that window is
+overwritten and the record holds what was read.
 
 ### `anvil plan`
 
@@ -543,6 +657,9 @@ In `--json` a file step's `run` is that label. A skipped step has `"skipped": tr
 and `would $ skipped file DEST: no match`. In `plan --json` the `run` is the same label, with `sudo_secret` for the
 password path.
 
+Before each write, apply reads DEST back and keeps what it held in the [apply record](#the-apply-record), so
+[`anvil rollback`](#anvil-rollback) can put it back; the write then refuses a DEST that changed since that read.
+
 The file's bytes are never printed: not in the human output, `--json`, `plan`, the `-v` logs or the ssh command line.
 The bytes go to the target on the script's stdin; on the password path they go to a mode-0600 `/tmp/anvil-` file
 first, which is removed after the step, on success, failure or cancel. A lost connection or a killed anvil (a Ctrl-C
@@ -722,6 +839,129 @@ enablement change comes first and the state change after it: `enable` then `stop
 A plist whose own `Disabled` key is true is not detected (anvil does not read the plist); expect the bootstrap to fail
 with launchctl's own error. These launchd changes are tested against stand-in tools, not a live launchd; only the
 `print-disabled` format was checked, read-only, on macOS 26.
+
+### `anvil rollback`
+
+```text
+anvil rollback [--force DEST]... [--force-all] [--allow-host-change] [--dry-run]
+```
+
+Puts back, on every selected target, the files the last apply wrote there, from the
+[apply record](#the-apply-record). Each file gets its previous text, mode and owner back; a dest that did not exist
+before is removed. It runs at once, with no confirmation; `--dry-run` shows first what it would do:
+
+```sh
+anvil rollback --dry-run --target web1    # read the record only: connect to nothing
+anvil rollback --target web1              # restore web1's files
+anvil rollback --force /etc/app.conf      # restore that dest even though it changed since the apply
+```
+
+| Flag                  | Effect                                                                        |
+| --------------------- | ----------------------------------------------------------------------------- |
+| `--force DEST`        | restore DEST even if it changed since the last apply; repeat for more dests   |
+| `--force-all`         | restore every file even if it changed since the last apply                    |
+| `--allow-host-change` | roll back even if the target's machine-id or hostname differs from the record |
+| `--dry-run`           | list what would be restored, connecting to nothing                            |
+
+`--target`, `--parallel` and `--json` work as for apply. `--force` and `--force-all` together are a usage error.
+
+```text
+▶ web1
+  $ remove /etc/new.conf
+  removed /etc/new.conf
+  $ restore /etc/app.conf
+  restored /etc/app.conf
+  $ cannot undo: packages
+  $ cannot undo: service nginx
+  $ cannot undo: step 1
+  ✔ ok · 5 steps
+
+▶ web2
+  $ nothing recorded
+  ✔ ok · 1 step
+
+2 ok, 0 failed
+```
+
+- **Last written first.** Each recorded file is one step, in the reverse of the order apply wrote them:
+  `restore DEST` prints `restored DEST`, `remove DEST` prints `removed DEST`, and either prints `unchanged DEST` when
+  DEST already is what it was before the apply (a restore still sets the owner and mode back). A file whose text was not kept
+  is a skipped step `cannot undo: DEST (REASON)`, with the reason from the record (`rollback = false`, say).
+- **What cannot be undone.** After the files, the steps of the apply that ran but cannot be undone show as skipped
+  steps: `cannot undo: packages`, `cannot undo: service NAME` and `cannot undo: step N` (the Nth `[[steps]]` entry).
+  Rollback never runs a package manager, a service command or a step.
+- **The same path as the write.** Each file is restored as apply wrote it, from the recorded `sudo` and the target's
+  current facts: through `sudo -n`, as root, as the connecting user, or on the password path, which stages the text in
+  a 0600 `/tmp/anvil-` file and runs `sudo install -o UID -g GID -m MODE`. The sudo password comes from the target's
+  sudo secret whenever its entry has a `sudo = true` file. The root checks of a write apply too
+  ([File steps](#file-steps)). Only root can give a file back its owner;
+  as the connecting user, rollback warns `files: DEST was owned by UID:GID; only root can give it back` when it differs.
+- **Only what the config names.** The record is a file the user can edit, so each of a target's recorded dests must
+  still be the `dest` of a `[[files]]` entry with the same `sudo` that applies to the target: its tags before the
+  target connects, its facts once the probe has run. A dest whose text the record keeps also needs that entry not to
+  say `rollback = false`. Otherwise the target fails and nothing runs, with
+  `rollback: DEST is not in [[files]]; refusing to restore it`,
+  `rollback: DEST has sudo = false in [[files]] but sudo = true in the record; refusing to restore it`,
+  `rollback: no [[files]] entry for DEST applies to TARGET; refusing to restore it` or
+  `rollback: DEST has rollback = false in [[files]] but the record keeps its text; refusing to restore it`. Put the
+  entry back to roll that target back. A record whose dest, mode or sha256 apply could not have written (a relative dest,
+  a `..`, a leading `-`, a mode that is not octal) fails with `rollback: PATH: cannot parse`, as a bad record does.
+- **The guard.** Before it changes DEST, the step hashes it. It goes ahead when DEST holds the bytes apply wrote or
+  what was there before. Anything else, a hand edit say, fails the target, exit 1, with
+  `files: DEST changed since the last apply; anvil rollback --force DEST restores it anyway`. With neither
+  `sha256sum` nor `shasum` on the target it cannot tell, and fails with
+  `files: no sha256 tool on the target to check DEST; anvil rollback --force DEST restores it`. `--force DEST` drops the
+  guard for that dest and `--force-all` for every dest. A file whose write failed midway is restored without the
+  guard: DEST may hold part of the bytes. A refused file ends its target, so the files apply wrote before it are not
+  restored either; force it or fix DEST and run rollback again. A `--force DEST` that no selected target's record lists
+  is exit 2 with `rollback: --force DEST: not in the record`.
+- **The host check.** Each target is probed first. When it is no longer the host the record is from, it fails and
+  nothing runs: `rollback: TARGET is now host LIVE, the record is from RECORDED; --allow-host-change rolls back anyway`.
+  The check compares the machine-id when both the record and the probe have one, else the short hostname (up to the
+  first `.`, lowercased); today's probe reports no machine-id, so it is the hostname. `--force` and `--force-all` do not
+  pass it; only `--allow-host-change` does.
+- **A dangling link.** A `sudo = false` dest that was a symlink to a missing file was written through the link, which
+  created that file. Rollback removes the link only, and the file it created stays:
+  `removed link DEST; the file it pointed to was kept`.
+- **`rolled_back`.** After each target, the dests it restored, removed or found unchanged are saved in its entry as
+  `rolled_back` (`at` and `dests`). That is the only change rollback makes to the record, so a second rollback restores
+  the same bytes again, or prints `unchanged DEST`. The next apply that writes a file on the target replaces the entry.
+- **Targets.** A selected target with no entry in the record shows `nothing recorded` and is ok. An entry for a target
+  no longer in the inventory is not rolled back.
+- **The lock.** Rollback holds the record's lock for its whole run, as apply does
+  ([The apply record](#the-apply-record)); a save that fails is `rollback: cannot write last-apply.json: REASON`, with
+  `; not recorded: …` for the targets whose `rolled_back` was not saved.
+
+`--dry-run` reads the record without the lock and connects to nothing. It prints `would restore DEST`,
+`would remove DEST`, `cannot undo: …` and `nothing recorded` per target, then `N targets, nothing executed`. It makes
+the same `[[files]]` checks as a rollback, with the record's facts in place of a probe: a target a rollback would
+refuse shows `✘ rollback: …` (`"error"` in `--json`), the summary reads `N targets, M failed, nothing executed`, and
+the exit is 1:
+
+```text
+▶ web1
+  would remove /etc/new.conf
+  would restore /etc/app.conf
+  cannot undo: packages
+  cannot undo: service nginx
+  cannot undo: step 1
+  ✔ 5 steps
+
+1 target, nothing executed
+```
+
+With `--json`: `{"targets":[{"target":"web1","steps":[{"run":"would remove /etc/new.conf"},…],"ok":true}],"ok":true}`.
+Without `--dry-run`, `--json` has apply's shape, a skipped step with `"skipped": true`.
+
+Exit codes:
+
+- **0**: every selected target rolled back, or had nothing recorded.
+- **1**: `rollback: no apply recorded` (no record, or one with no entry; nothing runs); a target failed (a refused
+  dest, a dest not in `[[files]]` or with another `sudo`, a host change, a failed restore or connection); the record
+  cannot be read (`rollback: PATH: REASON`, as for apply), is locked by another anvil or cannot be saved; no state
+  directory ([The apply record](#the-apply-record)).
+- **2**: a bad flag (`--force` with `--force-all`), a `--force DEST` not in the record, an unknown `--target`, or an
+  invalid config or inventory.
 
 ### `anvil run [--timeout SECS] <FILE|->`
 
@@ -971,12 +1211,15 @@ that exits non-zero aborts the command: nothing is written, exit 1.
   `plan`: a target could not be reached, probed or resolved.
   `apply`/`plan`: a plugin step's plugin failed on a target ([Plugin steps](#plugin-steps)).
   `run`: a target failed or could not be reached.
-  `apply`/`plan`/`run`: a first Ctrl-C cancelled the run ([Ctrl-C](#ctrl-c)); a second one kills anvil by SIGINT
+  `rollback`: see [anvil rollback](#anvil-rollback); `apply` also when the record cannot be read, locked or saved, or
+  there is no state directory ([The apply record](#the-apply-record)).
+  `apply`/`plan`/`run`/`rollback`: a first Ctrl-C cancelled the run ([Ctrl-C](#ctrl-c)); a second one kills anvil by SIGINT
   instead, which a shell reports as 130.
   `inventory`/`config`/`secret`: the editor exited non-zero (aborted), a file write failed, or the secret store failed,
   is locked or its passphrase prompt was cancelled.
 - **2**: a bad flag or argument (including an `--inventory` or `--config` path not ending in `.toml`), an unknown
-  `--target`, an invalid, unreadable or ambiguous file, no `$HOME`, editor not found, an invalid buffer after three
+  `--target`, an invalid, unreadable or ambiguous file, no `$HOME` (except for the state directory of `apply` and
+  `rollback`, which is 1: [The apply record](#the-apply-record)), editor not found, an invalid buffer after three
   attempts, or a secret larger than 1 MiB. For `apply` and `plan`, also a `[plugins]` entry that fails the pin checks
   ([Plugin steps](#plugin-steps)). For `run`, also a script that is empty, over 1 MiB, not UTF-8 or
   unreadable, or a `--timeout` outside 1..=3600. For `tui`, see below.

@@ -229,9 +229,9 @@ A `[[files]]` entry copies one text file onto each selected target whose tags an
 `facts` means every selected target. Matching entries run in config order, after the package step and before
 `[[steps]]`; an entry that does not match is still a step, reported as skipped, and the target's other steps still run
 ([File steps](cli.md#file-steps)). At most 64 entries: one more is exit 2 with `files: N entries exceeds the 64 entry limit`
-(`files: 65 entries exceeds the 64 entry limit` for 65). An unknown key, or a `sudo` that is not a boolean, is exit 2
-with the parser's message, which names the key and the line. A path or value quoted in a message below is cut at 64
-characters (the cut marked with `…`) and a control character is shown as a `\x1b`-style escape.
+(`files: 65 entries exceeds the 64 entry limit` for 65). An unknown key, or a `sudo` or `rollback` that is not a
+boolean, is exit 2 with the parser's message, which names the key and the line. A path or value quoted in a message
+below is cut at 64 characters (the cut marked with `…`) and a control character is shown as a `\x1b`-style escape.
 
 ```toml
 [[files]]
@@ -241,6 +241,7 @@ mode = "0644"                    # required: quoted, 3 or 4 octal digits
 tags = ["linode"]                # optional; [A-Za-z0-9_-]+; every one must be on the target
 facts = { distro = "arch" }      # optional; a probe key, equal to that fact
 sudo = false                     # optional; default true. false: write as the connecting user
+rollback = false                 # optional; default true. false: the apply record keeps the hash only
 ```
 
 **`mode`.** Required, and a quoted string. Three or four octal digits, at most `0777` plus the sticky bit, so `644`,
@@ -338,6 +339,14 @@ target fails and the others still run. `binary` with no secret, and `none`, run 
 sudo's own message. `apply` opens the secret store for files only when some selected target has a sudo secret and
 carries every tag of a `sudo = true` entry (facts are not known yet); a config whose entries are all `sudo = false`, or
 whose tags match no selected target, does not open it for files. `plan` never opens it.
+
+**`rollback`.** Defaults to true, and is omitted from the file anvil writes back when it is true. Before each write,
+apply keeps what dest held in the [apply record](cli.md#the-apply-record), `last-apply.json` in
+`$XDG_STATE_HOME/anvil` (else `~/.local/state/anvil`), so that [`anvil rollback`](cli.md#anvil-rollback) can put it
+back. The record is plain text, mode 0600, not encrypted. With `rollback = false` it keeps only the sha256 of what was
+there, never its text, and rollback shows that dest as `cannot undo: DEST (rollback = false)`. Set it on every entry
+whose dest holds a secret, such as a token or a private key. Only a previous text of at most 256 KiB, UTF-8 with no NUL
+byte, is kept; any other is kept as its hash only, and the write still goes ahead.
 
 **What lands on the target.** The bytes are compared with dest by `cmp`. The same bytes are left in place, `chmod`
 applies `mode`, and the step prints `unchanged DEST`. Otherwise it prints `wrote DEST`. Both exit 0. A missing or
@@ -538,3 +547,6 @@ and `anvil config` open the parsed document, not the file's text, so comments ar
 1 MiB cap also holds for the edit view and the stored TOML: when the document rendered in the edit format is over
 1 MiB, `anvil inventory` / `anvil config` exit 2 before starting the editor (naming the other `--format` when that view
 fits), and when a YAML edit's TOML form would be over 1 MiB, nothing is written and the exit is 2.
+
+The apply record has its own limits: a previous text is kept only up to 256 KiB, and the record up to 16 MiB, past which
+the largest texts are dropped with a warning ([The apply record](cli.md#the-apply-record)).

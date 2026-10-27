@@ -20,6 +20,12 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
 - **`[[services]]`** 在每個 tag 與 fact 都符合的選定 target 上啟動或停止一個服務，並啟用或停用它，排在檔案之後、`[[steps]]` 之前。
   它使用 target 的 init：systemd、Alpine 上的 OpenRC，或 macOS 上的 launchd。它只變更不同之處，
   因此再次執行會印出 `unchanged service NAME`。
+- **`anvil rollback`** 把上次 apply 寫入的檔案放回去：每個 dest 取回先前的文字、mode 與 owner，先前不存在的 dest 會被移除。
+  在那次 apply 之後被改過的 dest 會被拒絕，除非使用 `--force DEST`。先前的文字沒有保存的檔案（二進位、超過 256 KiB、
+  `rollback = false` 等）顯示為 `cannot undo: DEST (REASON)`，且只有以 root 寫入時 owner 才會還原。
+  套件、服務與 step 無法復原；rollback 把它們列為 `cannot undo: …`。
+  紀錄是 `$XDG_STATE_HOME/anvil` 中的 `last-apply.json`（mode 0600、明文），絕不放在 config 旁邊
+  （[anvil rollback](docs/cli.zh-TW.md#anvil-rollback)）。
 - **`anvil plan`** 列出 apply 會在每個 target 上執行的 step，但一個都不執行；`--json` 的文件標記為
   `"executed": false`。
 - **`anvil run FILE`**（或以 `-` 讀 stdin）在每個 target 上執行一份臨時的 POSIX sh 腳本，
@@ -27,7 +33,7 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
 - **plugin step**：step 可以指定一個 plugin，也就是控制端上以路徑與 sha256 釘選的程式，
   它以 JSON 讀取 target 的 facts，並回覆要在該 target 上執行的 sh 腳本。它在清空的環境中執行，拿不到任何 secret。
 - **secret（機密）** 存放在 macOS keychain、age 檔案或 sops 檔案中，`anvil secret --migrate` 可在 backend 之間搬移它們。
-- **`--parallel N`** 讓 apply、plan 與 run 同時處理最多 N 個 target（1..=32，預設 1）。
+- **`--parallel N`** 讓 apply、plan、run 與 rollback 同時處理最多 N 個 target（1..=32，預設 1）。
   輸出與 `--json` 維持 inventory 順序，Ctrl-C 會讓執行中的 step 跑完；第二次 Ctrl-C 立刻停止
   （[平行執行](docs/cli.zh-TW.md#平行執行)）。
 - **終端機介面**：`anvil tui` 在同一個畫面執行所有指令，並保留本次工作階段的結果供瀏覽。
@@ -35,7 +41,8 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
   並把先前的執行檔保留為 `anvil.prev`。金鑰要等專案 owner 加入後才會編入；在那之前，`anvil update` 會回報 `no release key compiled in`。
 - **為 agent 打造**：`--json` 在 stdout 輸出一份可解析的文件；日誌只寫到 stderr。
 - **預設即安全**：絕不自動接受 host 金鑰，sudo 密碼絕不出現在 argv、環境變數或日誌中，
-  secret 只以加密形式寫入磁碟，唯一的例外是你編輯時使用的私有編輯器暫存檔。
+  secret 只以加密形式寫入磁碟，唯一的例外是你編輯時使用的私有編輯器暫存檔。apply 紀錄以 mode 0600、未加密的形式保存
+  apply 取代掉的每個檔案先前的文字；`[[files]]` 項目設定 `rollback = false` 時只保存它的雜湊（[安全須知](docs/security.zh-TW.md)）。
 
 ## 安裝
 
@@ -61,6 +68,7 @@ anvil doctor               # local checks + every target's facts and reachabilit
 anvil plan                 # the steps apply would run on every target, running none
 anvil apply                # install packages, copy files, set services, run the steps
 anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
+anvil rollback --dry-run   # what rollback would put back; `anvil rollback` restores the last apply's files
 anvil --parallel 4 apply   # apply on up to 4 targets at once
 anvil tui                  # all of the above in one terminal UI
 anvil update --check       # is a newer release out? `anvil update` installs it
