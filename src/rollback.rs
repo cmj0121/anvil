@@ -62,7 +62,7 @@ pub fn run(
     }
     let _interrupt = Interrupt::install(&opts.cancel)?;
     apply::print_report(cli, "rollback", |on| {
-        run_targets(opts, &config, &force, allow_host_change, on)
+        run_targets(opts, &config, &force, allow_host_change, Wording::Cli, on)
     })
 }
 
@@ -104,6 +104,7 @@ pub fn run_targets(
     config: &Config,
     force: &Force,
     allow_host_change: bool,
+    wording: Wording,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
     let targets = opts.targets()?;
@@ -136,6 +137,7 @@ pub fn run_targets(
         |target, entry| {
             let host = HostCheck {
                 allow_change: allow_host_change,
+                wording,
             };
             roll_back(
                 target,
@@ -224,10 +226,12 @@ impl RolledTarget {
     }
 }
 
-/// Whether a target may be rolled back though it is now another host.
+/// Whether a target may be rolled back though it is now another host, and
+/// where its refusals send the user.
 #[derive(Clone, Copy)]
 struct HostCheck {
     allow_change: bool,
+    wording: Wording,
 }
 
 /// A selected target the record has no entry for: ok, nothing runs.
@@ -285,7 +289,7 @@ fn roll_back(
         return failed(error);
     }
     let mut runs =
-        match files::restore_runs(config, target, &facts, &entry.files, force, Wording::Cli) {
+        match files::restore_runs(config, target, &facts, &entry.files, force, host.wording) {
             Ok(runs) => runs,
             Err(error) => return failed(error),
         };

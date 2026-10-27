@@ -143,6 +143,61 @@ fn apply_shows_each_step_and_the_ok_block() {
     }
 }
 
+#[test]
+fn b_rolls_back_after_y_and_words_a_conflict_for_the_tui() {
+    if !python() {
+        return;
+    }
+    let sandbox = tui_sandbox("");
+    let dest = sandbox.root().join("out.conf").display().to_string();
+    fs::write(sandbox.config_dir().join("motd.txt"), "from apply\n").unwrap();
+    let config = fs::read_to_string(sandbox.config_dir().join("config.toml")).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{config}\n[[files]]\nsrc = \"motd.txt\"\ndest = \"{dest}\"\nmode = \"0644\"\n\
+             sudo = false\n"
+        ),
+    );
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    fs::write(&dest, "edited by hand\n").unwrap();
+
+    let refusal = format!(
+        "files: {dest} changed since the last apply; run anvil rollback --force {dest} in a \
+         terminal to restore it anyway"
+    );
+    let transcript = drive(
+        &sandbox,
+        &[],
+        &[
+            "--cols",
+            "250",
+            "--wait",
+            r"targets: all \(1\)",
+            "--send",
+            "b",
+            "--wait",
+            r"roll back 1 target: local\?",
+            // Enter does not answer it: the question stays and nothing runs.
+            "--send",
+            "\\r",
+            "--absent",
+            r"rollback · run",
+            "--wait",
+            r"y roll back · n/Esc cancel",
+            "--send",
+            "y",
+            "--wait",
+            &regex_escape(&refusal),
+            "--send",
+            "q",
+        ],
+    );
+    assert!(transcript.contains("rollback · run 1/1"), "{transcript}");
+    assert_eq!(fs::read_to_string(&dest).unwrap(), "edited by hand\n");
+}
+
 /// `text` as a Python regex matching it literally.
 fn regex_escape(text: &str) -> String {
     text.chars()

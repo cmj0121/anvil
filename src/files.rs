@@ -985,8 +985,8 @@ pub(crate) enum Wording {
     Cli,
     /// The TUI cannot force, so the message points to a terminal.
     #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the TUI rolls back from #18 U9 on")
+        not(any(test, feature = "tui")),
+        expect(dead_code, reason = "only the TUI rolls back with it")
     )]
     Tui,
 }
