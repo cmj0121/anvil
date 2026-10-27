@@ -13,10 +13,11 @@ use std::path::Path;
 use minisign_verify::{PublicKey, Signature, StreamVerifier};
 use sha2::{Digest, Sha256};
 
+use super::release::TARBALL_LIMIT;
 use crate::secret::shown_name;
 
 /// Largest tarball [`verify`] reads. D4's download cap.
-const MAX_BYTES: u64 = 64 << 20;
+const MAX_BYTES: u64 = TARBALL_LIMIT.bytes;
 /// One read, in the chunks D5 names, feeds the checksum and the signature.
 const CHUNK: usize = 64 << 10;
 
@@ -60,7 +61,7 @@ impl SignatureReason {
 }
 
 impl VerifyError {
-    fn checksum(asset: &str) -> Self {
+    pub(super) fn checksum(asset: &str) -> Self {
         VerifyError::Checksum {
             asset: asset.to_owned(),
         }
@@ -95,8 +96,9 @@ impl std::fmt::Display for VerifyError {
         match self {
             VerifyError::TooLarge { asset, bytes } => write!(
                 f,
-                "{} is {bytes} bytes, over the 64 MiB limit",
-                shown_name(asset)
+                "{} is {bytes} bytes, over the {} limit",
+                shown_name(asset),
+                TARBALL_LIMIT.text
             ),
             VerifyError::Checksum { asset } => {
                 write!(f, "checksum mismatch for {}", shown_name(asset))
@@ -128,7 +130,8 @@ impl std::error::Error for VerifyError {}
 /// `keys` is the current key and, when there is one, the next. `asset` is the
 /// file name the checksum line must carry and the name errors quote. `comment`
 /// is the trusted comment the signature must carry, exactly
-/// `anvil <tag> <triple>`.
+/// `anvil <tag> <triple>`. Returns the verified SHA-256, so the caller can
+/// check the bytes it goes on to use are the ones verified.
 pub fn verify(
     tarball: &Path,
     sha256_file: &str,
@@ -136,7 +139,7 @@ pub fn verify(
     keys: &[PublicKey],
     asset: &str,
     comment: &str,
-) -> Result<(), VerifyError> {
+) -> Result<[u8; 32], VerifyError> {
     let bytes = std::fs::metadata(tarball)
         .map_err(|err| VerifyError::read(asset, err))?
         .len();
@@ -166,7 +169,7 @@ pub fn verify(
             comment: signature.trusted_comment().to_owned(),
         });
     }
-    Ok(())
+    Ok(expected)
 }
 
 /// A verifier from whichever of `keys` carries the signature's key id.
@@ -295,7 +298,7 @@ mod tests {
             sha256_file: &str,
             minisig: &str,
             comment: &str,
-        ) -> Result<(), VerifyError> {
+        ) -> Result<[u8; 32], VerifyError> {
             let keys = TrustedKeys::parse([PUB_A, PUB_B]).unwrap();
             verify(
                 &self.tarball(),
@@ -314,14 +317,15 @@ mod tests {
         }
     }
 
-    fn message(result: Result<(), VerifyError>) -> String {
+    fn message(result: Result<[u8; 32], VerifyError>) -> String {
         result.unwrap_err().to_string()
     }
 
     #[test]
     fn accepts_a_tarball_signed_by_the_current_key() {
         let staged = Staged::new("update-a", TARBALL);
-        staged.verify(SHA256_FILE, SIG_A, COMMENT).unwrap();
+        let digest = staged.verify(SHA256_FILE, SIG_A, COMMENT).unwrap();
+        assert_eq!(digest, <[u8; 32]>::from(Sha256::digest(TARBALL)));
     }
 
     #[test]

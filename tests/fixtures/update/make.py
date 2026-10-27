@@ -5,11 +5,14 @@
 Three Ed25519 key pairs (A current, B next, C untrusted) are derived from
 fixed seeds. Only the public keys are written. These are test keys and public
 by design: anyone can rebuild their secret halves from the seeds below, so no
-release may ever trust them. The tarball is signed in the
+release may ever trust them. Each triple's tarball is signed in the
 minisign prehash format (`ED`: Ed25519 over the BLAKE2b-512 of the file) and
 once more as a legacy `Ed` signature over the file itself. The global
 signature is Ed25519 over the 64 signature bytes followed by the trusted
 comment. Secret keys never touch the disk.
+
+Per triple there is also a `.sleep.tar.gz` whose `anvil` sleeps 60 s before
+it answers `--version`, signed for the same asset name: the smoke-run timeout.
 """
 
 from __future__ import annotations
@@ -27,10 +30,9 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 HERE = Path(__file__).resolve().parent
 
 TAG = "v9.9.9"
-TRIPLE = "aarch64-apple-darwin"
-ASSET = f"anvil-{TAG}-{TRIPLE}.tar.gz"
-COMMENT = f"anvil {TAG} {TRIPLE}"
-WRONG_COMMENT = f"anvil v9.9.8 {TRIPLE}"
+TRIPLES = ("aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl")
+ANSWER = b'#!/bin/sh\necho "anvil 9.9.9"\n'
+SLEEPER = b'#!/bin/sh\nsleep 60\necho "anvil 9.9.9"\n'
 
 # Fixed phrases, not raw key material. The seed is their SHA-256.
 SEEDS = {
@@ -85,10 +87,9 @@ def sign(private, key_id: bytes, payload: bytes, trusted: str, *, prehashed: boo
     )
 
 
-def tarball_bytes() -> bytes:
+def tarball_bytes(triple: str, payload: bytes) -> bytes:
     """`anvil-<tag>-<triple>/anvil`, gzip mtime 0, so two runs match byte for byte."""
-    directory = f"anvil-{TAG}-{TRIPLE}"
-    payload = b'#!/bin/sh\necho "anvil 9.9.9"\n'
+    directory = f"anvil-{TAG}-{triple}"
     tar_buf = io.BytesIO()
     with tarfile.open(fileobj=tar_buf, mode="w", format=tarfile.USTAR_FORMAT) as tar:
         info = tarfile.TarInfo(directory)
@@ -126,25 +127,33 @@ def main() -> None:
     for name, (_private, public, key_id) in keys.items():
         write_text(f"{name}.pub", public_key_text(public, key_id))
 
-    blob = tarball_bytes()
-    (HERE / ASSET).write_bytes(blob)
-    digest = hashlib.sha256(blob).hexdigest()
-    write_text(f"{ASSET}.sha256", f"{digest}  {ASSET}\n")
-
     priv_a, _pub_a, id_a = keys["a"]
     priv_b, _pub_b, id_b = keys["b"]
     priv_c, _pub_c, id_c = keys["c"]
-    write_text(f"{ASSET}.minisig", sign(priv_a, id_a, blob, COMMENT, prehashed=True))
-    write_text(f"{ASSET}.b.minisig", sign(priv_b, id_b, blob, COMMENT, prehashed=True))
-    write_text(f"{ASSET}.c.minisig", sign(priv_c, id_c, blob, COMMENT, prehashed=True))
-    write_text(
-        f"{ASSET}.wrong.minisig",
-        sign(priv_a, id_a, blob, WRONG_COMMENT, prehashed=True),
-    )
-    write_text(
-        f"{ASSET}.legacy.minisig",
-        sign(priv_a, id_a, blob, COMMENT, prehashed=False),
-    )
+    for triple in TRIPLES:
+        asset = f"anvil-{TAG}-{triple}.tar.gz"
+        comment = f"anvil {TAG} {triple}"
+
+        def signed(file: str, blob: bytes) -> None:
+            (HERE / file).write_bytes(blob)
+            digest = hashlib.sha256(blob).hexdigest()
+            # The checksum line names the asset as served, whatever the file is called here.
+            write_text(f"{file}.sha256", f"{digest}  {asset}\n")
+            write_text(f"{file}.minisig", sign(priv_a, id_a, blob, comment, prehashed=True))
+
+        blob = tarball_bytes(triple, ANSWER)
+        signed(asset, blob)
+        signed(f"anvil-{TAG}-{triple}.sleep.tar.gz", tarball_bytes(triple, SLEEPER))
+        write_text(f"{asset}.b.minisig", sign(priv_b, id_b, blob, comment, prehashed=True))
+        write_text(f"{asset}.c.minisig", sign(priv_c, id_c, blob, comment, prehashed=True))
+        write_text(
+            f"{asset}.wrong.minisig",
+            sign(priv_a, id_a, blob, f"anvil v9.9.8 {triple}", prehashed=True),
+        )
+        write_text(
+            f"{asset}.legacy.minisig",
+            sign(priv_a, id_a, blob, comment, prehashed=False),
+        )
 
 
 if __name__ == "__main__":

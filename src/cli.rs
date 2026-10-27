@@ -55,6 +55,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "BASE", hide = true)]
     pub release_url: Option<String>,
 
+    /// Test aid, debug builds only: a minisign public key file `update`
+    /// trusts instead of the compiled-in keys; repeat once for the next key.
+    #[cfg(debug_assertions)]
+    #[arg(long, global = true, value_name = "PATH", hide = true)]
+    pub release_key: Vec<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -110,7 +116,7 @@ pub enum Command {
     /// Run every command and browse the results in a terminal UI
     #[cfg(feature = "tui")]
     Tui,
-    /// Check for a newer anvil release
+    /// Replace this binary with the latest release once it verifies
     Update {
         /// Only compare this version with the latest release
         #[arg(long)]
@@ -235,9 +241,7 @@ pub fn run(cli: &Cli) -> Result<(), Failure> {
         #[cfg(feature = "tui")]
         Command::Tui => crate::tui::run(opts),
         Command::Update { check: true } => crate::update::check(cli, &opts),
-        Command::Update { check: false } => Err(Failure::usage(
-            "anvil update: only --check is available yet",
-        )),
+        Command::Update { check: false } => crate::update::update(cli, &opts),
     }
 }
 

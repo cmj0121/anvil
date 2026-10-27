@@ -1139,6 +1139,8 @@ pub mod tests {
             ssh_home: None,
             #[cfg(debug_assertions)]
             release_url: None,
+            #[cfg(debug_assertions)]
+            release_keys: Vec::new(),
         }
     }
 

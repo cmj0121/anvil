@@ -1,10 +1,10 @@
 //! The latest release: which asset this build runs, what the GitHub API
 //! says the latest tag is, and how that tag compares with this version.
 //!
-//! The API is asked with the system `curl`, run from an argv (never a
-//! shell) with `-q` first so no `~/.curlrc` applies, https only, without a
-//! token. Its answer lands in a private stage under `$TMPDIR` that is
-//! removed again; nothing else is written.
+//! The API is asked, and the assets fetched, with the system `curl`, run
+//! from an argv (never a shell) with `-q` first so no `~/.curlrc` applies,
+//! https only, without a token, each bounded in size and time. Everything it
+//! writes lands in a private [`Stage`] under `$TMPDIR` that is removed again.
 
 use std::cmp::Ordering;
 use std::ffi::OsString;
@@ -266,37 +266,8 @@ fn query_args(source: &Source, stage: &Path) -> Vec<OsString> {
 
 /// Runs curl for the API query; its status, last headers and body.
 fn query(source: &Source, stage: &Path) -> Result<Answer, String> {
-    let curl = paths::find_program(Path::new("curl"), std::env::var_os("PATH").as_deref())
-        .ok_or("curl not found on PATH")?;
-    log::debug!("spawn {} {}", curl.display(), source.api);
-    let child = Command::new(&curl)
-        .args(query_args(source, stage))
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("cannot start {}: {err}", curl.display()))?;
-    let output =
-        collect_capped(child, Some(TIMEOUT), [64, STDERR_LIMIT]).map_err(|err| match err {
-            TransportError::Timeout { after, .. } => {
-                format!("curl timed out after {}s", after.as_secs())
-            }
-            TransportError::Spawn(reason) => format!("cannot run curl: {reason}"),
-            other => format!("curl: {other}"),
-        })?;
-    match output.code {
-        Some(0) => {}
-        Some(CURL_FILESIZE) => return Err(over_limit()),
-        Some(code) => {
-            return Err(match last_line(&output.stderr) {
-                Some(line) => format!("curl exited {code}: {line}"),
-                None => format!("curl exited {code}"),
-            });
-        }
-        None => return Err("curl was killed by a signal".to_owned()),
-    }
-    let status = String::from_utf8_lossy(&output.stdout)
+    let stdout = curl(query_args(source, stage), TIMEOUT, over_limit)?;
+    let status = String::from_utf8_lossy(&stdout)
         .trim()
         .parse()
         .map_err(|_| "curl printed no HTTP status".to_owned())?;
@@ -307,6 +278,137 @@ fn query(source: &Source, stage: &Path) -> Result<Answer, String> {
         headers: last_headers(&String::from_utf8_lossy(&headers.unwrap_or_default())),
         body,
     })
+}
+
+/// Runs curl with `args` (the URL last), stdin null and its output
+/// captured, killed after `timeout`; its stdout when it exits 0, else why
+/// not, with `too_big` for `--max-filesize` exceeded.
+fn curl(
+    args: Vec<OsString>,
+    timeout: Duration,
+    too_big: impl FnOnce() -> String,
+) -> Result<Vec<u8>, String> {
+    let curl = paths::find_program(Path::new("curl"), std::env::var_os("PATH").as_deref())
+        .ok_or("curl not found on PATH")?;
+    if let Some(url) = args.last() {
+        log::debug!("spawn {} {}", curl.display(), url.to_string_lossy());
+    }
+    let child = Command::new(&curl)
+        .args(args)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("cannot start {}: {err}", curl.display()))?;
+    let output =
+        collect_capped(child, Some(timeout), [64, STDERR_LIMIT]).map_err(|err| match err {
+            TransportError::Timeout { after, .. } => {
+                format!("curl timed out after {}s", after.as_secs())
+            }
+            TransportError::Spawn(reason) => format!("cannot run curl: {reason}"),
+            other => format!("curl: {other}"),
+        })?;
+    match output.code {
+        Some(0) => Ok(output.stdout),
+        Some(CURL_FILESIZE) => Err(too_big()),
+        Some(code) => Err(match last_line(&output.stderr) {
+            Some(line) => format!("curl exited {code}: {line}"),
+            None => format!("curl exited {code}"),
+        }),
+        None => Err("curl was killed by a signal".to_owned()),
+    }
+}
+
+/// How large one downloaded asset may be and how long it may take.
+pub struct Limit {
+    pub bytes: u64,
+    /// `bytes` as messages show it.
+    pub text: &'static str,
+    /// curl's `--max-time`, in seconds.
+    pub seconds: u64,
+}
+
+/// The tarball: 64 MiB in 300 s.
+pub const TARBALL_LIMIT: Limit = Limit {
+    bytes: 64 << 20,
+    text: "64 MiB",
+    seconds: 300,
+};
+
+/// A `.sha256` or `.minisig` file: 4 KiB in 30 s.
+pub const SMALL_LIMIT: Limit = Limit {
+    bytes: 4 << 10,
+    text: "4 KiB",
+    seconds: 30,
+};
+
+/// curl's argv to fetch `asset` into `file`, failing on an HTTP error and on
+/// more bytes than the release lists. curl before 8.4 may not enforce
+/// `--max-filesize` on a chunked response; [`download`]'s size check after
+/// the transfer still refuses it.
+fn download_args(source: &Source, asset: &Asset, limit: &Limit, file: &Path) -> Vec<OsString> {
+    let protocols = source.protocols();
+    let mut args: Vec<OsString> = [
+        "-q",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--proto",
+        protocols,
+        "--proto-redir",
+        protocols,
+        "--connect-timeout",
+        "10",
+        "--max-filesize",
+        &asset.size.to_string(),
+        "--max-time",
+        &limit.seconds.to_string(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    args.extend(["-o".into(), file.into()]);
+    args.push(asset.url.clone().into());
+    args
+}
+
+/// Downloads `asset` into `stage` under its own name, refusing one the
+/// release lists as over `limit` before it starts and one whose size is not
+/// the listed size after.
+pub fn download(
+    source: &Source,
+    asset: &Asset,
+    limit: &Limit,
+    stage: &Path,
+) -> Result<PathBuf, String> {
+    let name = &asset.name;
+    let over = || {
+        format!(
+            "{name} is larger than the {} bytes the release lists",
+            asset.size
+        )
+    };
+    if asset.size > limit.bytes {
+        return Err(format!(
+            "{name} is {} bytes, over the {} limit",
+            asset.size, limit.text
+        ));
+    }
+    let file = stage.join(name);
+    let timeout = Duration::from_secs(limit.seconds + 10);
+    curl(download_args(source, asset, limit, &file), timeout, over)?;
+    let size = fs::metadata(&file)
+        .map_err(|err| format!("cannot read the downloaded {name}: {err}"))?
+        .len();
+    if size != asset.size {
+        return Err(format!(
+            "{name} is {size} bytes, not the {} the release lists",
+            asset.size
+        ));
+    }
+    Ok(file)
 }
 
 fn over_limit() -> String {
@@ -535,6 +637,60 @@ mod tests {
         assert_eq!(
             local.last().unwrap(),
             "http://127.0.0.1:9/repos/mini-poc/anvil/releases/latest"
+        );
+    }
+
+    #[test]
+    fn a_download_runs_q_first_fails_on_http_errors_and_is_bounded() {
+        let asset = |size, url: &str| Asset {
+            name: "a".to_owned(),
+            size,
+            url: url.to_owned(),
+        };
+        let args = text(download_args(
+            &Source::github(),
+            &asset(1234, "https://github.com/x"),
+            &TARBALL_LIMIT,
+            Path::new("/s/a.tar.gz"),
+        ));
+        assert_eq!(args[0], "-q");
+        assert!(args.iter().any(|arg| arg == "--fail"));
+        assert_eq!(after(&args, "--proto"), "=https");
+        assert_eq!(after(&args, "--proto-redir"), "=https");
+        assert_eq!(after(&args, "--connect-timeout"), "10");
+        assert_eq!(after(&args, "--max-filesize"), "1234");
+        assert_eq!(after(&args, "--max-time"), "300");
+        assert_eq!(after(&args, "-o"), "/s/a.tar.gz");
+        assert_eq!(args.last().unwrap(), "https://github.com/x");
+        let small = text(download_args(
+            &Source::at("http://127.0.0.1:9"),
+            &asset(99, "http://127.0.0.1:9/x"),
+            &SMALL_LIMIT,
+            Path::new("/s/a"),
+        ));
+        assert_eq!(after(&small, "--proto"), "=http,https");
+        assert_eq!(after(&small, "--max-filesize"), "99");
+        assert_eq!(after(&small, "--max-time"), "30");
+    }
+
+    #[test]
+    fn an_asset_listed_over_its_limit_is_refused_before_curl_runs() {
+        let asset = Asset {
+            name: "anvil-v9.9.9-x.tar.gz".to_owned(),
+            size: (64 << 20) + 1,
+            url: "http://127.0.0.1:9/x".to_owned(),
+        };
+        let stage = Stage::new().unwrap();
+        let err = download(
+            &Source::at("http://127.0.0.1:9"),
+            &asset,
+            &TARBALL_LIMIT,
+            stage.path(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "anvil-v9.9.9-x.tar.gz is 67108865 bytes, over the 64 MiB limit"
         );
     }
 
