@@ -18,6 +18,7 @@ mod packages;
 mod paths;
 mod plan;
 mod plugin;
+mod private;
 mod run;
 mod secret;
 mod services;

@@ -22,25 +22,18 @@
 //! refuses to write over a store another anvil created meanwhile.
 
 use std::collections::BTreeMap;
-use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::fs::{self, File, Metadata};
+use std::io::{self, Read};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
-use rustix::fs::{FlockOperation, Mode, OFlags};
+use rustix::fs::{Mode, OFlags};
 use zeroize::Zeroizing;
 
 use super::{BackendKind, SecretError, Store, Vault, is_name};
-
-/// How often a commit tries another temp file name that already exists.
-const TEMP_ATTEMPTS: u32 = 8;
-/// How often, and how far apart, a held store lock is tried before the
-/// store counts as in use.
-const LOCK_ATTEMPTS: u32 = 10;
-const LOCK_PAUSE: Duration = Duration::from_millis(20);
+use crate::private::{self, LockError};
 
 /// How a file store turns its plaintext into the bytes on disk and back.
 pub trait Codec {
@@ -259,41 +252,15 @@ impl<'a, C: Codec> FileVault<'a, C> {
             .ok_or_else(|| self.error("not a file path".to_string()))
     }
 
-    /// `<store><suffix>` beside the store.
-    fn sibling(&self, suffix: &str) -> PathBuf {
-        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
-        name.push(suffix);
-        self.path.with_file_name(name)
-    }
-
     /// Takes the exclusive lock on `<store>.lock`, created 0600; a lock
     /// another anvil holds is an error, not a wait.
     fn lock(&self) -> Result<File, SecretError> {
-        let path = self.sibling(".lock");
-        let refuse = |message: String| SecretError::store(&path, message);
-        let fd = rustix::fs::open(
-            &path,
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600),
-        )
-        .map_err(|err| refuse(io::Error::from(err).to_string()))?;
-        let file = File::from(fd);
-        let meta = file.metadata().map_err(|err| refuse(err.to_string()))?;
-        if !meta.is_file() {
-            return Err(refuse("not a regular file".to_string()));
-        }
-        // A child forked by another thread holds a copy of the descriptor,
-        // and so the lock, until it execs: a lock held that briefly is
-        // waited out, a lock held any longer is another anvil.
-        for _ in 0..LOCK_ATTEMPTS {
-            match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => return Ok(file),
-                Err(rustix::io::Errno::WOULDBLOCK) => thread::sleep(LOCK_PAUSE),
-                Err(err) => return Err(refuse(io::Error::from(err).to_string())),
+        private::lock(self.path).map_err(|err| match err {
+            LockError::Busy(path) => SecretError::Busy { path },
+            LockError::Unsupported(path) => {
+                SecretError::store(&path, "the filesystem does not support locking (NFS?)")
             }
-        }
-        Err(SecretError::Busy {
-            path: self.path.to_path_buf(),
+            LockError::Io(path, err) => SecretError::store(&path, err.to_string()),
         })
     }
 
@@ -314,13 +281,7 @@ impl<'a, C: Codec> FileVault<'a, C> {
     /// A replacing vault overwrites whatever is there.
     fn prepare(&mut self) -> Result<(), SecretError> {
         let dir = self.dir()?;
-        if !dir.exists() {
-            DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .map_err(|err| self.error(err.to_string()))?;
-        }
+        private::create_dir(dir).map_err(|err| self.error(err.to_string()))?;
         // Checked even when just made: someone else may have made it first.
         check_dir(dir)?;
         if self.lock.is_none() {
@@ -337,40 +298,14 @@ impl<'a, C: Codec> FileVault<'a, C> {
     /// Writes `ciphertext` to a fresh 0600 temp file beside the store, syncs
     /// it and renames it over the store; the temp file is removed on error.
     fn write_atomic(&self, ciphertext: &[u8]) -> Result<(), SecretError> {
-        let (tmp, mut file) = self.create_temp()?;
-        let written = file
-            .write_all(ciphertext)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| fs::rename(&tmp, self.path));
-        if written.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        written.map_err(|err| self.error(err.to_string()))
+        private::write_atomic(self.path, ciphertext).map_err(|err| self.error(err.to_string()))
     }
 
     /// A new 0600 `<store>.tmp-<pid>-<nanos>-<n>`, a name not known
     /// in advance; a name that exists already is tried again.
+    #[cfg(test)]
     fn create_temp(&self) -> Result<(PathBuf, File), SecretError> {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let mut last = io::Error::from(io::ErrorKind::AlreadyExists);
-        for _ in 0..TEMP_ATTEMPTS {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| since.as_nanos());
-            let n = NEXT.fetch_add(1, Ordering::Relaxed);
-            let tmp = self.sibling(&format!(".tmp-{}-{nanos}-{n}", std::process::id()));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)
-            {
-                Ok(file) => return Ok((tmp, file)),
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => last = err,
-                Err(err) => return Err(self.error(err.to_string())),
-            }
-        }
-        Err(self.error(last.to_string()))
+        private::create_temp(self.path).map_err(|err| self.error(err.to_string()))
     }
 }
 
