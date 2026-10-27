@@ -5,6 +5,9 @@
 # port, `archsd` for a second container with systemd as PID 1) and a config
 # with no secret names, so the keychain is never touched. A temp XDG_STATE_HOME
 # holds last-apply.json, so no apply records into the real state directory.
+# The built anvil-audit is pinned as a doctor plugin for the drift checks, and
+# an alpine container, reached through a docker-exec stand-in for ssh, runs the
+# hash run under busybox.
 # The systemd container needs --privileged; when it cannot boot, the summary
 # says `SKIP systemd: <reason>` and the run still passes, unless
 # ANVIL_E2E_SYSTEMD=1, which turns that skip into a failure.
@@ -55,7 +58,7 @@ KEY="$TMP/id_ed25519"
 fails=0
 
 cleanup() {
-  docker rm -f "$NAME" "$SD_NAME" >/dev/null 2>&1
+  docker rm -f "$NAME" "$SD_NAME" "$NAME-alpine" >/dev/null 2>&1
   rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
@@ -87,10 +90,19 @@ docker build -q --platform "$PLATFORM" --build-arg "BASE=$BASE" --target systemd
   >"$TMP/sd-build" 2>&1 &
 sd_image=$!
 cargo build --quiet || exit 1
+cargo build --quiet -p anvil-audit || exit 1
 wait "$image" || exit 1
 wait "$sd_image" || { sd_skip="image build failed"; cat "$TMP/sd-build"; }
 ANVIL=$(pwd)/target/debug/anvil
 FAKE_EDITOR=$(pwd)/tests/fixtures/fake-editor.sh
+# anvil-audit pinned as a doctor plugin, from a 0700 dir as a plugin must be.
+mkdir -m 700 "$TMP/plugins"
+install -m 0700 target/debug/anvil-audit "$TMP/plugins/audit"
+AUDIT_SHA=$( (sha256sum "$TMP/plugins/audit" 2>/dev/null || shasum -a 256 "$TMP/plugins/audit") | cut -d' ' -f1)
+AUDIT_PLUGIN=$(printf '[plugins.audit]\npath = "%s"\nsha256 = "%s"\non = "doctor"\n' "$TMP/plugins/audit" "$AUDIT_SHA")
+# Busybox's sh, find and sha256sum for the hash run (block q): alpine:3.20, pinned
+# by manifest-list digest like the Arch images above.
+ALPINE=alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 
 step "start sshd"
 ssh-keygen -q -t ed25519 -N '' -f "$KEY" || exit 1
@@ -559,6 +571,125 @@ else
   fail "rollback after a write failed midway: exit $code"
 fi
 
+step "(p) drift on arch: anvil-audit pinned, a changed fact and file are drift, a re-apply clears it"
+DR_STATE="$TMP/state-drift"
+DR_DIR="$TMP/drift"
+mkdir -p "$DR_DIR"
+DR_TEXT="anvil-e2e-drift-$$"
+printf 'drift = "%s"\n' "$DR_TEXT" >"$DR_DIR/drift.conf"
+cat >"$DR_DIR/config.toml" <<CONF
+$AUDIT_PLUGIN
+
+[[files]]
+src = "drift.conf"
+dest = "/etc/anvil-e2e-drift"
+mode = "0644"
+CONF
+dr_anvil() {
+  run_env XDG_STATE_HOME="$DR_STATE" "$ANVIL" --ssh-config "$CFG" --config "$DR_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+# No byte of the file, and no hash or tag, reaches the output or the -vv log.
+dr_quiet() { ! grep -qF "$DR_TEXT" "$TMP/out" "$TMP/err" && ! grep -qE '[0-9a-f]{64}' "$TMP/out" "$TMP/err"; }
+docker exec "$NAME" rm -f /etc/anvil-e2e-drift /usr/local/bin/apk
+dr_anvil apply --target arch
+code=$?
+dr_anvil -vv doctor --target arch
+code2=$?
+if [ "$code" -eq 0 ] && [ "$code2" -eq 0 ] && grep -qE '^  audit +no drift$' "$TMP/out" && dr_quiet; then
+  pass "right after an apply: no drift"
+else
+  fail "apply then doctor: apply exit $code, doctor exit $code2"
+fi
+# A fact (pkg gains apk) and the file change on the target.
+docker exec "$NAME" sh -c 'printf "#!/bin/sh\n" >/usr/local/bin/apk && chmod 755 /usr/local/bin/apk \
+  && echo edited >>/etc/anvil-e2e-drift'
+dr_anvil -vv doctor --target arch
+code=$?
+if [ "$code" -eq 1 ] && grep -qxF '  audit           drift: pkg was pacman, now pacman apk' "$TMP/out" \
+  && grep -qxF '  audit           drift: /etc/anvil-e2e-drift was written, now changed' "$TMP/out" \
+  && grep -qF 'doctor: drift since the last apply' "$TMP/err" && dr_quiet; then
+  pass "a changed fact and a changed file are drift, exit 1"
+else
+  fail "doctor after the changes: exit $code"
+fi
+dr_anvil apply --target arch
+code=$?
+dr_anvil doctor --target arch
+code2=$?
+if [ "$code" -eq 0 ] && [ "$code2" -eq 0 ] && grep -qE '^  audit +no drift$' "$TMP/out" \
+  && docker exec "$NAME" cat /etc/anvil-e2e-drift | cmp -s - "$DR_DIR/drift.conf"; then
+  pass "a re-apply clears the drift"
+else
+  fail "re-apply then doctor: apply exit $code, doctor exit $code2"
+fi
+docker exec "$NAME" rm -f /etc/anvil-e2e-drift /usr/local/bin/apk
+
+step "(q) alpine (busybox sh, find, sha256sum): the hash run reads root-only files, changes are drift"
+ALP_NAME="$NAME-alpine"
+ALP_DIR="$TMP/alpine"
+mkdir -p "$ALP_DIR"
+# No network and no capabilities: the hash run needs only sh, find and
+# sha256sum, and apply only writes files root already owns.
+if docker run -d --rm --platform "$PLATFORM" --name "$ALP_NAME" --label anvil-e2e=1 \
+  --label "anvil-e2e.pid=$$" --network none --cap-drop ALL "$ALPINE" sleep 600 \
+  >/dev/null 2>"$TMP/err"; then
+  # An ssh for the container, given to the debug build's --ssh-program: every
+  # control command and master succeeds, a client runs its script there as root.
+  cat >"$ALP_DIR/ssh" <<SH
+#!/bin/sh
+for arg in "\$@"; do
+  case "\$arg" in -O | -M) exit 0 ;; esac
+done
+exec docker exec -i "$ALP_NAME" sh -s
+SH
+  chmod 755 "$ALP_DIR/ssh"
+  printf '[hosts.alpine]\nhost = "alpine.invalid"\n' >"$ALP_DIR/inventory.toml"
+  printf 'alpine = "%s"\n' "$DR_TEXT" >"$ALP_DIR/a.conf"
+  cat >"$ALP_DIR/config.toml" <<CONF
+$AUDIT_PLUGIN
+
+[[files]]
+src = "a.conf"
+dest = "/etc/anvil-e2e-alpine"
+mode = "0644"
+
+[[files]]
+src = "a.conf"
+dest = "/srv/anvil-e2e/b.conf"
+mode = "0644"
+CONF
+  docker exec "$ALP_NAME" install -d -m 755 /srv/anvil-e2e
+  alp_anvil() {
+    run_env XDG_STATE_HOME="$TMP/state-alpine" "$ANVIL" --ssh-program "$ALP_DIR/ssh" \
+      --inventory "$ALP_DIR/inventory.toml" --config "$ALP_DIR/config.toml" "$@" \
+      </dev/null >"$TMP/out" 2>"$TMP/err"
+  }
+  alp_anvil apply --target alpine
+  code=$?
+  alp_anvil doctor --target alpine
+  code2=$?
+  if [ "$code" -eq 0 ] && [ "$code2" -eq 0 ] && grep -qE '^  audit +no drift$' "$TMP/out" \
+    && grep -qE '^  distro +alpine$' "$TMP/out" && dr_quiet; then
+    pass "busybox hashes both root-only files as written: no drift"
+  else
+    fail "apply then doctor on alpine: apply exit $code, doctor exit $code2"
+  fi
+  docker exec "$ALP_NAME" sh -c 'echo edited >>/etc/anvil-e2e-alpine && chmod 775 /srv/anvil-e2e'
+  alp_anvil doctor --target alpine
+  code=$?
+  if [ "$code" -eq 1 ] && grep -qxF '  audit           drift: /etc/anvil-e2e-alpine was written, now changed' "$TMP/out" \
+    && grep -qxF '  audit           drift: /srv/anvil-e2e/b.conf was written, now not root-only' "$TMP/out" \
+    && dr_quiet; then
+    pass "busybox: a changed file is changed, a group-writable parent is not root-only"
+  else
+    fail "doctor on alpine after the changes: exit $code"
+  fi
+  docker rm -f "$ALP_NAME" >/dev/null 2>&1
+else
+  fail "docker run $ALPINE"
+fi
+
 step "(e) password user through a pty: prompted once by doctor, not again by apply"
 if command -v python3 >/dev/null 2>&1; then
   run_env PTY_PASSWORD="$PASSWORD" python3 tests/e2e/pty_login.py --prompts 1 --expect "$DISTRO_LINE" \
@@ -762,6 +893,19 @@ CONF
   else
     fail "rollback with the sudo secret: exit $code, left: $left"
     docker exec "$NAME" stat -c '%a %U:%G %n' /etc/anvil-e2e-rbpw
+  fi
+  # Doctor never types the sudo password: archpw's root-only file is counted,
+  # not compared, with one warning.
+  printf '%s\n' "$AUDIT_PLUGIN" >"$SUDO_FILES_DIR/doctor.toml"
+  SUDO_CONFIG_USED="$SUDO_FILES_DIR/doctor.toml"
+  sudo_anvil doctor --target archpw
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  files           1 not compared (1 no sudo)' "$TMP/out" \
+    && [ "$(grep -cE '^  sudo +WARNING: ' "$TMP/out")" = 1 ] && grep -qE '^  audit +no drift$' "$TMP/out" \
+    && ! grep -qF -e "$PASSWORD" -e "$FILE_CONTENT" "$TMP/out" "$TMP/err"; then
+    pass "doctor on archpw: the root-only file is no_sudo, one warning, exit 0"
+  else
+    fail "doctor with anvil-audit on archpw: exit $code"
   fi
   SUDO_CONFIG_USED=$SUDO_CONFIG
   # One wrong attempt only, and last: pam_faillock locks pw after three.

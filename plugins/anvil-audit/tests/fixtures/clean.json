@@ -1,0 +1,35 @@
+{
+  "target": "linode1",
+  "facts": {
+    "hostname": "linode1",
+    "kernel": "6.1",
+    "os": "arch",
+    "sudo": "binary=/usr/bin/sudo nopasswd=no"
+  },
+  "tags": [],
+  "args": {},
+  "last_apply": {
+    "at": 100,
+    "facts": {
+      "hostname": "linode1",
+      "kernel": "6.1",
+      "sudo": "binary=/usr/bin/sudo nopasswd=yes"
+    },
+    "files": [
+      {
+        "dest": "/etc/app.conf",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "written"
+      }
+    ],
+    "rolled_back": null
+  },
+  "current_files": [
+    {
+      "dest": "/etc/app.conf",
+      "state": "file",
+      "tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ]
+}

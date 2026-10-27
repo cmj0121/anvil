@@ -18,6 +18,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -478,15 +479,30 @@ fn not_a_symlink(sudo: &str, d: &str, dest: &str) -> String {
 /// follow `dir` when it is a symlink. A missing `dir` passes, so the write
 /// fails as it would, and so does a failing `sudo`, as above.
 fn owned_only(sudo: &str, dir: &str, owner: &str) -> String {
-    let d = quote(dir);
     let message = quote(&format!(
         "files: {dir} is not root-only; root will not write under it"
     ));
     format!(
-        "{{ {{ ! {sudo}test -e {d} && ! {sudo}test -L {d}; }} \
-         || [ -n \"$({sudo}find {d} -prune -type d -user {owner} ! -perm -020 ! -perm -002)\" ] \
-         || {{ echo {message} >&2; false; }}; }} && "
+        "{{ {} || {{ echo {message} >&2; false; }}; }} && ",
+        is_owned_only(sudo, dir, owner)
     )
+}
+
+/// The test [`owned_only`] runs, alone: true when `dir` is missing or a
+/// directory that `owner` owns and neither group nor others may write.
+fn is_owned_only(sudo: &str, dir: &str, owner: &str) -> String {
+    let d = quote(dir);
+    let found = root_only_find(owner);
+    format!(
+        "{{ ! {sudo}test -e {d} && ! {sudo}test -L {d}; }} \
+         || [ -n \"$({sudo}find {d} {found})\" ]"
+    )
+}
+
+/// The `find` test after a directory that prints it only when it is a
+/// directory `owner` owns that group and others cannot write.
+fn root_only_find(owner: &str) -> String {
+    format!("-prune -type d -user {owner} ! -perm -020 ! -perm -002")
 }
 
 /// The checks before a write as root, run as root ahead of any other command
@@ -891,8 +907,315 @@ impl Captured {
     }
 }
 
+/// What [`hash_script`] found at one dest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileState {
+    /// A regular file; its sha256 comes with it.
+    File,
+    Absent,
+    /// A symlink, on the user path, whose target does not exist.
+    Dangling,
+    /// A symlink, as root, which a write would refuse.
+    Symlink,
+    NotRegular,
+    Unreadable,
+    /// A directory on its path is not root's, or group or others may write
+    /// it, so root would not write under it.
+    NotRootOnly,
+    /// The target has neither `sha256sum` nor `shasum`.
+    NoHash,
+    /// `sudo -n` refused, or doctor would need the password.
+    NoSudo,
+}
+
+impl FileState {
+    const ALL: [FileState; 9] = [
+        FileState::File,
+        FileState::Absent,
+        FileState::Dangling,
+        FileState::Symlink,
+        FileState::NotRegular,
+        FileState::Unreadable,
+        FileState::NotRootOnly,
+        FileState::NoHash,
+        FileState::NoSudo,
+    ];
+
+    /// The word [`hash_script`] prints, and the JSON name.
+    fn word(self) -> &'static str {
+        match self {
+            FileState::File => "file",
+            FileState::Absent => "absent",
+            FileState::Dangling => "dangling",
+            FileState::Symlink => "symlink",
+            FileState::NotRegular => "not_regular",
+            FileState::Unreadable => "unreadable",
+            FileState::NotRootOnly => "not_root_only",
+            FileState::NoHash => "no_hash",
+            FileState::NoSudo => "no_sudo",
+        }
+    }
+}
+
+/// A dest to hash, and whether the write runs as root (a root login or a
+/// `sudo` entry), so the hash does too, after the write's root checks.
+#[derive(Debug, Clone, Copy)]
+pub struct HashDest<'a> {
+    pub dest: &'a str,
+    pub as_root: bool,
+}
+
+/// The lines [`hash_script`] prints start with this.
+const HASH_MARK: &str = "anvil-hash ";
+
+/// The whole hash run for one target: one `anvil-hash I STATE [HEX]` line
+/// per index of `dests`, where only `file` has a HEX. User-path dests are
+/// hashed in the outer `sh`, following a link as `tee` would; as-root dests
+/// inside one `{sudo}sh -s` (`sudo` is `""` on a root login, else
+/// `"sudo -n "`) that reads its script from a heredoc, so no argument
+/// grows with the dests. There each directory on their paths is checked
+/// once, as [`root_checks`] checks it, then each dest is refused as a
+/// symlink. The inner `sh` prints [`ROOT_READY`] first: with no output at
+/// all sudo never ran it, and each as-root dest is `no_sudo` (on a root
+/// login nothing, so [`parse_hashes`] refuses the run); output that stops
+/// after it leaves indexes missing, which the parse refuses too. A dest is
+/// only ever a quoted
+/// argument, never printed, so its name cannot forge a line; the run reads
+/// no bytes but the hash tool's.
+pub(crate) fn hash_script(dests: &[HashDest], sudo: &str) -> Result<String, String> {
+    hash_run(dests, sudo, Path::new("/"), "0")
+}
+
+/// [`hash_script`] with the as-root directory checks from `top` down, each
+/// owned by `owner`.
+fn hash_run(dests: &[HashDest], sudo: &str, top: &Path, owner: &str) -> Result<String, String> {
+    let setup = format!(
+        "umask 077; LC_ALL=C; export LC_ALL; set -f\n{hash}{state}",
+        hash = hash_fn(""),
+        state = HASH_STATE,
+    );
+    let user: String = dests
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| !file.as_root)
+        .map(|(i, file)| format!("anvil_user {i} {}\n", quote(file.dest)))
+        .collect();
+    let root: Vec<(usize, &str)> = dests
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| file.as_root)
+        .map(|(i, file)| (i, file.dest))
+        .collect();
+    if root.is_empty() {
+        return Ok(format!("{{ exec 2>/dev/null; {setup}{HASH_USER}{user}}}\n"));
+    }
+    let inner = format!("echo {ROOT_READY}\n{setup}{}", root_walk(&root, top, owner));
+    let heredoc = Heredoc::new(&inner).map_err(|why| format!("files: the hash run {why}"))?;
+    let failed: String = match sudo {
+        "" => String::new(),
+        _ => root
+            .iter()
+            .map(|(i, _)| format!("echo '{HASH_MARK}{i} no_sudo'\n"))
+            .collect(),
+    };
+    Ok(format!(
+        "{{ exec 2>/dev/null; {setup}{HASH_USER}{user}\
+         anvil_root() {{\n{sudo}sh -s <<'{delimiter}'\n{body}}}\n\
+         anvil_out=$(anvil_root)\n\
+         if [ -z \"$anvil_out\" ]; then :\n{failed}\
+         else case $anvil_out in {ROOT_READY}*) anvil_out=${{anvil_out#{ROOT_READY}}}; anvil_out=${{anvil_out#?}} ;; esac\n\
+         printf '%s\\n' \"$anvil_out\"; fi\n}}\n",
+        delimiter = heredoc.delimiter,
+        body = heredoc.body(),
+    ))
+}
+
+/// The inner `sh`'s first line: output without it means sudo never ran it.
+const ROOT_READY: &str = "anvil-root-ready";
+
+/// Defines `anvil_user I FILE`: a user-path dest's line, after a dangling
+/// link check.
+const HASH_USER: &str = "anvil_user() {
+if test -L \"$2\" && ! test -e \"$2\"; then echo \"anvil-hash $1 dangling\"
+else anvil_state \"$1\" \"$2\"; fi
+}
+";
+
+/// The as-root part of [`hash_run`]: from `top`, a walk that checks each
+/// directory on the dests' paths once and `cd`s into it only when it is
+/// `owner`'s and root-only, then one line per dest. The dests below each
+/// directory are a range of ranks, recorded in `$anvil_bad` when it exists
+/// and fails the test (`not_root_only`), or in `$anvil_shut` when it passes
+/// but root cannot enter it (`unreadable`). A missing directory is not
+/// entered and records nothing: the dests below are absent. Each name
+/// appears once, so the script grows with the dests.
+fn root_walk(root: &[(usize, &str)], top: &Path, owner: &str) -> String {
+    #[derive(Default)]
+    struct Dir<'a> {
+        dests: Vec<usize>,
+        dirs: BTreeMap<&'a str, Dir<'a>>,
+    }
+    fn walk(dir: &Dir, ranks: &mut Vec<usize>) -> String {
+        ranks.extend(&dir.dests);
+        let mut out = String::new();
+        for (name, sub) in &dir.dirs {
+            let (start, body) = (ranks.len(), walk(sub, ranks));
+            out += &format!(
+                "if anvil_cd {} {start}-{end}; then\n{body}cd -P .. || exit 1; fi\n",
+                quote(name),
+                end = ranks.len(),
+            );
+        }
+        out
+    }
+
+    let mut tree = Dir::default();
+    let mut outside = Vec::new();
+    for &(i, dest) in root {
+        let parent = Path::new(dest)
+            .parent()
+            .and_then(|p| p.strip_prefix(top).ok());
+        let Some(parent) = parent else {
+            outside.push(i);
+            continue;
+        };
+        let mut dir = &mut tree;
+        for name in parent.iter().filter_map(|name| name.to_str()) {
+            dir = dir.dirs.entry(name).or_default();
+        }
+        dir.dests.push(i);
+    }
+    let mut ranks = Vec::new();
+    let body = walk(&tree, &mut ranks);
+    let below = ranks.len();
+    ranks.extend(&outside);
+    let top = top.to_str().unwrap_or_default();
+    let found = root_only_find(owner);
+    let mut out = format!(
+        "anvil_cd() {{\n\
+         if [ -n \"$(find \"./$1\" {found})\" ]; then\n\
+         cd -P \"./$1\" && return 0\n\
+         anvil_shut=\"$anvil_shut $2\"\n\
+         elif test -e \"./$1\" || test -L \"./$1\"; then anvil_bad=\"$anvil_bad $2\"\n\
+         fi\n\
+         return 1\n}}\n\
+         {HASH_ROOT}anvil_bad=' {below}-{all}'; anvil_shut=\n\
+         if ! {{ {owned}; }}; then anvil_bad=' 0-{all}'\n\
+         elif cd -P {t}; then :\n{body}\
+         else anvil_shut=' 0-{below}'; fi\n",
+        all = ranks.len(),
+        owned = is_owned_only("", top, owner),
+        t = quote(top),
+    );
+    let dests: BTreeMap<usize, &str> = root.iter().copied().collect();
+    for (rank, i) in ranks.iter().enumerate() {
+        out += &format!("anvil_one {rank} {i} {}\n", quote(dests[i]));
+    }
+    out
+}
+
+/// Defines `anvil_one RANK I FILE`: an as-root dest's line, `not_root_only`
+/// when RANK is in a range in `$anvil_bad`, `unreadable` when in one in
+/// `$anvil_shut`, else after a symlink check.
+const HASH_ROOT: &str = "anvil_in() {
+for anvil_r in $2; do
+[ \"$1\" -ge \"${anvil_r%-*}\" ] && [ \"$1\" -lt \"${anvil_r#*-}\" ] && return 0
+done
+return 1
+}
+anvil_one() {
+if anvil_in \"$1\" \"$anvil_bad\"; then echo \"anvil-hash $2 not_root_only\"
+elif anvil_in \"$1\" \"$anvil_shut\"; then echo \"anvil-hash $2 unreadable\"
+elif test -L \"$3\"; then echo \"anvil-hash $2 symlink\"
+else anvil_state \"$2\" \"$3\"; fi
+}
+";
+
+/// Defines `anvil_state I FILE`, which prints FILE's line for index I after
+/// the link checks: `absent`, or `unreadable` when a directory on its path
+/// cannot be searched, then `not_regular`, else its hash through [`HASH`].
+/// `anvil_hidden FILE` walks up from FILE to the first directory it can
+/// enter (FILE was missing: absent), or one it cannot (unreadable).
+const HASH_STATE: &str = "anvil_hidden() {
+anvil_p=$1
+while :; do
+anvil_p=${anvil_p%/*}; [ -n \"$anvil_p\" ] || anvil_p=/
+if (cd -P \"$anvil_p\"); then return 1
+elif test -d \"$anvil_p\"; then return 0
+elif test -e \"$anvil_p\" || [ \"$anvil_p\" = / ]; then return 1
+fi
+done
+}
+anvil_state() {
+if ! test -e \"$2\"; then
+if anvil_hidden \"$2\"; then echo \"anvil-hash $1 unreadable\"; else echo \"anvil-hash $1 absent\"; fi
+elif ! test -f \"$2\"; then echo \"anvil-hash $1 not_regular\"
+else anvil_s=$(anvil_sha256 \"$2\")
+case $? in
+0) echo \"anvil-hash $1 file $anvil_s\" ;;
+2) echo \"anvil-hash $1 no_hash\" ;;
+*) echo \"anvil-hash $1 unreadable\" ;;
+esac
+fi
+}
+";
+
+/// Parses [`hash_script`]'s stdout for `count` dests, by index. Lines before
+/// the first `anvil-hash ` line are skipped; from it on, each index must
+/// come exactly once with a known state, `file` with a 64 hex sha256 and
+/// the others with none.
+pub(crate) fn parse_hashes(
+    count: usize,
+    stdout: &[u8],
+) -> Result<Vec<(FileState, Option<String>)>, String> {
+    let unread = || "files: cannot read the hashes".to_owned();
+    let text = std::str::from_utf8(stdout).map_err(|_| unread())?;
+    let mut found: Vec<Option<(FileState, Option<String>)>> = vec![None; count];
+    let lines = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .skip_while(|line| !line.starts_with(HASH_MARK));
+    for line in lines {
+        let fields: Vec<&str> = line
+            .strip_prefix(HASH_MARK)
+            .ok_or_else(unread)?
+            .split(' ')
+            .collect();
+        let (index, word, hex) = match fields[..] {
+            [index, word] => (index, word, None),
+            [index, word, hex] => (index, word, Some(hex)),
+            _ => return Err(unread()),
+        };
+        let state = FileState::ALL
+            .into_iter()
+            .find(|state| state.word() == word)
+            .ok_or_else(unread)?;
+        let hex = match (state, hex) {
+            (FileState::File, Some(hex)) if is_sha256(hex) => Some(hex.to_owned()),
+            (FileState::File, _) | (_, Some(_)) => return Err(unread()),
+            (_, None) => None,
+        };
+        if !index.bytes().all(|b| b.is_ascii_digit()) || index.starts_with('0') && index != "0" {
+            return Err(unread());
+        }
+        let slot = index
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| found.get_mut(i))
+            .ok_or_else(unread)?;
+        if slot.replace((state, hex)).is_some() {
+            return Err(unread());
+        }
+    }
+    found
+        .into_iter()
+        .map(|slot| slot.ok_or_else(unread))
+        .collect()
+}
+
 /// `bytes` in lowercase hex.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -3621,5 +3944,419 @@ mod tests {
             format!("{plain:?}").contains("hunter2"),
             "other runs are shown unchanged"
         );
+    }
+
+    /// [`hash_run`] with the parent test over the directories from `top`
+    /// down, owned by `top`'s owner, as [`user_checks`] builds them.
+    fn user_hash_script(dests: &[HashDest], sudo: &str, top: &Path) -> String {
+        let owner = fs::metadata(top).unwrap().uid().to_string();
+        hash_run(dests, sudo, top, &owner).unwrap()
+    }
+
+    /// A sudo that logs each call to `calls` and runs the rest as the user.
+    fn counting_sudo(dir: &Path, calls: &Path) -> PathBuf {
+        let body = format!(
+            "echo \"$1 $2 $3\" >>{}\ncase $1 in -n) shift ;; esac\nexec \"$@\"",
+            quote(calls.to_str().unwrap())
+        );
+        bin_with(dir, &[], &[("sudo", &body)])
+    }
+
+    fn dest(path: &Path, as_root: bool) -> HashDest<'_> {
+        HashDest {
+            dest: path.to_str().unwrap(),
+            as_root,
+        }
+    }
+
+    #[test]
+    fn the_hash_run_reports_each_state_with_one_sudo() {
+        let dir = dir("files-hash");
+        let calls = dir.join("calls");
+        let bin = counting_sudo(&dir, &calls);
+        let sub = dir.join("sub");
+        let open = dir.join("open");
+        for d in [&sub, &open] {
+            fs::create_dir(d).unwrap();
+        }
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o775)).unwrap();
+        let file = sub.join("file");
+        fs::write(&file, "x").unwrap();
+        fs::write(open.join("conf"), "x").unwrap();
+        symlink(&file, sub.join("link")).unwrap();
+        symlink(sub.join("gone"), sub.join("dangling")).unwrap();
+        let unreadable = sub.join("unreadable");
+        fs::write(&unreadable, "x").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let paths = [
+            (file.clone(), false),
+            (sub.join("absent"), false),
+            (sub.join("dangling"), false),
+            (sub.join("link"), false),
+            (sub.clone(), false),
+            (unreadable.clone(), false),
+            (file.clone(), true),
+            (sub.join("link"), true),
+            (sub.join("dangling"), true),
+            (sub.clone(), true),
+            (open.join("conf"), true),
+            (sub.join("absent"), true),
+        ];
+        let dests: Vec<HashDest> = paths.iter().map(|(p, root)| dest(p, *root)).collect();
+        let out = sh_with(&bin, &user_hash_script(&dests, "sudo -n ", &dir));
+        assert_eq!(out.code, Some(0));
+        let x = Some(sha_hex(b"x"));
+        let unread = match rustix::process::getuid().is_root() {
+            true => (FileState::File, x.clone()),
+            false => (FileState::Unreadable, None),
+        };
+        assert_eq!(
+            parse_hashes(dests.len(), &out.stdout).unwrap(),
+            vec![
+                (FileState::File, x.clone()),
+                (FileState::Absent, None),
+                (FileState::Dangling, None),
+                (FileState::File, x.clone()),
+                (FileState::NotRegular, None),
+                unread,
+                (FileState::File, x),
+                (FileState::Symlink, None),
+                (FileState::Symlink, None),
+                (FileState::NotRegular, None),
+                (FileState::NotRootOnly, None),
+                (FileState::Absent, None),
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(&calls)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["-n sh -s"],
+            "one sudo for every as-root dest"
+        );
+
+        fs::remove_file(&calls).unwrap();
+        let users: Vec<HashDest> = dests.iter().filter(|d| !d.as_root).copied().collect();
+        let out = sh_with(&bin, &user_hash_script(&users, "sudo -n ", &dir));
+        assert_eq!(parse_hashes(users.len(), &out.stdout).unwrap().len(), 6);
+        assert!(!calls.exists(), "no sudo without an as-root dest");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_hash_run_without_a_hash_tool_is_no_hash() {
+        let dir = dir("files-hash-notool");
+        let bin = bin_with(
+            &dir,
+            &["sh", "find"],
+            &[("sudo", "case $1 in -n) shift ;; esac\nexec \"$@\"")],
+        );
+        let file = dir.join("conf");
+        fs::write(&file, "x").unwrap();
+        let dests = [dest(&file, false), dest(&file, true)];
+        let out = sh_only(&bin, &user_hash_script(&dests, "sudo -n ", &dir));
+        assert_eq!(
+            parse_hashes(2, &out.stdout).unwrap(),
+            vec![(FileState::NoHash, None), (FileState::NoHash, None)]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_sudo_makes_each_as_root_dest_no_sudo() {
+        let dir = dir("files-hash-nosudo");
+        let bin = bin_with(
+            &dir,
+            &[],
+            &[("sudo", "echo 'sudo: a password is required' >&2; exit 1")],
+        );
+        let file = dir.join("conf");
+        fs::write(&file, "x").unwrap();
+        let dests = [dest(&file, true), dest(&file, false), dest(&file, true)];
+        let out = sh_with(&bin, &user_hash_script(&dests, "sudo -n ", &dir));
+        assert_eq!(out.code, Some(0));
+        assert!(out.stderr.is_empty(), "probe stderr goes to /dev/null");
+        assert_eq!(
+            parse_hashes(3, &out.stdout).unwrap(),
+            vec![
+                (FileState::NoSudo, None),
+                (FileState::File, Some(sha_hex(b"x"))),
+                (FileState::NoSudo, None),
+            ]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_inner_sh_that_fails_after_sudo_ran_it_is_no_answer_not_no_sudo() {
+        let dir = dir("files-hash-inner");
+        let file = dir.join("conf");
+        fs::write(&file, "x").unwrap();
+        let dests = [dest(&file, false), dest(&file, true)];
+        let script = user_hash_script(&dests, "sudo -n ", &dir);
+        for sh in [format!("echo {ROOT_READY}; exit 1"), "exit 1".to_owned()] {
+            let bin = dir.join("bin");
+            let _ = fs::remove_dir_all(&bin);
+            let bin = bin_with(
+                &dir,
+                &[],
+                &[("sudo", "shift; exec \"$@\""), ("sh", sh.as_str())],
+            );
+            let out = sh_with(&bin, &script);
+            let parsed = parse_hashes(2, &out.stdout);
+            if sh == "exit 1" {
+                assert_eq!(parsed.unwrap()[1], (FileState::NoSudo, None), "{sh}");
+            } else {
+                assert_eq!(parsed.unwrap_err(), "files: cannot read the hashes", "{sh}");
+            }
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_root_only_dir_root_cannot_enter_is_unreadable() {
+        if rustix::process::getuid().is_root() {
+            return;
+        }
+        let dir = dir("files-hash-shut");
+        let bin = passthrough_sudo(&dir);
+        // BSD find cannot -prune a directory it cannot search; GNU find can,
+        // and root can search any.
+        let find = std::env::split_paths(&std::env::var("PATH").unwrap())
+            .map(|p| p.join("find"))
+            .find(|p| p.is_file())
+            .unwrap();
+        let wrapper = format!(
+            "#!/bin/sh\ncase $1 in */shut) [ -d \"$1\" ] && echo \"$1\" ;; \
+             *) exec {} \"$@\" ;; esac\n",
+            quote(find.to_str().unwrap())
+        );
+        fs::write(bin.join("find"), wrapper).unwrap();
+        fs::set_permissions(bin.join("find"), fs::Permissions::from_mode(0o755)).unwrap();
+        let shut = dir.join("shut");
+        fs::create_dir_all(shut.join("sub")).unwrap();
+        fs::write(shut.join("sub/conf"), "x").unwrap();
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o600)).unwrap();
+        let open = dir.join("open");
+        fs::create_dir(&open).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o770)).unwrap();
+        let paths = [shut.join("sub/conf"), open.join("conf"), shut.join("conf")];
+        let dests: Vec<HashDest> = paths.iter().map(|path| dest(path, true)).collect();
+        let script = user_hash_script(&dests, "sudo -n ", &dir);
+        let out = sh_with(&bin, &script);
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            parse_hashes(3, &out.stdout).unwrap(),
+            vec![
+                (FileState::Unreadable, None),
+                (FileState::NotRootOnly, None),
+                (FileState::Unreadable, None),
+            ]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_hash_script_runs_the_root_checks_from_the_root() {
+        let dir = dir("files-hash-root");
+        let file = dir.join("conf");
+        fs::write(&file, "x").unwrap();
+        let script = hash_script(&[dest(&file, true)], "").unwrap();
+        assert!(!script.contains("sudo -n"), "{script}");
+        assert!(script.contains("find '/' -prune"), "{script}");
+        let out = sh_with(&dir, &script);
+        // A temp dir is world-writable or not root's.
+        assert_eq!(
+            parse_hashes(1, &out.stdout).unwrap(),
+            vec![(FileState::NotRootOnly, None)]
+        );
+
+        // On a root login a failing inner sh is no answer, not no_sudo.
+        let bin = bin_with(&dir, &[], &[("sh", "exit 1")]);
+        let out = sh_with(&bin, &script);
+        assert_eq!(
+            parse_hashes(1, &out.stdout).unwrap_err(),
+            "files: cannot read the hashes"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn deep_dests_check_each_directory_once_and_pass_no_long_argument() {
+        let dir = dir("files-hash-deep");
+        let bin = passthrough_sudo(&dir);
+        let top = dir.to_str().unwrap();
+        let level = format!("/{}", "d".repeat(99));
+        let depth = (4000 - top.len()) / level.len();
+        let dests: Vec<String> = (0..64)
+            .map(|k| format!("{top}/k{k:02}{}/conf", level.repeat(depth)))
+            .collect();
+        for (k, dest) in dests.iter().enumerate() {
+            assert!((3900..=4096).contains(&dest.len()), "{}", dest.len());
+            if k % 2 == 0 {
+                fs::create_dir(dir.join(format!("k{k:02}"))).unwrap();
+            }
+        }
+        // Two shared dirs, to see each checked once.
+        let shared = [format!("{top}/k00/a"), format!("{top}/k00/b")];
+        let all: Vec<HashDest> = dests
+            .iter()
+            .chain(&shared)
+            .map(|d| HashDest {
+                dest: d,
+                as_root: true,
+            })
+            .collect();
+        fs::write(&shared[0], "x").unwrap();
+        let script = user_hash_script(&all, "sudo -n ", &dir);
+        // Each of the 64 chains of depth + 1 directories, once.
+        assert_eq!(script.matches("if anvil_cd ").count(), 64 * (depth + 1));
+        assert!(script.len() < 1 << 20, "{} bytes", script.len());
+        let out = sh_with(&bin, &script);
+        let mut want = vec![(FileState::Absent, None); 64];
+        want.push((FileState::File, Some(sha_hex(b"x"))));
+        want.push((FileState::Absent, None));
+        assert_eq!(parse_hashes(66, &out.stdout).unwrap(), want);
+
+        fs::set_permissions(dir.join("k00"), fs::Permissions::from_mode(0o775)).unwrap();
+        let out = sh_with(&bin, &script);
+        let states: Vec<FileState> = parse_hashes(66, &out.stdout)
+            .unwrap()
+            .into_iter()
+            .map(|(state, _)| state)
+            .collect();
+        for (i, state) in states.iter().enumerate() {
+            let under_k00 = i == 0 || i >= 64;
+            let want = if under_k00 {
+                FileState::NotRootOnly
+            } else {
+                FileState::Absent
+            };
+            assert_eq!(*state, want, "dest {i}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_hash_run_carries_no_bytes_and_a_dest_cannot_forge_a_line() {
+        let dir = dir("files-hash-leak");
+        let bin = passthrough_sudo(&dir);
+        let secret = dir.join("conf");
+        fs::write(&secret, SECRET_TEXT).unwrap();
+        let forged = dir.join(format!("a\n{HASH_MARK}0 file {}\nb", "0".repeat(64)));
+        fs::write(&forged, "x").unwrap();
+        let quoted_dir = dir.join("o'k");
+        fs::create_dir(&quoted_dir).unwrap();
+        let quoted = quoted_dir.join(format!("it's '\n{HASH_MARK}2 absent\n'"));
+        fs::write(&quoted, "q").unwrap();
+        let dests = [
+            dest(&forged, false),
+            dest(&secret, false),
+            dest(&quoted, false),
+            dest(&forged, true),
+            dest(&secret, true),
+            dest(&quoted, true),
+        ];
+        let script = user_hash_script(&dests, "sudo -n ", &dir);
+        assert!(!script.contains("hunter2"), "{script}");
+        let out = sh_with(&bin, &script);
+        let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+        assert!(!stdout.contains("hunter2"), "{stdout}");
+        assert_eq!(stdout.lines().count(), 6, "{stdout}");
+        let x = Some(sha_hex(b"x"));
+        let secret = Some(sha_hex(SECRET_TEXT.as_bytes()));
+        let q = Some(sha_hex(b"q"));
+        assert_eq!(
+            parse_hashes(6, &out.stdout).unwrap(),
+            vec![
+                (FileState::File, x.clone()),
+                (FileState::File, secret.clone()),
+                (FileState::File, q.clone()),
+                (FileState::File, x),
+                (FileState::File, secret),
+                (FileState::File, q),
+            ]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_user_dest_under_a_dir_it_cannot_search_is_unreadable() {
+        if rustix::process::getuid().is_root() {
+            return;
+        }
+        let dir = dir("files-hash-locked");
+        let locked = dir.join("locked");
+        fs::create_dir_all(locked.join("sub")).unwrap();
+        fs::write(locked.join("sub/conf"), "x").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let (conf, gone) = (locked.join("sub/conf"), dir.join("gone/deeper/conf"));
+        let dests = [dest(&conf, false), dest(&gone, false)];
+        let out = sh_with(&dir, &user_hash_script(&dests, "", &dir));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            parse_hashes(2, &out.stdout).unwrap(),
+            vec![(FileState::Unreadable, None), (FileState::Absent, None)]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_hashes_takes_each_index_once_in_the_exact_shape() {
+        let hex = "ab".repeat(32);
+        let good = format!("sudo: a warning\n\n{HASH_MARK}1 absent\n{HASH_MARK}0 file {hex}\n");
+        assert_eq!(
+            parse_hashes(2, good.as_bytes()).unwrap(),
+            vec![
+                (FileState::File, Some(hex.clone())),
+                (FileState::Absent, None)
+            ]
+        );
+        for word in [
+            "absent",
+            "dangling",
+            "symlink",
+            "not_regular",
+            "unreadable",
+            "not_root_only",
+            "no_hash",
+            "no_sudo",
+        ] {
+            let line = format!("{HASH_MARK}0 {word}\n");
+            let (state, none) = parse_hashes(1, line.as_bytes()).unwrap().remove(0);
+            assert_eq!((state.word(), none), (word, None));
+            assert_eq!(serde_json::to_value(state).unwrap(), word);
+        }
+        for bad in [
+            format!("{HASH_MARK}0 absent\n"),
+            format!("{HASH_MARK}0 absent\n{HASH_MARK}0 absent\n{HASH_MARK}1 absent\n"),
+            format!("{HASH_MARK}0 absent\n{HASH_MARK}2 absent\n"),
+            format!("{HASH_MARK}0 absent\n{HASH_MARK}01 absent\n"),
+            format!("{HASH_MARK}0 absent\n{HASH_MARK}+1 absent\n"),
+            format!("{HASH_MARK}0 absent\n{HASH_MARK}1 gone\n"),
+            format!("{HASH_MARK}0 absent\n{HASH_MARK}1 file\n"),
+            format!(
+                "{HASH_MARK}0 absent\n{HASH_MARK}1 file {}\n",
+                hex.to_uppercase()
+            ),
+            format!("{HASH_MARK}0 absent\n{HASH_MARK}1 file {}\n", &hex[1..]),
+            format!("{HASH_MARK}0 absent {hex}\n{HASH_MARK}1 absent\n"),
+            format!("{HASH_MARK}0 absent\n{HASH_MARK}1 file {hex} x\n"),
+            format!("{HASH_MARK}0 absent\nnoise\n{HASH_MARK}1 absent\n"),
+            format!("{HASH_MARK}0  absent\n{HASH_MARK}1 absent\n"),
+            String::new(),
+        ] {
+            assert_eq!(
+                parse_hashes(2, bad.as_bytes()).unwrap_err(),
+                "files: cannot read the hashes",
+                "{bad:?}"
+            );
+        }
+        assert!(parse_hashes(1, b"anvil-hash 0 absent\xff\n").is_err());
+        assert_eq!(parse_hashes(0, b"").unwrap(), vec![]);
     }
 }

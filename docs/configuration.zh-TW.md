@@ -486,7 +486,7 @@ plugin 是控制端上、由 step 指定的程式。anvil 為每個 target 執�
 [plugins.harden]
 path = "~/.config/anvil/plugins/harden"  # required: absolute, or ~/
 sha256 = "…"                             # required: the sha256 of the file's bytes, 64 lowercase hex digits
-on = "step"                              # optional; "step", the default, is the only value
+on = "step"                              # optional; "step" (the default) or "doctor"
 
 [[steps]]
 plugin = "harden"                        # a [plugins] name, in place of run
@@ -509,15 +509,43 @@ shasum -a 256 ~/.config/anvil/plugins/harden    # macOS; on Linux: sha256sum ~/.
 - ``plugins `NAME`: must match [a-z][a-z0-9_-]*``
 - ``plugins.NAME.path `PATH`: must be an absolute path or start with ~/``
 - ``plugins.NAME.sha256 `VALUE`: must be 64 lowercase hex digits``
-- ``plugins.NAME.on `VALUE`: must be step``（`doctor` 保留給日後使用）
+- ``plugins.NAME.on `VALUE`: must be step or doctor``
+- ``steps[I].plugin `NAME`: names an on = "doctor" plugin; only doctor runs it``
 - `steps[I].args: needs plugin`，以及 `steps[I].args: N bytes as JSON exceeds the 32768 byte limit`
 - ``steps[I].plugin `NAME`: must name a [plugins] entry``
 
-檔案本身只由 `apply` 與 `plan`（以及 TUI 的 `a` 與 `p`）檢查，對每個項目都檢查，不論有沒有 step 使用它，且在連線任何 target 之前：
+檔案本身只由 `apply` 與 `plan`（以及 TUI 的 `a` 與 `p`）在連線任何 target 之前檢查，對每個 `on = "step"` 項目都檢查，不論有沒有 step 使用它；
+`on = "doctor"` 項目則由 `doctor` 檢查：
 它必須是至多 64 MiB 的一般檔案、屬於你、你可以執行、其他人都不能寫入，所在目錄也屬於你且其他人都不能寫入，
 而且檔案位元組的雜湊必須等於 `sha256`。不符合時會在任何 target 之前中止指令，`apply` 與 `plan` 以 2 結束並指出是哪個鍵，例如
 `plugins.harden.sha256: does not match /home/me/.config/anvil/plugins/harden (its bytes hash to 3b0c…)`。
-`anvil config`、`anvil doctor` 與 `anvil run` 從不檢查或執行 plugin。這些檢查沒有涵蓋的部分請見 [安全須知](security.zh-TW.md)。
+doctor 則把不符的 doctor 釘選顯示在本機檢查中、跳過該 plugin 並以 1 結束。
+`anvil config` 與 `anvil run` 從不檢查或執行 plugin。這些檢查沒有涵蓋的部分請見 [安全須知](security.zh-TW.md)。
+
+### Doctor plugins and anvil-audit
+
+`on = "doctor"` 的 plugin 只由 `anvil doctor` 執行，從不由 step 執行：它讀取上次 apply 的紀錄與每個 target 現在的狀態，
+並回覆其中的漂移。請求、回覆與顯示列請見 [Doctor plugins](cli.zh-TW.md#doctor-plugins-drift-since-the-last-apply)。
+anvil 的參考 doctor plugin `anvil-audit` 是 cargo workspace 的成員，從原始碼建置；它不在發行的 tarball 中，
+也不會被 `cargo install --path .` 安裝：
+
+```sh
+make audit-plugin                     # prints target/release/anvil-audit and its sha256
+install -d -m 0700 ~/.config/anvil/plugins
+install -m 0700 target/release/anvil-audit ~/.config/anvil/plugins/audit
+sha256sum ~/.config/anvil/plugins/audit     # or shasum -a 256; paste into sha256
+```
+
+```toml
+[plugins.audit]
+path = "~/.config/anvil/plugins/audit"
+sha256 = "…"
+on = "doctor"
+```
+
+每次重新建置位元組都會改變，所以之後要重新釘選：doctor 會在
+`plugin audit    error: plugins.audit.sha256: does not match …` 這一列顯示新的雜湊。
+config 中有 doctor plugin 時，apply 會探測每個 target，因此即使沒有 `[[files]]`，它的 facts 也會被記錄。
 
 ## 限制與拒絕
 

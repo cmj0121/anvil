@@ -38,7 +38,7 @@ impl Worker {
 pub fn spawn(job: Job, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) -> Worker {
     let opts = job_opts(&job, opts, &cancel);
     match job {
-        Job::Doctor => spawn_job(tx, move |tx| run_doctor(&opts, tx)),
+        Job::Doctor => spawn_job(tx, move |tx| run_doctor(&opts, &cancel, tx)),
         Job::Apply => spawn_job(tx, move |tx| run_apply(&opts, tx)),
         Job::Plan => spawn_job(tx, move |tx| run_plan(&opts, tx)),
         Job::Run(script) => spawn_job(tx, move |tx| run_script(&opts, script, tx)),
@@ -105,11 +105,12 @@ fn spawn_task(tx: Sender<Msg>, task: impl FnOnce(&Sender<Msg>) -> Msg + Send + '
 }
 
 /// The config and the secret store are opened here, on the worker, so an
-/// age passphrase prompt goes through the terminal handoff.
-fn run_doctor(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
+/// age passphrase prompt goes through the terminal handoff. `cancel` stops
+/// doctor between targets and plugins.
+fn run_doctor(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(), Failure> {
     let config = opts.load_config()?;
     let store = opts.secret_store(&config)?;
-    let report = doctor::check(opts, &config, store.as_ref(), &mut |progress| {
+    let report = doctor::check(opts, &config, store.as_ref(), cancel, &mut |progress| {
         let _ = tx.send(match progress {
             doctor::Progress::Start(target) => Msg::Start(target.name.clone()),
             doctor::Progress::Done(report) => Msg::DoctorTarget(report.clone()),
@@ -448,6 +449,23 @@ mod tests {
             &collect(worker, &rx)[3],
             Msg::TargetDone(_, apply::TargetReport::Cancelled { .. })
         ));
+    }
+
+    #[test]
+    fn a_set_cancel_flag_ends_the_doctor_targets_cancelled() {
+        let (tx, rx) = mpsc::channel();
+        let opts = local_opts("tui-worker-doctor-cancel", &[]);
+        let worker = spawn(Job::Doctor, opts, Arc::new(AtomicBool::new(true)), tx);
+        let msgs = collect(worker, &rx);
+        let report = msgs
+            .iter()
+            .find_map(|msg| match msg {
+                Msg::DoctorDone(report) => Some(report),
+                _ => None,
+            })
+            .expect("doctor ends with its report");
+        assert!(report.cancelled && !report.ok);
+        assert_eq!(report.targets[0].error.as_deref(), Some("cancelled"));
     }
 
     #[test]

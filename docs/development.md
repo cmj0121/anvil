@@ -3,14 +3,25 @@
 English | [繁體中文](development.zh-TW.md)
 
 ```sh
-make test   # cargo fmt --check, clippy -D warnings, cargo test
-make e2e    # doctor, apply and the ssh auth paths against an Arch sshd container; prints `skip` without docker
+make test          # builds anvil-audit, then fmt --check, clippy -D warnings and cargo test over the workspace
+make e2e           # doctor, apply and the ssh auth paths against an Arch sshd container; prints `skip` without docker
+make audit-plugin  # builds the reference doctor plugin in release and prints its path and sha256
 ```
+
+The repository is a cargo workspace: anvil at the root and `plugins/anvil-audit`, the reference
+[doctor plugin](cli.md#doctor-plugins-drift-since-the-last-apply). Its default member is anvil only, so `cargo build`,
+`cargo run`, `cargo install --path .` and the release build touch only anvil, and the release tarballs never hold
+anvil-audit. `make test` builds anvil-audit first because `tests/doctor_audit.rs` runs it; that test also builds it
+itself with `cargo build -p anvil-audit --locked`, so a plain `cargo test` works too. anvil-audit's stdin cap,
+`MAX_REQUEST` in `plugins/anvil-audit/src/main.rs`, is a plain literal: a unit test in `src/plugin.rs` reads that file
+and fails unless the literal is anvil's `DOCTOR_REQUEST_LIMIT + 1` (the request and its newline), and
+`tests/doctor_audit.rs` pipes a request of exactly the limit and one byte over through the built plugin.
 
 The terminal tests in `make test` (the age passphrase prompt and `anvil tui` on a pseudo-terminal) need python3 3.11
 or newer, for `os.login_tty`, and are skipped with a message without it.
 
-`make e2e` needs docker and `sops` on `PATH` (its sops round trip runs on the host and fails without it); its
+`make e2e` needs docker, an `alpine:3.20` image pinned by digest (pulled on the first run; its busybox runs doctor's
+hash run) and `sops` on `PATH` (its sops round trip runs on the host and fails without it); its
 interactive password checks, from the CLI and from `anvil tui`, also need `python3` (3.11 or newer for the TUI's,
 which uses `os.login_tty`) and are skipped without it. It uses a temporary `HOME` and config directory and never
 touches `~/.ssh`, the keychain or a real host. The official `archlinux` image is amd64-only, so on arm64 (Apple
@@ -27,7 +38,7 @@ GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs 
 | `version`    | Ubuntu                 | On a `v*` tag, that the tag matches Cargo.toml and both release keys exist        |
 | `pre-commit` | Ubuntu                 | `pre-commit run --all-files` (YAML, whitespace, gitleaks, markdownlint, prettier) |
 | `make test`  | Ubuntu and macOS       | `make test` with sops and python3 3.12, then a `--no-default-features` build      |
-| `MSRV`       | Ubuntu, Rust 1.89      | `cargo check --all-targets` on the `rust-version` in Cargo.toml                   |
+| `MSRV`       | Ubuntu, Rust 1.89      | `cargo check --workspace --all-targets` on the `rust-version` in Cargo.toml       |
 | `make e2e`   | Ubuntu, after the test | `make e2e` against the amd64 Arch image; a `skip` (no docker) fails the job       |
 | `build`      | Ubuntu and macOS       | After the test, release binaries for three targets, kept as artifacts (below)     |
 

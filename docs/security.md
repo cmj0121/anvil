@@ -75,6 +75,30 @@ English | [繁體中文](security.zh-TW.md)
     only its last non-empty line goes into a failure's message, cut to 64 characters with control characters escaped.
     That message is shown, and logged at info level (`-vv`), so a plugin should not write a secret to stderr.
   - `anvil plan` runs plugins too, so a plugin must have no side effects.
+- **What a doctor plugin sees.** An `on = "doctor"` plugin runs on the controller as a step plugin does, with the same
+  pin checks and cleared environment ([Doctor plugins](cli.md#doctor-plugins-drift-since-the-last-apply)). Its request
+  holds the target's live and recorded facts, its tags, each recorded dest with its mode and how the write ended, and
+  each dest's current state: never a file's bytes, a previous text, an owner, a secret or a sha256. In place of each
+  hash it gets a tag, the HMAC-SHA256 of the hash under a 32-byte key read from `/dev/urandom` for that run only and
+  never written, logged or passed on. A tag tells the plugin whether two hashes in one run are equal and nothing else; a
+  tag from one run cannot be matched against another run's, or against the hash of a guessed text. The hash run on the
+  target reads no byte back, only what `sha256sum` or `shasum` prints, and checks each directory above a root-only dest
+  as the write does. The tags keep every hash out of the request and out of doctor's output.
+- **A doctor plugin is not sandboxed.** The request is all anvil gives it, but the plugin runs as you, on the
+  controller, so it can read anything you can: `last-apply.json` (with each previous text in plain text and each
+  `written_sha256`), your config, your keys. Pin only a doctor plugin you trust as you trust the config itself.
+- **A swapped user-path dest can stall doctor.** When a dest outside the root-only paths sits in a directory others can
+  write, someone can replace it with a FIFO between the hash run's `test -f` and the hash; the read then blocks until
+  the 30 s timeout and that target's plugins fail. This is accepted: it delays doctor and nothing more, and the tags
+  keep anything read from leaking.
+- **Doctor never types the sudo password.** On a target whose `sudo -n` is refused or asks for a password, root-only
+  dests are not compared (`no_sudo`), even when the target has a `sudo_secret`; doctor says so with one warning line per
+  target. Drift in those files goes unseen until doctor can use `sudo -n`.
+- **No hash in doctor's output, with one exception.** doctor prints no sha256 and no tag. It refuses a plugin's reply
+  that holds a run of 64 or more hex digits in `was`, `now` or `text`, or whose `item` is not a dest or a fact key
+  from the request, so a 64-hex `item` can only be a real dest named like a hash. The exception is a bad pin: the
+  `plugins.NAME.sha256: does not match PATH (its bytes hash to HEX)` row names the file's actual sha256 so you can
+  re-pin it. That is the hash of the plugin file, which you own, not of anything on a target.
 
 ## anvil update
 

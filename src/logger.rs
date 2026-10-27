@@ -135,6 +135,22 @@ pub fn is_escaped(c: char) -> bool {
     c.is_control() && c != '\n' && c != '\t'
 }
 
+/// Whether `c` is a bidi, invisible or line-breaking character that could
+/// hide or reorder what is shown.
+pub fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
 fn colour_code(level: Level) -> &'static str {
     match level {
         Level::Error => RED,

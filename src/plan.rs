@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use crate::apply::{self, Escape, Line, PlannedRun, Style, Unresolved, print_lines};
 use crate::cli::{Cli, Failure, print_json};
-use crate::config::Config;
+use crate::config::{Config, Plugin};
 use crate::fanout::{self, Event};
 use crate::files::{self, Sources};
 use crate::interrupt::Interrupt;
@@ -84,7 +84,7 @@ pub fn run_targets(
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Plan, Failure> {
     let targets = opts.targets()?;
-    let pins = plugin::verify(config).map_err(Failure::usage)?;
+    let pins = plugin::verify_where(config, Plugin::is_step).map_err(Failure::usage)?;
     let sources = files::load(config).map_err(Failure::usage)?;
     Ok(plan_targets(
         &targets,

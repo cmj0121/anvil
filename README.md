@@ -34,6 +34,12 @@ system OpenSSH client.
   `--json` and exit codes. It loads no config, asks for no confirmation and types no sudo password.
 - **Plugin steps**: a step can name a plugin, a program on the controller pinned by its path and sha256, that reads
   the target's facts as JSON and replies with the sh script to run there. It gets a cleared environment and no secrets.
+- **Drift is a plugin, not a command**: there is no `anvil audit`. Pin a plugin with `on = "doctor"` and `anvil doctor`
+  reports what changed on each target since the last apply: a fact (`kernel was 6.1, now 6.2`) or a file the apply
+  wrote (`/etc/app.conf was written, now changed`). The reference plugin, `anvil-audit`, is built from source with
+  `make audit-plugin`. It sees facts, dests and per-run tags in place of hashes, never a file's bytes or a secret; drift
+  exits 1, as an unreachable target does
+  ([Doctor plugins](docs/cli.md#doctor-plugins-drift-since-the-last-apply)).
 - **Secrets** live in the macOS keychain, an age file or a sops file, and `anvil secret --migrate` moves them between
   backends.
 - **`--parallel N`** lets apply, plan, run and rollback work on up to N targets at once (1..=32, default 1). Output and
@@ -169,6 +175,31 @@ prints one JSON document; the script runs on the target as a step, and `anvil pl
 
 `anvil plan` runs the plugin too, so a plugin must have no side effects. It is pinned, not sandboxed: it runs as you,
 and the pin covers only the file's bytes ([Security notes](docs/security.md)).
+
+Drift since the last apply comes from a doctor plugin, not a command. Build the reference one, `anvil-audit`, from a
+checkout, pin it with `on = "doctor"`, and `anvil doctor` lists each change under its target, exiting 1 on drift
+([Doctor plugins](docs/cli.md#doctor-plugins-drift-since-the-last-apply)):
+
+```sh
+make audit-plugin                    # prints target/release/anvil-audit and its sha256
+install -d -m 0700 ~/.config/anvil/plugins
+install -m 0700 target/release/anvil-audit ~/.config/anvil/plugins/audit
+```
+
+```toml
+[plugins.audit]
+path = "~/.config/anvil/plugins/audit"
+sha256 = "…"                 # the sha256 make audit-plugin printed
+on = "doctor"
+```
+
+```text
+  audit           drift: kernel was 6.1, now 6.2
+  audit           drift: /etc/app.conf was written, now changed
+```
+
+The `sudo` fact is neither compared nor shown as drift. A file a rollback put back, and root-only files on a target
+where `sudo -n` was refused or asks for a password, are not compared; doctor counts and shows them instead.
 
 ## Documentation
 

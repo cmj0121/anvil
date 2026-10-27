@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use super::app::{
     self, App, BACKENDS, OPTION_FLAGS, Overlay, Pane, RunKind, RunResult, Running, Slot,
 };
-use crate::doctor::{self, SecretStatus};
+use crate::doctor::{self, RowKind, SecretStatus};
 use crate::logger::escape_controls;
 use crate::plan::{self, PlanReport};
 use crate::secret;
@@ -937,12 +937,30 @@ fn local_block(local: &doctor::LocalReport) -> Vec<Line<'static>> {
             &format!("{}{reason}", status.as_str()),
         ));
     }
+    for (name, error) in &local.plugins {
+        let label = format!("plugin {}", text(name));
+        lines.push(match error {
+            None => row(&label, "pinned"),
+            Some(error) => row(&label, &format!("error: {error}")).style(Color::Red),
+        });
+    }
+    if let Some(record) = &local.record {
+        lines.push(match local.record_failed() {
+            false => row("record", record),
+            true => row("record", &format!("error: {record}")).style(Color::Red),
+        });
+    }
+    if let Some(error) = &local.tag_key {
+        lines.push(row("tag key", &format!("error: {error}")).style(Color::Red));
+    }
     lines.push(Line::default());
     lines
 }
 
 /// One target: how it is reached, whether it is connectable, its facts,
-/// its package manager and its error.
+/// its package manager, its error, then each doctor plugin's rows (drift,
+/// errors and the `sudo` warning failed, notices dim) and the files not
+/// compared.
 fn doctor_block(report: &doctor::TargetReport) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(text(&report.target)).style(heading()),
@@ -960,6 +978,25 @@ fn doctor_block(report: &doctor::TargetReport) -> Vec<Line<'static>> {
     }
     if let Some(error) = &report.error {
         lines.push(row("error", error).style(Color::Red));
+    }
+    for plugin in &report.plugins {
+        for (kind, line) in doctor::plugin_rows(plugin) {
+            let style = match kind {
+                RowKind::Failed => Style::new().fg(Color::Red),
+                RowKind::Dim => secondary(),
+                RowKind::Plain => Style::default(),
+            };
+            lines.push(row(&text(&plugin.plugin), &line).style(style));
+        }
+    }
+    if let Some(drift) = &report.drift {
+        for (label, line) in doctor::drift_rows(drift) {
+            let style = match label {
+                "sudo" => Style::new().fg(Color::Red),
+                _ => secondary(),
+            };
+            lines.push(row(label, &line).style(style));
+        }
     }
     lines.push(Line::default());
     lines
@@ -2997,6 +3034,7 @@ mod tests {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", Some("down"))],
             ok: false,
+            cancelled: false,
         }));
         let rows = results(&shown, 12);
         assert_eq!(rows[0], "✔ local checks  ✔ pi  [✘ mac]");
@@ -3015,6 +3053,7 @@ mod tests {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", None)],
             ok: true,
+            cancelled: false,
         }));
         assert_eq!((older.shown, older.tab), (Some(0), 0));
         let rows = results(&older, 10);
@@ -3045,5 +3084,155 @@ mod tests {
             },
         );
         assert_eq!(results(&app, 6)[0], "[✘ secret \\x07]");
+    }
+
+    /// Each line's text and foreground.
+    fn shown(lines: &[Line]) -> Vec<(String, Option<Color>)> {
+        lines
+            .iter()
+            .map(|line| (line.to_string(), line.style.fg))
+            .collect()
+    }
+
+    #[test]
+    fn the_doctor_tab_shows_plugin_rows_the_summary_and_the_warning() {
+        use crate::doctor::{DriftSummary, PluginReport};
+        use crate::plugin::{Finding, Severity};
+        let finding = |item: &str, severity, text: Option<&str>| Finding {
+            target: "pi".to_owned(),
+            item: item.to_owned(),
+            was: Some("written".to_owned()),
+            now: Some("changed".to_owned()),
+            severity,
+            text: text.map(str::to_owned),
+        };
+        let mut report = probed("pi", None);
+        report.plugins = vec![
+            PluginReport {
+                plugin: "audit".to_owned(),
+                ok: true,
+                error: None,
+                notice: None,
+                findings: vec![
+                    finding("/etc/a", Severity::Drift, None),
+                    finding(
+                        "/etc/b",
+                        Severity::Notice,
+                        Some("the last apply failed while writing it"),
+                    ),
+                ],
+            },
+            PluginReport {
+                plugin: "first".to_owned(),
+                ok: true,
+                error: None,
+                notice: Some("no apply recorded".to_owned()),
+                findings: Vec::new(),
+            },
+            PluginReport {
+                plugin: "slow".to_owned(),
+                ok: false,
+                error: Some("plugin slow: timed out after 30s".to_owned()),
+                notice: None,
+                findings: Vec::new(),
+            },
+        ];
+        report.drift = Some(DriftSummary {
+            not_compared: 2,
+            no_sudo: 1,
+            no_hash: 1,
+            rolled_back: 0,
+        });
+        let lines = doctor_block(&report);
+        let rows = shown(&lines);
+        let tail = &rows[rows.len() - 7..];
+        let dim = Some(Color::DarkGray);
+        let red = Some(Color::Red);
+        assert_eq!(
+            tail,
+            [
+                (
+                    "  audit           drift: /etc/a was written, now changed".to_owned(),
+                    red
+                ),
+                (
+                    "  audit           notice: /etc/b was written, now changed \
+                     (the last apply failed while writing it)"
+                        .to_owned(),
+                    dim
+                ),
+                ("  first           no apply recorded".to_owned(), dim),
+                (
+                    "  slow            error: plugin slow: timed out after 30s".to_owned(),
+                    red
+                ),
+                (
+                    "  files           2 not compared (1 no sudo, 1 no hash tool)".to_owned(),
+                    dim
+                ),
+                (
+                    "  sudo            WARNING: sudo -n was refused or asks for a password; \
+                     1 root-only files were not compared"
+                        .to_owned(),
+                    red
+                ),
+                (String::new(), None),
+            ]
+        );
+
+        let plain = shown(&doctor_block(&probed("pi", None)));
+        assert!(
+            !plain
+                .iter()
+                .any(|(row, _)| row.contains("not compared") || row.contains("audit")),
+            "{plain:?}"
+        );
+
+        let mut odd = probed("pi", None);
+        odd.plugins = vec![PluginReport {
+            plugin: "a\u{1b}[2Jb".to_owned(),
+            ok: true,
+            error: None,
+            notice: Some("no apply recorded".to_owned()),
+            findings: Vec::new(),
+        }];
+        let rows = shown(&doctor_block(&odd));
+        assert!(
+            rows.iter()
+                .any(|(row, _)| row.starts_with("  a\\x1b[2Jb ") && row.ends_with("recorded")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_local_block_shows_the_doctor_pins_and_the_record() {
+        let mut local = local_report();
+        let before = shown(&local_block(&local));
+        assert!(
+            !before
+                .iter()
+                .any(|(row, _)| row.contains("plugin") || row.contains("record"))
+        );
+        local.plugins = [
+            ("audit".to_owned(), None),
+            (
+                "stale".to_owned(),
+                Some("plugins.stale.sha256: does not match".to_owned()),
+            ),
+        ]
+        .into();
+        local.record = Some("found".to_owned());
+        let rows = shown(&local_block(&local));
+        assert_eq!(
+            &rows[rows.len() - 4..rows.len() - 1],
+            [
+                ("  plugin audit    pinned".to_owned(), None),
+                (
+                    "  plugin stale    error: plugins.stale.sha256: does not match".to_owned(),
+                    Some(Color::Red)
+                ),
+                ("  record          found".to_owned(), None),
+            ]
+        );
     }
 }

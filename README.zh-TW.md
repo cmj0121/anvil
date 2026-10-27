@@ -32,6 +32,11 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
   輸出、`--json` 與結束碼都與 apply 相同。它不載入 config、不詢問確認，也不輸入 sudo 密碼。
 - **plugin step**：step 可以指定一個 plugin，也就是控制端上以路徑與 sha256 釘選的程式，
   它以 JSON 讀取 target 的 facts，並回覆要在該 target 上執行的 sh 腳本。它在清空的環境中執行，拿不到任何 secret。
+- **漂移是 plugin，不是指令**：沒有 `anvil audit`。以 `on = "doctor"` 釘選一個 plugin，`anvil doctor`
+  就會回報每個 target 自上次 apply 以來的變化：一個 fact（`kernel was 6.1, now 6.2`）或 apply 寫入的檔案
+  （`/etc/app.conf was written, now changed`）。參考 plugin `anvil-audit` 以 `make audit-plugin` 從原始碼建置。
+  它看到的是 facts、dest 與取代雜湊的單次執行 tag，絕不是檔案的位元組或 secret；漂移與無法連線的 target 一樣以 1 結束
+  （[Doctor plugins](docs/cli.zh-TW.md#doctor-plugins-drift-since-the-last-apply)）。
 - **secret（機密）** 存放在 macOS keychain、age 檔案或 sops 檔案中，`anvil secret --migrate` 可在 backend 之間搬移它們。
 - **`--parallel N`** 讓 apply、plan、run 與 rollback 同時處理最多 N 個 target（1..=32，預設 1）。
   輸出與 `--json` 維持 inventory 順序，Ctrl-C 會讓執行中的 step 跑完；第二次 Ctrl-C 立刻停止
@@ -161,6 +166,31 @@ args = { profile = "ssh" }
 
 `anvil plan` 也會執行 plugin，因此 plugin 不可以有副作用。它是被釘選，而不是被沙箱隔離：它以你的身分執行，
 而釘選只涵蓋檔案的位元組（[安全須知](docs/security.zh-TW.md)）。
+
+上次 apply 之後的漂移由 doctor plugin 回報，而不是一個指令。從原始碼目錄建置參考 plugin `anvil-audit`，
+以 `on = "doctor"` 釘選它，`anvil doctor` 就會在每個 target 之下列出每項變化，有漂移時以 1 結束
+（[Doctor plugins](docs/cli.zh-TW.md#doctor-plugins-drift-since-the-last-apply)）：
+
+```sh
+make audit-plugin                    # prints target/release/anvil-audit and its sha256
+install -d -m 0700 ~/.config/anvil/plugins
+install -m 0700 target/release/anvil-audit ~/.config/anvil/plugins/audit
+```
+
+```toml
+[plugins.audit]
+path = "~/.config/anvil/plugins/audit"
+sha256 = "…"                 # the sha256 make audit-plugin printed
+on = "doctor"
+```
+
+```text
+  audit           drift: kernel was 6.1, now 6.2
+  audit           drift: /etc/app.conf was written, now changed
+```
+
+`sudo` fact 既不比對，也不顯示為漂移。rollback 放回的檔案，以及 `sudo -n` 被拒或需要密碼的 target 上僅 root 可寫的檔案，
+都不會被比對；doctor 改為計數並顯示它們。
 
 ## 文件
 

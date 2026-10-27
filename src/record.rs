@@ -192,10 +192,6 @@ impl Record {
     /// The record without any previous state, for plugins: per target its
     /// `at`, facts, `rolled_back`, and each file's dest, mode, written hash
     /// and how the write ended.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the doctor plugins read it from #19 on")
-    )]
     pub fn audit_view(&self) -> serde_json::Value {
         let targets: serde_json::Map<String, serde_json::Value> = self
             .targets

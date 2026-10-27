@@ -43,7 +43,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::cli::{Cli, Failure, print_json};
-use crate::config::{Config, StepKind};
+use crate::config::{Config, Plugin, StepKind};
 use crate::facts::{self, Facts};
 use crate::fanout::{self, Event};
 use crate::files::{self, Sources};
@@ -348,7 +348,7 @@ pub fn run_targets(
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
     let targets = opts.targets()?;
-    let pins = plugin::verify(config).map_err(Failure::usage)?;
+    let pins = plugin::verify_where(config, Plugin::is_step).map_err(Failure::usage)?;
     let sources = files::load(config).map_err(Failure::usage)?;
     let passwords = load_passwords(&targets, config, || opts.secret_store(config))?;
     let session = match needs_facts(config) {
@@ -699,10 +699,12 @@ pub(crate) fn cancelled(command: &str, target: &Target, steps: Vec<StepReport>) 
 }
 
 /// Whether apply probes each target: `[packages]` has work, a step is a
-/// plugin, or there are `[[files]]` or `[[services]]`.
+/// plugin, a doctor plugin is configured (its drift needs the facts), or
+/// there are `[[files]]` or `[[services]]`.
 fn needs_facts(config: &Config) -> bool {
     package_work(config).is_some()
         || config.steps.iter().any(|s| s.plugin.is_some())
+        || config.plugins.values().any(Plugin::is_doctor)
         || !config.files.is_empty()
         || !config.services.is_empty()
 }

@@ -13,7 +13,8 @@
 #   FAKE_PLUGIN_DETACH  when set, leaves a 3s sleep in the background, out of
 #                       its process group (perl's `setpgrp`), holding stdout
 #                       and stderr open
-#   FAKE_PLUGIN_HOLD_STDIN  when set, replies without reading stdin and leaves
+#   FAKE_PLUGIN_HOLD_STDIN  when set, replies (FAKE_PLUGIN_REPLY or
+#                       {"script":"hostname"}) without reading stdin and leaves
 #                       `sleep 30` in the background holding it, its pid in
 #                       `./record.holder`
 #
@@ -28,7 +29,9 @@ fi
 if [ -n "${FAKE_PLUGIN_HOLD_STDIN:-}" ]; then
 	sleep 30 <&0 >/dev/null 2>&1 &
 	echo "$!" >record.holder
-	printf '%s\n' '{"script":"hostname"}'
+	reply=${FAKE_PLUGIN_REPLY:-}
+	[ -n "$reply" ] || reply='{"script":"hostname"}'
+	printf '%s\n' "$reply"
 	exit 0
 fi
 
