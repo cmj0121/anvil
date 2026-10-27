@@ -206,6 +206,16 @@ impl Sandbox {
         self.root.join("plugins")
     }
 
+    /// Forgets every master fake-ssh opened, as if each had exited.
+    pub fn close_masters(&self) {
+        let control = self.root.join("h/.ssh/anvil");
+        for entry in fs::read_dir(control).into_iter().flatten().flatten() {
+            if entry.path().extension().is_some_and(|ext| ext == "master") {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+    }
+
     /// One inventory host, `fake`, reached through `fake-ssh.sh`.
     pub fn with_fake_host(&self) {
         self.write_config("inventory.toml", "[hosts.fake]\nhost = \"fakehost\"\n");

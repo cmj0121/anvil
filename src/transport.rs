@@ -64,6 +64,8 @@ pub enum TransportError {
     /// Neither anvil's prompt nor the sudo-ok marker came within the prompt wait
     /// after the script was ready: sudo asked some other way (PAM, 2FA).
     NoPrompt,
+    /// The run was cancelled before a new ssh master was opened.
+    Cancelled,
 }
 
 impl fmt::Display for TransportError {
@@ -95,6 +97,7 @@ impl fmt::Display for TransportError {
             }
             Self::PasswordRejected => f.write_str("sudo rejected the password"),
             Self::NoPrompt => f.write_str("sudo did not show anvil's prompt"),
+            Self::Cancelled => f.write_str("cancelled"),
         }
     }
 }
@@ -106,6 +109,15 @@ pub trait Transport {
     /// Runs `script`, killed after `timeout`; a script that ran to completion
     /// is `Ok` whatever its exit code, which the caller judges.
     fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError>;
+    /// [`Transport::run`] for a cleanup that must run even once the run was
+    /// cancelled.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the [[files]] cleanup calls it")
+    )]
+    fn run_uncancelled(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
+        self.run(script, timeout)
+    }
     /// Runs `script` on a terminal and types `password` once at sudo's prompt,
     /// per [`run_tty_with`] with `timeout` as [`TtyLimits::run`]. The output's
     /// stdout is the cleaned terminal output.

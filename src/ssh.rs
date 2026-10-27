@@ -3,6 +3,12 @@
 //! Every invocation is an argv array on the configured `program`, never a shell
 //! string. The master authenticates once (key first, a password prompt only when
 //! anvil has a terminal); clients run `sh -s` over the socket in BatchMode.
+//!
+//! Targets run on several threads at once. A step whose master is alive
+//! takes no lock; opening a master is serialized process-wide (`MASTER`), so
+//! two targets never race on one ControlPath nor hit sshd's MaxStartups
+//! together, and the interactive retry also holds `PROMPT`, so two never
+//! prompt on one terminal at once. Lock order: `MASTER`, then `PROMPT`.
 
 use std::cell::OnceCell;
 use std::fs::{self, DirBuilder};
@@ -10,6 +16,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::paths::{self, PrivateDirError};
@@ -29,6 +37,13 @@ const CONTROL_PATH_MAX: usize = 103;
 const CONTROL_HASH_LEN: usize = 40;
 const CONTROL_SUFFIX_LEN: usize = 17;
 
+/// Held while a master is opened.
+static MASTER: Mutex<()> = Mutex::new(());
+/// Held around the interactive retry, which prompts on the terminal. The
+/// retry already runs under [`MASTER`], which serializes it; `PROMPT` is
+/// defence in depth, should a prompt ever be reached outside `MASTER`.
+static PROMPT: Mutex<()> = Mutex::new(());
+
 /// Environment the ssh child never inherits: nothing may answer a prompt for us.
 const DROPPED_ENV: [&str; 3] = ["SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "DISPLAY"];
 
@@ -43,6 +58,8 @@ pub struct SshSettings {
     pub key_timeout: Duration,
     /// Deadline for `-O check`.
     pub check_timeout: Duration,
+    /// The run's cancel flag, checked right before a master is opened.
+    pub cancel: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +74,7 @@ pub struct Ssh {
     can_prompt: bool,
     key_timeout: Duration,
     check_timeout: Duration,
+    cancel: Arc<AtomicBool>,
     /// The checked control directory, once the first run has found it.
     control_dir: OnceCell<PathBuf>,
 }
@@ -83,6 +101,7 @@ impl Ssh {
             can_prompt: settings.can_prompt,
             key_timeout: settings.key_timeout,
             check_timeout: settings.check_timeout,
+            cancel: settings.cancel,
             control_dir: OnceCell::new(),
         })
     }
@@ -156,13 +175,38 @@ impl Ssh {
         args
     }
 
-    /// The control directory, with a live master behind it.
-    fn connected(&self) -> Result<&Path, TransportError> {
+    /// The control directory, with a live master behind it. A live master
+    /// takes no lock. Otherwise, under [`MASTER`], the master is checked again
+    /// (another thread may just have opened it, for an alias with the same
+    /// `%C` too), and a still dead one is opened unless `cancellable` and the
+    /// run was cancelled.
+    fn connected(&self, cancellable: bool) -> Result<&Path, TransportError> {
         let control_dir = self.control_dir()?;
-        if !self.master_alive(control_dir) {
-            self.open_master(control_dir)?;
+        if self.master_alive(control_dir) {
+            return Ok(control_dir);
         }
+        let _master = MASTER.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.master_alive(control_dir) {
+            return Ok(control_dir);
+        }
+        if cancellable && self.cancel.load(Ordering::Relaxed) {
+            return Err(TransportError::Cancelled);
+        }
+        self.open_master(control_dir)?;
         Ok(control_dir)
+    }
+
+    fn run_with(
+        &self,
+        script: &str,
+        timeout: Duration,
+        cancellable: bool,
+    ) -> Result<Output, TransportError> {
+        let control_dir = self.connected(cancellable)?;
+        // Auth happened in the master; any client exit, 255 included, is the
+        // script's (a nested ssh, say) and comes back as its output.
+        let mut command = self.command(&self.client_args(control_dir));
+        run_with_script(&mut command, script, timeout)
     }
 
     /// `ssh <common> -o ControlMaster=no -o BatchMode=yes -o LogLevel=ERROR -tt
@@ -224,6 +268,7 @@ impl Ssh {
         match self.master_attempt(control_dir, true)? {
             MasterOutcome::Connected => Ok(()),
             MasterOutcome::Denied if self.can_prompt => {
+                let _prompt = PROMPT.lock().unwrap_or_else(PoisonError::into_inner);
                 match term::with_terminal(|| self.master_attempt(control_dir, false))? {
                     MasterOutcome::Connected => Ok(()),
                     MasterOutcome::Denied => Err(TransportError::AuthDenied { after_prompt: true }),
@@ -288,11 +333,11 @@ impl Transport for Ssh {
     }
 
     fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
-        let control_dir = self.connected()?;
-        // Auth happened in the master; any client exit, 255 included, is the
-        // script's (a nested ssh, say) and comes back as its output.
-        let mut command = self.command(&self.client_args(control_dir));
-        run_with_script(&mut command, script, timeout)
+        self.run_with(script, timeout, true)
+    }
+
+    fn run_uncancelled(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
+        self.run_with(script, timeout, false)
     }
 
     fn run_tty(
@@ -301,7 +346,7 @@ impl Transport for Ssh {
         password: &[u8],
         timeout: Duration,
     ) -> Result<Output, TransportError> {
-        let control_dir = self.connected()?;
+        let control_dir = self.connected(true)?;
         let mut command = self.command(&self.tty_client_args(control_dir, script));
         run_tty_with(&mut command, password, TtyLimits::with_run(timeout))
     }
@@ -383,14 +428,18 @@ pub fn control_dir(home: &Path, uid: u32) -> Result<PathBuf, TransportError> {
     }
 }
 
+/// Creates `dir` 0700 unless it exists; another target's thread may create
+/// it at the same moment, which is no error.
 fn ensure_private_dir(dir: &Path) -> Result<(), TransportError> {
     if dir.exists() {
         return Ok(());
     }
-    DirBuilder::new()
-        .mode(0o700)
-        .create(dir)
-        .map_err(|err| TransportError::Spawn(format!("cannot create {}: {err}", dir.display())))
+    match DirBuilder::new().mode(0o700).create(dir) {
+        Err(err) if err.kind() != std::io::ErrorKind::AlreadyExists => Err(TransportError::Spawn(
+            format!("cannot create {}: {err}", dir.display()),
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn mode_of(path: &Path) -> Result<u32, TransportError> {
@@ -422,6 +471,7 @@ mod tests {
             can_prompt: false,
             key_timeout: KEY_TIMEOUT,
             check_timeout: CHECK_TIMEOUT,
+            cancel: Arc::default(),
             control_dir: OnceCell::new(),
         }
     }
@@ -638,6 +688,7 @@ mod tests {
             can_prompt: false,
             key_timeout: KEY_TIMEOUT,
             check_timeout: CHECK_TIMEOUT,
+            cancel: Arc::default(),
             control_dir: OnceCell::new(),
         }
     }
@@ -673,17 +724,20 @@ mod tests {
         assert!(recorder.events().is_empty());
         assert_eq!(out.stdout, b"hi\n");
         let calls = invocations(&log);
-        assert_eq!(calls.len(), 3, "{calls:?}");
-        assert!(calls[0].ends_with("-O check -- box"), "{}", calls[0]);
+        assert_eq!(calls.len(), 4, "{calls:?}");
         assert!(
-            calls[1].ends_with("-M -N -f -o ControlPersist=60 -o BatchMode=yes -- box"),
-            "{}",
-            calls[1]
+            calls[..2].iter().all(|c| c.ends_with("-O check -- box")),
+            "{calls:?}"
         );
         assert!(
-            calls[2].ends_with("-o ControlMaster=no -o BatchMode=yes -- box sh -s"),
+            calls[2].ends_with("-M -N -f -o ControlPersist=60 -o BatchMode=yes -- box"),
             "{}",
             calls[2]
+        );
+        assert!(
+            calls[3].ends_with("-o ControlMaster=no -o BatchMode=yes -- box sh -s"),
+            "{}",
+            calls[3]
         );
         let control = home.join(".ssh/anvil").to_string_lossy().into_owned();
         for call in &calls {
@@ -738,10 +792,11 @@ mod tests {
             err.to_string(),
             "key auth failed; run interactively for password sign-in"
         );
-        // Under cargo test stdin/stderr are not terminals: check, one master, no client.
+        // Under cargo test stdin/stderr are not terminals: check twice, one master,
+        // no client.
         let calls = invocations(&log);
-        assert_eq!(calls.len(), 2, "{calls:?}");
-        assert!(calls[1].contains("-o BatchMode=yes"), "{}", calls[1]);
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert!(calls[2].contains("-o BatchMode=yes"), "{}", calls[2]);
     }
 
     #[test]
@@ -766,18 +821,18 @@ mod tests {
         assert_eq!(recorder.events(), [Event::Suspend, Event::Resume]);
         assert_eq!(out.stdout, b"hi\n");
         let calls = invocations(&log);
-        assert_eq!(calls.len(), 4, "{calls:?}");
-        assert!(calls[1].contains("-o BatchMode=yes"), "{}", calls[1]);
+        assert_eq!(calls.len(), 5, "{calls:?}");
+        assert!(calls[2].contains("-o BatchMode=yes"), "{}", calls[2]);
         assert!(
-            calls[2].ends_with("-M -N -f -o ControlPersist=60 -- box"),
+            calls[3].ends_with("-M -N -f -o ControlPersist=60 -- box"),
             "{}",
-            calls[2]
+            calls[3]
         );
-        assert!(!calls[2].contains("BatchMode"), "{}", calls[2]);
+        assert!(!calls[3].contains("BatchMode"), "{}", calls[3]);
         assert!(
-            !calls[2].contains("PreferredAuthentications"),
+            !calls[3].contains("PreferredAuthentications"),
             "{}",
-            calls[2]
+            calls[3]
         );
     }
 
@@ -807,7 +862,11 @@ mod tests {
             err.to_string(),
             "authentication failed after the interactive attempt"
         );
-        assert_eq!(invocations(&log).len(), 3, "check, key, retry; no client");
+        assert_eq!(
+            invocations(&log).len(),
+            4,
+            "check twice, key, retry; no client"
+        );
     }
 
     #[test]
@@ -834,7 +893,7 @@ mod tests {
             err.to_string(),
             "cannot connect: ssh: connect to host box port 22: Connection refused"
         );
-        assert_eq!(invocations(&log).len(), 2);
+        assert_eq!(invocations(&log).len(), 3);
     }
 
     #[test]
@@ -851,7 +910,7 @@ mod tests {
             let err = ssh.run("true", RUN_TIMEOUT).unwrap_err();
             assert_eq!(err, TransportError::HostKey);
             assert!(err.to_string().contains("run `ssh <host>` once"), "{err}");
-            assert_eq!(invocations(&log).len(), 2, "no retry");
+            assert_eq!(invocations(&log).len(), 3, "no retry");
             let _ = fs::remove_file(&log);
         }
     }
@@ -922,8 +981,8 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(15));
         let calls = invocations(&log);
         assert!(
-            calls.len() <= 2,
-            "check, key; no retry or client: {calls:?}"
+            calls.len() <= 3,
+            "check twice, key; no retry or client: {calls:?}"
         );
         assert!(calls.iter().all(|c| !c.ends_with("sh -s")), "{calls:?}");
     }
@@ -1102,17 +1161,187 @@ mod tests {
         assert_eq!(out.stdout, b"got:9\n");
         assert_eq!(out.code, Some(5));
         let calls = invocations(&log);
-        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(calls.len(), 4, "{calls:?}");
         assert!(
-            calls[2].ends_with(&format!(
+            calls[3].ends_with(&format!(
                 "-o ControlMaster=no -o BatchMode=yes -o LogLevel=ERROR -tt -e none -- box {}",
                 remote_tty_command(script)
             )),
             "{}",
-            calls[2]
+            calls[3]
         );
         for call in &calls {
             assert!(!call.contains("pw-secret") && !call.contains("anvil-sudo-"));
         }
+    }
+
+    // --- several threads -------------------------------------------------
+
+    fn masters(log: &Path) -> usize {
+        invocations(log)
+            .iter()
+            .filter(|c| c.contains(" -M "))
+            .count()
+    }
+
+    fn cancelled(ssh: Ssh) -> Ssh {
+        Ssh {
+            cancel: Arc::new(AtomicBool::new(true)),
+            ..ssh
+        }
+    }
+
+    #[test]
+    fn threads_creating_the_control_dir_at_once_all_get_it() {
+        let home = temp_home();
+        let dirs = std::thread::scope(|scope| {
+            let made: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| control_dir(&home, uid())))
+                .collect();
+            made.into_iter()
+                .map(|dir| dir.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for dir in dirs {
+            assert_eq!(dir.unwrap(), home.join(".ssh/anvil"));
+        }
+    }
+
+    #[test]
+    fn an_opened_master_is_reused_by_the_next_run() {
+        let home = temp_home();
+        let (ssh, log) = fake_with(&home, &[]);
+        ssh.run("true", RUN_TIMEOUT).unwrap();
+        ssh.run("true", RUN_TIMEOUT).unwrap();
+        assert_eq!(masters(&log), 1, "{:?}", invocations(&log));
+        assert_eq!(
+            invocations(&log).len(),
+            6,
+            "check twice, master, client, check, client"
+        );
+    }
+
+    #[test]
+    fn a_run_on_a_live_master_never_takes_the_master_lock() {
+        let home = temp_home();
+        let (ssh, log) = fake_with(&home, &[("FAKE_SSH_CHECK_EXIT", "0")]);
+        let (done, ran) = std::sync::mpsc::channel();
+        let held = MASTER.lock().unwrap_or_else(PoisonError::into_inner);
+        std::thread::spawn(move || {
+            let _ = done.send(ssh.run("echo hi", RUN_TIMEOUT));
+        });
+        let out = ran.recv_timeout(Duration::from_secs(10));
+        drop(held);
+        assert_eq!(
+            out.expect("the run waited for MASTER").unwrap().stdout,
+            b"hi\n"
+        );
+        assert_eq!(masters(&log), 0);
+    }
+
+    #[test]
+    fn two_threads_on_one_destination_open_one_master() {
+        let home = temp_home();
+        let (ssh, log) = fake_with(&home, &[("FAKE_SSH_SLEEP", "0.3")]);
+        let other = ssh.clone();
+        let outs = std::thread::scope(|scope| {
+            let runs = [ssh, other].map(|ssh| scope.spawn(move || ssh.run("echo hi", RUN_TIMEOUT)));
+            runs.map(|run| run.join().unwrap())
+        });
+        for out in outs {
+            assert_eq!(out.unwrap().stdout, b"hi\n");
+        }
+        assert_eq!(masters(&log), 1, "{:?}", invocations(&log));
+    }
+
+    /// Two retries on two hosts never overlap. `MASTER` already serializes
+    /// them, so this does not show that `PROMPT` is held.
+    #[test]
+    fn two_interactive_retries_never_overlap() {
+        let _lock = term::test_lock();
+        let home = temp_home();
+        let retries = home.join("retry.log");
+        let shown = retries.display().to_string();
+        let (ssh, log) = fake_with(
+            &home,
+            &[
+                ("FAKE_SSH_EXIT", "255"),
+                ("FAKE_SSH_STDERR", "me@box: Permission denied (publickey)."),
+                ("FAKE_SSH_RETRY_SLEEP", "0.3"),
+                ("FAKE_SSH_RETRY_LOG", &shown),
+            ],
+        );
+        let ssh = Ssh {
+            can_prompt: true,
+            ..ssh
+        };
+        let other = Ssh {
+            host: "box2".to_owned(),
+            ..ssh.clone()
+        };
+        std::thread::scope(|scope| {
+            let runs = [ssh, other].map(|ssh| scope.spawn(move || ssh.run("true", RUN_TIMEOUT)));
+            for run in runs {
+                run.join().unwrap().unwrap();
+            }
+        });
+        let lines = fs::read_to_string(&retries).unwrap();
+        assert_eq!(
+            lines.lines().collect::<Vec<_>>(),
+            ["enter", "leave", "enter", "leave"]
+        );
+        assert_eq!(masters(&log), 4, "a key attempt and a retry per host");
+    }
+
+    #[test]
+    fn a_cancelled_run_opens_no_master_but_a_live_one_still_runs() {
+        let home = temp_home();
+        let (ssh, log) = fake_with(&home, &[]);
+        let ssh = cancelled(ssh);
+        let err = ssh.run("true", RUN_TIMEOUT).unwrap_err();
+        assert_eq!(err, TransportError::Cancelled);
+        assert_eq!(err.to_string(), "cancelled");
+        assert_eq!(
+            ssh.run_tty("true", b"pw", RUN_TIMEOUT).unwrap_err(),
+            TransportError::Cancelled
+        );
+        assert_eq!(masters(&log), 0, "{:?}", invocations(&log));
+
+        let (ssh, log) = fake_with(&home, &[("FAKE_SSH_CHECK_EXIT", "0")]);
+        let out = cancelled(ssh).run("echo hi", RUN_TIMEOUT).unwrap();
+        assert_eq!(out.stdout, b"hi\n");
+        assert_eq!(masters(&log), 0);
+    }
+
+    #[test]
+    fn run_uncancelled_opens_a_master_after_cancel() {
+        let home = temp_home();
+        let (ssh, log) = fake_with(&home, &[]);
+        let out = cancelled(ssh)
+            .run_uncancelled("echo hi", RUN_TIMEOUT)
+            .unwrap();
+        assert_eq!(out.stdout, b"hi\n");
+        assert_eq!(masters(&log), 1);
+    }
+
+    #[test]
+    fn run_uncancelled_defaults_to_run() {
+        struct Echo;
+        impl Transport for Echo {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn run(&self, script: &str, _: Duration) -> Result<Output, TransportError> {
+                Ok(Output {
+                    stdout: script.as_bytes().to_vec(),
+                    ..Output::default()
+                })
+            }
+            fn run_tty(&self, _: &str, _: &[u8], _: Duration) -> Result<Output, TransportError> {
+                unreachable!()
+            }
+        }
+        let out = Echo.run_uncancelled("hi", RUN_TIMEOUT).unwrap();
+        assert_eq!(out.stdout, b"hi");
     }
 }

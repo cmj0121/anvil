@@ -4,6 +4,8 @@
 use std::io::IsTerminal;
 use std::num::NonZeroU8;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::cli::{Cli, Failure};
 use crate::config::Config;
@@ -32,6 +34,8 @@ pub struct Options {
         expect(dead_code, reason = "read once targets run in parallel")
     )]
     pub parallel: NonZeroU8,
+    /// The run's cancel flag; ssh checks it before opening a master.
+    pub cancel: Arc<AtomicBool>,
     /// ssh may run its interactive retry. CLI: stdin && stderr are terminals.
     /// TUI: true only while a term::Handoff is installed.
     pub can_prompt: bool,
@@ -66,6 +70,7 @@ impl Options {
             ssh_config: cli.ssh_config.clone(),
             target: cli.target.clone(),
             parallel: NonZeroU8::new(cli.parallel).expect("clap keeps --parallel in 1..=32"),
+            cancel: Arc::default(),
             can_prompt: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
             #[cfg(debug_assertions)]
             secret_store: cli.secret_store,
@@ -129,6 +134,7 @@ impl Options {
             can_prompt: self.can_prompt,
             key_timeout: ssh::KEY_TIMEOUT,
             check_timeout: ssh::CHECK_TIMEOUT,
+            cancel: Arc::clone(&self.cancel),
         }
     }
 
@@ -218,6 +224,13 @@ mod tests {
         assert!(opts.ssh_settings().can_prompt);
         opts.can_prompt = false;
         assert!(!opts.ssh_settings().can_prompt);
+    }
+
+    #[test]
+    fn ssh_settings_share_the_cancel_flag() {
+        let opts = parse(&["apply"]);
+        assert!(!opts.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(Arc::ptr_eq(&opts.ssh_settings().cancel, &opts.cancel));
     }
 
     #[test]

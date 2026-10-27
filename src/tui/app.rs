@@ -1234,6 +1234,7 @@ pub mod tests {
             ssh_config: None,
             target: Vec::new(),
             parallel: std::num::NonZeroU8::MIN,
+            cancel: std::sync::Arc::default(),
             can_prompt: false,
             #[cfg(debug_assertions)]
             secret_store: None,

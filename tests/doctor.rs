@@ -166,6 +166,7 @@ fn with_packages_each_reachable_target_reports_its_manager() {
     }
 
     sandbox.write_config("config.toml", "[packages]\nmanager = \"apk\"\n");
+    sandbox.close_masters();
     let out = sandbox.anvil(&["--json", "doctor"], &CONNECT_REFUSED);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     let value = json(&out);
