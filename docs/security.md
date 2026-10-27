@@ -16,7 +16,30 @@ English | [繁體中文](security.zh-TW.md)
   rebuild, because the unsigned binary has no stable identity. `anvil doctor` only checks that the item exists and never
   prompts; unlike age and sops, the keychain is not decrypted first.
 - **Plaintext on disk.** Secrets are only ever written encrypted, except for the editor temp file `anvil secret` uses
-  while you edit a value.
+  while you edit a value. The apply record is the other exception, below.
+- **The apply record holds previous file texts in plain text.** `last-apply.json` in `$XDG_STATE_HOME/anvil` (else
+  `~/.local/state/anvil`) keeps the text each `[[files]]` write replaced, so that `anvil rollback` can put it back
+  ([The apply record](cli.md#the-apply-record)). It is not encrypted: its protection is mode 0600 in a 0700 directory
+  owned by you, both checked on every run, and anvil refuses a record or directory open to others. Anyone who can read
+  your files as you, or a backup of them, can read it. Set `rollback = false` on a `[[files]]` entry whose dest holds a
+  secret: the record then keeps only its sha256 ([Files](configuration.md#files)). Never point `$XDG_STATE_HOME` into a
+  dotfiles or other shared repository, and never commit the record. The texts are never printed or logged, and core
+  dumps are turned off before the record is read. Since the record is only a file you own, rollback never trusts it to
+  choose a path: it refuses a record whose dest or mode apply could not have written, and restores only dests the
+  current config's `[[files]]` still names, with the same `sudo`, for a target the entry applies to
+  ([anvil rollback](cli.md#anvil-rollback)).
+- **The record is trusted as the config is.** It is not signed or authenticated. At a dest the config names, the
+  record decides the bytes, owner and mode rollback puts back, so whoever can write it can have rollback (through sudo,
+  as root) write any text with any owner and mode there. Keep it as private as the config: the same user, the 0700
+  state directory, no shared or synced copy.
+- **A change between the read and the write.** Before each `[[files]]` write apply reads DEST, and the write refuses
+  when DEST's sha256 changed since: `files: DEST changed while anvil was writing it; re-run apply`. That check needs
+  `sha256sum` or `shasum` on the target. Without either there is no check, so a change made between the read and the
+  write is overwritten and the record holds the older state. Rollback refuses such a file (unless its write failed
+  midway) without `--force`, since it cannot tell whether DEST changed ([anvil rollback](cli.md#anvil-rollback)).
+- **One apply or rollback per record.** The record is locked through `last-apply.json.lock` beside it; a second anvil
+  fails with `PATH is in use by another anvil` rather than wait. The lock needs `flock`, which NFS may not offer:
+  `PATH: the filesystem does not support locking (NFS?); set $XDG_STATE_HOME to a local disk`.
 - **One anvil per store.** An open age or sops store is locked through `<store>.lock` beside it; a second anvil on the
   same store fails with `another anvil is using <store>` rather than wait.
 - **sops sees a cleared environment.** Cloud KMS credentials in your environment do not reach sops; use age or PGP

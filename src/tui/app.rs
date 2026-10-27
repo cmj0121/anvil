@@ -128,6 +128,8 @@ pub enum RunKind {
     Run,
     /// `u`: the check, then the update it confirmed.
     Update,
+    /// `b`, once confirmed: the last apply's files put back.
+    Rollback,
 }
 
 impl RunKind {
@@ -138,6 +140,7 @@ impl RunKind {
             RunKind::Plan => "plan",
             RunKind::Run => "run",
             RunKind::Update => "update",
+            RunKind::Rollback => "rollback",
         }
     }
 }
@@ -152,6 +155,7 @@ pub enum Job {
     Run(String),
     UpdateCheck,
     Update(String),
+    Rollback,
 }
 
 impl Job {
@@ -162,6 +166,7 @@ impl Job {
             Job::Plan => RunKind::Plan,
             Job::Run(_) => RunKind::Run,
             Job::UpdateCheck | Job::Update(_) => RunKind::Update,
+            Job::Rollback => RunKind::Rollback,
         }
     }
 }
@@ -246,12 +251,15 @@ pub enum RunResult {
     /// worker sends them.
     Apply {
         /// [`RunKind::Apply`] for `a` on the config's steps, [`RunKind::Run`]
-        /// for `x` on a script.
+        /// for `x` on a script, [`RunKind::Rollback`] for `b`, whose steps
+        /// differ per target and are not listed.
         kind: RunKind,
         steps: Vec<StepRow>,
         targets: Vec<Slot<apply::TargetReport>>,
         ok: Option<bool>,
         error: Option<String>,
+        /// What the run warns about once it ended, such as a full record.
+        warnings: Vec<String>,
     },
     /// `ok` is `None` while running.
     Plan {
@@ -326,6 +334,10 @@ pub enum Overlay {
     Confirm {
         targets: Vec<String>,
     },
+    /// `b`'s question before it rolls back `targets`; only `y` answers it.
+    ConfirmRollback {
+        targets: Vec<String>,
+    },
     /// `u`'s question before it replaces anvil with release `version`.
     ConfirmUpdate {
         version: String,
@@ -356,6 +368,8 @@ pub enum Msg {
     UpdateChecked(Result<Check, String>),
     /// The version a confirmed `u` installed, in place of `Finished`.
     Updated(Result<String, String>),
+    /// An apply's or rollback's warnings, before `Finished`.
+    Warnings(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -500,7 +514,9 @@ impl App {
             KeyCode::Char('u') if self.updated.is_some() => {
                 self.notice = self.updated.as_deref().map(restart_notice);
             }
-            KeyCode::Char('i' | 'c' | 's' | 'm' | 'o' | 'x' | 'u') if self.running.is_some() => {
+            KeyCode::Char('i' | 'c' | 's' | 'm' | 'o' | 'x' | 'u' | 'b')
+                if self.running.is_some() =>
+            {
                 self.notice = self.busy();
             }
             KeyCode::Char('u') => match self.available.take() {
@@ -510,6 +526,10 @@ impl App {
             KeyCode::Char('i') => return vec![Effect::Edit(EditKind::Inventory), Effect::Redraw],
             KeyCode::Char('c') => return vec![Effect::Edit(EditKind::Config), Effect::Redraw],
             KeyCode::Char('x') => return vec![Effect::EditScript, Effect::Redraw],
+            KeyCode::Char('b') => match self.chosen_targets() {
+                Ok(targets) => self.overlay = Some(Overlay::ConfirmRollback { targets }),
+                Err(err) => self.notice = Some(err),
+            },
             KeyCode::Char('s') => {
                 self.overlay = Some(Overlay::Input {
                     text: String::new(),
@@ -569,15 +589,22 @@ impl App {
 
     /// A key under `overlay`, which was taken out of `self.overlay`: it is
     /// put back unless the key closes it. Esc closes any overlay; Enter
-    /// confirms the Input, Migrate, Options and both Confirm overlays, and
-    /// closes Targets as `t` does: its selection changes as Space is pressed.
+    /// confirms the Input, Migrate, Options, Confirm and ConfirmUpdate
+    /// overlays, and closes Targets as `t` does: its selection changes as
+    /// Space is pressed. ConfirmRollback takes `y` only.
     fn on_overlay_key(&mut self, mut overlay: Overlay, key: KeyEvent) -> Vec<Effect> {
         let mut effects = vec![Effect::Redraw];
         let keep = match (&mut overlay, key.code) {
             (_, KeyCode::Esc)
             | (Overlay::Help, KeyCode::Char('?'))
-            | (Overlay::Confirm { .. } | Overlay::ConfirmUpdate { .. }, KeyCode::Char('n')) => {
-                false
+            | (
+                Overlay::Confirm { .. }
+                | Overlay::ConfirmUpdate { .. }
+                | Overlay::ConfirmRollback { .. },
+                KeyCode::Char('n'),
+            ) => false,
+            (Overlay::ConfirmRollback { .. }, KeyCode::Char('y')) => {
+                return self.start(Job::Rollback);
             }
             (Overlay::Confirm { .. }, KeyCode::Enter | KeyCode::Char('y')) => {
                 return self.start(Job::Run(self.last_script.clone()));
@@ -585,7 +612,13 @@ impl App {
             (Overlay::ConfirmUpdate { version }, KeyCode::Enter | KeyCode::Char('y')) => {
                 return self.start(Job::Update(std::mem::take(version)));
             }
-            (Overlay::Help | Overlay::Confirm { .. } | Overlay::ConfirmUpdate { .. }, _) => {
+            (
+                Overlay::Help
+                | Overlay::Confirm { .. }
+                | Overlay::ConfirmUpdate { .. }
+                | Overlay::ConfirmRollback { .. },
+                _,
+            ) => {
                 self.overlay = Some(overlay);
                 return Vec::new();
             }
@@ -882,6 +915,11 @@ impl App {
                     Err(err) => self.notice = Some(err),
                 }
             }
+            Msg::Warnings(lines) => {
+                if let Some(RunResult::Apply { warnings, .. }) = self.results.last_mut() {
+                    *warnings = lines;
+                }
+            }
             Msg::Updated(updated) => {
                 self.running = None;
                 match updated {
@@ -930,12 +968,13 @@ impl App {
                 ok: None,
                 error: None,
             }),
-            RunKind::Apply | RunKind::Run => Some(RunResult::Apply {
+            RunKind::Apply | RunKind::Run | RunKind::Rollback => Some(RunResult::Apply {
                 kind,
                 steps: Vec::new(),
                 targets: Vec::new(),
                 ok: None,
                 error: None,
+                warnings: Vec::new(),
             }),
             RunKind::Plan => Some(RunResult::Plan {
                 targets: Vec::new(),
@@ -955,21 +994,21 @@ impl App {
     fn busy(&self) -> Option<String> {
         let running = self.running.as_ref()?;
         let hint = match running.kind {
-            RunKind::Apply | RunKind::Plan | RunKind::Run => " (Esc cancels)",
+            RunKind::Apply | RunKind::Plan | RunKind::Run | RunKind::Rollback => " (Esc cancels)",
             RunKind::Doctor | RunKind::Update => "",
         };
         Some(format!("busy: {} is running{hint}", running.kind.as_str()))
     }
 
-    /// Sets the cancel flag: apply and run stop before their next target or
-    /// step, plan before its next target, doctor runs to the end (D3).
+    /// Sets the cancel flag: apply, run and rollback stop before their next
+    /// target or step, plan before its next target, doctor runs to the end (D3).
     fn cancel(&mut self) {
         let Some(running) = &self.running else {
             return;
         };
         running.cancel.store(true, Ordering::Relaxed);
         self.notice = Some(match running.kind {
-            RunKind::Apply | RunKind::Run => {
+            RunKind::Apply | RunKind::Run | RunKind::Rollback => {
                 "cancelling: the running step finishes first".to_owned()
             }
             RunKind::Plan => "cancelling: running targets finish first".to_owned(),
@@ -1213,8 +1252,9 @@ pub fn restart_notice(version: &str) -> String {
     format!("updated anvil to {version}; restart anvil to use it")
 }
 
-/// `run on N targets: a, b, c?`, the names after [`CONFIRM_NAMES`] cut to `…`.
-pub fn confirm_prompt(names: &[String]) -> String {
+/// `<verb> N targets: a, b, c?` (`run on`, `roll back`), the names after
+/// [`CONFIRM_NAMES`] cut to `…`.
+pub fn confirm_prompt(verb: &str, names: &[String]) -> String {
     let noun = if names.len() == 1 {
         "target"
     } else {
@@ -1228,7 +1268,7 @@ pub fn confirm_prompt(names: &[String]) -> String {
     if names.len() > CONFIRM_NAMES {
         shown.push("…");
     }
-    format!("run on {} {noun}: {}?", names.len(), shown.join(", "))
+    format!("{verb} {} {noun}: {}?", names.len(), shown.join(", "))
 }
 
 /// An options-overlay path: empty is the default (`None`); a leading `~/`
@@ -1915,9 +1955,10 @@ pub mod tests {
     fn a_second_run_and_the_editor_keys_are_refused_while_running() {
         let mut app = app();
         press(&mut app, &[KeyCode::Char('d')]);
-        for c in ['d', 'a', 'i', 'c', 's', 'm', 'o', 'x', 'u'] {
+        for c in ['d', 'a', 'i', 'c', 's', 'm', 'o', 'x', 'u', 'b'] {
             assert_eq!(app.on_key(key(KeyCode::Char(c))), [Effect::Redraw], "{c}");
             assert_eq!(app.notice.as_deref(), Some("busy: doctor is running"));
+            assert!(app.overlay.is_none(), "{c}");
         }
         assert_eq!(app.results.len(), 1);
         // The notice goes with the next key.
@@ -1961,7 +2002,7 @@ pub mod tests {
             Some(&["local", "mac", "pi"].map(String::from)[..])
         );
         assert_eq!(
-            confirm_prompt(&["local", "mac", "pi"].map(String::from)),
+            confirm_prompt("run on", &["local", "mac", "pi"].map(String::from)),
             "run on 3 targets: local, mac, pi?"
         );
         assert!(app.results.is_empty() && app.running.is_none());
@@ -1983,10 +2024,13 @@ pub mod tests {
             confirming(&app),
             Some(&["local", "pi"].map(String::from)[..])
         );
-        assert_eq!(confirm_prompt(&["pi".to_owned()]), "run on 1 target: pi?");
+        assert_eq!(
+            confirm_prompt("run on", &["pi".to_owned()]),
+            "run on 1 target: pi?"
+        );
         let many: Vec<String> = (1..=7).map(|i| format!("h{i}")).collect();
         assert_eq!(
-            confirm_prompt(&many),
+            confirm_prompt("run on", &many),
             "run on 7 targets: h1, h2, h3, h4, h5, …?"
         );
     }
@@ -2148,6 +2192,101 @@ pub mod tests {
                 ..
             })
         ));
+    }
+
+    fn confirming_rollback(app: &App) -> Option<&[String]> {
+        match &app.overlay {
+            Some(Overlay::ConfirmRollback { targets }) => Some(targets),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn b_confirms_the_selection_and_only_y_rolls_back() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('b')]);
+        assert_eq!(
+            confirming_rollback(&app),
+            Some(&["local", "mac", "pi"].map(String::from)[..])
+        );
+        assert_eq!(
+            confirm_prompt("roll back", &["local".to_owned()]),
+            "roll back 1 target: local?"
+        );
+        for other in [KeyCode::Enter, KeyCode::Char('a'), KeyCode::Char(' ')] {
+            assert_eq!(app.on_key(key(other)), [], "{other}");
+            assert!(confirming_rollback(&app).is_some(), "{other} keeps it");
+        }
+        assert!(app.results.is_empty() && app.running.is_none());
+        for close in [KeyCode::Char('n'), KeyCode::Esc] {
+            press(&mut app, &[KeyCode::Char('b')]);
+            assert_eq!(app.on_key(key(close)), [Effect::Redraw], "{close}");
+            assert!(app.overlay.is_none(), "{close}");
+            assert!(app.running.is_none(), "{close}");
+        }
+
+        let mut opts = opts();
+        opts.target = vec!["home".to_owned()];
+        let mut app = App::with_inventory(opts, Ok(inventory()), Ok(Vec::new()));
+        press(&mut app, &[KeyCode::Char('b')]);
+        assert_eq!(confirming_rollback(&app), Some(&["pi".to_owned()][..]));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('y'))),
+            [Effect::Spawn(Job::Rollback), Effect::Redraw]
+        );
+        assert_eq!(app.running.as_ref().unwrap().kind, RunKind::Rollback);
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Apply {
+                kind: RunKind::Rollback,
+                ok: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn b_with_an_inventory_error_is_the_notice() {
+        let mut app = App::with_inventory(opts(), Err("bad inventory".to_owned()), Ok(Vec::new()));
+        press(&mut app, &[KeyCode::Char('b')]);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.notice.as_deref(), Some("bad inventory"));
+    }
+
+    #[test]
+    fn a_rollback_is_busy_cancels_like_apply_and_keeps_its_warnings() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('b'), KeyCode::Char('y')]);
+        for c in ['a', 'b', 'x'] {
+            assert_eq!(app.on_key(key(KeyCode::Char(c))), [Effect::Redraw], "{c}");
+            assert_eq!(
+                app.notice.as_deref(),
+                Some("busy: rollback is running (Esc cancels)")
+            );
+            assert!(app.overlay.is_none(), "{c}");
+        }
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(cancel_flag(&app));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("cancelling: the running step finishes first")
+        );
+        begin(&mut app, &["local", "pi"]);
+        app.on_msg(Msg::TargetDone(0, ran("local", Vec::new())));
+        app.on_msg(Msg::TargetDone(1, cancelled("pi")));
+        let full = "apply: last-apply.json is full; /etc/a on local cannot be rolled back";
+        app.on_msg(Msg::Warnings(vec![full.to_owned()]));
+        app.on_msg(Msg::Finished(Ok(())));
+        assert!(app.running.is_none());
+        let Some(RunResult::Apply {
+            kind, ok, warnings, ..
+        }) = app.shown_result()
+        else {
+            panic!("an apply-shaped result");
+        };
+        assert_eq!((*kind, *ok), (RunKind::Rollback, Some(false)));
+        assert_eq!(warnings, &[full.to_owned()]);
+        assert_eq!(app.shown_result().unwrap().counts(), Some((1, 1)));
     }
 
     fn check(status: Status) -> Check {

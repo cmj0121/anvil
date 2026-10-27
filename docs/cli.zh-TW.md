@@ -16,6 +16,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
   plan                           show the steps apply would run on every target, running none
+  rollback [--force DEST]...     restore the files the last apply wrote on every target
   run [--timeout SECS] <FILE|->  run a POSIX sh script on every target, read from FILE or stdin
   secret <NAME>                  edit one secret in the editor
   secret --migrate --to BACKEND  move every secret to keychain, age or sops and select it
@@ -27,17 +28,17 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
 
 每個旗標都是全域的：可以放在指令之前或之後。
 
-| 旗標                | 效果                                                                                          |
-| ------------------- | --------------------------------------------------------------------------------------------- |
-| `-v`, `--verbose`   | stderr 上更多日誌（`tui`：Log pane）；`-v` 警告、`-vv` info、`-vvv` debug（[日誌](#日誌)）    |
-| `--inventory PATH`  | 使用此 inventory 檔案而非自動找到的；須以 `.toml` 結尾（否則以 2 結束；見 [tui](#anvil-tui)） |
-| `--config PATH`     | 使用此 config 檔案而非自動找到的；PATH 須以 `.toml` 結尾（否則以 2 結束）                     |
-| `--ssh-config PATH` | 以 `-F PATH` 傳給每個 `ssh`                                                                   |
-| `--json`            | 在 stdout 印出恰好一份 JSON 文件，取代給人看的輸出                                            |
-| `--target SEL`      | `local`、host 名稱或 tag；可重複以取聯集；未指定表示 `local` 加上所有 host                    |
-| `--parallel N`      | `apply`、`plan` 與 `run` 同時處理的 target 數，1..=32，預設 1（[平行執行](#平行執行)）        |
-| `-h`, `--help`      | 說明                                                                                          |
-| `-V`, `--version`   | 版本                                                                                          |
+| 旗標                | 效果                                                                                               |
+| ------------------- | -------------------------------------------------------------------------------------------------- |
+| `-v`, `--verbose`   | stderr 上更多日誌（`tui`：Log pane）；`-v` 警告、`-vv` info、`-vvv` debug（[日誌](#日誌)）         |
+| `--inventory PATH`  | 使用此 inventory 檔案而非自動找到的；須以 `.toml` 結尾（否則以 2 結束；見 [tui](#anvil-tui)）      |
+| `--config PATH`     | 使用此 config 檔案而非自動找到的；PATH 須以 `.toml` 結尾（否則以 2 結束）                          |
+| `--ssh-config PATH` | 以 `-F PATH` 傳給每個 `ssh`                                                                        |
+| `--json`            | 在 stdout 印出恰好一份 JSON 文件，取代給人看的輸出                                                 |
+| `--target SEL`      | `local`、host 名稱或 tag；可重複以取聯集；未指定表示 `local` 加上所有 host                         |
+| `--parallel N`      | `apply`、`plan`、`run` 與 `rollback` 同時處理的 target 數，1..=32，預設 1（[平行執行](#平行執行)） |
+| `-h`, `--help`      | 說明                                                                                               |
+| `-V`, `--version`   | 版本                                                                                               |
 
 下方的 JSON 範例經過排版；anvil 會將每份文件印成一行。
 未知的 `--target` 是用法錯誤（以 2 結束；對 `tui` 而言僅在 inventory 載入成功時）。
@@ -50,7 +51,7 @@ target（目標）依序啟動，先 `local`，再依名稱排序的 host（主�
 
 ## 平行執行
 
-`--parallel N` 讓 `apply`、`plan` 與 `run` 同時處理最多 N 個 target；
+`--parallel N` 讓 `apply`、`plan`、`run` 與 `rollback` 同時處理最多 N 個 target；
 `anvil tui` 把它當作其 apply、plan 與 run（`x`）的起始值，doctor 則一次一個 target，且不發出警告：
 
 ```sh
@@ -289,7 +290,7 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 
 #### Ctrl-C
 
-`apply`、`plan` 與 `run` 對 Ctrl-C 的處理相同，不論 `--parallel` 為何：
+`apply`、`plan`、`run` 與 `rollback` 對 Ctrl-C 的處理相同，不論 `--parallel` 為何：
 
 - **第一次按下會取消。** anvil 在 stderr 印出
   `interrupted: running targets stop after their current step; Ctrl-C again stops now`，不論 `-v` 為何。
@@ -304,6 +305,109 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
   並因 SIGINT 結束（shell 顯示 130），不印摘要也不印 JSON。
   沒有終端機的遠端指令會在 host 上繼續執行，也可能留下 `[[files]]` 暫存檔（[平行執行](#平行執行)）。
 - **快速連按兩次可能只算一次。** 兩次按得非常接近時，可能只以一個訊號送達 anvil，此時算作第一次；請再按一次。
+
+#### apply 紀錄
+
+會探測 target 的 apply（有工作的 `[packages]`、plugin step、`[[files]]` 或 `[[services]]`）會保存
+`last-apply.json`，供 [`anvil rollback`](#anvil-rollback) 讀取。只有一般 `[[steps]]` 的 apply 不會開啟它。
+
+- **位置。** `$XDG_STATE_HOME/anvil/last-apply.json`，否則為 `~/.local/state/anvil/last-apply.json`；空的或相對路徑的
+  `$XDG_STATE_HOME` 視同未設定。`--config` 與 `$XDG_CONFIG_HOME` 都不會移動它，所以它絕不會放在 config 旁邊。
+  請讓它遠離 dotfiles repository：不要把 `$XDG_STATE_HOME` 指進其中，也不要 commit 這個檔案，因為它保存了 apply
+  取代掉的檔案先前的文字。目錄以 mode 0700 建立，檔案以 mode 0600 寫入；每次執行都會檢查兩者。
+  兩個變數都沒設定時，指令在任何 target 之前以 1 結束失敗，訊息為
+  `apply: neither $XDG_STATE_HOME nor $HOME is set: cannot find the state directory`（rollback 時為 `rollback: …`）。
+- **每個 target 一筆。** 每個 target 一結束就合併進紀錄並儲存（以原子性的 rename）。只有在某個 target 上開始了
+  `[[files]]` 寫入時，才會取代該 target 的項目。apply 有連到但沒有寫入檔案的 target 會保留它的檔案，並更新為新的 facts。
+  這次 apply 沒有選到的 target 保留各自的項目。
+- **保存的內容。** 每個 target：時間（`at`）、anvil 版本、每個 step 是否都通過（`ok`）、探測得到的 facts、寫入的每個檔案、
+  無法復原的 step（`cannot_undo`），以及 rollback 之後的 `rolled_back`。每個檔案：dest、寫入時的 mode 與 `sudo`、
+  寫入位元組的 sha256、寫入如何結束（`write`），以及先前的狀態（`previous`）。它絕不保存 secret 的值、step 的腳本或套件清單。
+
+```json
+{
+  "version": 1,
+  "targets": {
+    "web1": {
+      "at": 1730000000,
+      "anvil": "0.4.0",
+      "ok": true,
+      "facts": { "hostname": "web1", "distro": "arch" },
+      "files": [
+        {
+          "dest": "/etc/app.conf",
+          "mode": "0644",
+          "sudo": true,
+          "written_sha256": "<64 hex>",
+          "write": "written",
+          "previous": {
+            "state": "file",
+            "mode": "0600",
+            "uid": 0,
+            "gid": 0,
+            "sha256": "<64 hex>",
+            "kept": true,
+            "text": "…"
+          }
+        },
+        {
+          "dest": "/etc/new.conf",
+          "mode": "0644",
+          "sudo": true,
+          "written_sha256": "<64 hex>",
+          "write": "written",
+          "previous": { "state": "absent" }
+        }
+      ],
+      "cannot_undo": ["packages", "service nginx", "step 1"]
+    }
+  }
+}
+```
+
+anvil 把它寫成一行。`previous` 對先前不存在的 dest 為 `{"state": "absent"}`；對指向不存在檔案之 symlink 的
+`sudo = false` dest 為 `{"state": "dangling", "target": "…"}`；否則為 `file`，帶有它的 mode、owner、sha256，
+以及 `kept` 為 true 時的 `text`。`write` 為 `written`（step 以 0 結束）或 `failed_midway`（開始後失敗、逾時或失去連線，
+因此 DEST 可能只有部分位元組）。寫入任何東西之前就被拒絕（`refused`：root 檢查、DEST 是目錄，或 DEST 在讀取後被改過，
+都以 4 結束）的寫入絕不保存：該 dest 保留前一次 apply 的項目（若有）。
+
+**保存或不保存。** 只有在先前的文字是不含 NUL 位元組的 UTF-8 文字、最多 256 KiB，且項目沒有設定 `rollback = false` 時，
+才會保存它。否則 `kept` 為 false，`reason` 說明原因：`rollback = false`、`over 256 KiB`、`not UTF-8 text`、
+`contains NUL`、`unreadable`、`no od on the target` 或 `record full`。不論哪種情況寫入都會進行；失去的只是它的復原，
+rollback 會把該檔案顯示為 `cannot undo: DEST (REASON)`。`rollback = false` 只保存雜湊：dest 保存 secret 時請使用它
+（[Files](configuration.zh-TW.md#files)）。
+
+**重試保留最初的狀態。** dest 已經是相同位元組的重跑，會保留寫入這些位元組的那次 apply 的項目，所以它的 `previous`
+仍是那次 apply 之前的狀態。中途失敗的寫入在下一次嘗試時保留它之前的 `previous`。失敗的 apply（`ok: false`）
+會保留它沒有碰到的 dest 的項目，因此提早停止的重試不會遺失任何東西；成功的 apply 則捨棄它們。
+
+**16 MiB。** 儲存的紀錄最多 16 MiB（16777216 位元組）。超過時，會從儲存的副本中由大到小捨棄先前的文字，
+每捨棄一份就在 stderr 印出警告：`apply: last-apply.json is full; DEST on TARGET cannot be rolled back`。
+這次 apply 沒有選到的 target 的項目先計入，因此可能讓這次 apply 的文字沒有空間；在這次 apply 的 target 之間，
+依 target 順序較前面的先保留。即使沒有任何文字仍超過上限的紀錄，會以
+`apply: cannot write last-apply.json: over the 16777216 byte limit even without the texts` 失敗。
+
+**一次一個 apply 或 rollback。** 紀錄透過旁邊的 `last-apply.json.lock` 鎖住，從第一個 target 之前直到最後一次儲存；
+只有 `[packages]` 或 `[[services]]` 工作的 apply 也會取得這個鎖。第二個 anvil 會立即以 1 結束失敗，訊息為
+`apply: PATH is in use by another anvil`（PATH 是紀錄的路徑；rollback 為 `rollback: …`）。不支援 `flock` 的檔案系統
+（NFS 可能如此）會以 `apply: PATH: the filesystem does not support locking (NFS?); set $XDG_STATE_HOME to a local disk` 失敗。
+
+**儲存錯誤。** 儲存失敗會讓 apply 不再啟動其他 target；已經在執行的每個 target 仍會結束，並且也會嘗試儲存它。
+接著指令在各區塊印出後以 1 結束失敗，訊息為第一個錯誤加上紀錄仍缺少的 target：
+`apply: cannot write last-apply.json: REASON; not recorded: web1, web2`。無法讀取的紀錄會讓 apply 在任何 target 之前以
+`apply: PATH: REASON` 失敗：`a symlink, refused`、`not a regular file`、`mode 640 lets others in; run chmod 600 on it`、
+`larger than the 16777216 byte limit`、`version N is not supported` 或 `cannot parse`。訊息絕不引用它的內容。
+
+**會遺失什麼。** 以 `internal error: …`（anvil 的 bug）失敗的 target 不會被記錄，並保留它先前的項目。第一次 Ctrl-C
+讓執行中的 target 結束，它們會被儲存。第二次 Ctrl-C 或 anvil 被終止時，已經結束的每個 target 都會保留；
+仍在執行的 target 不會被記錄，即使它的檔案可能已經寫入。
+
+**先讀取 DEST。** 每次 `[[files]]` 寫入之前，會另外執行一次，經由與寫入相同的路徑讀取 DEST（`ls -lLdn` 與 `od`）。
+它的輸出絕不會印出或記錄。不是一般檔案的 dest 會以 `files: DEST is not a regular file` 讓 step 失敗，讀回不完整時則以
+`files: cannot read DEST before writing it` 或 `files: cannot parse ls output for DEST` 失敗；不會寫入任何東西。
+接著寫入會再次雜湊 DEST，若它在讀取後變了就拒絕：`files: DEST changed while anvil was writing it; re-run apply`。
+這項檢查需要 target 上有 `sha256sum` 或 `shasum`。兩者都沒有時，讀取與寫入之間沒有任何檢查，
+因此在這段期間做的變更會被覆寫，而紀錄保存的是讀到的內容。
 
 ### `anvil plan`
 
@@ -527,6 +631,9 @@ facts = { distro = "arch" }
 `anvil plan` 顯示 `would $ file DEST`（apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
 與 `would $ skipped file DEST: no match`。在 `plan --json` 中 `run` 是同一個標籤，走密碼路徑時另有 `sudo_secret`。
 
+每次寫入之前，apply 會讀回 DEST，並把它的內容保存在 [apply 紀錄](#apply-紀錄)中，讓 [`anvil rollback`](#anvil-rollback)
+能把它放回去；接著寫入會拒絕在那次讀取後被改過的 DEST。
+
 檔案的位元組絕不會印出：人類可讀輸出、`--json`、`plan`、`-v` 日誌與 ssh 命令列都不會包含它們。
 位元組透過腳本的 stdin 送到 target；走密碼路徑時先寫入一個 mode 0600 的 `/tmp/anvil-` 檔案，
 該檔案在 step 結束後移除，不論成功、失敗或取消。
@@ -694,6 +801,117 @@ target 以 `✘ timed out after 120 s` 結束。120 s 涵蓋 systemd 預設 90 s
 
 plist 本身的 `Disabled` 鍵為 true 時不會被偵測到（anvil 不讀取 plist）；預期 bootstrap 會以 launchctl 自己的錯誤失敗。
 這些 launchd 的變更是以替身工具測試的，而非實際的 launchd；只有 `print-disabled` 的格式在 macOS 26 上以唯讀方式確認過。
+
+### `anvil rollback`
+
+```text
+anvil rollback [--force DEST]... [--force-all] [--allow-host-change] [--dry-run]
+```
+
+在每個選定的 target 上，從 [apply 紀錄](#apply-紀錄)把上次 apply 在那裡寫入的檔案放回去。每個檔案取回先前的文字、mode 與 owner；
+先前不存在的 dest 會被移除。它直接執行，不詢問確認；`--dry-run` 會先顯示它要做的事：
+
+```sh
+anvil rollback --dry-run --target web1    # read the record only: connect to nothing
+anvil rollback --target web1              # restore web1's files
+anvil rollback --force /etc/app.conf      # restore that dest even though it changed since the apply
+```
+
+| 旗標                  | 效果                                                            |
+| --------------------- | --------------------------------------------------------------- |
+| `--force DEST`        | 即使 DEST 在上次 apply 後被改過也還原它；可重複以指定更多 dest  |
+| `--force-all`         | 即使檔案在上次 apply 後被改過也還原每一個                       |
+| `--allow-host-change` | 即使 target 的 machine-id 或 hostname 與紀錄不同也執行 rollback |
+| `--dry-run`           | 列出會還原的內容，不連線到任何地方                              |
+
+`--target`、`--parallel` 與 `--json` 的作用與 apply 相同。同時使用 `--force` 與 `--force-all` 是用法錯誤。
+
+```text
+▶ web1
+  $ remove /etc/new.conf
+  removed /etc/new.conf
+  $ restore /etc/app.conf
+  restored /etc/app.conf
+  $ cannot undo: packages
+  $ cannot undo: service nginx
+  $ cannot undo: step 1
+  ✔ ok · 5 steps
+
+▶ web2
+  $ nothing recorded
+  ✔ ok · 1 step
+
+2 ok, 0 failed
+```
+
+- **最後寫入的先處理。** 每個記錄的檔案是一個 step，順序與 apply 寫入時相反：`restore DEST` 印出 `restored DEST`，
+  `remove DEST` 印出 `removed DEST`；DEST 已經是 apply 之前的樣子時，兩者都印出 `unchanged DEST`（restore 仍會把 owner 與 mode 設回去）。
+  文字沒有保存的檔案是一個略過的 step `cannot undo: DEST (REASON)`，原因取自紀錄（例如 `rollback = false`）。
+- **無法復原的部分。** 在檔案之後，apply 中有執行但無法復原的 step 會顯示為略過的 step：`cannot undo: packages`、
+  `cannot undo: service NAME` 與 `cannot undo: step N`（第 N 個 `[[steps]]` 項目）。rollback 絕不執行套件管理器、
+  service 指令或 step。
+- **與寫入相同的路徑。** 每個檔案都依 apply 寫入的方式還原，依據記錄的 `sudo` 與 target 目前的 facts：透過 `sudo -n`、
+  以 root、以連線使用者，或走密碼路徑：把文字暫存在 0600 的 `/tmp/anvil-` 檔案，再執行 `sudo install -o UID -g GID -m MODE`。
+  只要 target 的項目中有 `sudo = true` 的檔案，sudo 密碼就取自該 target 的 sudo secret。
+  寫入時的 root 檢查同樣適用（[File steps](#file-steps)）。只有 root 能把檔案的 owner 還回去；
+  以連線使用者執行時，若 owner 不同，rollback 會警告 `files: DEST was owned by UID:GID; only root can give it back`。
+- **只還原 config 列出的檔案。** 紀錄是使用者能編輯的檔案，因此 target 記錄的每個 dest 都必須仍是某個 `[[files]]`
+  項目的 `dest`，且 `sudo` 相同、該項目適用於這個 target：連線之前檢查它的 tag，探測之後檢查它的 facts。
+  紀錄保存了文字的 dest，該項目還不能設定 `rollback = false`。否則該 target 失敗且不執行任何東西，訊息為
+  `rollback: DEST is not in [[files]]; refusing to restore it`、
+  `rollback: DEST has sudo = false in [[files]] but sudo = true in the record; refusing to restore it`、
+  `rollback: no [[files]] entry for DEST applies to TARGET; refusing to restore it` 或
+  `rollback: DEST has rollback = false in [[files]] but the record keeps its text; refusing to restore it`。
+  把項目加回 config 才能 rollback 該 target。dest、mode 或 sha256 不可能由 apply 寫出的紀錄（相對路徑的 dest、`..`、
+  開頭的 `-`、不是八進位的 mode）與其他錯誤的紀錄一樣，以 `rollback: PATH: cannot parse` 失敗。
+- **防護。** 變更 DEST 之前，step 會先雜湊它。DEST 是 apply 寫入的位元組或先前的內容時才會繼續。
+  其他任何情況（例如手動編輯過）都會讓 target 以 1 結束失敗，訊息為
+  `files: DEST changed since the last apply; anvil rollback --force DEST restores it anyway`。target 上既沒有
+  `sha256sum` 也沒有 `shasum` 時無法判斷，會以 `files: no sha256 tool on the target to check DEST; anvil rollback --force DEST restores it`
+  失敗。`--force DEST` 取消該 dest 的防護，`--force-all` 取消每個 dest 的防護。寫入中途失敗的檔案會在沒有防護的情況下還原：
+  DEST 可能只有部分位元組。被拒絕的檔案會結束它的 target，因此 apply 在它之前寫入的檔案也不會還原；
+  請強制它，或修正 DEST 後再執行一次 rollback。沒有任何選定 target 的紀錄列出的 `--force DEST` 會以 2 結束，訊息為
+  `rollback: --force DEST: not in the record`。
+- **host 檢查。** 每個 target 會先被探測。當它已不是紀錄所來自的 host 時，它會失敗且不執行任何東西：
+  `rollback: TARGET is now host LIVE, the record is from RECORDED; --allow-host-change rolls back anyway`。
+  紀錄與探測都有 machine-id 時比較 machine-id，否則比較短 hostname（到第一個 `.` 為止，轉小寫）；
+  目前的探測不回報 machine-id，所以比較的是 hostname。`--force` 與 `--force-all` 不能略過它，只有 `--allow-host-change` 可以。
+- **懸空的連結。** 原本是指向不存在檔案之 symlink 的 `sudo = false` dest，會透過連結寫入，因而建立了那個檔案。
+  rollback 只移除連結，它所建立的檔案會留下：`removed link DEST; the file it pointed to was kept`。
+- **`rolled_back`。** 每個 target 結束後，它還原、移除或發現未變更的 dest 會以 `rolled_back`（`at` 與 `dests`）存進它的項目。
+  這是 rollback 對紀錄唯一的變更，所以第二次 rollback 會再次還原相同的位元組，或印出 `unchanged DEST`。
+  下一次在該 target 上寫入檔案的 apply 會取代這個項目。
+- **Target。** 紀錄中沒有項目的選定 target 顯示 `nothing recorded`，並算作成功。已不在 inventory 中的 target 的項目不會被 rollback。
+- **鎖。** rollback 在整個執行期間持有紀錄的鎖，與 apply 相同（[apply 紀錄](#apply-紀錄)）；儲存失敗為
+  `rollback: cannot write last-apply.json: REASON`，並以 `; not recorded: …` 列出 `rolled_back` 沒有儲存的 target。
+
+`--dry-run` 不取得鎖就讀取紀錄，也不連線到任何地方。它為每個 target 印出 `would restore DEST`、`would remove DEST`、
+`cannot undo: …` 與 `nothing recorded`，最後印出 `N targets, nothing executed`。它做與 rollback 相同的 `[[files]]` 檢查，
+以紀錄中的 facts 代替探測：rollback 會拒絕的 target 顯示 `✘ rollback: …`（`--json` 中為 `"error"`），摘要為
+`N targets, M failed, nothing executed`，並以 1 結束：
+
+```text
+▶ web1
+  would remove /etc/new.conf
+  would restore /etc/app.conf
+  cannot undo: packages
+  cannot undo: service nginx
+  cannot undo: step 1
+  ✔ 5 steps
+
+1 target, nothing executed
+```
+
+搭配 `--json`：`{"targets":[{"target":"web1","steps":[{"run":"would remove /etc/new.conf"},…],"ok":true}],"ok":true}`。
+沒有 `--dry-run` 時，`--json` 的形狀與 apply 相同，略過的 step 帶有 `"skipped": true`。
+
+結束碼：
+
+- **0**：每個選定的 target 都完成 rollback，或沒有任何紀錄。
+- **1**：`rollback: no apply recorded`（沒有紀錄，或紀錄中沒有任何項目；不執行任何東西）；某個 target 失敗
+  （被拒絕的 dest、不在 `[[files]]` 中或 `sudo` 不同的 dest、host 改變、還原或連線失敗）；紀錄無法讀取（`rollback: PATH: REASON`，與 apply 相同）、
+  被另一個 anvil 鎖住或無法儲存；找不到狀態目錄（[apply 紀錄](#apply-紀錄)）。
+- **2**：錯誤的旗標（`--force` 與 `--force-all` 並用）、不在紀錄中的 `--force DEST`、未知的 `--target`，或無效的 config 或 inventory。
 
 ### `anvil run [--timeout SECS] <FILE|->`
 
@@ -935,10 +1153,11 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
   `plan`：某個 target 無法連線、探測或解析。
   `apply`/`plan`：某個 plugin step 的 plugin 在某個 target 上失敗（[Plugin steps](#plugin-steps)）。
   `run`：某個 target 失敗或無法連線。
-  `apply`/`plan`/`run`：第一次 Ctrl-C 取消了執行（[Ctrl-C](#ctrl-c)）；第二次則讓 anvil 因 SIGINT 結束，shell 回報為 130。
+  `rollback`：見 [anvil rollback](#anvil-rollback)；`apply` 還有紀錄無法讀取、被鎖住或無法儲存，或找不到狀態目錄時（[apply 紀錄](#apply-紀錄)）。
+  `apply`/`plan`/`run`/`rollback`：第一次 Ctrl-C 取消了執行（[Ctrl-C](#ctrl-c)）；第二次則讓 anvil 因 SIGINT 結束，shell 回報為 130。
   `inventory`/`config`/`secret`：編輯器以非零結束（中止）、檔案寫入失敗，或 secret store 失敗、被鎖住或其密語提示被取消。
 - **2**：錯誤的旗標或引數（包括不以 `.toml` 結尾的 `--inventory` 或 `--config` 路徑）、未知的 `--target`、
-  無效、無法讀取或模稜兩可的檔案、沒有 `$HOME`、找不到編輯器、三次嘗試後仍無效的緩衝區，或大於 1 MiB 的 secret。
+  無效、無法讀取或模稜兩可的檔案、沒有 `$HOME`（`apply` 與 `rollback` 的狀態目錄除外，為 1：[apply 紀錄](#apply-紀錄)）、找不到編輯器、三次嘗試後仍無效的緩衝區，或大於 1 MiB 的 secret。
   對 `apply` 與 `plan` 而言，還有釘選檢查失敗的 `[plugins]` 項目（[Plugin steps](#plugin-steps)）。
   對 `run` 而言，還有空的、超過 1 MiB、不是 UTF-8 或無法讀取的腳本，以及超出 1..=3600 的 `--timeout`。
   `tui` 見下方。

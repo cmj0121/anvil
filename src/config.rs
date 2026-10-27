@@ -258,6 +258,10 @@ pub struct FileEntry {
     /// `false`: write as the connecting user, no sudo, temp file, tty or secret.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub sudo: bool,
+    /// `false`: the apply record keeps only the hash of the file it
+    /// replaces, never its bytes, so `anvil rollback` cannot restore it.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub rollback: bool,
 }
 
 /// By hand, so a field added later must be chosen for `Debug` rather than
@@ -271,6 +275,7 @@ impl std::fmt::Debug for FileEntry {
             .field("tags", &self.tags)
             .field("facts", &self.facts)
             .field("sudo", &self.sudo)
+            .field("rollback", &self.rollback)
             .finish()
     }
 }
@@ -694,9 +699,10 @@ fn check_src(src: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// A `[[files]]` dest: absolute, in a charset that needs no shell quoting
-/// beyond single quotes, with no `.` or `..` component.
-fn check_dest(dest: &str) -> Result<(), String> {
+/// A `[[files]]` dest: absolute (so never read as an option), in a charset
+/// that needs no shell quoting beyond single quotes, with no `.` or `..`
+/// component. `last-apply.json` holds each dest to the same rule.
+pub(crate) fn check_dest(dest: &str) -> Result<(), String> {
     if dest.len() > MAX_DEST_BYTES {
         return Err(format!(
             "{} bytes exceeds the {MAX_DEST_BYTES} byte limit",
@@ -832,7 +838,7 @@ fn check_fact(key: &str, value: &str) -> Result<(), String> {
 }
 
 /// 64 lowercase hex digits, as `sha256sum` prints them.
-fn is_sha256(s: &str) -> bool {
+pub(crate) fn is_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
@@ -1059,6 +1065,25 @@ mod tests {
                 .unwrap()
                 .contains("files")
         );
+    }
+
+    #[test]
+    fn a_files_entry_keeps_rollback_on_unless_set_false() {
+        let config = file_entry(ENTRY);
+        assert!(config.files[0].rollback);
+        let off = file_entry(&format!("{ENTRY}\nrollback = false"));
+        off.check_files().unwrap();
+        assert!(!off.files[0].rollback);
+        assert!(off.files[0].sudo, "rollback leaves sudo alone");
+        assert!(format!("{:?}", off.files[0]).contains("rollback: false"));
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&config, format).unwrap();
+            assert!(!text.contains("rollback"), "{text}");
+            let text = document::to_string(&off, format).unwrap();
+            assert!(text.contains("rollback"), "{text}");
+            let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(back, off);
+        }
     }
 
     #[test]
@@ -1291,6 +1316,11 @@ mod tests {
         for (file, key, line) in [
             ("invalid/config-files-unknown-key.toml", "owner", "line 5"),
             ("invalid/config-files-sudo-not-bool.toml", "sudo", "line 5"),
+            (
+                "invalid/config-files-rollback-not-bool.toml",
+                "rollback",
+                "line 5",
+            ),
             ("invalid/config-files-unknown-key.yaml", "owner", "line 5"),
         ] {
             let err = Config::load(Some(&fixture_doc(file))).unwrap_err();

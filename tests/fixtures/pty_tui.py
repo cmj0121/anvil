@@ -2,11 +2,14 @@
 """Drive a full-screen program on a pseudo-terminal, step by step.
 
     pty_tui.py [--rows R] [--cols C] [--prompts N] [--exit N] [--entries N]
-               [--main REGEX] (--wait REGEX | --send KEYS)... -- COMMAND [ARG...]
+               [--main REGEX] (--wait REGEX | --absent REGEX | --send KEYS)...
+               -- COMMAND [ARG...]
 
 The steps run in order: `--wait` reads until the screen the program shows
 matches REGEX (Python syntax, searched over its rows joined by newlines),
-`--send` types KEYS (backslash escapes such as `\\r` and `\\x1b` allowed).
+`--absent` reads for a moment and fails if the screen matches REGEX at
+any point meanwhile, `--send` types KEYS (backslash escapes such as `\\r`
+and `\\x1b` allowed).
 The screen comes from a small terminal model: cursor moves, printing, the
 alternate screen and erases; colours and other sequences are dropped.
 
@@ -35,6 +38,8 @@ import termios
 import time
 
 TIMEOUT = 30
+# How long `--absent` watches the screen.
+SETTLE = 0.5
 PROMPT = re.compile(rb"password:\s*$", re.IGNORECASE)
 ENTER_ALT = b"\x1b[?1049h"
 LEAVE_ALT = b"\x1b[?1049l"
@@ -148,6 +153,7 @@ def main() -> int:
     parser.add_argument("--entries", type=int, default=1)
     parser.add_argument("--main")
     parser.add_argument("--wait", dest="steps", action="append", type=lambda s: ("wait", s))
+    parser.add_argument("--absent", dest="steps", action="append", type=lambda s: ("absent", s))
     parser.add_argument("--send", dest="steps", action="append", type=lambda s: ("send", s))
     parser.add_argument("command", nargs="+")
     args = parser.parse_args()
@@ -200,6 +206,16 @@ def main() -> int:
             os.write(master, codecs.decode(value, "unicode_escape").encode("latin-1"))
             continue
         pattern = re.compile(value, re.MULTILINE)
+        if kind == "absent":
+            settle = time.monotonic() + SETTLE
+            seen = pattern.search(screen.text())
+            while open_ and not seen and time.monotonic() < settle:
+                open_ = pump(min(settle - time.monotonic(), 0.1))
+                seen = pattern.search(screen.text())
+            if seen:
+                problems.append(f"saw {value!r}")
+                break
+            continue
         while open_ and not pattern.search(screen.text()):
             left = deadline - time.monotonic()
             if left <= 0:

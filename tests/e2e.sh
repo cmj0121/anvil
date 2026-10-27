@@ -3,7 +3,8 @@
 # commands: a temp XDG_CONFIG_HOME holds the inventory (the container as `arch`
 # for the key user and `archpw` for the password user, `closed` on a closed
 # port, `archsd` for a second container with systemd as PID 1) and a config
-# with no secret names, so the keychain is never touched.
+# with no secret names, so the keychain is never touched. A temp XDG_STATE_HOME
+# holds last-apply.json, so no apply records into the real state directory.
 # The systemd container needs --privileged; when it cannot boot, the summary
 # says `SKIP systemd: <reason>` and the run still passes, unless
 # ANVIL_E2E_SYSTEMD=1, which turns that skip into a failure.
@@ -155,11 +156,14 @@ format = "toml"
 run = "hostname"
 CONF
 
-# The environment of every anvil run: temp HOME (control dir) and config dir,
-# the fake editor as $EDITOR, no $VISUAL to shadow it.
+# The environment of every anvil run: temp HOME (control dir), config dir and
+# state dir (last-apply.json), the fake editor as $EDITOR, no $VISUAL to shadow it.
 run_env() {
-  env -u VISUAL HOME="$HOME_DIR" XDG_CONFIG_HOME="$XDG" EDITOR="$FAKE_EDITOR" "$@"
+  env -u VISUAL HOME="$HOME_DIR" XDG_CONFIG_HOME="$XDG" XDG_STATE_HOME="$TMP/state" EDITOR="$FAKE_EDITOR" "$@"
 }
+
+# The permission bits of a local path in octal: GNU stat, else BSD stat.
+local_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 
 # anvil with stdin not a tty; stdout and stderr captured.
 anvil() {
@@ -415,6 +419,146 @@ else
   fail "1 MiB file: exit $code after ${elapsed}s"
 fi
 
+step "(o) rollback on arch (NOPASSWD): apply records, rollback restores bytes, mode and owner, removes a new dest"
+# A state dir of its own, so the record holds only this block's apply.
+RB_STATE="$TMP/state-rb"
+RB_RECORD="$RB_STATE/anvil/last-apply.json"
+RB_DIR="$TMP/rollback"
+mkdir -p "$RB_DIR"
+RB_OLD="anvil-e2e-rb-previous-$$"
+RB_NEW="anvil-e2e-rb-written-$$"
+printf 'new = "%s"\n' "$RB_NEW" >"$RB_DIR/new.conf"
+cat >"$RB_DIR/config.toml" <<CONF
+[[files]]
+src = "new.conf"
+dest = "/etc/anvil-e2e-rb"
+mode = "0644"
+
+[[files]]
+src = "new.conf"
+dest = "/etc/anvil-e2e-rb-new"
+mode = "0644"
+CONF
+rb_anvil() {
+  run_env XDG_STATE_HOME="$RB_STATE" "$ANVIL" --ssh-config "$CFG" --config "$RB_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+# Neither the previous nor the written bytes ever reach the output, logs included.
+rb_quiet() { ! grep -qF -e "$RB_OLD" -e "$RB_NEW" "$TMP/out" "$TMP/err"; }
+rb_stat() { docker exec "$NAME" stat -c '%a %U:%G' "$1"; }
+# Previous: root:key 0600 (tee keeps the owner, so its mode is what changes).
+docker exec "$NAME" sh -c "printf '%s\n' '$RB_OLD' >/etc/anvil-e2e-rb && chown root:key /etc/anvil-e2e-rb \
+  && chmod 600 /etc/anvil-e2e-rb && rm -f /etc/anvil-e2e-rb-new"
+rb_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  wrote /etc/anvil-e2e-rb' "$TMP/out" \
+  && grep -qxF '  wrote /etc/anvil-e2e-rb-new' "$TMP/out" \
+  && docker exec "$NAME" cat /etc/anvil-e2e-rb | cmp -s - "$RB_DIR/new.conf" \
+  && [ "$(rb_stat /etc/anvil-e2e-rb)" = '644 root:key' ] \
+  && [ "$(rb_stat /etc/anvil-e2e-rb-new)" = '644 root:root' ] && rb_quiet; then
+  pass "apply wrote a root-owned dest and a new one, no bytes in the output or the -vv log"
+else
+  fail "apply with [[files]] to record: exit $code"
+fi
+if [ "$(local_mode "$RB_STATE/anvil")" = 700 ] && [ "$(local_mode "$RB_RECORD")" = 600 ] \
+  && grep -qF "$RB_OLD" "$RB_RECORD" && grep -qF '"previous":{"state":"absent"}' "$RB_RECORD"; then
+  pass "last-apply.json is 0600 in the 0700 \$XDG_STATE_HOME/anvil, the previous text kept"
+else
+  fail "the record: dir $(local_mode "$RB_STATE/anvil"), file $(local_mode "$RB_RECORD")"
+fi
+rb_anvil apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-rb' "$TMP/out" && grep -qF "$RB_OLD" "$RB_RECORD"; then
+  pass "a rerun apply is unchanged and keeps the previous text"
+else
+  fail "rerun apply: exit $code"
+fi
+rb_anvil rollback --dry-run --target arch
+code=$?
+# The config's default hostname step is step 1, which a rollback cannot undo.
+expected=$(printf '▶ arch\n  would remove /etc/anvil-e2e-rb-new\n  would restore /etc/anvil-e2e-rb\n  cannot undo: step 1\n  ✔ 3 steps\n\n1 target, nothing executed')
+if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ] \
+  && docker exec "$NAME" cat /etc/anvil-e2e-rb | cmp -s - "$RB_DIR/new.conf"; then
+  pass "rollback --dry-run lists the restore and the remove, changes nothing"
+else
+  fail "rollback --dry-run: exit $code, expected:"
+  printf '%s\n' "$expected"
+fi
+rb_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  restored /etc/anvil-e2e-rb' "$TMP/out" \
+  && grep -qxF '  removed /etc/anvil-e2e-rb-new' "$TMP/out" \
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" = "$RB_OLD" ] \
+  && [ "$(rb_stat /etc/anvil-e2e-rb)" = '600 root:key' ] \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-rb-new && rb_quiet \
+  && grep -qF '"rolled_back":{' "$RB_RECORD"; then
+  pass "rollback restored the previous bytes, mode 0600 and owner root:key, removed the new dest"
+else
+  fail "rollback: exit $code"
+  docker exec "$NAME" stat -c '%a %U:%G %n' /etc/anvil-e2e-rb
+fi
+rb_anvil rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-rb' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-rb-new' "$TMP/out" \
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" = "$RB_OLD" ]; then
+  pass "a second rollback is unchanged"
+else
+  fail "second rollback: exit $code"
+fi
+# Applied again, then edited by hand: the guard refuses until --force DEST.
+rb_anvil apply --target arch
+code=$?
+docker exec "$NAME" sh -c 'printf "edited by hand\n" >/etc/anvil-e2e-rb'
+rb_anvil rollback --target arch
+code2=$?
+if [ "$code" -eq 0 ] && [ "$code2" -eq 1 ] \
+  && grep -qxF '  ✘ step 2 exited 3' "$TMP/out" \
+  && grep -qxF '  arch: files: /etc/anvil-e2e-rb changed since the last apply; anvil rollback --force /etc/anvil-e2e-rb restores it anyway' "$TMP/err" \
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" = 'edited by hand' ]; then
+  pass "a hand-edited dest is refused and left as edited"
+else
+  fail "rollback over a hand edit: apply exit $code, rollback exit $code2"
+fi
+rb_anvil rollback --force /etc/anvil-e2e-rb --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  restored /etc/anvil-e2e-rb' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-rb-new' "$TMP/out" \
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" = "$RB_OLD" ] \
+  && [ "$(rb_stat /etc/anvil-e2e-rb)" = '600 root:key' ] \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-rb-new && rb_quiet; then
+  pass "--force DEST restored the hand-edited dest"
+else
+  fail "rollback --force: exit $code"
+fi
+# A write killed midway: a tee that writes 4 bytes of the file, then exits 1.
+# Its own -a (the 0600 create) goes to the real tee, set back right after.
+docker exec -i "$NAME" sh -c 'mv /usr/bin/tee /usr/bin/tee.anvil-e2e && cat >/usr/bin/tee && chmod 755 /usr/bin/tee' <<'STUB'
+#!/bin/sh
+case $1 in -a) exec /usr/bin/tee.anvil-e2e "$@" ;; esac
+head -c 4 >"$1"
+exit 1
+STUB
+rb_anvil apply --target arch
+code=$?
+docker exec "$NAME" mv /usr/bin/tee.anvil-e2e /usr/bin/tee
+if [ "$code" -eq 1 ] \
+  && grep -qE '"dest":"/etc/anvil-e2e-rb","mode":"0644","sudo":true,"written_sha256":"[0-9a-f]{64}","write":"failed_midway"' "$RB_RECORD" \
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" = "$(head -c 4 "$RB_DIR/new.conf")" ]; then
+  pass "a write that fails midway leaves part of the bytes, recorded as failed_midway"
+else
+  fail "apply with a tee that fails midway: exit $code"
+fi
+rb_anvil rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  restored /etc/anvil-e2e-rb' "$TMP/out" \
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" = "$RB_OLD" ] \
+  && [ "$(rb_stat /etc/anvil-e2e-rb)" = '600 root:key' ] && rb_quiet; then
+  pass "rollback restored the dest a write left half-written, without --force"
+else
+  fail "rollback after a write failed midway: exit $code"
+fi
+
 step "(e) password user through a pty: prompted once by doctor, not again by apply"
 if command -v python3 >/dev/null 2>&1; then
   run_env PTY_PASSWORD="$PASSWORD" python3 tests/e2e/pty_login.py --prompts 1 --expect "$DISTRO_LINE" \
@@ -574,6 +718,50 @@ CONF
     pass "a rerun prints unchanged, no /tmp/anvil-* left on the target"
   else
     fail "rerun [[files]] with the sudo secret: exit $code, left: $left"
+  fi
+  # Rollback over the password path: staged in /tmp, put back by sudo install
+  # with the previous owner and mode, from a state dir of its own.
+  PW_STATE="$TMP/state-pw"
+  PW_RECORD="$PW_STATE/anvil/last-apply.json"
+  PW_OLD="anvil-e2e-pw-previous-$$"
+  cat >>"$SUDO_FILES_DIR/config.toml" <<CONF
+
+[[files]]
+src = "e2e.conf"
+dest = "/etc/anvil-e2e-rbpw"
+mode = "0600"
+
+[[files]]
+src = "e2e.conf"
+dest = "/etc/anvil-e2e-rbpw-new"
+mode = "0600"
+CONF
+  docker exec "$NAME" sh -c "printf '%s\n' '$PW_OLD' >/etc/anvil-e2e-rbpw && chown pw:pw /etc/anvil-e2e-rbpw \
+    && chmod 640 /etc/anvil-e2e-rbpw && rm -f /etc/anvil-e2e-rbpw-new"
+  pw_quiet() { ! grep -qF -e "$PASSWORD" -e "$FILE_CONTENT" -e "$PW_OLD" "$TMP/out" "$TMP/err"; }
+  sudo_anvil XDG_STATE_HOME="$PW_STATE" -vv apply --target archpw
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  wrote /etc/anvil-e2e-rbpw' "$TMP/out" \
+    && grep -qxF '  wrote /etc/anvil-e2e-rbpw-new' "$TMP/out" \
+    && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-rbpw)" = '600 root:root' ] \
+    && [ "$(local_mode "$PW_STATE/anvil")" = 700 ] && [ "$(local_mode "$PW_RECORD")" = 600 ] \
+    && ! grep -qF "$PASSWORD" "$PW_RECORD" && pw_quiet; then
+    pass "apply over the password path took a pw-owned dest to root:root 0600, recorded at 0600"
+  else
+    fail "apply [[files]] to record with the sudo secret: exit $code"
+  fi
+  sudo_anvil XDG_STATE_HOME="$PW_STATE" -vv rollback --target archpw
+  code=$?
+  left=$(docker exec "$NAME" sh -c 'ls -d /tmp/anvil-* 2>/dev/null')
+  if [ "$code" -eq 0 ] && grep -qxF '  restored /etc/anvil-e2e-rbpw' "$TMP/out" \
+    && grep -qxF '  removed /etc/anvil-e2e-rbpw-new' "$TMP/out" \
+    && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rbpw)" = "$PW_OLD" ] \
+    && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-rbpw)" = '640 pw:pw' ] \
+    && ! docker exec "$NAME" test -e /etc/anvil-e2e-rbpw-new && [ -z "$left" ] && pw_quiet; then
+    pass "rollback with the sudo secret restored the bytes, mode 0640 and owner pw:pw, removed the new dest"
+  else
+    fail "rollback with the sudo secret: exit $code, left: $left"
+    docker exec "$NAME" stat -c '%a %U:%G %n' /etc/anvil-e2e-rbpw
   fi
   SUDO_CONFIG_USED=$SUDO_CONFIG
   # One wrong attempt only, and last: pam_faillock locks pw after three.

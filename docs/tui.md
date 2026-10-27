@@ -93,6 +93,7 @@ Host and config text is escaped as in the CLI, and a secret value is never drawn
 | `a`          | apply on the selection                                        | `anvil apply`                             |
 | `p`          | plan on the selection: the steps apply would run, none run    | `anvil plan`                              |
 | `x`          | edit a sh script, confirm, then run it on the selection       | `anvil run FILE`                          |
+| `b`          | rollback on the selection, `y` to confirm                     | `anvil rollback`                          |
 | `Esc`        | cancel the run; close an overlay                              | —                                         |
 | `i`          | edit the inventory, then reload the inventory and the config  | `anvil inventory`                         |
 | `c`          | edit the config, then reload the inventory and the config     | `anvil config`                            |
@@ -126,6 +127,12 @@ script for the next `x`. The run is `anvil run`'s, with the default 300 s timeou
 and no sudo password typed, so root work needs `sudo -n` or a NOPASSWD target. The last script is kept in memory for
 the session only; scripts to keep belong in `[[steps]]`.
 
+`b` asks `roll back N targets: a, b, c?`, naming the selection as `x` does. Only `y` answers it: `Enter` and other keys
+keep the question, `n` or `Esc` closes it. The rollback is `anvil rollback`'s with no `--force` and no
+`--allow-host-change`, each target in its own tab. A dest changed since the last apply fails its target with
+`files: DEST changed since the last apply; run anvil rollback --force DEST in a terminal to restore it anyway`. A
+warning the run ends with, such as a full `last-apply.json` after an apply, shows under the result.
+
 `u` checks the latest release in the background, as `anvil update --check` does. When it is newer, `u` asks
 `replace anvil with VERSION?`: `y` or `Enter` downloads, verifies and replaces the binary as `anvil update` does, and
 `n` or `Esc` changes nothing. If another overlay is open when the check returns, the question waits: the status bar
@@ -137,18 +144,19 @@ greyed in the help and only shows that notice again, until anvil is restarted.
 
 ## Rules
 
-- **`--parallel N`** sets how many targets apply, plan and run (`x`) take at once, as in the CLI
+- **`--parallel N`** sets how many targets apply, plan, run (`x`) and rollback (`b`) take at once, as in the CLI
   ([Running in parallel](cli.md#running-in-parallel)); no key changes it. doctor runs one target at a time and says
   nothing about the flag.
-- **One run at a time.** While doctor, apply, plan, run or an update runs, `d`, `a`, `p`, `x`, `u`, `i`, `c`, `s`, `m`
-  and `o` are refused with `busy: <run> is running (Esc cancels)` on the status bar; for doctor and an update, which
-  Esc cannot cancel, it is `busy: <run> is running`. A run keeps the selection and paths it started with.
+- **One run at a time.** While doctor, apply, plan, run, rollback or an update runs, `d`, `a`, `p`, `x`, `b`, `u`, `i`,
+  `c`, `s`, `m` and `o` are refused with `busy: <run> is running (Esc cancels)` on the status bar; for doctor and an
+  update, which Esc cannot cancel, it is `busy: <run> is running`. A run keeps the selection and paths it started with.
 - **Esc cancels between steps.** apply checks before each target and each step: the running step finishes, and the rest
-  of that target and every later target end as `⊘ cancelled`. A run (`x`) cancels the same way: its script is its one
-  step, so the running script finishes first and every later target ends as `⊘ cancelled`. plan checks before each
+  of that target and every later target end as `⊘ cancelled`. A rollback (`b`) cancels as apply does. A run (`x`)
+  cancels the same way: its script is its one step, so the running script finishes first and every later target ends
+  as `⊘ cancelled`. plan checks before each
   target: the running probe finishes and every later target ends as `⊘ cancelled`. With `--parallel`, every running
   target finishes its step or probe that way and no other target starts. The notice is
-  `cancelling: the running step finishes first` for apply and run, `cancelling: running targets finish first` for plan.
+  `cancelling: the running step finishes first` for apply, run and rollback, `cancelling: running targets finish first` for plan.
   Esc never kills a running step, local or remote; only the step's timeout ends it (300 s for `x`). doctor cannot be
   cancelled; its probes are bounded by the [ssh timeouts](cli.md#ssh-behaviour).
 - **Handoff.** The editor (`i`, `c`, `s`, `x`), the migration (`m`, so its age passphrase prompt works), ssh's interactive

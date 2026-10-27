@@ -163,11 +163,16 @@ fn a_failed_target_does_not_stop_the_others() {
     sandbox.with_fake_host();
     let out = anvil_stdin(
         &sandbox,
-        &["run", "--target", "fake", "--target", "local", "-"],
+        &["-vv", "run", "--target", "fake", "--target", "local", "-"],
         &CONNECT_REFUSED,
         b"exit 3\n",
     );
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("run fake: failed: ") && !stderr.contains("apply fake:"),
+        "the log names the run: {stderr}"
+    );
     assert_eq!(
         text(&out.stdout),
         format!(

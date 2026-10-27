@@ -305,34 +305,6 @@ fn a_bad_src_exits_two_before_any_target_but_config_still_opens() {
     assert!(!ran.exists(), "no target ran");
 }
 
-/// A stand-in sudo, first on the target's `PATH`: `-n` needs a password, so
-/// the probe reports `sudo=binary`; `-v` prints `$SUDO_PROMPT` on the
-/// terminal and accepts `$FAKE_SUDO_PW`; `find` prints its start path, so
-/// each directory of the sandbox passes as root-only; anything else runs as
-/// the user, `install` after the heartbeat of [`heartbeat`] in
-/// `$FAKE_SUDO_BEAT` when set. Each call's argv is appended to
-/// `$FAKE_SUDO_LOG`.
-const FAKE_SUDO: &str = r#"#!/bin/sh
-printf '%s\n' "$*" >>"$FAKE_SUDO_LOG"
-case "$1" in
-  -n) echo 'sudo: a password is required' >&2; exit 1 ;;
-  -k) exit 0 ;;
-  find) printf '%s\n' "$2"; exit 0 ;;
-  install)
-    D=$FAKE_SUDO_BEAT
-    if [ -n "$D" ]; then
-      i=0; until [ -e "$D/go" ]; do i=$((i+1)); echo $i >"$D/beat"; [ $i -gt 600 ] && exit 1; sleep 0.05; done
-    fi ;;
-  -v)
-    printf %s "$SUDO_PROMPT" >/dev/tty
-    IFS= read -r pw </dev/tty
-    [ "$pw" = "$FAKE_SUDO_PW" ] && exit 0
-    echo 'Sorry, try again.' >/dev/tty
-    exit 1 ;;
-esac
-exec "$@"
-"#;
-
 /// Every `/tmp/anvil-<32 hex>` temp file name.
 fn temp_files() -> Vec<String> {
     std::fs::read_dir("/tmp")
@@ -346,55 +318,15 @@ fn temp_files() -> Vec<String> {
         .collect()
 }
 
-/// Whether script(1) is there: fake-ssh runs a `-tt` client under it.
-fn have_script() -> bool {
-    ["/usr/bin/script", "/bin/script"]
-        .iter()
-        .any(|path| std::path::Path::new(path).exists())
-}
-
-/// A sandbox without the debug flags whose host `fake` types the sudo
-/// password `PW_SUDO` from an age store, set as `anvil secret` sets it, and
-/// [`FAKE_SUDO`] in `<root>/bin`. Returns the sandbox, the `[secrets]` table
-/// every config must start with, and a `PATH` with that sudo first.
-fn sudo_sandbox() -> (Sandbox, &'static str, String) {
-    use std::os::unix::fs::PermissionsExt;
-
-    use age::secrecy::ExposeSecret;
-
-    let sandbox = Sandbox::new("aa").without_debug_flags();
-    let identity = age::x25519::Identity::generate();
-    common::write_private(
-        &sandbox.root().join("h/key.txt"),
-        format!("{}\n", identity.to_string().expose_secret()).as_bytes(),
-    );
-    let secrets = "[secrets]\nbackend = \"age\"\n\n\
-                   [secrets.age]\npath = \"~/secrets.age\"\nidentity = \"~/key.txt\"\n\n";
-    sandbox.write_config("config.toml", secrets);
-    let out = sandbox.edit(&["secret", "PW_SUDO"], Some(&sandbox.typed()), None);
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-
-    let bin = sandbox.root().join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    std::fs::write(bin.join("sudo"), FAKE_SUDO).unwrap();
-    std::fs::set_permissions(bin.join("sudo"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    sandbox.write_config(
-        "inventory.toml",
-        "[hosts.fake]\nhost = \"fakehost\"\nsudo_secret = \"PW_SUDO\"\n",
-    );
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    (sandbox, secrets, path)
-}
-
 #[test]
 fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
     use std::os::unix::fs::PermissionsExt;
 
-    if !have_script() {
+    if !common::have_script() {
         eprintln!("skip: no script(1) for fake-ssh -tt");
         return;
     }
-    let (sandbox, secrets, path) = sudo_sandbox();
+    let (sandbox, secrets, path) = common::sudo_sandbox("aa");
     std::fs::create_dir(sandbox.root().join("out")).unwrap();
     std::fs::write(sandbox.config_dir().join("motd.txt"), FILE_TEXT).unwrap();
     let dest = sandbox.root().join("out/pw.conf");
@@ -616,7 +548,7 @@ fn beating_into(kind: Kind, stderr: Option<Stdio>) -> Running {
             (sandbox, "", command)
         }
         Kind::Tty => {
-            let (sandbox, secrets, path) = sudo_sandbox();
+            let (sandbox, secrets, path) = common::sudo_sandbox("aa");
             let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
             command
                 .arg("--ssh-program")
@@ -753,7 +685,7 @@ impl Running {
 #[test]
 fn one_ctrl_c_lets_the_running_step_end_and_cancels_the_rest() {
     for kind in [Kind::Plain, Kind::Tty, Kind::Run] {
-        if matches!(kind, Kind::Tty) && !have_script() {
+        if matches!(kind, Kind::Tty) && !common::have_script() {
             eprintln!("skip: no script(1) for fake-ssh -tt");
             continue;
         }
@@ -822,7 +754,7 @@ fn two_ctrl_c_kill_anvil_even_when_stderr_is_full() {
 #[test]
 fn a_second_ctrl_c_kills_the_running_step_and_anvil_dies_by_sigint() {
     for kind in [Kind::Plain, Kind::Tty, Kind::Paused] {
-        if matches!(kind, Kind::Tty) && !have_script() {
+        if matches!(kind, Kind::Tty) && !common::have_script() {
             eprintln!("skip: no script(1) for fake-ssh -tt");
             continue;
         }
@@ -855,4 +787,222 @@ fn a_second_ctrl_c_kills_the_running_step_and_anvil_dies_by_sigint() {
         }
         assert!(!running.second.exists(), "{kind:?}: no later step ran");
     }
+}
+
+/// What `local.conf` holds before the first apply; it must show only in
+/// the record.
+const PREVIOUS: &str = "previous = text-kept-only-in-the-record\n";
+
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[test]
+fn apply_records_what_each_target_held_before_it_wrote() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let sandbox = Sandbox::new("aa");
+    let (web, local) = with_files(&sandbox);
+    std::fs::write(&local, PREVIOUS).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let ssh_log = sandbox.root().join("ssh.log");
+    let ssh_log = ssh_log.to_str().unwrap();
+    let out = sandbox.anvil(&["-vvv", "apply"], &[("FAKE_SSH_LOG", ssh_log)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for (what, shown) in [
+        ("stdout", text(&out.stdout)),
+        ("stderr", text(&out.stderr)),
+        ("ssh argv", std::fs::read_to_string(ssh_log).unwrap()),
+    ] {
+        assert!(!shown.contains(PREVIOUS.trim_end()), "{what}: {shown}");
+    }
+    assert!(
+        text(&out.stderr).contains(&format!("capture {local}: {} bytes", PREVIOUS.len())),
+        "{}",
+        text(&out.stderr)
+    );
+
+    let dir = sandbox.state_home().join("anvil");
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir), 0o700);
+    assert_eq!(mode(&dir.join("last-apply.json")), 0o600);
+    let raw = std::fs::read_to_string(dir.join("last-apply.json")).unwrap();
+    assert!(
+        !raw.contains("echo after") && !raw.contains(FILE_TEXT.trim_end()),
+        "no step script, nor the bytes written: {raw}"
+    );
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["version"], 1);
+    let uid = std::fs::metadata(&local).unwrap().uid();
+    let gid = std::fs::metadata(&local).unwrap().gid();
+    let written = sha256_hex(FILE_TEXT);
+    let local_entry = &record["targets"]["local"];
+    assert_eq!(local_entry["ok"], true);
+    assert_eq!(local_entry["facts"]["hostname"], local_hostname().trim());
+    assert_eq!(local_entry["cannot_undo"], serde_json::json!(["step 1"]));
+    assert_eq!(
+        local_entry["files"],
+        serde_json::json!([{
+            "dest": local, "mode": "0640", "sudo": false,
+            "written_sha256": written, "write": "written",
+            "previous": {"state": "file", "mode": "0600", "uid": uid, "gid": gid,
+                         "sha256": sha256_hex(PREVIOUS), "kept": true, "text": PREVIOUS},
+        }])
+    );
+    assert_eq!(
+        record["targets"]["fake"]["files"][0]["previous"],
+        serde_json::json!({"state": "absent"})
+    );
+    assert_eq!(record["targets"]["fake"]["files"][0]["dest"], web);
+
+    // A second apply finds the bytes it wrote and keeps the real previous
+    // text; its facts and `at` are this apply's.
+    let first_at = local_entry["at"].as_u64().unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let again = sandbox.last_apply().unwrap();
+    assert!(again["targets"]["local"]["at"].as_u64().unwrap() > first_at);
+    assert_eq!(
+        again["targets"]["local"]["files"][0]["previous"]["text"],
+        PREVIOUS
+    );
+}
+
+#[test]
+fn a_failed_step_still_records_the_files_written_before_it() {
+    let sandbox = Sandbox::new("aa");
+    let (_, local) = with_files(&sandbox);
+    let config = std::fs::read_to_string(sandbox.config_dir().join("config.toml")).unwrap();
+    sandbox.write_config("config.toml", &config.replace("echo after", "exit 3"));
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let record = sandbox.last_apply().unwrap();
+    let entry = &record["targets"]["local"];
+    assert_eq!(entry["ok"], false);
+    assert_eq!(entry["files"][0]["dest"], local);
+    assert_eq!(entry["files"][0]["write"], "written");
+    assert!(record["targets"].get("fake").is_none(), "not selected");
+}
+
+#[test]
+fn a_target_that_ended_is_saved_while_the_next_runs_and_holds_the_lock() {
+    let sandbox = Sandbox::new("aa");
+    let (_, local) = with_files(&sandbox);
+    let (waiting, go) = (sandbox.root().join("waiting"), sandbox.root().join("go"));
+    // Exported by fake-ssh to its client, so only `fake` waits.
+    std::fs::write(sandbox.root().join("h/fake-ssh.env"), "export ON_FAKE=1\n").unwrap();
+    let config = std::fs::read_to_string(sandbox.config_dir().join("config.toml")).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &config.replace(
+            "run = \"echo after\"",
+            &format!(
+                "run = 'if [ -n \"${{ON_FAKE-}}\" ]; then touch {}; i=0; until [ -e {} ]; do \
+                 i=$((i+1)); [ $i -gt 600 ] && exit 1; sleep 0.05; done; fi'",
+                waiting.display(),
+                go.display()
+            ),
+        ),
+    );
+    let mut child = sandbox
+        .command(env!("CARGO_BIN_EXE_anvil"))
+        .args(["--secret-store", "memory", "--ssh-program"])
+        .arg(common::fixture("fake-ssh.sh"))
+        .arg("apply")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn anvil");
+    until(|| waiting.exists(), "fake's step");
+    let record = sandbox.last_apply().expect("local's entry is saved");
+    assert_eq!(record["targets"]["local"]["files"][0]["dest"], local);
+    assert!(record["targets"].get("fake").is_none(), "still running");
+
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("last-apply.json is in use by another anvil"),
+        "{}",
+        text(&out.stderr)
+    );
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    // The step outlives anvil: `go` ends its wait, which a `go` written
+    // before the kill would let fake's entry be saved first.
+    std::fs::write(&go, "").unwrap();
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["targets"]["local"]["files"][0]["dest"], local);
+    assert!(record["targets"].get("fake").is_none(), "killed mid-target");
+}
+
+#[test]
+fn the_password_path_capture_leaks_no_byte_at_trace_level() {
+    if !common::have_script() {
+        eprintln!("skip: no script(1) for fake-ssh -tt");
+        return;
+    }
+    let (sandbox, secrets, path) = common::sudo_sandbox("aa");
+    std::fs::create_dir(sandbox.root().join("out")).unwrap();
+    std::fs::write(sandbox.config_dir().join("motd.txt"), FILE_TEXT).unwrap();
+    let dest = sandbox.root().join("out/pw.conf");
+    std::fs::write(&dest, PREVIOUS).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{secrets}[[files]]\nsrc = \"motd.txt\"\ndest = \"{}\"\nmode = \"0640\"\n",
+            dest.display()
+        ),
+    );
+    let dest = dest.display().to_string();
+    let (ssh_log, sudo_log) = (
+        sandbox.root().join("ssh.log"),
+        sandbox.root().join("sudo.log"),
+    );
+    let out = sandbox
+        .command(env!("CARGO_BIN_EXE_anvil"))
+        .arg("--ssh-program")
+        .arg(common::fixture("fake-ssh.sh"))
+        .args(["-vvv", "apply", "--target", "fake"])
+        .env("PATH", &path)
+        .env("FAKE_SSH_LOG", &ssh_log)
+        .env("FAKE_SUDO_LOG", &sudo_log)
+        .env("FAKE_SUDO_PW", common::VALUE)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains(&format!("capture {dest}: {} bytes", PREVIOUS.len())),
+        "the capture ran on the terminal: {stderr}"
+    );
+    let sudo = std::fs::read_to_string(&sudo_log).unwrap();
+    assert!(sudo.lines().any(|line| line == "-v"), "{sudo}");
+    // What `od -An -v -tx1` prints for the first bytes of PREVIOUS.
+    let hex: Vec<String> = PREVIOUS
+        .bytes()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let hex = hex.join(" ");
+    for (what, shown) in [
+        ("stdout", text(&out.stdout)),
+        ("stderr", stderr),
+        ("ssh argv", std::fs::read_to_string(&ssh_log).unwrap()),
+        ("sudo argv", sudo),
+    ] {
+        assert!(!shown.contains(PREVIOUS.trim_end()), "{what}: {shown}");
+        assert!(!shown.contains(&hex), "{what}: od's dump: {shown}");
+        assert!(!shown.contains(common::VALUE), "{what}: {shown}");
+    }
+    let record = sandbox.last_apply().unwrap();
+    let file = &record["targets"]["fake"]["files"][0];
+    assert_eq!(file["sudo"], true);
+    assert_eq!(file["previous"]["text"], PREVIOUS);
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), FILE_TEXT);
 }

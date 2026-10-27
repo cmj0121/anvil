@@ -22,6 +22,7 @@ pub const EXTENSIONS: [&str; 3] = ["toml", "yaml", "yml"];
 #[derive(Debug, PartialEq, Eq)]
 pub enum PathsError {
     NoHome,
+    NoStateHome,
     Ambiguous { name: String, paths: Vec<PathBuf> },
     NotToml { path: PathBuf },
 }
@@ -31,6 +32,9 @@ impl fmt::Display for PathsError {
         match self {
             PathsError::NoHome => f.write_str(
                 "neither $XDG_CONFIG_HOME nor $HOME is set: cannot find the config directory",
+            ),
+            PathsError::NoStateHome => f.write_str(
+                "neither $XDG_STATE_HOME nor $HOME is set: cannot find the state directory",
             ),
             PathsError::Ambiguous { name, paths } => {
                 let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
@@ -79,6 +83,35 @@ pub fn config_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Result<Path
     match set(home) {
         Some(home) => Ok(Path::new(home).join(".config").join("anvil")),
         None => Err(PathsError::NoHome),
+    }
+}
+
+/// The state directory from the process environment, where anvil keeps
+/// what it must remember between runs, such as the last apply's record.
+pub fn state_dir() -> Result<PathBuf, PathsError> {
+    state_dir_from(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// `$XDG_STATE_HOME/anvil`, else `$HOME/.local/state/anvil`; an empty
+/// variable counts as unset, and so does a relative `$XDG_STATE_HOME`, as
+/// the XDG spec says. Never the config directory, so neither
+/// `$XDG_CONFIG_HOME` nor `--config` moves it.
+pub fn state_dir_from(
+    xdg_state: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<PathBuf, PathsError> {
+    fn set(v: Option<&OsStr>) -> Option<&Path> {
+        v.filter(|v| !v.is_empty()).map(Path::new)
+    }
+    if let Some(xdg) = set(xdg_state).filter(|xdg| xdg.is_absolute()) {
+        return Ok(xdg.join("anvil"));
+    }
+    match set(home) {
+        Some(home) => Ok(home.join(".local").join("state").join("anvil")),
+        None => Err(PathsError::NoStateHome),
     }
 }
 
@@ -225,6 +258,28 @@ mod tests {
         assert_eq!(
             config_dir_from(None, Some(OsStr::new(""))),
             Err(PathsError::NoHome)
+        );
+    }
+
+    #[test]
+    fn the_state_dir_is_xdg_state_else_home_and_never_the_config_dir() {
+        let (xdg, home) = (Some(OsStr::new("/xdg/state")), Some(OsStr::new("/home/u")));
+        assert_eq!(
+            state_dir_from(xdg, home).unwrap(),
+            PathBuf::from("/xdg/state/anvil")
+        );
+        for unset in [None, Some(OsStr::new("")), Some(OsStr::new("xdg/state"))] {
+            assert_eq!(
+                state_dir_from(unset, home).unwrap(),
+                PathBuf::from("/home/u/.local/state/anvil")
+            );
+            let err = state_dir_from(unset, Some(OsStr::new(""))).unwrap_err();
+            assert_eq!(err, PathsError::NoStateHome);
+            assert!(err.to_string().contains("$XDG_STATE_HOME"), "{err}");
+        }
+        assert_ne!(
+            state_dir_from(None, home).unwrap(),
+            config_dir_from(None, home).unwrap()
         );
     }
 

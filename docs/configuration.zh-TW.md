@@ -230,7 +230,7 @@ names = ["HOST_SUDO"]
 符合的項目依 config 順序執行，排在套件 step 之後、`[[steps]]` 之前；
 不符合的項目仍是一個 step，回報為略過，該 target 的其他 step 仍會執行（[File steps](cli.zh-TW.md#file-steps)）。
 最多 64 個項目：多一個就以 2 結束並顯示 `files: N entries exceeds the 64 entry limit`（65 個時為 `files: 65 entries exceeds the 64 entry limit`）。
-未知的鍵，或不是布林值的 `sudo`，以 2 結束並顯示解析器的訊息，其中會指出該鍵與行號。
+未知的鍵，或不是布林值的 `sudo` 或 `rollback`，以 2 結束並顯示解析器的訊息，其中會指出該鍵與行號。
 下列訊息中引用的路徑或值會在 64 個字元處截斷（以 `…` 標示），控制字元則顯示為 `\x1b` 形式的跳脫序列。
 
 ```toml
@@ -241,6 +241,7 @@ mode = "0644"                    # required: quoted, 3 or 4 octal digits
 tags = ["linode"]                # optional; [A-Za-z0-9_-]+; every one must be on the target
 facts = { distro = "arch" }      # optional; a probe key, equal to that fact
 sudo = false                     # optional; default true. false: write as the connecting user
+rollback = false                 # optional; default true. false: the apply record keeps the hash only
 ```
 
 **`mode`。** 必填，且必須是加引號的字串。三或四位八進位數字，最大為 `0777` 加上 sticky bit，
@@ -337,6 +338,13 @@ secret 失敗與套件 step 相同，前綴改為 `files`：
 只有當某個選定的 target 有 sudo secret，且帶有某個 `sudo = true` 項目的全部 tag 時（此時 facts 還未知），
 `apply` 才會為 files 開啟 secret store；項目全是 `sudo = false`，或 tag 不符合任何選定 target 的 config，
 不會為 files 開啟它。`plan` 從不開啟它。
+
+**`rollback`。** 預設為 true，為 true 時 anvil 寫回的檔案會省略它。每次寫入之前，apply 會把 dest 的內容保存在
+[apply 紀錄](cli.zh-TW.md#apply-紀錄)中，也就是 `$XDG_STATE_HOME/anvil`（否則為 `~/.local/state/anvil`）中的 `last-apply.json`，
+讓 [`anvil rollback`](cli.zh-TW.md#anvil-rollback) 能把它放回去。紀錄是明文，mode 0600，沒有加密。
+設定 `rollback = false` 時，它只保存原內容的 sha256，絕不保存文字，rollback 會把該 dest 顯示為 `cannot undo: DEST (rollback = false)`。
+dest 保存 secret（例如 token 或私鑰）的每個項目都請設定它。只有最多 256 KiB、不含 NUL 位元組的 UTF-8 先前文字才會保存；
+其他的只保存雜湊，寫入仍會進行。
 
 **寫到 target 上的結果。** 位元組以 `cmp` 與 dest 比較。位元組相同時保留原檔，`chmod` 套用 `mode`，step 印出 `unchanged DEST`；
 否則印出 `wrote DEST`。兩者都以 0 結束。不存在或無法讀取的 dest 會被寫入。
@@ -520,3 +528,6 @@ YAML 會拒絕 anchor 與 alias、merge key（`<<`）、重複的鍵、不支援
 1 MiB 上限同樣適用於編輯檢視與儲存的 TOML：
 當以編輯格式呈現的文件超過 1 MiB 時，`anvil inventory` / `anvil config` 會在啟動編輯器前以 2 結束（若另一種 `--format` 的檢視放得下，會指出它）；
 當 YAML 編輯的 TOML 形式會超過 1 MiB 時，不會寫入任何東西，並以 2 結束。
+
+apply 紀錄有自己的上限：先前的文字最多保存 256 KiB，紀錄最多 16 MiB，超過時會捨棄最大的文字並發出警告
+（[apply 紀錄](cli.zh-TW.md#apply-紀錄)）。

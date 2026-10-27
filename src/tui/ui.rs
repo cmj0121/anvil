@@ -44,6 +44,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("p", "plan"),
             ("d", "doctor"),
             ("x", "run script"),
+            ("b", "rollback"),
             ("Esc", "cancel"),
         ],
     ),
@@ -109,6 +110,7 @@ pub fn draw(app: &App, f: &mut Frame) {
         Some(Overlay::Options { field, texts }) => draw_options(f, *field, texts),
         Some(Overlay::Targets { cursor }) => draw_targets(app, f, *cursor),
         Some(Overlay::Confirm { targets }) => draw_confirm(f, targets),
+        Some(Overlay::ConfirmRollback { targets }) => draw_confirm_rollback(f, targets),
         Some(Overlay::ConfirmUpdate { version }) => draw_confirm_update(f, version),
     }
 }
@@ -468,6 +470,7 @@ fn draw_results(app: &App, f: &mut Frame, area: Rect) {
     } else {
         section_lines(result, selected, running)
     };
+    lines.extend(result_warnings(result));
     lines.extend(run_error(result_error(result)));
     if let Some(running) = running_line(app) {
         lines.push(running);
@@ -495,6 +498,17 @@ fn shown_running(app: &App) -> Option<&Running> {
         return None;
     }
     Some(running)
+}
+
+/// An apply's or rollback's warnings, each escaped, in yellow.
+fn result_warnings(result: &RunResult) -> Vec<Line<'static>> {
+    let RunResult::Apply { warnings, .. } = result else {
+        return Vec::new();
+    };
+    warnings
+        .iter()
+        .map(|warning| Line::from(format!("! {}", text(warning))).style(Color::Yellow))
+        .collect()
 }
 
 fn result_error(result: &RunResult) -> Option<&str> {
@@ -1111,10 +1125,22 @@ fn draw_targets(app: &App, f: &mut Frame, cursor: usize) {
 fn draw_confirm(f: &mut Frame, targets: &[String]) {
     let names: Vec<String> = targets.iter().map(|name| text(name)).collect();
     let lines = vec![
-        Line::from(format!(" {}", app::confirm_prompt(&names))),
+        Line::from(format!(" {}", app::confirm_prompt("run on", &names))),
         Line::from(" y/Enter run · n/Esc cancel").style(secondary()),
     ];
     popup(f, "Run script", fitted_width(f, &lines), lines);
+}
+
+/// `b`'s question, its target names escaped; as wide as it is, up to the
+/// screen. Only `y` answers it, so Enter is not offered.
+fn draw_confirm_rollback(f: &mut Frame, targets: &[String]) {
+    let names: Vec<String> = targets.iter().map(|name| text(name)).collect();
+    let lines = vec![
+        Line::from(format!(" {}", app::confirm_prompt("roll back", &names))),
+        Line::from(" restores the files the last apply wrote").style(secondary()),
+        Line::from(" y roll back · n/Esc cancel").style(secondary()),
+    ];
+    popup(f, "Rollback", fitted_width(f, &lines), lines);
 }
 
 /// `u`'s question, the version escaped; as wide as it is, up to the screen.
@@ -1255,6 +1281,7 @@ mod tests {
                 targets: done(vec![local, cancelled("pi")]),
                 ok: Some(false),
                 error: None,
+                warnings: Vec::new(),
             },
         );
         let screen = render(&app, 100, 30);
@@ -1333,6 +1360,7 @@ mod tests {
             tags: vec![tag.to_owned()],
             facts: Default::default(),
             sudo: false,
+            rollback: true,
         };
         let config = Config {
             packages: Some(Packages {
@@ -1405,6 +1433,7 @@ mod tests {
                 tags: vec!["web".to_owned()],
                 facts: Default::default(),
                 sudo: false,
+                rollback: true,
             }],
             services: vec![service("sshd", "local"), service("cron", "web")],
             steps: vec![Step::script("hostname")],
@@ -1450,6 +1479,7 @@ mod tests {
                 targets: Vec::new(),
                 ok: None,
                 error: None,
+                warnings: Vec::new(),
             },
         );
         app.running = Some(Running {
@@ -1487,6 +1517,7 @@ mod tests {
                 ],
                 ok: None,
                 error: None,
+                warnings: Vec::new(),
             },
         );
         app.running = Some(Running {
@@ -1532,6 +1563,7 @@ mod tests {
                 ],
                 ok: Some(false),
                 error: None,
+                warnings: Vec::new(),
             },
         );
         press(&mut app, KeyCode::Right);
@@ -1560,6 +1592,7 @@ mod tests {
                 targets: done(vec![pi, cancelled("mac")]),
                 ok: Some(false),
                 error: None,
+                warnings: Vec::new(),
             },
         );
         let buf = buffer(&app, 60, 8);
@@ -1613,6 +1646,7 @@ mod tests {
                 targets: done(vec![pi, cancelled("mac")]),
                 ok: Some(false),
                 error: None,
+                warnings: Vec::new(),
             },
         );
         // A 50-column screen leaves the Results body 20 columns.
@@ -1670,6 +1704,7 @@ mod tests {
                 )]),
                 ok: Some(true),
                 error: None,
+                warnings: Vec::new(),
             },
         );
         let screen = render(&app, 80, 8);
@@ -1706,6 +1741,71 @@ mod tests {
     }
 
     #[test]
+    fn the_rollback_confirmation_asks_with_the_escaped_names_and_y_only() {
+        let mut app = app();
+        app.overlay = Some(Overlay::ConfirmRollback {
+            targets: vec!["local".to_owned(), "p\x1bi".to_owned()],
+        });
+        let screen = render(&app, 80, 10);
+        let inside: Vec<String> = screen[2..8]
+            .iter()
+            .map(|row| row.trim_matches(|c| c == '│' || c == ' ').to_owned())
+            .collect();
+        assert!(
+            inside.iter().any(|row| row.starts_with("┌Rollback")),
+            "{screen:#?}"
+        );
+        for line in [
+            "roll back 2 targets: local, p\\x1bi?",
+            "restores the files the last apply wrote",
+            "y roll back · n/Esc cancel",
+        ] {
+            assert!(
+                inside.iter().any(|row| row.contains(line)),
+                "{line:?} in {screen:#?}"
+            );
+        }
+        assert!(
+            !screen.iter().any(|row| row.contains("Enter")),
+            "{screen:#?}"
+        );
+    }
+
+    #[test]
+    fn a_rollback_result_shows_its_kind_and_its_warnings() {
+        let mut app = app();
+        let full = "apply: last-apply.json is full; /etc/a on local cannot be rolled back";
+        show(
+            &mut app,
+            RunResult::Apply {
+                kind: RunKind::Rollback,
+                steps: Vec::new(),
+                targets: done(vec![ran(
+                    "local",
+                    vec![step("restore /etc/a", Some(0), "", "")],
+                )]),
+                ok: Some(true),
+                error: None,
+                warnings: vec![format!("{full}\x07")],
+            },
+        );
+        let screen = render(&app, 120, 16);
+        assert!(
+            screen[0].starts_with(" anvil · rollback · run 1/1"),
+            "{}",
+            screen[0]
+        );
+        let shown = format!("! {full}\\x07");
+        assert!(
+            screen.iter().any(|row| row.contains(&shown)),
+            "escaped, after the block: {screen:#?}"
+        );
+        let buf = buffer(&app, 120, 16);
+        let (x, y) = find(&buf, 120, 16, "! apply: last-apply.json");
+        assert_eq!(buf[(x, y)].fg, Color::Yellow);
+    }
+
+    #[test]
     fn a_tiny_screen_draws_without_panicking() {
         let steps = Ok(vec![step_row("a very long step label that cannot fit")]);
         let mut app = App::with_inventory(opts(), Err("bad inventory".to_owned()), steps);
@@ -1717,6 +1817,7 @@ mod tests {
                 targets: done(vec![ran("local", vec![step("true", Some(0), "x", "")])]),
                 ok: Some(true),
                 error: None,
+                warnings: Vec::new(),
             },
         );
         app.show_log = true;
@@ -1779,6 +1880,7 @@ mod tests {
                 targets: done(vec![ran("local", Vec::new()), cancelled("pi")]),
                 ok: Some(false),
                 error: None,
+                warnings: Vec::new(),
             },
         );
         let buf = buffer(&app, 100, 12);
@@ -1883,20 +1985,20 @@ mod tests {
         assert_eq!(
             screen[8..17],
             [
-                "│    ┌Help────────────────────────────────────────────────────────────────┐    │",
-                "│    │ Run      a apply  p plan  d doctor  x run script  Esc cancel       │    │",
-                "│    │ Targets  t pick  Space select                                      │    │",
-                "│    │ Move     ↑↓/jk step/scroll  ←→ target  Enter go to step  Tab focus │    │",
-                "│    │ History  [ ] run                                                   │    │",
-                "│    │ Edit     i inventory  c config  s secret  m migrate                │    │",
-                "│    │ Options  f format  o paths  +/- log                                │    │",
-                "│    │ App      l log  r reload  u update  ? help  q/^C quit              │    │",
-                "│    └────────────────────────────────────────────────────────────────────┘    │",
+                "│ ┌Help──────────────────────────────────────────────────────────────────────┐ │",
+                "│ │ Run      a apply  p plan  d doctor  x run script  b rollback  Esc cancel │ │",
+                "│ │ Targets  t pick  Space select                                            │ │",
+                "│ │ Move     ↑↓/jk step/scroll  ←→ target  Enter go to step  Tab focus       │ │",
+                "│ │ History  [ ] run                                                         │ │",
+                "│ │ Edit     i inventory  c config  s secret  m migrate                      │ │",
+                "│ │ Options  f format  o paths  +/- log                                      │ │",
+                "│ │ App      l log  r reload  u update  ? help  q/^C quit                    │ │",
+                "│ └──────────────────────────────────────────────────────────────────────────┘ │",
             ]
         );
         let buf = buffer(&app, 80, 24);
-        assert_eq!(buf[(7, 9)].fg, Color::Cyan, "the group name");
-        assert_eq!(buf[(16, 9)].fg, Color::LightBlue, "a key");
+        assert_eq!(buf[(4, 9)].fg, Color::Cyan, "the group name");
+        assert_eq!(buf[(13, 9)].fg, Color::LightBlue, "a key");
         let (x, y) = find(&buf, 80, 24, "u update");
         assert_eq!(buf[(x, y)].fg, Color::LightBlue);
         assert_eq!(buf[(x + 2, y)].fg, Color::Reset);
@@ -1905,7 +2007,7 @@ mod tests {
         let buf = buffer(&app, 80, 24);
         assert_eq!(buf[(x, y)].fg, Color::DarkGray);
         assert_eq!(buf[(x + 2, y)].fg, Color::DarkGray);
-        assert_eq!(buf[(16, 9)].fg, Color::LightBlue, "the other keys stay");
+        assert_eq!(buf[(13, 9)].fg, Color::LightBlue, "the other keys stay");
     }
 
     #[test]
@@ -2115,6 +2217,7 @@ mod tests {
             targets: Vec::new(),
             ok: Some(true),
             error: None,
+            warnings: Vec::new(),
         });
         app.shown = Some(0);
         let screen = render(&app, 100, 10);
@@ -2180,6 +2283,7 @@ mod tests {
                 ]),
                 ok: Some(false),
                 error: None,
+                warnings: Vec::new(),
             },
         );
         let header = render(&app, 100, 20).swap_remove(0);
@@ -2241,7 +2345,7 @@ mod tests {
                         target: "local".to_owned(),
                         steps: vec![
                             PlannedRun {
-                                run: "pacman -S git".to_owned(),
+                                run: "pacman -S git".to_owned().into(),
                                 label: None,
                                 sudo_secret: Some("LOCAL_SUDO".to_owned()),
                                 plugin: None,
@@ -2250,7 +2354,7 @@ mod tests {
                                 service: None,
                             },
                             PlannedRun {
-                                run: "hostname".to_owned(),
+                                run: "hostname".to_owned().into(),
                                 label: None,
                                 sudo_secret: None,
                                 plugin: None,
@@ -2316,6 +2420,7 @@ mod tests {
                 }]),
                 ok: Some(false),
                 error: Some("apply panicked: boom".to_owned()),
+                warnings: Vec::new(),
             },
         );
         assert_eq!(
@@ -2346,6 +2451,7 @@ mod tests {
                 }]),
                 ok: Some(false),
                 error: None,
+                warnings: Vec::new(),
             },
         );
         assert_eq!(
@@ -2372,6 +2478,7 @@ mod tests {
                 targets: done(vec![ran("local", Vec::new())]),
                 ok: None,
                 error: None,
+                warnings: Vec::new(),
             },
         );
         app.running = Some(Running {
@@ -2391,6 +2498,7 @@ mod tests {
             targets: Vec::new(),
             ok: None,
             error: None,
+            warnings: Vec::new(),
         });
         assert_eq!(
             results(&app, 8),
@@ -2512,6 +2620,7 @@ mod tests {
                 targets: done(vec![ran("local", Vec::new()), ran("pi", Vec::new())]),
                 ok: Some(true),
                 error: None,
+                warnings: Vec::new(),
             },
         );
         app.scroll = 1;
@@ -2750,6 +2859,7 @@ mod tests {
                 ]),
                 ok: Some(false),
                 error: Some("apply panicked: boom".to_owned()),
+                warnings: Vec::new(),
             },
         );
         assert!(
@@ -2776,6 +2886,7 @@ mod tests {
                 targets: Vec::new(),
                 ok: Some(false),
                 error: Some("no config".to_owned()),
+                warnings: Vec::new(),
             },
         );
         assert_eq!(results(&app, 8)[0], "✘ no config");
@@ -2814,6 +2925,7 @@ mod tests {
                 ]),
                 ok: Some(true),
                 error: None,
+                warnings: Vec::new(),
             },
         );
         wide.tab = 2;
@@ -2834,6 +2946,7 @@ mod tests {
                 ]),
                 ok: Some(true),
                 error: None,
+                warnings: Vec::new(),
             },
         );
         high.tab = 1;

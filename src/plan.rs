@@ -254,7 +254,7 @@ pub fn would_text(step: &PlannedRun) -> String {
 }
 
 /// The last line of the human output: `N targets, [M failed, ]nothing executed`.
-fn render_summary(targets: usize, failed: usize, style: Style) -> String {
+pub(crate) fn render_summary(targets: usize, failed: usize, style: Style) -> String {
     let plural = if targets == 1 { "" } else { "s" };
     let failed = if failed == 0 {
         String::new()
@@ -455,6 +455,7 @@ mod tests {
             tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
             facts: Default::default(),
             sudo: true,
+            rollback: true,
         };
         let config = Config {
             files: vec![file("/etc/a.conf", &[]), file("/etc/b.conf", &["web"])],
@@ -540,7 +541,7 @@ mod tests {
             target: "local".to_owned(),
             steps: vec![
                 PlannedRun {
-                    run: one_liner.to_owned(),
+                    run: one_liner.to_owned().into(),
                     label: None,
                     sudo_secret: Some("LOCAL_SUDO".to_owned()),
                     plugin: None,
@@ -549,7 +550,7 @@ mod tests {
                     service: None,
                 },
                 PlannedRun {
-                    run: "one".to_owned(),
+                    run: "one".to_owned().into(),
                     label: None,
                     sudo_secret: None,
                     plugin: None,
@@ -558,7 +559,7 @@ mod tests {
                     service: None,
                 },
                 PlannedRun {
-                    run: "two".to_owned(),
+                    run: "two".to_owned().into(),
                     label: None,
                     sudo_secret: None,
                     plugin: None,

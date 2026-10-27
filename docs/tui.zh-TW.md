@@ -91,6 +91,7 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
 | `a`          | 對選擇執行 apply                                        | `anvil apply`                             |
 | `p`          | 對選擇執行 plan：列出 apply 會執行的 step，一個都不執行 | `anvil plan`                              |
 | `x`          | 編輯 sh 腳本，確認後在選擇上執行                        | `anvil run FILE`                          |
+| `b`          | 對選擇執行 rollback，按 `y` 確認                        | `anvil rollback`                          |
 | `Esc`        | 取消執行；關閉 overlay                                  | —                                         |
 | `i`          | 編輯 inventory，然後重新載入 inventory 與 config        | `anvil inventory`                         |
 | `c`          | 編輯 config，然後重新載入 inventory 與 config           | `anvil config`                            |
@@ -123,6 +124,12 @@ Enter 套用三個路徑（開頭的 `~/` 或單獨的 `~` 為 `$HOME`）並重�
 因此需要 root 的工作要用 `sudo -n` 或 NOPASSWD 的 target。上一份腳本只保留在本次工作階段的記憶體中；
 要保留的腳本請放進 `[[steps]]`。
 
+`b` 會像 `x` 一樣列出選擇並詢問 `roll back N targets: a, b, c?`。只有 `y` 會回答：`Enter` 與其他按鍵保留問題，
+`n` 或 `Esc` 關閉它。rollback 與 `anvil rollback` 相同，不帶 `--force` 也不帶 `--allow-host-change`，每個 target 一個分頁。
+自上次 apply 後被改過的 dest 會讓它的 target 失敗，訊息為
+`files: DEST changed since the last apply; run anvil rollback --force DEST in a terminal to restore it anyway`。
+執行結束時的警告（例如 apply 之後 `last-apply.json` 已滿）顯示在結果下方。
+
 `u` 在背景檢查最新的 release，如同 `anvil update --check`。若較新，`u` 會詢問 `replace anvil with VERSION?`：
 `y` 或 `Enter` 會如同 `anvil update` 一樣下載、驗證並取代執行檔，`n` 或 `Esc` 則不做任何變更。
 若檢查結果回來時另一個 overlay 正開著，問題會等待：狀態列顯示 `anvil VERSION is available; press u to update`，
@@ -133,17 +140,17 @@ curl、tar 與新執行檔的 `--version` 執行時輸出都會被擷取，不�
 
 ## 規則
 
-- **`--parallel N`** 設定 apply、plan 與 run（`x`）同時處理的 target 數，與 CLI 相同
+- **`--parallel N`** 設定 apply、plan、run（`x`）與 rollback（`b`）同時處理的 target 數，與 CLI 相同
   （[平行執行](cli.zh-TW.md#平行執行)）；沒有按鍵可以變更它。doctor 一次處理一個 target，且不提這個旗標。
-- **一次一個執行。** doctor、apply、plan、run 或更新執行期間，`d`、`a`、`p`、`x`、`u`、`i`、`c`、`s`、`m` 與 `o`
+- **一次一個執行。** doctor、apply、plan、run、rollback 或更新執行期間，`d`、`a`、`p`、`x`、`b`、`u`、`i`、`c`、`s`、`m` 與 `o`
   會被拒絕，狀態列顯示 `busy: <run> is running (Esc cancels)`；doctor 與更新無法以 Esc 取消，因此顯示
   `busy: <run> is running`。執行會保留它開始時的選擇與路徑。
 - **Esc 在 step 之間取消。** apply 在每個 target 與每個 step（步驟）之前檢查：正在執行的 step 會跑完，
   該 target 剩下的部分以及之後的每個 target 都以 `⊘ cancelled` 結束。
-  run（`x`）以相同方式取消：它的腳本是唯一的 step，因此正在執行的腳本會先跑完，之後的每個 target 都以 `⊘ cancelled` 結束。
+  rollback（`b`）與 apply 一樣取消。run（`x`）以相同方式取消：它的腳本是唯一的 step，因此正在執行的腳本會先跑完，之後的每個 target 都以 `⊘ cancelled` 結束。
   plan 在每個 target 之前檢查：正在執行的探測會跑完，之後的每個 target 都以 `⊘ cancelled` 結束。
   使用 `--parallel` 時，每個執行中的 target 都這樣跑完它的 step 或探測，且不再啟動其他 target。
-  通知在 apply 與 run 為 `cancelling: the running step finishes first`，在 plan 為 `cancelling: running targets finish first`。
+  通知在 apply、run 與 rollback 為 `cancelling: the running step finishes first`，在 plan 為 `cancelling: running targets finish first`。
   Esc 從不終止正在執行的 step，不論本機或遠端；只有該 step 的逾時會結束它（`x` 為 300 秒）。
   doctor 無法取消；它的探測受 [ssh 逾時](cli.zh-TW.md#ssh-行為)限制。
 - **交接。** 編輯器（`i`、`c`、`s`、`x`）、遷移（`m`，讓它的 age 密碼短語提示能運作）、

@@ -1,4 +1,4 @@
-//! Runs doctor, apply, plan or run on a background thread and reports to the main
+//! Runs doctor, apply, plan, run or rollback on a background thread and reports to the main
 //! loop as [`Msg`]s: `Steps` (apply and run), then `Start` and a per-target report as
 //! each target goes, then `DoctorDone` (doctor only) and `Finished`. An
 //! update's check or install sends only `UpdateChecked` or `Updated`. A panic
@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use super::app::{self, Job, Msg};
 use crate::cli::Failure;
+use crate::files::{Force, Wording};
 use crate::inventory::Target;
 use crate::options::Options;
-use crate::{apply, doctor, fanout, plan, run, update};
+use crate::{apply, doctor, fanout, plan, rollback, run, update};
 
 /// A run in progress; [`Worker::join`] waits for it, which is quick once
 /// `Finished` or `Panicked` has arrived.
@@ -41,6 +42,7 @@ pub fn spawn(job: Job, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) 
         Job::Apply => spawn_job(tx, move |tx| run_apply(&opts, tx)),
         Job::Plan => spawn_job(tx, move |tx| run_plan(&opts, tx)),
         Job::Run(script) => spawn_job(tx, move |tx| run_script(&opts, script, tx)),
+        Job::Rollback => spawn_job(tx, move |tx| run_rollback(&opts, tx)),
         // curl, tar and the smoke run capture their output and read no
         // stdin, so nothing reaches the screen.
         Job::UpdateCheck => spawn_task(tx, move |_| {
@@ -56,10 +58,10 @@ pub fn spawn(job: Job, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) 
     }
 }
 
-/// `opts` as `job` runs with them: apply, plan and run carry `cancel`, which
-/// ssh checks before opening a master.
+/// `opts` as `job` runs with them: apply, plan, run and rollback carry
+/// `cancel`, which ssh checks before opening a master.
 fn job_opts(job: &Job, mut opts: Options, cancel: &Arc<AtomicBool>) -> Options {
-    if matches!(job, Job::Apply | Job::Plan | Job::Run(_)) {
+    if matches!(job, Job::Apply | Job::Plan | Job::Run(_) | Job::Rollback) {
         opts.cancel = Arc::clone(cancel);
     }
     opts
@@ -123,8 +125,32 @@ fn run_doctor(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
 fn run_apply(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
     let config = opts.load_config()?;
     let _ = tx.send(Msg::Steps(app::step_rows(&config)));
-    apply::run_targets(opts, &config, &mut send_progress(tx))?;
+    let report = apply::run_targets(opts, &config, &mut send_progress(tx))?;
+    send_warnings(tx, report.warnings);
     Ok(())
+}
+
+/// As `anvil rollback` with no force and no host change allowed, the
+/// conflicts worded for the TUI; the secret store, when a recorded file
+/// went through sudo, is opened here, on the worker.
+fn run_rollback(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
+    let config = opts.load_config()?;
+    let report = rollback::run_targets(
+        opts,
+        &config,
+        &Force::None,
+        false,
+        Wording::Tui,
+        &mut send_progress(tx),
+    )?;
+    send_warnings(tx, report.warnings);
+    Ok(())
+}
+
+fn send_warnings(tx: &Sender<Msg>, warnings: Vec<String>) {
+    if !warnings.is_empty() {
+        let _ = tx.send(Msg::Warnings(warnings));
+    }
 }
 
 /// Sends each of apply's (or run's) progress events to the main loop.
@@ -277,6 +303,7 @@ mod tests {
                 Msg::DoctorDone(_) => "doctor done".to_owned(),
                 Msg::Finished(result) => format!("finished {result:?}"),
                 Msg::Panicked(message) => format!("panicked {message}"),
+                Msg::Warnings(lines) => format!("warnings {}", lines.len()),
                 Msg::Log(_)
                 | Msg::Interrupted
                 | Msg::Suspend(_)
@@ -442,7 +469,7 @@ mod tests {
         match &msgs[2] {
             Msg::PlanDone(_, plan::PlanReport::Planned { target, steps, ok }) => {
                 assert_eq!((target.as_str(), *ok), ("local", true));
-                assert_eq!(steps[0].run, format!("touch {}", ran.display()));
+                assert_eq!(*steps[0].run, format!("touch {}", ran.display()));
             }
             _ => panic!("expected PlanDone"),
         }
