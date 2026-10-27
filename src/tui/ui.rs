@@ -2243,7 +2243,7 @@ mod tests {
                         target: "local".to_owned(),
                         steps: vec![
                             PlannedRun {
-                                run: "pacman -S git".to_owned(),
+                                run: "pacman -S git".to_owned().into(),
                                 label: None,
                                 sudo_secret: Some("LOCAL_SUDO".to_owned()),
                                 plugin: None,
@@ -2252,7 +2252,7 @@ mod tests {
                                 service: None,
                             },
                             PlannedRun {
-                                run: "hostname".to_owned(),
+                                run: "hostname".to_owned().into(),
                                 label: None,
                                 sudo_secret: None,
                                 plugin: None,

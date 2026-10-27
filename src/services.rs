@@ -149,7 +149,7 @@ fn root_access<'a>(
 
 fn service_run(run: String, label: String, sudo_secret: Option<String>, skip: bool) -> PlannedRun {
     PlannedRun {
-        run,
+        run: run.into(),
         label: Some(label),
         sudo_secret,
         plugin: None,

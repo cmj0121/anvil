@@ -442,7 +442,7 @@ mod tests {
         match &msgs[2] {
             Msg::PlanDone(_, plan::PlanReport::Planned { target, steps, ok }) => {
                 assert_eq!((target.as_str(), *ok), ("local", true));
-                assert_eq!(steps[0].run, format!("touch {}", ran.display()));
+                assert_eq!(*steps[0].run, format!("touch {}", ran.display()));
             }
             _ => panic!("expected PlanDone"),
         }

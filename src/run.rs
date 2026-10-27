@@ -37,7 +37,7 @@ pub fn run_targets(
 ) -> Result<Report, Failure> {
     let targets = opts.targets()?;
     let runs = [PlannedRun {
-        run: wrap(&script),
+        run: wrap(&script).into(),
         label: Some(script),
         sudo_secret: None,
         plugin: None,

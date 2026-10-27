@@ -12,7 +12,7 @@
 //! file over a plain run, then a terminal run types the password and runs
 //! `sudo install`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
@@ -26,6 +26,7 @@ use crate::config::{Config, ModeValue, is_mode, is_sha256};
 use crate::document;
 use crate::facts::Facts;
 use crate::inventory::{self, Target, TargetKind};
+use crate::record::{FileRecord, Previous, PreviousFile, Write};
 use crate::secret;
 use crate::transport::RUN_TIMEOUT;
 
@@ -154,16 +155,7 @@ pub fn runs(
         let dest = &entry.dest;
         if !matches(&entry.tags, &entry.facts, target, facts) {
             log::info!("{}: files[{i}] {dest}: no match", target.name);
-            runs.push(file_run(
-                String::new(),
-                format!("skipped file {dest}: no match"),
-                None,
-                FileRun {
-                    upload: None,
-                    skip: true,
-                    write: None,
-                },
-            ));
+            runs.push(skip_run(format!("skipped file {dest}: no match")));
             continue;
         }
         let Some(ModeValue::Text(mode)) = &entry.mode else {
@@ -261,7 +253,7 @@ pub(crate) fn write_script(
     step: &FileWrite,
     sources: &Sources,
     expected: &Expected,
-) -> Result<(String, Option<Upload>), String> {
+) -> Result<(Zeroizing<String>, Option<Upload>), String> {
     let i = step.index;
     let Some(Source { text }) = sources.0.get(i) else {
         return Err(format!("files[{i}]: src was not loaded"));
@@ -272,13 +264,20 @@ pub(crate) fn write_script(
         let script = tee_script(&heredoc, dest, mode, &step.sudo, &step.checks, expected);
         return Ok((script, None));
     }
+    let (temp, upload) = staged(&heredoc)?;
+    let script = install_script(&temp, dest, mode, &step.checks, expected);
+    Ok((script.into(), Some(upload)))
+}
+
+/// The password path's upload of `heredoc`: a fresh temp name, the stage
+/// that writes the bytes there and the cleanup that removes it.
+fn staged(heredoc: &Heredoc<'_>) -> Result<(String, Upload), String> {
     let temp = temp_path()?;
     let upload = Upload {
-        stage: stage_script(&heredoc, &temp),
+        stage: stage_script(heredoc, &temp),
         cleanup: format!("rm -f {}", quote(&temp)),
     };
-    let script = install_script(&temp, dest, mode, &step.checks, expected);
-    Ok((script, Some(upload)))
+    Ok((temp, upload))
 }
 
 /// The status of a write script that refused before writing anything:
@@ -308,7 +307,12 @@ fn guard(sudo: &str, dest: &str, expected: &Expected) -> String {
     }
 }
 
-fn file_run(run: String, label: String, sudo_secret: Option<String>, file: FileRun) -> PlannedRun {
+fn file_run(
+    run: Zeroizing<String>,
+    label: String,
+    sudo_secret: Option<String>,
+    file: FileRun,
+) -> PlannedRun {
     PlannedRun {
         run,
         label: Some(label),
@@ -318,6 +322,16 @@ fn file_run(run: String, label: String, sudo_secret: Option<String>, file: FileR
         file: Some(file),
         service: None,
     }
+}
+
+/// A file step that runs nothing and only shows `label`.
+pub(crate) fn skip_run(label: String) -> PlannedRun {
+    let skip = FileRun {
+        upload: None,
+        skip: true,
+        write: None,
+    };
+    file_run(Zeroizing::default(), label, None, skip)
 }
 
 /// A text as a quoted heredoc: `head -c N <<'D'`, then the body, which ends
@@ -459,7 +473,7 @@ fn tee_script(
     sudo: &str,
     checks: &str,
     expected: &Expected,
-) -> String {
+) -> Zeroizing<String> {
     debug_assert!(is_mode(mode), "{mode}");
     let (head, body) = (heredoc.head(), heredoc.body());
     let d = quote(dest);
@@ -470,7 +484,7 @@ fn tee_script(
         quote(&format!("unchanged {dest}")),
         quote(&format!("wrote {dest}")),
     );
-    format!(
+    zeroizing(format_args!(
         "{{ umask 077\n\
          {checks}{directory} || exit {REFUSED}\n\
          {guard}if {head} | {{ {has_cmp} && {sudo}cmp -s - {d}; }}\n\
@@ -482,17 +496,35 @@ fn tee_script(
          {body}\
          fi\n\
          }}\n"
-    )
+    ))
 }
 
 /// The password path's plain stage: the bytes into a new 0600 `temp`.
-fn stage_script(heredoc: &Heredoc<'_>, temp: &str) -> String {
-    format!(
+fn stage_script(heredoc: &Heredoc<'_>, temp: &str) -> Zeroizing<String> {
+    zeroizing(format_args!(
         "{{ umask 077; set -C; {} >{}\n{}}}\n",
         heredoc.head(),
         quote(temp),
         heredoc.body()
-    )
+    ))
+}
+
+/// `args` written into a [`Zeroizing`] string sized to fit first, so a
+/// script that carries a file's text is zeroed when dropped and never
+/// leaves a smaller copy behind as it grows.
+fn zeroizing(args: fmt::Arguments<'_>) -> Zeroizing<String> {
+    struct Len(usize);
+    impl fmt::Write for Len {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            self.0 += s.len();
+            Ok(())
+        }
+    }
+    let mut len = Len(0);
+    fmt::write(&mut len, args).expect("a script's parts always format");
+    let mut script = Zeroizing::new(String::with_capacity(len.0));
+    fmt::write(&mut *script, args).expect("a script's parts always format");
+    script
 }
 
 /// The password path's terminal run, one brace group so a failed `sudo -v`
@@ -846,6 +878,302 @@ pub(crate) fn parse_od(text: &str, size: u64) -> Result<Zeroizing<Vec<u8>>, Stri
         return Err(format!("od output has {} bytes, not {size}", bytes.len()));
     }
     Ok(bytes)
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "anvil rollback restores from #18 U8 on")
+)]
+/// The dests whose conflict guard a rollback drops.
+pub(crate) enum Force {
+    None,
+    Dests(BTreeSet<String>),
+    All,
+}
+
+impl Force {
+    fn allows(&self, dest: &str) -> bool {
+        match self {
+            Force::None => false,
+            Force::Dests(dests) => dests.contains(dest),
+            Force::All => true,
+        }
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "anvil rollback restores from #18 U8 on")
+)]
+/// Where a rollback's refusals send the user for `--force DEST`.
+#[derive(Clone, Copy)]
+pub(crate) enum Wording {
+    Cli,
+    /// The TUI cannot force, so the message points to a terminal.
+    Tui,
+}
+
+/// The exit status of a restore that DEST's current state refused.
+pub(crate) const CONFLICT: i32 = 3;
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "anvil rollback restores from #18 U8 on")
+)]
+/// One step per recorded file, last written first, that puts back what
+/// DEST held before the apply: `restore DEST` for a file, `remove DEST` for
+/// one that was absent or a dangling link, or a skip `cannot undo: DEST
+/// (reason)` when its text was not kept. Each takes the write's path again,
+/// from the recorded `sudo` and `target`'s current facts and secret, with
+/// the same root checks. A guard refuses, exit [`CONFLICT`], a DEST that is
+/// neither what the apply wrote nor what was there before, unless the write
+/// failed midway or `force` allows the dest.
+pub(crate) fn restore_runs(
+    config: &Config,
+    target: &Target,
+    facts: &Facts,
+    files: &[FileRecord],
+    force: &Force,
+    wording: Wording,
+) -> Result<Vec<PlannedRun>, String> {
+    let root = facts.is_root();
+    let mut runs = Vec::with_capacity(files.len());
+    for file in files.iter().rev() {
+        let dest = file.dest.as_str();
+        let skip = |reason: &str| skip_run(format!("cannot undo: {dest} ({reason})"));
+        let previous = match &file.previous {
+            Previous::File(previous) => match previous.text.as_deref() {
+                Some(text) if previous.kept => Some((previous, text)),
+                _ => {
+                    runs.push(skip(previous.reason.as_deref().unwrap_or("not kept")));
+                    continue;
+                }
+            },
+            _ => None,
+        };
+        if let Some((previous, _)) = previous
+            && !is_mode(&previous.mode)
+        {
+            return Err(format!("files: {dest}: the record's mode is not octal"));
+        }
+        let secret =
+            sudo_secret_for(config, target).filter(|_| file.sudo && facts.sudo_asks_password());
+        let sudo = match secret {
+            Some(_) => "sudo ",
+            None if root || !file.sudo => "",
+            None => "sudo -n ",
+        };
+        let as_root = root || file.sudo;
+        let checks = if as_root {
+            root_checks(sudo, dest)
+        } else {
+            String::new()
+        };
+        let restore = Restore {
+            dest,
+            sudo,
+            checks: &checks,
+            as_root,
+            guard: restore_guard(sudo, file, force.allows(dest), wording),
+        };
+        let (run, label, upload) = match (previous, &file.previous) {
+            (Some((previous, text)), _) => {
+                let heredoc = Heredoc::new(text).map_err(|why| format!("files: {dest}: {why}"))?;
+                let label = format!("restore {dest}");
+                match secret {
+                    Some(_) => {
+                        let (temp, upload) = staged(&heredoc)?;
+                        (restore.install(&temp, previous).into(), label, Some(upload))
+                    }
+                    None => (restore.tee(&heredoc, previous), label, None),
+                }
+            }
+            (None, Previous::Dangling { .. }) => (
+                restore
+                    .remove(&format!(
+                        "removed link {dest}; the file it pointed to was kept"
+                    ))
+                    .into(),
+                format!("remove {dest}"),
+                None,
+            ),
+            (None, _) => (
+                restore.remove(&format!("removed {dest}")).into(),
+                format!("remove {dest}"),
+                None,
+            ),
+        };
+        log::info!("{}: {label}", target.name);
+        runs.push(file_run(
+            run,
+            label,
+            secret.map(str::to_owned),
+            FileRun {
+                upload,
+                skip: false,
+                write: None,
+            },
+        ));
+    }
+    Ok(runs)
+}
+
+/// The lines that set `anvil_same` when DEST already holds `file`'s
+/// previous state, else exit [`CONFLICT`] unless DEST holds what the apply
+/// wrote, the write failed midway, or `forced`. DEST's state is `absent` or
+/// its sha256 through `sudo`; a dangling previous link matches when DEST is
+/// still that link.
+fn restore_guard(sudo: &str, file: &FileRecord, forced: bool, wording: Wording) -> String {
+    let (dest, d) = (file.dest.as_str(), quote(&file.dest));
+    let previous = match &file.previous {
+        // A dangling link the rollback already removed counts as restored.
+        Previous::Absent | Previous::Dangling { .. } => Some("absent"),
+        Previous::File(previous) if !previous.sha256.is_empty() => Some(previous.sha256.as_str()),
+        _ => None,
+    };
+    let link = match &file.previous {
+        Previous::Dangling { target } => format!(
+            "if test -L {d} && ! test -e {d} && [ \"$(readlink {d})\" = {} ]; then anvil_same=1; fi\n",
+            quote(target)
+        ),
+        _ => String::new(),
+    };
+    let same = match previous {
+        Some(sha) => format!(
+            "[ -n \"$anvil_same\" ] || [ \"$anvil_cur\" = {} ]",
+            quote(sha)
+        ),
+        None => "[ -n \"$anvil_same\" ]".to_owned(),
+    };
+    let conflict = if forced || file.write == Write::FailedMidway {
+        String::new()
+    } else {
+        let force = match wording {
+            Wording::Cli => format!("anvil rollback --force {dest} restores"),
+            Wording::Tui => format!("run anvil rollback --force {dest} in a terminal to restore"),
+        };
+        let changed = format!("files: {dest} changed since the last apply; {force} it anyway");
+        let no_tool = format!("files: no sha256 tool on the target to check {dest}; {force} it");
+        format!(
+            "elif [ \"$anvil_cur\" = {written} ]; then :\n\
+             elif [ \"$anvil_rc\" -eq 2 ]; then echo {no_tool} >&2; exit {CONFLICT}\n\
+             else echo {changed} >&2; exit {CONFLICT}\n",
+            written = quote(&file.written_sha256),
+            no_tool = quote(&no_tool),
+            changed = quote(&changed),
+        )
+    };
+    format!(
+        "{hash}anvil_same=\n\
+         {link}if {sudo}test -e {d}; then anvil_cur=$(anvil_sha256 {d}); anvil_rc=$?\n\
+         else anvil_cur=absent; anvil_rc=0; fi\n\
+         if {same}; then anvil_same=1\n\
+         {conflict}fi\n",
+        hash = hash_fn(sudo),
+    )
+}
+
+/// What every restore script of one dest shares.
+struct Restore<'a> {
+    dest: &'a str,
+    /// `""`, `"sudo -n "`, or `"sudo "` on the password path.
+    sudo: &'a str,
+    /// [`root_checks`] when the restore runs as root, else empty.
+    checks: &'a str,
+    as_root: bool,
+    /// [`restore_guard`]'s lines.
+    guard: String,
+}
+
+impl Restore<'_> {
+    /// The opening shared by the plain scripts: `sudo` works, then the root
+    /// checks and the directory refusal, then the guard.
+    fn head(&self) -> String {
+        let d = quote(self.dest);
+        let ready = match self.sudo {
+            "" => String::new(),
+            sudo => format!("{sudo}true || exit 1\n"),
+        };
+        let directory = not_a_directory(self.sudo, &d, self.dest);
+        format!(
+            "{{ umask 077; LC_ALL=C; export LC_ALL; set -f\n\
+             {ready}{}{directory} || exit 1\n\
+             {}",
+            self.checks, self.guard
+        )
+    }
+
+    /// Owner: `chown` as root; as the user, a warning when it differs.
+    fn owner(&self, previous: &PreviousFile) -> String {
+        let (d, sudo) = (quote(self.dest), self.sudo);
+        let ids = format!("{}:{}", previous.uid, previous.gid);
+        if self.as_root {
+            return format!("{sudo}chown {ids} {d} && ");
+        }
+        let warning = quote(&format!(
+            "files: {} was owned by {ids}; only root can give it back",
+            self.dest
+        ));
+        format!("{{ set -- $(ls -lLdn {d}); [ \"$3:$4\" = {ids} ] || echo {warning} >&2; }} && ")
+    }
+
+    /// The tee path: the bytes into a 0600 DEST in place, then the owner,
+    /// then the mode; only owner and mode when DEST already holds them.
+    fn tee(&self, heredoc: &Heredoc<'_>, previous: &PreviousFile) -> Zeroizing<String> {
+        let (d, sudo, mode) = (quote(self.dest), self.sudo, &previous.mode);
+        let (head, body) = (heredoc.head(), heredoc.body());
+        let owner = self.owner(previous);
+        let (unchanged, restored) = (
+            quote(&format!("unchanged {}", self.dest)),
+            quote(&format!("restored {}", self.dest)),
+        );
+        zeroizing(format_args!(
+            "{}if [ -n \"$anvil_same\" ]; then {owner}{sudo}chmod {mode} {d} && echo {unchanged}\n\
+             else {{ {sudo}test -f {d} && {sudo}chmod 600 {d} || : | {sudo}tee -a {d} >/dev/null; }} \
+             && {sudo}chmod 600 {d} && {head} | {sudo}tee {d} >/dev/null \
+             && {owner}{sudo}chmod {mode} {d} && echo {restored}\n\
+             {body}\
+             fi\n\
+             }}\n",
+            self.head()
+        ))
+    }
+
+    /// The password path's terminal run: check the staged `temp`, the root
+    /// checks, the guard, then `install -o -g -m` it over DEST, or only
+    /// `chown` and `chmod` when DEST already holds the bytes.
+    fn install(&self, temp: &str, previous: &PreviousFile) -> String {
+        let (t, d, mode) = (quote(temp), quote(self.dest), &previous.mode);
+        let (uid, gid) = (previous.uid, previous.gid);
+        let directory = not_a_directory("sudo ", &d, self.dest);
+        let (unchanged, restored) = (
+            quote(&format!("unchanged {}", self.dest)),
+            quote(&format!("restored {}", self.dest)),
+        );
+        format!(
+            "{{ trap \"rm -f {t}; sudo -k\" EXIT\n\
+             [ -f {t} ] && [ ! -L {t} ] && [ -O {t} ] \
+             || {{ echo 'files: temp file check failed' >&2; exit 1; }}\n\
+             {}{directory} || exit 1\n\
+             {}\
+             if [ -n \"$anvil_same\" ]; then sudo chown {uid}:{gid} {d} && sudo chmod {mode} {d} && echo {unchanged}\n\
+             else sudo install -o {uid} -g {gid} -m {mode} {t} {d} && echo {restored}; fi\n\
+             }}\n",
+            self.checks, self.guard
+        )
+    }
+
+    /// Removes DEST (`rm` does not follow a link), printing `removed`.
+    fn remove(&self, removed: &str) -> String {
+        let (d, sudo) = (quote(self.dest), self.sudo);
+        let (unchanged, removed) = (quote(&format!("unchanged {}", self.dest)), quote(removed));
+        format!(
+            "{}if [ -n \"$anvil_same\" ]; then echo {unchanged}\n\
+             else {sudo}rm -f {d} && echo {removed}; fi\n\
+             }}\n",
+            self.head()
+        )
+    }
 }
 
 /// A new `/tmp/anvil-<32 hex>` from 16 bytes of `/dev/urandom`; there is no
@@ -1515,7 +1843,8 @@ mod tests {
                 "sudo -n ",
                 &user_checks("sudo -n ", dest, top),
                 &Expected::Unchecked,
-            ),
+            )
+            .to_string(),
             tee_script(
                 &heredoc,
                 d,
@@ -1523,7 +1852,8 @@ mod tests {
                 "",
                 &user_checks("", dest, top),
                 &Expected::Unchecked,
-            ),
+            )
+            .to_string(),
             install_script(
                 temp.to_str().unwrap(),
                 d,
@@ -1681,7 +2011,8 @@ mod tests {
                 "0644",
                 &user_checks("sudo ", &link, &dir),
                 &Expected::Unchecked,
-            ),
+            )
+            .into(),
         ];
         for (n, script) in scripts.iter().enumerate() {
             for old in ["new\n", "old\n"] {
@@ -2426,7 +2757,7 @@ mod tests {
     fn guarded_scripts(dir: &Path, dest: &Path, temp: &Path, expected: &Expected) -> [String; 3] {
         let (heredoc, d) = (Heredoc::new("new\n").unwrap(), dest.to_str().unwrap());
         [
-            tee_script(&heredoc, d, "0644", "", "", expected),
+            tee_script(&heredoc, d, "0644", "", "", expected).to_string(),
             tee_script(
                 &heredoc,
                 d,
@@ -2434,7 +2765,8 @@ mod tests {
                 "sudo -n ",
                 &user_checks("sudo -n ", dest, dir),
                 expected,
-            ),
+            )
+            .to_string(),
             install_script(
                 temp.to_str().unwrap(),
                 d,
@@ -2546,7 +2878,8 @@ mod tests {
                 write_script(&write, &sources, &Expected::Sha256(sha_hex(b"x"))).unwrap();
             assert!(
                 guarded.contains(&format!("= '{}' ] ||", sha_hex(b"x"))),
-                "{guarded}"
+                "{}",
+                *guarded
             );
             let prefix = if secret.is_some() {
                 "sudo "
@@ -2580,6 +2913,604 @@ mod tests {
             write_script(&missing, &sources, &Expected::Unchecked).unwrap_err(),
             "files[1]: src was not loaded"
         );
+    }
+
+    /// A record of `dest` written with `written`, before which it held
+    /// `previous`.
+    fn recorded(dest: &Path, written: &str, write: Write, previous: Previous) -> FileRecord {
+        FileRecord {
+            dest: dest.to_str().unwrap().to_owned(),
+            mode: "0644".to_owned(),
+            sudo: false,
+            written_sha256: sha_hex(written.as_bytes()),
+            write,
+            previous,
+        }
+    }
+
+    /// A kept previous file of `text`, mode `mode`, owned by `path`'s owner.
+    fn kept_file(text: &str, mode: &str, owner: &Path) -> Previous {
+        let (uid, gid) = ids(owner);
+        Previous::File(PreviousFile {
+            mode: mode.to_owned(),
+            uid,
+            gid,
+            sha256: sha_hex(text.as_bytes()),
+            kept: true,
+            text: Some(Zeroizing::new(text.to_owned())),
+            reason: None,
+        })
+    }
+
+    /// Runs the restore of each of `files` as the user, `force`d, in order;
+    /// each one's exit code, stdout and stderr.
+    fn restore(files: &[FileRecord], force: &Force) -> Vec<(Option<i32>, String, String)> {
+        let runs = restore_runs(
+            &Config::default(),
+            &host(&[], None),
+            &user_facts("nopasswd"),
+            files,
+            force,
+            Wording::Cli,
+        )
+        .unwrap();
+        runs.iter()
+            .map(|run| {
+                let out = Local.run(&run.run, RUN_TIMEOUT).unwrap();
+                (
+                    out.code,
+                    String::from_utf8(out.stdout).unwrap(),
+                    String::from_utf8(out.stderr).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn ok(stdout: String) -> (Option<i32>, String, String) {
+        (Some(0), stdout, String::new())
+    }
+
+    #[test]
+    fn a_restore_puts_the_text_and_mode_back_then_is_unchanged() {
+        let dir = dir("files-restore");
+        let dest = dir.join("conf");
+        fs::write(&dest, "v1\n").unwrap();
+        let file = recorded(
+            &dest,
+            "v1\n",
+            Write::Written,
+            kept_file("v0\n", "0640", &dir),
+        );
+        let d = dest.display();
+        assert_eq!(
+            restore(std::slice::from_ref(&file), &Force::None),
+            [ok(format!("restored {d}\n"))]
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "v0\n");
+        assert_eq!(mode_of(&dest), 0o640);
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            restore(&[file], &Force::None),
+            [ok(format!("unchanged {d}\n"))]
+        );
+        assert_eq!(
+            mode_of(&dest),
+            0o640,
+            "the mode comes back also when unchanged"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_remove_deletes_a_dest_that_was_absent_then_is_unchanged() {
+        let dir = dir("files-remove");
+        let dest = dir.join("conf");
+        fs::write(&dest, "v1\n").unwrap();
+        let file = recorded(&dest, "v1\n", Write::Written, Previous::Absent);
+        let d = dest.display();
+        assert_eq!(
+            restore(std::slice::from_ref(&file), &Force::None),
+            [ok(format!("removed {d}\n"))]
+        );
+        assert!(!dest.exists());
+        assert_eq!(
+            restore(&[file], &Force::None),
+            [ok(format!("unchanged {d}\n"))]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_dest_edited_since_is_refused_unless_forced() {
+        let dir = dir("files-restore-edited");
+        let dest = dir.join("conf");
+        let file = recorded(
+            &dest,
+            "v1\n",
+            Write::Written,
+            kept_file("v0\n", "0644", &dir),
+        );
+        let d = dest.display();
+        let refused = (
+            Some(CONFLICT),
+            String::new(),
+            format!(
+                "files: {d} changed since the last apply; anvil rollback --force {d} restores it anyway\n"
+            ),
+        );
+        let dests = Force::Dests(BTreeSet::from([file.dest.clone()]));
+        let others = Force::Dests(BTreeSet::from(["/etc/other".to_owned()]));
+        for force in [&dests, &Force::All] {
+            fs::write(&dest, "edited\n").unwrap();
+            assert_eq!(
+                restore(std::slice::from_ref(&file), &Force::None),
+                std::slice::from_ref(&refused)
+            );
+            assert_eq!(
+                restore(std::slice::from_ref(&file), &others),
+                std::slice::from_ref(&refused)
+            );
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "edited\n");
+            assert_eq!(
+                restore(std::slice::from_ref(&file), force),
+                [ok(format!("restored {d}\n"))]
+            );
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "v0\n");
+        }
+        // Gone since the apply: changed as well.
+        fs::remove_file(&dest).unwrap();
+        assert_eq!(restore(&[file], &Force::None), [refused]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_that_failed_midway_restores_without_force() {
+        let dir = dir("files-restore-midway");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        fs::write(&a, "v").unwrap();
+        fs::write(&b, "half").unwrap();
+        let files = [
+            recorded(
+                &a,
+                "v1\n",
+                Write::FailedMidway,
+                kept_file("v0\n", "0644", &dir),
+            ),
+            recorded(&b, "v1\n", Write::FailedMidway, Previous::Absent),
+        ];
+        assert_eq!(
+            restore(&files, &Force::None),
+            [
+                ok(format!("removed {}\n", b.display())),
+                ok(format!("restored {}\n", a.display()))
+            ],
+            "last written first"
+        );
+        assert_eq!(fs::read_to_string(&a).unwrap(), "v0\n");
+        assert!(!b.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_dangling_previous_removes_the_link_and_keeps_the_file_made_through_it() {
+        let dir = dir("files-restore-dangling");
+        let (link, made) = (dir.join("link"), dir.join("made"));
+        symlink(&made, &link).unwrap();
+        let file = recorded(
+            &link,
+            "v1\n",
+            Write::Written,
+            Previous::Dangling {
+                target: made.to_str().unwrap().to_owned(),
+            },
+        );
+        let l = link.display();
+        assert_eq!(
+            restore(std::slice::from_ref(&file), &Force::None),
+            [ok(format!("unchanged {l}\n"))]
+        );
+        assert!(
+            fs::symlink_metadata(&link).is_ok(),
+            "still the dangling link"
+        );
+        fs::write(&made, "v1\n").unwrap();
+        assert_eq!(
+            restore(std::slice::from_ref(&file), &Force::None),
+            [ok(format!(
+                "removed link {l}; the file it pointed to was kept\n"
+            ))]
+        );
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert_eq!(fs::read_to_string(&made).unwrap(), "v1\n");
+        assert_eq!(
+            restore(&[file], &Force::None),
+            [ok(format!("unchanged {l}\n"))]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_a_hash_tool_a_written_dest_is_refused_unless_forced() {
+        let dir = dir("files-restore-nohash");
+        let bin = bin_with(&dir, &["head", "tee", "chmod", "sh", "ls", "rm"], &[]);
+        let dest = dir.join("conf");
+        let d = dest.display();
+        let written = recorded(
+            &dest,
+            "v1\n",
+            Write::Written,
+            kept_file("v0\n", "0644", &dir),
+        );
+        let midway = FileRecord {
+            write: Write::FailedMidway,
+            ..written.clone()
+        };
+        let run = |file: &FileRecord, force: &Force| {
+            fs::write(&dest, "v1\n").unwrap();
+            let runs = restore_runs(
+                &Config::default(),
+                &host(&[], None),
+                &user_facts("nopasswd"),
+                std::slice::from_ref(file),
+                force,
+                Wording::Cli,
+            )
+            .unwrap();
+            let out = sh_only(&bin, &runs[0].run);
+            (out.code, String::from_utf8(out.stderr).unwrap())
+        };
+        assert_eq!(
+            run(&written, &Force::None),
+            (
+                Some(CONFLICT),
+                format!(
+                    "files: no sha256 tool on the target to check {d}; anvil rollback --force {d} restores it\n"
+                )
+            )
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "v1\n");
+        assert_eq!(run(&written, &Force::All), (Some(0), String::new()));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "v0\n");
+        assert_eq!(run(&midway, &Force::None), (Some(0), String::new()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_tui_wording_points_to_a_terminal() {
+        let file = recorded(
+            Path::new("/etc/a"),
+            "v1\n",
+            Write::Written,
+            Previous::Absent,
+        );
+        let runs = restore_runs(
+            &Config::default(),
+            &host(&[], None),
+            &user_facts("nopasswd"),
+            &[file],
+            &Force::None,
+            Wording::Tui,
+        )
+        .unwrap();
+        assert!(runs[0].run.contains(
+            "files: /etc/a changed since the last apply; run anvil rollback --force /etc/a in a \
+             terminal to restore it anyway"
+        ));
+        assert!(!runs[0].run.contains("restores it anyway"));
+    }
+
+    /// The restore of `file` as root through `sudo`, with the checks from
+    /// `top` down.
+    fn root_restore(file: &FileRecord, top: &Path, sudo: &str) -> String {
+        let dest = Path::new(&file.dest);
+        let checks = user_checks(sudo, dest, top);
+        let restore = Restore {
+            dest: &file.dest,
+            sudo,
+            checks: &checks,
+            as_root: true,
+            guard: restore_guard(sudo, file, false, Wording::Cli),
+        };
+        match &file.previous {
+            Previous::File(previous) => {
+                let text = previous.text.as_deref().unwrap();
+                restore
+                    .tee(&Heredoc::new(text).unwrap(), previous)
+                    .to_string()
+            }
+            _ => restore.remove(&format!("removed {}", file.dest)),
+        }
+    }
+
+    #[test]
+    fn a_restore_as_root_chowns_before_it_chmods() {
+        let dir = dir("files-restore-root");
+        let bin = passthrough_sudo(&dir);
+        let log = dir.join("log");
+        for tool in ["chown", "chmod"] {
+            let real = std::env::split_paths(&std::env::var("PATH").unwrap())
+                .map(|p| p.join(tool))
+                .find(|p| p.is_file())
+                .unwrap();
+            let script = bin.join(tool);
+            fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\necho \"{tool} $*\" >>'{}'\nexec '{}' \"$@\"\n",
+                    log.display(),
+                    real.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let sub = dir.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        let dest = sub.join("conf");
+        fs::write(&dest, "v1\n").unwrap();
+        let file = recorded(
+            &dest,
+            "v1\n",
+            Write::Written,
+            kept_file("v0\n", "0640", &dir),
+        );
+        let out = sh_with(&bin, &root_restore(&file, &dir, "sudo -n "));
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+        assert_eq!(out.code, Some(0));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "v0\n");
+        assert_eq!(mode_of(&dest), 0o640);
+        let (uid, gid) = ids(&dir);
+        let d = dest.display();
+        let log = fs::read_to_string(&log).unwrap();
+        let tail: Vec<&str> = log.lines().rev().take(2).collect();
+        assert_eq!(
+            tail,
+            [format!("chmod 0640 {d}"), format!("chown {uid}:{gid} {d}")]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_restore_as_root_refuses_a_symlink_and_a_parent_that_is_not_root_only() {
+        let dir = dir("files-restore-refuse");
+        let bin = passthrough_sudo(&dir);
+        let sub = dir.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        let real = sub.join("real");
+        fs::write(&real, "v1\n").unwrap();
+        let link = sub.join("link");
+        symlink(&real, &link).unwrap();
+        for previous in [kept_file("v0\n", "0644", &dir), Previous::Absent] {
+            let file = recorded(&link, "v1\n", Write::Written, previous);
+            let out = sh_with(&bin, &root_restore(&file, &dir, "sudo -n "));
+            assert_ne!(out.code, Some(0));
+            assert_eq!(
+                String::from_utf8(out.stderr).unwrap(),
+                format!(
+                    "files: {} is a symlink; point dest at the real file\n",
+                    link.display()
+                )
+            );
+            assert_eq!(fs::read_to_string(&real).unwrap(), "v1\n");
+            assert!(fs::symlink_metadata(&link).is_ok());
+        }
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o775)).unwrap();
+        let file = recorded(&real, "v1\n", Write::Written, Previous::Absent);
+        let out = sh_with(&bin, &root_restore(&file, &dir, "sudo -n "));
+        assert_ne!(out.code, Some(0));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!(
+                "files: {} is not root-only; root will not write under it\n",
+                sub.display()
+            )
+        );
+        assert!(real.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_password_path_stages_the_text_and_installs_it_with_owner_and_mode() {
+        let dir = dir("files-restore-install");
+        let bin = passthrough_sudo(&dir);
+        let dest = dir.join("conf");
+        fs::write(&dest, "v1\n").unwrap();
+        let file = FileRecord {
+            sudo: true,
+            ..recorded(
+                &dest,
+                "v1\n",
+                Write::Written,
+                kept_file(SECRET_TEXT, "0640", &dir),
+            )
+        };
+        let runs = restore_runs(
+            &Config::default(),
+            &host(&[], Some("WEB")),
+            &user_facts("binary"),
+            std::slice::from_ref(&file),
+            &Force::None,
+            Wording::Cli,
+        )
+        .unwrap();
+        let run = &runs[0];
+        assert_eq!(run.shown(), format!("restore {}", dest.display()));
+        assert_eq!(run.sudo_secret.as_deref(), Some("WEB"));
+        let upload = run.file.as_ref().unwrap().upload.as_ref().unwrap();
+        let temp = upload
+            .cleanup
+            .strip_prefix("rm -f '")
+            .unwrap()
+            .strip_suffix('\'')
+            .unwrap();
+        let (uid, gid) = ids(&dir);
+        assert!(run.run.contains(&format!(
+            "sudo install -o {uid} -g {gid} -m 0640 '{temp}' '{}'",
+            dest.display()
+        )));
+        assert!(upload.stage.contains(SECRET_TEXT));
+        assert!(
+            !run.run.contains("hunter2"),
+            "the tty run carries paths only"
+        );
+
+        // Over Local, with the checks from the temp dir down and a temp file there.
+        let local_temp = dir.join("temp");
+        let checks = user_checks("sudo ", &dest, &dir);
+        let restore = Restore {
+            dest: &file.dest,
+            sudo: "sudo ",
+            checks: &checks,
+            as_root: true,
+            guard: restore_guard("sudo ", &file, false, Wording::Cli),
+        };
+        let Previous::File(previous) = &file.previous else {
+            unreachable!()
+        };
+        let script = restore.install(local_temp.to_str().unwrap(), previous);
+        for expected in ["restored", "unchanged"] {
+            let stage = stage_script(
+                &Heredoc::new(SECRET_TEXT).unwrap(),
+                local_temp.to_str().unwrap(),
+            );
+            assert_eq!(sh(&stage), (Some(0), String::new()));
+            let out = sh_with(&bin, &script);
+            assert_eq!(String::from_utf8(out.stderr).unwrap(), "", "{expected}");
+            assert_eq!(
+                (out.code, String::from_utf8(out.stdout).unwrap()),
+                (Some(0), format!("{expected} {}\n", dest.display()))
+            );
+            assert_eq!(fs::read_to_string(&dest).unwrap(), SECRET_TEXT);
+            assert_eq!(mode_of(&dest), 0o640);
+            assert!(!local_temp.exists(), "the trap removed the temp file");
+        }
+        let wrapped = crate::packages::with_password(&script);
+        let syntax = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", &wrapped])
+            .status()
+            .unwrap();
+        assert!(syntax.success(), "{wrapped}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_text_not_kept_cannot_be_undone() {
+        let reasons = ["rollback = false", "over 256 KiB"];
+        let files: Vec<FileRecord> = reasons
+            .iter()
+            .enumerate()
+            .map(|(n, reason)| {
+                recorded(
+                    Path::new(&format!("/etc/{n}")),
+                    "v1\n",
+                    Write::Written,
+                    Previous::File(PreviousFile {
+                        mode: "0644".to_owned(),
+                        uid: 0,
+                        gid: 0,
+                        sha256: sha_hex(b"v0"),
+                        kept: false,
+                        text: None,
+                        reason: Some((*reason).to_owned()),
+                    }),
+                )
+            })
+            .collect();
+        let runs = restore_runs(
+            &Config::default(),
+            &host(&[], None),
+            &user_facts("nopasswd"),
+            &files,
+            &Force::All,
+            Wording::Cli,
+        )
+        .unwrap();
+        let shown: Vec<_> = runs.iter().map(PlannedRun::shown).collect();
+        assert_eq!(
+            shown,
+            [
+                "cannot undo: /etc/1 (over 256 KiB)",
+                "cannot undo: /etc/0 (rollback = false)"
+            ]
+        );
+        assert!(
+            runs.iter()
+                .all(|run| run.file.as_ref().unwrap().skip && run.run.is_empty())
+        );
+    }
+
+    #[test]
+    fn no_restore_script_carries_or_shows_the_text_outside_its_heredoc() {
+        let dest = Path::new("/etc/a");
+        let previous = Previous::File(PreviousFile {
+            mode: "0600".to_owned(),
+            uid: 0,
+            gid: 0,
+            sha256: sha_hex(SECRET_TEXT.as_bytes()),
+            kept: true,
+            text: Some(Zeroizing::new(SECRET_TEXT.to_owned())),
+            reason: None,
+        });
+        let file = FileRecord {
+            sudo: true,
+            ..recorded(dest, "v1\n", Write::Written, previous)
+        };
+        let absent = FileRecord {
+            sudo: true,
+            ..recorded(dest, "v1\n", Write::Written, Previous::Absent)
+        };
+        let both = [absent, file];
+        let ((), lines) = logged(|| {
+            for (secret, facts) in [
+                (None, user_facts("nopasswd")),
+                (Some("WEB"), user_facts("binary")),
+                (None, facts(&[("user", "root"), ("sudo", "binary")])),
+            ] {
+                let runs = restore_runs(
+                    &Config::default(),
+                    &host(&[], secret),
+                    &facts,
+                    &both,
+                    &Force::None,
+                    Wording::Cli,
+                )
+                .unwrap();
+                let (restore, remove) = (&runs[0], &runs[1]);
+                assert!(!remove.run.contains("hunter2"));
+                match &restore.file.as_ref().unwrap().upload {
+                    Some(upload) => {
+                        assert!(!restore.run.contains("hunter2"));
+                        assert_eq!(upload.stage.matches("hunter2").count(), 1);
+                        spawn_for(&upload.stage, false);
+                        spawn_for(&restore.run, true);
+                    }
+                    None => {
+                        assert_eq!(
+                            restore.run.matches("hunter2").count(),
+                            1,
+                            "only the heredoc body, on stdin"
+                        );
+                        spawn_for(&restore.run, false);
+                    }
+                }
+                spawn_for(&remove.run, secret.is_some());
+                for run in &runs {
+                    let shown = format!("{run:?}");
+                    assert!(!shown.contains("hunter2"), "{shown}");
+                }
+            }
+        });
+        assert_no_leak(&lines);
+    }
+
+    #[test]
+    fn a_zeroizing_script_is_allocated_once_at_its_size() {
+        let text = "x".repeat(1000);
+        let script = zeroizing(format_args!("{{ {} {text} }}", quote("/etc/a")));
+        assert_eq!(*script, format!("{{ '/etc/a' {text} }}"));
+        assert_eq!(script.capacity(), script.len());
     }
 
     #[test]

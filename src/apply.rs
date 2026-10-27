@@ -80,7 +80,8 @@ fn sudo_password<'a>(
 /// `run` is the label when there is one.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PlannedRun {
-    pub run: String,
+    /// Zeroed when dropped: a `[[files]]` step's carries the file's bytes.
+    pub run: Zeroizing<String>,
     /// What the step's report shows instead of `run`, when what is sent
     /// differs from what the user wrote.
     pub label: Option<String>,
@@ -99,7 +100,7 @@ impl std::fmt::Debug for PlannedRun {
         let mut debug = f.debug_struct("PlannedRun");
         match self.file {
             Some(_) => debug.field("run", &Redacted(self.run.len())),
-            None => debug.field("run", &self.run),
+            None => debug.field("run", &*self.run),
         };
         debug
             .field("label", &self.label)
@@ -133,7 +134,8 @@ pub struct ServiceRun {
 /// to the temp file, `cleanup` removes it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Upload {
-    pub stage: String,
+    /// Zeroed when dropped, as it carries the file's bytes.
+    pub stage: Zeroizing<String>,
     pub cleanup: String,
 }
 
@@ -808,7 +810,7 @@ pub fn resolve(
                 None => log::info!("{}: packages with {manager}", target.name),
             }
             runs.push(PlannedRun {
-                run,
+                run: run.into(),
                 label: None,
                 sudo_secret: sudo_secret.map(str::to_owned),
                 plugin: None,
@@ -837,7 +839,7 @@ pub fn resolve(
                 let script = plugins.script(name, &request)?;
                 log::info!("{}: step from plugin {name}", target.name);
                 runs.push(PlannedRun {
-                    run: crate::run::wrap(&script),
+                    run: crate::run::wrap(&script).into(),
                     label: Some(script),
                     sudo_secret: None,
                     plugin: Some(name.to_owned()),
@@ -847,7 +849,7 @@ pub fn resolve(
                 });
             }
             StepKind::Run(run) => runs.push(PlannedRun {
-                run: run.to_owned(),
+                run: run.to_owned().into(),
                 label: None,
                 sudo_secret: None,
                 plugin: None,
@@ -2346,7 +2348,7 @@ mod tests {
 
     fn planned(run: &str, sudo_secret: Option<&str>, timeout: Duration) -> PlannedRun {
         PlannedRun {
-            run: run.to_owned(),
+            run: run.to_owned().into(),
             label: None,
             sudo_secret: sudo_secret.map(str::to_owned),
             plugin: None,
@@ -2450,7 +2452,7 @@ mod tests {
 
     fn from_plugin(name: &str, script: &str) -> PlannedRun {
         PlannedRun {
-            run: crate::run::wrap(script),
+            run: crate::run::wrap(script).into(),
             label: Some(script.to_owned()),
             sudo_secret: None,
             plugin: Some(name.to_owned()),
@@ -2487,7 +2489,7 @@ mod tests {
                 from_plugin("harden", "hostname")
             ]
         );
-        assert_eq!(runs[1].run, crate::run::wrap("hostname"));
+        assert_eq!(*runs[1].run, crate::run::wrap("hostname"));
         assert_eq!(
             *plugins.seen.lock().unwrap(),
             [(
@@ -4028,12 +4030,12 @@ mod tests {
         ssh.home = home.clone();
         let temp = home.join("staged");
         let upload = Upload {
-            stage: format!("echo bytes > '{}'", temp.display()),
+            stage: format!("echo bytes > '{}'", temp.display()).into(),
             cleanup: format!("rm -f '{}'", temp.display()),
         };
         let transport = DiesAfterStage {
             ssh,
-            stage: upload.stage.clone(),
+            stage: upload.stage.to_string(),
             marker: home.join(".ssh/anvil/box.master"),
             cancel: Arc::clone(&cancel),
         };
