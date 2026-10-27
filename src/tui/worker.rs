@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use super::app::{self, Job, Msg};
 use crate::cli::Failure;
+use crate::inventory::Target;
 use crate::options::Options;
 use crate::{apply, doctor, fanout, plan, run, update};
 
@@ -61,9 +62,6 @@ fn job_opts(job: &Job, mut opts: Options, cancel: &Arc<AtomicBool>) -> Options {
     if matches!(job, Job::Apply | Job::Plan | Job::Run(_)) {
         opts.cancel = Arc::clone(cancel);
     }
-    // One target at a time until the TUI shows every running target in
-    // fixed rows; U8 removes this clamp.
-    opts.parallel = std::num::NonZeroU8::MIN;
     opts
 }
 
@@ -133,14 +131,18 @@ fn run_apply(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
 fn send_progress(tx: &Sender<Msg>) -> impl FnMut(apply::Progress<'_>) + '_ {
     |progress| {
         let msg = match progress {
-            // The slots come with the TUI's parallel view.
-            apply::Progress::Begin(_) => return,
-            apply::Progress::Start(_, target) => Msg::Start(target.name.clone()),
-            apply::Progress::Done(_, report) => Msg::TargetDone(report.clone()),
+            apply::Progress::Begin(targets) => Msg::Begin(names(targets)),
+            apply::Progress::Start(target) => Msg::Start(target.name.clone()),
+            apply::Progress::Done(index, report) => Msg::TargetDone(index, report.clone()),
+            // The fixed slots place each report by its index.
             apply::Progress::Ordered(_) => return,
         };
         let _ = tx.send(msg);
     }
+}
+
+fn names(targets: &[Target]) -> Vec<String> {
+    targets.iter().map(|target| target.name.clone()).collect()
 }
 
 /// As `anvil run`: no config and no secret store, the default timeout. The
@@ -158,10 +160,9 @@ fn run_plan(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
     let config = opts.load_config()?;
     plan::run_targets(opts, &config, &mut |progress| {
         let msg = match progress {
-            // The slots come with the TUI's parallel view.
-            plan::Progress::Begin(_) => return,
-            plan::Progress::Start(_, target) => Msg::Start(target.name.clone()),
-            plan::Progress::Done(_, report) => Msg::PlanDone(report.clone()),
+            plan::Progress::Begin(targets) => Msg::Begin(names(targets)),
+            plan::Progress::Start(target) => Msg::Start(target.name.clone()),
+            plan::Progress::Done(index, report) => Msg::PlanDone(index, report.clone()),
             plan::Progress::Ordered(_) => return,
         };
         let _ = tx.send(msg);
@@ -268,9 +269,10 @@ mod tests {
         msgs.iter()
             .map(|msg| match msg {
                 Msg::Steps(rows) => format!("steps {}", rows.len()),
+                Msg::Begin(names) => format!("begin {}", names.join(" ")),
                 Msg::Start(name) => format!("start {name}"),
-                Msg::TargetDone(report) => format!("done {}", report.target()),
-                Msg::PlanDone(report) => format!("done {}", report.target()),
+                Msg::TargetDone(index, report) => format!("done {index} {}", report.target()),
+                Msg::PlanDone(index, report) => format!("done {index} {}", report.target()),
                 Msg::DoctorTarget(report) => format!("done {}", report.target),
                 Msg::DoctorDone(_) => "doctor done".to_owned(),
                 Msg::Finished(result) => format!("finished {result:?}"),
@@ -297,28 +299,32 @@ mod tests {
             order(&msgs),
             [
                 "steps 1",
+                "begin down up",
                 "start down",
-                "done down",
+                "done 0 down",
                 "start up",
-                "done up",
+                "done 1 up",
                 "finished Ok(())"
             ]
         );
-        match &msgs[2] {
-            Msg::TargetDone(apply::TargetReport::Failed {
-                target,
-                steps,
-                error,
-                ok,
-            }) => {
+        match &msgs[3] {
+            Msg::TargetDone(
+                _,
+                apply::TargetReport::Failed {
+                    target,
+                    steps,
+                    error,
+                    ok,
+                },
+            ) => {
                 assert_eq!((target.as_str(), *ok), ("down", false));
                 assert!(steps.is_empty());
                 assert_eq!(error, &format!("cannot connect: {REFUSED}"));
             }
             _ => panic!("expected a Failed report for down"),
         }
-        match &msgs[4] {
-            Msg::TargetDone(apply::TargetReport::Ran { target, steps, ok }) => {
+        match &msgs[5] {
+            Msg::TargetDone(_, apply::TargetReport::Ran { target, steps, ok }) => {
                 assert_eq!((target.as_str(), *ok), ("up", true));
                 assert_eq!(steps[0].stdout, "hi\n");
             }
@@ -365,17 +371,18 @@ mod tests {
         let opts = local_opts("tui-worker-apply", &["printf 'hi\\n'"]);
         let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
         let msgs = collect(worker, &rx);
-        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs.len(), 5);
         assert!(matches!(&msgs[0], Msg::Steps(rows) if rows[..] == [row("printf 'hi\\n'")]));
-        assert!(matches!(&msgs[1], Msg::Start(name) if name == "local"));
-        match &msgs[2] {
-            Msg::TargetDone(apply::TargetReport::Ran { target, steps, ok }) => {
+        assert!(matches!(&msgs[1], Msg::Begin(names) if names[..] == ["local"]));
+        assert!(matches!(&msgs[2], Msg::Start(name) if name == "local"));
+        match &msgs[3] {
+            Msg::TargetDone(_, apply::TargetReport::Ran { target, steps, ok }) => {
                 assert_eq!((target.as_str(), *ok), ("local", true));
                 assert_eq!(steps[0].stdout, "hi\n");
             }
             _ => panic!("expected TargetDone"),
         }
-        assert!(matches!(&msgs[3], Msg::Finished(Ok(()))));
+        assert!(matches!(&msgs[4], Msg::Finished(Ok(()))));
     }
 
     #[test]
@@ -391,11 +398,11 @@ mod tests {
             tx,
         );
         let msgs = collect(worker, &rx);
-        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs.len(), 5);
         assert!(matches!(&msgs[0], Msg::Steps(rows) if rows[..] == [row("printf 'one\\n' …")]));
-        assert!(matches!(&msgs[1], Msg::Start(name) if name == "local"));
-        match &msgs[2] {
-            Msg::TargetDone(apply::TargetReport::Ran { target, steps, ok }) => {
+        assert!(matches!(&msgs[2], Msg::Start(name) if name == "local"));
+        match &msgs[3] {
+            Msg::TargetDone(_, apply::TargetReport::Ran { target, steps, ok }) => {
                 assert_eq!((target.as_str(), *ok), ("local", true));
                 assert_eq!(
                     (steps[0].run.as_str(), steps[0].stdout.as_str()),
@@ -404,15 +411,15 @@ mod tests {
             }
             _ => panic!("expected TargetDone"),
         }
-        assert!(matches!(&msgs[3], Msg::Finished(Ok(()))));
+        assert!(matches!(&msgs[4], Msg::Finished(Ok(()))));
 
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-run-cancel", &[]);
         let cancel = Arc::new(AtomicBool::new(true));
         let worker = spawn(Job::Run("true".to_owned()), opts, cancel, tx);
         assert!(matches!(
-            &collect(worker, &rx)[2],
-            Msg::TargetDone(apply::TargetReport::Cancelled { .. })
+            &collect(worker, &rx)[3],
+            Msg::TargetDone(_, apply::TargetReport::Cancelled { .. })
         ));
     }
 
@@ -429,16 +436,17 @@ mod tests {
         .unwrap();
         let worker = spawn(Job::Plan, opts, Arc::new(AtomicBool::new(false)), tx);
         let msgs = collect(worker, &rx);
-        assert_eq!(msgs.len(), 3);
-        assert!(matches!(&msgs[0], Msg::Start(name) if name == "local"));
-        match &msgs[1] {
-            Msg::PlanDone(plan::PlanReport::Planned { target, steps, ok }) => {
+        assert_eq!(msgs.len(), 4);
+        assert!(matches!(&msgs[0], Msg::Begin(names) if names[..] == ["local"]));
+        assert!(matches!(&msgs[1], Msg::Start(name) if name == "local"));
+        match &msgs[2] {
+            Msg::PlanDone(_, plan::PlanReport::Planned { target, steps, ok }) => {
                 assert_eq!((target.as_str(), *ok), ("local", true));
                 assert_eq!(steps[0].run, format!("touch {}", ran.display()));
             }
             _ => panic!("expected PlanDone"),
         }
-        assert!(matches!(&msgs[2], Msg::Finished(Ok(()))));
+        assert!(matches!(&msgs[3], Msg::Finished(Ok(()))));
         assert!(!ran.exists(), "the step did not run");
 
         let (tx, rx) = mpsc::channel();
@@ -446,8 +454,8 @@ mod tests {
         let worker = spawn(Job::Plan, opts, Arc::new(AtomicBool::new(true)), tx);
         let msgs = collect(worker, &rx);
         assert!(matches!(
-            &msgs[1],
-            Msg::PlanDone(plan::PlanReport::Cancelled { .. })
+            &msgs[2],
+            Msg::PlanDone(_, plan::PlanReport::Cancelled { .. })
         ));
     }
 
@@ -458,8 +466,8 @@ mod tests {
         let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(true)), tx);
         let msgs = collect(worker, &rx);
         assert!(matches!(
-            &msgs[2],
-            Msg::TargetDone(apply::TargetReport::Cancelled { steps, .. }) if steps.is_empty()
+            &msgs[3],
+            Msg::TargetDone(_, apply::TargetReport::Cancelled { steps, .. }) if steps.is_empty()
         ));
     }
 
@@ -487,8 +495,8 @@ mod tests {
         let msgs = collect(worker, &rx);
         assert!(
             matches!(
-                &msgs[2],
-                Msg::TargetDone(apply::TargetReport::Cancelled { target, steps, .. })
+                &msgs[3],
+                Msg::TargetDone(_, apply::TargetReport::Cancelled { target, steps, .. })
                     if target == "down" && steps.is_empty()
             ),
             "the refused master is cancelled, not a failure"
@@ -496,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_plan_and_run_carry_the_cancel_flag_and_run_one_target_at_a_time() {
+    fn apply_plan_and_run_carry_the_cancel_flag_and_the_parallel_count() {
         let cancel = Arc::new(AtomicBool::new(false));
         for job in [
             Job::Apply,
@@ -507,7 +515,7 @@ mod tests {
             let mut opts = opts();
             opts.parallel = std::num::NonZeroU8::new(4).unwrap();
             let opts = job_opts(&job, opts, &cancel);
-            assert_eq!(opts.parallel.get(), 1);
+            assert_eq!(opts.parallel.get(), 4);
             let carried = Arc::ptr_eq(&opts.cancel, &cancel);
             assert_eq!(carried, !matches!(job, Job::Doctor));
         }
@@ -532,7 +540,7 @@ mod tests {
         fs::write(&gate, "").unwrap();
         let msgs = collect(worker, &rx);
         assert!(
-            matches!(&msgs[1], Msg::PlanDone(plan::PlanReport::Cancelled { target, .. }) if target == "down"),
+            matches!(&msgs[2], Msg::PlanDone(_, plan::PlanReport::Cancelled { target, .. }) if target == "down"),
             "the refused probe is cancelled, not a failure"
         );
     }

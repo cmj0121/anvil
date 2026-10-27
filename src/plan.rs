@@ -425,7 +425,7 @@ mod tests {
             &AtomicBool::new(cancelled),
             &mut |progress| match progress {
                 Progress::Begin(targets) => assert_eq!(targets.len(), names.len()),
-                Progress::Start(_, target) => events.push(format!("start {}", target.name)),
+                Progress::Start(target) => events.push(format!("start {}", target.name)),
                 Progress::Done(_, report) => events.push(format!("done {}", report.target())),
                 Progress::Ordered(_) => {}
             },

@@ -10,7 +10,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use super::app::{self, App, BACKENDS, OPTION_FLAGS, Overlay, Pane, RunKind, RunResult, Running};
+use super::app::{
+    self, App, BACKENDS, OPTION_FLAGS, Overlay, Pane, RunKind, RunResult, Running, Slot,
+};
 use crate::doctor::{self, SecretStatus};
 use crate::logger::escape_controls;
 use crate::plan::{self, PlanReport};
@@ -282,15 +284,15 @@ fn draw_steps(app: &App, f: &mut Frame, area: Rect) {
         return;
     }
     let steps = app.shown_steps();
-    // `Some` on an apply result: the shown tab's report, if it has one yet.
-    let report = match app.shown_result() {
+    // `Some` on an apply result: the shown tab's slot, if it has one.
+    let slot = match app.shown_result() {
         Some(RunResult::Apply { targets, .. }) => Some(targets.get(app.shown_tab())),
         _ => None,
     };
     let cursor = app.step_cursor();
     let digits = steps.len().to_string().len();
     // Columns left after the border, the `▶` column and a mark with its space.
-    let mark_cols = if report.is_some() { 2 } else { 0 };
+    let mark_cols = if slot.is_some() { 2 } else { 0 };
     let room = usize::from(area.width.saturating_sub(2)).saturating_sub(1 + mark_cols);
     let lines: Vec<Line> = steps
         .iter()
@@ -304,8 +306,8 @@ fn draw_steps(app: &App, f: &mut Frame, area: Rect) {
             };
             let body = format!("{:>digits$} {}", i + 1, text(&step.label));
             let mut spans = vec![Span::styled(if at { "▶" } else { " " }, style)];
-            if let Some(report) = report {
-                let (mark, mark_style) = step_mark(report, i);
+            if let Some(slot) = slot {
+                let (mark, mark_style) = step_mark(slot, i);
                 spans.extend([Span::styled(mark, mark_style), Span::styled(" ", style)]);
             }
             spans.push(Span::styled(ellipsize(&body, room), style));
@@ -325,12 +327,14 @@ fn draw_steps(app: &App, f: &mut Frame, area: Rect) {
 /// `[[services]]` step; past
 /// the report `⊘` (not run), except the
 /// step a transport error ended with no timed-out step kept, `✘`; `·`
-/// before the target has a report.
-fn step_mark(report: Option<&TargetReport>, index: usize) -> (&'static str, Style) {
+/// before the target has a report, and `⊘` for a target that never ran.
+fn step_mark(slot: Option<&Slot<TargetReport>>, index: usize) -> (&'static str, Style) {
     let failed = ("✘", Style::new().fg(Color::Red));
     let skipped = ("⊘", secondary());
-    let Some(report) = report else {
-        return ("·", secondary());
+    let report = match slot {
+        Some(Slot::Done(report)) => report,
+        Some(Slot::NotRun(_)) => return skipped,
+        Some(Slot::Pending(_)) | None => return ("·", secondary()),
     };
     let steps = report.steps();
     if let Some(step) = steps.get(index) {
@@ -440,7 +444,8 @@ fn draw_results(app: &App, f: &mut Frame, area: Rect) {
         );
         return;
     };
-    let tabs = result_tabs(result);
+    let running = shown_running(app);
+    let tabs = result_tabs(result, running);
     let mut body_area = inner;
     if !tabs.is_empty() {
         let strip = Rect { height: 1, ..inner };
@@ -461,7 +466,7 @@ fn draw_results(app: &App, f: &mut Frame, area: Rect) {
     let mut lines = if tabs.is_empty() {
         Vec::new()
     } else {
-        section_lines(result, selected)
+        section_lines(result, selected, running)
     };
     lines.extend(run_error(result_error(result)));
     if let Some(running) = running_line(app) {
@@ -502,58 +507,158 @@ fn result_error(result: &RunResult) -> Option<&str> {
 }
 
 struct StripTab {
-    ok: bool,
+    mark: Mark,
     label: String,
 }
 
-fn result_tabs(result: &RunResult) -> Vec<StripTab> {
+/// A tab's mark: how its target ended, or that it is running or has not
+/// started yet.
+#[derive(Clone, Copy)]
+enum Mark {
+    Ok,
+    Failed,
+    Running(char),
+    Waiting,
+}
+
+impl Mark {
+    fn of(ok: bool) -> Mark {
+        if ok { Mark::Ok } else { Mark::Failed }
+    }
+
+    fn text(self) -> String {
+        match self {
+            Mark::Ok => "✔".to_owned(),
+            Mark::Failed => "✘".to_owned(),
+            Mark::Running(glyph) => glyph.to_string(),
+            Mark::Waiting => "·".to_owned(),
+        }
+    }
+
+    fn style(self) -> Style {
+        match self {
+            Mark::Ok => Color::Green.into(),
+            Mark::Failed => Color::Red.into(),
+            Mark::Running(_) => Color::Cyan.into(),
+            Mark::Waiting => secondary(),
+        }
+    }
+}
+
+fn result_tabs(result: &RunResult, running: Option<&Running>) -> Vec<StripTab> {
     match result {
         RunResult::Doctor { local, targets, .. } => {
             let mut tabs = Vec::new();
             if let Some(local) = local {
                 tabs.push(StripTab {
-                    ok: local.ok(),
+                    mark: Mark::of(local.ok()),
                     label: "local checks".to_owned(),
                 });
             }
             tabs.extend(targets.iter().map(|target| StripTab {
-                ok: target.ok(),
+                mark: Mark::of(target.ok()),
                 label: text(&target.target),
             }));
             tabs
         }
         RunResult::Apply { targets, .. } => targets
             .iter()
-            .map(|target| StripTab {
-                ok: target.ok(),
-                label: text(target.target()),
-            })
+            .map(|slot| slot_tab(slot, running, |r| (r.ok(), r.target())))
             .collect(),
         RunResult::Plan { targets, .. } => targets
             .iter()
-            .map(|target| StripTab {
-                ok: target.ok(),
-                label: text(target.target()),
-            })
+            .map(|slot| slot_tab(slot, running, |r| (r.ok(), r.target())))
             .collect(),
         RunResult::Edit { what, outcome } => vec![StripTab {
-            ok: outcome.is_ok(),
+            mark: Mark::of(outcome.is_ok()),
             label: text(what),
         }],
     }
 }
 
-fn section_lines(result: &RunResult, index: usize) -> Vec<Line<'static>> {
+/// The tab of `slot`, whose report `ends` reads as ok and target name.
+fn slot_tab<R>(
+    slot: &Slot<R>,
+    running: Option<&Running>,
+    ends: impl Fn(&R) -> (bool, &str),
+) -> StripTab {
+    match slot {
+        Slot::Done(report) => {
+            let (ok, target) = ends(report);
+            StripTab {
+                mark: Mark::of(ok),
+                label: text(target),
+            }
+        }
+        Slot::Pending(name) => StripTab {
+            mark: match spinning(running, name) {
+                Some(running) => Mark::Running(spinner_glyph(running)),
+                None => Mark::Waiting,
+            },
+            label: text(name),
+        },
+        Slot::NotRun(name) => StripTab {
+            mark: Mark::Failed,
+            label: text(name),
+        },
+    }
+}
+
+fn section_lines(
+    result: &RunResult,
+    index: usize,
+    running: Option<&Running>,
+) -> Vec<Line<'static>> {
     match result {
         RunResult::Doctor { local, targets, .. } => match local {
             Some(local) if index == 0 => local_block(local),
             Some(_) => doctor_block(&targets[index - 1]),
             None => doctor_block(&targets[index]),
         },
-        RunResult::Apply { targets, .. } => apply_block(&targets[index]),
-        RunResult::Plan { targets, .. } => plan_block(&targets[index]),
+        RunResult::Apply { targets, .. } => slot_block(&targets[index], running, apply_block),
+        RunResult::Plan { targets, .. } => slot_block(&targets[index], running, plan_block),
         RunResult::Edit { what, outcome } => edit_lines(what, outcome),
     }
+}
+
+/// An apply or plan target's section: its report's block via `done`, else
+/// as [`pending_block`] or [`not_run_block`].
+fn slot_block<R>(
+    slot: &Slot<R>,
+    running: Option<&Running>,
+    done: fn(&R) -> Vec<Line<'static>>,
+) -> Vec<Line<'static>> {
+    match slot {
+        Slot::Done(report) => done(report),
+        Slot::Pending(name) => pending_block(name, running),
+        Slot::NotRun(name) => not_run_block(name),
+    }
+}
+
+/// `running` when `name` is one of its running targets.
+fn spinning<'a>(running: Option<&'a Running>, name: &str) -> Option<&'a Running> {
+    running.filter(|r| r.running.iter().any(|n| n == name))
+}
+
+/// A target with no report yet: `▶ target` and the spinner while it runs,
+/// else its dimmed name.
+fn pending_block(name: &str, running: Option<&Running>) -> Vec<Line<'static>> {
+    let header = format!("▶ {}", text(name));
+    match spinning(running, name) {
+        Some(running) => vec![
+            Line::from(header).style(heading()),
+            Line::from(format!("  {} running", spinner_glyph(running))).style(Color::Cyan),
+        ],
+        None => vec![Line::from(header).style(secondary())],
+    }
+}
+
+/// A target the run finished without: `▶ target` and `✘ not run`.
+fn not_run_block(name: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(format!("▶ {}", text(name))).style(heading()),
+        Line::from("  ✘ not run").style(Color::Red),
+    ]
 }
 
 fn edit_lines(what: &str, outcome: &Result<String, String>) -> Vec<Line<'static>> {
@@ -670,34 +775,27 @@ fn tab_window(tabs: &[StripTab], selected: usize, width: usize) -> TabWindow {
 
 fn tab_text(tab: &StripTab, selected: bool) -> String {
     let (open, close) = if selected { ("[", "]") } else { ("", "") };
-    format!("{open}{} {}{close}", tab_mark(tab.ok), tab.label)
-}
-
-fn tab_mark(ok: bool) -> &'static str {
-    if ok { "✔" } else { "✘" }
+    format!("{open}{} {}{close}", tab.mark.text(), tab.label)
 }
 
 /// `budget` columns of `{open}{mark} {label}{close}`. The mark and the
 /// space after it stay whole while the budget can hold them.
 fn tab_spans(tab: &StripTab, selected: bool, budget: usize) -> Vec<Span<'static>> {
     let (open, close) = if selected { ("[", "]") } else { ("", "") };
-    let mark = tab_mark(tab.ok);
+    let mark = tab.mark.text();
     let rest = if selected {
         cursor_style()
     } else {
         secondary()
     };
-    let fixed = cols(open) + cols(close) + cols(mark) + 1;
+    let fixed = cols(open) + cols(close) + cols(&mark) + 1;
     if budget >= fixed {
         let label = ellipsize(&tab.label, budget - fixed);
         let mut spans = Vec::new();
         if !open.is_empty() {
             spans.push(Span::styled(open, rest));
         }
-        spans.push(Span::styled(
-            mark,
-            if tab.ok { Color::Green } else { Color::Red },
-        ));
+        spans.push(Span::styled(mark, tab.mark.style()));
         spans.push(Span::styled(format!(" {label}{close}"), rest));
         spans
     } else {
@@ -708,10 +806,19 @@ fn tab_spans(tab: &StripTab, selected: bool, budget: usize) -> Vec<Span<'static>
     }
 }
 
+fn spinner_glyph(running: &Running) -> char {
+    SPINNER[usize::from(running.tick) % SPINNER.len()]
+}
+
+/// The spinner and every running target, comma-joined in the order they
+/// started; the run's kind before the first starts.
 fn spinner_text(running: &Running) -> String {
-    let glyph = SPINNER[usize::from(running.tick) % SPINNER.len()];
-    let what = running.current.as_deref().unwrap_or(running.kind.as_str());
-    format!("{glyph} {}", escape_controls(what))
+    let what = if running.running.is_empty() {
+        running.kind.as_str().to_owned()
+    } else {
+        running.running.join(", ")
+    };
+    format!("{} {}", spinner_glyph(running), escape_controls(&what))
 }
 
 fn text(text: &str) -> String {
@@ -1069,6 +1176,11 @@ mod tests {
     };
     use crate::tui::app::{LogLine, Msg, RunKind, RunResult, Running};
 
+    /// `reports` as the slots of targets that all ended.
+    fn done<R>(reports: Vec<R>) -> Vec<Slot<R>> {
+        reports.into_iter().map(Slot::Done).collect()
+    }
+
     fn render(app: &App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| draw(app, f)).unwrap();
@@ -1140,7 +1252,7 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: steps.to_vec(),
-                targets: vec![local, cancelled("pi")],
+                targets: done(vec![local, cancelled("pi")]),
                 ok: Some(false),
                 error: None,
             },
@@ -1165,7 +1277,8 @@ mod tests {
 
     /// The marks of `rows` steps against `report`, as the Steps pane draws them.
     fn marks(report: Option<&TargetReport>, rows: usize) -> String {
-        (0..rows).map(|i| step_mark(report, i).0).collect()
+        let slot = report.map(|report| Slot::Done(report.clone()));
+        (0..rows).map(|i| step_mark(slot.as_ref(), i).0).collect()
     }
 
     #[test]
@@ -1341,7 +1454,7 @@ mod tests {
         );
         app.running = Some(Running {
             kind: RunKind::Apply,
-            current: Some("pi".to_owned()),
+            running: vec!["pi".to_owned()],
             cancel: Arc::new(AtomicBool::new(false)),
             tick: 1,
         });
@@ -1359,6 +1472,79 @@ mod tests {
     }
 
     #[test]
+    fn every_running_target_spins_in_its_fixed_tab_and_the_header() {
+        let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
+        show(
+            &mut app,
+            RunResult::Apply {
+                kind: RunKind::Apply,
+                steps: vec![step_row("hostname")],
+                targets: vec![
+                    Slot::Pending("local".to_owned()),
+                    Slot::Pending("pi".to_owned()),
+                    Slot::Pending("mac".to_owned()),
+                    Slot::Done(ran("zz", Vec::new())),
+                ],
+                ok: None,
+                error: None,
+            },
+        );
+        app.running = Some(Running {
+            kind: RunKind::Apply,
+            running: vec!["pi".to_owned(), "local".to_owned()],
+            cancel: Arc::new(AtomicBool::new(false)),
+            tick: 1,
+        });
+        let buf = buffer(&app, 80, 8);
+        assert_eq!(
+            row_text(&buf, 0, 80).trim_end(),
+            " anvil · apply · run 1/1 · ⠙ pi, local · targets: all (3)              ✔ 1  ✘ 0"
+        );
+        assert_eq!(
+            render(&app, 46, 8)[0],
+            " anvil · apply · run 1/1 · ⠙ pi, lo… ✔ 1  ✘ 0"
+        );
+        let rows = results(&app, 8);
+        assert_eq!(rows[0], "[⠙ local]  ⠙ pi  · mac  ✔ zz");
+        assert_eq!(rows[1..4], ["▶ local", "  ⠙ running", "⠙ pi, local"]);
+        let (x, y) = find(&buf, 80, 8, "· mac");
+        assert_eq!(buf[(x, y)].fg, Color::DarkGray, "mac has not started");
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        let rows = results(&app, 8);
+        assert_eq!(rows[1..3], ["▶ mac", "⠙ pi, local"]);
+        let buf = buffer(&app, 80, 8);
+        let (x, y) = find(&buf, 80, 8, "▶ mac");
+        assert_eq!(buf[(x, y)].fg, Color::DarkGray, "a waiting slot is dim");
+    }
+
+    #[test]
+    fn a_slot_the_run_finished_without_reads_not_run() {
+        let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
+        show(
+            &mut app,
+            RunResult::Apply {
+                kind: RunKind::Apply,
+                steps: vec![step_row("hostname")],
+                targets: vec![
+                    Slot::Done(ran("local", Vec::new())),
+                    Slot::NotRun("pi".to_owned()),
+                ],
+                ok: Some(false),
+                error: None,
+            },
+        );
+        press(&mut app, KeyCode::Right);
+        let rows = results(&app, 8);
+        assert_eq!(rows[0], "✔ local  [✘ pi]");
+        assert_eq!(rows[1..3], ["▶ pi", "  ✘ not run"]);
+        let buf = buffer(&app, 80, 8);
+        let (x, y) = find(&buf, 80, 8, "✘ not run");
+        assert_eq!(buf[(x, y)].fg, Color::Red);
+        assert!(row_text(&buf, 2, 80).starts_with("│▶⊘ 1 hostname"));
+    }
+
+    #[test]
     fn marks_are_coloured_and_follow_the_tab() {
         let steps = vec![step_row("a"), step_row("b"), step_row("c")];
         let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
@@ -1371,7 +1557,7 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps,
-                targets: vec![pi, cancelled("mac")],
+                targets: done(vec![pi, cancelled("mac")]),
                 ok: Some(false),
                 error: None,
             },
@@ -1424,7 +1610,7 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps,
-                targets: vec![pi, cancelled("mac")],
+                targets: done(vec![pi, cancelled("mac")]),
                 ok: Some(false),
                 error: None,
             },
@@ -1478,7 +1664,10 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Run,
                 steps: vec![step_row("uptime …")],
-                targets: vec![ran("local", vec![step("uptime\nw", Some(0), "up\n", "")])],
+                targets: done(vec![ran(
+                    "local",
+                    vec![step("uptime\nw", Some(0), "up\n", "")],
+                )]),
                 ok: Some(true),
                 error: None,
             },
@@ -1525,7 +1714,7 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: vec![ran("local", vec![step("true", Some(0), "x", "")])],
+                targets: done(vec![ran("local", vec![step("true", Some(0), "x", "")])]),
                 ok: Some(true),
                 error: None,
             },
@@ -1587,7 +1776,7 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: vec![ran("local", Vec::new()), cancelled("pi")],
+                targets: done(vec![ran("local", Vec::new()), cancelled("pi")]),
                 ok: Some(false),
                 error: None,
             },
@@ -1741,7 +1930,7 @@ mod tests {
         let mut app = app();
         app.running = Some(Running {
             kind: RunKind::Update,
-            current: Some("checking for an update".to_owned()),
+            running: vec!["checking for an update".to_owned()],
             cancel: Arc::new(AtomicBool::new(false)),
             tick: 0,
         });
@@ -1808,7 +1997,7 @@ mod tests {
             // Esc cancels only while running; Space selects in the targets overlay.
             app.running = (code == KeyCode::Esc).then(|| Running {
                 kind: RunKind::Apply,
-                current: None,
+                running: Vec::new(),
                 cancel: Arc::new(AtomicBool::new(false)),
                 tick: 0,
             });
@@ -1975,7 +2164,7 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: vec![
+                targets: done(vec![
                     ran(
                         "local",
                         vec![step(multi_line, Some(0), "a\nb\n", "warn: \x1b[31mred\n")],
@@ -1988,7 +2177,7 @@ mod tests {
                         ],
                     ),
                     cancelled("mac"),
-                ],
+                ]),
                 ok: Some(false),
                 error: None,
             },
@@ -2047,7 +2236,7 @@ mod tests {
         show(
             &mut app,
             RunResult::Plan {
-                targets: vec![
+                targets: done(vec![
                     PlanReport::Planned {
                         target: "local".to_owned(),
                         steps: vec![
@@ -2081,7 +2270,7 @@ mod tests {
                         target: "mac".to_owned(),
                         ok: false,
                     },
-                ],
+                ]),
                 ok: Some(false),
                 error: None,
             },
@@ -2119,12 +2308,12 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: vec![crate::apply::TargetReport::Failed {
+                targets: done(vec![crate::apply::TargetReport::Failed {
                     target: "pi".to_owned(),
                     steps: Vec::new(),
                     error: "ssh: connect timed out\x07".to_owned(),
                     ok: false,
-                }],
+                }]),
                 ok: Some(false),
                 error: Some("apply panicked: boom".to_owned()),
             },
@@ -2149,12 +2338,12 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: vec![crate::apply::TargetReport::Failed {
+                targets: done(vec![crate::apply::TargetReport::Failed {
                     target: "pi".to_owned(),
                     steps: vec![step("sleep 40", None, "start\n", "warn\n")],
                     error: "timed out after 30 s".to_owned(),
                     ok: false,
-                }],
+                }]),
                 ok: Some(false),
                 error: None,
             },
@@ -2180,14 +2369,14 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: vec![ran("local", Vec::new())],
+                targets: done(vec![ran("local", Vec::new())]),
                 ok: None,
                 error: None,
             },
         );
         app.running = Some(Running {
             kind: RunKind::Apply,
-            current: Some("pi\x1b".to_owned()),
+            running: vec!["pi\x1b".to_owned()],
             cancel: Arc::new(AtomicBool::new(false)),
             tick: 11,
         });
@@ -2320,7 +2509,7 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: vec![ran("local", Vec::new()), ran("pi", Vec::new())],
+                targets: done(vec![ran("local", Vec::new()), ran("pi", Vec::new())]),
                 ok: Some(true),
                 error: None,
             },
@@ -2555,10 +2744,10 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: vec![
+                targets: done(vec![
                     ran("local", Vec::new()),
                     ran("pi", vec![step("false", Some(1), "", "")]),
-                ],
+                ]),
                 ok: Some(false),
                 error: Some("apply panicked: boom".to_owned()),
             },
@@ -2617,12 +2806,12 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: vec![
+                targets: done(vec![
                     ran("zz", Vec::new()),
                     ran("local checks", Vec::new()),
                     ran("pi", Vec::new()),
                     ran("abcdefghijklmno", Vec::new()),
-                ],
+                ]),
                 ok: Some(true),
                 error: None,
             },
@@ -2638,11 +2827,11 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: vec![
+                targets: done(vec![
                     ran("a", Vec::new()),
                     ran("b", Vec::new()),
                     ran("c", Vec::new()),
-                ],
+                ]),
                 ok: Some(true),
                 error: None,
             },
@@ -2702,7 +2891,8 @@ mod tests {
 
         let mut older = app();
         press(&mut older, KeyCode::Char('a'));
-        older.on_msg(Msg::TargetDone(ran("local", Vec::new())));
+        older.on_msg(Msg::Begin(vec!["local".to_owned()]));
+        older.on_msg(Msg::TargetDone(0, ran("local", Vec::new())));
         older.on_msg(Msg::Finished(Ok(())));
         press(&mut older, KeyCode::Char('d'));
         older.on_msg(Msg::DoctorTarget(probed("pi", None)));

@@ -17,23 +17,23 @@ use std::thread;
 use crate::inventory::Target;
 
 /// What [`fan_out`] reports, in this order: `Begin` once, then a `Start`
-/// and a `Done` per target, by its index in the targets. Each result is
-/// also reported once as `Ordered`, in the order of the targets, right
-/// after the `Done` that leaves every earlier target ended.
+/// and a `Done` per target; `Done` carries its index in the targets. Each
+/// result is also reported once as `Ordered`, in the order of the targets,
+/// right after the `Done` that leaves every earlier target ended.
 pub enum Event<'a, R> {
     #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the TUI's fixed slots read the targets")
+        not(any(test, feature = "tui")),
+        expect(dead_code, reason = "read by the TUI")
     )]
     Begin(&'a [Target]),
     #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the TUI's fixed slots read the index")
+        not(any(test, feature = "tui")),
+        expect(dead_code, reason = "read by the TUI")
     )]
-    Start(usize, &'a Target),
+    Start(&'a Target),
     #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the TUI's fixed slots read the index")
+        not(any(test, feature = "tui")),
+        expect(dead_code, reason = "read by the TUI")
     )]
     Done(usize, &'a R),
     Ordered(&'a R),
@@ -93,7 +93,7 @@ pub fn fan_out<R: Send>(
         drop(tx);
         for msg in rx {
             match msg {
-                Msg::Start(index) => on(Event::Start(index, &targets[index])),
+                Msg::Start(index) => on(Event::Start(&targets[index])),
                 Msg::Done(index, result) => {
                     on(Event::Done(index, results[index].insert(result)));
                     show_ordered(&results, &mut shown, on);
@@ -193,9 +193,9 @@ mod tests {
                     // in_order's tests cover these.
                     Event::Ordered(_) => return,
                     Event::Begin(targets) => format!("begin {}", targets.len()),
-                    Event::Start(index, target) => {
-                        assert_eq!(target.name, names[index]);
-                        format!("start {index}")
+                    Event::Start(target) => {
+                        let index = names.iter().position(|name| *name == target.name);
+                        format!("start {}", index.unwrap())
                     }
                     Event::Done(index, result) => format!("done {index} {result}"),
                 })

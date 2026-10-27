@@ -1722,7 +1722,7 @@ mod tests {
             &cancel,
             &mut |progress| match progress {
                 Progress::Begin(targets) => events.push(format!("begin {}", targets.len())),
-                Progress::Start(_, target) => events.push(format!("start {}", target.name)),
+                Progress::Start(target) => events.push(format!("start {}", target.name)),
                 Progress::Done(_, report) => events.push(format!("done {}", report.target())),
                 Progress::Ordered(_) => {}
             },
