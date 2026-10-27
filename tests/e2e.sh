@@ -272,6 +272,111 @@ else
   fail "apply --json with [packages]: exit $code"
 fi
 
+step "(l) [[files]] on arch (NOPASSWD): sudo tee writes, refuses a symlinked dest or a user-owned directory, an unmatched entry is skipped"
+# The probed distro: arch, or archarm on the arm64 image.
+REMOTE_DISTRO=$(docker exec "$NAME" sh -c '. /etc/os-release && printf %s "$ID"')
+FILES_DIR="$TMP/files"
+mkdir -p "$FILES_DIR"
+printf 'managed = "anvil-e2e"\n' >"$FILES_DIR/managed.conf"
+# sudo = false writes as key, so it still follows the link in key's home.
+cat >"$FILES_DIR/config.toml" <<CONF
+[[files]]
+src = "managed.conf"
+dest = "/etc/anvil-e2e-plain"
+mode = "0644"
+facts = { distro = "$REMOTE_DISTRO" }
+
+[[files]]
+src = "managed.conf"
+dest = "/etc/anvil-e2e-skip"
+mode = "0644"
+facts = { distro = "not-$REMOTE_DISTRO" }
+
+[[files]]
+src = "managed.conf"
+dest = "/home/key/anvil-e2e-link"
+mode = "0600"
+sudo = false
+CONF
+cat >"$FILES_DIR/link.toml" <<CONF
+[[files]]
+src = "managed.conf"
+dest = "/etc/anvil-e2e-link"
+mode = "0644"
+CONF
+# Root writes nothing under key's home, which key could swap for a link.
+cat >"$FILES_DIR/home.toml" <<CONF
+[[files]]
+src = "managed.conf"
+dest = "/home/key/anvil-e2e-root"
+mode = "0644"
+CONF
+docker exec "$NAME" sh -c 'printf old >/etc/anvil-e2e-real && chmod 600 /etc/anvil-e2e-real \
+  && ln -s anvil-e2e-real /etc/anvil-e2e-link'
+docker exec -u key "$NAME" sh -c 'printf old >/home/key/anvil-e2e-real && ln -s anvil-e2e-real /home/key/anvil-e2e-link'
+anvil --config "$FILES_DIR/config.toml" apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  $ file /etc/anvil-e2e-plain' "$TMP/out" \
+  && grep -qxF '  wrote /etc/anvil-e2e-plain' "$TMP/out" \
+  && grep -qxF '  $ skipped file /etc/anvil-e2e-skip: no match' "$TMP/out" \
+  && grep -qxF '  wrote /home/key/anvil-e2e-link' "$TMP/out" \
+  && docker exec "$NAME" cat /etc/anvil-e2e-plain | cmp -s - "$FILES_DIR/managed.conf" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-plain)" = '644 root:root' ] \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-skip \
+  && [ "$(docker exec "$NAME" readlink /home/key/anvil-e2e-link)" = anvil-e2e-real ] \
+  && docker exec "$NAME" cat /home/key/anvil-e2e-real | cmp -s - "$FILES_DIR/managed.conf" \
+  && ! grep -qF 'managed = ' "$TMP/out" "$TMP/err"; then
+  pass "sudo tee wrote a root-owned file, sudo = false wrote through a link, the unmatched entry was skipped"
+else
+  fail "apply with [[files]]: exit $code"
+fi
+anvil --config "$FILES_DIR/config.toml" apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-plain' "$TMP/out" \
+  && grep -qxF '  unchanged /home/key/anvil-e2e-link' "$TMP/out"; then
+  pass "a rerun prints unchanged"
+else
+  fail "rerun with [[files]]: exit $code"
+fi
+anvil --config "$FILES_DIR/link.toml" apply --target arch
+code=$?
+if [ "$code" -eq 1 ] && grep -qxF '  $ file /etc/anvil-e2e-link' "$TMP/out" \
+  && grep -qF 'files: /etc/anvil-e2e-link is a symlink; point dest at the real file' "$TMP/err" \
+  && [ "$(docker exec "$NAME" readlink /etc/anvil-e2e-link)" = anvil-e2e-real ] \
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-real)" = old ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-real)" = '600 root:root' ]; then
+  pass "sudo refused the symlinked dest, link and target untouched"
+else
+  fail "apply to a symlinked dest: exit $code"
+fi
+anvil --config "$FILES_DIR/home.toml" apply --target arch
+code=$?
+if [ "$code" -eq 1 ] && grep -qxF '  $ file /home/key/anvil-e2e-root' "$TMP/out" \
+  && grep -qF 'files: /home/key is not root-only; root will not write under it' "$TMP/err" \
+  && ! docker exec "$NAME" test -e /home/key/anvil-e2e-root; then
+  pass "sudo refused a dest under key's home and wrote nothing"
+else
+  fail "apply to a dest under a user-owned directory: exit $code"
+fi
+# 1 MiB, the src limit: bash `sh -s` over ssh carries the text twice (D13).
+yes 'anvil e2e: one line of a 1 MiB text file' | head -c 1048576 >"$FILES_DIR/big.txt"
+cat >"$FILES_DIR/big.toml" <<CONF
+[[files]]
+src = "big.txt"
+dest = "/etc/anvil-e2e-big"
+mode = "0644"
+CONF
+step "(l) a 1 MiB file on arch within 10 s"
+anvil --config "$FILES_DIR/big.toml" apply --target arch
+code=$?
+elapsed=$(($(date +%s) - started))
+if [ "$code" -eq 0 ] && [ "$elapsed" -le 10 ] && grep -qxF '  wrote /etc/anvil-e2e-big' "$TMP/out" \
+  && docker exec "$NAME" cat /etc/anvil-e2e-big | cmp -s - "$FILES_DIR/big.txt"; then
+  pass "1 MiB written in ${elapsed}s"
+else
+  fail "1 MiB file: exit $code after ${elapsed}s"
+fi
+
 step "(e) password user through a pty: prompted once by doctor, not again by apply"
 if command -v python3 >/dev/null 2>&1; then
   run_env PTY_PASSWORD="$PASSWORD" python3 tests/e2e/pty_login.py --prompts 1 --expect "$DISTRO_LINE" \
@@ -344,7 +449,7 @@ CONF
     done
     # shellcheck disable=SC2086 # the assignments hold no spaces
     run_env HOME="$SUDO_HOME" $sudo_env "$ANVIL" --ssh-config "$CFG" --inventory "$SUDO_INV" \
-      --config "$SUDO_CONFIG" "$@" </dev/null >"$TMP/out" 2>"$TMP/err"
+      --config "${SUDO_CONFIG_USED:-$SUDO_CONFIG}" "$@" </dev/null >"$TMP/out" 2>"$TMP/err"
   }
   # The password reaches the store only through the editor buffer.
   printf '%s\n' "$PASSWORD" >"$TMP/typed.good"
@@ -390,6 +495,49 @@ CONF
   else
     fail "apply --json with the sudo secret: exit $code"
   fi
+  # [[files]] over the password path: staged in /tmp, installed by sudo over a tty.
+  SUDO_FILES_DIR="$TMP/sudo-files"
+  mkdir -p "$SUDO_FILES_DIR"
+  FILE_CONTENT="anvil-e2e-content-$$"
+  printf '# managed by the anvil e2e\nkey = "%s"\n' "$FILE_CONTENT" >"$SUDO_FILES_DIR/e2e.conf"
+  cat >"$SUDO_FILES_DIR/config.toml" <<CONF
+[secrets]
+backend = "age"
+
+[secrets.age]
+path = "$TMP/age/secrets.age"
+identity = "$TMP/age-key.txt"
+
+[[files]]
+src = "e2e.conf"
+dest = "/etc/anvil-e2e.conf"
+mode = "0640"
+facts = { distro = "$REMOTE_DISTRO" }
+CONF
+  SUDO_CONFIG_USED="$SUDO_FILES_DIR/config.toml"
+  sudo_anvil apply --target archpw
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  $ file /etc/anvil-e2e.conf' "$TMP/out" \
+    && grep -qxF '  wrote /etc/anvil-e2e.conf' "$TMP/out" \
+    && docker exec "$NAME" cat /etc/anvil-e2e.conf | cmp -s - "$SUDO_FILES_DIR/e2e.conf" \
+    && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e.conf)" = '640 root:root' ] \
+    && ! grep -qF -e "$PASSWORD" -e "$FILE_CONTENT" "$TMP/out" "$TMP/err"; then
+    pass "the file went in through sudo with the password: bytes, mode 0640, root-owned"
+  else
+    fail "apply [[files]] with the sudo secret: exit $code"
+    docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e.conf
+  fi
+  sudo_anvil apply --json --target archpw
+  code=$?
+  left=$(docker exec "$NAME" sh -c 'ls -d /tmp/anvil-* 2>/dev/null')
+  if [ "$code" -eq 0 ] \
+    && grep -qF '{"run":"file /etc/anvil-e2e.conf","code":0,"stdout":"unchanged /etc/anvil-e2e.conf\n"' "$TMP/out" \
+    && [ -z "$left" ] && ! grep -qF -e "$PASSWORD" -e "$FILE_CONTENT" "$TMP/out" "$TMP/err"; then
+    pass "a rerun prints unchanged, no /tmp/anvil-* left on the target"
+  else
+    fail "rerun [[files]] with the sudo secret: exit $code, left: $left"
+  fi
+  SUDO_CONFIG_USED=$SUDO_CONFIG
   # One wrong attempt only, and last: pam_faillock locks pw after three.
   sudo_anvil apply --json --target archbad
   code=$?

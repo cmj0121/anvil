@@ -1,6 +1,7 @@
 # sshd on Arch for the anvil e2e: `key` signs in with the authorized key
 # passed as AUTHORIZED_KEY at start, `pw` only with the password `pw-secret`.
-# inetutils provides `hostname`, the config placeholder step `apply` runs.
+# inetutils provides `hostname`, the config placeholder step `apply` runs;
+# diffutils provides `cmp`, which a `[[files]]` step uses to print `unchanged`.
 # sudo: `key` has passwordless sudo (the `[packages]` step's `sudo -n`), `pw`
 # needs its password (typed by anvil from a secret).
 # BASE defaults to the official amd64 image; tests/e2e.sh passes the pinned
@@ -12,7 +13,7 @@ FROM ${BASE}
 # pacman's own seccomp sandbox has the same problem under emulation.
 RUN sed -i 's/^#\?DisableSandbox/DisableSandbox/' /etc/pacman.conf \
     && (grep -q '^DisableSandbox' /etc/pacman.conf || echo 'DisableSandbox' >> /etc/pacman.conf) \
-    && pacman -Sy --noconfirm --needed filesystem openssh inetutils sudo \
+    && pacman -Sy --noconfirm --needed filesystem openssh inetutils diffutils sudo \
     && pacman -Scc --noconfirm \
     && ssh-keygen -A \
     && useradd -m -s /bin/bash -p '*' key \

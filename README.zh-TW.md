@@ -14,6 +14,9 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
   接著執行 config 中的 step。它直接執行，不會詢問確認。`[packages.alias]` 可依管理器為套件指定名稱，
   因此 `fd` 在 apt 與 dnf 上會以 `fd-find` 安裝。`remove` 會移除已安裝的套件，`pin` 則在 pacman 與 dnf 上讓套件不被升級
   （brew、apt 與 apk 拒絕）。
+- **`[[files]]`** 把一份文字檔複製到每個 tag 與 fact 都符合的選定 target，排在套件 step 之後、`[[steps]]` 之前。
+  除非項目設定 `sudo = false`，否則透過 sudo 寫入；位元組相同時再次執行會印出 `unchanged`。
+  檔案位元組不會印出，輸出與 `--json` 都不會包含它們。
 - **`anvil plan`** 列出 apply 會在每個 target 上執行的 step，但一個都不執行；`--json` 的文件標記為
   `"executed": false`。
 - **`anvil run FILE`**（或以 `-` 讀 stdin）在每個 target 上逐一執行一份臨時的 POSIX sh 腳本，
@@ -44,11 +47,11 @@ make build                 # builds target/release/anvil
 
 ```sh
 anvil inventory            # add your hosts (opens $EDITOR, default nvim)
-anvil config               # edit the preferences, packages and steps
+anvil config               # edit the preferences, packages, files and steps
 anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secrets] says otherwise)
 anvil doctor               # local checks + every target's facts and reachability
 anvil plan                 # the steps apply would run on every target, running none
-anvil apply                # install packages and run the steps on every target
+anvil apply                # install packages, copy matching files and run the steps
 anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
 anvil tui                  # all of the above in one terminal UI
 ```
@@ -73,6 +76,19 @@ install = ["git"]
 pin = ["vim"]
 remove = ["nano"]
 upgrade = true
+```
+
+一份複製到每個帶有 tag `linode`、且 `distro` fact 為 `arch` 的選定 target 的檔案
+（[Files](docs/configuration.zh-TW.md#files)）。`mode` 必填且必須加引號。位元組不會印出
+（[File steps](docs/cli.zh-TW.md#file-steps)）：
+
+```toml
+[[files]]
+src = "files/sshd_config"      # beside the config file
+dest = "/etc/ssh/sshd_config"  # absolute path on the target
+mode = "0644"
+tags = ["linode"]              # every listed tag; omit to skip the tag check
+facts = { distro = "arch" }    # each value equals that fact; omit to skip it
 ```
 
 一個腳本來自 plugin 的 step（[Plugin steps](docs/cli.zh-TW.md#plugin-steps)）。anvil 只執行 config 指定的檔案，
