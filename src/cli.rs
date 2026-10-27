@@ -49,6 +49,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH", hide = true)]
     pub ssh_program: Option<PathBuf>,
 
+    /// Test aid, debug builds only: the base URL that replaces the GitHub
+    /// API and download hosts for `update`; plain http is allowed.
+    #[cfg(debug_assertions)]
+    #[arg(long, global = true, value_name = "BASE", hide = true)]
+    pub release_url: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -104,6 +110,12 @@ pub enum Command {
     /// Run every command and browse the results in a terminal UI
     #[cfg(feature = "tui")]
     Tui,
+    /// Check for a newer anvil release
+    Update {
+        /// Only compare this version with the latest release
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 impl Command {
@@ -118,6 +130,7 @@ impl Command {
             Command::Secret { .. } => "secret",
             #[cfg(feature = "tui")]
             Command::Tui => "tui",
+            Command::Update { .. } => "update",
         }
     }
 }
@@ -221,6 +234,10 @@ pub fn run(cli: &Cli) -> Result<(), Failure> {
         Command::Tui if cli.json => Err(Failure::usage("anvil tui: --json is not available")),
         #[cfg(feature = "tui")]
         Command::Tui => crate::tui::run(opts),
+        Command::Update { check: true } => crate::update::check(cli, &opts),
+        Command::Update { check: false } => Err(Failure::usage(
+            "anvil update: only --check is available yet",
+        )),
     }
 }
 
@@ -278,6 +295,14 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+        assert!(matches!(
+            parse(&["update"]).command,
+            Command::Update { check: false }
+        ));
+        assert!(matches!(
+            parse(&["update", "--check", "--json"]).command,
+            Command::Update { check: true }
+        ));
         match parse(&["secret", "--migrate", "--to", "age"]).command {
             Command::Secret { name, migrate, to } => {
                 assert_eq!(name, None);
@@ -337,6 +362,8 @@ mod tests {
             ["secret", "--migrate", "--to", "vault"].as_slice(),
             ["run"].as_slice(),
             ["run", "--timeout", "soon", "x.sh"].as_slice(),
+            ["update", "--check", "now"].as_slice(),
+            ["update", "--force"].as_slice(),
         ] {
             assert!(
                 Cli::try_parse_from(std::iter::once("anvil").chain(args.iter().copied())).is_err(),

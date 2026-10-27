@@ -315,8 +315,9 @@ fn script_of(stdout: Vec<u8>) -> Result<String, String> {
     Ok(script)
 }
 
-/// The last non-empty line of a plugin's stderr, as an error shows it.
-fn last_line(stderr: &[u8]) -> Option<String> {
+/// The last non-empty line of a child's stderr, cut and escaped, as an
+/// error shows it.
+pub(crate) fn last_line(stderr: &[u8]) -> Option<String> {
     String::from_utf8_lossy(stderr)
         .lines()
         .rev()

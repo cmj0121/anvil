@@ -309,7 +309,7 @@ fn migrate_stores(
     Ok(migrated)
 }
 
-fn warn_target(cli: &Cli) {
+pub fn warn_target(cli: &Cli) {
     if !cli.target.is_empty() {
         log::warn!("--target is ignored by `{}`", cli.command.name());
     }

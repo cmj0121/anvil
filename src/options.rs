@@ -11,6 +11,7 @@ use crate::paths;
 use crate::secret::{self, Store};
 use crate::ssh::{self, Ssh, SshSettings};
 use crate::transport::{Local, Transport, TransportError};
+use crate::update::Source;
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -33,6 +34,8 @@ pub struct Options {
     /// Replaces `$HOME` for ssh's control directory; set only by tests.
     #[cfg(debug_assertions)]
     pub ssh_home: Option<PathBuf>,
+    #[cfg(debug_assertions)]
+    pub release_url: Option<String>,
 }
 
 #[cfg(debug_assertions)]
@@ -59,6 +62,8 @@ impl Options {
             ssh_program: cli.ssh_program.clone(),
             #[cfg(debug_assertions)]
             ssh_home: None,
+            #[cfg(debug_assertions)]
+            release_url: cli.release_url.clone(),
         }
     }
 
@@ -80,6 +85,16 @@ impl Options {
             return program.clone();
         }
         PathBuf::from("ssh")
+    }
+
+    /// Where `update` looks for releases: GitHub, or the debug-only
+    /// `--release-url`.
+    pub fn release_source(&self) -> Source {
+        #[cfg(debug_assertions)]
+        if let Some(base) = &self.release_url {
+            return Source::at(base);
+        }
+        Source::github()
     }
 
     /// How ssh runs: [`Options::ssh_program`], a password prompt only when
@@ -211,6 +226,16 @@ mod tests {
         assert_eq!(
             parse(&["doctor", "--ssh-program", "/x/fake-ssh"]).ssh_program(),
             PathBuf::from("/x/fake-ssh")
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn hidden_release_url_replaces_github() {
+        assert_eq!(parse(&["update"]).release_source(), Source::github());
+        assert_eq!(
+            parse(&["update", "--release-url", "http://127.0.0.1:9"]).release_source(),
+            Source::at("http://127.0.0.1:9")
         );
     }
 }

@@ -1137,6 +1137,8 @@ pub mod tests {
             ssh_program: None,
             #[cfg(debug_assertions)]
             ssh_home: None,
+            #[cfg(debug_assertions)]
+            release_url: None,
         }
     }
 
