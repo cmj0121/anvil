@@ -97,6 +97,7 @@ Host and config text is escaped as in the CLI, and a secret value is never drawn
 | `[` / `]`    | previous / next result                                        | —                                         |
 | `←` / `→`    | previous / next tab; on apply, at the cursor's step           | —                                         |
 | `r`          | reload the inventory and the config                           | —                                         |
+| `u`          | check for an update, confirm, then replace anvil              | `anvil update`                            |
 | `?`          | help                                                          | `--help`                                  |
 | `q` / Ctrl-C | quit; while running, cancel and quit once the run ends        | —                                         |
 
@@ -117,11 +118,20 @@ script for the next `x`. The run is `anvil run`'s, with the default 300 s timeou
 and no sudo password typed, so root work needs `sudo -n` or a NOPASSWD target. The last script is kept in memory for
 the session only; scripts to keep belong in `[[steps]]`.
 
+`u` checks the latest release in the background, as `anvil update --check` does. When it is newer, `u` asks
+`replace anvil with VERSION?`: `y` or `Enter` downloads, verifies and replaces the binary as `anvil update` does, and
+`n` or `Esc` changes nothing. If another overlay is open when the check returns, the question waits: the status bar
+says `anvil VERSION is available; press u to update`, and the next `u` asks it. Up to date, ahead of the latest
+release, or any failure (`anvil update: …`) is a notice. curl, tar and the new binary's `--version` run with their
+output captured, so nothing is drawn over the screen; their errors appear only in the notice. After one update the
+running TUI is still the old binary: the status bar keeps `updated anvil to VERSION; restart anvil to use it`, `u` is
+greyed in the help and only shows that notice again, until anvil is restarted.
+
 ## Rules
 
-- **One run at a time.** While doctor, apply, plan or run runs, `d`, `a`, `p`, `x`, `i`, `c`, `s`, `m` and `o` are
-  refused with `busy: <run> is running (Esc cancels)` on the status bar. A run keeps the selection and paths it started
-  with.
+- **One run at a time.** While doctor, apply, plan, run or an update runs, `d`, `a`, `p`, `x`, `u`, `i`, `c`, `s`, `m`
+  and `o` are refused with `busy: <run> is running (Esc cancels)` on the status bar; for doctor and an update, which
+  Esc cannot cancel, it is `busy: <run> is running`. A run keeps the selection and paths it started with.
 - **Esc cancels between steps.** apply checks before each target and each step: the running step finishes, and the rest
   of that target and every later target end as `⊘ cancelled`. A run (`x`) cancels the same way: its script is its one
   step, so the running script finishes first and every later target ends as `⊘ cancelled`. plan checks before each

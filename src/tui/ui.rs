@@ -1,7 +1,7 @@
 //! Draws [`App`]: the header, Steps on the left, Results on the right, an
 //! optional log pane, the status bar and the overlays (help, the secret
-//! NAME prompt, the migrate choice, the options, the targets, the run
-//! confirmation). Host and
+//! NAME prompt, the migrate choice, the options, the targets, the run and
+//! update confirmations). Host and
 //! config text is escaped before it is drawn.
 
 use ratatui::Frame;
@@ -10,7 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use super::app::{self, App, BACKENDS, OPTION_FLAGS, Overlay, Pane, RunResult, Running};
+use super::app::{self, App, BACKENDS, OPTION_FLAGS, Overlay, Pane, RunKind, RunResult, Running};
 use crate::doctor::{self, SecretStatus};
 use crate::logger::escape_controls;
 use crate::plan::{self, PlanReport};
@@ -74,6 +74,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("l", "log"),
             ("r", "reload"),
+            ("u", "update"),
             ("?", "help"),
             ("q/^C", "quit"),
         ],
@@ -100,12 +101,13 @@ pub fn draw(app: &App, f: &mut Frame) {
     f.render_widget(Paragraph::new(status_line(app, status.width)), status);
     match &app.overlay {
         None => {}
-        Some(Overlay::Help) => draw_help(f),
+        Some(Overlay::Help) => draw_help(app, f),
         Some(Overlay::Input { text, invalid }) => draw_input(f, text, *invalid),
         Some(Overlay::Migrate { choice }) => draw_migrate(f, *choice),
         Some(Overlay::Options { field, texts }) => draw_options(f, *field, texts),
         Some(Overlay::Targets { cursor }) => draw_targets(app, f, *cursor),
         Some(Overlay::Confirm { targets }) => draw_confirm(f, targets),
+        Some(Overlay::ConfirmUpdate { version }) => draw_confirm_update(f, version),
     }
 }
 
@@ -192,7 +194,8 @@ fn header_line(app: &App, width: u16) -> Line<'static> {
     spread(spans, right, width)
 }
 
-/// The notice, else the keys that fit; `-v N · <format>` on the right.
+/// The notice, else the restart notice once `u` updated anvil, else an
+/// update's spinner, else the keys that fit; `-v N · <format>` on the right.
 fn status_line(app: &App, width: u16) -> Line<'static> {
     let format = app
         .edit_format
@@ -201,9 +204,17 @@ fn status_line(app: &App, width: u16) -> Line<'static> {
         format!("-v {} · {format} ", app.opts.verbose),
         secondary(),
     )];
-    let left = match &app.notice {
-        Some(notice) => Span::styled(format!(" {}", text(notice)), Color::Yellow),
-        None => {
+    let update = app.running.as_ref().filter(|r| r.kind == RunKind::Update);
+    let left = match (&app.notice, &app.updated, update) {
+        (Some(notice), ..) => Span::styled(format!(" {}", text(notice)), Color::Yellow),
+        (None, Some(version), _) => Span::styled(
+            format!(" {}", text(&app::restart_notice(version))),
+            Color::Yellow,
+        ),
+        (None, None, Some(running)) => {
+            Span::styled(format!(" {}", spinner_text(running)), Color::Cyan)
+        }
+        (None, None, None) => {
             let room = usize::from(width).saturating_sub(spans_width(&right) + 1);
             let mut keys = String::new();
             for key in STATUS_KEYS {
@@ -469,9 +480,9 @@ fn running_line(app: &App) -> Option<Line<'static>> {
 }
 
 /// The run going, when it is the shown result: the running result is the
-/// newest one. An edit has no spinner.
+/// newest one. An edit has no spinner, and an update has no result.
 fn shown_running(app: &App) -> Option<&Running> {
-    let running = app.running.as_ref()?;
+    let running = app.running.as_ref().filter(|r| r.kind != RunKind::Update)?;
     if app.shown != Some(app.results.len() - 1)
         || matches!(app.shown_result(), Some(RunResult::Edit { .. }))
     {
@@ -866,15 +877,22 @@ fn log_level_style(level: log::Level) -> Style {
     }
 }
 
-/// [`HELP`], a group per row: its name, then each key and what it does.
-fn draw_help(f: &mut Frame) {
+/// [`HELP`], a group per row: its name, then each key and what it does;
+/// `u` greyed once it has updated anvil.
+fn draw_help(app: &App, f: &mut Frame) {
     let lines: Vec<Line> = HELP
         .iter()
         .map(|(group, keys)| {
             let mut spans = vec![Span::styled(format!(" {group:<8}"), heading())];
             for (key, what) in *keys {
-                spans.push(Span::styled(format!(" {key}"), cursor_style()));
-                spans.push(Span::raw(format!(" {what} ")));
+                let off = *key == "u" && app.updated.is_some();
+                let (key_style, what_style) = if off {
+                    (secondary(), secondary())
+                } else {
+                    (cursor_style(), Style::new())
+                };
+                spans.push(Span::styled(format!(" {key}"), key_style));
+                spans.push(Span::styled(format!(" {what} "), what_style));
             }
             Line::from(spans)
         })
@@ -989,6 +1007,15 @@ fn draw_confirm(f: &mut Frame, targets: &[String]) {
         Line::from(" y/Enter run · n/Esc cancel").style(secondary()),
     ];
     popup(f, "Run script", fitted_width(f, &lines), lines);
+}
+
+/// `u`'s question, the version escaped; as wide as it is, up to the screen.
+fn draw_confirm_update(f: &mut Frame, version: &str) {
+    let lines = vec![
+        Line::from(format!(" replace anvil with {}?", text(version))),
+        Line::from(" y/Enter yes · n/Esc no").style(secondary()),
+    ];
+    popup(f, "Update", fitted_width(f, &lines), lines);
 }
 
 /// A popup as wide as its widest line and its border, up to the screen.
@@ -1621,13 +1648,69 @@ mod tests {
                 "│    │ History  [ ] run                                                   │    │",
                 "│    │ Edit     i inventory  c config  s secret  m migrate                │    │",
                 "│    │ Options  f format  o paths  +/- log                                │    │",
-                "│    │ App      l log  r reload  ? help  q/^C quit                        │    │",
+                "│    │ App      l log  r reload  u update  ? help  q/^C quit              │    │",
                 "│    └────────────────────────────────────────────────────────────────────┘    │",
             ]
         );
         let buf = buffer(&app, 80, 24);
         assert_eq!(buf[(7, 9)].fg, Color::Cyan, "the group name");
         assert_eq!(buf[(16, 9)].fg, Color::LightBlue, "a key");
+        let (x, y) = find(&buf, 80, 24, "u update");
+        assert_eq!(buf[(x, y)].fg, Color::LightBlue);
+        assert_eq!(buf[(x + 2, y)].fg, Color::Reset);
+        // Once updated, `u` is listed as unavailable.
+        app.updated = Some("0.2.0".to_owned());
+        let buf = buffer(&app, 80, 24);
+        assert_eq!(buf[(x, y)].fg, Color::DarkGray);
+        assert_eq!(buf[(x + 2, y)].fg, Color::DarkGray);
+        assert_eq!(buf[(16, 9)].fg, Color::LightBlue, "the other keys stay");
+    }
+
+    #[test]
+    fn the_update_confirmation_asks_with_the_escaped_version() {
+        let mut app = app();
+        app.overlay = Some(Overlay::ConfirmUpdate {
+            version: "0.2.0\x1b".to_owned(),
+        });
+        assert_eq!(
+            render(&app, 80, 10)[3..7],
+            [
+                "│                       ┌Update─────────────────────────┐                      │",
+                "│                       │ replace anvil with 0.2.0\\x1b? │                      │",
+                "│                       │ y/Enter yes · n/Esc no        │                      │",
+                "│                       └───────────────────────────────┘                      │",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_restart_notice_stays_and_an_update_spins_in_the_status_bar() {
+        let mut app = app();
+        app.running = Some(Running {
+            kind: RunKind::Update,
+            current: Some("checking for an update".to_owned()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            tick: 0,
+        });
+        let screen = render(&app, 80, 6);
+        assert_eq!(
+            screen[5],
+            " ⠋ checking for an update                                        -v 0 · default"
+        );
+        assert!(
+            screen[0].starts_with(" anvil · targets: all (3)"),
+            "{}",
+            screen[0]
+        );
+        app.running = None;
+        app.updated = Some("0.2.0".to_owned());
+        assert_eq!(
+            render(&app, 80, 6)[5],
+            " updated anvil to 0.2.0; restart anvil to use it                 -v 0 · default"
+        );
+        // Another notice shows first; the restart notice comes back after it.
+        app.notice = Some("busy: apply is running (Esc cancels)".to_owned());
+        assert!(render(&app, 80, 6)[5].starts_with(" busy: apply"));
     }
 
     /// The help key that stands for `code`.

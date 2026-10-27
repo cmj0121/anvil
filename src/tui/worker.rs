@@ -1,6 +1,7 @@
 //! Runs doctor, apply, plan or run on a background thread and reports to the main
 //! loop as [`Msg`]s: `Steps` (apply and run), then `Start` and a per-target report as
-//! each target goes, then `DoctorDone` (doctor only) and `Finished`. A panic
+//! each target goes, then `DoctorDone` (doctor only) and `Finished`. An
+//! update's check or install sends only `UpdateChecked` or `Updated`. A panic
 //! in the run becomes `Msg::Panicked`, caught by joining the run's thread.
 
 use std::any::Any;
@@ -14,7 +15,7 @@ use std::time::Duration;
 use super::app::{self, Job, Msg};
 use crate::cli::Failure;
 use crate::options::Options;
-use crate::{apply, doctor, plan, run};
+use crate::{apply, doctor, plan, run, update};
 
 /// A run in progress; [`Worker::join`] waits for it, which is quick once
 /// `Finished` or `Panicked` has arrived.
@@ -39,6 +40,18 @@ pub fn spawn(job: Job, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) 
         Job::Apply => spawn_job(tx, move |tx| run_apply(&opts, &cancel, tx)),
         Job::Plan => spawn_job(tx, move |tx| run_plan(&opts, &cancel, tx)),
         Job::Run(script) => spawn_job(tx, move |tx| run_script(&opts, script, &cancel, tx)),
+        // curl, tar and the smoke run capture their output and read no
+        // stdin, so nothing reaches the screen.
+        Job::UpdateCheck => spawn_task(tx, move |_| {
+            Msg::UpdateChecked(update::latest(&opts).map_err(|failure| failure.message))
+        }),
+        Job::Update(version) => spawn_task(tx, move |_| {
+            Msg::Updated(
+                update::update_to(&opts, &version)
+                    .map(|updated| updated.to)
+                    .map_err(|failure| failure.message),
+            )
+        }),
     }
 }
 
@@ -58,13 +71,19 @@ pub(super) fn spawn_job(
     tx: Sender<Msg>,
     job: impl FnOnce(&Sender<Msg>) -> Result<(), Failure> + Send + 'static,
 ) -> Worker {
+    spawn_task(tx, move |tx| {
+        Msg::Finished(job(tx).map_err(|failure| failure.message))
+    })
+}
+
+/// Runs `task` as [`spawn_job`] does, sending the message it returns.
+fn spawn_task(tx: Sender<Msg>, task: impl FnOnce(&Sender<Msg>) -> Msg + Send + 'static) -> Worker {
     Worker(thread::spawn(move || {
         let run = {
             let tx = tx.clone();
             thread::spawn(move || {
                 JOB.with(|job| job.set(true));
-                let result = job(&tx).map_err(|failure| failure.message);
-                let _ = tx.send(Msg::Finished(result));
+                let _ = tx.send(task(&tx));
             })
         };
         if let Err(payload) = run.join() {
@@ -249,7 +268,11 @@ mod tests {
                 Msg::DoctorDone(_) => "doctor done".to_owned(),
                 Msg::Finished(result) => format!("finished {result:?}"),
                 Msg::Panicked(message) => format!("panicked {message}"),
-                Msg::Log(_) | Msg::Interrupted | Msg::Suspend(_) => "other".to_owned(),
+                Msg::Log(_)
+                | Msg::Interrupted
+                | Msg::Suspend(_)
+                | Msg::UpdateChecked(_)
+                | Msg::Updated(_) => "other".to_owned(),
             })
             .collect()
     }
@@ -498,6 +521,51 @@ mod tests {
         assert!(matches!(&msgs[1], Msg::DoctorTarget(t) if t.target == "local" && t.connectable));
         assert!(matches!(&msgs[2], Msg::DoctorDone(r) if r.targets.len() == 1));
         assert!(matches!(&msgs[3], Msg::Finished(Ok(()))));
+    }
+
+    /// The one message an update job sends, then the worker joined: nothing
+    /// follows it.
+    fn only_msg(worker: Worker, rx: &Receiver<Msg>) -> Msg {
+        let msg = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the worker went quiet");
+        worker.join();
+        assert!(rx.try_recv().is_err(), "a message after the update's");
+        msg
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_update_check_that_fails_sends_only_its_error() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut opts = opts();
+        opts.release_url = Some(format!("http://127.0.0.1:{port}"));
+        let (tx, rx) = mpsc::channel();
+        let worker = spawn(Job::UpdateCheck, opts, Arc::new(AtomicBool::new(false)), tx);
+        match only_msg(worker, &rx) {
+            Msg::UpdateChecked(Err(err)) => assert!(err.starts_with("anvil update: "), "{err}"),
+            _ => panic!("expected a failed check"),
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_update_with_an_unreadable_key_sends_only_its_error() {
+        let mut opts = opts();
+        opts.release_keys = vec![temp_dir("tui-worker-update").join("missing.pub")];
+        let (tx, rx) = mpsc::channel();
+        let job = Job::Update("0.2.0".to_owned());
+        let worker = spawn(job, opts, Arc::new(AtomicBool::new(false)), tx);
+        match only_msg(worker, &rx) {
+            Msg::Updated(Err(err)) => {
+                assert!(err.starts_with("anvil update: --release-key: "), "{err}");
+            }
+            _ => panic!("expected a failed update"),
+        }
     }
 
     #[test]

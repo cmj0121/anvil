@@ -149,10 +149,7 @@ pub fn check(cli: &Cli, opts: &Options) -> Result<(), Failure> {
 /// any failure leaves the binary as it was.
 pub fn update(cli: &Cli, opts: &Options) -> Result<(), Failure> {
     warn_target(cli);
-    let keys = opts.trusted_keys()?;
-    if keys.is_empty() {
-        return Err(fail(keys::NO_RELEASE_KEY));
-    }
+    let keys = trusted_keys(opts)?;
     let source = opts.release_source();
     let latest = resolve(&source)?;
     if latest.check.status != Status::Available {
@@ -163,23 +160,67 @@ pub fn update(cli: &Cli, opts: &Options) -> Result<(), Failure> {
         }
         return Ok(());
     }
-    let exe = std::env::current_exe()
-        .map_err(|err| fail(format_args!("cannot find this binary: {err}")))?;
-    let installed = install::preflight(&exe).map_err(fail)?;
-    installed.sweep();
-    let prev = install_latest(&source, &latest, &installed, keys.as_slice()).map_err(fail)?;
-    let updated = Updated {
-        from: latest.check.current,
-        to: latest.check.latest,
-        path: installed.exe.display().to_string(),
-        prev: prev.display().to_string(),
-    };
+    let updated = replace(&source, latest, &keys)?;
     if cli.json {
         print_json(&updated, Failure::failed)
     } else {
         print!("{updated}");
         Ok(())
     }
+}
+
+/// The TUI's `u`: this version against the latest release, printing
+/// nothing.
+#[cfg_attr(
+    not(any(test, feature = "tui")),
+    expect(dead_code, reason = "called by the TUI front end")
+)]
+pub fn latest(opts: &Options) -> Result<Check, Failure> {
+    resolve(&opts.release_source()).map(|latest| latest.check)
+}
+
+/// The TUI's confirmed `u`: [`update`] to `version`, printing nothing.
+/// Refused when the latest release is no longer `version`.
+#[cfg_attr(
+    not(any(test, feature = "tui")),
+    expect(dead_code, reason = "called by the TUI front end")
+)]
+pub fn update_to(opts: &Options, version: &str) -> Result<Updated, Failure> {
+    let keys = trusted_keys(opts)?;
+    let source = opts.release_source();
+    let latest = resolve(&source)?;
+    if latest.check.status != Status::Available || latest.check.latest != version {
+        return Err(fail(format_args!(
+            "the latest release is now {}, not {version}; check again",
+            latest.check.latest
+        )));
+    }
+    replace(&source, latest, &keys)
+}
+
+/// The keys a release must verify with; none compiled in is refused.
+fn trusted_keys(opts: &Options) -> Result<keys::TrustedKeys, Failure> {
+    let keys = opts.trusted_keys()?;
+    if keys.is_empty() {
+        return Err(fail(keys::NO_RELEASE_KEY));
+    }
+    Ok(keys)
+}
+
+/// Replaces this binary with `latest`, an available update, once it
+/// verifies with `keys`.
+fn replace(source: &Source, latest: Latest, keys: &keys::TrustedKeys) -> Result<Updated, Failure> {
+    let exe = std::env::current_exe()
+        .map_err(|err| fail(format_args!("cannot find this binary: {err}")))?;
+    let installed = install::preflight(&exe).map_err(fail)?;
+    installed.sweep();
+    let prev = install_latest(source, &latest, &installed, keys.as_slice()).map_err(fail)?;
+    Ok(Updated {
+        from: latest.check.current,
+        to: latest.check.latest,
+        path: installed.exe.display().to_string(),
+        prev: prev.display().to_string(),
+    })
 }
 
 /// Downloads `latest` into a private stage, verifies it with `keys`,
@@ -266,6 +307,93 @@ mod tests {
             assert_eq!(serde_json::to_string(&status).unwrap(), word);
             assert_eq!(status.verdict(), verdict);
         }
+    }
+
+    /// Serves `body(base)` as the latest release to one request, curl's;
+    /// the base URL.
+    #[cfg(debug_assertions)]
+    fn serve_latest(body: impl FnOnce(&str) -> String) -> String {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let body = body(&base);
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            let mut stream = &stream;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        base
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn update_to_refuses_once_the_latest_release_moved_and_touches_nothing() {
+        if [
+            "http_proxy",
+            "https_proxy",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "ALL_PROXY",
+        ]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some())
+        {
+            eprintln!("skip: a proxy is set");
+            return;
+        }
+        let triple = release::target().unwrap();
+        let tarball = format!("anvil-v9.9.9-{triple}.tar.gz");
+        let names = [
+            format!("{tarball}.sha256"),
+            format!("{tarball}.minisig"),
+            tarball,
+        ];
+        let base = serve_latest(|base| {
+            let assets: Vec<_> = names
+                .iter()
+                .map(|name| {
+                    serde_json::json!({
+                        "name": name,
+                        "size": 1234,
+                        "browser_download_url": format!("{base}/releases/download/v9.9.9/{name}"),
+                    })
+                })
+                .collect();
+            serde_json::json!({ "tag_name": "v9.9.9", "prerelease": false, "assets": assets })
+                .to_string()
+        });
+        let key = crate::test_util::fixture("update/a.pub");
+        let cli = <Cli as clap::Parser>::parse_from([
+            "anvil",
+            "update",
+            "--release-url",
+            &base,
+            "--release-key",
+            key.to_str().unwrap(),
+        ]);
+        let exe = std::env::current_exe().unwrap();
+        let before = std::fs::metadata(&exe).unwrap();
+        let err = update_to(&Options::from_cli(&cli), "9.9.8").unwrap_err();
+        assert_eq!(
+            err.message,
+            "anvil update: the latest release is now 9.9.9, not 9.9.8; check again"
+        );
+        let after = std::fs::metadata(&exe).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+        let mut prev = exe.into_os_string();
+        prev.push(".prev");
+        assert!(!std::path::Path::new(&prev).exists());
     }
 
     #[test]

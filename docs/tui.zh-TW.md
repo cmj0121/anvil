@@ -94,6 +94,7 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
 | `[` / `]`    | 上一個／下一個結果                                      | —                                         |
 | `←` / `→`    | 上一個／下一個分頁；apply 時位於游標所在的 step         | —                                         |
 | `r`          | 重新載入 inventory 與 config                            | —                                         |
+| `u`          | 檢查更新，確認後取代 anvil                              | `anvil update`                            |
 | `?`          | 說明                                                    | `--help`                                  |
 | `q` / Ctrl-C | 結束；執行中時，取消並在執行結束後結束                  | —                                         |
 
@@ -113,10 +114,19 @@ Enter 套用三個路徑（開頭的 `~/` 或單獨的 `~` 為 `$HOME`）並重�
 因此需要 root 的工作要用 `sudo -n` 或 NOPASSWD 的 target。上一份腳本只保留在本次工作階段的記憶體中；
 要保留的腳本請放進 `[[steps]]`。
 
+`u` 在背景檢查最新的 release，如同 `anvil update --check`。若較新，`u` 會詢問 `replace anvil with VERSION?`：
+`y` 或 `Enter` 會如同 `anvil update` 一樣下載、驗證並取代執行檔，`n` 或 `Esc` 則不做任何變更。
+若檢查結果回來時另一個 overlay 正開著，問題會等待：狀態列顯示 `anvil VERSION is available; press u to update`，
+下一次按 `u` 才會詢問。已是最新、比最新 release 更新，或任何失敗（`anvil update: …`）都以提示顯示。
+curl、tar 與新執行檔的 `--version` 執行時輸出都會被擷取，不會畫到畫面上；它們的錯誤只出現在提示中。
+更新一次之後，執行中的 TUI 仍是舊的執行檔：狀態列保留 `updated anvil to VERSION; restart anvil to use it`，
+`u` 在說明中變灰，且只會再次顯示該提示，直到重新啟動 anvil。
+
 ## 規則
 
-- **一次一個執行。** doctor、apply、plan 或 run 執行期間，`d`、`a`、`p`、`x`、`i`、`c`、`s`、`m` 與 `o` 會被拒絕，
-  狀態列顯示 `busy: <run> is running (Esc cancels)`。執行會保留它開始時的選擇與路徑。
+- **一次一個執行。** doctor、apply、plan、run 或更新執行期間，`d`、`a`、`p`、`x`、`u`、`i`、`c`、`s`、`m` 與 `o`
+  會被拒絕，狀態列顯示 `busy: <run> is running (Esc cancels)`；doctor 與更新無法以 Esc 取消，因此顯示
+  `busy: <run> is running`。執行會保留它開始時的選擇與路徑。
 - **Esc 在 step 之間取消。** apply 在每個 target 與每個 step（步驟）之前檢查：正在執行的 step 會跑完，
   該 target 剩下的部分以及之後的每個 target 都以 `⊘ cancelled` 結束。
   run（`x`）以相同方式取消：它的腳本是唯一的 step，因此正在執行的腳本會先跑完，之後的每個 target 都以 `⊘ cancelled` 結束。
