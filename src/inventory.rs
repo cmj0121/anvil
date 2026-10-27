@@ -228,7 +228,7 @@ fn all(s: &str, ok: impl Fn(char) -> bool) -> bool {
 }
 
 /// `[A-Za-z0-9_-]+`: host names and tags.
-fn is_word(s: &str) -> bool {
+pub(crate) fn is_word(s: &str) -> bool {
     all(s, |c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 

@@ -681,6 +681,7 @@ mod tests {
                 ..Default::default()
             },
             steps: vec![],
+            ..Config::default()
         };
         let store = Unopenable::new(|| SecretError::Locked);
         let failure = run(&cli, &Options::from_cli(&cli), &config, &store).unwrap_err();
@@ -712,6 +713,7 @@ mod tests {
             plugins: Default::default(),
             anvil: Default::default(),
             steps: vec![],
+            ..Config::default()
         };
         let mut events = Vec::new();
         let report = check(
@@ -926,6 +928,7 @@ mod tests {
                 ..Default::default()
             },
             steps: vec![],
+            ..Config::default()
         };
         let local = Target {
             name: "local".to_owned(),
@@ -991,6 +994,7 @@ mod tests {
             anvil: Default::default(),
             plugins: Default::default(),
             steps: vec![],
+            ..Config::default()
         };
         let store = Memory::with(&[("LOCAL_SUDO", b"hunter2-secret")]);
         let report = check(&Options::from_cli(&cli), &config, &store, &mut |_| {}).unwrap();

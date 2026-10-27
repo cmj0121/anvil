@@ -1,0 +1,3 @@
+files:
+  - src: motd
+    dest: /etc/motd

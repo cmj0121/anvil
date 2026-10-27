@@ -10,7 +10,8 @@ pub const PROBE: &str = include_str!("probe.sh");
 
 const END_MARKER: &str = "anvil-probe-end=1";
 const MAX_OUTPUT: usize = 64 * 1024;
-const MAX_VALUE: usize = 256;
+/// Longest fact value, in bytes.
+pub(crate) const MAX_VALUE: usize = 256;
 /// The keys the probe prints, in its order.
 pub const KEYS: &[&str] = &[
     "hostname",
