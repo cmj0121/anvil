@@ -48,6 +48,13 @@ timeout = 300              # seconds the package step may run, 1..=3600; default
 apt = "fd-find"
 dnf = "fd-find"
 
+[[files]]                  # optional; after packages, before [[steps]]; see Files
+src = "files/sshd_config"  # relative to this file's directory
+dest = "/etc/ssh/sshd_config"
+mode = "0644"              # required, quoted
+tags = ["linode"]          # optional; the target must carry every tag
+facts = { distro = "arch" } # optional; pkg matches by list membership
+
 [[steps]]
 run = "hostname"           # placeholder: a POSIX sh script run on every target
 ```
@@ -141,6 +148,14 @@ timeout = 300              # seconds the package step may run, 1..=3600; default
 apt = "fd-find"            # installed in place of fd on apt; a manager with no entry installs fd
 dnf = "fd-find"
 
+[[files]]                  # optional; one file copied per matching target; see Files
+src = "files/sshd_config"  # relative to the config file's directory
+dest = "/etc/ssh/sshd_config" # absolute path on the target
+mode = "0644"              # required: a quoted string of 3 or 4 octal digits
+tags = ["linode"]          # optional; every tag must be on the target
+facts = { distro = "arch" } # optional; each value equals that fact
+sudo = true                # optional; default true. false writes as the connecting user
+
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
 
@@ -195,6 +210,158 @@ backend = "keychain"
 names = ["HOST_SUDO"]
 ```
 
+## Files
+
+A `[[files]]` entry copies one text file onto each selected target whose tags and facts all match. No `tags` and no
+`facts` means every selected target. Matching entries run in config order, after the package step and before
+`[[steps]]`; an entry that does not match is still a step, reported as skipped, and the target's other steps still run
+([File steps](cli.md#file-steps)). At most 64 entries: one more is exit 2 with `files: N entries exceeds the 64 entry limit`
+(`files: 65 entries exceeds the 64 entry limit` for 65). An unknown key, or a `sudo` that is not a boolean, is exit 2
+with the parser's message, which names the key and the line. A path or value quoted in a message below is cut at 64
+characters (the cut marked with `…`) and a control character is shown as a `\x1b`-style escape.
+
+```toml
+[[files]]
+src = "files/sshd_config"        # required: relative to the config file's directory
+dest = "/etc/ssh/sshd_config"    # required: absolute path on the target
+mode = "0644"                    # required: quoted, 3 or 4 octal digits
+tags = ["linode"]                # optional; [A-Za-z0-9_-]+; every one must be on the target
+facts = { distro = "arch" }      # optional; a probe key, equal to that fact
+sudo = false                     # optional; default true. false: write as the connecting user
+```
+
+**`mode`.** Required, and a quoted string. Three or four octal digits, at most `0777` plus the sticky bit, so `644`,
+`0644`, `0444`, `0755`, `1777` and `1000` pass. The setuid bit (`4000`) and the setgid bit (`2000`) are refused, alone
+or together (`4755`, `2755`, `6755`, `7777`). An unquoted number (TOML `mode = 0644`, or YAML `mode: 0644`) is not a
+mode. Exit 2:
+
+- `files[0].mode: required`
+- `files[0].mode: write it as a quoted string such as "0644"`
+- ``files[0].mode `64`: must be 3 or 4 octal digits`` (`00644`, `0648`, `+644` and `rw-` get the same message)
+- ``files[0].mode `4755`: setuid and setgid are refused``
+
+**`dest`.** An absolute path of at most 4096 bytes. Every character is in `[A-Za-z0-9._/@+-]`. No component is `.` or
+`..` (`/etc/../root/x`, `/etc/./motd` and `/etc/..` are refused; `/etc//motd` is allowed). It must not end with `/`
+(`/etc/` and `/` are refused). Exit 2, naming the entry:
+
+- ``files[0].dest `etc/motd`: must be an absolute path`` (an empty dest too)
+- ``files[0].dest `/etc/my motd`: must match [A-Za-z0-9._/@+-]``
+- ``files[0].dest `/etc/../root/x`: must not contain a . or .. component``
+- ``files[0].dest `/etc/`: must not end with /``
+- ``files[0].dest `/aaa…`: 4097 bytes exceeds the 4096 byte limit`` (the quoted path is the first 64 characters plus `…`)
+
+**`src`.** A path relative to the directory of the config file, not shell-expanded: `~/a` is a directory whose name is
+`~`, and `..` is allowed at this check. Absolute, empty, or containing a NUL byte is exit 2 with
+``files[0].src `/etc/motd`: must be relative to the config directory``. `apply` and `plan` (and the TUI's `a` and `p`)
+then resolve `..` and symlinks and read the file, before any target. The resolved path must stay inside the config
+directory: ``files[0].src `../outside`: leaves the config directory``, and the same for a symlink inside the directory
+whose target is outside it. That check guards against a mistake (a stray `..`, a symlink that points the wrong way). It
+is not a security boundary: someone who can edit the config can already put the file in that directory. The path must
+name a regular file. A missing file is ``files[0].src `missing`: cannot read: REASON``, with the operating system's
+REASON; a directory is ``files[0].src `sub`: is not a regular file``. `anvil config`, `anvil doctor`, `anvil inventory`
+and `anvil secret` check the syntax only, so a missing src does not break them, and `anvil run` does not load the config.
+
+Text only, and at most 1 MiB (1048576 bytes; a file of that size passes), both current limits. Exit 2, and the first
+such src stops `apply` and `plan` for every target, before any target is contacted:
+
+- ``files[0].src `big`: exceeds the 1 MiB limit``
+- ``files[0].src `notes`: is not UTF-8 text; [[files]] copies text files only for now``
+- ``files[0].src `notes`: contains a NUL byte; [[files]] copies text files only for now``
+
+A line of the file equal to the heredoc delimiter (`ANVIL_EOF_` and the first 32 hex digits of the file's sha256) is
+not part of that preflight. It fails the target, and the others still run, with
+`files[0].src: has a line equal to the heredoc delimiter ANVIL_EOF_HEX`, where HEX is those 32 digits.
+
+**`tags` and `facts`.** Every listed tag must be on the target, and every listed fact must match. Tags use the inventory
+rule, ``files[0].tags[1] `bad tag`: must match [A-Za-z0-9_-]+``; `local` is allowed. The `local` target carries `local`
+even though it has no inventory tags. Tags are not checked against the inventory: a typo matches nothing, so every
+target shows `skipped file DEST: no match` ([File steps](cli.md#file-steps)). There is no glob, alternative or negation.
+
+A fact key must be one the probe reports. The comparison is exact and case-sensitive, with no trimming (`Arch` and
+`"arch "`, with a trailing space, do not match `arch`). `pkg` is the exception: the probe's value is the managers
+present, separated by whitespace, and the configured value matches when it is one of those words. `pkg = "pacman"`
+matches a target whose `pkg` fact is `brew pacman`; `pkg = "pacman brew"` and `pkg = "pac"` do not. A fact the probe did
+not report does not match. Probe values have their control characters removed and are cut at 256 bytes, so some values
+that could never be reported are refused: an empty one, one over 256 bytes, or one with an ASCII control byte. Exit 2:
+
+- `files[0].facts.x: unknown fact; must be one of hostname, os, kernel, arch, distro, distro_version, user, shell, pkg, sudo`
+- `files[0].facts.distro: is empty`
+- `files[0].facts.distro: 257 bytes exceeds the 256 byte limit`
+- `files[0].facts.distro: contains a control character`
+
+The probe's values, as `anvil doctor` shows them:
+
+- `hostname` — the `hostname` command.
+- `os` — `uname -s`, such as `Linux` or `Darwin`.
+- `kernel` — `uname -r`.
+- `arch` — `uname -m`, such as `x86_64`, `aarch64` or `arm64`.
+- `distro` — `ID` from `/etc/os-release`, such as `arch`, `debian`, `ubuntu`, `alpine` or `fedora`. It is the ID as the
+  image sets it, not a family: Arch Linux ARM on arm64 reports `archarm`, so `distro = "arch"` does not match it. `macos`
+  when there is no readable os-release and `sw_vers` exists; `unknown` when neither does. When os-release is readable
+  but cannot be parsed, or has no `ID` or `VERSION_ID`, that value is empty, and an empty value cannot be written here.
+- `distro_version` — `VERSION_ID` from os-release, or `sw_vers -productVersion` on macOS. The match is the whole string.
+- `user` — `id -un`. `root` means the login is root.
+- `shell` — `$SHELL` as the probe sees it.
+- `pkg` — the managers present, in this order, separated by spaces: `brew` when `command -v brew` finds it or
+  `/opt/homebrew/bin/brew`, `/usr/local/bin/brew` or `/home/linuxbrew/.linuxbrew/bin/brew` is executable (a non-login
+  ssh shell may leave Homebrew off `PATH`), then whichever of `pacman`, `apt`, `dnf` and `apk` `command -v` finds.
+- `sudo` — `none` (no `sudo`), `nopasswd` (`sudo -n true` succeeds) or `binary` (sudo asks for a password).
+
+**`sudo`.** Defaults to true, and is omitted from the file anvil writes back when it is true. `false` writes as the
+connecting user: no `sudo`, no temp file, no terminal and no secret. Use it for a dest under that user's home. A login
+whose `user` fact is `root` still writes as root, with `sudo = false` and with `sudo = true`; a root login never takes
+the password path.
+
+With `sudo = true` and a login that is not root, `nopasswd` uses `sudo -n tee`. `binary` with a sudo secret uses the
+password path: the bytes go on stdin to a new mode-0600 `/tmp/anvil-` file (32 hex digits) owned by the connecting
+user, then a terminal run types the secret and runs `sudo install -m MODE`. The temp file is removed after the step,
+on success, failure or cancel; a lost connection or a killed anvil (a Ctrl-C while the bytes are staged, say) can leave
+it behind, readable only by that user. The secret is the host's `sudo_secret`, or
+`[packages].local_sudo_secret` for `local` when `[packages]` is present; without `[packages]`, only a host's
+`sudo_secret` counts, so `local` has none. The same secret failures as the package step, with the prefix `files`:
+`files: secret NAME is not set`, `files: secret NAME contains control characters`,
+`files: sudo rejected the password from secret NAME`, `files: sudo did not show anvil's prompt (secret NAME)`. That
+target fails and the others still run. `binary` with no secret, and `none`, run `sudo -n` and the step fails with
+sudo's own message. `apply` opens the secret store for files only when some selected target has a sudo secret and
+carries every tag of a `sudo = true` entry (facts are not known yet); a config whose entries are all `sudo = false`, or
+whose tags match no selected target, does not open it for files. `plan` never opens it.
+
+**What lands on the target.** The bytes are compared with dest by `cmp`. The same bytes are left in place, `chmod`
+applies `mode`, and the step prints `unchanged DEST`. Otherwise it prints `wrote DEST`. Both exit 0. A missing or
+unreadable dest is written. The comparison needs `cmp` (diffutils) on the target, on the `PATH` the write runs with
+(sudo's when the write is through sudo). Without it the file is always rewritten and the step always prints
+`wrote DEST`; some minimal container images lack it. A mode without owner write, such as `0444`, still writes: on the
+tee path the file is mode 0600 for the write and `chmod` to `mode` after it. anvil sets `mode` only. It does not set owner or
+group, and it does not create a missing parent directory; the step fails with `tee`'s or `install`'s own message.
+
+A write as root (through sudo, or on a root login) refuses a dest unless every directory on its path, from `/` to the
+one that holds dest, is owned by root and writable by neither its group nor others. Root checks each one in turn,
+before anything else touches dest; the first that fails stops the step with
+`files: DIR is not root-only; root will not write under it` (DIR is `/home/u` for `/home/u/.config/app.conf`), and
+nothing is written. A directory on the path that is a symlink also fails. A root write refuses symlinked system
+directories too: macOS `/etc`, `/var` and `/tmp` (links into `/private`), and the merged-/usr links `/bin`, `/sbin` and
+`/lib` on current Linux distributions; use the real path instead, e.g. `/usr/bin/x`. A directory missing from the path
+passes, and the write then fails as above. So a dest under a user's home, or under `/tmp`, needs `sudo = false`.
+Without this rule, whoever can write a directory on the path could swap it, or what is in it, for a symlink or a hard
+link to another file, and root would write that file.
+
+Root then refuses a dest that is itself a symlink: the step fails with
+`files: DEST is a symlink; point dest at the real file`, and the link and the file it points to are left alone. Point
+dest at the real file instead. That check and the write are separate commands, so the check alone is not atomic and
+would not stop a link put in place between them; what stops it is the directory rule above, since only root can
+change what a root-only directory holds. A write as the connecting user (`sudo = false` on a login that is not
+root) follows the link and writes the file it points to, since it can only write what that user can. A dest that is a
+directory fails the step with `files: DEST is a directory` (`files: /etc/a is a directory` for `/etc/a`) and is left
+alone.
+
+`tee` (root, `sudo = false`, or `nopasswd`) rewrites an existing file in place, so it keeps its owner, group, ACLs and
+SELinux label. In place also means a process that opened the file before the write can read the new bytes, even
+before the final `chmod` applies `mode`. A new file written as root is owned by root; its group is root's primary
+group on Linux, and the parent directory's group on macOS and the BSDs or under a setgid parent directory. With
+`sudo = false` it is owned by the connecting user. `install` (the password path) puts a new file in place, owned by
+root with the group as above, and the old file's ACLs and SELinux label are dropped. `install` would replace a symlink
+with a regular file; the symlink refusal above runs first.
+
 ## Plugins
 
 A plugin is a program on the controller that a step names. anvil runs it for each target, sends it the target's facts
@@ -242,7 +409,8 @@ Anything else stops the command before any target, and `apply` and `plan` exit 2
 
 ## Limits and refusals
 
-Every file is capped at 1 MiB, checked before parsing. YAML refuses anchors and aliases, merge keys (`<<`), duplicate
+Every config or inventory file is capped at 1 MiB, checked before parsing. A `[[files]]` src has its own 1 MiB cap,
+checked when `apply` or `plan` reads it ([Files](#files)). YAML refuses anchors and aliases, merge keys (`<<`), duplicate
 keys, unsupported tags and more than one document, in a legacy file and in the YAML edit view alike. `anvil inventory`
 and `anvil config` open the parsed document, not the file's text, so comments are not preserved once you save. The
 1 MiB cap also holds for the edit view and the stored TOML: when the document rendered in the edit format is over

@@ -1,18 +1,22 @@
 //! The config document: `[anvil]` preferences, the `[secrets]` backend, the
-//! `[packages]` to install, the pinned `[plugins]` and the `[[steps]]` that
-//! `anvil apply` runs.
+//! `[packages]` to install, the pinned `[plugins]`, the `[[files]]` to copy
+//! and the `[[steps]]` that `anvil apply` runs.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::document::{self, DocumentError, Format};
+use crate::facts;
+use crate::inventory;
 use crate::logger::escape_controls;
 use crate::packages::Packages;
 use crate::paths::{self, DocPath};
 use crate::secret::{self, BackendKind, SERVICE};
+use crate::transport;
 
 /// Longest `run` script, in bytes.
 pub const MAX_RUN_BYTES: usize = 4 << 10;
@@ -20,6 +24,12 @@ pub const MAX_RUN_BYTES: usize = 4 << 10;
 /// Longest step `args`, in bytes as JSON: leaves room for the facts in the
 /// request a plugin reads.
 pub const ARGS_LIMIT: usize = 32 << 10;
+
+/// Most `[[files]]` entries in one config.
+pub const MAX_FILES: usize = 64;
+
+/// Longest `[[files]]` dest, in bytes: Linux's `PATH_MAX`.
+const MAX_DEST_BYTES: usize = 4096;
 
 /// Whether this build can use the keychain.
 const MACOS: bool = cfg!(target_os = "macos");
@@ -34,6 +44,11 @@ pub struct Config {
     pub packages: Option<Packages>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub plugins: BTreeMap<String, Plugin>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileEntry>,
+    /// The loaded file, canonicalized by [`Config::load`]; `None` for defaults.
+    #[serde(skip)]
+    pub path: Option<PathBuf>,
     pub steps: Vec<Step>,
 }
 
@@ -44,6 +59,8 @@ impl Default for Config {
             secrets: None,
             packages: None,
             plugins: BTreeMap::new(),
+            files: Vec::new(),
+            path: None,
             steps: vec![Step::script("hostname")],
         }
     }
@@ -213,10 +230,115 @@ pub struct Step {
     pub args: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+/// A `[[files]]` entry: `src` beside the config, copied to `dest` on each
+/// target whose tags and facts all match.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileEntry {
+    pub src: String,
+    pub dest: String,
+    /// Required; `Option<ModeValue>` so a missing or unquoted mode gets its
+    /// own message from [`Config::validate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ModeValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facts: BTreeMap<String, String>,
+    /// `false`: write as the connecting user, no sudo, temp file, tty or secret.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub sudo: bool,
+}
+
+/// By hand, so a field added later must be chosen for `Debug` rather than
+/// shown by default: the file's bytes must never reach it.
+impl std::fmt::Debug for FileEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileEntry")
+            .field("src", &self.src)
+            .field("dest", &self.dest)
+            .field("mode", &self.mode)
+            .field("tags", &self.tags)
+            .field("facts", &self.facts)
+            .field("sudo", &self.sudo)
+            .finish()
+    }
+}
+
+/// A `[[files]]` mode as written: a quoted string, or the number an unquoted
+/// one parses as.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ModeValue {
+    Text(String),
+    Number(i64),
+}
+
+/// By hand rather than `untagged`: the YAML parser reads an unquoted `0644`
+/// as the float `644.0`, which must still reach the "quote it" message.
+impl<'de> Deserialize<'de> for ModeValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = ModeValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a quoted octal mode such as \"0644\"")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ModeValue, E> {
+                Ok(ModeValue::Text(v.to_string()))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<ModeValue, E> {
+                Ok(ModeValue::Number(v))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<ModeValue, E> {
+                i64::try_from(v)
+                    .map(ModeValue::Number)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(v), &self))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<ModeValue, E> {
+                if v.fract() == 0.0 && v.abs() < 1e15 {
+                    Ok(ModeValue::Number(v as i64))
+                } else {
+                    Err(E::invalid_type(serde::de::Unexpected::Float(v), &self))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 impl Config {
     /// Loads and validates the config; `None` or a missing file is the defaults.
     pub fn load(doc: Option<&DocPath>) -> Result<Config, DocumentError> {
-        document::load_or_default(doc, Config::validate)
+        let mut config = document::load_or_default(doc, Config::validate)?;
+        if let Some(doc) = doc {
+            config.path = match fs::canonicalize(&doc.path) {
+                Ok(path) => Some(path),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => {
+                    return Err(DocumentError::Read {
+                        path: doc.path.clone(),
+                        source,
+                    });
+                }
+            };
+        }
+        Ok(config)
     }
 
     /// Checks the schema rules; the error names the field.
@@ -241,8 +363,47 @@ impl Config {
         }
         self.check_plugins(std::env::var_os("HOME").as_deref())
             .map_err(|message| DocumentError::invalid(path, message))?;
+        self.check_files()
+            .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_steps()
             .map_err(|message| DocumentError::invalid(path, message))
+    }
+
+    /// The `[[files]]` syntax rules; src is read only by `apply` and `plan`,
+    /// so nothing here touches the filesystem.
+    fn check_files(&self) -> Result<(), String> {
+        if self.files.len() > MAX_FILES {
+            return Err(format!(
+                "files: {} entries exceeds the {MAX_FILES} entry limit",
+                self.files.len()
+            ));
+        }
+        for (i, entry) in self.files.iter().enumerate() {
+            check_src(&entry.src).map_err(|why| {
+                format!("files[{i}].src `{}`: {why}", secret::shown_name(&entry.src))
+            })?;
+            check_dest(&entry.dest).map_err(|why| {
+                format!(
+                    "files[{i}].dest `{}`: {why}",
+                    secret::shown_name(&entry.dest)
+                )
+            })?;
+            check_mode(entry.mode.as_ref()).map_err(|why| format!("files[{i}].mode{why}"))?;
+            for (j, tag) in entry.tags.iter().enumerate() {
+                if !inventory::is_word(tag) {
+                    return Err(format!(
+                        "files[{i}].tags[{j}] `{}`: must match [A-Za-z0-9_-]+",
+                        secret::shown_name(tag)
+                    ));
+                }
+            }
+            for (key, value) in &entry.facts {
+                check_fact(key, value).map_err(|why| {
+                    format!("files[{i}].facts.{}: {why}", secret::shown_name(key))
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// The `[plugins]` schema rules; the files are checked by
@@ -444,6 +605,92 @@ fn is_plugin_name(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
+/// A `[[files]]` src: a path under the config directory, which `apply` and
+/// `plan` check when they read it.
+fn check_src(src: &str) -> Result<(), &'static str> {
+    if src.is_empty() || src.contains('\0') || Path::new(src).is_absolute() {
+        return Err("must be relative to the config directory");
+    }
+    Ok(())
+}
+
+/// A `[[files]]` dest: absolute, in a charset that needs no shell quoting
+/// beyond single quotes, with no `.` or `..` component.
+fn check_dest(dest: &str) -> Result<(), String> {
+    if dest.len() > MAX_DEST_BYTES {
+        return Err(format!(
+            "{} bytes exceeds the {MAX_DEST_BYTES} byte limit",
+            dest.len()
+        ));
+    }
+    if !dest.starts_with('/') {
+        return Err("must be an absolute path".to_string());
+    }
+    if !dest
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._/@+-".contains(c))
+    {
+        return Err("must match [A-Za-z0-9._/@+-]".to_string());
+    }
+    if dest.split('/').any(|part| part == "." || part == "..") {
+        return Err("must not contain a . or .. component".to_string());
+    }
+    if dest.ends_with('/') {
+        return Err("must not end with /".to_string());
+    }
+    Ok(())
+}
+
+/// A `[[files]]` mode: 3 or 4 quoted octal digits, at most `0777` plus the
+/// sticky bit. The error follows `files[i].mode`.
+fn check_mode(mode: Option<&ModeValue>) -> Result<(), String> {
+    let mode = match mode {
+        None => return Err(": required".to_string()),
+        Some(ModeValue::Number(_)) => {
+            return Err(": write it as a quoted string such as \"0644\"".to_string());
+        }
+        Some(ModeValue::Text(mode)) => mode,
+    };
+    let shown = secret::shown_name(mode);
+    if !is_mode(mode) {
+        return Err(format!(" `{shown}`: must be 3 or 4 octal digits"));
+    }
+    let bits = u32::from_str_radix(mode, 8).expect("checked: 3 or 4 octal digits");
+    if bits & 0o6000 != 0 {
+        return Err(format!(" `{shown}`: setuid and setgid are refused"));
+    }
+    Ok(())
+}
+
+/// Whether `mode` is 3 or 4 octal digits.
+pub(crate) fn is_mode(mode: &str) -> bool {
+    (3..=4).contains(&mode.len()) && mode.bytes().all(|b| matches!(b, b'0'..=b'7'))
+}
+
+/// A `[[files]]` fact: a key the probe reports, and a value it could report.
+fn check_fact(key: &str, value: &str) -> Result<(), String> {
+    if !facts::KEYS.contains(&key) {
+        return Err(format!(
+            "unknown fact; must be one of {}",
+            facts::KEYS.join(", ")
+        ));
+    }
+    if value.is_empty() {
+        return Err("is empty".to_string());
+    }
+    if value.len() > facts::MAX_VALUE {
+        return Err(format!(
+            "{} bytes exceeds the {} byte limit",
+            value.len(),
+            facts::MAX_VALUE
+        ));
+    }
+    if transport::has_control_bytes(value.as_bytes()) {
+        return Err("contains a control character".to_string());
+    }
+    Ok(())
+}
+
 /// 64 lowercase hex digits, as `sha256sum` prints them.
 fn is_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
@@ -582,7 +829,9 @@ mod tests {
     #[test]
     fn toml_and_yaml_configs_are_equal() {
         let toml = Config::load(Some(&fixture_doc("config.toml"))).unwrap();
-        let yaml = Config::load(Some(&fixture_doc("config.yaml"))).unwrap();
+        let mut yaml = Config::load(Some(&fixture_doc("config.yaml"))).unwrap();
+        assert_ne!(toml.path, yaml.path);
+        yaml.path.clone_from(&toml.path);
         assert_eq!(toml, yaml);
         assert_eq!(toml.anvil.editor.as_deref(), Some("nvim"));
         assert_eq!(toml.anvil.format, Format::Yaml);
@@ -614,7 +863,305 @@ mod tests {
         for format in [Format::Toml, Format::Yaml] {
             let text = document::to_string(&config, format).unwrap();
             let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(
+                back,
+                Config {
+                    path: None,
+                    ..config.clone()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn load_keeps_the_canonical_path_of_the_file() {
+        let doc = fixture_doc("config.toml");
+        let config = Config::load(Some(&doc)).unwrap();
+        assert_eq!(config.path, Some(fs::canonicalize(&doc.path).unwrap()));
+        assert_eq!(Config::default().path, None);
+    }
+
+    /// A config with one `[[files]]` entry made of `keys`.
+    fn file_entry(keys: &str) -> Config {
+        parse(&format!("[[files]]\n{keys}\n"))
+    }
+
+    const ENTRY: &str = "src = \"motd\"\ndest = \"/etc/motd\"\nmode = \"0644\"";
+
+    #[test]
+    fn a_files_entry_parses_with_sudo_on_by_default() {
+        let config = file_entry(&format!(
+            "{ENTRY}\ntags = [\"web\", \"local\"]\nfacts = {{ distro = \"arch\", pkg = \"pacman\" }}"
+        ));
+        config.check_files().unwrap();
+        let [entry] = config.files.as_slice() else {
+            panic!("{:?}", config.files);
+        };
+        assert_eq!(entry.src, "motd");
+        assert_eq!(entry.dest, "/etc/motd");
+        assert_eq!(entry.mode, Some(ModeValue::Text("0644".into())));
+        assert_eq!(entry.tags, ["web", "local"]);
+        assert_eq!(entry.facts["distro"], "arch");
+        assert!(entry.sudo);
+        assert!(!file_entry(&format!("{ENTRY}\nsudo = false")).files[0].sudo);
+
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&config, format).unwrap();
+            assert!(!text.contains("sudo"), "{text}");
+            let back: Config = document::from_str(&text, format).unwrap();
             assert_eq!(back, config);
+        }
+        let config = file_entry(&format!("{ENTRY}\nsudo = false"));
+        let text = document::to_string(&config, Format::Toml).unwrap();
+        assert!(text.contains("sudo = false"), "{text}");
+        assert!(
+            !document::to_string(&Config::default(), Format::Toml)
+                .unwrap()
+                .contains("files")
+        );
+    }
+
+    #[test]
+    fn files_modes_and_dests_within_the_rules_pass() {
+        for mode in ["644", "0644", "0444", "0000", "0777", "1777", "0600", "755"] {
+            let config = file_entry(&format!("src = \"a\"\ndest = \"/a\"\nmode = \"{mode}\""));
+            assert_eq!(config.check_files(), Ok(()), "{mode}");
+        }
+        for dest in [
+            "/etc/motd",
+            "/home/u/.config/app/conf.toml",
+            "/opt/x@1+2/a-b_c",
+            "/etc//motd",
+            "/.hidden",
+        ] {
+            let config = file_entry(&format!(
+                "src = \"conf/a\"\ndest = \"{dest}\"\nmode = \"0644\""
+            ));
+            assert_eq!(config.check_files(), Ok(()), "{dest}");
+        }
+        for src in ["a", "../shared/a", "~/a", "dir/./a"] {
+            let config = file_entry(&format!("src = \"{src}\"\ndest = \"/a\"\nmode = \"0644\""));
+            assert_eq!(config.check_files(), Ok(()), "{src}");
+        }
+    }
+
+    #[test]
+    fn files_refusals_name_the_entry_and_the_key() {
+        let entry = |src: &str, dest: &str, mode: &str| {
+            format!("src = {src:?}\ndest = {dest:?}\nmode = {mode}")
+        };
+        let long_dest = format!("/{}", "a".repeat(4096));
+        let long_fact = "a".repeat(257);
+        for (keys, message) in [
+            (
+                "src = \"a\"\ndest = \"/a\"".to_string(),
+                "files[0].mode: required".to_string(),
+            ),
+            (
+                entry("a", "/a", "644"),
+                "files[0].mode: write it as a quoted string such as \"0644\"".to_string(),
+            ),
+            (
+                entry("a", "/a", "\"64\""),
+                "files[0].mode `64`: must be 3 or 4 octal digits".to_string(),
+            ),
+            (
+                entry("a", "/a", "\"00644\""),
+                "files[0].mode `00644`: must be 3 or 4 octal digits".to_string(),
+            ),
+            (
+                entry("a", "/a", "\"0648\""),
+                "files[0].mode `0648`: must be 3 or 4 octal digits".to_string(),
+            ),
+            (
+                entry("a", "/a", "\"+644\""),
+                "files[0].mode `+644`: must be 3 or 4 octal digits".to_string(),
+            ),
+            (
+                entry("a", "/a", "\"rw-\""),
+                "files[0].mode `rw-`: must be 3 or 4 octal digits".to_string(),
+            ),
+            (
+                entry("a", "/a", "\"4755\""),
+                "files[0].mode `4755`: setuid and setgid are refused".to_string(),
+            ),
+            (
+                entry("a", "/a", "\"2755\""),
+                "files[0].mode `2755`: setuid and setgid are refused".to_string(),
+            ),
+            (
+                entry("a", "/a", "\"7777\""),
+                "files[0].mode `7777`: setuid and setgid are refused".to_string(),
+            ),
+            (
+                entry("a", "etc/motd", "\"0644\""),
+                "files[0].dest `etc/motd`: must be an absolute path".to_string(),
+            ),
+            (
+                entry("a", "", "\"0644\""),
+                "files[0].dest ``: must be an absolute path".to_string(),
+            ),
+            (
+                entry("a", "/etc/my motd", "\"0644\""),
+                "files[0].dest `/etc/my motd`: must match [A-Za-z0-9._/@+-]".to_string(),
+            ),
+            (
+                entry("a", "/etc/$(id)", "\"0644\""),
+                "files[0].dest `/etc/$(id)`: must match [A-Za-z0-9._/@+-]".to_string(),
+            ),
+            (
+                entry("a", "/etc/it's", "\"0644\""),
+                "files[0].dest `/etc/it's`: must match [A-Za-z0-9._/@+-]".to_string(),
+            ),
+            (
+                "src = \"a\"\ndest = \"/etc/\\u001b[2J\"\nmode = \"0644\"".to_string(),
+                "files[0].dest `/etc/\\x1b[2J`: must match [A-Za-z0-9._/@+-]".to_string(),
+            ),
+            (
+                entry("a", "/etc/../root/x", "\"0644\""),
+                "files[0].dest `/etc/../root/x`: must not contain a . or .. component".to_string(),
+            ),
+            (
+                entry("a", "/etc/./motd", "\"0644\""),
+                "files[0].dest `/etc/./motd`: must not contain a . or .. component".to_string(),
+            ),
+            (
+                entry("a", "/etc/..", "\"0644\""),
+                "files[0].dest `/etc/..`: must not contain a . or .. component".to_string(),
+            ),
+            (
+                entry("a", "/etc/", "\"0644\""),
+                "files[0].dest `/etc/`: must not end with /".to_string(),
+            ),
+            (
+                entry("a", "/", "\"0644\""),
+                "files[0].dest `/`: must not end with /".to_string(),
+            ),
+            (
+                entry("a", &long_dest, "\"0644\""),
+                format!(
+                    "files[0].dest `/{}…`: 4097 bytes exceeds the 4096 byte limit",
+                    "a".repeat(63)
+                ),
+            ),
+            (
+                entry("/etc/motd", "/a", "\"0644\""),
+                "files[0].src `/etc/motd`: must be relative to the config directory".to_string(),
+            ),
+            (
+                entry("", "/a", "\"0644\""),
+                "files[0].src ``: must be relative to the config directory".to_string(),
+            ),
+            (
+                "src = \"a\\u0000b\"\ndest = \"/a\"\nmode = \"0644\"".to_string(),
+                "files[0].src `a\\x00b`: must be relative to the config directory".to_string(),
+            ),
+            (
+                format!("{ENTRY}\ntags = [\"web\", \"bad tag\"]"),
+                "files[0].tags[1] `bad tag`: must match [A-Za-z0-9_-]+".to_string(),
+            ),
+            (
+                format!("{ENTRY}\ntags = [\"\"]"),
+                "files[0].tags[0] ``: must match [A-Za-z0-9_-]+".to_string(),
+            ),
+            (
+                format!("{ENTRY}\nfacts = {{ distribution = \"arch\" }}"),
+                "files[0].facts.distribution: unknown fact; must be one of hostname, os, kernel, \
+                 arch, distro, distro_version, user, shell, pkg, sudo"
+                    .to_string(),
+            ),
+            (
+                format!("{ENTRY}\nfacts = {{ \"\\u001b[2J\" = \"arch\" }}"),
+                "files[0].facts.\\x1b[2J: unknown fact".to_string(),
+            ),
+            (
+                format!("{ENTRY}\nfacts = {{ distro = \"\" }}"),
+                "files[0].facts.distro: is empty".to_string(),
+            ),
+            (
+                format!("{ENTRY}\nfacts = {{ distro = \"{long_fact}\" }}"),
+                "files[0].facts.distro: 257 bytes exceeds the 256 byte limit".to_string(),
+            ),
+            (
+                format!("{ENTRY}\nfacts = {{ distro = \"arch\\n\" }}"),
+                "files[0].facts.distro: contains a control character".to_string(),
+            ),
+        ] {
+            let err = file_entry(&keys).check_files().unwrap_err();
+            assert!(err.contains(&message), "{keys}: {err}");
+        }
+
+        // The index is the entry's, after a valid one.
+        let config = parse(&format!(
+            "[[files]]\n{ENTRY}\n\n[[files]]\n{}\n",
+            entry("a", "/a", "\"0648\"")
+        ));
+        assert_eq!(
+            config.check_files().unwrap_err(),
+            "files[1].mode `0648`: must be 3 or 4 octal digits"
+        );
+    }
+
+    #[test]
+    fn more_than_64_files_entries_are_refused() {
+        let table = format!("[[files]]\n{ENTRY}\n");
+        assert_eq!(parse(&table.repeat(MAX_FILES)).check_files(), Ok(()));
+        assert_eq!(
+            parse(&table.repeat(MAX_FILES + 1))
+                .check_files()
+                .unwrap_err(),
+            "files: 65 entries exceeds the 64 entry limit"
+        );
+    }
+
+    #[test]
+    fn files_fixtures_are_refused_naming_the_entry_and_the_key() {
+        for (file, field) in [
+            (
+                "invalid/config-files-unquoted-mode.yaml",
+                "files[0].mode: write it as a quoted string such as \"0644\"",
+            ),
+            (
+                "invalid/config-files-missing-mode.yaml",
+                "files[0].mode: required",
+            ),
+            (
+                "invalid/config-files-relative-dest.toml",
+                "files[1].dest `etc/motd`: must be an absolute path",
+            ),
+            (
+                "invalid/config-files-setuid.toml",
+                "files[0].mode `4755`: setuid and setgid are refused",
+            ),
+            (
+                "invalid/config-files-unknown-fact.yaml",
+                "files[0].facts.distribution: unknown fact",
+            ),
+        ] {
+            let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                matches!(err, DocumentError::Invalid { .. }),
+                "{file}: {message}"
+            );
+            assert!(message.contains(file), "{file}: {message}");
+            assert!(message.contains(field), "{file}: {message}");
+        }
+        // Serde refuses these while parsing; its message names the key.
+        for (file, key, line) in [
+            ("invalid/config-files-unknown-key.toml", "owner", "line 5"),
+            ("invalid/config-files-sudo-not-bool.toml", "sudo", "line 5"),
+            ("invalid/config-files-unknown-key.yaml", "owner", "line 5"),
+        ] {
+            let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                matches!(err, DocumentError::Parse { .. }),
+                "{file}: {message}"
+            );
+            assert!(message.contains(file), "{file}: {message}");
+            assert!(message.contains(key), "{file}: {message}");
+            assert!(message.contains(line), "{file}: {message}");
         }
     }
 

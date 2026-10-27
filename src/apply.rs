@@ -13,6 +13,13 @@
 //! A plugin step runs its plugin on the controller (after the probe, which
 //! any plugin step needs) and becomes the script it replies with, wrapped
 //! as `anvil run` wraps a script.
+//!
+//! Each `[[files]]` entry is one step after the package step, before
+//! `[[steps]]`: it copies its src when the target matches, else it is
+//! reported as skipped without running anything. When sudo asks that
+//! target for a password, the bytes go to a temp file over a plain run,
+//! a terminal run types the password and installs it, and the temp file is
+//! removed whatever happened.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,6 +33,7 @@ use serde::Serialize;
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::{Config, StepKind};
 use crate::facts::{self, Facts};
+use crate::files::{self, Sources};
 use crate::inventory::Target;
 use crate::logger::{BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, is_escaped, paint};
 use crate::options::Options;
@@ -41,12 +49,16 @@ use zeroize::Zeroizing;
 pub(crate) type Passwords = BTreeMap<String, Zeroizing<Vec<u8>>>;
 
 /// The value of secret `name` to type at sudo's prompt: set, and free of
-/// control characters.
-fn sudo_password<'a>(passwords: &'a Passwords, name: &str) -> Result<&'a [u8], String> {
+/// control characters. Errors start with `prefix`, the step's kind.
+fn sudo_password<'a>(
+    passwords: &'a Passwords,
+    name: &str,
+    prefix: &str,
+) -> Result<&'a [u8], String> {
     match passwords.get(name) {
-        None => Err(format!("packages: secret {name} is not set")),
+        None => Err(format!("{prefix}: secret {name} is not set")),
         Some(password) if has_control_bytes(password) => Err(format!(
-            "packages: secret {name} contains control characters"
+            "{prefix}: secret {name} contains control characters"
         )),
         Some(password) => Ok(password),
     }
@@ -56,7 +68,7 @@ fn sudo_password<'a>(passwords: &'a Passwords, name: &str) -> Result<&'a [u8], S
 /// is typed when it runs through sudo with a password, the plugin that
 /// returned it, and its time limit. It serializes as the user sees it:
 /// `run` is the label when there is one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PlannedRun {
     pub run: String,
     /// What the step's report shows instead of `run`, when what is sent
@@ -65,6 +77,61 @@ pub struct PlannedRun {
     pub sudo_secret: Option<String>,
     pub plugin: Option<String>,
     pub timeout: Duration,
+    /// Set for a `[[files]]` step, whose `run` carries the file's bytes.
+    pub file: Option<FileRun>,
+}
+
+/// By hand: a `[[files]]` step's `run` is shown only by its length.
+impl std::fmt::Debug for PlannedRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("PlannedRun");
+        match self.file {
+            Some(_) => debug.field("run", &Redacted(self.run.len())),
+            None => debug.field("run", &self.run),
+        };
+        debug
+            .field("label", &self.label)
+            .field("sudo_secret", &self.sudo_secret)
+            .field("plugin", &self.plugin)
+            .field("timeout", &self.timeout)
+            .field("file", &self.file)
+            .finish()
+    }
+}
+
+/// A `[[files]]` step: the temp-file scripts of the password path, and
+/// whether the entry matched no tag or fact of the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRun {
+    pub upload: Option<Upload>,
+    pub skip: bool,
+}
+
+/// The password path's plain scripts around `run`: `stage` writes the bytes
+/// to the temp file, `cleanup` removes it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Upload {
+    pub stage: String,
+    pub cleanup: String,
+}
+
+/// By hand: `stage` carries the file's bytes.
+impl std::fmt::Debug for Upload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Upload")
+            .field("stage", &Redacted(self.stage.len()))
+            .field("cleanup", &self.cleanup)
+            .finish()
+    }
+}
+
+/// A script's length in place of its text, for `Debug`.
+struct Redacted(usize);
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes redacted>", self.0)
+    }
 }
 
 impl PlannedRun {
@@ -100,6 +167,9 @@ pub struct StepReport {
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    /// A `[[files]]` entry the target does not match: nothing ran.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
 }
 
 impl StepReport {
@@ -109,6 +179,18 @@ impl StepReport {
             code: output.code,
             stdout: into_string(output.stdout),
             stderr: into_string(output.stderr),
+            skipped: false,
+        }
+    }
+
+    /// A step that ran nothing and passed.
+    fn skipped(run: &str) -> StepReport {
+        StepReport {
+            run: run.to_owned(),
+            code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            skipped: true,
         }
     }
 }
@@ -225,7 +307,8 @@ pub enum Progress<'a> {
 /// Loads the targets and applies `config` to each in order. Before each target
 /// and each step, `cancel` is checked; once set, the current target ends as
 /// Cancelled (keeping its completed steps) and every later target is Cancelled
-/// with no steps.
+/// with no steps. A `[[files]]` src that cannot be read fails the command
+/// before any target.
 pub fn run_targets(
     opts: &Options,
     config: &Config,
@@ -234,12 +317,13 @@ pub fn run_targets(
 ) -> Result<Report, Failure> {
     let targets = opts.targets()?;
     let pins = plugin::verify(config).map_err(Failure::usage)?;
-    let packages = package_work(config);
-    let passwords = load_passwords(&targets, packages, || opts.secret_store(config))?;
+    let sources = files::load(config).map_err(Failure::usage)?;
+    let passwords = load_passwords(&targets, config, || opts.secret_store(config))?;
     Ok(apply_targets(
         &targets,
         |target| opts.transport(target),
         config,
+        &sources,
         &pins,
         &passwords,
         cancel,
@@ -247,19 +331,29 @@ pub fn run_targets(
     ))
 }
 
-/// The sudo password of each of `targets` with a sudo secret, read from the
-/// store `store` builds, opened once; nothing is built or opened when
-/// `packages` (`Some` only with work to do) is `None` or no target has a
-/// sudo secret. One trailing newline is trimmed. A store error fails the
-/// command. Core dumps are turned off first.
+/// The sudo password of each of `targets` with a sudo secret that a step may
+/// type, read from the store `store` builds, opened once: the package step's
+/// when `[packages]` has work, and a target's when a `sudo = true`
+/// `[[files]]` entry carries only tags it has (its facts are not known yet).
+/// Nothing is built or opened when no step may type one. One trailing
+/// newline is trimmed. A store error fails the command. Core dumps are
+/// turned off first.
 fn load_passwords(
     targets: &[Target],
-    packages: Option<&Packages>,
+    config: &Config,
     store: impl FnOnce() -> Result<Box<dyn Store>, Failure>,
 ) -> Result<Passwords, Failure> {
-    let names: BTreeSet<&str> = packages
+    let mut names: BTreeSet<&str> = package_work(config)
         .map(|packages| packages.sudo_secrets(targets).collect())
         .unwrap_or_default();
+    names.extend(
+        targets
+            .iter()
+            .filter(|target| {
+                (config.files.iter()).any(|entry| entry.sudo && files::has_tags(entry, target))
+            })
+            .filter_map(|target| files::sudo_secret_for(config, target)),
+    );
     let mut passwords = Passwords::new();
     if names.is_empty() {
         return Ok(passwords);
@@ -299,10 +393,15 @@ fn no_core_dumps() {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one input of apply_target, passed through"
+)]
 fn apply_targets(
     targets: &[Target],
     transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError>,
     config: &Config,
+    sources: &Sources,
     plugins: &dyn Plugins,
     passwords: &Passwords,
     cancel: &AtomicBool,
@@ -313,6 +412,7 @@ fn apply_targets(
             target,
             transport(target),
             config,
+            sources,
             plugins,
             passwords,
             cancel,
@@ -397,13 +497,14 @@ pub(crate) fn cancelled(target: &Target, steps: Vec<StepReport>) -> TargetReport
     }
 }
 
-/// Probes `target` when `[packages]` has work or a step is a plugin, then
-/// runs the steps [`resolve`] lists; `passwords` holds the sudo passwords
-/// to type.
+/// Probes `target` when `[packages]` has work, a step is a plugin or there
+/// are `[[files]]`, then runs the steps [`resolve`] lists; `passwords` holds
+/// the sudo passwords to type.
 fn apply_target(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
     config: &Config,
+    sources: &Sources,
     plugins: &dyn Plugins,
     passwords: &Passwords,
     cancel: &AtomicBool,
@@ -414,8 +515,9 @@ fn apply_target(
         Err(err) => return failed(target, Vec::new(), err.to_string()),
     };
     log::info!("apply {}: over {}", target.name, transport.name());
-    let needs_facts =
-        package_work(config).is_some() || config.steps.iter().any(|s| s.plugin.is_some());
+    let needs_facts = package_work(config).is_some()
+        || config.steps.iter().any(|s| s.plugin.is_some())
+        || !config.files.is_empty();
     let facts = if needs_facts {
         if cancel.load(Ordering::Relaxed) {
             return cancelled(target, Vec::new());
@@ -427,7 +529,7 @@ fn apply_target(
     } else {
         None
     };
-    match resolve(target, facts.as_ref(), config, plugins, cancel) {
+    match resolve(target, facts.as_ref(), config, sources, plugins, cancel) {
         Ok(runs) => execute(target, transport.as_ref(), &runs, passwords, cancel),
         Err(Unresolved::Failed(error)) => failed(target, Vec::new(), error),
         Err(Unresolved::Cancelled) => cancelled(target, Vec::new()),
@@ -447,7 +549,8 @@ pub(crate) fn failed(target: &Target, steps: Vec<StepReport>, error: String) -> 
 
 /// Runs `runs` over `transport` in order, stopping at the first that fails;
 /// `cancel` is checked before each, and `passwords` holds the sudo
-/// passwords to type.
+/// passwords to type. A skipped `[[files]]` step runs nothing; one that
+/// needs a sudo password goes through [`send_file`].
 pub(crate) fn execute(
     target: &Target,
     transport: &dyn Transport,
@@ -461,25 +564,45 @@ pub(crate) fn execute(
         if cancel.load(Ordering::Relaxed) {
             return cancelled(target, reports);
         }
+        let label = planned.shown();
+        if planned.file.as_ref().is_some_and(|file| file.skip) {
+            reports.push(StepReport::skipped(label));
+            continue;
+        }
+        let prefix = if planned.file.is_some() {
+            "files"
+        } else {
+            "packages"
+        };
         let password = match planned.sudo_secret.as_deref() {
             None => None,
-            Some(name) => match sudo_password(passwords, name) {
+            Some(name) => match sudo_password(passwords, name, prefix) {
                 Ok(password) => Some((name, password)),
                 Err(error) => return failed(target, reports, error),
             },
         };
         let (run, timeout) = (planned.run.as_str(), planned.timeout);
-        let label = planned.shown();
-        let output = match password {
-            None => transport.run(run, timeout),
-            Some((_, password)) => {
+        let upload = planned.file.as_ref().and_then(|file| file.upload.as_ref());
+        let output = match (password, upload) {
+            (None, None) => transport.run(run, timeout),
+            (None, Some(_)) => {
+                let error = format!("files: internal error: {label} has no sudo secret");
+                return failed(target, reports, error);
+            }
+            (Some((_, password)), None) => {
                 transport.run_tty(&packages::with_password(run), password, timeout)
+            }
+            (Some((_, password)), Some(upload)) => {
+                match send_file(target, transport, upload, run, password, timeout, cancel) {
+                    Some(output) => output,
+                    None => return cancelled(target, reports),
+                }
             }
         };
         let output = match output {
             Ok(output) => output,
             Err(err) => {
-                let error = step_error(&err, password.map(|(name, _)| name));
+                let error = step_error(&err, password.map(|(name, _)| name), prefix);
                 // A step killed at the limit still shows what it printed.
                 if let TransportError::Timeout {
                     output: Some(output),
@@ -513,15 +636,61 @@ pub(crate) fn execute(
     }
 }
 
-/// The failure of a step: for the package step run on a terminal with the
-/// password from secret `secret`, sudo's refusals name the secret, never its value.
-fn step_error(err: &TransportError, secret: Option<&str>) -> String {
+/// The password path of a `[[files]]` step: `upload.stage` writes the bytes
+/// to the temp file over a plain run; unless it failed or `cancel` was set
+/// meanwhile, `run` then installs it on a terminal, typing `password`.
+/// `upload.cleanup` runs after, whatever happened, and its failure is only
+/// logged. The result is the terminal run's; a failed stage is a fixed
+/// message instead of what the shell printed, which names the temp file.
+/// `None` when cancelled.
+fn send_file(
+    target: &Target,
+    transport: &dyn Transport,
+    upload: &Upload,
+    run: &str,
+    password: &[u8],
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Option<Result<Output, TransportError>> {
+    let result = match transport.run(&upload.stage, timeout) {
+        Ok(staged) if staged.code == Some(0) => {
+            log::debug!("apply {}: file staged", target.name);
+            (!cancel.load(Ordering::Relaxed))
+                .then(|| transport.run_tty(&packages::with_password(run), password, timeout))
+        }
+        Ok(staged) => Some(Ok(Output {
+            code: staged.code,
+            stderr: b"files: could not stage the file\n".to_vec(),
+            ..Output::default()
+        })),
+        Err(TransportError::Timeout { after, .. }) => Some(Err(TransportError::Timeout {
+            after,
+            output: None,
+        })),
+        Err(err) => Some(Err(err)),
+    };
+    match transport.run(&upload.cleanup, RUN_TIMEOUT) {
+        Ok(output) if output.code == Some(0) => {}
+        Ok(output) => log::debug!(
+            "apply {}: removing the temp file exited {:?}",
+            target.name,
+            output.code
+        ),
+        Err(err) => log::debug!("apply {}: cannot remove the temp file: {err}", target.name),
+    }
+    result
+}
+
+/// The failure of a step: for a step run on a terminal with the password
+/// from secret `secret`, sudo's refusals name the secret, never its value,
+/// after `prefix`, the step's kind.
+fn step_error(err: &TransportError, secret: Option<&str>, prefix: &str) -> String {
     match (err, secret) {
         (TransportError::PasswordRejected, Some(name)) => {
-            format!("packages: sudo rejected the password from secret {name}")
+            format!("{prefix}: sudo rejected the password from secret {name}")
         }
         (TransportError::NoPrompt, Some(name)) => {
-            format!("packages: sudo did not show anvil's prompt (secret {name})")
+            format!("{prefix}: sudo did not show anvil's prompt (secret {name})")
         }
         (err, _) => err.to_string(),
     }
@@ -569,20 +738,22 @@ impl From<String> for Unresolved {
 
 /// The steps apply runs on `target`, in order: the step that installs and
 /// upgrades `[packages]` with the target's package manager (when it has
-/// work), then each `[[steps]]` entry, a plugin step as the script its
-/// plugin returns. Runs nothing on the target, but each plugin on the
-/// controller, in step order, `cancel` checked before each. `facts`, from
-/// [`probe`], is required when `[packages]` has work or a step is a
-/// plugin. A failure is `packages: <reason>` or `plugin <name>: <reason>`;
-/// the first one ends the list.
+/// work), then one step per `[[files]]` entry, copying its src from
+/// `sources` or skipped, then each `[[steps]]` entry, a plugin step as the
+/// script its plugin returns. Runs nothing on the target, but each plugin on
+/// the controller, in step order, `cancel` checked before each. `facts`, from
+/// [`probe`], is required when `[packages]` has work, a step is a plugin or
+/// there are `[[files]]`. A failure is `packages: <reason>`, `files…` or
+/// `plugin <name>: <reason>`; the first one ends the list.
 pub fn resolve(
     target: &Target,
     facts: Option<&Facts>,
     config: &Config,
+    sources: &Sources,
     plugins: &dyn Plugins,
     cancel: &AtomicBool,
 ) -> Result<Vec<PlannedRun>, Unresolved> {
-    let mut runs = Vec::with_capacity(config.steps.len() + 1);
+    let mut runs = Vec::with_capacity(config.steps.len() + config.files.len() + 1);
     if let Some(packages) = package_work(config) {
         let facts = facts.ok_or_else(|| "packages: the probe has not run".to_owned())?;
         let reason = |why: String| format!("packages: {why}");
@@ -605,9 +776,11 @@ pub fn resolve(
                 sudo_secret: sudo_secret.map(str::to_owned),
                 plugin: None,
                 timeout: packages.timeout(),
+                file: None,
             });
         }
     }
+    runs.extend(files::runs(config, sources, target, facts)?);
     let no_args = serde_json::Map::new();
     for step in &config.steps {
         match step.kind() {
@@ -630,6 +803,7 @@ pub fn resolve(
                     sudo_secret: None,
                     plugin: Some(name.to_owned()),
                     timeout: RUN_TIMEOUT,
+                    file: None,
                 });
             }
             StepKind::Run(run) => runs.push(PlannedRun {
@@ -638,6 +812,7 @@ pub fn resolve(
                 sudo_secret: None,
                 plugin: None,
                 timeout: RUN_TIMEOUT,
+                file: None,
             }),
         }
     }
@@ -841,7 +1016,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::config::Step;
+    use crate::config::{FileEntry, ModeValue, Step};
     use crate::inventory::TargetKind;
     use crate::test_util::{FakePlugins, json, keys};
 
@@ -861,6 +1036,11 @@ mod tests {
         tty_fail: Option<TransportError>,
         /// The timeout of each `run` and `run_tty`, in order.
         timeouts: Rc<RefCell<Vec<Duration>>>,
+        /// A `run` script containing the text prints `shell-err` on stderr
+        /// and exits with the code.
+        exits: &'static [(&'static str, i32)],
+        /// Set once a `run` script containing the text has run.
+        cancel_on: Option<(&'static str, Rc<AtomicBool>)>,
     }
 
     impl Fake {
@@ -874,6 +1054,8 @@ mod tests {
                 typed: Rc::default(),
                 tty_fail: None,
                 timeouts: Rc::default(),
+                exits: &[],
+                cancel_on: None,
             }
         }
     }
@@ -894,6 +1076,22 @@ mod tests {
                 && ran > self.succeed
             {
                 return Err(err.clone());
+            }
+            if let Some((needle, cancel)) = &self.cancel_on
+                && script.contains(needle)
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            if let Some((_, code)) = self
+                .exits
+                .iter()
+                .find(|(needle, _)| script.contains(needle))
+            {
+                return Ok(Output {
+                    stderr: b"shell-err\n".to_vec(),
+                    code: Some(*code),
+                    ..Output::default()
+                });
             }
             Ok(match script {
                 facts::PROBE => Output {
@@ -985,6 +1183,7 @@ mod tests {
             &target(name),
             Ok(Box::new(fake)),
             &config(None, runs),
+            &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
@@ -1030,6 +1229,7 @@ mod tests {
             code,
             stdout: stdout.to_owned(),
             stderr: stderr.to_owned(),
+            skipped: false,
         }
     }
 
@@ -1086,6 +1286,7 @@ mod tests {
             &target("box"),
             Err(TransportError::Spawn("HOME is not set".to_owned())),
             &config(None, &["one"]),
+            &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
@@ -1429,6 +1630,7 @@ mod tests {
                 }))
             },
             &config(None, runs),
+            &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
             &cancel,
@@ -1543,6 +1745,7 @@ mod tests {
             &target(name),
             Ok(Box::new(fake)),
             &config(Some(packages), runs),
+            &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
@@ -1619,6 +1822,7 @@ mod tests {
                 ..Fake::new(&log)
             })),
             &config(Some(&packages(&["git"], false)), &["one"]),
+            &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
@@ -1662,6 +1866,7 @@ mod tests {
                 ..Fake::new(&log)
             })),
             &config(Some(&pkgs), &["one"]),
+            &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
@@ -1695,6 +1900,7 @@ mod tests {
                 }))
             },
             &config(Some(packages), runs),
+            &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(cancelled),
@@ -1745,6 +1951,7 @@ mod tests {
             &target("a"),
             Ok(Box::new(Fake::new(&log))),
             &config(Some(&pkgs), &["one"]),
+            &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(true),
@@ -1806,6 +2013,7 @@ mod tests {
             &target("local"),
             Ok(Box::new(fake)),
             &config(Some(&local_sudo(packages(&["git"], false))), &["one"]),
+            &Sources::default(),
             &FakePlugins::none(),
             &local_passwords(password),
             &AtomicBool::new(false),
@@ -1839,6 +2047,7 @@ mod tests {
                 &target("local"),
                 Ok(Box::new(fake)),
                 &config(Some(&pkgs), &["one", "two"]),
+                &Sources::default(),
                 &FakePlugins::none(),
                 &passwords,
                 &AtomicBool::new(false),
@@ -2013,6 +2222,7 @@ mod tests {
             &target("local"),
             Ok(Box::new(fake)),
             &config(Some(&packages(&["git"], false)), &["one"]),
+            &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
             &AtomicBool::new(false),
@@ -2047,6 +2257,7 @@ mod tests {
             sudo_secret: sudo_secret.map(str::to_owned),
             plugin: None,
             timeout,
+            file: None,
         }
     }
 
@@ -2057,7 +2268,15 @@ mod tests {
         config: &Config,
     ) -> Result<Vec<PlannedRun>, String> {
         let cancel = AtomicBool::new(false);
-        resolve(target, facts, config, &FakePlugins::none(), &cancel).map_err(|err| match err {
+        resolve(
+            target,
+            facts,
+            config,
+            &Sources::default(),
+            &FakePlugins::none(),
+            &cancel,
+        )
+        .map_err(|err| match err {
             Unresolved::Failed(error) => error,
             Unresolved::Cancelled => panic!("cancelled"),
         })
@@ -2141,6 +2360,7 @@ mod tests {
             sudo_secret: None,
             plugin: Some(name.to_owned()),
             timeout: RUN_TIMEOUT,
+            file: None,
         }
     }
 
@@ -2155,7 +2375,15 @@ mod tests {
             Some(serde_json::json!({"profile": "ssh"})),
         );
         let cancel = AtomicBool::new(false);
-        let runs = resolve(&host, Some(&facts(ARCH_ROOT)), &config, &plugins, &cancel).unwrap();
+        let runs = resolve(
+            &host,
+            Some(&facts(ARCH_ROOT)),
+            &config,
+            &Sources::default(),
+            &plugins,
+            &cancel,
+        )
+        .unwrap();
         assert_eq!(
             runs,
             [
@@ -2183,6 +2411,7 @@ mod tests {
             &target("local"),
             Some(&facts(ARCH_ROOT)),
             &config,
+            &Sources::default(),
             &plugins,
             &cancel,
         )
@@ -2201,6 +2430,7 @@ mod tests {
                 &target("box"),
                 None,
                 &config,
+                &Sources::default(),
                 &plugins,
                 &AtomicBool::new(false)
             ),
@@ -2220,6 +2450,7 @@ mod tests {
                 ..Fake::new(&log)
             })),
             &with_plugin(&[], &["harden"], None),
+            &Sources::default(),
             &FakePlugins::new(|_, _| Ok("hostname".to_owned())),
             &Passwords::new(),
             &AtomicBool::new(false),
@@ -2250,6 +2481,7 @@ mod tests {
                 }))
             },
             &with_plugin(&["one"], &["harden"], None),
+            &Sources::default(),
             &plugins,
             &Passwords::new(),
             &AtomicBool::new(false),
@@ -2285,6 +2517,7 @@ mod tests {
                 ..Fake::new(&log)
             })),
             &with_plugin(&["one"], &["harden", "audit"], None),
+            &Sources::default(),
             &plugins,
             &Passwords::new(),
             &cancel,
@@ -2312,6 +2545,7 @@ mod tests {
                 &target("box"),
                 Some(&facts(ARCH_ROOT)),
                 &with_plugin(&[], &["harden"], None),
+                &Sources::default(),
                 &plugins,
                 &AtomicBool::new(true)
             ),
@@ -2339,6 +2573,7 @@ mod tests {
                     ..Fake::new(&log)
                 })),
                 &with_plugin(&["one"], &["harden"], None),
+                &Sources::default(),
                 &FakePlugins::none(),
                 &Passwords::new(),
                 &AtomicBool::new(false),
@@ -2414,6 +2649,7 @@ mod tests {
                 }))
             },
             &config(Some(&pkgs), &[]),
+            &Sources::default(),
             &FakePlugins::none(),
             &passwords,
             &AtomicBool::new(false),
@@ -2430,11 +2666,11 @@ mod tests {
     /// Calls [`load_passwords`] with a store builder that counts its calls.
     fn load(
         targets: &[Target],
-        packages: Option<&Packages>,
+        config: &Config,
         store: impl Fn() -> Box<dyn Store>,
     ) -> (Result<Passwords, Failure>, u32) {
         let built = std::cell::Cell::new(0);
-        let result = load_passwords(targets, packages, || {
+        let result = load_passwords(targets, config, || {
             built.set(built.get() + 1);
             Ok(store())
         });
@@ -2463,19 +2699,23 @@ mod tests {
             (vec![target("local"), host.clone()], Some(&pkgs)),
             (vec![host.clone()], Some(&local_secret)),
         ] {
-            let (result, built) = load(&targets, packages, locked);
+            let (result, built) = load(&targets, &config(packages, &[]), locked);
             assert!(result.unwrap().is_empty());
             assert_eq!(built, 0, "nothing needs a password");
         }
 
-        let (result, built) = load(&[target("local")], Some(&local_secret), || {
-            assert_eq!(
-                rustix::process::getrlimit(rustix::process::Resource::Core).current,
-                Some(0),
-                "core dumps are off before the store opens"
-            );
-            locked()
-        });
+        let (result, built) = load(
+            &[target("local")],
+            &config(Some(&local_secret), &[]),
+            || {
+                assert_eq!(
+                    rustix::process::getrlimit(rustix::process::Resource::Core).current,
+                    Some(0),
+                    "core dumps are off before the store opens"
+                );
+                locked()
+            },
+        );
         assert_eq!(built, 1);
         let failure = result.unwrap_err();
         assert_eq!(failure.message, SecretError::Locked.to_string());
@@ -2492,7 +2732,7 @@ mod tests {
         gone.sudo_secret = Some("GONE".to_owned());
         let (result, built) = load(
             &[target("local"), host.clone(), gone, host],
-            Some(&local_secret),
+            &config(Some(&local_secret), &[]),
             memory,
         );
         assert_eq!(built, 1);
@@ -2505,6 +2745,429 @@ mod tests {
             got,
             [("BOX_SUDO", &b"box-pw"[..]), ("LOCAL_SUDO", b"pw\n")],
             "one trailing newline trimmed; unset and unused names absent"
+        );
+    }
+
+    const FILE_TEXT: &str = "token = file-bytes-never-shown\n";
+
+    /// A `[[files]]` entry copying `src.txt` to `dest` (mode 0644) on targets
+    /// with `tags`.
+    fn file_entry(dest: &str, tags: &[&str], sudo: bool) -> FileEntry {
+        FileEntry {
+            src: "src.txt".to_owned(),
+            dest: dest.to_owned(),
+            mode: Some(ModeValue::Text("0644".to_owned())),
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            facts: BTreeMap::new(),
+            sudo,
+        }
+    }
+
+    /// `files`, each with src [`FILE_TEXT`], before the `[[steps]]` `runs`.
+    fn with_files(packages: Option<&Packages>, files: Vec<FileEntry>, runs: &[&str]) -> Config {
+        Config {
+            files,
+            ..config(packages, runs)
+        }
+    }
+
+    fn file_sources(config: &Config) -> Sources {
+        Sources::of(&vec![FILE_TEXT; config.files.len()])
+    }
+
+    /// Applies `config` to `target` over a [`Fake`] probing as `probe`, with
+    /// `passwords`; returns the report, the scripts run and the passwords
+    /// typed.
+    fn apply_files(
+        target: &Target,
+        config: &Config,
+        probe: &'static str,
+        passwords: &Passwords,
+    ) -> (TargetReport, Vec<String>, Vec<Vec<u8>>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let fake = Fake {
+            probe,
+            ..Fake::new(&log)
+        };
+        let typed = Rc::clone(&fake.typed);
+        let report = apply_target(
+            target,
+            Ok(Box::new(fake)),
+            config,
+            &file_sources(config),
+            &FakePlugins::none(),
+            passwords,
+            &AtomicBool::new(false),
+        );
+        let runs = log.borrow().clone();
+        let typed = typed.borrow().clone();
+        (report, runs, typed)
+    }
+
+    #[test]
+    fn files_run_after_the_package_step_and_before_the_steps() {
+        let config = with_files(
+            Some(&packages(&["git"], false)),
+            vec![
+                file_entry("/etc/a.conf", &["local"], true),
+                file_entry("/etc/b.conf", &["web"], true),
+            ],
+            &["one"],
+        );
+        let (report, runs, typed) =
+            apply_files(&target("local"), &config, ARCH_ROOT, &Passwords::new());
+        assert!(report.ok(), "{report:?}");
+        assert!(typed.is_empty());
+        assert_eq!(
+            runs.len(),
+            4,
+            "probe, packages, one file, one step: {runs:?}"
+        );
+        assert_eq!(runs[0], facts::PROBE);
+        assert!(runs[1].contains("pacman"), "{}", runs[1]);
+        assert!(runs[2].contains("'/etc/a.conf'"), "{}", runs[2]);
+        assert!(!runs[2].contains("sudo"), "root writes without sudo");
+        assert_eq!(runs[3], "one");
+        assert!(
+            !runs.iter().any(|run| run.contains("/etc/b.conf")),
+            "the unmatched entry runs nothing"
+        );
+        let steps = report.steps();
+        let shown: Vec<(&str, bool)> = steps
+            .iter()
+            .map(|step| (step.run.as_str(), step.skipped))
+            .skip(1)
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("file /etc/a.conf", false),
+                ("skipped file /etc/b.conf: no match", true),
+                ("one", false)
+            ]
+        );
+        assert_eq!(
+            steps[2],
+            StepReport {
+                run: "skipped file /etc/b.conf: no match".to_owned(),
+                code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                skipped: true,
+            }
+        );
+        let value = json(&report);
+        assert_eq!(value["steps"][2]["skipped"], true);
+        assert_eq!(
+            keys(&value["steps"][1]),
+            ["code", "run", "stderr", "stdout"],
+            "skipped only when true"
+        );
+        assert_eq!(report.failure(), None);
+    }
+
+    #[test]
+    fn a_skipped_file_step_shows_only_its_label() {
+        let report = TargetReport::Ran {
+            target: "pi".to_owned(),
+            steps: vec![StepReport::skipped("skipped file /etc/b.conf: no match")],
+            ok: true,
+        };
+        assert_eq!(
+            screen(&report, piped()),
+            "▶ pi\n  $ skipped file /etc/b.conf: no match\n  ✔ ok · 1 step\n\n"
+        );
+    }
+
+    #[test]
+    fn files_alone_probe_the_target() {
+        let config = with_files(None, vec![file_entry("/etc/a.conf", &[], false)], &[]);
+        let (report, runs, _) =
+            apply_files(&target("local"), &config, ARCH_NOPASSWD, &Passwords::new());
+        assert!(report.ok(), "{report:?}");
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!(runs[0], facts::PROBE);
+        assert!(!runs[1].contains("sudo"), "sudo = false: {}", runs[1]);
+    }
+
+    #[test]
+    fn a_nopasswd_target_writes_through_sudo_n_tee() {
+        let config = with_files(None, vec![file_entry("/etc/a.conf", &[], true)], &[]);
+        let (report, runs, typed) =
+            apply_files(&target("local"), &config, ARCH_NOPASSWD, &Passwords::new());
+        assert!(report.ok(), "{report:?}");
+        assert!(typed.is_empty(), "no terminal run");
+        assert!(runs[1].contains("sudo -n tee '/etc/a.conf'"), "{}", runs[1]);
+    }
+
+    /// `local` with sudo secret `LOCAL_SUDO`, and a config copying one
+    /// `sudo = true` file to `/etc/b.conf` before the step `one`.
+    fn password_file() -> (Target, Config) {
+        let mut local = target("local");
+        local.sudo_secret = Some("LOCAL_SUDO".to_owned());
+        let config = with_files(None, vec![file_entry("/etc/b.conf", &[], true)], &["one"]);
+        (local, config)
+    }
+
+    /// Applies [`password_file`] over `fake`, which logs to `log` and probes
+    /// as `ARCH_SUDO`, with `LOCAL_SUDO` holding `password` (unset when
+    /// `None`); returns the report, the scripts run and the passwords typed.
+    fn apply_password_file(
+        log: &Rc<RefCell<Vec<String>>>,
+        fake: Fake,
+        password: Option<&[u8]>,
+    ) -> (TargetReport, Vec<String>, Vec<Vec<u8>>) {
+        let (local, config) = password_file();
+        let typed = Rc::clone(&fake.typed);
+        let cancel = fake
+            .cancel_on
+            .as_ref()
+            .map_or_else(Rc::default, |(_, flag)| Rc::clone(flag));
+        let report = apply_target(
+            &local,
+            Ok(Box::new(Fake {
+                probe: ARCH_SUDO,
+                ..fake
+            })),
+            &config,
+            &file_sources(&config),
+            &FakePlugins::none(),
+            &local_passwords(password),
+            &cancel,
+        );
+        let runs = log.borrow().clone();
+        let typed = typed.borrow().clone();
+        (report, runs, typed)
+    }
+
+    /// The temp file a cleanup script removes.
+    fn temp_of(cleanup: &str) -> &str {
+        let temp = cleanup
+            .strip_prefix("rm -f '")
+            .and_then(|rest| rest.strip_suffix('\''))
+            .unwrap_or_else(|| panic!("not a cleanup: {cleanup}"));
+        assert!(temp.starts_with("/tmp/anvil-"), "{temp}");
+        temp
+    }
+
+    #[test]
+    fn a_password_file_is_staged_then_installed_on_a_terminal_then_removed() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let (report, runs, typed) =
+            apply_password_file(&log, Fake::new(&log), Some(PASSWORD.as_bytes()));
+        assert!(report.ok(), "{report:?}");
+        assert_eq!(
+            runs.len(),
+            5,
+            "probe, stage, install, cleanup, one: {runs:?}"
+        );
+        let (stage, install, cleanup) = (&runs[1], &runs[2], &runs[3]);
+        let temp = temp_of(cleanup);
+        assert!(stage.starts_with("{ umask 077; set -C; "), "{stage}");
+        assert!(stage.contains(FILE_TEXT) && stage.contains(temp));
+        assert!(install.starts_with("export TERM=dumb\n"), "{install}");
+        assert!(
+            install.contains(&format!("sudo install -m 0644 '{temp}' '/etc/b.conf'")),
+            "{install}"
+        );
+        assert!(
+            !install.contains(FILE_TEXT),
+            "the terminal run carries paths only"
+        );
+        assert_eq!(runs[4], "one");
+        assert_eq!(typed, [PASSWORD.as_bytes()]);
+        assert_eq!(
+            report.steps()[0],
+            step("file /etc/b.conf", Some(0), "tty-out\n", "ssh-err\n")
+        );
+        let shown = json(&report).to_string();
+        assert!(
+            !shown.contains(FILE_TEXT.trim_end()) && !shown.contains(PASSWORD),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_failed_stage_installs_nothing_and_still_removes_the_temp_file() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let fake = Fake {
+            exits: &[("set -C", 1)],
+            ..Fake::new(&log)
+        };
+        let (report, runs, typed) = apply_password_file(&log, fake, Some(PASSWORD.as_bytes()));
+        assert_eq!(report.failure().unwrap(), "step 1 exited 1");
+        assert_eq!(
+            report.steps(),
+            [step(
+                "file /etc/b.conf",
+                Some(1),
+                "",
+                "files: could not stage the file\n"
+            )],
+            "not what the shell printed, which names the temp file"
+        );
+        assert_eq!(runs.len(), 3, "probe, stage, cleanup: {runs:?}");
+        temp_of(&runs[2]);
+        assert!(typed.is_empty());
+
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let fake = Fake {
+            fail_with: Some(TransportError::HostKey),
+            succeed: 1,
+            ..Fake::new(&log)
+        };
+        let (report, runs, typed) = apply_password_file(&log, fake, Some(PASSWORD.as_bytes()));
+        assert_eq!(
+            report.failure().unwrap(),
+            TransportError::HostKey.to_string()
+        );
+        assert!(report.steps().is_empty());
+        assert_eq!(runs.len(), 3, "the cleanup is tried too: {runs:?}");
+        temp_of(&runs[2]);
+        assert!(typed.is_empty());
+    }
+
+    #[test]
+    fn a_cancel_after_the_stage_removes_the_temp_file_and_installs_nothing() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let fake = Fake {
+            cancel_on: Some(("set -C", Rc::new(AtomicBool::new(false)))),
+            ..Fake::new(&log)
+        };
+        let (report, runs, typed) = apply_password_file(&log, fake, Some(PASSWORD.as_bytes()));
+        assert!(
+            matches!(report, TargetReport::Cancelled { .. }),
+            "{report:?}"
+        );
+        assert!(report.steps().is_empty());
+        assert_eq!(runs.len(), 3, "probe, stage, cleanup: {runs:?}");
+        temp_of(&runs[2]);
+        assert!(typed.is_empty(), "no password is typed");
+    }
+
+    #[test]
+    fn a_failed_terminal_run_names_the_secret_and_still_removes_the_temp_file() {
+        let timeout = TransportError::Timeout {
+            after: RUN_TIMEOUT,
+            output: None,
+        };
+        for (err, want) in [
+            (
+                TransportError::PasswordRejected,
+                "files: sudo rejected the password from secret LOCAL_SUDO".to_owned(),
+            ),
+            (
+                TransportError::NoPrompt,
+                "files: sudo did not show anvil's prompt (secret LOCAL_SUDO)".to_owned(),
+            ),
+            (timeout.clone(), timeout.to_string()),
+        ] {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let fake = Fake {
+                tty_fail: Some(err),
+                ..Fake::new(&log)
+            };
+            let (report, runs, typed) = apply_password_file(&log, fake, Some(PASSWORD.as_bytes()));
+            assert_eq!(report.failure().unwrap(), want);
+            assert_eq!(runs.len(), 4, "probe, stage, install, cleanup: {runs:?}");
+            temp_of(&runs[3]);
+            assert_eq!(typed, [PASSWORD.as_bytes()]);
+            assert!(!format!("{report:?}").contains(PASSWORD));
+        }
+    }
+
+    #[test]
+    fn a_cleanup_on_a_dead_transport_keeps_the_step_result() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        // The probe, the stage and the terminal run pass; the cleanup and
+        // `one` hit the dead transport.
+        let fake = Fake {
+            fail_with: Some(TransportError::HostKey),
+            succeed: 3,
+            ..Fake::new(&log)
+        };
+        let (report, runs, _) = apply_password_file(&log, fake, Some(PASSWORD.as_bytes()));
+        temp_of(&runs[3]);
+        assert_eq!(
+            report.steps(),
+            [step("file /etc/b.conf", Some(0), "tty-out\n", "ssh-err\n")]
+        );
+        assert_eq!(
+            report.failure().unwrap(),
+            TransportError::HostKey.to_string(),
+            "only `one` failed"
+        );
+    }
+
+    #[test]
+    fn an_unset_secret_fails_its_target_before_staging_and_the_others_run() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let (report, runs, _) = apply_password_file(&log, Fake::new(&log), None);
+        assert_eq!(
+            report.failure().unwrap(),
+            "files: secret LOCAL_SUDO is not set"
+        );
+        assert_eq!(runs, [facts::PROBE], "nothing staged");
+
+        let (local, config) = password_file();
+        let mut unset = target("b");
+        unset.sudo_secret = Some("B_SUDO".to_owned());
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let report = apply_targets(
+            &[unset, local],
+            |_| {
+                Ok(Box::new(Fake {
+                    probe: ARCH_SUDO,
+                    ..Fake::new(&log)
+                }))
+            },
+            &config,
+            &file_sources(&config),
+            &FakePlugins::none(),
+            &local_passwords(Some(PASSWORD.as_bytes())),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        );
+        assert_eq!(report.counts(), (1, 1), "{report:?}");
+        assert_eq!(
+            report.targets[0].failure().unwrap(),
+            "files: secret B_SUDO is not set"
+        );
+    }
+
+    #[test]
+    fn the_store_opens_for_files_only_when_a_sudo_entry_may_apply() {
+        use crate::secret::SecretError;
+        use crate::test_util::Unopenable;
+
+        let locked = || -> Box<dyn Store> { Box::new(Unopenable::new(|| SecretError::Locked)) };
+        let mut local = target("local");
+        local.sudo_secret = Some("LOCAL_SUDO".to_owned());
+        for files in [
+            vec![file_entry("/home/u/a", &[], false)],
+            vec![file_entry("/etc/a", &["web"], true)],
+        ] {
+            let (result, built) = load(&[local.clone()], &with_files(None, files, &[]), locked);
+            assert!(result.unwrap().is_empty());
+            assert_eq!(built, 0, "sudo = false or no tag match: no store");
+        }
+        let (result, built) = load(
+            &[target("local")],
+            &with_files(None, vec![file_entry("/etc/a", &[], true)], &[]),
+            locked,
+        );
+        assert!(result.unwrap().is_empty());
+        assert_eq!(built, 0, "a target without a secret: no store");
+
+        let memory = || -> Box<dyn Store> {
+            Box::new(crate::secret::Memory::with(&[("LOCAL_SUDO", b"pw\n")]))
+        };
+        let config = with_files(None, vec![file_entry("/etc/a", &["local"], true)], &[]);
+        let (result, built) = load(&[local], &config, memory);
+        assert_eq!(built, 1);
+        assert_eq!(
+            result.unwrap().get("LOCAL_SUDO").map(|pw| pw.as_slice()),
+            Some(&b"pw"[..])
         );
     }
 }

@@ -15,6 +15,9 @@ system OpenSSH client.
   then runs the config's steps. It runs directly, with no prompt. `[packages.alias]` names a package per manager, so
   `fd` installs as `fd-find` on apt and dnf. `remove` removes packages that are installed, and `pin` keeps a package
   out of the upgrade on pacman and dnf (brew, apt and apk refuse it).
+- **`[[files]]`** copies a text file onto each selected target whose tags and facts match, after the package step and
+  before `[[steps]]`. The write goes through sudo unless the entry sets `sudo = false`, and a rerun with the same bytes
+  prints `unchanged`. The file's bytes are never printed, not in the output and not in `--json`.
 - **`anvil plan`** shows the steps apply would run on each target and runs none of them; `--json` marks the document
   `"executed": false`.
 - **`anvil run FILE`** (or `-` for stdin) runs one ad-hoc POSIX sh script on every target, one after another, with
@@ -46,11 +49,11 @@ Pre-built binaries: see [Getting started](docs/getting-started.md#pre-built-bina
 
 ```sh
 anvil inventory            # add your hosts (opens $EDITOR, default nvim)
-anvil config               # edit the preferences, packages and steps
+anvil config               # edit the preferences, packages, files and steps
 anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secrets] says otherwise)
 anvil doctor               # local checks + every target's facts and reachability
 anvil plan                 # the steps apply would run on every target, running none
-anvil apply                # install packages and run the steps on every target
+anvil apply                # install packages, copy matching files and run the steps
 anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
 anvil tui                  # all of the above in one terminal UI
 ```
@@ -77,6 +80,19 @@ install = ["git"]
 pin = ["vim"]
 remove = ["nano"]
 upgrade = true
+```
+
+A file copied onto each selected target that carries the tag `linode` and whose `distro` fact is `arch`
+([Files](docs/configuration.md#files)). `mode` is required and quoted. The bytes are not printed
+([File steps](docs/cli.md#file-steps)):
+
+```toml
+[[files]]
+src = "files/sshd_config"      # beside the config file
+dest = "/etc/ssh/sshd_config"  # absolute path on the target
+mode = "0644"
+tags = ["linode"]              # every listed tag; omit to skip the tag check
+facts = { distro = "arch" }    # each value equals that fact; omit to skip it
 ```
 
 A step whose script comes from a plugin ([Plugin steps](docs/cli.md#plugin-steps)). anvil runs only the file the

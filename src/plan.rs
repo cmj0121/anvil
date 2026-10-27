@@ -6,7 +6,9 @@
 //! [`apply::resolve`] lists its steps. The secret store is never opened: a
 //! step that would type a sudo password names its secret, and whether that
 //! secret is set is `anvil doctor`'s job. A plugin step runs its plugin, on
-//! the controller only, to list the script it returns.
+//! the controller only, to list the script it returns. Each `[[files]]`
+//! src is read before any target, as apply reads it; its bytes are never
+//! shown.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +18,7 @@ use serde::Serialize;
 use crate::apply::{self, Escape, Line, PlannedRun, Style, Unresolved, print_lines};
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
+use crate::files::{self, Sources};
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, YELLOW, paint};
 use crate::options::Options;
@@ -77,7 +80,8 @@ pub enum Progress<'a> {
     Done(&'a PlanReport),
 }
 
-/// Loads the targets and plans `config` for each, as [`plan_targets`].
+/// Loads the targets and plans `config` for each, as [`plan_targets`]. A
+/// `[[files]]` src that cannot be read fails the command before any target.
 pub fn run_targets(
     opts: &Options,
     config: &Config,
@@ -86,10 +90,12 @@ pub fn run_targets(
 ) -> Result<Plan, Failure> {
     let targets = opts.targets()?;
     let pins = plugin::verify(config).map_err(Failure::usage)?;
+    let sources = files::load(config).map_err(Failure::usage)?;
     Ok(plan_targets(
         &targets,
         |target| opts.transport(target),
         config,
+        &sources,
         &pins,
         cancel,
         on,
@@ -102,6 +108,7 @@ pub fn plan_targets(
     targets: &[Target],
     transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError>,
     config: &Config,
+    sources: &Sources,
     plugins: &dyn Plugins,
     cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
@@ -112,7 +119,7 @@ pub fn plan_targets(
         let report = if cancel.load(Ordering::Relaxed) {
             cancelled(target)
         } else {
-            plan_target(target, transport(target), config, plugins, cancel)
+            plan_target(target, transport(target), config, sources, plugins, cancel)
         };
         on(Progress::Done(&report));
         reports.push(report);
@@ -139,6 +146,7 @@ fn plan_target(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
     config: &Config,
+    sources: &Sources,
     plugins: &dyn Plugins,
     cancel: &AtomicBool,
 ) -> PlanReport {
@@ -147,7 +155,7 @@ fn plan_target(
         .map_err(|err| err.to_string())
         .and_then(|transport| apply::probe(transport.as_ref(), config))
         .map_err(Unresolved::Failed)
-        .and_then(|facts| apply::resolve(target, Some(&facts), config, plugins, cancel));
+        .and_then(|facts| apply::resolve(target, Some(&facts), config, sources, plugins, cancel));
     match runs {
         Ok(steps) => {
             log::info!("plan {}: {} steps", target.name, steps.len());
@@ -364,10 +372,14 @@ mod tests {
             &target("local"),
             Some(facts),
             config,
+            &Sources::default(),
             &FakePlugins::none(),
             &cancel,
         )
     }
+
+    /// The src text of each `[[files]]` entry [`plan`] plans.
+    const FILE_TEXT: &str = "token = file-bytes-never-shown\n";
 
     /// Plans `config` for each of `names` over [`Recorder`]s probing as
     /// `probe`, the transport of `unreachable` failing; returns the plan
@@ -407,6 +419,7 @@ mod tests {
                 }))
             },
             config,
+            &Sources::of(&vec![FILE_TEXT; config.files.len()]),
             plugins,
             &AtomicBool::new(cancelled),
             &mut |progress| {
@@ -431,6 +444,47 @@ mod tests {
     }
 
     #[test]
+    fn each_file_is_a_step_after_packages_and_its_bytes_never_show() {
+        use crate::config::{FileEntry, ModeValue};
+
+        let file = |dest: &str, tags: &[&str]| FileEntry {
+            src: "src.txt".to_owned(),
+            dest: dest.to_owned(),
+            mode: Some(ModeValue::Text("0644".to_owned())),
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            facts: Default::default(),
+            sudo: true,
+        };
+        let config = Config {
+            files: vec![file("/etc/a.conf", &[]), file("/etc/b.conf", &["web"])],
+            ..config(Some(git()), &["one"])
+        };
+        let (plan, runs) = plan(&["local"], None, ARCH_SUDO, &config, false);
+        assert_eq!(runs, [facts::PROBE], "no step ran");
+        assert_eq!(
+            screen(&plan.targets[0]),
+            "▶ local\n  \
+             would $ sudo -n pacman -S --noconfirm --needed git (sudo password from secret LOCAL_SUDO)\n  \
+             would $ file /etc/a.conf (sudo password from secret LOCAL_SUDO)\n  \
+             would $ skipped file /etc/b.conf: no match\n  \
+             would $ one\n  \
+             ✔ 4 steps\n\n"
+        );
+        let value = json(&plan);
+        assert_eq!(
+            value["targets"][0]["steps"][1],
+            serde_json::json!({"run": "file /etc/a.conf", "sudo_secret": "LOCAL_SUDO"})
+        );
+        assert_eq!(
+            value["targets"][0]["steps"][2],
+            serde_json::json!({"run": "skipped file /etc/b.conf: no match"})
+        );
+        let shown = value.to_string();
+        assert!(!shown.contains("file-bytes-never-shown"), "{shown}");
+        assert!(!shown.contains("head -c"), "no script: {shown}");
+    }
+
+    #[test]
     fn only_the_probe_runs_and_the_package_step_names_its_secret() {
         let config = config(Some(git()), &["one", "two"]);
         let (plan, runs) = plan(&["local", "b"], None, ARCH_SUDO, &config, false);
@@ -446,6 +500,7 @@ mod tests {
                     sudo_secret: Some("LOCAL_SUDO".to_owned()),
                     plugin: None,
                     timeout: git().timeout(),
+                    file: None,
                 },
                 PlannedRun {
                     run: "one".to_owned(),
@@ -453,6 +508,7 @@ mod tests {
                     sudo_secret: None,
                     plugin: None,
                     timeout: RUN_TIMEOUT,
+                    file: None,
                 },
                 PlannedRun {
                     run: "two".to_owned(),
@@ -460,6 +516,7 @@ mod tests {
                     sudo_secret: None,
                     plugin: None,
                     timeout: RUN_TIMEOUT,
+                    file: None,
                 },
             ],
             ok: true,
@@ -613,6 +670,7 @@ mod tests {
             &[target("a")],
             |_| Ok(Box::new(Failing)),
             &config(None, &["one"]),
+            &Sources::default(),
             &FakePlugins::none(),
             &AtomicBool::new(false),
             &mut |_| {},

@@ -155,7 +155,11 @@ cannot be resolved, or a `pin` on brew, apt or apk, fails it with `packages: REA
 [Packages](packages.md)). When the target's sudo asks for a password and it has a sudo secret, that step runs on a
 terminal and anvil types the password at sudo's prompt ([Typing the sudo password](packages.md#typing-the-sudo-password)); its
 `$` line is still the one-line script. Without `[packages]`, or with nothing to install, upgrade, pin or remove, no
-probe runs and apply runs only the `[[steps]]`, unless a step names a plugin ([Plugin steps](#plugin-steps)).
+probe runs and apply runs only the `[[steps]]`, unless a step names a plugin ([Plugin steps](#plugin-steps)) or the
+config has `[[files]]`.
+
+Each `[[files]]` entry is one step on every target, after the package step and before the `[[steps]]`: it copies the
+file when the target's tags and facts match and shows as skipped when they do not ([File steps](#file-steps)).
 
 Each `install` name goes into the script as the resolved manager's `[packages.alias]` entry, else as is
 ([Aliases](packages.md#aliases)). With this config apt and dnf install `fd-find`, and brew, pacman and apk `fd`; `anvil
@@ -247,12 +251,12 @@ the step was killed by a signal or timed out; a timed-out step is the last `step
 
 Shows the steps `anvil apply` would run on every selected target, and runs none of them. Each target is probed over its
 transport, even without `[packages]` work, so a target that cannot be reached fails here as it would under apply. Its
-steps then come from the same resolver apply uses: the package step when `[packages]` has work, then each `[[steps]]`
-entry. No package command and no `[[steps]]` script runs. A target that cannot be reached, probed or resolved fails
-with the same reason apply gives (`packages: REASON` for the probe, the manager and a `pin` on brew, apt or apk, such
-as `packages: pin is not one-shot on brew: vim`; without `[packages]` work a failed probe reads `probe: REASON`), and the
-other targets are still planned. plan runs each plugin step's plugin on the controller, as apply would, to list the script
-it returns ([Plugin steps](#plugin-steps)).
+steps then come from the same resolver apply uses: the package step when `[packages]` has work, then each `[[files]]`
+entry, then each `[[steps]]` entry. No package command, no file write and no `[[steps]]` script runs. A target that
+cannot be reached, probed or resolved fails with the same reason apply gives (`packages: REASON` for the probe, the
+manager and a `pin` on brew, apt or apk, such as `packages: pin is not one-shot on brew: vim`; without `[packages]` work
+a failed probe reads `probe: REASON`), and the other targets are still planned. plan runs each plugin step's plugin on
+the controller, as apply would, to list the script it returns ([Plugin steps](#plugin-steps)).
 
 plan never opens the secret store. A step that would type a sudo password says which secret it would use; whether that
 secret is set and free of control characters is not checked, so plan can pass where apply then fails with
@@ -429,6 +433,72 @@ A probe that exits non-zero or prints bad output fails the target with `probe: R
 can list the script; only the script is not run. A plugin must therefore have no side effects. It also runs again
 under apply, so a plugin that does not always give the same reply to the same request (one that reads the clock, a
 random number or a remote API) can make plan show a script that apply then does not run.
+
+### File steps
+
+A `[[files]]` entry copies one text file from beside the config onto each selected target whose tags and facts match
+([Files](configuration.md#files)):
+
+```toml
+[[files]]
+src = "files/sshd_config"
+dest = "/etc/ssh/sshd_config"
+mode = "0644"
+facts = { distro = "arch" }
+```
+
+Every entry is one step on every target, in config order, after the package step and before the `[[steps]]`. On a
+target that matches, the step shows as `$ file DEST` and prints `wrote DEST`, or `unchanged DEST` when dest already
+holds the same bytes (only `mode` is applied then). On a target that does not match, it is
+`$ skipped file DEST: no match` with no output: it runs nothing, counts in `✔ ok · N steps`, and the target's other
+steps still run. A step whose write fails ends the target like any step:
+
+```text
+▶ linode1
+  $ file /etc/ssh/sshd_config
+  wrote /etc/ssh/sshd_config
+  $ skipped file /etc/motd: no match
+  $ hostname
+  linode1
+  ✔ ok · 3 steps
+```
+
+`unchanged` needs `cmp` (diffutils) on the target; without it every run rewrites the file and prints `wrote DEST`.
+
+In `--json` a file step's `run` is that label. A skipped step has `"skipped": true`, `code` 0 and empty output:
+
+```json
+{ "run": "file /etc/ssh/sshd_config", "code": 0, "stdout": "wrote /etc/ssh/sshd_config\n", "stderr": "" }
+{ "run": "skipped file /etc/motd: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true }
+```
+
+`anvil plan` shows `would $ file DEST`, with `(sudo password from secret NAME)` when apply would take the password path,
+and `would $ skipped file DEST: no match`. In `plan --json` the `run` is the same label, with `sudo_secret` for the
+password path.
+
+The file's bytes are never printed: not in the human output, `--json`, `plan`, the `-v` logs or the ssh command line.
+The bytes go to the target on the script's stdin; on the password path they go to a mode-0600 `/tmp/anvil-` file
+first, which is removed after the step, on success, failure or cancel. A lost connection or a killed anvil (a Ctrl-C
+while the bytes are staged, say) can leave that file behind, readable only by the connecting user.
+
+A write as root, through sudo or on a root login, refuses a dest unless every directory on its path is owned by root
+and writable by neither its group nor others; the step fails with
+`files: DIR is not root-only; root will not write under it`, naming the first directory that fails, and writes
+nothing. A dest under a user's home therefore needs `sudo = false`. A write as root also refuses a dest that is a
+symlink and leaves the link and its target alone; the step fails with
+`files: DEST is a symlink; point dest at the real file`. A `sudo = false` write as the connecting user follows the
+link.
+
+`apply` and `plan` read every src before any target is contacted. A src that is missing, outside the config
+directory, not a regular file, over 1 MiB, or not text is exit 2, and one bad src stops the command for every target,
+those the entry does not match included:
+
+```text
+ERROR anvil: files[0].src `../nope`: cannot read: No such file or directory (os error 2)
+```
+
+The refusals, the matching rules and what lands on the target (owner, symlinks, a missing parent directory) are in
+[Files](configuration.md#files).
 
 ### `anvil run [--timeout SECS] <FILE|->`
 

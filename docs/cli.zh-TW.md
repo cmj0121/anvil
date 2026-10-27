@@ -154,7 +154,10 @@ facts 探測、解析其套件管理器，並將產生的腳本作為 step 1 執
 當 target 的 sudo 要求密碼且它有 sudo secret 時，該 step 在終端機上執行，
 anvil 會在 sudo 的提示處輸入密碼（[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)）；
 其 `$` 行仍是那行一行式腳本。沒有 `[packages]`，或沒有要安裝、升級、鎖定或移除的東西時，不會執行探測，apply 只執行 `[[steps]]`，
-除非有 step 指定 plugin（[Plugin steps](#plugin-steps)）。
+除非有 step 指定 plugin（[Plugin steps](#plugin-steps)），或 config 含有 `[[files]]`。
+
+每個 `[[files]]` 項目在每個 target 上都是一個 step，排在套件 step 之後、`[[steps]]` 之前：
+target 的 tag 與 fact 符合時複製檔案，不符合時顯示為略過（[File steps](#file-steps)）。
 
 每個 `install` 名稱在腳本中會換成解析出的管理器的 `[packages.alias]` 項目，沒有則原樣使用（[別名](packages.zh-TW.md#別名)）。
 以下面的 config 而言，apt 與 dnf 安裝 `fd-find`，brew、pacman 與 apk 安裝 `fd`；`anvil plan` 顯示相同的腳本：
@@ -243,8 +246,8 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 
 列出 `anvil apply` 會在每個選定 target 上執行的 step，但一個都不執行。
 每個 target 都會透過其傳輸執行探測，即使 `[packages]` 沒有事可做也一樣，因此無法連線的 target 在這裡就會像在 apply 中一樣失敗。
-接著由 apply 使用的同一個解析函式列出 step：`[packages]` 有事可做時先是套件 step，再來是每個 `[[steps]]` 項目。
-不會執行任何套件指令或 `[[steps]]` 腳本。
+接著由 apply 使用的同一個解析函式列出 step：`[packages]` 有事可做時先是套件 step，再來是每個 `[[files]]` 項目，
+然後是每個 `[[steps]]` 項目。不會執行任何套件指令、不會寫入任何檔案，也不會執行任何 `[[steps]]` 腳本。
 無法連線、探測或解析的 target 會以與 apply 相同的原因失敗（探測、套件管理器，以及在 brew、apt 或 apk 上的 `pin` 為
 `packages: REASON`，例如 `packages: pin is not one-shot on brew: vim`；`[packages]` 沒有事可做時，探測失敗為 `probe: REASON`），
 其他 target 仍會繼續規劃。plan 會像 apply 一樣，在控制端執行每個 plugin step 的 plugin，以列出它回傳的腳本
@@ -420,6 +423,66 @@ plan 顯示 `would $ SCRIPT (from plugin NAME)`，其 `--json` 的 step 帶有 `
 **plan 也會執行 plugin。** `anvil plan` 會像 apply 一樣在控制端執行每個 plugin step 的 plugin，才能列出腳本；只是不執行腳本。
 因此 plugin 不可以有副作用。它在 apply 時會再執行一次，所以對相同請求不一定給出相同回覆的 plugin
 （讀取時鐘、亂數或遠端 API 的 plugin）可能讓 plan 顯示的腳本與 apply 接著執行的不同。
+
+### File steps
+
+`[[files]]` 項目把 config 旁的一份文字檔複製到每個 tag 與 fact 都符合的選定 target（[Files](configuration.zh-TW.md#files)）：
+
+```toml
+[[files]]
+src = "files/sshd_config"
+dest = "/etc/ssh/sshd_config"
+mode = "0644"
+facts = { distro = "arch" }
+```
+
+每個項目在每個 target 上都是一個 step，依 config 順序排在套件 step 之後、`[[steps]]` 之前。
+在符合的 target 上，該 step 顯示為 `$ file DEST` 並印出 `wrote DEST`；dest 已是相同位元組時印出 `unchanged DEST`（此時只套用 `mode`）。
+在不符合的 target 上，它是沒有輸出的 `$ skipped file DEST: no match`：它不執行任何東西，計入 `✔ ok · N steps`，
+該 target 的其他 step 仍會執行。寫入失敗的 step 會像任何 step 一樣結束該 target：
+
+```text
+▶ linode1
+  $ file /etc/ssh/sshd_config
+  wrote /etc/ssh/sshd_config
+  $ skipped file /etc/motd: no match
+  $ hostname
+  linode1
+  ✔ ok · 3 steps
+```
+
+`unchanged` 需要 target 上有 `cmp`（diffutils）；沒有它時每次執行都會重寫檔案並印出 `wrote DEST`。
+
+在 `--json` 中，file step 的 `run` 就是該標籤。略過的 step 帶有 `"skipped": true`、`code` 為 0 且輸出為空：
+
+```json
+{ "run": "file /etc/ssh/sshd_config", "code": 0, "stdout": "wrote /etc/ssh/sshd_config\n", "stderr": "" }
+{ "run": "skipped file /etc/motd: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true }
+```
+
+`anvil plan` 顯示 `would $ file DEST`（apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
+與 `would $ skipped file DEST: no match`。在 `plan --json` 中 `run` 是同一個標籤，走密碼路徑時另有 `sudo_secret`。
+
+檔案的位元組絕不會印出：人類可讀輸出、`--json`、`plan`、`-v` 日誌與 ssh 命令列都不會包含它們。
+位元組透過腳本的 stdin 送到 target；走密碼路徑時先寫入一個 mode 0600 的 `/tmp/anvil-` 檔案，
+該檔案在 step 結束後移除，不論成功、失敗或取消。
+連線中斷或 anvil 被終止（例如在暫存位元組時按下 Ctrl-C）時，該檔案可能留下來，只有連線使用者能讀取。
+
+以 root 寫入（透過 sudo，或以 root 登入）時，除非 dest 路徑上的每個目錄都屬於 root，且其群組與其他人都不能寫入，
+否則拒絕該 dest：step 失敗並顯示 `files: DIR is not root-only; root will not write under it`，指出第一個不符合的目錄，
+且不寫入任何東西。因此位於使用者家目錄之下的 dest 需要 `sudo = false`。
+以 root 寫入時也會拒絕本身是 symlink 的 dest，連結與其目標都保持不動；
+step 失敗並顯示 `files: DEST is a symlink; point dest at the real file`。`sudo = false` 以連線使用者身分寫入時會跟隨連結。
+
+`apply` 與 `plan` 在連線任何 target 之前讀取每個 src。
+src 不存在、位於 config 目錄之外、不是一般檔案、超過 1 MiB 或不是文字時以 2 結束，
+而且只要一個 src 有問題，該指令就對每個 target 停止，包括該項目不符合的 target：
+
+```text
+ERROR anvil: files[0].src `../nope`: cannot read: No such file or directory (os error 2)
+```
+
+拒絕條件、比對規則，以及寫到 target 上的結果（擁有者、symlink、不存在的上層目錄）見 [Files](configuration.zh-TW.md#files)。
 
 ### `anvil run [--timeout SECS] <FILE|->`
 

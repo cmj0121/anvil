@@ -314,13 +314,21 @@ pub fn load_steps(opts: &Options) -> Result<Vec<StepRow>, String> {
 }
 
 /// The steps apply runs for `config`: `packages` first when it has work,
-/// then each step's command as its `$` line shows it, or `plugin <name>`
-/// for a plugin step, whose script is known only once it has run.
+/// then `file <dest>` for each `[[files]]` entry (a step on every target,
+/// skipped where it does not match), then each step's command as its `$`
+/// line shows it, or `plugin <name>` for a plugin step, whose script is
+/// known only once it has run.
 pub fn step_rows(config: &Config) -> Vec<StepRow> {
     let packages = config.packages.as_ref().is_some_and(|p| p.has_work());
     packages
         .then(|| "packages".to_owned())
         .into_iter()
+        .chain(
+            config
+                .files
+                .iter()
+                .map(|entry| format!("file {}", entry.dest)),
+        )
         .chain(config.steps.iter().map(|step| match step.kind() {
             StepKind::Plugin(name) => format!("plugin {name}"),
             StepKind::Run(run) => apply::command(run),
@@ -1171,6 +1179,7 @@ pub mod tests {
             code,
             stdout: stdout.to_owned(),
             stderr: stderr.to_owned(),
+            skipped: false,
         }
     }
 

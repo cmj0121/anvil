@@ -90,3 +90,31 @@ fn tui_refuses_json_and_a_missing_terminal_with_exit_two() {
         assert_eq!(text(&out.stderr), format!("ERROR anvil: {message}\n"));
     }
 }
+
+#[test]
+fn config_with_a_files_entry_whose_src_is_missing_still_opens() {
+    let sb = Sandbox::new("ac").without_debug_flags();
+    sb.write_config(
+        "config.toml",
+        "[[files]]\nsrc = \"missing/motd\"\ndest = \"/etc/motd\"\nmode = \"0644\"\n",
+    );
+    let out = sb.edit(&["config"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(!sb.config_dir().join("missing").exists());
+}
+
+#[test]
+fn config_with_a_bad_files_entry_exits_two_naming_the_entry() {
+    let sb = Sandbox::new("ac").without_debug_flags();
+    sb.write_config(
+        "config.toml",
+        "[[files]]\nsrc = \"motd\"\ndest = \"etc/motd\"\nmode = \"0644\"\n",
+    );
+    let out = sb.edit(&["config"], None, None);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("files[0].dest `etc/motd`: must be an absolute path"),
+        "{stderr}"
+    );
+}

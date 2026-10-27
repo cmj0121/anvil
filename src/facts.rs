@@ -10,7 +10,8 @@ pub const PROBE: &str = include_str!("probe.sh");
 
 const END_MARKER: &str = "anvil-probe-end=1";
 const MAX_OUTPUT: usize = 64 * 1024;
-const MAX_VALUE: usize = 256;
+/// Longest fact value, in bytes.
+pub(crate) const MAX_VALUE: usize = 256;
 /// The keys the probe prints, in its order.
 pub const KEYS: &[&str] = &[
     "hostname",
@@ -83,6 +84,12 @@ impl Facts {
     /// Whether the probe ran as root.
     pub fn is_root(&self) -> bool {
         self.get("user") == Some("root")
+    }
+
+    /// Whether sudo asks this target for a password: not root, and sudo
+    /// without NOPASSWD.
+    pub fn sudo_asks_password(&self) -> bool {
+        !self.is_root() && self.get("sudo") == Some("binary")
     }
 }
 

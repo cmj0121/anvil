@@ -1,0 +1,4 @@
+[[files]]
+src = "tool"
+dest = "/usr/local/bin/tool"
+mode = "4755"

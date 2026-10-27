@@ -8,6 +8,7 @@ mod doctor;
 mod document;
 mod editor;
 mod facts;
+mod files;
 mod inventory;
 mod logger;
 mod options;
