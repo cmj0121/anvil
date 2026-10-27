@@ -8,10 +8,6 @@ mod doctor;
 mod document;
 mod editor;
 mod facts;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "load and runs are for apply and plan")
-)]
 mod files;
 mod inventory;
 mod logger;

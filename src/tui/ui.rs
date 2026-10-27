@@ -310,7 +310,8 @@ fn draw_steps(app: &App, f: &mut Frame, area: Rect) {
 }
 
 /// Step `index`'s mark in a target's apply `report` (D2): `✔` or `✘` by
-/// its exit code once reported; past the report `⊘` (not run), except the
+/// its exit code once reported, `⊘` for a skipped `[[files]]` step; past
+/// the report `⊘` (not run), except the
 /// step a transport error ended with no timed-out step kept, `✘`; `·`
 /// before the target has a report.
 fn step_mark(report: Option<&TargetReport>, index: usize) -> (&'static str, Style) {
@@ -321,7 +322,9 @@ fn step_mark(report: Option<&TargetReport>, index: usize) -> (&'static str, Styl
     };
     let steps = report.steps();
     if let Some(step) = steps.get(index) {
-        return if step.code == Some(0) {
+        return if step.skipped {
+            skipped
+        } else if step.code == Some(0) {
             ("✔", Style::new().fg(Color::Green))
         } else {
             failed
@@ -1175,6 +1178,71 @@ mod tests {
             "a failed probe or connect is the first step's"
         );
         assert_eq!(marks(None, 3), "···", "no report yet");
+    }
+
+    #[test]
+    fn file_rows_sit_between_packages_and_the_steps_and_their_marks_line_up() {
+        use crate::config::{Config, FileEntry, ModeValue, Step};
+        use crate::packages::Packages;
+
+        let file = |dest: &str, tag: &str| FileEntry {
+            src: "src.txt".to_owned(),
+            dest: dest.to_owned(),
+            mode: Some(ModeValue::Text("0644".to_owned())),
+            tags: vec![tag.to_owned()],
+            facts: Default::default(),
+            sudo: false,
+        };
+        let config = Config {
+            packages: Some(Packages {
+                install: vec!["git".to_owned()],
+                ..Packages::default()
+            }),
+            files: vec![file("/etc/a.conf", "local"), file("/etc/b.conf", "web")],
+            steps: vec![Step::script("hostname"), Step::script("false")],
+            ..Config::default()
+        };
+        let rows = crate::tui::app::step_rows(&config);
+        assert_eq!(
+            rows,
+            [
+                step_row("packages"),
+                step_row("file /etc/a.conf"),
+                step_row("file /etc/b.conf"),
+                step_row("hostname"),
+                step_row("false"),
+            ]
+        );
+        let skip = |dest: &str| apply::StepReport {
+            skipped: true,
+            ..step(&format!("skipped file {dest}: no match"), Some(0), "", "")
+        };
+        let ok = |run: &str| step(run, Some(0), "", "");
+        let local = ran(
+            "local",
+            vec![
+                ok("pacman …"),
+                ok("file /etc/a.conf"),
+                skip("/etc/b.conf"),
+                ok("hostname"),
+                step("false", Some(1), "", ""),
+            ],
+        );
+        assert_eq!(marks(Some(&local), rows.len()), "✔✔⊘✔✘");
+        let web = ran(
+            "web",
+            vec![
+                ok("pacman …"),
+                skip("/etc/a.conf"),
+                ok("file /etc/b.conf"),
+                step("hostname", Some(1), "", ""),
+            ],
+        );
+        assert_eq!(
+            marks(Some(&web), rows.len()),
+            "✔⊘✔✘⊘",
+            "a failed step after a skipped file keeps its row"
+        );
     }
 
     #[test]

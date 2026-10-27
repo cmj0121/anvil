@@ -174,3 +174,128 @@ fn unknown_target_exits_two() {
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
 }
+
+/// The text every `[[files]]` test copies; it must never show in any output.
+const FILE_TEXT: &str = "token = file-bytes-never-shown\n";
+
+/// The fake host tagged `web`, and a config copying `motd.txt`
+/// ([`FILE_TEXT`]) to `<root>/out/web.conf` on `web` targets and to
+/// `<root>/out/local.conf` on `local`, then running `echo after`; returns
+/// both dests.
+fn with_files(sandbox: &Sandbox) -> (String, String) {
+    sandbox.write_config(
+        "inventory.toml",
+        "[hosts.fake]\nhost = \"fakehost\"\ntags = [\"web\"]\n",
+    );
+    std::fs::create_dir(sandbox.root().join("out")).unwrap();
+    std::fs::write(sandbox.config_dir().join("motd.txt"), FILE_TEXT).unwrap();
+    let dest = |name: &str| sandbox.root().join("out").join(name).display().to_string();
+    let (web, local) = (dest("web.conf"), dest("local.conf"));
+    let entry = |dest: &str, tag: &str| {
+        format!(
+            "[[files]]\nsrc = \"motd.txt\"\ndest = \"{dest}\"\nmode = \"0640\"\n\
+             tags = [\"{tag}\"]\nsudo = false\n\n"
+        )
+    };
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}{}[[steps]]\nrun = \"echo after\"\n",
+            entry(&web, "web"),
+            entry(&local, "local")
+        ),
+    );
+    (web, local)
+}
+
+/// Fails when [`FILE_TEXT`] shows in `haystack`.
+fn assert_no_file_text(what: &str, haystack: &str) {
+    assert!(
+        !haystack.contains(FILE_TEXT.trim_end()),
+        "{what}: {haystack}"
+    );
+}
+
+#[test]
+fn files_go_to_each_matching_target_between_packages_and_the_steps() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new("aa");
+    let (web, local) = with_files(&sandbox);
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  $ skipped file {web}: no match\n  $ file {local}\n  wrote {local}\n  \
+             $ echo after\n  after\n  ✔ ok · 3 steps\n\n\
+             ▶ fake\n  $ file {web}\n  wrote {web}\n  $ skipped file {local}: no match\n  \
+             $ echo after\n  after\n  ✔ ok · 3 steps\n\n\
+             2 ok, 0 failed\n"
+        )
+    );
+    assert_eq!(text(&out.stderr), "", "nothing on raw stderr");
+    for dest in [&web, &local] {
+        assert_eq!(std::fs::read_to_string(dest).unwrap(), FILE_TEXT);
+        let mode = std::fs::metadata(dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o640, "{dest}");
+    }
+
+    let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains(&format!("  $ file {web}\n  unchanged {web}\n")),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn file_bytes_never_show_in_json_logs_or_argv() {
+    let sandbox = Sandbox::new("aa");
+    let (web, local) = with_files(&sandbox);
+    let ssh_log = sandbox.root().join("ssh.log");
+    let ssh_log = ssh_log.to_str().unwrap();
+    let out = sandbox.anvil(&["-vvv", "--json", "apply"], &[("FAKE_SSH_LOG", ssh_log)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(
+        value["targets"][1]["steps"],
+        serde_json::json!([
+            {"run": format!("file {web}"), "code": 0, "stdout": format!("wrote {web}\n"), "stderr": ""},
+            {"run": format!("skipped file {local}: no match"), "code": 0, "stdout": "", "stderr": "", "skipped": true},
+            {"run": "echo after", "code": 0, "stdout": "after\n", "stderr": ""},
+        ])
+    );
+    assert_no_file_text("stdout", &text(&out.stdout));
+    assert_no_file_text("stderr", &text(&out.stderr));
+    assert_no_file_text("ssh argv", &std::fs::read_to_string(ssh_log).unwrap());
+    assert_eq!(std::fs::read_to_string(&web).unwrap(), FILE_TEXT);
+}
+
+#[test]
+fn a_bad_src_exits_two_before_any_target_but_config_still_opens() {
+    let sandbox = Sandbox::new("aa");
+    let ran = sandbox.root().join("ran");
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"missing.txt\"\ndest = \"/tmp/anvil-never\"\nmode = \"0644\"\n\n\
+             [[steps]]\nrun = \"touch {}\"\n",
+            ran.display()
+        ),
+    );
+    let out = sandbox.anvil(&["config"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for command in ["apply", "plan"] {
+        let out = sandbox.anvil(&[command], &[]);
+        assert_eq!(out.status.code(), Some(2), "{command}");
+        assert!(out.stdout.is_empty(), "{command}: {}", text(&out.stdout));
+        let stderr = text(&out.stderr);
+        assert!(
+            stderr.contains("files[0].src `missing.txt`: cannot read: "),
+            "{command}: {stderr}"
+        );
+    }
+    assert!(!ran.exists(), "no target ran");
+}

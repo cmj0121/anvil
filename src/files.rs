@@ -31,6 +31,21 @@ use crate::transport::RUN_TIMEOUT;
 #[derive(Debug, Default)]
 pub struct Sources(Vec<Source>);
 
+#[cfg(test)]
+impl Sources {
+    /// Each entry's src text, as [`load`] would read it.
+    pub fn of(texts: &[&str]) -> Sources {
+        Sources(
+            texts
+                .iter()
+                .map(|text| Source {
+                    text: (*text).to_owned(),
+                })
+                .collect(),
+        )
+    }
+}
+
 /// One src's text: UTF-8, no NUL, at most [`document::MAX_BYTES`].
 pub struct Source {
     pub text: String,
@@ -89,15 +104,20 @@ fn read_src(dir: &Path, src: &str) -> Result<String, String> {
 /// and its facts equal every fact of `entry`; `pkg` matches when the value
 /// is one of the managers present.
 pub fn matches(entry: &FileEntry, target: &Target, facts: &Facts) -> bool {
-    let has_tag = |tag: &String| {
-        target.tags.contains(tag)
-            || (target.kind == TargetKind::Local && tag.as_str() == inventory::LOCAL)
-    };
     let has_fact = |(key, value): (&String, &String)| match key.as_str() {
         "pkg" => facts.pkg().contains(&value.as_str()),
         _ => facts.get(key) == Some(value.as_str()),
     };
-    entry.tags.iter().all(has_tag) && entry.facts.iter().all(has_fact)
+    has_tags(entry, target) && entry.facts.iter().all(has_fact)
+}
+
+/// Whether `target` carries every tag of `entry`; `local` carries `local`.
+/// Known before the probe, unlike the facts.
+pub fn has_tags(entry: &FileEntry, target: &Target) -> bool {
+    entry.tags.iter().all(|tag| {
+        target.tags.contains(tag)
+            || (target.kind == TargetKind::Local && tag.as_str() == inventory::LOCAL)
+    })
 }
 
 /// The secret holding `target`'s sudo password, as the package step finds it.
@@ -438,17 +458,6 @@ mod tests {
         fs::canonicalize(temp_dir(tag)).unwrap()
     }
 
-    fn sources(texts: &[&str]) -> Sources {
-        Sources(
-            texts
-                .iter()
-                .map(|text| Source {
-                    text: (*text).to_owned(),
-                })
-                .collect(),
-        )
-    }
-
     fn host(tags: &[&str], sudo_secret: Option<&str>) -> Target {
         Target {
             name: "web1".to_owned(),
@@ -648,7 +657,7 @@ mod tests {
         );
         let runs = runs(
             &config,
-            &sources(&["a\n", "db\n", "b\n"]),
+            &Sources::of(&["a\n", "db\n", "b\n"]),
             &host(&["web"], None),
             Some(&user_facts("nopasswd")),
         )
@@ -691,7 +700,7 @@ mod tests {
         );
         let config = config_in(Path::new("/c"), vec![entry("a", "/etc/a")]);
         assert_eq!(
-            runs(&config, &sources(&["a"]), &target, None).unwrap_err(),
+            runs(&config, &Sources::of(&["a"]), &target, None).unwrap_err(),
             "files: the probe has not run"
         );
     }
@@ -708,7 +717,7 @@ mod tests {
         );
         let mut runs = runs(
             &config,
-            &sources(&[SECRET_TEXT]),
+            &Sources::of(&[SECRET_TEXT]),
             &host(&[], secret),
             Some(facts),
         )
@@ -982,7 +991,7 @@ mod tests {
             );
             let err = runs(
                 &config,
-                &sources(&["a\n"]),
+                &Sources::of(&["a\n"]),
                 &host(&[], None),
                 Some(&user_facts("nopasswd")),
             )
@@ -1315,7 +1324,7 @@ mod tests {
         let tee = only_run(true, None, &user_facts("nopasswd"));
         let upload = only_run(true, Some("WEB"), &user_facts("binary"));
         let shown = [
-            format!("{:?}", sources(&[SECRET_TEXT])),
+            format!("{:?}", Sources::of(&[SECRET_TEXT])),
             format!("{tee:?}"),
             format!("{upload:?}"),
             format!("{:?}", upload.file.as_ref().unwrap().upload),
