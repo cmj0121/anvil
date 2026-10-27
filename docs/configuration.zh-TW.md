@@ -144,9 +144,18 @@ dnf = "fd-find"
 
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
+
+[plugins.harden]           # optional; see Plugins below
+path = "~/.config/anvil/plugins/harden"
+sha256 = "…"               # the sha256 of the file's bytes
+
+[[steps]]
+plugin = "harden"          # instead of run: the [plugins] entry whose reply is the script
+args = { profile = "ssh" } # optional, plugin steps only
 ```
 
-沒有任何 `[[steps]]` 時，config 會執行一個 step（步驟）：`hostname`。
+沒有任何 `[[steps]]` 時，config 會執行一個 step（步驟）：`hostname`。每個 step 有 `run` 或 `plugin`，不能兩者都有；
+兩者都有時以 2 結束並顯示 `steps[I]: has both run and plugin; keep one`，兩者都沒有時為 `steps[I]: needs run or plugin`。
 
 沒有 `[secrets]` 時，backend（後端）在 macOS 上是 keychain（其他平台不支援）。
 只有被選中的 backend 的區段是必要的且會被檢查：缺少該區段、未知的 backend，或在非 macOS 上使用 `keychain`，
@@ -186,6 +195,49 @@ secrets = ["HOST_SUDO"]
 backend = "keychain"
 names = ["HOST_SUDO"]
 ```
+
+## Plugins
+
+plugin 是控制端上、由 step 指定的程式。anvil 為每個 target 執行它，以 JSON 傳給它該 target 的 facts 與該 step 的 `args`，
+再把它回覆的 POSIX sh 腳本拿到 target 上執行。兩份 JSON 文件、plugin 拿到什麼、它的限制與失敗，
+請見 [Plugin steps](cli.zh-TW.md#plugin-steps)。
+
+```toml
+[plugins.harden]
+path = "~/.config/anvil/plugins/harden"  # required: absolute, or ~/
+sha256 = "…"                             # required: the sha256 of the file's bytes, 64 lowercase hex digits
+on = "step"                              # optional; "step", the default, is the only value
+
+[[steps]]
+plugin = "harden"                        # a [plugins] name, in place of run
+args = { profile = "ssh" }               # optional; any TOML table, at most 32 KiB as JSON
+```
+
+anvil 只執行 `[plugins]` 項目指定的檔案：它從不在 `PATH` 或任何目錄中搜尋 plugin。
+把檔案放在只有你能寫入的目錄中、讓它可執行，並釘選它的位元組：
+
+```sh
+mkdir -p ~/.config/anvil/plugins && chmod 700 ~/.config/anvil/plugins
+chmod 700 ~/.config/anvil/plugins/harden
+shasum -a 256 ~/.config/anvil/plugins/harden    # macOS; on Linux: sha256sum ~/.config/anvil/plugins/harden
+```
+
+輸出的第一欄就是 `sha256` 的值。檔案每次變更都需要新的 `sha256`。
+
+每次載入 config 時都會檢查結構；違規時以 2 結束：
+
+- ``plugins `NAME`: must match [a-z][a-z0-9_-]*``
+- ``plugins.NAME.path `PATH`: must be an absolute path or start with ~/``
+- ``plugins.NAME.sha256 `VALUE`: must be 64 lowercase hex digits``
+- ``plugins.NAME.on `VALUE`: must be step``（`doctor` 保留給日後使用）
+- `steps[I].args: needs plugin`，以及 `steps[I].args: N bytes as JSON exceeds the 32768 byte limit`
+- ``steps[I].plugin `NAME`: must name a [plugins] entry``
+
+檔案本身只由 `apply` 與 `plan`（以及 TUI 的 `a` 與 `p`）檢查，對每個項目都檢查，不論有沒有 step 使用它，且在連線任何 target 之前：
+它必須是至多 64 MiB 的一般檔案、屬於你、你可以執行、其他人都不能寫入，所在目錄也屬於你且其他人都不能寫入，
+而且檔案位元組的雜湊必須等於 `sha256`。不符合時會在任何 target 之前中止指令，`apply` 與 `plan` 以 2 結束並指出是哪個鍵，例如
+`plugins.harden.sha256: does not match /home/me/.config/anvil/plugins/harden (its bytes hash to 3b0c…)`。
+`anvil config`、`anvil doctor` 與 `anvil run` 從不檢查或執行 plugin。這些檢查沒有涵蓋的部分請見 [安全須知](security.zh-TW.md)。
 
 ## 限制與拒絕
 

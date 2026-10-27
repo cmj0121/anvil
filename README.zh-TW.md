@@ -18,6 +18,8 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
   `"executed": false`。
 - **`anvil run FILE`**（或以 `-` 讀 stdin）在每個 target 上逐一執行一份臨時的 POSIX sh 腳本，
   輸出、`--json` 與結束碼都與 apply 相同。它不載入 config、不詢問確認，也不輸入 sudo 密碼。
+- **plugin step**：step 可以指定一個 plugin，也就是控制端上以路徑與 sha256 釘選的程式，
+  它以 JSON 讀取 target 的 facts，並回覆要在該 target 上執行的 sh 腳本。它在清空的環境中執行，拿不到任何 secret。
 - **secret（機密）** 存放在 macOS keychain、age 檔案或 sops 檔案中，`anvil secret --migrate` 可在 backend 之間搬移它們。
 - **終端機介面**：`anvil tui` 在同一個畫面執行所有指令，並保留本次工作階段的結果供瀏覽。
 - **為 agent 打造**：`--json` 在 stdout 輸出一份可解析的文件；日誌只寫到 stderr。
@@ -72,6 +74,41 @@ pin = ["vim"]
 remove = ["nano"]
 upgrade = true
 ```
+
+一個腳本來自 plugin 的 step（[Plugin steps](docs/cli.zh-TW.md#plugin-steps)）。anvil 只執行 config 指定的檔案，
+而且只有在它屬於你、其他人都不能寫入、所在目錄其他人也不能寫入，且檔案位元組的雜湊等於 `sha256`
+（`shasum -a 256 FILE` 或 `sha256sum FILE`）時才執行；否則在連線任何 target 之前就以 2 結束：
+
+```toml
+[plugins.harden]
+path = "~/.config/anvil/plugins/harden"
+sha256 = "…"                 # 64 lowercase hex digits
+
+[[steps]]
+plugin = "harden"
+args = { profile = "ssh" }
+```
+
+對每個 target，plugin 在控制端執行，沒有引數，工作目錄是它自己的目錄，環境變數只保留 `PATH`、`HOME`、`TMPDIR`、`LANG`
+以及 `LC_ALL`、`LC_CTYPE`、`LC_COLLATE`、`LC_MESSAGES`、`LC_MONETARY`、`LC_NUMERIC` 與 `LC_TIME` 這些語系變數。
+它從 stdin 讀一行 JSON（下方分成多行顯示），並印出一份 JSON 文件；腳本會像一個 step 一樣在 target 上執行，
+`anvil plan` 則將它顯示為 `would $ … (from plugin harden)`：
+
+```json
+{
+  "target": "linode1",
+  "facts": { "distro": "arch", "pkg": "pacman" },
+  "tags": ["linode"],
+  "args": { "profile": "ssh" }
+}
+```
+
+```json
+{ "script": "sshd -t && systemctl reload sshd" }
+```
+
+`anvil plan` 也會執行 plugin，因此 plugin 不可以有副作用。它是被釘選，而不是被沙箱隔離：它以你的身分執行，
+而釘選只涵蓋檔案的位元組（[安全須知](docs/security.zh-TW.md)）。
 
 ## 文件
 

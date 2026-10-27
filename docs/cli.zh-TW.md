@@ -153,7 +153,8 @@ facts 探測、解析其套件管理器，並將產生的腳本作為 step 1 執
 無論哪種情況，該 target 都不執行任何 step（見 [套件](packages.zh-TW.md)）。
 當 target 的 sudo 要求密碼且它有 sudo secret 時，該 step 在終端機上執行，
 anvil 會在 sudo 的提示處輸入密碼（[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)）；
-其 `$` 行仍是那行一行式腳本。沒有 `[packages]`，或沒有要安裝、升級、鎖定或移除的東西時，不會執行探測，apply 只執行 `[[steps]]`。
+其 `$` 行仍是那行一行式腳本。沒有 `[packages]`，或沒有要安裝、升級、鎖定或移除的東西時，不會執行探測，apply 只執行 `[[steps]]`，
+除非有 step 指定 plugin（[Plugin steps](#plugin-steps)）。
 
 每個 `install` 名稱在腳本中會換成解析出的管理器的 `[packages.alias]` 項目，沒有則原樣使用（[別名](packages.zh-TW.md#別名)）。
 以下面的 config 而言，apt 與 dnf 安裝 `fd-find`，brew、pacman 與 apk 安裝 `fd`；`anvil plan` 顯示相同的腳本：
@@ -245,7 +246,9 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 接著由 apply 使用的同一個解析函式列出 step：`[packages]` 有事可做時先是套件 step，再來是每個 `[[steps]]` 項目。
 不會執行任何套件指令或 `[[steps]]` 腳本。
 無法連線、探測或解析的 target 會以與 apply 相同的原因失敗（探測、套件管理器，以及在 brew、apt 或 apk 上的 `pin` 為
-`packages: REASON`，例如 `packages: pin is not one-shot on brew: vim`），其他 target 仍會繼續規劃。
+`packages: REASON`，例如 `packages: pin is not one-shot on brew: vim`；`[packages]` 沒有事可做時，探測失敗為 `probe: REASON`），
+其他 target 仍會繼續規劃。plan 會像 apply 一樣，在控制端執行每個 plugin step 的 plugin，以列出它回傳的腳本
+（[Plugin steps](#plugin-steps)）。
 
 plan 絕不開啟 secret store。會輸入 sudo 密碼的 step 會註明它要用哪個 secret；
 該 secret 是否已設定、是否不含控制字元則不檢查，因此 plan 可能通過，而 apply 接著以 `packages: secret NAME is not set` 失敗。
@@ -305,6 +308,118 @@ step 只有 `run`，以及 apply 會輸入 sudo 密碼時的 `sudo_secret`，絕
 ```
 
 每個選定的 target 都解析成功時以 0 結束，任一個無法連線或解析時為 1，用法或設定錯誤為 2。
+
+### Plugin steps
+
+`[[steps]]` 項目可以指定一個 plugin 來取代 `run` 腳本：plugin 是控制端（controller）上的程式，
+在 config 中以其路徑與檔案位元組的 sha256 釘選（[Plugins](configuration.zh-TW.md#plugins)）。
+對每個 target，anvil 在控制端執行它，把一份 JSON 文件寫到它的 stdin，再把它回覆的 POSIX sh 腳本拿到 target 上執行。
+plugin 從不在 target 上執行，因此 target 仍然只需要 `sh`。
+
+```toml
+[plugins.harden]
+path = "~/.config/anvil/plugins/harden"   # absolute, or ~/
+sha256 = "…"                              # the file's sha256; see Plugins in configuration.md
+
+[[steps]]
+plugin = "harden"
+args = { profile = "ssh" }
+```
+
+**釘選檢查。** `apply` 與 `plan`（以及 TUI 的 `a` 與 `p`）會在連線任何 target 之前，檢查每個 `[plugins]` 項目，不論有沒有 step 使用它。
+路徑只會解析一次符號連結。它指向的檔案必須是至多 64 MiB 的一般檔案、屬於目前使用者、擁有者有執行位元、
+群組與其他人沒有寫入位元，所在目錄也屬於目前使用者且群組與其他人沒有寫入位元；而且檔案位元組的雜湊必須等於 `sha256`。
+任何失敗都會在任何 target 之前中止指令；`apply` 與 `plan` 以 2 結束，並指出是哪個鍵：
+
+```text
+ERROR anvil: plugins.harden.sha256: does not match /home/me/.config/anvil/plugins/harden (its bytes hash to 3b0c…)
+ERROR anvil: plugins.harden.path `~/.config/anvil/plugins/harden`: mode 775 lets others write to it; run chmod go-w on it
+```
+
+其他拒絕訊息的結尾為 `not owned by the current user`、`not executable; run chmod u+x on it`、
+`not a regular file`、`directory DIR: REASON`、`larger than the 67108864 byte limit`，或解析、開啟路徑時的錯誤。
+只檢查檔案本身與它所在的目錄，不檢查更上層的目錄（[安全須知](security.zh-TW.md)）。
+每次啟動 plugin 之前，anvil 會確認檔案仍是它雜湊過的那一個（相同的 device、inode、大小、mtime 與 ctime），
+否則該 target 以 `plugin NAME: PATH changed since it was checked` 失敗。
+
+**請求。** 只要有 plugin step，每個 target 都會先執行 facts 探測，即使 `[packages]` 沒有事可做也一樣。
+接著在該 target 的第一個 step 執行之前，依 step 順序執行每個 plugin step 的 plugin。
+它的 stdin 是一行 JSON，接著是 EOF（此處分成多行顯示）：
+
+```json
+{
+  "target": "linode1",
+  "facts": {
+    "arch": "x86_64",
+    "distro": "arch",
+    "hostname": "linode1",
+    "os": "Linux",
+    "pkg": "pacman"
+  },
+  "tags": ["linode"],
+  "args": { "profile": "ssh" }
+}
+```
+
+`target` 是 target 的名稱；`facts` 包含探測回報的每個鍵，與 [`anvil doctor`](#anvil-doctor) 相同（上例有刪節）；
+`tags` 是該 host 在 inventory 中的 `tags`，`local` 為 `[]`；`args` 是該 step 的 `args`，沒有時為 `{}`。
+
+**回覆。** stdout 必須恰好是一個 JSON 物件，唯一的鍵是字串 `script`；之後可以有空白：
+
+```json
+{ "script": "sshd -t && systemctl reload sshd" }
+```
+
+腳本會像一個 step 一樣在 target 上執行：整份送到 `sh -s` 的 stdin，並像 `anvil run` 送出腳本時一樣包在 `{ :` … `}` 中，
+時間上限是 step 的 30 秒。不會為它輸入 sudo 密碼；請在腳本中呼叫 `sudo -n`。
+apply 將它顯示為 `$ SCRIPT`（第一行，還有更多行時加上 `…`），`--json` 中該 step 的 `run` 是不含包裝的腳本。
+plan 顯示 `would $ SCRIPT (from plugin NAME)`，其 `--json` 的 step 帶有 `"plugin"`：
+
+```json
+{ "run": "sshd -t && systemctl reload sshd", "plugin": "harden" }
+```
+
+**plugin 拿到什麼。** 沒有任何引數。工作目錄是它實際檔案所在的目錄。環境變數會被清空，
+只從 anvil 的環境傳入 `PATH`、`HOME`、`TMPDIR`、`LANG`、`LC_ALL`、`LC_CTYPE`、`LC_COLLATE`、`LC_MESSAGES`、
+`LC_MONETARY`、`LC_NUMERIC` 與 `LC_TIME`；其他都不會傳給它
+（不含其他 `LC_` 變數、`GNUPGHOME`、`XDG_CONFIG_HOME`、`SSH_AUTH_SOCK` 或雲端憑證），anvil 也從不把 secret 放進它的環境變數或 argv。
+它的 stderr 從不原樣顯示或寫入日誌，只有失敗訊息中的一行例外（見下方）。
+
+**限制。**
+
+| 項目           | 上限        | 超過時                                                                       |
+| -------------- | ----------- | ---------------------------------------------------------------------------- |
+| plugin 檔案    | 64 MiB      | 以 2 結束：``plugins.NAME.path `PATH`: larger than the 67108864 byte limit`` |
+| `args`         | 32 KiB      | 以 2 結束：`steps[I].args: N bytes as JSON exceeds the 32768 byte limit`     |
+| 請求           | 64 KiB      | 該 target 失敗：`request is larger than the 65536 byte limit`                |
+| 執行時間       | 30 秒       | 被終止；該 target 失敗：`timed out after 30s`                                |
+| 回覆（stdout） | 2 MiB       | 該 target 失敗：`reply is larger than the 2097152 byte limit`                |
+| `script`       | 1 MiB       | 該 target 失敗：`reply script: N bytes exceeds the 1048576 byte limit`       |
+| stderr         | 保留 64 KiB | 只顯示最後一個非空行，截至 64 個字元                                         |
+
+**失敗。** 失敗的 plugin 只會讓該 target 失敗，且發生在它任何 step（包括套件 step）執行之前；其他 target 照常進行，結束碼為 1。
+錯誤為 `plugin NAME: REASON`，REASON 例如：
+
+- `exited CODE: LINE`，或 stderr 沒有非空行時的 `exited CODE`。LINE 是它 stderr 的最後一個非空行，截至 64 個字元並加上 `…`，
+  控制字元會被跳脫；
+- `was killed by a signal`、`timed out after 30s`、`cannot start PATH: REASON`、`cannot run: REASON`（等待它時失敗）、
+  `PATH changed since it was checked`；
+- `request is larger than the 65536 byte limit`；
+- `a process it started still held its output open`：它以 0 結束，但留下一個仍持有其 stdout 或 stderr 的行程；
+- `reply is larger than the 2097152 byte limit`、`reply is not UTF-8`、
+  `reply is not one {"script": …} JSON document (line L, column C)`（從不引用回覆本身）、
+  `reply script is empty or blank`、`reply script: N bytes exceeds the 1048576 byte limit`。
+
+探測以非零結束或印出格式不正確的輸出時，target 以 `probe: REASON` 失敗（`[packages]` 有事可做時為 `packages: REASON`）。
+
+```text
+▶ linode1
+  ✘ plugin harden: exited 3: profile ssh needs openssh, which is not installed on this target…
+```
+
+**plan 也會執行 plugin。** `anvil plan` 會像 apply 一樣在控制端執行每個 plugin step 的 plugin，才能列出腳本；只是不執行腳本。
+因此 plugin 不可以有副作用。它在 apply 時會再執行一次，所以對相同請求不一定給出相同回覆的 plugin
+（讀取時鐘、亂數或遠端 API 的 plugin）可能讓 plan 顯示的腳本與 apply 接著執行的不同。
 
 ### `anvil run [--timeout SECS] <FILE|->`
 
@@ -435,10 +550,12 @@ TUI 照常啟動，在標頭以紅色顯示 `inventory error`，錯誤本身則�
 - **0**：對 `doctor` 而言，`missing` 的 secret 或無法解析的編輯器只是警告。
 - **1**：`doctor`/`apply`：某個 target 或檢查失敗（包括 `locked` 或 `error` 的 secret，以及有 `[packages]` 時無法解析的套件管理器）。
   `plan`：某個 target 無法連線、探測或解析。
+  `apply`/`plan`：某個 plugin step 的 plugin 在某個 target 上失敗（[Plugin steps](#plugin-steps)）。
   `run`：某個 target 失敗或無法連線。
   `inventory`/`config`/`secret`：編輯器以非零結束（中止）、檔案寫入失敗，或 secret store 失敗、被鎖住或其密語提示被取消。
 - **2**：錯誤的旗標或引數（包括不以 `.toml` 結尾的 `--inventory` 或 `--config` 路徑）、未知的 `--target`、
   無效、無法讀取或模稜兩可的檔案、沒有 `$HOME`、找不到編輯器、三次嘗試後仍無效的緩衝區，或大於 1 MiB 的 secret。
+  對 `apply` 與 `plan` 而言，還有釘選檢查失敗的 `[plugins]` 項目（[Plugin steps](#plugin-steps)）。
   對 `run` 而言，還有空的、超過 1 MiB、不是 UTF-8 或無法讀取的腳本，以及超出 1..=3600 的 `--timeout`。
   `tui` 見下方。
 - **`tui`**：離開時為 0，不論結果為何。

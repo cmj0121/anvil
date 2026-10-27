@@ -33,3 +33,22 @@ English | [繁體中文](security.zh-TW.md)
   so `--json`) has any occurrence of a password of 8 bytes or more replaced with `***`; a shorter one is not scrubbed.
   sudo must show anvil's own prompt; a PAM prompt of another kind (2FA, fingerprint) fails the target after 15 s. See
   [Typing the sudo password](packages.md#typing-the-sudo-password).
+- **Plugins are pinned, not sandboxed.** A plugin runs only when a `[plugins]` entry names its file and the file's bytes
+  hash to its `sha256` ([Plugins](configuration.md#plugins)). What that does and does not cover:
+  - Only the file and its own directory are checked (owned by you, no group or other write bit), not the directories
+    above it. A directory higher up that someone else can write can let them move the plugin's directory aside and put
+    another in its place; keep the whole path yours.
+  - The pin covers only the entry file's bytes. Its interpreter (the `#!` line), anything it imports or sources and any
+    file next to it are not hashed: a pinned script that runs `python3` or reads `./lib.sh` runs whatever those are
+    today.
+  - There is no sandbox. The plugin runs as you, on the controller, with `PATH`, `HOME`, `TMPDIR`, `LANG` and the
+    `LC_ALL`, `LC_CTYPE`, `LC_COLLATE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC` and `LC_TIME` locale variables, so
+    it can read and write whatever you can. anvil only keeps secrets out of its way: no secret value is ever put in
+    its environment or argv, and the rest of your environment (cloud credentials, `GNUPGHOME`, `SSH_AUTH_SOCK`) is
+    cleared.
+  - A file changed after the check is refused at spawn by its stat (device, inode, size, mtime, ctime), not
+    re-hashed. A swap made by your own user is out of scope: a process running as you can already run anything as you.
+  - A plugin never runs on a target; only the script it returns does. Its stderr is never logged or printed as is:
+    only its last non-empty line goes into a failure's message, cut to 64 characters with control characters escaped.
+    That message is shown, and logged at info level (`-vv`), so a plugin should not write a secret to stderr.
+  - `anvil plan` runs plugins too, so a plugin must have no side effects.

@@ -143,9 +143,18 @@ dnf = "fd-find"
 
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
+
+[plugins.harden]           # optional; see Plugins below
+path = "~/.config/anvil/plugins/harden"
+sha256 = "…"               # the sha256 of the file's bytes
+
+[[steps]]
+plugin = "harden"          # instead of run: the [plugins] entry whose reply is the script
+args = { profile = "ssh" } # optional, plugin steps only
 ```
 
-Without any `[[steps]]` the config runs one step, `hostname`.
+Without any `[[steps]]` the config runs one step, `hostname`. Each step has `run` or `plugin`, never both; a step with
+both is exit 2 with `steps[I]: has both run and plugin; keep one`, one with neither with `steps[I]: needs run or plugin`.
 
 Without `[secrets]` the backend is the keychain on macOS (and unsupported elsewhere). Only the selected backend's section
 is required and checked: a missing section, an unknown backend or `keychain` off macOS is a config error (exit 2). A
@@ -185,6 +194,51 @@ secrets = ["HOST_SUDO"]
 backend = "keychain"
 names = ["HOST_SUDO"]
 ```
+
+## Plugins
+
+A plugin is a program on the controller that a step names. anvil runs it for each target, sends it the target's facts
+and the step's `args` as JSON, and runs the POSIX sh script it replies with on the target. The two JSON documents, what
+the plugin gets, its limits and its failures are in [Plugin steps](cli.md#plugin-steps).
+
+```toml
+[plugins.harden]
+path = "~/.config/anvil/plugins/harden"  # required: absolute, or ~/
+sha256 = "…"                             # required: the sha256 of the file's bytes, 64 lowercase hex digits
+on = "step"                              # optional; "step", the default, is the only value
+
+[[steps]]
+plugin = "harden"                        # a [plugins] name, in place of run
+args = { profile = "ssh" }               # optional; any TOML table, at most 32 KiB as JSON
+```
+
+anvil runs only a file a `[plugins]` entry names: it never searches `PATH` or a directory for plugins. Put the file in a
+directory only you can write, make it executable and pin its bytes:
+
+```sh
+mkdir -p ~/.config/anvil/plugins && chmod 700 ~/.config/anvil/plugins
+chmod 700 ~/.config/anvil/plugins/harden
+shasum -a 256 ~/.config/anvil/plugins/harden    # macOS; on Linux: sha256sum ~/.config/anvil/plugins/harden
+```
+
+The first field of the output is the `sha256` value. Any change to the file needs a new `sha256`.
+
+The schema is checked whenever the config loads; a violation is exit 2:
+
+- ``plugins `NAME`: must match [a-z][a-z0-9_-]*``
+- ``plugins.NAME.path `PATH`: must be an absolute path or start with ~/``
+- ``plugins.NAME.sha256 `VALUE`: must be 64 lowercase hex digits``
+- ``plugins.NAME.on `VALUE`: must be step`` (`doctor` is reserved for later)
+- `steps[I].args: needs plugin`, and `steps[I].args: N bytes as JSON exceeds the 32768 byte limit`
+- ``steps[I].plugin `NAME`: must name a [plugins] entry``
+
+The file itself is checked only by `apply` and `plan` (and the TUI's `a` and `p`), for every entry, used by a step or
+not, before any target is contacted: it must be a regular file of at most 64 MiB, owned by you, executable by you,
+writable by no one else, in a directory owned by you that no one else can write, and its bytes must hash to `sha256`.
+Anything else stops the command before any target, and `apply` and `plan` exit 2 naming the key, such as
+`plugins.harden.sha256: does not match /home/me/.config/anvil/plugins/harden (its bytes hash to 3b0c…)`. `anvil config`,
+`anvil doctor` and `anvil run` never check or run a plugin. What the checks leave out is in
+[Security notes](security.md).
 
 ## Limits and refusals
 

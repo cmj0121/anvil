@@ -19,6 +19,8 @@ system OpenSSH client.
   `"executed": false`.
 - **`anvil run FILE`** (or `-` for stdin) runs one ad-hoc POSIX sh script on every target, one after another, with
   apply's output, `--json` and exit codes. It loads no config, asks for no confirmation and types no sudo password.
+- **Plugin steps**: a step can name a plugin, a program on the controller pinned by its path and sha256, that reads
+  the target's facts as JSON and replies with the sh script to run there. It gets a cleared environment and no secrets.
 - **Secrets** live in the macOS keychain, an age file or a sops file, and `anvil secret --migrate` moves them between
   backends.
 - **Terminal UI**: `anvil tui` runs every command in one screen and keeps the session's results for browsing.
@@ -76,6 +78,42 @@ pin = ["vim"]
 remove = ["nano"]
 upgrade = true
 ```
+
+A step whose script comes from a plugin ([Plugin steps](docs/cli.md#plugin-steps)). anvil runs only the file the
+config names, and only when it is yours, writable by no one else, in a directory no one else can write, and its bytes
+hash to `sha256` (`shasum -a 256 FILE`, or `sha256sum FILE`); anything else is exit 2 before any target is contacted:
+
+```toml
+[plugins.harden]
+path = "~/.config/anvil/plugins/harden"
+sha256 = "…"                 # 64 lowercase hex digits
+
+[[steps]]
+plugin = "harden"
+args = { profile = "ssh" }
+```
+
+For each target the plugin runs on the controller, with no arguments, in its own directory, with only `PATH`, `HOME`,
+`TMPDIR`, `LANG` and the `LC_ALL`, `LC_CTYPE`, `LC_COLLATE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC` and `LC_TIME`
+locale variables of the environment. It reads one JSON line on stdin (shown on several lines below) and
+prints one JSON document; the script runs on the target as a step, and `anvil plan` shows it as
+`would $ … (from plugin harden)`:
+
+```json
+{
+  "target": "linode1",
+  "facts": { "distro": "arch", "pkg": "pacman" },
+  "tags": ["linode"],
+  "args": { "profile": "ssh" }
+}
+```
+
+```json
+{ "script": "sshd -t && systemctl reload sshd" }
+```
+
+`anvil plan` runs the plugin too, so a plugin must have no side effects. It is pinned, not sandboxed: it runs as you,
+and the pin covers only the file's bytes ([Security notes](docs/security.md)).
 
 ## Documentation
 

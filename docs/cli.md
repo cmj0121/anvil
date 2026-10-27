@@ -155,7 +155,7 @@ cannot be resolved, or a `pin` on brew, apt or apk, fails it with `packages: REA
 [Packages](packages.md)). When the target's sudo asks for a password and it has a sudo secret, that step runs on a
 terminal and anvil types the password at sudo's prompt ([Typing the sudo password](packages.md#typing-the-sudo-password)); its
 `$` line is still the one-line script. Without `[packages]`, or with nothing to install, upgrade, pin or remove, no
-probe runs and apply runs only the `[[steps]]`.
+probe runs and apply runs only the `[[steps]]`, unless a step names a plugin ([Plugin steps](#plugin-steps)).
 
 Each `install` name goes into the script as the resolved manager's `[packages.alias]` entry, else as is
 ([Aliases](packages.md#aliases)). With this config apt and dnf install `fd-find`, and brew, pacman and apk `fd`; `anvil
@@ -250,7 +250,9 @@ transport, even without `[packages]` work, so a target that cannot be reached fa
 steps then come from the same resolver apply uses: the package step when `[packages]` has work, then each `[[steps]]`
 entry. No package command and no `[[steps]]` script runs. A target that cannot be reached, probed or resolved fails
 with the same reason apply gives (`packages: REASON` for the probe, the manager and a `pin` on brew, apt or apk, such
-as `packages: pin is not one-shot on brew: vim`), and the other targets are still planned.
+as `packages: pin is not one-shot on brew: vim`; without `[packages]` work a failed probe reads `probe: REASON`), and the
+other targets are still planned. plan runs each plugin step's plugin on the controller, as apply would, to list the script
+it returns ([Plugin steps](#plugin-steps)).
 
 plan never opens the secret store. A step that would type a sudo password says which secret it would use; whether that
 secret is set and free of control characters is not checked, so plan can pass where apply then fails with
@@ -310,6 +312,123 @@ password, its `sudo_secret`, but never `code`, `stdout` or `stderr`:
 ```
 
 Exit 0 when every selected target resolves, 1 when any cannot be reached or resolved, 2 for usage or config.
+
+### Plugin steps
+
+A `[[steps]]` entry can name a plugin instead of a `run` script: a program on the controller, pinned in the config by
+its path and the sha256 of its bytes ([Plugins](configuration.md#plugins)). For each target, anvil runs it on the
+controller, writes one JSON document to its stdin and runs the POSIX sh script it replies with on the target. The
+plugin never runs on a target, so a target still needs only `sh`.
+
+```toml
+[plugins.harden]
+path = "~/.config/anvil/plugins/harden"   # absolute, or ~/
+sha256 = "…"                              # the file's sha256; see Plugins in configuration.md
+
+[[steps]]
+plugin = "harden"
+args = { profile = "ssh" }
+```
+
+**Pin checks.** `apply` and `plan` (and the TUI's `a` and `p`) check every `[plugins]` entry, used by a step or not,
+before any target is contacted. The path is resolved through symlinks once. The file it names must be a regular file of
+at most 64 MiB, owned by the current user, with the owner's execute bit and no group or other write bit, in a directory
+owned by the current user with no group or other write bit; and its bytes must hash to `sha256`. Any failure stops
+the command before any target; `apply` and `plan` exit 2, naming the key:
+
+```text
+ERROR anvil: plugins.harden.sha256: does not match /home/me/.config/anvil/plugins/harden (its bytes hash to 3b0c…)
+ERROR anvil: plugins.harden.path `~/.config/anvil/plugins/harden`: mode 775 lets others write to it; run chmod go-w on it
+```
+
+The other refusals end in `not owned by the current user`, `not executable; run chmod u+x on it`,
+`not a regular file`, `directory DIR: REASON`, `larger than the 67108864 byte limit`, or the error from resolving or
+opening the path. Only the file and its own directory are checked, not the directories above it
+([Security notes](security.md)). Right before each spawn anvil checks that the file is still the one it hashed (the same
+device, inode, size, mtime and ctime), else that target fails with `plugin NAME: PATH changed since it was checked`.
+
+**Request.** Any plugin step makes each target run the facts probe first, even without `[packages]` work. Then, before
+the target's first step runs, each plugin step's plugin runs in step order. Its stdin is one line of JSON, then EOF
+(shown here on several lines):
+
+```json
+{
+  "target": "linode1",
+  "facts": {
+    "arch": "x86_64",
+    "distro": "arch",
+    "hostname": "linode1",
+    "os": "Linux",
+    "pkg": "pacman"
+  },
+  "tags": ["linode"],
+  "args": { "profile": "ssh" }
+}
+```
+
+`target` is the target's name; `facts` holds every key the probe reported, as in [`anvil doctor`](#anvil-doctor)
+(abridged above); `tags` is the host's inventory `tags`, `[]` for `local`; `args` is the step's `args`, `{}` without
+them.
+
+**Reply.** stdout must be exactly one JSON object whose only key is `script`, a string; whitespace after it is allowed:
+
+```json
+{ "script": "sshd -t && systemctl reload sshd" }
+```
+
+The script runs on the target as a step: sent whole on stdin to `sh -s`, wrapped in `{ :` … `}` as `anvil run`
+sends a script, with the 30 s step time limit. No sudo password is
+typed for it; call `sudo -n` in the script. apply shows it as `$ SCRIPT` (its first line and `…` when it has more),
+and in `--json` the step's `run` is the script, without the wrapper. plan shows
+`would $ SCRIPT (from plugin NAME)`, and its `--json` step has `"plugin"`:
+
+```json
+{ "run": "sshd -t && systemctl reload sshd", "plugin": "harden" }
+```
+
+**What the plugin gets.** No arguments. Its working directory is the directory of its real file. Its environment is
+cleared, then only `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `LC_CTYPE`, `LC_COLLATE`, `LC_MESSAGES`, `LC_MONETARY`,
+`LC_NUMERIC` and `LC_TIME` are passed on from anvil's; nothing else reaches it (not another `LC_` variable,
+`GNUPGHOME`, `XDG_CONFIG_HOME`, `SSH_AUTH_SOCK` or cloud credentials), and anvil puts no secret in its environment or
+argv. Its stderr is never shown or logged as is, apart from one line in a failure's message (below).
+
+**Limits.**
+
+| What           | Limit       | Over it                                                                   |
+| -------------- | ----------- | ------------------------------------------------------------------------- |
+| plugin file    | 64 MiB      | exit 2: ``plugins.NAME.path `PATH`: larger than the 67108864 byte limit`` |
+| `args`         | 32 KiB      | exit 2: `steps[I].args: N bytes as JSON exceeds the 32768 byte limit`     |
+| request        | 64 KiB      | the target fails: `request is larger than the 65536 byte limit`           |
+| run time       | 30 s        | killed; the target fails: `timed out after 30s`                           |
+| reply (stdout) | 2 MiB       | the target fails: `reply is larger than the 2097152 byte limit`           |
+| `script`       | 1 MiB       | the target fails: `reply script: N bytes exceeds the 1048576 byte limit`  |
+| stderr         | 64 KiB kept | only its last non-empty line is shown, cut to 64 characters               |
+
+**Failures.** A plugin that fails fails only that target, before any of its steps run (the package step too); the other
+targets go on, and the exit is 1. The error is `plugin NAME: REASON`, with a REASON such as:
+
+- `exited CODE: LINE`, or `exited CODE` with no non-empty stderr line. LINE is the last non-empty line of its stderr, cut to 64
+  characters with `…` and with control characters escaped;
+- `was killed by a signal`, `timed out after 30s`, `cannot start PATH: REASON`, `cannot run: REASON` (waiting for it
+  failed), `PATH changed since it was checked`;
+- `request is larger than the 65536 byte limit`;
+- `a process it started still held its output open`: it exited 0, but left a process holding its stdout or stderr;
+- `reply is larger than the 2097152 byte limit`, `reply is not UTF-8`,
+  `reply is not one {"script": …} JSON document (line L, column C)` (the reply itself is never quoted),
+  `reply script is empty or blank`, `reply script: N bytes exceeds the 1048576 byte limit`.
+
+A probe that exits non-zero or prints bad output fails the target with `probe: REASON` (`packages: REASON` when
+`[packages]` has work).
+
+```text
+▶ linode1
+  ✘ plugin harden: exited 3: profile ssh needs openssh, which is not installed on this target…
+```
+
+**plan runs plugins too.** `anvil plan` runs every plugin step's plugin on the controller, exactly as apply does, so it
+can list the script; only the script is not run. A plugin must therefore have no side effects. It also runs again
+under apply, so a plugin that does not always give the same reply to the same request (one that reads the clock, a
+random number or a remote API) can make plan show a script that apply then does not run.
 
 ### `anvil run [--timeout SECS] <FILE|->`
 
@@ -445,12 +564,14 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 - **1**: `doctor`/`apply`: a target or a check failed (including a `locked` or `error` secret, and, with `[packages]`, a
   package manager that cannot be resolved).
   `plan`: a target could not be reached, probed or resolved.
+  `apply`/`plan`: a plugin step's plugin failed on a target ([Plugin steps](#plugin-steps)).
   `run`: a target failed or could not be reached.
   `inventory`/`config`/`secret`: the editor exited non-zero (aborted), a file write failed, or the secret store failed,
   is locked or its passphrase prompt was cancelled.
 - **2**: a bad flag or argument (including an `--inventory` or `--config` path not ending in `.toml`), an unknown
   `--target`, an invalid, unreadable or ambiguous file, no `$HOME`, editor not found, an invalid buffer after three
-  attempts, or a secret larger than 1 MiB. For `run`, also a script that is empty, over 1 MiB, not UTF-8 or
+  attempts, or a secret larger than 1 MiB. For `apply` and `plan`, also a `[plugins]` entry that fails the pin checks
+  ([Plugin steps](#plugin-steps)). For `run`, also a script that is empty, over 1 MiB, not UTF-8 or
   unreadable, or a `--timeout` outside 1..=3600. For `tui`, see below.
 - **`tui`**: 0 on quit, whatever the results. 2 when stdin or stdout is not a terminal, for `--json`, or for an unknown
   `--target` (checked only when the inventory loads); an inventory that does not load (any load error, including an

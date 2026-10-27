@@ -9,12 +9,14 @@
 #![allow(dead_code)]
 
 use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
+
+use sha2::{Digest, Sha256};
 
 /// The secret value the tests store; it must never show in any output.
 pub const VALUE: &str = "s3cr3t-hunter2";
@@ -170,6 +172,35 @@ impl Sandbox {
 
     pub fn write_config(&self, name: &str, body: &str) {
         fs::write(self.config_dir().join(name), body).unwrap();
+    }
+
+    /// `body` as a 0700 `<root>/plugins/<name>`, in a 0700 directory, as a
+    /// plugin must be; returns its path and the lowercase hex sha256 of
+    /// `body`.
+    pub fn plugin(&self, name: &str, body: &[u8]) -> (PathBuf, String) {
+        let dir = self.plugin_dir();
+        if !dir.exists() {
+            DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        }
+        let path = dir.join(name);
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)
+            .unwrap()
+            .write_all(body)
+            .unwrap();
+        let sha256 = Sha256::digest(body)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        (path, sha256)
+    }
+
+    /// `<root>/plugins`, where [`Sandbox::plugin`] puts each plugin.
+    pub fn plugin_dir(&self) -> PathBuf {
+        self.root.join("plugins")
     }
 
     /// One inventory host, `fake`, reached through `fake-ssh.sh`.

@@ -53,7 +53,8 @@ Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
   the target has a report (queued or running) every row is `·`; the running target has no tab until it ends, and its
   spinner is in the header and on the last line of Results. On doctor and edit results the list is the config's as of
   the last reload, without marks; so is a plan result's. A run result (`x`) lists one step, its script (the first line,
-  with `…` when it has more), marked as on apply. A config that does not load shows its error in red instead.
+  with `…` when it has more), marked as on apply. A plugin step is listed as `plugin NAME`. A config that does not
+  load shows its error in red instead.
 - **Results.** One tab per section of the shown result, not one per past run. A doctor result has a `local checks` tab
   when local checks exist, then one tab per target, in order; apply, plan and run have one tab per target, in order; an
   edit has one tab, labeled by what it edited (`inventory`, `config`, `secret NAME`, `migrate → age`). `←` and `→`
