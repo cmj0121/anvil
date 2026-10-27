@@ -21,6 +21,7 @@ use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
 use crate::fanout::{self, Event};
 use crate::files::{self, Sources};
+use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, YELLOW, paint};
 use crate::options::Options;
@@ -80,7 +81,6 @@ pub type Progress<'a> = Event<'a, PlanReport>;
 pub fn run_targets(
     opts: &Options,
     config: &Config,
-    cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Plan, Failure> {
     let targets = opts.targets()?;
@@ -93,7 +93,7 @@ pub fn run_targets(
         config,
         &sources,
         &pins,
-        cancel,
+        &opts.cancel,
         on,
     ))
 }
@@ -185,10 +185,9 @@ fn plan_target(
 pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
     let style = Style::detect();
     let config = opts.load_config()?;
-    // Only the TUI cancels a plan.
-    let cancel = AtomicBool::new(false);
+    let _interrupt = Interrupt::install(&opts.cancel)?;
     let mut print = fanout::in_order(|report| print_lines(&render(report), style));
-    let plan = run_targets(opts, &config, &cancel, &mut |progress| {
+    let plan = run_targets(opts, &config, &mut |progress| {
         if !cli.json {
             print(progress);
         }
@@ -341,7 +340,7 @@ mod tests {
     fn a_bad_pin_is_exit_two_before_any_target() {
         let (dir, opts, config) = crate::test_util::bad_pin("plan");
         let mut started = 0;
-        let failure = run_targets(&opts, &config, &AtomicBool::new(false), &mut |progress| {
+        let failure = run_targets(&opts, &config, &mut |progress| {
             if let Progress::Start(..) = progress {
                 started += 1;
             }

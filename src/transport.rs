@@ -230,7 +230,6 @@ impl Groups {
     }
 
     /// Closes the registry and kills every tracked group.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called on the second Ctrl-C"))]
     pub fn kill_all(&self) {
         let mut state = self.lock();
         state.closed = true;

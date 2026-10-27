@@ -81,12 +81,18 @@ impl Logger {
     }
 
     fn write_record(&self, out: &mut dyn Write, record: &Record) -> std::io::Result<()> {
-        let level = record.level();
         let message = record.args().to_string();
-        let message = escape_controls(&message);
-        let level = paint(self.colour, colour_code(level), level.as_str());
-        writeln!(out, "{level} {}: {message}", record.target())
+        let line = format_line(self.colour, record.level(), record.target(), &message);
+        out.write_all(line.as_bytes())
     }
+}
+
+/// One log line, as the logger writes it: `message` has its controls
+/// escaped, and the level is painted when `colour`. Takes no lock.
+pub fn format_line(colour: bool, level: Level, target: &str, message: &str) -> String {
+    let message = escape_controls(message);
+    let level = paint(colour, colour_code(level), level.as_str());
+    format!("{level} {target}: {message}\n")
 }
 
 /// `text` with every control character but `\n` and `\t` shown as a visible

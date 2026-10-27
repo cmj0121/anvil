@@ -42,6 +42,7 @@ use crate::config::{Config, StepKind};
 use crate::facts::{self, Facts};
 use crate::fanout::{self, Event};
 use crate::files::{self, Sources};
+use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::{BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, is_escaped, paint};
 use crate::options::Options;
@@ -317,7 +318,7 @@ impl Report {
 pub type Progress<'a> = Event<'a, TargetReport>;
 
 /// Loads the targets and applies `config` to each, `opts.parallel` at a
-/// time. Before each target and each step, `cancel` is checked; once set,
+/// time. Before each target and each step, `opts.cancel` is checked; once set,
 /// each running target ends as Cancelled after its current step (keeping its
 /// completed steps) and every target not started is Cancelled with no steps.
 /// A `[[files]]` src that cannot be read fails the command before any
@@ -325,7 +326,6 @@ pub type Progress<'a> = Event<'a, TargetReport>;
 pub fn run_targets(
     opts: &Options,
     config: &Config,
-    cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
     let targets = opts.targets()?;
@@ -340,7 +340,7 @@ pub fn run_targets(
         &sources,
         &pins,
         &passwords,
-        cancel,
+        &opts.cancel,
         on,
     ))
 }
@@ -467,9 +467,9 @@ pub(crate) fn for_each_target(
 /// `anvil apply`: prints each target's block in order (or one JSON
 /// document), then the summary.
 pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
-    let cancel = AtomicBool::new(false);
     let config = opts.load_config()?;
-    print_report(cli, "apply", |on| run_targets(opts, &config, &cancel, on))
+    let _interrupt = Interrupt::install(&opts.cancel)?;
+    print_report(cli, "apply", |on| run_targets(opts, &config, on))
 }
 
 /// Prints each target's block once it and every earlier target have ended
@@ -972,14 +972,22 @@ impl Style {
 }
 
 /// Writes each line to its stream, flushing so a terminal shows them in order.
+/// Each write locks only its own stream, so a stdout blocked on a full pipe
+/// never holds stderr.
 pub(crate) fn print_lines(lines: &[Line], style: Style) {
-    let mut out = std::io::stdout().lock();
-    let mut err = std::io::stderr().lock();
     for line in lines {
-        let stream: &mut dyn Write = if line.stderr { &mut err } else { &mut out };
-        let _ = stream.write_all(line.show(style).as_bytes());
-        let _ = stream.flush();
+        let text = line.show(style);
+        let _ = if line.stderr {
+            write_flushed(&mut std::io::stderr().lock(), &text)
+        } else {
+            write_flushed(&mut std::io::stdout().lock(), &text)
+        };
     }
+}
+
+fn write_flushed(stream: &mut dyn Write, text: &str) -> std::io::Result<()> {
+    stream.write_all(text.as_bytes())?;
+    stream.flush()
 }
 
 /// The step's command as shown in its `$` line: a multi-line script shows its
@@ -2674,7 +2682,7 @@ mod tests {
     fn a_bad_pin_is_exit_two_before_any_target() {
         let (dir, opts, config) = crate::test_util::bad_pin("apply");
         let mut started = 0;
-        let failure = run_targets(&opts, &config, &AtomicBool::new(false), &mut |progress| {
+        let failure = run_targets(&opts, &config, &mut |progress| {
             if let Progress::Start(..) = progress {
                 started += 1;
             }

@@ -252,6 +252,14 @@ A target either ran its steps (`steps` and `ok`; a failed step shows its `code`,
 transport (`error`, `ok: false`, and `steps` only when some steps completed before the error). `code` is `null` when
 the step was killed by a signal or timed out; a timed-out step is the last `steps` entry, next to `error`.
 
+**Ctrl-C.** `apply`, `plan` and `run` handle Ctrl-C the same way. The first press cancels: anvil prints
+`interrupted: running targets stop after their current step; Ctrl-C again stops now` on stderr, each running target
+ends as `⊘ cancelled` after its current step (keeping the steps that completed), no other target starts, and the
+command exits 1. This holds with `--parallel 1` too: where Ctrl-C used to stop anvil at once, it now waits for the
+current step, up to that step's timeout. A second press kills every step still running and anvil dies by SIGINT (a
+shell shows 130), printing no summary and no JSON. Two presses very close together can reach anvil as one signal and
+then count as the first.
+
 ### `anvil plan`
 
 Shows the steps `anvil apply` would run on every selected target, and runs none of them. Each target is probed over its

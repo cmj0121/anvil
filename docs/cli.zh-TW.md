@@ -246,6 +246,13 @@ target 要嘛執行了它的 step（`steps` 與 `ok`；失敗的 step 會顯示�
 要嘛在傳輸中失敗（`error`、`ok: false`，只有在錯誤前已完成某些 step 時才有 `steps`）。
 step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 的最後一項，與 `error` 並列。
 
+**Ctrl-C。** `apply`、`plan` 與 `run` 對 Ctrl-C 的處理相同。第一次按下會取消：anvil 在 stderr 印出
+`interrupted: running targets stop after their current step; Ctrl-C again stops now`，
+每個執行中的 target 在目前的 step 結束後以 `⊘ cancelled` 結束（保留已完成的 step），不再啟動其他 target，指令以 1 結束。
+`--parallel 1` 也是如此：以前 Ctrl-C 會立刻停止 anvil，現在會等目前的 step 結束，最多等到該 step 的逾時。
+第二次按下會終止所有仍在執行的 step，anvil 因 SIGINT 結束（shell 顯示 130），不印摘要也不印 JSON。
+兩次按得非常接近時，可能只以一個訊號送達 anvil，此時算作第一次。
+
 ### `anvil plan`
 
 列出 `anvil apply` 會在每個選定 target 上執行的 step，但一個都不執行。

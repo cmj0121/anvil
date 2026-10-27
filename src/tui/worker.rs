@@ -37,9 +37,9 @@ pub fn spawn(job: Job, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) 
     let opts = job_opts(&job, opts, &cancel);
     match job {
         Job::Doctor => spawn_job(tx, move |tx| run_doctor(&opts, tx)),
-        Job::Apply => spawn_job(tx, move |tx| run_apply(&opts, &cancel, tx)),
-        Job::Plan => spawn_job(tx, move |tx| run_plan(&opts, &cancel, tx)),
-        Job::Run(script) => spawn_job(tx, move |tx| run_script(&opts, script, &cancel, tx)),
+        Job::Apply => spawn_job(tx, move |tx| run_apply(&opts, tx)),
+        Job::Plan => spawn_job(tx, move |tx| run_plan(&opts, tx)),
+        Job::Run(script) => spawn_job(tx, move |tx| run_script(&opts, script, tx)),
         // curl, tar and the smoke run capture their output and read no
         // stdin, so nothing reaches the screen.
         Job::UpdateCheck => spawn_task(tx, move |_| {
@@ -122,10 +122,10 @@ fn run_doctor(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
 /// As [`run_doctor`]: the config, and the secret store when a target types a
 /// sudo password (in [`apply::run_targets`]), are opened here, on the worker.
 /// The steps sent are this config's, which may be newer than the app's.
-fn run_apply(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(), Failure> {
+fn run_apply(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
     let config = opts.load_config()?;
     let _ = tx.send(Msg::Steps(app::step_rows(&config)));
-    apply::run_targets(opts, &config, cancel, &mut send_progress(tx))?;
+    apply::run_targets(opts, &config, &mut send_progress(tx))?;
     Ok(())
 }
 
@@ -145,23 +145,18 @@ fn send_progress(tx: &Sender<Msg>) -> impl FnMut(apply::Progress<'_>) + '_ {
 
 /// As `anvil run`: no config and no secret store, the default timeout. The
 /// one step sent is the script, as its `$` line shows it.
-fn run_script(
-    opts: &Options,
-    script: String,
-    cancel: &AtomicBool,
-    tx: &Sender<Msg>,
-) -> Result<(), Failure> {
+fn run_script(opts: &Options, script: String, tx: &Sender<Msg>) -> Result<(), Failure> {
     let label = apply::command(&script);
     let _ = tx.send(Msg::Steps(vec![app::StepRow { label }]));
     let timeout = Duration::from_secs(run::DEFAULT_TIMEOUT);
-    run::run_targets(opts, script, timeout, cancel, &mut send_progress(tx))?;
+    run::run_targets(opts, script, timeout, &mut send_progress(tx))?;
     Ok(())
 }
 
 /// Plan opens no secret store; the steps pane keeps the app's list.
-fn run_plan(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(), Failure> {
+fn run_plan(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
     let config = opts.load_config()?;
-    plan::run_targets(opts, &config, cancel, &mut |progress| {
+    plan::run_targets(opts, &config, &mut |progress| {
         let msg = match progress {
             // The slots come with the TUI's parallel view.
             plan::Progress::Begin(_) => return,

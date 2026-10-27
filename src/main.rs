@@ -10,6 +10,7 @@ mod editor;
 mod facts;
 mod fanout;
 mod files;
+mod interrupt;
 mod inventory;
 mod logger;
 mod options;

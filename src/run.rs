@@ -16,6 +16,7 @@ use std::time::Duration;
 use crate::apply::{self, PlannedRun, Report, TargetReport};
 use crate::cli::{Cli, Failure};
 use crate::document::{MAX_BYTES, read_capped_from};
+use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::escape_controls;
 use crate::options::Options;
@@ -26,13 +27,12 @@ use crate::transport::{Transport, TransportError};
 pub const DEFAULT_TIMEOUT: u64 = 300;
 
 /// Loads the targets and runs `script` on each, `opts.parallel` at a time,
-/// killing it after `timeout`. Before each target, `cancel` is checked; once
+/// killing it after `timeout`. Before each target, `opts.cancel` is checked; once
 /// set, every target not started is Cancelled.
 pub fn run_targets(
     opts: &Options,
     script: String,
     timeout: Duration,
-    cancel: &AtomicBool,
     on: &mut dyn FnMut(apply::Progress<'_>),
 ) -> Result<Report, Failure> {
     let targets = opts.targets()?;
@@ -45,6 +45,7 @@ pub fn run_targets(
         file: None,
         service: None,
     }];
+    let cancel = &opts.cancel;
     Ok(apply::for_each_target(
         &targets,
         opts.parallel,
@@ -91,12 +92,9 @@ pub fn run(cli: &Cli, opts: &Options, source: &Path, timeout: u64) -> Result<(),
         )));
     }
     let script = read_script(source)?;
-    // Only the TUI cancels a run.
-    let cancel = AtomicBool::new(false);
     let timeout = Duration::from_secs(timeout);
-    apply::print_report(cli, "run", |on| {
-        run_targets(opts, script, timeout, &cancel, on)
-    })
+    let _interrupt = Interrupt::install(&opts.cancel)?;
+    apply::print_report(cli, "run", |on| run_targets(opts, script, timeout, on))
 }
 
 /// The script at `source`, or stdin for `-`: refused when unreadable, over
