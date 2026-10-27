@@ -446,6 +446,7 @@ mod tests {
             tags: Vec::new(),
             facts: BTreeMap::new(),
             sudo: true,
+            rollback: true,
         }
     }
 

@@ -455,6 +455,7 @@ mod tests {
             tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
             facts: Default::default(),
             sudo: true,
+            rollback: true,
         };
         let config = Config {
             files: vec![file("/etc/a.conf", &[]), file("/etc/b.conf", &["web"])],

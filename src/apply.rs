@@ -2856,6 +2856,7 @@ mod tests {
             tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
             facts: BTreeMap::new(),
             sudo,
+            rollback: true,
         }
     }
 

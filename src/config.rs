@@ -258,6 +258,10 @@ pub struct FileEntry {
     /// `false`: write as the connecting user, no sudo, temp file, tty or secret.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub sudo: bool,
+    /// `false`: the apply record keeps only the hash of the file it
+    /// replaces, never its bytes, so `anvil rollback` cannot restore it.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub rollback: bool,
 }
 
 /// By hand, so a field added later must be chosen for `Debug` rather than
@@ -271,6 +275,7 @@ impl std::fmt::Debug for FileEntry {
             .field("tags", &self.tags)
             .field("facts", &self.facts)
             .field("sudo", &self.sudo)
+            .field("rollback", &self.rollback)
             .finish()
     }
 }
@@ -1062,6 +1067,25 @@ mod tests {
     }
 
     #[test]
+    fn a_files_entry_keeps_rollback_on_unless_set_false() {
+        let config = file_entry(ENTRY);
+        assert!(config.files[0].rollback);
+        let off = file_entry(&format!("{ENTRY}\nrollback = false"));
+        off.check_files().unwrap();
+        assert!(!off.files[0].rollback);
+        assert!(off.files[0].sudo, "rollback leaves sudo alone");
+        assert!(format!("{:?}", off.files[0]).contains("rollback: false"));
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&config, format).unwrap();
+            assert!(!text.contains("rollback"), "{text}");
+            let text = document::to_string(&off, format).unwrap();
+            assert!(text.contains("rollback"), "{text}");
+            let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(back, off);
+        }
+    }
+
+    #[test]
     fn files_modes_and_dests_within_the_rules_pass() {
         for mode in ["644", "0644", "0444", "0000", "0777", "1777", "0600", "755"] {
             let config = file_entry(&format!("src = \"a\"\ndest = \"/a\"\nmode = \"{mode}\""));
@@ -1291,6 +1315,11 @@ mod tests {
         for (file, key, line) in [
             ("invalid/config-files-unknown-key.toml", "owner", "line 5"),
             ("invalid/config-files-sudo-not-bool.toml", "sudo", "line 5"),
+            (
+                "invalid/config-files-rollback-not-bool.toml",
+                "rollback",
+                "line 5",
+            ),
             ("invalid/config-files-unknown-key.yaml", "owner", "line 5"),
         ] {
             let err = Config::load(Some(&fixture_doc(file))).unwrap_err();

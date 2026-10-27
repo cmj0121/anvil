@@ -1333,6 +1333,7 @@ mod tests {
             tags: vec![tag.to_owned()],
             facts: Default::default(),
             sudo: false,
+            rollback: true,
         };
         let config = Config {
             packages: Some(Packages {
@@ -1405,6 +1406,7 @@ mod tests {
                 tags: vec!["web".to_owned()],
                 facts: Default::default(),
                 sudo: false,
+                rollback: true,
             }],
             services: vec![service("sshd", "local"), service("cron", "web")],
             steps: vec![Step::script("hostname")],
