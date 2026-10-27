@@ -43,6 +43,7 @@ pub fn run_targets(
         plugin: None,
         timeout,
         file: None,
+        service: None,
     }];
     Ok(apply::for_each_target(&targets, cancel, on, |target| {
         run_target(target, opts.transport(target), &runs, cancel)

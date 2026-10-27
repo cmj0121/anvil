@@ -18,6 +18,9 @@ system OpenSSH client.
 - **`[[files]]`** copies a text file onto each selected target whose tags and facts match, after the package step and
   before `[[steps]]`. The write goes through sudo unless the entry sets `sudo = false`, and a rerun with the same bytes
   prints `unchanged`. The file's bytes are never printed, not in the output and not in `--json`.
+- **`[[services]]`** starts or stops a service, and enables or disables it, on each selected target whose tags and
+  facts match, after the files and before `[[steps]]`. It uses the target's init: systemd, OpenRC on Alpine, or launchd
+  on macOS. It changes only what differs, so a rerun prints `unchanged service NAME`.
 - **`anvil plan`** shows the steps apply would run on each target and runs none of them; `--json` marks the document
   `"executed": false`.
 - **`anvil run FILE`** (or `-` for stdin) runs one ad-hoc POSIX sh script on every target, one after another, with
@@ -52,11 +55,11 @@ Pre-built binaries: see [Getting started](docs/getting-started.md#pre-built-bina
 
 ```sh
 anvil inventory            # add your hosts (opens $EDITOR, default nvim)
-anvil config               # edit the preferences, packages, files and steps
+anvil config               # edit the preferences, packages, files, services and steps
 anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secrets] says otherwise)
 anvil doctor               # local checks + every target's facts and reachability
 anvil plan                 # the steps apply would run on every target, running none
-anvil apply                # install packages, copy matching files and run the steps
+anvil apply                # install packages, copy files, set services, run the steps
 anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
 anvil tui                  # all of the above in one terminal UI
 anvil update --check       # is a newer release out? `anvil update` installs it
@@ -97,6 +100,24 @@ dest = "/etc/ssh/sshd_config"  # absolute path on the target
 mode = "0644"
 tags = ["linode"]              # every listed tag; omit to skip the tag check
 facts = { distro = "arch" }    # each value equals that fact; omit to skip it
+```
+
+A service started and enabled at boot on each selected target that carries the tag `linode`
+([Services](docs/configuration.md#services)). The init comes from the target's `distro` fact; a distro with no known
+init fails a target that some entry matches with ``services: no init known for distro `gentoo` `` ([Service steps](docs/cli.md#service-steps)):
+
+| `distro`                                                                   | Init    |
+| -------------------------------------------------------------------------- | ------- |
+| `macos`                                                                    | launchd |
+| `alpine`                                                                   | OpenRC  |
+| a pacman, apt or dnf distro: `arch`, `debian`, `ubuntu`, `fedora` and more | systemd |
+
+```toml
+[[services]]
+name = "sshd"                  # the systemd unit, OpenRC service or launchd label
+state = "started"              # started | stopped
+enabled = true                 # optional; omit to leave enablement alone
+tags = ["linode"]
 ```
 
 A step whose script comes from a plugin ([Plugin steps](docs/cli.md#plugin-steps)). anvil runs only the file the

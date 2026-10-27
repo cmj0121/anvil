@@ -12,6 +12,7 @@
 //! file over a plain run, then a terminal run types the password and runs
 //! `sudo install`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
@@ -20,7 +21,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::apply::{FileRun, PlannedRun, Upload};
-use crate::config::{Config, FileEntry, ModeValue, is_mode};
+use crate::config::{Config, ModeValue, is_mode};
 use crate::document;
 use crate::facts::Facts;
 use crate::inventory::{self, Target, TargetKind};
@@ -100,21 +101,26 @@ fn read_src(dir: &Path, src: &str) -> Result<String, String> {
     Ok(text)
 }
 
-/// Whether `target` carries every tag of `entry` (`local` carries `local`)
-/// and its facts equal every fact of `entry`; `pkg` matches when the value
-/// is one of the managers present.
-pub fn matches(entry: &FileEntry, target: &Target, facts: &Facts) -> bool {
+/// Whether `target` carries every one of `tags` (`local` carries `local`)
+/// and its facts equal every one of `wanted`; `pkg` matches when the value
+/// is one of the managers present. Shared by `[[files]]` and `[[services]]`.
+pub fn matches(
+    tags: &[String],
+    wanted: &BTreeMap<String, String>,
+    target: &Target,
+    facts: &Facts,
+) -> bool {
     let has_fact = |(key, value): (&String, &String)| match key.as_str() {
         "pkg" => facts.pkg().contains(&value.as_str()),
         _ => facts.get(key) == Some(value.as_str()),
     };
-    has_tags(entry, target) && entry.facts.iter().all(has_fact)
+    has_tags(tags, target) && wanted.iter().all(has_fact)
 }
 
-/// Whether `target` carries every tag of `entry`; `local` carries `local`.
+/// Whether `target` carries every one of `tags`; `local` carries `local`.
 /// Known before the probe, unlike the facts.
-pub fn has_tags(entry: &FileEntry, target: &Target) -> bool {
-    entry.tags.iter().all(|tag| {
+pub fn has_tags(tags: &[String], target: &Target) -> bool {
+    tags.iter().all(|tag| {
         target.tags.contains(tag)
             || (target.kind == TargetKind::Local && tag.as_str() == inventory::LOCAL)
     })
@@ -145,7 +151,7 @@ pub fn runs(
     let mut runs = Vec::with_capacity(config.files.len());
     for (i, entry) in config.files.iter().enumerate() {
         let dest = &entry.dest;
-        if !matches(entry, target, facts) {
+        if !matches(&entry.tags, &entry.facts, target, facts) {
             log::info!("{}: files[{i}] {dest}: no match", target.name);
             runs.push(file_run(
                 String::new(),
@@ -219,6 +225,7 @@ fn file_run(run: String, label: String, sudo_secret: Option<String>, file: FileR
         plugin: None,
         timeout: RUN_TIMEOUT,
         file: Some(file),
+        service: None,
     }
 }
 
@@ -275,7 +282,7 @@ impl fmt::Display for Body<'_> {
 }
 
 /// `s` in single quotes for `sh`.
-fn quote(s: &str) -> String {
+pub(crate) fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
@@ -420,11 +427,11 @@ fn temp_path() -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::PathBuf;
 
     use super::*;
+    use crate::config::FileEntry;
     use crate::packages::Packages;
     use crate::test_util::temp_dir;
     use crate::transport::{Local, Transport};
@@ -586,40 +593,49 @@ mod tests {
         let mut e = entry("a", "/etc/a");
         let web = host(&["web", "prod"], None);
         let arch = facts(&[("distro", "arch"), ("pkg", "pacman brew"), ("os", "Linux")]);
-        assert!(matches(&e, &web, &arch), "no tags and no facts match all");
-        assert!(matches(&e, &web, &Facts::default()));
+        assert!(
+            matches(&e.tags, &e.facts, &web, &arch),
+            "no tags and no facts match all"
+        );
+        assert!(matches(&e.tags, &e.facts, &web, &Facts::default()));
 
         e.tags = vec!["web".into(), "prod".into()];
-        assert!(matches(&e, &web, &arch));
+        assert!(matches(&e.tags, &e.facts, &web, &arch));
         e.tags.push("db".into());
-        assert!(!matches(&e, &web, &arch));
+        assert!(!matches(&e.tags, &e.facts, &web, &arch));
         e.tags = vec!["local".into()];
-        assert!(!matches(&e, &web, &arch), "an ssh host is not local");
+        assert!(
+            !matches(&e.tags, &e.facts, &web, &arch),
+            "an ssh host is not local"
+        );
         let local = Target {
             kind: TargetKind::Local,
             tags: Vec::new(),
             ..host(&[], None)
         };
-        assert!(matches(&e, &local, &arch));
+        assert!(matches(&e.tags, &e.facts, &local, &arch));
 
         e.tags.clear();
         e.facts = BTreeMap::from([("distro".into(), "arch".into())]);
-        assert!(matches(&e, &web, &arch));
+        assert!(matches(&e.tags, &e.facts, &web, &arch));
         for value in ["Arch", "arch ", "debian"] {
             e.facts.insert("distro".into(), value.into());
-            assert!(!matches(&e, &web, &arch), "{value:?}");
+            assert!(!matches(&e.tags, &e.facts, &web, &arch), "{value:?}");
         }
         e.facts = BTreeMap::from([("pkg".into(), "brew".into())]);
-        assert!(matches(&e, &web, &arch));
+        assert!(matches(&e.tags, &e.facts, &web, &arch));
         for value in ["apt", "pacman brew", "pac"] {
             e.facts.insert("pkg".into(), value.into());
-            assert!(!matches(&e, &web, &arch), "{value:?}");
+            assert!(!matches(&e.tags, &e.facts, &web, &arch), "{value:?}");
         }
         e.facts = BTreeMap::from([
             ("os".into(), "Linux".into()),
             ("arch".into(), "x86_64".into()),
         ]);
-        assert!(!matches(&e, &web, &arch), "a fact the probe did not report");
+        assert!(
+            !matches(&e.tags, &e.facts, &web, &arch),
+            "a fact the probe did not report"
+        );
     }
 
     #[test]

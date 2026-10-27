@@ -18,6 +18,7 @@ mod plan;
 mod plugin;
 mod run;
 mod secret;
+mod services;
 mod ssh;
 mod term;
 #[cfg(test)]

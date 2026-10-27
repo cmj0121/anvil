@@ -17,6 +17,9 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
 - **`[[files]]`** 把一份文字檔複製到每個 tag 與 fact 都符合的選定 target，排在套件 step 之後、`[[steps]]` 之前。
   除非項目設定 `sudo = false`，否則透過 sudo 寫入；位元組相同時再次執行會印出 `unchanged`。
   檔案位元組不會印出，輸出與 `--json` 都不會包含它們。
+- **`[[services]]`** 在每個 tag 與 fact 都符合的選定 target 上啟動或停止一個服務，並啟用或停用它，排在檔案之後、`[[steps]]` 之前。
+  它使用 target 的 init：systemd、Alpine 上的 OpenRC，或 macOS 上的 launchd。它只變更不同之處，
+  因此再次執行會印出 `unchanged service NAME`。
 - **`anvil plan`** 列出 apply 會在每個 target 上執行的 step，但一個都不執行；`--json` 的文件標記為
   `"executed": false`。
 - **`anvil run FILE`**（或以 `-` 讀 stdin）在每個 target 上逐一執行一份臨時的 POSIX sh 腳本，
@@ -49,11 +52,11 @@ make build                 # builds target/release/anvil
 
 ```sh
 anvil inventory            # add your hosts (opens $EDITOR, default nvim)
-anvil config               # edit the preferences, packages, files and steps
+anvil config               # edit the preferences, packages, files, services and steps
 anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secrets] says otherwise)
 anvil doctor               # local checks + every target's facts and reachability
 anvil plan                 # the steps apply would run on every target, running none
-anvil apply                # install packages, copy matching files and run the steps
+anvil apply                # install packages, copy files, set services, run the steps
 anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
 anvil tui                  # all of the above in one terminal UI
 anvil update --check       # is a newer release out? `anvil update` installs it
@@ -92,6 +95,24 @@ dest = "/etc/ssh/sshd_config"  # absolute path on the target
 mode = "0644"
 tags = ["linode"]              # every listed tag; omit to skip the tag check
 facts = { distro = "arch" }    # each value equals that fact; omit to skip it
+```
+
+一個在每個帶有 tag `linode` 的選定 target 上啟動、並設為開機啟動的服務（[Services](docs/configuration.zh-TW.md#services)）。
+init 取自 target 的 `distro` fact；沒有已知 init 的發行版會讓有項目符合的 target 以
+``services: no init known for distro `gentoo` `` 失敗（[Service steps](docs/cli.zh-TW.md#service-steps)）：
+
+| `distro`                                                             | Init    |
+| -------------------------------------------------------------------- | ------- |
+| `macos`                                                              | launchd |
+| `alpine`                                                             | OpenRC  |
+| pacman、apt 或 dnf 的發行版：`arch`、`debian`、`ubuntu`、`fedora` 等 | systemd |
+
+```toml
+[[services]]
+name = "sshd"                  # the systemd unit, OpenRC service or launchd label
+state = "started"              # started | stopped
+enabled = true                 # optional; omit to leave enablement alone
+tags = ["linode"]
 ```
 
 一個腳本來自 plugin 的 step（[Plugin steps](docs/cli.zh-TW.md#plugin-steps)）。anvil 只執行 config 指定的檔案，

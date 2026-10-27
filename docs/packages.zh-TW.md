@@ -75,7 +75,9 @@ anvil apply
 ```
 
 **載入。** 當 `[packages]` 有工作要做，且某個選定的 target 有 sudo secret 時，
-apply 會在任何 target 執行之前開啟機密儲存庫一次，並讀取每個不同的 secret；否則完全不開啟儲存庫。
+apply 會在任何 target 執行之前開啟機密儲存庫一次，並讀取每個不同的 secret。
+`[[files]]` 或 `[[services]]` 項目也可能開啟它
+（[Files](configuration.zh-TW.md#files)、[Service steps](cli.zh-TW.md#service-steps)）；否則完全不開啟儲存庫。
 無法開啟的儲存庫會使指令失敗。值結尾的一個 `\n` 會被去除；其餘保持不變。
 需要密碼時，未設定的 secret 會使該 target 以 `packages: secret NAME is not set` 失敗，
 含有控制字元的值（任何小於 0x20 的位元組，或 0x7f；CRLF 結尾會留下一個 `\r`，也算在內），
@@ -127,7 +129,7 @@ step 輸出（因此 `--json` 也是）中任何 8 位元組以上的密碼都�
 - `sudo -v` 建立一個供各 step 的 `sudo -n` 使用的 ticket；若設定 `Defaults timestamp_timeout=0`，ticket 會立即過期，
   之後的 `sudo -n` 會失敗，因此 step 以非零值結束。
 - 在 Linux 上，local target 需要 util-linux 的 `script`；busybox 的 `script` 沒有 `-e`，因此 local 執行會在那裡失敗。
-- 只有套件 step 在終端機上執行；`[[steps]]` 從不會拿到密碼。
+- 只有套件 step，以及走密碼路徑的 file 或 service step 在終端機上執行；`[[steps]]` 從不會拿到密碼。
 
 ## 別名
 

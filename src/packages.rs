@@ -67,7 +67,7 @@ impl Manager {
     }
 
     /// The manager `auto` picks for a `distro` fact.
-    fn for_distro(distro: &str) -> Option<Manager> {
+    pub(crate) fn for_distro(distro: &str) -> Option<Manager> {
         match distro {
             "macos" => Some(Manager::Brew),
             "arch" | "archarm" | "manjaro" | "endeavouros" => Some(Manager::Pacman),

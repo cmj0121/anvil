@@ -8,7 +8,7 @@
 //! secret is set is `anvil doctor`'s job. A plugin step runs its plugin, on
 //! the controller only, to list the script it returns. Each `[[files]]`
 //! src is read before any target, as apply reads it; its bytes are never
-//! shown.
+//! shown. A `[[services]]` step shows as `service NAME`, never its script.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -485,6 +485,50 @@ mod tests {
     }
 
     #[test]
+    fn each_service_is_a_step_by_its_name_and_its_script_never_shows() {
+        use crate::config::ServiceEntry;
+
+        let service = |name: &str, tags: &[&str]| ServiceEntry {
+            name: name.to_owned(),
+            state: Some("started".to_owned()),
+            enabled: Some(true),
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            facts: Default::default(),
+        };
+        let config = Config {
+            packages: Some(Packages {
+                local_sudo_secret: Some("LOCAL_SUDO".to_owned()),
+                ..Packages::default()
+            }),
+            services: vec![service("sshd", &[]), service("cron", &["web"])],
+            ..config(None, &["one"])
+        };
+        let (plan, runs) = plan(&["local"], None, ARCH_SUDO, &config, false);
+        assert_eq!(runs, [facts::PROBE], "no step ran");
+        assert_eq!(
+            screen(&plan.targets[0]),
+            "▶ local\n  \
+             would $ service sshd (sudo password from secret LOCAL_SUDO)\n  \
+             would $ skipped service cron: no match\n  \
+             would $ one\n  \
+             ✔ 3 steps\n\n"
+        );
+        let value = json(&plan);
+        assert_eq!(
+            value["targets"][0]["steps"][0],
+            serde_json::json!({"run": "service sshd", "sudo_secret": "LOCAL_SUDO"})
+        );
+        assert_eq!(
+            value["targets"][0]["steps"][1],
+            serde_json::json!({"run": "skipped service cron: no match"})
+        );
+        assert!(
+            !value.to_string().contains("systemctl"),
+            "no script: {value}"
+        );
+    }
+
+    #[test]
     fn only_the_probe_runs_and_the_package_step_names_its_secret() {
         let config = config(Some(git()), &["one", "two"]);
         let (plan, runs) = plan(&["local", "b"], None, ARCH_SUDO, &config, false);
@@ -501,6 +545,7 @@ mod tests {
                     plugin: None,
                     timeout: git().timeout(),
                     file: None,
+                    service: None,
                 },
                 PlannedRun {
                     run: "one".to_owned(),
@@ -509,6 +554,7 @@ mod tests {
                     plugin: None,
                     timeout: RUN_TIMEOUT,
                     file: None,
+                    service: None,
                 },
                 PlannedRun {
                     run: "two".to_owned(),
@@ -517,6 +563,7 @@ mod tests {
                     plugin: None,
                     timeout: RUN_TIMEOUT,
                     file: None,
+                    service: None,
                 },
             ],
             ok: true,

@@ -334,8 +334,9 @@ pub fn load_steps(opts: &Options) -> Result<Vec<StepRow>, String> {
 }
 
 /// The steps apply runs for `config`: `packages` first when it has work,
-/// then `file <dest>` for each `[[files]]` entry (a step on every target,
-/// skipped where it does not match), then each step's command as its `$`
+/// then `file <dest>` for each `[[files]]` entry and `service <name>` for
+/// each `[[services]]` entry (each a step on every target, skipped where it
+/// does not match), then each step's command as its `$`
 /// line shows it, or `plugin <name>` for a plugin step, whose script is
 /// known only once it has run.
 pub fn step_rows(config: &Config) -> Vec<StepRow> {
@@ -348,6 +349,12 @@ pub fn step_rows(config: &Config) -> Vec<StepRow> {
                 .files
                 .iter()
                 .map(|entry| format!("file {}", entry.dest)),
+        )
+        .chain(
+            config
+                .services
+                .iter()
+                .map(|entry| format!("service {}", entry.name)),
         )
         .chain(config.steps.iter().map(|step| match step.kind() {
             StepKind::Plugin(name) => format!("plugin {name}"),
@@ -1430,6 +1437,26 @@ pub mod tests {
             ..Config::default()
         };
         assert_eq!(step_rows(&config), [row("ls"), row("plugin harden")]);
+    }
+
+    #[test]
+    fn service_rows_follow_the_file_rows_before_the_steps() {
+        let opts = config_opts(
+            "tui-steps-services",
+            "[[files]]\nsrc = \"motd\"\ndest = \"/etc/motd\"\nmode = \"0644\"\n\n\
+             [[services]]\nname = \"sshd\"\nstate = \"started\"\n\n\
+             [[services]]\nname = \"cron\"\nstate = \"stopped\"\ntags = [\"web\"]\n\n\
+             [[steps]]\nrun = \"hostname\"\n",
+        );
+        assert_eq!(
+            load_steps(&opts),
+            Ok(vec![
+                row("file /etc/motd"),
+                row("service sshd"),
+                row("service cron"),
+                row("hostname"),
+            ])
+        );
     }
 
     #[test]

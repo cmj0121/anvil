@@ -44,17 +44,18 @@ Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
   picked. While the shown result is running, its spinner and the running target (`· ⠙ linode1`) come before
   `targets:`. On the right, `✔ ok  ✘ failed` counts the shown result's targets. Text that does not fit is cut with `…`.
   An inventory that does not load shows `inventory error` in red instead of the selection, and its error as a notice.
-- **Steps.** The steps apply runs, numbered: `packages` when `[packages]` has work, then each `[[steps]]` command (its
-  first line, with `…` when it has more); a config with neither runs the default `hostname` step. The cursor row is
-  marked `▶`. On an apply result the list is the one of the config that run loaded, and each row has a mark for the
-  shown tab's target: `✔` exited 0, `✘` exited non-zero or was killed, `⊘` did not run (after a failed step or a
-  cancel). When a transport error ended the target, the step it ended is `✘` (with no step run yet, the first: the
-  connect or probe failed), unless a timed-out step kept its output, which is the `✘` row then; the rest are `⊘`. Before
-  the target has a report (queued or running) every row is `·`; the running target has no tab until it ends, and its
-  spinner is in the header and on the last line of Results. On doctor and edit results the list is the config's as of
-  the last reload, without marks; so is a plan result's. A run result (`x`) lists one step, its script (the first line,
-  with `…` when it has more), marked as on apply. A plugin step is listed as `plugin NAME`. A config that does not
-  load shows its error in red instead.
+- **Steps.** The steps apply runs, numbered: `packages` when `[packages]` has work, then `file DEST` for each
+  `[[files]]` entry and `service NAME` for each `[[services]]` entry, then each `[[steps]]` command (its first line,
+  with `…` when it has more); a config without `[[steps]]` runs the default `hostname` step. The cursor row is marked
+  `▶`. On an apply result the list is the one of the config that run loaded, and each row has a mark for the shown tab's
+  target: `✔` exited 0, `✘` exited non-zero or was killed, `⊘` did not run (after a failed step or a cancel, or a file
+  or service step skipped because the target does not match). When a transport error ended the target, the step it ended
+  is `✘` (with no step run yet, the first: the connect or probe failed), unless a timed-out step kept its output, which
+  is the `✘` row then; the rest are `⊘`. Before the target has a report (queued or running) every row is `·`; the
+  running target has no tab until it ends, and its spinner is in the header and on the last line of Results. On doctor
+  and edit results the list is the config's as of the last reload, without marks; so is a plan result's. A run result
+  (`x`) lists one step, its script (the first line, with `…` when it has more), marked as on apply. A plugin step is
+  listed as `plugin NAME`. A config that does not load shows its error in red instead.
 - **Results.** One tab per section of the shown result, not one per past run. A doctor result has a `local checks` tab
   when local checks exist, then one tab per target, in order; apply, plan and run have one tab per target, in order; an
   edit has one tab, labeled by what it edited (`inventory`, `config`, `secret NAME`, `migrate → age`). `←` and `→`
