@@ -182,6 +182,161 @@ manager cannot be resolved also makes the exit 1; without `[packages]` nothing i
 the probe reported (abridged above). `manager` (the resolved manager) or `manager_error` (the reason, without the
 `error:` prefix) appears only with `[packages]` and only on a connectable target.
 
+#### Doctor plugins: drift since the last apply
+
+There is no `anvil audit` command: drift is a doctor plugin. Pin one with `on = "doctor"` and `anvil doctor` reports what
+changed on each target since the last apply. anvil ships a reference plugin, `anvil-audit`, built from source
+([Plugins](configuration.md#plugins) has the setup):
+
+```toml
+[plugins.audit]
+path = "~/.config/anvil/plugins/audit"
+sha256 = "…"
+on = "doctor"
+```
+
+```text
+linode1
+  transport       ssh linode1
+  …
+  audit           drift: kernel was 6.1, now 6.2
+  audit           drift: /etc/app.conf was written, now changed
+  audit           notice: /etc/b.conf was written, now changed (the last apply failed while writing it)
+  files           3 not compared (2 no sudo, 1 rolled back)
+  sudo            WARNING: sudo -n was refused or asks for a password; 2 root-only files were not compared
+```
+
+**What doctor adds.** With at least one `on = "doctor"` entry, doctor also, among the local checks:
+
+- checks each doctor plugin's pin, as apply checks a step plugin's ([Plugin steps](#plugin-steps)), and shows a row
+  `plugin NAME     pinned` or `plugin NAME     error: REASON`. A bad pin skips only that plugin, the others still
+  run, and doctor exits 1. Only `on = "doctor"` entries are checked here; apply and plan check only `on = "step"` ones,
+  so a stale doctor pin never stops an apply;
+- reads [the apply record](#the-apply-record), shown as `record          none`, `found` or `error: REASON`. A record
+  that cannot be read fails doctor and no doctor plugin runs;
+- reads a fresh 32-byte key from `/dev/urandom` for this run's tags (below); if it cannot, `tag key error: …` and no
+  doctor plugin runs.
+
+Then, on each connectable target, after the facts and the manager: one hash-only run over the dests the target's
+record entry lists (at most one `sudo -n` per target, as root for a `sudo` entry, with the write's root checks on each
+directory, never reading a byte of a file back), then each pinned doctor plugin in name order. Without a doctor plugin
+none of this happens and doctor's output, `--json` and exit are as before.
+
+**The request.** A doctor plugin gets one line of JSON on stdin, with no arguments, in its own directory and with the
+cleared environment of a step plugin:
+
+```json
+{
+  "target": "linode1",
+  "facts": { "hostname": "linode1", "kernel": "6.2", "…": "…" },
+  "tags": ["linode"],
+  "args": {},
+  "last_apply": {
+    "at": 1730000000,
+    "facts": { "kernel": "6.1", "…": "…" },
+    "files": [
+      {
+        "dest": "/etc/app.conf",
+        "mode": "0644",
+        "write": "written",
+        "written_tag": "<64 hex>"
+      }
+    ],
+    "rolled_back": null
+  },
+  "current_files": [
+    { "dest": "/etc/app.conf", "state": "file", "tag": "<64 hex>" }
+  ]
+}
+```
+
+- `facts` are this run's probe; `last_apply` is the target's record entry, or `null` when there is no record or no
+  entry for the target. It never holds a previous text, owner or hash.
+- `current_files` has one entry per `last_apply.files` dest, in that order. `state` is `file`, `absent`, `dangling`
+  (a link on the user path whose target is gone), `symlink` (an as-root dest that is a link), `not_regular`,
+  `unreadable`, `not_root_only` (a directory above an as-root dest is not root's or group or others can write it),
+  `no_hash` (neither `sha256sum` nor `shasum`) or `no_sudo`. Only `file` has a `tag`.
+- No sha256 leaves anvil: each `written_sha256` becomes `written_tag` and each live sha256 a `tag`, the hex
+  HMAC-SHA256 of the hex under this run's key. Equal tags mean equal hashes within one run; the tags change on every
+  run.
+- At most 1736704 bytes (64 KiB, plus 26112 for each of the 64 files a record entry may list). A larger request, or a
+  record entry listing more than 64 files, is that plugin's error on that target; nothing is spawned.
+
+**The reply.** One JSON document on stdout:
+
+```json
+{
+  "ok": true,
+  "findings": [
+    { "target": "linode1", "item": "kernel", "was": "6.1", "now": "6.2" },
+    {
+      "target": "linode1",
+      "item": "/etc/b.conf",
+      "severity": "notice",
+      "was": "written",
+      "now": "changed",
+      "text": "the last apply failed while writing it"
+    }
+  ]
+}
+```
+
+`severity` is `drift` (the default) or `notice`; `was`, `now` and `text` are optional. The whole reply is refused,
+`plugin NAME: reply …`, without quoting it, for an unknown field, anything but one object, more than 1000 findings, a
+`target` other than the request's, an empty `item` or one over 4096 bytes, an `item` that is neither a dest in
+`last_apply.files` or `current_files` nor a fact key in `facts` or `last_apply.facts`, a `was`, `now` or `text` over
+256 bytes, a control, bidi, zero-width or other invisible character in any of them (U+00AD, U+061C, U+200B–U+200F,
+U+2028–U+202E, U+2060–U+2064, U+2066–U+2069, U+FEFF, U+E0000–U+E007F), a run of 64 or more hex digits in `was`, `now`
+or `text`, or, on an `item` that is a recorded dest, a `was` or `now` other than `written`, `changed`, `absent`,
+`dangling link`, `symlink`, `not a regular file`, `unreadable`, `not root-only`, `no hash tool` or `no sudo`. So a
+plugin cannot print a tag or a hash: a 64-hex `item` can only be a real dest named like one. The limits of a step plugin
+hold too: 30 s, 2 MiB of reply, exit 0, only the last stderr line in an error.
+
+A doctor plugin is not sandboxed. The request holds no hash, but the plugin runs as you and can read anything you can,
+`last-apply.json` included (previous texts in plain text, each `written_sha256`). Pin only one you trust as you trust
+the config ([Security notes](security.md)).
+
+**Rows.** Under the target, labelled with the plugin's name: `drift: ITEM was WAS, now NOW`, `notice: …` with its
+`text` in parentheses, `no apply recorded` (a `last_apply` of `null`), `error: REASON` (also
+`error: it replied ok: false`), or `no drift`. An item is cut to 256 bytes and `…`, with runs of spaces shown as one;
+`--json` keeps it whole. Then `files N not compared (…)` counts the files no plugin could compare (no sudo, no hash
+tool, rolled back since), and a target with any `no_sudo` file gets the one `sudo WARNING: …` line, also logged as a
+warning. The tags keep every hash out of the request and out of doctor's output: no hash or tag is ever printed.
+
+**`--json`** adds `local.plugins` (`{"audit": null}` when pinned, else the error), `local.record` and, on a key
+error, `local.tag_key`; and on each target `plugins` (`[{"plugin": "audit", "ok": true, "notice": …, "error": …,
+"findings": [{"target", "item", "was", "now", "severity", "text"}]}]`) and `drift` (`{"not_compared", "no_sudo",
+"no_hash", "rolled_back"}`). Each is left out when empty.
+
+**Exit.** A `drift` finding, `ok: false`, a plugin error, a bad pin, a record or key error each make the exit 1, the same
+code as an unreachable target, so a script cannot tell drift from a down host by the code alone; `--json` can. With
+drift the only failure the message is `doctor: drift since the last apply`. Notices alone, `no apply recorded` alone
+and files not compared exit 0.
+
+**Cancel and time.** The first Ctrl-C (or Esc in the TUI) lets the running probe, hash run or plugin finish, then the
+rest of that target's plugins and every later target end `cancelled`: `doctor: cancelled`, exit 1. A second Ctrl-C
+kills them and anvil dies by SIGINT. doctor runs one target at a time: in the worst case a target takes, on ssh, up to
+40 s to connect and open its master (the 10 s `ssh -O check`, then the 30 s key attempt, whose connect is capped by
+`ConnectTimeout=10`), then 30 s for the probe, 30 s for the hash run and 30 s for each doctor plugin.
+
+**anvil-audit's rules.** With `last_apply` null it finds nothing. Else each recorded fact whose live value differs is
+drift (a fact only in the live probe is ignored), then each recorded file in record order:
+
+- `file` with the written tag: no finding.
+- another tag: drift `was written, now changed`; `absent`, `dangling`, `symlink`, `not_regular`, `unreadable` and
+  `not_root_only`: drift with `now` `absent`, `dangling link`, `symlink`, `not a regular file`, `unreadable` or
+  `not root-only`.
+- the same on a file whose write failed midway: a notice instead, with the text `the last apply failed while writing it`.
+- `no_hash`, `no_sudo`, or a dest rolled back since the apply: no finding; doctor counts it as not compared.
+
+Its limits:
+
+- A file a rollback put back is not checked: the record keeps no hash of the previous state for a plugin.
+- The `sudo` fact is never compared: it reads sudo's cache at that moment, so it changes without any drift.
+- Root-only files on a target whose `sudo -n` is refused or asks for a password are `no_sudo`: doctor never types the
+  sudo password, not even from `sudo_secret`.
+- Only the bytes are compared, not a file's mode or owner, and only dests the record lists.
+
 ### `anvil apply`
 
 Runs the config's `[[steps]]` in order on every selected target: each step's `run` is sent to `sh -s` on the target
@@ -296,7 +451,8 @@ the step was killed by a signal or timed out; a timed-out step is the last `step
 
 #### Ctrl-C
 
-`apply`, `plan`, `run` and `rollback` handle Ctrl-C the same way, with any `--parallel`:
+`apply`, `plan`, `run` and `rollback` handle Ctrl-C the same way, with any `--parallel`; `doctor` does too, between its
+targets and its doctor plugins ([Doctor plugins](#doctor-plugins-drift-since-the-last-apply)):
 
 - **The first press cancels.** anvil prints
   `interrupted: running targets stop after their current step; Ctrl-C again stops now` on stderr, whatever `-v`. Each
@@ -515,10 +671,11 @@ plugin = "harden"
 args = { profile = "ssh" }
 ```
 
-**Pin checks.** `apply` and `plan` (and the TUI's `a` and `p`) check every `[plugins]` entry, used by a step or not,
-before any target is contacted. The path is resolved through symlinks once. The file it names must be a regular file of
-at most 64 MiB, owned by the current user, with the owner's execute bit and no group or other write bit, in a directory
-owned by the current user with no group or other write bit; and its bytes must hash to `sha256`. Any failure stops
+**Pin checks.** `apply` and `plan` (and the TUI's `a` and `p`) check every `on = "step"` `[plugins]` entry, used by a
+step or not, before any target is contacted; an `on = "doctor"` entry is checked only by doctor. The path is resolved
+through symlinks once. The file it names must be a regular file of at most 64 MiB, owned by the current user, with the
+owner's execute bit and no group or other write bit, in a directory owned by the current user with no group or other
+write bit; and its bytes must hash to `sha256`. Any failure stops
 the command before any target; `apply` and `plan` exit 2, naming the key:
 
 ```text
@@ -1208,13 +1365,15 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 - **0**: for `doctor`, a `missing` secret or an unresolved editor is only a warning.
 - **1**: `doctor`/`apply`: a target or a check failed (including a `locked` or `error` secret, and, with `[packages]`, a
   package manager that cannot be resolved).
+  `doctor`: also drift, a doctor plugin's error or `ok: false`, its bad pin, or a record or tag key that cannot be read
+  ([Doctor plugins](#doctor-plugins-drift-since-the-last-apply)); drift and an unreachable target share the code.
   `plan`: a target could not be reached, probed or resolved.
   `apply`/`plan`: a plugin step's plugin failed on a target ([Plugin steps](#plugin-steps)).
   `run`: a target failed or could not be reached.
   `rollback`: see [anvil rollback](#anvil-rollback); `apply` also when the record cannot be read, locked or saved, or
   there is no state directory ([The apply record](#the-apply-record)).
-  `apply`/`plan`/`run`/`rollback`: a first Ctrl-C cancelled the run ([Ctrl-C](#ctrl-c)); a second one kills anvil by SIGINT
-  instead, which a shell reports as 130.
+  `apply`/`plan`/`run`/`rollback`/`doctor`: a first Ctrl-C cancelled the run ([Ctrl-C](#ctrl-c)); a second one kills
+  anvil by SIGINT instead, which a shell reports as 130.
   `inventory`/`config`/`secret`: the editor exited non-zero (aborted), a file write failed, or the secret store failed,
   is locked or its passphrase prompt was cancelled.
 - **2**: a bad flag or argument (including an `--inventory` or `--config` path not ending in `.toml`), an unknown

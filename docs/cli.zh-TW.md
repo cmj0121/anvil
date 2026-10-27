@@ -180,6 +180,156 @@ anvil run --parallel 4 fix.sh
 `facts` 含探測回報的每個鍵（上例有刪節）。
 `manager`（解析出的套件管理器）或 `manager_error`（原因，不含 `error:` 前綴）只在有 `[packages]` 且 target 可連線時出現。
 
+#### Doctor plugins: drift since the last apply
+
+沒有 `anvil audit` 指令：漂移（drift）由 doctor plugin 回報。以 `on = "doctor"` 釘選一個 plugin，
+`anvil doctor` 就會回報每個 target 自上次 apply 以來的變化。anvil 附有參考 plugin `anvil-audit`，從原始碼建置
+（設定方式見 [Plugins](configuration.zh-TW.md#plugins)）：
+
+```toml
+[plugins.audit]
+path = "~/.config/anvil/plugins/audit"
+sha256 = "…"
+on = "doctor"
+```
+
+```text
+linode1
+  transport       ssh linode1
+  …
+  audit           drift: kernel was 6.1, now 6.2
+  audit           drift: /etc/app.conf was written, now changed
+  audit           notice: /etc/b.conf was written, now changed (the last apply failed while writing it)
+  files           3 not compared (2 no sudo, 1 rolled back)
+  sudo            WARNING: sudo -n was refused or asks for a password; 2 root-only files were not compared
+```
+
+**doctor 多做的事。** 只要有一個 `on = "doctor"` 項目，doctor 在本機檢查中還會：
+
+- 以 apply 檢查 step plugin 的方式（[Plugin steps](#plugin-steps)）檢查每個 doctor plugin 的釘選，
+  並顯示一列 `plugin NAME     pinned` 或 `plugin NAME     error: REASON`。
+  釘選不符只會跳過該 plugin，其他 plugin 照常執行，doctor 以 1 結束。
+  這裡只檢查 `on = "doctor"` 項目；apply 與 plan 只檢查 `on = "step"` 項目，因此過期的 doctor 釘選絕不會擋下 apply；
+- 讀取 [apply 紀錄](#apply-紀錄)，顯示為 `record          none`、`found` 或 `error: REASON`。
+  無法讀取的紀錄會讓 doctor 失敗，且不執行任何 doctor plugin；
+- 為本次執行的 tag（見下）從 `/dev/urandom` 讀取一把新的 32 位元組金鑰；讀不到時顯示 `tag key error: …`，且不執行任何 doctor plugin。
+
+接著在每個可連線的 target 上，於 facts 與 manager 之後：對該 target 紀錄中列出的 dest 做一次只算雜湊的執行
+（每個 target 至多一次 `sudo -n`，`sudo` 項目以 root 執行，並對每層目錄做與寫入相同的 root 檢查，絕不讀回檔案的任何位元組），
+然後依名稱順序執行每個已釘選的 doctor plugin。沒有 doctor plugin 時這些都不會發生，doctor 的輸出、`--json` 與結束碼一如以往。
+
+**請求。** doctor plugin 從 stdin 讀到一行 JSON，沒有引數，工作目錄是它自己的目錄，環境與 step plugin 一樣是清空過的：
+
+```json
+{
+  "target": "linode1",
+  "facts": { "hostname": "linode1", "kernel": "6.2", "…": "…" },
+  "tags": ["linode"],
+  "args": {},
+  "last_apply": {
+    "at": 1730000000,
+    "facts": { "kernel": "6.1", "…": "…" },
+    "files": [
+      {
+        "dest": "/etc/app.conf",
+        "mode": "0644",
+        "write": "written",
+        "written_tag": "<64 hex>"
+      }
+    ],
+    "rolled_back": null
+  },
+  "current_files": [
+    { "dest": "/etc/app.conf", "state": "file", "tag": "<64 hex>" }
+  ]
+}
+```
+
+- `facts` 是本次的探測結果；`last_apply` 是該 target 在紀錄中的項目，沒有紀錄或紀錄中沒有該 target 時為 `null`。
+  它絕不含先前的文字、擁有者或雜湊。
+- `current_files` 對 `last_apply.files` 的每個 dest 各有一項，順序相同。`state` 是 `file`、`absent`、
+  `dangling`（使用者路徑上目標已不存在的連結）、`symlink`（以 root 寫入的 dest 是連結）、`not_regular`、`unreadable`、
+  `not_root_only`（以 root 寫入的 dest 上層有目錄不屬於 root，或群組、其他人可寫入）、
+  `no_hash`（`sha256sum` 與 `shasum` 都沒有）或 `no_sudo`。只有 `file` 帶有 `tag`。
+- 沒有任何 sha256 離開 anvil：每個 `written_sha256` 換成 `written_tag`，每個現場 sha256 換成 `tag`，
+  也就是以本次執行的金鑰對該十六進位字串做 HMAC-SHA256 的十六進位值。同一次執行中 tag 相同即雜湊相同；每次執行 tag 都不同。
+- 至多 1736704 位元組（64 KiB，再加上紀錄項目最多可列的 64 個檔案，每個 26112）。
+  更大的請求，或列出超過 64 個檔案的紀錄項目，都是該 plugin 在該 target 上的錯誤；不會啟動任何程序。
+
+**回覆。** stdout 上的一份 JSON 文件：
+
+```json
+{
+  "ok": true,
+  "findings": [
+    { "target": "linode1", "item": "kernel", "was": "6.1", "now": "6.2" },
+    {
+      "target": "linode1",
+      "item": "/etc/b.conf",
+      "severity": "notice",
+      "was": "written",
+      "now": "changed",
+      "text": "the last apply failed while writing it"
+    }
+  ]
+}
+```
+
+`severity` 是 `drift`（預設）或 `notice`；`was`、`now` 與 `text` 可省略。整份回覆會被拒絕，
+錯誤為 `plugin NAME: reply …` 且不引用回覆內容，情況包括：未知欄位、不是單一物件、超過 1000 個 finding、
+`target` 與請求不同、`item` 為空或超過 4096 位元組、
+`item` 既不是 `last_apply.files` 或 `current_files` 中的 dest，也不是 `facts` 或 `last_apply.facts` 中的 fact 鍵、
+`was`、`now` 或 `text` 超過 256 位元組、其中任一含控制字元、雙向（bidi）、零寬或其他不可見字元
+（U+00AD、U+061C、U+200B–U+200F、U+2028–U+202E、U+2060–U+2064、U+2066–U+2069、U+FEFF、U+E0000–U+E007F）、
+`was`、`now` 或 `text` 中出現 64 個以上連續的十六進位數字，或者 `item` 是紀錄中的 dest 時，`was` 或 `now` 不是
+`written`、`changed`、`absent`、`dangling link`、`symlink`、`not a regular file`、`unreadable`、`not root-only`、
+`no hash tool` 或 `no sudo`。因此 plugin 無法印出 tag 或雜湊：64 位十六進位的 `item` 只可能是名稱像雜湊的真實 dest。
+step plugin 的限制同樣適用：30 秒、2 MiB 回覆、以 0 結束、錯誤中只有 stderr 的最後一行。
+
+doctor plugin 沒有沙箱。請求中沒有雜湊，但 plugin 以你的身分執行，能讀取任何你能讀的東西，
+包括 `last-apply.json`（明文的先前文字、每個 `written_sha256`）。只釘選你信任的 plugin，信任程度要與信任設定相同
+（[安全須知](security.zh-TW.md)）。
+
+**顯示列。** 在 target 之下，以 plugin 名稱為標籤：`drift: ITEM was WAS, now NOW`、`notice: …`（括號中為其 `text`）、
+`no apply recorded`（`last_apply` 為 `null`）、`error: REASON`（也包括 `error: it replied ok: false`）或 `no drift`。
+item 會截到 256 位元組並加上 `…`，連續空白顯示為一個；`--json` 保留完整內容。
+接著 `files N not compared (…)` 計算沒有 plugin 能比對的檔案（no sudo、no hash tool、之後已 rollback），
+有任何 `no_sudo` 檔案的 target 會多一行 `sudo WARNING: …`，同時記錄為警告。
+tag 讓所有雜湊都不出現在請求與 doctor 的輸出中：任何雜湊或 tag 都不會被印出。
+
+**`--json`** 會加上 `local.plugins`（已釘選為 `{"audit": null}`，否則為錯誤）、`local.record`，金鑰出錯時加上 `local.tag_key`；
+每個 target 加上 `plugins`（`[{"plugin": "audit", "ok": true, "notice": …, "error": …,
+"findings": [{"target", "item", "was", "now", "severity", "text"}]}]`）與
+`drift`（`{"not_compared", "no_sudo", "no_hash", "rolled_back"}`）。各欄位為空時省略。
+
+**結束碼。** `drift` finding、`ok: false`、plugin 錯誤、釘選不符、紀錄或金鑰錯誤都會讓結束碼為 1，
+與無法連線的 target 相同，因此腳本光看結束碼分不出漂移與主機離線；`--json` 可以。
+漂移是唯一的失敗時，訊息為 `doctor: drift since the last apply`。只有 notice、只有 `no apply recorded`
+以及未比對的檔案都以 0 結束。
+
+**取消與時間。** 第一次 Ctrl-C（或 TUI 中的 Esc）讓正在執行的探測、雜湊執行或 plugin 跑完，
+之後該 target 其餘的 plugin 與之後的每個 target 都以 `cancelled` 結束：`doctor: cancelled`，結束碼 1。
+第二次 Ctrl-C 會殺掉它們，anvil 因 SIGINT 結束。doctor 一次處理一個 target：最壞情況下，每個 target 在 ssh 上
+需要最多 40 秒連線並開啟 master（10 秒的 `ssh -O check`，接著 30 秒的金鑰嘗試，其連線受 `ConnectTimeout=10` 限制），
+接著探測 30 秒、雜湊執行 30 秒，以及每個 doctor plugin 各 30 秒。
+
+**anvil-audit 的規則。** `last_apply` 為 null 時沒有任何 finding。否則，每個紀錄中的 fact 若與現場值不同即為漂移
+（只出現在現場探測中的 fact 會被忽略），接著依紀錄順序檢查每個紀錄中的檔案：
+
+- `file` 且 tag 與寫入時相同：沒有 finding。
+- tag 不同：漂移 `was written, now changed`；`absent`、`dangling`、`symlink`、`not_regular`、`unreadable` 與
+  `not_root_only`：漂移，`now` 分別為 `absent`、`dangling link`、`symlink`、`not a regular file`、`unreadable` 或
+  `not root-only`。
+- 同上，但該檔案的寫入中途失敗：改為 notice，文字為 `the last apply failed while writing it`。
+- `no_hash`、`no_sudo`，或 apply 之後已被 rollback 的 dest：沒有 finding；doctor 將它計為未比對。
+
+它的限制：
+
+- rollback 放回的檔案不會被檢查：紀錄沒有為 plugin 保留先前狀態的雜湊。
+- `sudo` fact 從不比對：它讀的是當下 sudo 的快取，因此即使沒有漂移也會改變。
+- 在 `sudo -n` 被拒或需要密碼的 target 上，僅 root 可寫的檔案為 `no_sudo`：doctor 從不輸入 sudo 密碼，即使有 `sudo_secret` 也一樣。
+- 只比對位元組，不比對檔案的 mode 或擁有者，也只比對紀錄中列出的 dest。
+
 ### `anvil apply`
 
 在每個選定的 target 上依序執行 config 的 `[[steps]]`：每個 step（步驟）的 `run` 會送到 target 上的 `sh -s`（`local` 則為 `/bin/sh -s`）。
@@ -290,7 +440,8 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 
 #### Ctrl-C
 
-`apply`、`plan`、`run` 與 `rollback` 對 Ctrl-C 的處理相同，不論 `--parallel` 為何：
+`apply`、`plan`、`run` 與 `rollback` 對 Ctrl-C 的處理相同，不論 `--parallel` 為何；`doctor` 也一樣，
+在它的 target 與 doctor plugin 之間生效（[Doctor plugins](#doctor-plugins-drift-since-the-last-apply)）：
 
 - **第一次按下會取消。** anvil 在 stderr 印出
   `interrupted: running targets stop after their current step; Ctrl-C again stops now`，不論 `-v` 為何。
@@ -497,7 +648,8 @@ plugin = "harden"
 args = { profile = "ssh" }
 ```
 
-**釘選檢查。** `apply` 與 `plan`（以及 TUI 的 `a` 與 `p`）會在連線任何 target 之前，檢查每個 `[plugins]` 項目，不論有沒有 step 使用它。
+**釘選檢查。** `apply` 與 `plan`（以及 TUI 的 `a` 與 `p`）會在連線任何 target 之前，檢查每個 `on = "step"` 的 `[plugins]` 項目，
+不論有沒有 step 使用它；`on = "doctor"` 項目只由 doctor 檢查。
 路徑只會解析一次符號連結。它指向的檔案必須是至多 64 MiB 的一般檔案、屬於目前使用者、擁有者有執行位元、
 群組與其他人沒有寫入位元，所在目錄也屬於目前使用者且群組與其他人沒有寫入位元；而且檔案位元組的雜湊必須等於 `sha256`。
 任何失敗都會在任何 target 之前中止指令；`apply` 與 `plan` 以 2 結束，並指出是哪個鍵：
@@ -1150,11 +1302,13 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
 
 - **0**：對 `doctor` 而言，`missing` 的 secret 或無法解析的編輯器只是警告。
 - **1**：`doctor`/`apply`：某個 target 或檢查失敗（包括 `locked` 或 `error` 的 secret，以及有 `[packages]` 時無法解析的套件管理器）。
+  `doctor`：還有漂移、doctor plugin 的錯誤或 `ok: false`、它的釘選不符，或無法讀取的紀錄或 tag 金鑰
+  （[Doctor plugins](#doctor-plugins-drift-since-the-last-apply)）；漂移與無法連線的 target 共用這個結束碼。
   `plan`：某個 target 無法連線、探測或解析。
   `apply`/`plan`：某個 plugin step 的 plugin 在某個 target 上失敗（[Plugin steps](#plugin-steps)）。
   `run`：某個 target 失敗或無法連線。
   `rollback`：見 [anvil rollback](#anvil-rollback)；`apply` 還有紀錄無法讀取、被鎖住或無法儲存，或找不到狀態目錄時（[apply 紀錄](#apply-紀錄)）。
-  `apply`/`plan`/`run`/`rollback`：第一次 Ctrl-C 取消了執行（[Ctrl-C](#ctrl-c)）；第二次則讓 anvil 因 SIGINT 結束，shell 回報為 130。
+  `apply`/`plan`/`run`/`rollback`/`doctor`：第一次 Ctrl-C 取消了執行（[Ctrl-C](#ctrl-c)）；第二次則讓 anvil 因 SIGINT 結束，shell 回報為 130。
   `inventory`/`config`/`secret`：編輯器以非零結束（中止）、檔案寫入失敗，或 secret store 失敗、被鎖住或其密語提示被取消。
 - **2**：錯誤的旗標或引數（包括不以 `.toml` 結尾的 `--inventory` 或 `--config` 路徑）、未知的 `--target`、
   無效、無法讀取或模稜兩可的檔案、沒有 `$HOME`（`apply` 與 `rollback` 的狀態目錄除外，為 1：[apply 紀錄](#apply-紀錄)）、找不到編輯器、三次嘗試後仍無效的緩衝區，或大於 1 MiB 的 secret。

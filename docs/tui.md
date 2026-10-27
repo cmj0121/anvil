@@ -70,7 +70,9 @@ Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
   blocks (`▶ name`, `$ command`, its output, `✔ ok · N steps`, `✘ reason` or `⊘ cancelled`); the plan section like
   `anvil plan`'s (`▶ name`, `would $ command`, `✔ N steps`, `✘ reason` or `⊘ cancelled`); the doctor section reads
   like its human output, including the `manager` row with `[packages]` (a target whose manager cannot be resolved
-  counts as failed).
+  counts as failed) and, with a [doctor plugin](cli.md#doctor-plugins-drift-since-the-last-apply), each plugin's rows,
+  the `files … not compared` row and the `sudo WARNING` line: drift, errors and the warning in red, notices and the
+  summary dim. The `local checks` tab then also shows each doctor pin and the record.
   Long lines wrap. A run's own error (config, inventory, a panic) is the last line on every tab.
 - **Status bar.** The last notice, else the keys `a apply · d doctor · t targets · ↑↓ step · ←→ target · ? help`, as
   many as fit; on the right `-v N · <edit format>`.
@@ -148,8 +150,8 @@ greyed in the help and only shows that notice again, until anvil is restarted.
   ([Running in parallel](cli.md#running-in-parallel)); no key changes it. doctor runs one target at a time and says
   nothing about the flag.
 - **One run at a time.** While doctor, apply, plan, run, rollback or an update runs, `d`, `a`, `p`, `x`, `b`, `u`, `i`,
-  `c`, `s`, `m` and `o` are refused with `busy: <run> is running (Esc cancels)` on the status bar; for doctor and an
-  update, which Esc cannot cancel, it is `busy: <run> is running`. A run keeps the selection and paths it started with.
+  `c`, `s`, `m` and `o` are refused with `busy: <run> is running (Esc cancels)` on the status bar; for an update,
+  which Esc cannot cancel, it is `busy: <run> is running`. A run keeps the selection and paths it started with.
 - **Esc cancels between steps.** apply checks before each target and each step: the running step finishes, and the rest
   of that target and every later target end as `⊘ cancelled`. A rollback (`b`) cancels as apply does. A run (`x`)
   cancels the same way: its script is its one step, so the running script finishes first and every later target ends
@@ -157,8 +159,9 @@ greyed in the help and only shows that notice again, until anvil is restarted.
   target: the running probe finishes and every later target ends as `⊘ cancelled`. With `--parallel`, every running
   target finishes its step or probe that way and no other target starts. The notice is
   `cancelling: the running step finishes first` for apply, run and rollback, `cancelling: running targets finish first` for plan.
-  Esc never kills a running step, local or remote; only the step's timeout ends it (300 s for `x`). doctor cannot be
-  cancelled; its probes are bounded by the [ssh timeouts](cli.md#ssh-behaviour).
+  Esc never kills a running step, local or remote; only the step's timeout ends it (300 s for `x`). doctor checks
+  before each target and each doctor plugin: the running probe, hash run or plugin finishes, and the rest end
+  `cancelled`, with the notice `cancelling: the running check finishes first`.
 - **Handoff.** The editor (`i`, `c`, `s`, `x`), the migration (`m`, so its age passphrase prompt works), ssh's interactive
   retry (a password, passphrase or PIN, see [SSH behaviour](cli.md#ssh-behaviour)) and the
   [age passphrase prompt](secrets.md#the-passphrase-prompt) get the real terminal: the TUI leaves its screen, the

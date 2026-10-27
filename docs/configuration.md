@@ -503,7 +503,7 @@ the plugin gets, its limits and its failures are in [Plugin steps](cli.md#plugin
 [plugins.harden]
 path = "~/.config/anvil/plugins/harden"  # required: absolute, or ~/
 sha256 = "…"                             # required: the sha256 of the file's bytes, 64 lowercase hex digits
-on = "step"                              # optional; "step", the default, is the only value
+on = "step"                              # optional; "step" (the default) or "doctor"
 
 [[steps]]
 plugin = "harden"                        # a [plugins] name, in place of run
@@ -526,17 +526,44 @@ The schema is checked whenever the config loads; a violation is exit 2:
 - ``plugins `NAME`: must match [a-z][a-z0-9_-]*``
 - ``plugins.NAME.path `PATH`: must be an absolute path or start with ~/``
 - ``plugins.NAME.sha256 `VALUE`: must be 64 lowercase hex digits``
-- ``plugins.NAME.on `VALUE`: must be step`` (`doctor` is reserved for later)
+- ``plugins.NAME.on `VALUE`: must be step or doctor``
+- ``steps[I].plugin `NAME`: names an on = "doctor" plugin; only doctor runs it``
 - `steps[I].args: needs plugin`, and `steps[I].args: N bytes as JSON exceeds the 32768 byte limit`
 - ``steps[I].plugin `NAME`: must name a [plugins] entry``
 
-The file itself is checked only by `apply` and `plan` (and the TUI's `a` and `p`), for every entry, used by a step or
-not, before any target is contacted: it must be a regular file of at most 64 MiB, owned by you, executable by you,
-writable by no one else, in a directory owned by you that no one else can write, and its bytes must hash to `sha256`.
-Anything else stops the command before any target, and `apply` and `plan` exit 2 naming the key, such as
-`plugins.harden.sha256: does not match /home/me/.config/anvil/plugins/harden (its bytes hash to 3b0c…)`. `anvil config`,
-`anvil doctor` and `anvil run` never check or run a plugin. What the checks leave out is in
-[Security notes](security.md).
+The file itself is checked only by `apply` and `plan` (and the TUI's `a` and `p`), for every `on = "step"` entry, used
+by a step or not, before any target is contacted, and by `doctor` for every `on = "doctor"` entry: it must be a regular
+file of at most 64 MiB, owned by you, executable by you, writable by no one else, in a directory owned by you that no
+one else can write, and its bytes must hash to `sha256`. Anything else stops the command before any target, and `apply`
+and `plan` exit 2 naming the key, such as `plugins.harden.sha256: does not match /home/me/.config/anvil/plugins/harden
+(its bytes hash to 3b0c…)`. doctor instead shows a bad doctor pin under its local checks, skips that plugin and exits 1.
+`anvil config` and `anvil run` never check or run a plugin. What the checks leave out is in [Security
+notes](security.md).
+
+### Doctor plugins and anvil-audit
+
+An `on = "doctor"` plugin is run by `anvil doctor` only, never by a step: it reads what the last apply recorded and what
+each target holds now, and replies with the drift. The request, the reply and the rows are in
+[Doctor plugins](cli.md#doctor-plugins-drift-since-the-last-apply). anvil's reference doctor plugin, `anvil-audit`, is a
+member of the cargo workspace, built from source; it is not in the release tarballs or `cargo install --path .`:
+
+```sh
+make audit-plugin                     # prints target/release/anvil-audit and its sha256
+install -d -m 0700 ~/.config/anvil/plugins
+install -m 0700 target/release/anvil-audit ~/.config/anvil/plugins/audit
+sha256sum ~/.config/anvil/plugins/audit     # or shasum -a 256; paste into sha256
+```
+
+```toml
+[plugins.audit]
+path = "~/.config/anvil/plugins/audit"
+sha256 = "…"
+on = "doctor"
+```
+
+Every rebuild changes the bytes, so pin again after it: doctor shows the new hash in its
+`plugin audit    error: plugins.audit.sha256: does not match …` row. A config with a doctor plugin makes apply probe
+each target, so its facts are recorded even without `[[files]]`.
 
 ## Limits and refusals
 

@@ -3,14 +3,24 @@
 [English](development.md) | 繁體中文
 
 ```sh
-make test   # cargo fmt --check, clippy -D warnings, cargo test
-make e2e    # doctor, apply and the ssh auth paths against an Arch sshd container; prints `skip` without docker
+make test          # builds anvil-audit, then fmt --check, clippy -D warnings and cargo test over the workspace
+make e2e           # doctor, apply and the ssh auth paths against an Arch sshd container; prints `skip` without docker
+make audit-plugin  # builds the reference doctor plugin in release and prints its path and sha256
 ```
+
+這個儲存庫是一個 cargo workspace：根目錄的 anvil，以及參考 [doctor plugin](cli.zh-TW.md#doctor-plugins-drift-since-the-last-apply)
+`plugins/anvil-audit`。預設成員只有 anvil，因此 `cargo build`、`cargo run`、`cargo install --path .` 與發行建置只動到 anvil，
+發行的 tarball 也從不含 anvil-audit。`make test` 先建置 anvil-audit，因為 `tests/doctor_audit.rs` 會執行它；
+該測試也會自己以 `cargo build -p anvil-audit --locked` 建置它，所以單純的 `cargo test` 也能用。
+anvil-audit 的 stdin 上限，也就是 `plugins/anvil-audit/src/main.rs` 中的 `MAX_REQUEST`，是一個單純的常值：
+`src/plugin.rs` 中的單元測試會讀取該檔案，常值不等於 anvil 的 `DOCTOR_REQUEST_LIMIT + 1`（請求加上換行）時就失敗；
+`tests/doctor_audit.rs` 則透過建置好的 plugin 送出剛好等於上限與多一個位元組的請求。
 
 `make test` 中的終端機測試（age passphrase 提示，以及在虛擬終端機上執行的 `anvil tui`）需要 python3 3.11 或更新版本，
 以使用 `os.login_tty`；缺少時會顯示訊息並略過。
 
-`make e2e` 需要 docker，且 `PATH` 上要有 `sops`（它的 sops 往返測試在本機執行，缺少時會失敗）；
+`make e2e` 需要 docker、以 digest 釘選的 `alpine:3.20` 映像（第一次執行時下載；doctor 的雜湊執行在它的 busybox 上跑），
+且 `PATH` 上要有 `sops`（它的 sops 往返測試在本機執行，缺少時會失敗）；
 它的互動式密碼檢查（從 CLI 與從 `anvil tui`）也需要 `python3`（TUI 的檢查需要 3.11 或更新版本，
 因為會用到 `os.login_tty`），缺少時會略過。
 它使用暫時的 `HOME` 與設定目錄，從不碰觸 `~/.ssh`、keychain 或真實的 host（主機）。
@@ -28,7 +38,7 @@ GitHub Actions（[`.github/workflows/ci.yml`](../.github/workflows/ci.yml)）會
 | `version`    | Ubuntu               | 在 `v*` tag 上檢查 tag 是否與 Cargo.toml 相符，且兩把 release 金鑰都存在         |
 | `pre-commit` | Ubuntu               | `pre-commit run --all-files`（YAML、空白字元、gitleaks、markdownlint、prettier） |
 | `make test`  | Ubuntu 與 macOS      | 搭配 sops 與 python3 3.12 執行 `make test`，再以 `--no-default-features` 建置    |
-| `MSRV`       | Ubuntu、Rust 1.89    | 以 Cargo.toml 的 `rust-version` 執行 `cargo check --all-targets`                 |
+| `MSRV`       | Ubuntu、Rust 1.89    | 以 Cargo.toml 的 `rust-version` 執行 `cargo check --workspace --all-targets`     |
 | `make e2e`   | Ubuntu，在測試通過後 | 對 amd64 的 Arch 映像檔執行 `make e2e`；出現 `skip`（沒有 docker）時該 job 失敗  |
 | `build`      | Ubuntu 與 macOS      | 在測試通過後，為三個 target 建置 release 執行檔，並保留為 artifact（見下文）     |
 
