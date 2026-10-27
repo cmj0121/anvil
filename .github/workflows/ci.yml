@@ -45,6 +45,13 @@ jobs:
                 echo "::error::tag $version points at $GITHUB_SHA, which is not on main"
                 exit 1
               fi
+              # Without both keys compiled in, anvil update could never install this release.
+              for key in keys/minisign.pub keys/minisign-next.pub; do
+                if [ ! -s "$key" ]; then
+                  echo "::error::$key is missing; a release without both public keys cannot be updated by anvil update"
+                  exit 1
+                fi
+              done
               ;;
             *)
               version="$cargo_version-$(printf %.7s "$GITHUB_SHA")"
@@ -172,6 +179,15 @@ jobs:
             exit 0
           fi
           "$bin" --version
+          # The debug-only test flags must not exist in a release build: clap rejects them with exit 2.
+          for flag in --release-key --release-url; do
+            code=0
+            "$bin" "$flag" x update --check || code=$?
+            if [ "$code" -ne 2 ]; then
+              echo "::error::$bin $flag x update --check exited $code, not 2; debug-only flags are in the release build"
+              exit 1
+            fi
+          done
       - run: sh .github/package.sh "$TARGET" "$VERSION"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

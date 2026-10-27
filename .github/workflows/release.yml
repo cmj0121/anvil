@@ -16,21 +16,76 @@ jobs:
     name: publish
     needs: ci
     runs-on: ubuntu-latest
+    # The environment holds MINISIGN_SECRET_KEY and needs the owner's approval; ci gets no secrets.
+    environment: release
     permissions:
       contents: write
+    env:
+      MINISIGN_VERSION: "0.12"
+      MINISIGN_SHA256: 9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github
+            keys
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: anvil-*
           path: dist
           merge-multiple: true
+      - name: Install minisign
+        run: sh .github/install-minisign.sh
+      # The key is password-less; the environment's approval and the secret's scope protect it.
+      - name: Write the signing key
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::the release environment has no MINISIGN_SECRET_KEY secret"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$MINISIGN_SECRET_KEY" >"$RUNNER_TEMP/minisign.key"
+      # The trusted comment binds each signature to its tag and target; anvil update checks it.
+      - name: Sign the archives
+        run: |
+          for archive in dist/*.tar.gz; do
+            name=${archive#dist/}
+            triple=${name#"anvil-$GITHUB_REF_NAME-"}
+            triple=${triple%.tar.gz}
+            if [ "$name" != "anvil-$GITHUB_REF_NAME-$triple.tar.gz" ] || [ -z "$triple" ]; then
+              echo "::error::$name is not named anvil-$GITHUB_REF_NAME-<target>.tar.gz"
+              exit 1
+            fi
+            minisign -S -s "$RUNNER_TEMP/minisign.key" -m "$archive" -x "$archive.minisig" \
+              -t "anvil $GITHUB_REF_NAME $triple" </dev/null
+          done
+      - name: Remove the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/minisign.key"
+      - name: Verify the signatures
+        run: |
+          for archive in dist/*.tar.gz; do
+            name=${archive#dist/}
+            triple=${name#"anvil-$GITHUB_REF_NAME-"}
+            expected="anvil $GITHUB_REF_NAME ${triple%.tar.gz}"
+            comment=$(minisign -Q -V -p keys/minisign.pub -m "$archive" -x "$archive.minisig")
+            if [ "$comment" != "$expected" ]; then
+              echo "::error::$name.minisig has trusted comment \"$comment\", not \"$expected\""
+              exit 1
+            fi
+            echo "$name: $comment"
+          done
       - name: Check the archives
         run: |
           ls -l dist
           archives=$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)
           sums=$(find dist -maxdepth 1 -name '*.tar.gz.sha256' | wc -l)
-          if [ "$archives" -ne 3 ] || [ "$sums" -ne 3 ]; then
-            echo "::error::expected 3 archives and 3 checksums in dist/, found $archives and $sums"
+          sigs=$(find dist -maxdepth 1 -name '*.tar.gz.minisig' | wc -l)
+          if [ "$archives" -ne 3 ] || [ "$sums" -ne 3 ] || [ "$sigs" -ne 3 ]; then
+            echo "::error::expected 3 archives, 3 checksums and 3 signatures in dist/, found $archives, $sums and $sigs"
             exit 1
           fi
       # A re-run re-uploads the assets to the release the first run created.
