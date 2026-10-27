@@ -152,7 +152,6 @@ pub fn runs(
                 format!("skipped file {dest}: no match"),
                 None,
                 FileRun {
-                    entry: i,
                     upload: None,
                     skip: true,
                 },
@@ -204,7 +203,6 @@ pub fn runs(
             format!("file {dest}"),
             secret.map(str::to_owned),
             FileRun {
-                entry: i,
                 upload,
                 skip: false,
             },
@@ -675,14 +673,12 @@ mod tests {
         assert_eq!(
             files[1],
             FileRun {
-                entry: 1,
                 upload: None,
                 skip: true
             }
         );
         assert!(runs[1].run.is_empty());
         assert!(!files[0].skip && !files[2].skip);
-        assert_eq!((files[0].entry, files[2].entry), (0, 2));
         for run in &runs {
             assert_eq!(run.timeout, RUN_TIMEOUT);
             assert_eq!((&run.sudo_secret, &run.plugin), (&None, &None));
