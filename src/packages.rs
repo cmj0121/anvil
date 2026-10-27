@@ -30,8 +30,11 @@ macro_rules! managers {
 }
 const CHOICES: &str = concat!("auto, ", managers!());
 const MANAGERS: &str = managers!();
-const BREW_PATH: &str =
-    "export PATH=\"$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin\"; ";
+/// Prefix of every brew line. Homebrew passes `-A` to sudo when
+/// `SUDO_ASKPASS` is set, so a sudo inside brew (a `.pkg` cask) fails at
+/// once instead of prompting on the terminal; a helper the user set is kept.
+const BREW_ENV: &str = "export PATH=\"$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin\"; \
+     export SUDO_ASKPASS=\"${SUDO_ASKPASS:-/usr/bin/false}\"; ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -521,7 +524,7 @@ pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<Strin
     match manager {
         Manager::Brew => {
             if packages.upgrade {
-                parts.push("brew update && brew upgrade".to_string());
+                parts.push("brew update && brew upgrade --formula".to_string());
             }
             if install {
                 parts.push(format!("brew install {p}"));
@@ -606,7 +609,7 @@ pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<Strin
     }
     let line = parts.join(" && ");
     Some(match manager {
-        Manager::Brew => format!("{BREW_PATH}{line}"),
+        Manager::Brew => format!("{BREW_ENV}{line}"),
         _ => line,
     })
 }
@@ -650,15 +653,15 @@ mod tests {
 
     #[test]
     fn scripts_per_manager_with_and_without_upgrade() {
-        let brew = BREW_PATH;
+        let brew = BREW_ENV;
         let cases = [
             (Manager::Brew, false, true, format!("{brew}brew install git curl")),
-            (Manager::Brew, true, false, format!("{brew}brew update && brew upgrade")),
+            (Manager::Brew, true, false, format!("{brew}brew update && brew upgrade --formula")),
             (
                 Manager::Brew,
                 true,
                 true,
-                format!("{brew}brew update && brew upgrade && brew install git curl"),
+                format!("{brew}brew update && brew upgrade --formula && brew install git curl"),
             ),
             (
                 Manager::Pacman,
@@ -757,14 +760,14 @@ mod tests {
 
     #[test]
     fn scripts_install_the_name_the_manager_uses() {
-        let brew = BREW_PATH;
+        let brew = BREW_ENV;
         let apt = "sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive";
         let cases = [
             (Manager::Brew, false, format!("{brew}brew install git fd")),
             (
                 Manager::Brew,
                 true,
-                format!("{brew}brew update && brew upgrade && brew install git fd"),
+                format!("{brew}brew update && brew upgrade --formula && brew install git fd"),
             ),
             (
                 Manager::Pacman,
@@ -851,7 +854,7 @@ mod tests {
         );
         assert_eq!(
             script(Manager::Brew, &p, false).unwrap(),
-            format!("{BREW_PATH}brew install fd fdfind")
+            format!("{BREW_ENV}brew install fd fdfind")
         );
     }
 
@@ -877,9 +880,11 @@ mod tests {
         );
         for root in [true, false] {
             let brew = script(Manager::Brew, &both, root).unwrap();
-            assert!(
-                brew.starts_with("export PATH=\"$PATH:/opt/homebrew/bin:"),
-                "{brew}"
+            assert_eq!(
+                brew,
+                "export PATH=\"$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin\"; \
+                 export SUDO_ASKPASS=\"${SUDO_ASKPASS:-/usr/bin/false}\"; \
+                 brew update && brew upgrade --formula && brew install git"
             );
             assert!(!brew.contains("sudo"), "{brew}");
         }
@@ -1173,7 +1178,7 @@ mod tests {
 
     #[test]
     fn remove_alone_removes_the_installed_names_per_manager() {
-        let brew = BREW_PATH;
+        let brew = BREW_ENV;
         let group =
             |check: &str, r: &str, command: &str| expected_group('r', "&&", check, r, command);
         let cases = [
@@ -1243,7 +1248,7 @@ mod tests {
         for manager in Manager::ALL {
             for root in [true, false] {
                 let alone = script(manager, &removing(&[], false), root).unwrap();
-                let group = alone.strip_prefix(BREW_PATH).unwrap_or(&alone);
+                let group = alone.strip_prefix(BREW_ENV).unwrap_or(&alone);
                 for (install, upgrade) in [(&["git"][..], false), (&[], true), (&["git"], true)] {
                     let before = script(manager, &with_fd_alias(install, upgrade), root).unwrap();
                     assert_eq!(
