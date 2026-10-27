@@ -321,7 +321,8 @@ fn draw_steps(app: &App, f: &mut Frame, area: Rect) {
 }
 
 /// Step `index`'s mark in a target's apply `report` (D2): `✔` or `✘` by
-/// its exit code once reported, `⊘` for a skipped `[[files]]` step; past
+/// its exit code once reported, `⊘` for a skipped `[[files]]` or
+/// `[[services]]` step; past
 /// the report `⊘` (not run), except the
 /// step a transport error ended with no timed-out step kept, `✘`; `·`
 /// before the target has a report.
@@ -1273,6 +1274,58 @@ mod tests {
     }
 
     #[test]
+    fn a_skipped_service_step_is_marked_and_the_rows_after_it_line_up() {
+        use crate::config::{Config, FileEntry, ModeValue, ServiceEntry, Step};
+
+        let service = |name: &str, tag: &str| ServiceEntry {
+            name: name.to_owned(),
+            state: Some("started".to_owned()),
+            enabled: None,
+            tags: vec![tag.to_owned()],
+            facts: Default::default(),
+        };
+        let config = Config {
+            files: vec![FileEntry {
+                src: "src.txt".to_owned(),
+                dest: "/etc/a.conf".to_owned(),
+                mode: Some(ModeValue::Text("0644".to_owned())),
+                tags: vec!["web".to_owned()],
+                facts: Default::default(),
+                sudo: false,
+            }],
+            services: vec![service("sshd", "local"), service("cron", "web")],
+            steps: vec![Step::script("hostname")],
+            ..Config::default()
+        };
+        let rows = crate::tui::app::step_rows(&config);
+        assert_eq!(
+            rows,
+            [
+                step_row("file /etc/a.conf"),
+                step_row("service sshd"),
+                step_row("service cron"),
+                step_row("hostname"),
+            ]
+        );
+        let local = ran(
+            "local",
+            vec![
+                apply::StepReport {
+                    skipped: true,
+                    ..step("skipped file /etc/a.conf: no match", Some(0), "", "")
+                },
+                step("service sshd", Some(0), "started service sshd\n", ""),
+                apply::StepReport {
+                    skipped: true,
+                    ..step("skipped service cron: no match", Some(0), "", "")
+                },
+                step("hostname", Some(1), "", ""),
+            ],
+        );
+        assert_eq!(marks(Some(&local), rows.len()), "⊘✔⊘✘");
+    }
+
+    #[test]
     fn a_running_apply_marks_queued_steps_and_spins_in_the_header() {
         let steps = vec![step_row("packages"), step_row("hostname")];
         let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
@@ -2005,6 +2058,7 @@ mod tests {
                                 plugin: None,
                                 timeout: RUN_TIMEOUT,
                                 file: None,
+                                service: None,
                             },
                             PlannedRun {
                                 run: "hostname".to_owned(),
@@ -2013,6 +2067,7 @@ mod tests {
                                 plugin: None,
                                 timeout: RUN_TIMEOUT,
                                 file: None,
+                                service: None,
                             },
                         ],
                         ok: true,

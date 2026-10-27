@@ -20,6 +20,11 @@
 //! target for a password, the bytes go to a temp file over a plain run,
 //! a terminal run types the password and installs it, and the temp file is
 //! removed whatever happened.
+//!
+//! Each `[[services]]` entry is one step after the `[[files]]` steps: a
+//! script that brings the service to its state under the target's init when
+//! the target matches, else a skip. A target where an entry matches but no
+//! init is known for its distro fails before any of its steps.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,6 +45,7 @@ use crate::options::Options;
 use crate::packages::{self, Packages};
 use crate::plugin::{self, Plugins, Request};
 use crate::secret::Store;
+use crate::services;
 use crate::transport::{
     Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
 };
@@ -79,6 +85,8 @@ pub struct PlannedRun {
     pub timeout: Duration,
     /// Set for a `[[files]]` step, whose `run` carries the file's bytes.
     pub file: Option<FileRun>,
+    /// Set for a `[[services]]` step.
+    pub service: Option<ServiceRun>,
 }
 
 /// By hand: a `[[files]]` step's `run` is shown only by its length.
@@ -95,6 +103,7 @@ impl std::fmt::Debug for PlannedRun {
             .field("plugin", &self.plugin)
             .field("timeout", &self.timeout)
             .field("file", &self.file)
+            .field("service", &self.service)
             .finish()
     }
 }
@@ -104,6 +113,12 @@ impl std::fmt::Debug for PlannedRun {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRun {
     pub upload: Option<Upload>,
+    pub skip: bool,
+}
+
+/// A `[[services]]` step: whether the entry matched no tag or fact of the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRun {
     pub skip: bool,
 }
 
@@ -167,7 +182,8 @@ pub struct StepReport {
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
-    /// A `[[files]]` entry the target does not match: nothing ran.
+    /// A `[[files]]` or `[[services]]` entry the target does not match:
+    /// nothing ran.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skipped: bool,
 }
@@ -334,7 +350,8 @@ pub fn run_targets(
 /// The sudo password of each of `targets` with a sudo secret that a step may
 /// type, read from the store `store` builds, opened once: the package step's
 /// when `[packages]` has work, and a target's when a `sudo = true`
-/// `[[files]]` entry carries only tags it has (its facts are not known yet).
+/// `[[files]]` entry or a `[[services]]` entry carries only tags it has (its
+/// facts are not known yet).
 /// Nothing is built or opened when no step may type one. One trailing
 /// newline is trimmed. A store error fails the command. Core dumps are
 /// turned off first.
@@ -350,7 +367,9 @@ fn load_passwords(
         targets
             .iter()
             .filter(|target| {
-                (config.files.iter()).any(|entry| entry.sudo && files::has_tags(entry, target))
+                (config.files.iter())
+                    .any(|entry| entry.sudo && files::has_tags(&entry.tags, target))
+                    || (config.services.iter()).any(|entry| files::has_tags(&entry.tags, target))
             })
             .filter_map(|target| files::sudo_secret_for(config, target)),
     );
@@ -498,7 +517,7 @@ pub(crate) fn cancelled(target: &Target, steps: Vec<StepReport>) -> TargetReport
 }
 
 /// Probes `target` when `[packages]` has work, a step is a plugin or there
-/// are `[[files]]`, then runs the steps [`resolve`] lists; `passwords` holds
+/// are `[[files]]` or `[[services]]`, then runs the steps [`resolve`] lists; `passwords` holds
 /// the sudo passwords to type.
 fn apply_target(
     target: &Target,
@@ -517,7 +536,8 @@ fn apply_target(
     log::info!("apply {}: over {}", target.name, transport.name());
     let needs_facts = package_work(config).is_some()
         || config.steps.iter().any(|s| s.plugin.is_some())
-        || !config.files.is_empty();
+        || !config.files.is_empty()
+        || !config.services.is_empty();
     let facts = if needs_facts {
         if cancel.load(Ordering::Relaxed) {
             return cancelled(target, Vec::new());
@@ -549,8 +569,9 @@ pub(crate) fn failed(target: &Target, steps: Vec<StepReport>, error: String) -> 
 
 /// Runs `runs` over `transport` in order, stopping at the first that fails;
 /// `cancel` is checked before each, and `passwords` holds the sudo
-/// passwords to type. A skipped `[[files]]` step runs nothing; one that
-/// needs a sudo password goes through [`send_file`].
+/// passwords to type. A skipped `[[files]]` or `[[services]]` step runs
+/// nothing; a file step that needs a sudo password goes through
+/// [`send_file`].
 pub(crate) fn execute(
     target: &Target,
     transport: &dyn Transport,
@@ -565,14 +586,16 @@ pub(crate) fn execute(
             return cancelled(target, reports);
         }
         let label = planned.shown();
-        if planned.file.as_ref().is_some_and(|file| file.skip) {
+        if planned.file.as_ref().is_some_and(|file| file.skip)
+            || planned.service.as_ref().is_some_and(|service| service.skip)
+        {
             reports.push(StepReport::skipped(label));
             continue;
         }
-        let prefix = if planned.file.is_some() {
-            "files"
-        } else {
-            "packages"
+        let prefix = match (&planned.file, &planned.service) {
+            (Some(_), _) => "files",
+            (_, Some(_)) => "services",
+            _ => "packages",
         };
         let password = match planned.sudo_secret.as_deref() {
             None => None,
@@ -739,11 +762,13 @@ impl From<String> for Unresolved {
 /// The steps apply runs on `target`, in order: the step that installs and
 /// upgrades `[packages]` with the target's package manager (when it has
 /// work), then one step per `[[files]]` entry, copying its src from
-/// `sources` or skipped, then each `[[steps]]` entry, a plugin step as the
+/// `sources` or skipped, then one step per `[[services]]` entry, bringing it
+/// to its state or skipped, then each `[[steps]]` entry, a plugin step as the
 /// script its plugin returns. Runs nothing on the target, but each plugin on
 /// the controller, in step order, `cancel` checked before each. `facts`, from
 /// [`probe`], is required when `[packages]` has work, a step is a plugin or
-/// there are `[[files]]`. A failure is `packages: <reason>`, `files…` or
+/// there are `[[files]]` or `[[services]]`. A failure is
+/// `packages: <reason>`, `files…`, `services: <reason>` or
 /// `plugin <name>: <reason>`; the first one ends the list.
 pub fn resolve(
     target: &Target,
@@ -753,7 +778,8 @@ pub fn resolve(
     plugins: &dyn Plugins,
     cancel: &AtomicBool,
 ) -> Result<Vec<PlannedRun>, Unresolved> {
-    let mut runs = Vec::with_capacity(config.steps.len() + config.files.len() + 1);
+    let mut runs =
+        Vec::with_capacity(config.steps.len() + config.files.len() + config.services.len() + 1);
     if let Some(packages) = package_work(config) {
         let facts = facts.ok_or_else(|| "packages: the probe has not run".to_owned())?;
         let reason = |why: String| format!("packages: {why}");
@@ -777,10 +803,12 @@ pub fn resolve(
                 plugin: None,
                 timeout: packages.timeout(),
                 file: None,
+                service: None,
             });
         }
     }
     runs.extend(files::runs(config, sources, target, facts)?);
+    runs.extend(services::runs(config, target, facts)?);
     let no_args = serde_json::Map::new();
     for step in &config.steps {
         match step.kind() {
@@ -804,6 +832,7 @@ pub fn resolve(
                     plugin: Some(name.to_owned()),
                     timeout: RUN_TIMEOUT,
                     file: None,
+                    service: None,
                 });
             }
             StepKind::Run(run) => runs.push(PlannedRun {
@@ -813,6 +842,7 @@ pub fn resolve(
                 plugin: None,
                 timeout: RUN_TIMEOUT,
                 file: None,
+                service: None,
             }),
         }
     }
@@ -1016,7 +1046,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::config::{FileEntry, ModeValue, Step};
+    use crate::config::{FileEntry, ModeValue, ServiceEntry, Step};
     use crate::inventory::TargetKind;
     use crate::test_util::{FakePlugins, json, keys};
 
@@ -2258,6 +2288,7 @@ mod tests {
             plugin: None,
             timeout,
             file: None,
+            service: None,
         }
     }
 
@@ -2361,6 +2392,7 @@ mod tests {
             plugin: Some(name.to_owned()),
             timeout: RUN_TIMEOUT,
             file: None,
+            service: None,
         }
     }
 
@@ -3164,6 +3196,379 @@ mod tests {
         };
         let config = with_files(None, vec![file_entry("/etc/a", &["local"], true)], &[]);
         let (result, built) = load(&[local], &config, memory);
+        assert_eq!(built, 1);
+        assert_eq!(
+            result.unwrap().get("LOCAL_SUDO").map(|pw| pw.as_slice()),
+            Some(&b"pw"[..])
+        );
+    }
+
+    /// A `[[services]]` entry bringing `name` to `state` on targets with
+    /// `tags`.
+    fn service_entry(
+        name: &str,
+        state: &str,
+        enabled: Option<bool>,
+        tags: &[&str],
+    ) -> ServiceEntry {
+        ServiceEntry {
+            name: name.to_owned(),
+            state: Some(state.to_owned()),
+            enabled,
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            facts: BTreeMap::new(),
+        }
+    }
+
+    /// `services` after `files`, before the `[[steps]]` `runs`.
+    fn with_services(
+        packages: Option<&Packages>,
+        files: Vec<FileEntry>,
+        services: Vec<ServiceEntry>,
+        runs: &[&str],
+    ) -> Config {
+        Config {
+            services,
+            ..with_files(packages, files, runs)
+        }
+    }
+
+    const ALPINE_NOPASSWD: &str =
+        "distro=alpine\nuser=cmj\nsudo=nopasswd\npkg=apk\nanvil-probe-end=1\n";
+    const MAC_NOPASSWD: &str =
+        "distro=macos\nuser=cmj\nsudo=nopasswd\npkg=brew\nanvil-probe-end=1\n";
+    const GENTOO_ROOT: &str = "distro=gentoo\nuser=root\nsudo=none\npkg=\nanvil-probe-end=1\n";
+
+    #[test]
+    fn services_run_after_the_files_and_before_the_steps() {
+        let config = with_services(
+            Some(&packages(&["git"], false)),
+            vec![file_entry("/etc/a.conf", &[], true)],
+            vec![
+                service_entry("sshd", "started", Some(true), &["local"]),
+                service_entry("cron", "stopped", None, &["web"]),
+            ],
+            &["one"],
+        );
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let fake = Fake {
+            probe: ARCH_ROOT,
+            ..Fake::new(&log)
+        };
+        let timeouts = Rc::clone(&fake.timeouts);
+        let report = apply_target(
+            &target("local"),
+            Ok(Box::new(fake)),
+            &config,
+            &file_sources(&config),
+            &FakePlugins::none(),
+            &Passwords::new(),
+            &AtomicBool::new(false),
+        );
+        assert!(report.ok(), "{report:?}");
+        let runs = log.borrow().clone();
+        assert_eq!(
+            runs.len(),
+            5,
+            "probe, packages, file, service, step: {runs:?}"
+        );
+        assert!(runs[1].contains("pacman"), "{}", runs[1]);
+        assert!(runs[2].contains("'/etc/a.conf'"), "{}", runs[2]);
+        assert!(
+            runs[3].contains("systemctl --no-ask-password enable --now -- sshd"),
+            "{}",
+            runs[3]
+        );
+        assert!(!runs[3].contains("sudo"), "root runs systemctl itself");
+        assert_eq!(runs[4], "one");
+        assert!(!runs.iter().any(|run| run.contains("cron")), "{runs:?}");
+        assert_eq!(timeouts.borrow()[3], services::SERVICE_TIMEOUT);
+        assert_eq!(timeouts.borrow()[4], RUN_TIMEOUT);
+
+        let shown: Vec<(&str, bool)> = report
+            .steps()
+            .iter()
+            .map(|step| (step.run.as_str(), step.skipped))
+            .skip(1)
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("file /etc/a.conf", false),
+                ("service sshd", false),
+                ("skipped service cron: no match", true),
+                ("one", false)
+            ]
+        );
+        let value = json(&report);
+        assert_eq!(value["steps"][2]["run"], "service sshd");
+        assert_eq!(value["steps"][3]["skipped"], true);
+    }
+
+    /// The service step's script for one `sshd` entry on `local` probing as
+    /// `probe`.
+    fn service_script(probe: &'static str, state: &str, enabled: Option<bool>) -> String {
+        let config = with_services(
+            None,
+            Vec::new(),
+            vec![service_entry("sshd", state, enabled, &[])],
+            &[],
+        );
+        let (report, runs, _) = apply_files(&target("local"), &config, probe, &Passwords::new());
+        assert!(report.ok(), "{report:?}");
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        runs[1].clone()
+    }
+
+    #[test]
+    fn each_init_gets_its_own_script() {
+        let systemd = service_script(DEBIAN_ROOT, "started", Some(true));
+        assert!(systemd.contains("systemctl --no-ask-password enable --now -- sshd"));
+        let openrc = service_script(ALPINE_NOPASSWD, "started", Some(true));
+        assert!(
+            openrc.contains("sudo -n rc-update add sshd default"),
+            "{openrc}"
+        );
+        assert!(openrc.contains("sudo -n rc-service sshd start"), "{openrc}");
+        assert!(openrc.starts_with("{ c= "), "{openrc}");
+        let launchd = service_script(MAC_NOPASSWD, "stopped", Some(false));
+        assert!(
+            launchd.contains("sudo -n launchctl disable system/sshd"),
+            "{launchd}"
+        );
+        assert!(
+            launchd.contains("sudo -n launchctl bootout system/sshd"),
+            "{launchd}"
+        );
+        let nopasswd = service_script(ARCH_NOPASSWD, "stopped", None);
+        assert!(nopasswd.contains("sudo -n systemctl --no-ask-password stop -- sshd"));
+    }
+
+    #[test]
+    fn a_target_without_an_init_or_a_way_to_root_fails_alone() {
+        let config = with_services(
+            None,
+            Vec::new(),
+            vec![service_entry("sshd", "started", None, &[])],
+            &["one"],
+        );
+        let no_sudo = "distro=arch\nuser=cmj\nsudo=none\npkg=pacman\nanvil-probe-end=1\n";
+        let no_distro = "user=root\nsudo=none\npkg=\nanvil-probe-end=1\n";
+        for (probe, error) in [
+            (GENTOO_ROOT, "services: no init known for distro `gentoo`"),
+            (no_distro, "services: no init known for distro ``"),
+            (
+                ARCH_SUDO,
+                "services: sudo asks for a password; set sudo_secret \
+                 (local_sudo_secret for local), set NOPASSWD, or connect as root",
+            ),
+            (no_sudo, "services: needs root and sudo is not installed"),
+        ] {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let next = RefCell::new([probe, ARCH_ROOT].into_iter());
+            let report = apply_targets(
+                &[target("a"), target("b")],
+                |_| {
+                    Ok(Box::new(Fake {
+                        probe: next.borrow_mut().next().unwrap(),
+                        ..Fake::new(&log)
+                    }))
+                },
+                &config,
+                &Sources::default(),
+                &FakePlugins::none(),
+                &Passwords::new(),
+                &AtomicBool::new(false),
+                &mut |_| {},
+            );
+            assert_eq!(report.counts(), (1, 1), "{report:?}");
+            assert_eq!(report.targets[0].failure().unwrap(), error);
+            assert!(report.targets[0].steps().is_empty());
+            let runs = log.borrow().clone();
+            assert_eq!(runs.len(), 4, "probe a; probe b, service, one: {runs:?}");
+            assert_eq!(runs[3], "one");
+        }
+
+        // No entry matches: no init is needed, and the step is a skip.
+        let config = with_services(
+            None,
+            Vec::new(),
+            vec![service_entry("sshd", "started", None, &["web"])],
+            &["one"],
+        );
+        let (report, runs, _) =
+            apply_files(&target("local"), &config, GENTOO_ROOT, &Passwords::new());
+        assert!(report.ok(), "{report:?}");
+        assert_eq!(runs, [facts::PROBE, "one"]);
+        assert!(report.steps()[0].skipped);
+    }
+
+    #[test]
+    fn a_failing_service_step_stops_the_later_steps() {
+        let config = with_services(
+            None,
+            Vec::new(),
+            vec![
+                service_entry("sshd", "started", None, &[]),
+                service_entry("cron", "started", None, &[]),
+            ],
+            &["one"],
+        );
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let report = apply_target(
+            &target("local"),
+            Ok(Box::new(Fake {
+                probe: ARCH_ROOT,
+                exits: &[("-- sshd", 1)],
+                ..Fake::new(&log)
+            })),
+            &config,
+            &Sources::default(),
+            &FakePlugins::none(),
+            &Passwords::new(),
+            &AtomicBool::new(false),
+        );
+        assert!(!report.ok());
+        let steps = report.steps();
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        assert_eq!(
+            (steps[0].run.as_str(), steps[0].code),
+            ("service sshd", Some(1))
+        );
+        assert_eq!(log.borrow().len(), 2, "cron and one never run");
+    }
+
+    /// Applies one `sshd` entry to `local`, whose sudo asks for a password
+    /// and whose secret `LOCAL_SUDO` holds `password` (unset when `None`).
+    fn apply_password_service(
+        password: Option<&[u8]>,
+        tty_fail: Option<TransportError>,
+    ) -> (TargetReport, Vec<String>, Vec<Vec<u8>>, Config) {
+        let local = target_with_secret("local", "LOCAL_SUDO");
+        let config = with_services(
+            None,
+            Vec::new(),
+            vec![service_entry("sshd", "started", Some(true), &[])],
+            &["one"],
+        );
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let fake = Fake {
+            probe: ARCH_SUDO,
+            tty_fail,
+            ..Fake::new(&log)
+        };
+        let typed = Rc::clone(&fake.typed);
+        let report = apply_target(
+            &local,
+            Ok(Box::new(fake)),
+            &config,
+            &Sources::default(),
+            &FakePlugins::none(),
+            &local_passwords(password),
+            &AtomicBool::new(false),
+        );
+        let runs = log.borrow().clone();
+        let typed = typed.borrow().clone();
+        (report, runs, typed, config)
+    }
+
+    #[test]
+    fn a_password_sudo_runs_the_service_step_on_a_terminal() {
+        let (report, runs, typed, config) = apply_password_service(Some(PASSWORD.as_bytes()), None);
+        assert!(report.ok(), "{report:?}");
+        assert_eq!(typed, [PASSWORD.as_bytes()]);
+        let script = services::script(
+            services::Init::Systemd,
+            "sshd",
+            crate::config::ServiceState::Started,
+            Some(true),
+            "sudo -n ",
+            services::LAUNCH_DAEMONS,
+        );
+        assert_eq!(
+            runs,
+            [facts::PROBE, &packages::with_password(&script), "one"]
+        );
+        for text in runs.iter().chain([&json(&report).to_string()]) {
+            assert!(!text.contains(PASSWORD), "{text}");
+        }
+        let planned = resolve(
+            &target_with_secret("local", "LOCAL_SUDO"),
+            Some(&facts(ARCH_SUDO)),
+            &config,
+            &Sources::default(),
+            &FakePlugins::none(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(planned[0].sudo_secret.as_deref(), Some("LOCAL_SUDO"));
+        assert_eq!(
+            json(&planned[0]),
+            serde_json::json!({"run": "service sshd", "sudo_secret": "LOCAL_SUDO"})
+        );
+        let debug = format!("{:?}", planned[0]);
+        assert!(
+            debug.contains("service: Some(ServiceRun { skip: false })"),
+            "{debug}"
+        );
+    }
+
+    fn target_with_secret(name: &str, secret: &str) -> Target {
+        Target {
+            sudo_secret: Some(secret.to_owned()),
+            ..target(name)
+        }
+    }
+
+    #[test]
+    fn service_password_failures_say_services_and_name_the_secret() {
+        for (password, tty_fail, error) in [
+            (None, None, "services: secret LOCAL_SUDO is not set"),
+            (
+                Some(&b"pw\x1b"[..]),
+                None,
+                "services: secret LOCAL_SUDO contains control characters",
+            ),
+            (
+                Some(PASSWORD.as_bytes()),
+                Some(TransportError::PasswordRejected),
+                "services: sudo rejected the password from secret LOCAL_SUDO",
+            ),
+            (
+                Some(PASSWORD.as_bytes()),
+                Some(TransportError::NoPrompt),
+                "services: sudo did not show anvil's prompt (secret LOCAL_SUDO)",
+            ),
+        ] {
+            let (report, runs, _, _) = apply_password_service(password, tty_fail);
+            assert_eq!(report.failure().unwrap(), error);
+            assert!(!runs.contains(&"one".to_owned()), "{runs:?}");
+        }
+    }
+
+    #[test]
+    fn the_store_opens_for_services_when_an_entry_may_apply() {
+        use crate::secret::SecretError;
+        use crate::test_util::Unopenable;
+
+        let locked = || -> Box<dyn Store> { Box::new(Unopenable::new(|| SecretError::Locked)) };
+        let local = target_with_secret("local", "LOCAL_SUDO");
+        let only = |tags: &[&str]| {
+            with_services(
+                None,
+                Vec::new(),
+                vec![service_entry("sshd", "started", None, tags)],
+                &[],
+            )
+        };
+        let (result, built) = load(std::slice::from_ref(&local), &only(&["web"]), locked);
+        assert!(result.unwrap().is_empty());
+        assert_eq!(built, 0, "no tag match: no store");
+
+        let memory = || -> Box<dyn Store> {
+            Box::new(crate::secret::Memory::with(&[("LOCAL_SUDO", b"pw\n")]))
+        };
+        let (result, built) = load(&[local], &only(&["local"]), memory);
         assert_eq!(built, 1);
         assert_eq!(
             result.unwrap().get("LOCAL_SUDO").map(|pw| pw.as_slice()),

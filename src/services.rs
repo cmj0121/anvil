@@ -1,6 +1,10 @@
 //! `[[services]]`: a service brought to a state, and to an enablement when
 //! one is set, by the init each target runs.
 //!
+//! [`runs`] turns each entry into one step per target: a skip when the
+//! entry does not match, else the script, run as root or through
+//! `sudo -n`, with the password typed when sudo asks for one.
+//!
 //! [`init_for`] names the init from the `distro` fact. [`script`] builds one
 //! sh brace group that asks the init first and changes only what differs: it
 //! prints one line per change (`enabled`, `disabled`, `started`, `stopped`,
@@ -10,9 +14,14 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::config::{ServiceState, check_service_name};
-use crate::files::quote;
+use crate::apply::{PlannedRun, ServiceRun};
+use crate::config::{Config, ServiceState, check_service_name};
+use crate::facts::Facts;
+use crate::files::{self, quote};
+use crate::inventory::Target;
 use crate::packages::Manager;
+use crate::secret;
+use crate::transport::RUN_TIMEOUT;
 
 /// The time limit of a service step: systemd's default 90 s start timeout
 /// plus the password exchange.
@@ -47,6 +56,106 @@ pub fn init_for(distro: &str) -> Option<Init> {
         Manager::Brew => Some(Init::Launchd),
         Manager::Apk => Some(Init::OpenRc),
         Manager::Pacman | Manager::Apt | Manager::Dnf => Some(Init::Systemd),
+    }
+}
+
+/// One step per `[[services]]` entry for `target`, in config order: a skip
+/// when it does not match, else its script under the target's init. The
+/// init and the way to root are looked up once, and only when an entry
+/// matches; either failing fails the whole target.
+pub fn runs(
+    config: &Config,
+    target: &Target,
+    facts: Option<&Facts>,
+) -> Result<Vec<PlannedRun>, String> {
+    if config.services.is_empty() {
+        return Ok(Vec::new());
+    }
+    let facts = facts.ok_or("services: the probe has not run")?;
+    let mut found: Option<(Init, &str, Option<&str>)> = None;
+    let mut runs = Vec::with_capacity(config.services.len());
+    for (i, entry) in config.services.iter().enumerate() {
+        let name = &entry.name;
+        if !files::matches(&entry.tags, &entry.facts, target, facts) {
+            log::info!("{}: services[{i}] {name}: no match", target.name);
+            runs.push(service_run(
+                String::new(),
+                format!("skipped service {name}: no match"),
+                None,
+                true,
+            ));
+            continue;
+        }
+        let (init, sudo, secret) = match found {
+            Some(found) => found,
+            None => {
+                let init = init_of(facts)?;
+                let (sudo, secret) = root_access(config, target, facts)?;
+                *found.insert((init, sudo, secret))
+            }
+        };
+        let state = entry
+            .state()
+            .ok_or_else(|| format!("services: internal error: services[{i}] has no valid state"))?;
+        match secret {
+            Some(secret) => log::info!(
+                "{}: services[{i}] {name} with {init}, sudo password from secret {secret}",
+                target.name
+            ),
+            None => log::info!("{}: services[{i}] {name} with {init}", target.name),
+        }
+        runs.push(service_run(
+            script(init, name, state, entry.enabled, sudo, LAUNCH_DAEMONS),
+            format!("service {name}"),
+            secret.map(str::to_owned),
+            false,
+        ));
+    }
+    Ok(runs)
+}
+
+/// The init the target's `distro` fact names.
+fn init_of(facts: &Facts) -> Result<Init, String> {
+    let distro = facts.get("distro").unwrap_or("");
+    init_for(distro).ok_or_else(|| {
+        format!(
+            "services: no init known for distro `{}`",
+            secret::shown_name(distro)
+        )
+    })
+}
+
+/// How a service step reaches root on `target`: the script's sudo prefix,
+/// and the secret whose password is typed when sudo asks for one.
+fn root_access<'a>(
+    config: &'a Config,
+    target: &'a Target,
+    facts: &Facts,
+) -> Result<(&'static str, Option<&'a str>), String> {
+    if facts.is_root() {
+        return Ok(("", None));
+    }
+    match facts.get("sudo") {
+        Some("nopasswd") => Ok(("sudo -n ", None)),
+        Some("binary") => match files::sudo_secret_for(config, target) {
+            Some(secret) => Ok(("sudo -n ", Some(secret))),
+            None => Err("services: sudo asks for a password; set sudo_secret \
+                 (local_sudo_secret for local), set NOPASSWD, or connect as root"
+                .to_string()),
+        },
+        _ => Err("services: needs root and sudo is not installed".to_string()),
+    }
+}
+
+fn service_run(run: String, label: String, sudo_secret: Option<String>, skip: bool) -> PlannedRun {
+    PlannedRun {
+        run,
+        label: Some(label),
+        sudo_secret,
+        plugin: None,
+        timeout: if skip { RUN_TIMEOUT } else { SERVICE_TIMEOUT },
+        file: None,
+        service: Some(ServiceRun { skip }),
     }
 }
 
