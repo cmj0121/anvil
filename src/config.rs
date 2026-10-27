@@ -502,7 +502,7 @@ impl Config {
     }
 
     /// The `[plugins]` schema rules; the files are checked by
-    /// [`crate::plugin::verify`] only before a command runs any target.
+    /// [`crate::plugin::verify_where`] only before a command runs any target.
     fn check_plugins(&self, home: Option<&OsStr>) -> Result<(), String> {
         for (name, plugin) in &self.plugins {
             if !is_plugin_name(name) {

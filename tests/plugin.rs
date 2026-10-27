@@ -259,3 +259,28 @@ fn on_doctor_loads_and_a_step_naming_it_exits_two() {
     }
     assert_eq!(record(&sandbox, "stdin"), "", "the plugin never ran");
 }
+
+#[test]
+fn a_missing_or_stale_doctor_plugin_never_fails_apply_or_plan() {
+    let (sandbox, path) = pinned(None);
+    let config = fs::read_to_string(sandbox.config_dir().join("config.toml")).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{config}\n[plugins.gone]\npath = \"/nonexistent/audit\"\nsha256 = \"{zero}\"\n\
+             on = \"doctor\"\n\n[plugins.stale]\npath = \"{}\"\nsha256 = \"{zero}\"\n\
+             on = \"doctor\"\n",
+            path.display(),
+            zero = "0".repeat(64),
+        ),
+    );
+    for command in ["plan", "apply"] {
+        let out = sandbox.anvil(&[command, "--target", "fake"], &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{command}: {}",
+            text(&out.stderr)
+        );
+    }
+}

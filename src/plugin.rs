@@ -1,10 +1,12 @@
 //! `[plugins]`: programs on the controller that a step names, each pinned
 //! by its `path` and the `sha256` of its bytes.
 //!
-//! [`verify`] checks every entry once, before any target runs: the file its
-//! path resolves to must be a regular file the current user owns and can
-//! run, that no one else can write, in a directory no one else can write,
-//! and its bytes must hash to the pin. The directories above that one are
+//! [`verify_where`] checks the entries a command runs once, before any
+//! target runs: apply and plan only `on = "step"`, doctor only
+//! `on = "doctor"` (through [`verify_each`]). The file each path resolves
+//! to must be a regular file the current user owns and can run, that no
+//! one else can write, in a directory no one else can write, and its bytes
+//! must hash to the pin. The directories above that one are
 //! not checked. What fstat said of the hashed file is kept, so a file
 //! changed afterwards is refused at spawn instead of being hashed again.
 //!
@@ -17,7 +19,7 @@
 //! logged.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::fs::{self, Metadata};
 use std::io::{self, Read, Write};
@@ -33,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::config::Config;
+use crate::config::{Config, Plugin};
 use crate::document::MAX_BYTES;
 use crate::facts::Facts;
 use crate::logger::escape_controls;
@@ -127,48 +129,70 @@ pub struct Pin {
 #[derive(Debug)]
 pub struct Pins(BTreeMap<String, Pin>);
 
-/// Checks every `[plugins]` entry, used by a step or not; the error names
-/// the key.
-pub fn verify(config: &Config) -> Result<Pins, String> {
+/// Checks the `[plugins]` entries `keep` accepts, in name order; the first
+/// error, naming the key, fails them all. Entries `keep` drops are neither
+/// stat'ed nor hashed.
+pub fn verify_where(config: &Config, keep: impl Fn(&Plugin) -> bool) -> Result<Pins, String> {
     let home = std::env::var_os("HOME");
     let mut pins = BTreeMap::new();
-    for (name, plugin) in &config.plugins {
-        let key = format!("plugins.{name}.path");
-        let refuse = |message: &dyn std::fmt::Display| {
-            format!("{key} `{}`: {message}", escape_controls(&plugin.path))
-        };
-        let path = plugin.path(name, home.as_deref())?;
-        let real = fs::canonicalize(&path).map_err(|err| refuse(&err))?;
-        let (mut file, meta) = open_regular(&real).map_err(|err| refuse(&err))?;
-        check_owner(&meta, 0o022).map_err(|message| refuse(&message))?;
-        if meta.mode() & 0o100 == 0 {
-            return Err(refuse(&"not executable; run chmod u+x on it"));
-        }
-        // Others able to write the directory of the real file could swap it.
-        check_dir(real.parent().unwrap_or(Path::new("/"))).map_err(|err| {
-            refuse(&format_args!(
-                "directory {}",
-                escape_controls(&err.to_string())
-            ))
-        })?;
-        let digest = hash(&mut file, PLUGIN_LIMIT).map_err(|err| refuse(&err))?;
-        if digest != plugin.sha256 {
-            return Err(format!(
-                "plugins.{name}.sha256: does not match {} (its bytes hash to {digest})",
-                escape_controls(&real.to_string_lossy())
-            ));
-        }
-        let stamp = Stamp::of(&file.metadata().map_err(|err| refuse(&err))?);
-        pins.insert(
-            name.clone(),
-            Pin {
-                name: name.clone(),
-                real,
-                stamp,
-            },
-        );
+    for (name, plugin) in config.plugins.iter().filter(|(_, plugin)| keep(plugin)) {
+        pins.insert(name.clone(), verify_one(name, plugin, home.as_deref())?);
     }
     Ok(Pins(pins))
+}
+
+/// [`verify_where`], but each entry `keep` accepts on its own: one that
+/// fails keeps its error and the others are still checked.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "doctor verifies from #19 U5 on")
+)]
+pub fn verify_each(
+    config: &Config,
+    keep: impl Fn(&Plugin) -> bool,
+) -> BTreeMap<String, Result<Pin, String>> {
+    let home = std::env::var_os("HOME");
+    config
+        .plugins
+        .iter()
+        .filter(|(_, plugin)| keep(plugin))
+        .map(|(name, plugin)| (name.clone(), verify_one(name, plugin, home.as_deref())))
+        .collect()
+}
+
+/// Checks the entry `name`; the error names the key.
+fn verify_one(name: &str, plugin: &Plugin, home: Option<&OsStr>) -> Result<Pin, String> {
+    let key = format!("plugins.{name}.path");
+    let refuse = |message: &dyn std::fmt::Display| {
+        format!("{key} `{}`: {message}", escape_controls(&plugin.path))
+    };
+    let path = plugin.path(name, home)?;
+    let real = fs::canonicalize(&path).map_err(|err| refuse(&err))?;
+    let (mut file, meta) = open_regular(&real).map_err(|err| refuse(&err))?;
+    check_owner(&meta, 0o022).map_err(|message| refuse(&message))?;
+    if meta.mode() & 0o100 == 0 {
+        return Err(refuse(&"not executable; run chmod u+x on it"));
+    }
+    // Others able to write the directory of the real file could swap it.
+    check_dir(real.parent().unwrap_or(Path::new("/"))).map_err(|err| {
+        refuse(&format_args!(
+            "directory {}",
+            escape_controls(&err.to_string())
+        ))
+    })?;
+    let digest = hash(&mut file, PLUGIN_LIMIT).map_err(|err| refuse(&err))?;
+    if digest != plugin.sha256 {
+        return Err(format!(
+            "plugins.{name}.sha256: does not match {} (its bytes hash to {digest})",
+            escape_controls(&real.to_string_lossy())
+        ));
+    }
+    let stamp = Stamp::of(&file.metadata().map_err(|err| refuse(&err))?);
+    Ok(Pin {
+        name: name.to_owned(),
+        real,
+        stamp,
+    })
 }
 
 /// The lowercase hex sha256 of what is left to read in `file`, at most
@@ -213,25 +237,35 @@ impl Plugins for Pins {
 /// Runs the plugin `pin` with `request` on its stdin and returns the
 /// script it replied with.
 pub fn run(pin: &Pin, request: &Request) -> Result<String, String> {
-    spawn(pin, request, std::env::vars_os(), TIMEOUT)
+    let input = encode(pin, request, REQUEST_LIMIT)?;
+    let stdout = spawn(pin, &input, std::env::vars_os(), TIMEOUT)?;
+    script_of(stdout).map_err(|why| format!("plugin {}: {why}", pin.name))
 }
 
-/// [`run`] with the variables [`is_passed`] accepts of `vars` and the time
-/// limit `timeout`.
-fn spawn(
-    pin: &Pin,
-    request: &Request,
-    vars: impl IntoIterator<Item = (OsString, OsString)>,
-    timeout: Duration,
-) -> Result<String, String> {
-    let fail = |why: &dyn Display| format!("plugin {}: {why}", pin.name);
+/// `request` as the line written to `pin`'s stdin, at most `limit` bytes
+/// before its newline.
+fn encode(pin: &Pin, request: &impl Serialize, limit: usize) -> Result<Vec<u8>, String> {
     let mut input = serde_json::to_vec(request).expect("a request always encodes");
-    if input.len() > REQUEST_LIMIT {
-        return Err(fail(&format_args!(
-            "request is larger than the {REQUEST_LIMIT} byte limit"
-        )));
+    if input.len() > limit {
+        return Err(format!(
+            "plugin {}: request is larger than the {limit} byte limit",
+            pin.name
+        ));
     }
     input.push(b'\n');
+    Ok(input)
+}
+
+/// Runs the plugin `pin` with `input` on its stdin, the variables
+/// [`is_passed`] accepts of `vars` and the time limit `timeout`, and
+/// returns its stdout once it exits 0.
+fn spawn(
+    pin: &Pin,
+    input: &[u8],
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let fail = |why: &dyn Display| format!("plugin {}: {why}", pin.name);
     unchanged(pin)?;
     let real = pin.real.to_string_lossy();
     let real = escape_controls(&real);
@@ -257,7 +291,7 @@ fn spawn(
         if let Some(mut stdin) = stdin {
             // A plugin exiting early closes the pipe; its exit status tells.
             scope.spawn(move || {
-                let _ = stdin.write_all(&input);
+                let _ = stdin.write_all(input);
             });
         }
         // One byte past the limit tells an oversize reply.
@@ -282,7 +316,7 @@ fn spawn(
         Some(0) if output.stdout.len() > REPLY_LIMIT => Err(fail(&format_args!(
             "reply is larger than the {REPLY_LIMIT} byte limit"
         ))),
-        Some(0) => script_of(output.stdout).map_err(|why| fail(&why)),
+        Some(0) => Ok(output.stdout),
         Some(code) => Err(fail(&match last_line(&output.stderr) {
             Some(line) => format!("exited {code}: {line}"),
             None => format!("exited {code}"),
@@ -380,6 +414,11 @@ mod tests {
         }
     }
 
+    /// What apply and plan verify.
+    fn verify_step(config: &Config) -> Result<Pins, String> {
+        verify_where(config, Plugin::is_step)
+    }
+
     fn chmod(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
@@ -389,7 +428,7 @@ mod tests {
         let (root, path) = sandbox("plugin-ok");
         let link = root.join("link");
         std::os::unix::fs::symlink(&path, &link).unwrap();
-        let pins = verify(&config(&link, &body_sha())).unwrap();
+        let pins = verify_step(&config(&link, &body_sha())).unwrap();
         let pin = &pins.0["harden"];
         assert_eq!(pin.name, "harden");
         assert_eq!(pin.real, fs::canonicalize(&path).unwrap());
@@ -400,7 +439,7 @@ mod tests {
     #[test]
     fn a_hash_mismatch_is_refused_with_the_real_hash() {
         let (root, path) = sandbox("plugin-mismatch");
-        let err = verify(&config(&path, &"0".repeat(64))).unwrap_err();
+        let err = verify_step(&config(&path, &"0".repeat(64))).unwrap_err();
         let real = fs::canonicalize(&path).unwrap();
         assert_eq!(
             err,
@@ -435,14 +474,14 @@ mod tests {
         ] {
             let (root, path) = sandbox(tag);
             chmod(&path, mode);
-            let err = verify(&config(&path, &body_sha())).unwrap_err();
+            let err = verify_step(&config(&path, &body_sha())).unwrap_err();
             assert_eq!(err, format!("{}{why}", shown(&path)), "{tag}");
             fs::remove_dir_all(&root).unwrap();
         }
 
         let (root, _) = sandbox("plugin-missing");
         let missing = root.join("plugins/none");
-        let err = verify(&config(&missing, &body_sha())).unwrap_err();
+        let err = verify_step(&config(&missing, &body_sha())).unwrap_err();
         assert!(err.starts_with(&shown(&missing)), "{err}");
 
         let fifo = root.join("plugins/fifo");
@@ -452,10 +491,10 @@ mod tests {
             .unwrap();
         assert!(made.success());
         chmod(&fifo, 0o700);
-        let err = verify(&config(&fifo, &body_sha())).unwrap_err();
+        let err = verify_step(&config(&fifo, &body_sha())).unwrap_err();
         assert_eq!(err, format!("{}not a regular file", shown(&fifo)));
 
-        let err = verify(&config(&root.join("plugins"), &body_sha())).unwrap_err();
+        let err = verify_step(&config(&root.join("plugins"), &body_sha())).unwrap_err();
         assert!(err.contains("not a regular file"), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -470,7 +509,7 @@ mod tests {
         std::os::unix::fs::symlink(&path, tight.join("harden")).unwrap();
         let real_dir = fs::canonicalize(root.join("plugins")).unwrap();
         for named in [path.clone(), tight.join("harden")] {
-            let err = verify(&config(&named, &body_sha())).unwrap_err();
+            let err = verify_step(&config(&named, &body_sha())).unwrap_err();
             assert_eq!(
                 err,
                 format!(
@@ -487,7 +526,7 @@ mod tests {
 
     #[test]
     fn a_relative_path_is_refused_before_any_file_is_read() {
-        let err = verify(&config(Path::new("plugins/harden"), &body_sha())).unwrap_err();
+        let err = verify_step(&config(Path::new("plugins/harden"), &body_sha())).unwrap_err();
         assert_eq!(
             err,
             "plugins.harden.path `plugins/harden`: must be an absolute path or start with ~/"
@@ -512,7 +551,7 @@ mod tests {
             .unwrap()
             .set_len(PLUGIN_LIMIT + 1)
             .unwrap();
-        let err = verify(&config(&path, &body_sha())).unwrap_err();
+        let err = verify_step(&config(&path, &body_sha())).unwrap_err();
         assert_eq!(
             err,
             format!(
@@ -525,7 +564,7 @@ mod tests {
 
     #[test]
     fn controls_in_the_path_are_escaped() {
-        let err = verify(&config(
+        let err = verify_step(&config(
             Path::new("/nonexistent/\x1b[2Jharden"),
             &body_sha(),
         ))
@@ -539,7 +578,7 @@ mod tests {
     #[test]
     fn a_file_changed_after_the_check_is_refused_at_spawn() {
         let (root, path) = sandbox("plugin-changed");
-        let pins = verify(&config(&path, &body_sha())).unwrap();
+        let pins = verify_step(&config(&path, &body_sha())).unwrap();
         let pin = &pins.0["harden"];
         let changed = format!(
             "plugin harden: {} changed since it was checked",
@@ -554,7 +593,7 @@ mod tests {
         assert_eq!(unchanged(pin).unwrap_err(), changed, "a grown file");
 
         fs::write(&path, BODY).unwrap();
-        let pins = verify(&config(&path, &body_sha())).unwrap();
+        let pins = verify_step(&config(&path, &body_sha())).unwrap();
         let pin = &pins.0["harden"];
         // Kept aside, so the new file cannot reuse its inode.
         fs::rename(&path, root.join("old")).unwrap();
@@ -574,7 +613,48 @@ mod tests {
 
     #[test]
     fn no_plugins_is_no_pins() {
-        assert!(verify(&Config::default()).unwrap().0.is_empty());
+        assert!(verify_step(&Config::default()).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_entry_is_never_stated_nor_hashed() {
+        let (root, path) = sandbox("plugin-keep");
+        let mut config = config(&path, &body_sha());
+        // Missing, and pinned wrong: either would fail if it were checked.
+        for (name, path, sha256) in [
+            ("gone", "/nonexistent/audit", body_sha()),
+            ("stale", path.to_str().unwrap(), "0".repeat(64)),
+        ] {
+            config.plugins.insert(
+                name.to_owned(),
+                Plugin {
+                    path: path.to_owned(),
+                    sha256,
+                    on: "doctor".to_owned(),
+                },
+            );
+        }
+        let pins = verify_step(&config).unwrap();
+        assert_eq!(pins.0.keys().collect::<Vec<_>>(), ["harden"]);
+        assert!(verify_where(&config, |_| true).is_err());
+
+        let each = verify_each(&config, Plugin::is_doctor);
+        assert_eq!(each.keys().collect::<Vec<_>>(), ["gone", "stale"]);
+        assert!(
+            each["gone"]
+                .as_ref()
+                .unwrap_err()
+                .starts_with("plugins.gone.path `/nonexistent/audit`: ")
+        );
+        assert!(
+            each["stale"]
+                .as_ref()
+                .unwrap_err()
+                .starts_with("plugins.stale.sha256: does not match ")
+        );
+        let each = verify_each(&config, Plugin::is_step);
+        assert_eq!(each["harden"].as_ref().unwrap().name, "harden");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// What sh sets on its own.
@@ -587,7 +667,7 @@ mod tests {
         fs::write(&path, body).unwrap();
         write_knobs(&root.join("plugins/fake-plugin.env"), vars);
         let sha = hash(&mut &body[..], PLUGIN_LIMIT).unwrap();
-        let pins = verify(&config(&path, &sha)).unwrap();
+        let pins = verify_step(&config(&path, &sha)).unwrap();
         (root, pins)
     }
 
@@ -627,7 +707,9 @@ mod tests {
             tags: &[],
             args: &Map::new(),
         };
-        spawn(&pins.0["harden"], &request, env, timeout)
+        let pin = &pins.0["harden"];
+        let input = encode(pin, &request, REQUEST_LIMIT)?;
+        script_of(spawn(pin, &input, env, timeout)?).map_err(|why| format!("plugin harden: {why}"))
     }
 
     #[test]
@@ -890,7 +972,7 @@ mod tests {
 
     #[test]
     fn a_name_that_is_not_pinned_fails_without_a_spawn() {
-        let pins = verify(&Config::default()).unwrap();
+        let pins = verify_step(&Config::default()).unwrap();
         assert_eq!(
             ask(&pins, &Map::new()).unwrap_err(),
             "plugin harden: not pinned"
