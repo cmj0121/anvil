@@ -485,6 +485,7 @@ mod tests {
             },
             pkg: None,
             sudo_secret: None,
+            tags: Vec::new(),
         }
     }
 
@@ -860,6 +861,7 @@ mod tests {
             kind: TargetKind::Local,
             pkg: None,
             sudo_secret: None,
+            tags: Vec::new(),
         };
         assert_eq!(describe(&local), "local");
         let bare = Target {
@@ -930,6 +932,7 @@ mod tests {
             kind: TargetKind::Local,
             pkg: None,
             sudo_secret: None,
+            tags: Vec::new(),
         };
         let boxed = Target {
             sudo_secret: Some("BOX_SUDO".to_owned()),

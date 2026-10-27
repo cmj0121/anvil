@@ -37,14 +37,21 @@ pub fn run_targets(
 ) -> Result<Report, Failure> {
     let targets = opts.targets()?;
     let runs = [PlannedRun {
-        run: format!("{{ :\n{script}\n}}\n"),
+        run: wrap(&script),
         label: Some(script),
         sudo_secret: None,
+        plugin: None,
         timeout,
     }];
     Ok(apply::for_each_target(&targets, cancel, on, |target| {
         run_target(target, opts.transport(target), &runs, cancel)
     }))
+}
+
+/// `script` as it travels on the transport's stdin; see the module
+/// documentation.
+pub fn wrap(script: &str) -> String {
+    format!("{{ :\n{script}\n}}\n")
 }
 
 fn run_target(

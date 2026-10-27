@@ -187,6 +187,7 @@ mod tests {
             kind: TargetKind::Local,
             pkg: None,
             sudo_secret: None,
+            tags: Vec::new(),
         };
         assert_eq!(opts.transport(&local).unwrap().name(), "local");
         let host = Target {
@@ -198,6 +199,7 @@ mod tests {
             },
             pkg: None,
             sudo_secret: None,
+            tags: Vec::new(),
         };
         assert_eq!(opts.transport(&host).unwrap().name(), "203.0.113.10");
     }

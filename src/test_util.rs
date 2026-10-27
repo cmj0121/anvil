@@ -1,6 +1,6 @@
 //! Helpers shared by the unit tests.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -14,6 +14,7 @@ use crate::document::{self, Format};
 use crate::editor::random;
 use crate::options::Options;
 use crate::paths::DocPath;
+use crate::plugin::{Plugins, Request};
 use crate::secret::{BackendKind, SecretError, Store, Vault};
 
 pub fn json(value: &impl Serialize) -> serde_json::Value {
@@ -129,6 +130,39 @@ pub fn write_knobs(path: &Path, vars: &[(&str, &str)]) {
         .map(|(name, value)| format!("{name}='{value}'\n"))
         .collect();
     fs::write(path, body).unwrap();
+}
+
+/// How [`FakePlugins`] replies to plugin `name`.
+type Reply = dyn Fn(&str, &Request) -> Result<String, String>;
+
+/// Plugins that reply as `reply` says, recording each call's plugin name
+/// and request.
+pub struct FakePlugins {
+    reply: Box<Reply>,
+    pub seen: RefCell<Vec<(String, serde_json::Value)>>,
+}
+
+impl FakePlugins {
+    pub fn new(reply: impl Fn(&str, &Request) -> Result<String, String> + 'static) -> FakePlugins {
+        FakePlugins {
+            reply: Box::new(reply),
+            seen: RefCell::default(),
+        }
+    }
+
+    /// For a config without plugin steps.
+    pub fn none() -> FakePlugins {
+        FakePlugins::new(|name, _| panic!("plugin {name} ran"))
+    }
+}
+
+impl Plugins for FakePlugins {
+    fn script(&self, name: &str, request: &Request) -> Result<String, String> {
+        self.seen
+            .borrow_mut()
+            .push((name.to_owned(), json(request)));
+        (self.reply)(name, request)
+    }
 }
 
 /// A store that fails to open with `error()`, like a locked age identity,

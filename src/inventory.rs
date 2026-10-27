@@ -60,6 +60,8 @@ pub struct Target {
     pub pkg: Option<Choice>,
     /// The host's `sudo_secret`; `None` for `local`.
     pub sudo_secret: Option<String>,
+    /// The host's `tags`; empty for `local`.
+    pub tags: Vec<String>,
 }
 
 /// One `--target SEL`: `local`, or a word that is a host name or a tag.
@@ -199,6 +201,7 @@ impl Inventory {
                 kind: TargetKind::Local,
                 pkg: None,
                 sudo_secret: None,
+                tags: Vec::new(),
             });
         }
         for (name, host) in &self.hosts {
@@ -212,6 +215,7 @@ impl Inventory {
                     },
                     pkg: host.pkg,
                     sudo_secret: host.sudo_secret.clone(),
+                    tags: host.tags.clone(),
                 });
             }
         }
