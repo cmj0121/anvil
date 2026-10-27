@@ -234,13 +234,19 @@ impl Sandbox {
     /// `met`: it passes only when two targets run at once. After 30 s it
     /// gives up: it says why on stderr and exits 1.
     pub fn barrier_step(&self) -> String {
+        self.barrier_step_within(30)
+    }
+
+    /// [`Sandbox::barrier_step`], giving up after `secs` seconds instead.
+    pub fn barrier_step_within(&self, secs: u32) -> String {
         let dir = self.root.join("barrier");
         fs::create_dir_all(&dir).unwrap();
         let dir = dir.display();
+        let polls = secs * 20;
         format!(
             "touch {dir}/$$; i=0; until [ \"$(ls {dir} | wc -l)\" -ge 2 ]; do \
-             i=$((i+1)); if [ $i -gt 600 ]; then \
-             echo \"barrier: gave up after 30 s, $(ls {dir} | wc -l) of 2 runs started\" >&2; \
+             i=$((i+1)); if [ $i -gt {polls} ]; then \
+             echo \"barrier: gave up after {secs} s, $(ls {dir} | wc -l) of 2 runs started\" >&2; \
              exit 1; fi; sleep 0.05; done; echo met"
         )
     }

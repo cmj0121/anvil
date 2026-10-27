@@ -162,10 +162,14 @@ fn run_script(
 fn run_plan(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(), Failure> {
     let config = opts.load_config()?;
     plan::run_targets(opts, &config, cancel, &mut |progress| {
-        let _ = tx.send(match progress {
-            plan::Progress::Start(target) => Msg::Start(target.name.clone()),
-            plan::Progress::Done(report) => Msg::PlanDone(report.clone()),
-        });
+        let msg = match progress {
+            // The slots come with the TUI's parallel view.
+            plan::Progress::Begin(_) => return,
+            plan::Progress::Start(_, target) => Msg::Start(target.name.clone()),
+            plan::Progress::Done(_, report) => Msg::PlanDone(report.clone()),
+            plan::Progress::Ordered(_) => return,
+        };
+        let _ = tx.send(msg);
     })?;
     Ok(())
 }

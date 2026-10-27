@@ -155,3 +155,70 @@ fn each_file_is_listed_and_neither_written_nor_shown() {
     assert!(!sandbox.root().join("motd").exists(), "nothing written");
     assert!(!sandbox.root().join("ran").exists(), "the step did not run");
 }
+
+#[test]
+fn parallel_two_plans_two_hosts_at_once_and_keeps_inventory_order() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.with_two_fake_hosts();
+    // The plugin runs on the controller once per target: it replies only
+    // once both targets are being planned at once. Its barrier gives up
+    // before the plugin's own 30 s limit, so a miss says why.
+    let barrier = sandbox.barrier_step_within(20);
+    let body = format!(
+        "#!/bin/sh\nPATH=/usr/bin:/bin\ncat >/dev/null\n{barrier} >/dev/null || exit 1\n\
+         printf '%s\\n' '{{\"script\":\"echo planned\"}}'\n"
+    );
+    let (path, sha256) = sandbox.plugin("meet", body.as_bytes());
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[plugins.meet]\npath = \"{}\"\nsha256 = \"{sha256}\"\n\n\
+             [[steps]]\nplugin = \"meet\"\n",
+            path.display()
+        ),
+    );
+    let args = [
+        "--parallel",
+        "2",
+        "plan",
+        "--target",
+        "beta",
+        "--target",
+        "alpha",
+    ];
+    let out = sandbox.anvil(&args, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let block =
+        |name: &str| format!("▶ {name}\n  would $ echo planned (from plugin meet)\n  ✔ 1 step\n\n");
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "{}{}2 targets, nothing executed\n",
+            block("alpha"),
+            block("beta")
+        )
+    );
+
+    std::fs::remove_dir_all(sandbox.root().join("barrier")).unwrap();
+    sandbox.barrier_step_within(20);
+    let out = sandbox.anvil(&[&["--json"][..], &args].concat(), &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let targets = value["targets"].as_array().unwrap();
+    assert_eq!(targets[0]["target"], "alpha");
+    assert_eq!(targets[1]["target"], "beta");
+    assert_eq!(value["ok"], true);
+}
+
+#[test]
+fn parallel_one_prints_exactly_what_the_default_prints() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.with_fake_host();
+    for flag in [&[][..], &["--json"]] {
+        let default = sandbox.anvil(&[flag, &["plan"]].concat(), &[]);
+        let one = sandbox.anvil(&[flag, &["--parallel", "1", "plan"]].concat(), &[]);
+        assert_eq!(default.status.code(), Some(0), "{}", text(&default.stderr));
+        assert_eq!(one.status.code(), Some(0), "{}", text(&one.stderr));
+        assert_eq!(text(&one.stdout), text(&default.stdout), "{flag:?}");
+    }
+}
