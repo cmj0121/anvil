@@ -1222,7 +1222,7 @@ pub(crate) fn parse_hashes(
 }
 
 /// `bytes` in lowercase hex.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

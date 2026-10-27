@@ -14,10 +14,11 @@ use std::process::ExitCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// anvil's `DOCTOR_REQUEST_LIMIT`: 64 KiB plus, for each of 64 files, two
-/// entries of a 4096-byte dest JSON-escaped up to twice and 512 bytes more.
-/// A plain literal, so a test can read it from this file.
-const MAX_REQUEST: u64 = 1_179_648;
+/// anvil's `DOCTOR_REQUEST_LIMIT` and the request's newline: 64 KiB plus,
+/// for each of 64 files, three copies of a 4096-byte dest JSON-escaped up
+/// to twice and 512 bytes more. A plain literal: anvil's unit tests read
+/// it from this file and fail when it is not that limit plus one.
+const MAX_REQUEST: u64 = 1_736_705;
 
 /// A fact anvil reads from the moment's sudo cache, so it changes between
 /// runs without any drift.

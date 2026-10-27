@@ -7,8 +7,8 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::{Value, json};
 
-/// anvil's `DOCTOR_REQUEST_LIMIT`.
-const LIMIT: usize = 1_179_648;
+/// anvil's `DOCTOR_REQUEST_LIMIT`, plus the newline anvil sends after it.
+const LIMIT: usize = 1_736_704 + 1;
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
