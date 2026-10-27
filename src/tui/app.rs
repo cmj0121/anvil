@@ -1233,6 +1233,7 @@ pub mod tests {
             config: None,
             ssh_config: None,
             target: Vec::new(),
+            parallel: std::num::NonZeroU8::MIN,
             can_prompt: false,
             #[cfg(debug_assertions)]
             secret_store: None,

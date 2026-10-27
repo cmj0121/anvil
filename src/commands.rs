@@ -313,6 +313,15 @@ pub fn warn_target(cli: &Cli) {
     if !cli.target.is_empty() {
         log::warn!("--target is ignored by `{}`", cli.command.name());
     }
+    warn_parallel(cli);
+}
+
+/// For a command that runs no targets in parallel: the CLI's doctor,
+/// inventory, config, secret and update.
+pub fn warn_parallel(cli: &Cli) {
+    if cli.parallel != 1 {
+        log::warn!("--parallel is ignored by `{}`", cli.command.name());
+    }
 }
 
 /// Where document `name` is written: the explicit `.toml` path (already

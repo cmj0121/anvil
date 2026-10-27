@@ -2,6 +2,7 @@
 //! or the command, so a front end other than the CLI can build one.
 
 use std::io::IsTerminal;
+use std::num::NonZeroU8;
 use std::path::PathBuf;
 
 use crate::cli::{Cli, Failure};
@@ -25,6 +26,12 @@ pub struct Options {
     pub config: Option<PathBuf>,
     pub ssh_config: Option<PathBuf>,
     pub target: Vec<String>,
+    /// Targets apply, plan and run work on at once.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read once targets run in parallel")
+    )]
+    pub parallel: NonZeroU8,
     /// ssh may run its interactive retry. CLI: stdin && stderr are terminals.
     /// TUI: true only while a term::Handoff is installed.
     pub can_prompt: bool,
@@ -58,6 +65,7 @@ impl Options {
             config: cli.config.clone(),
             ssh_config: cli.ssh_config.clone(),
             target: cli.target.clone(),
+            parallel: NonZeroU8::new(cli.parallel).expect("clap keeps --parallel in 1..=32"),
             can_prompt: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
             #[cfg(debug_assertions)]
             secret_store: cli.secret_store,
@@ -199,6 +207,8 @@ mod tests {
         assert_eq!(opts.config, Some(PathBuf::from("cfg.toml")));
         assert_eq!(opts.ssh_config, Some(PathBuf::from("ssh_config")));
         assert_eq!(opts.target, ["local", "mac"]);
+        assert_eq!(opts.parallel.get(), 1);
+        assert_eq!(parse(&["--parallel", "4", "plan"]).parallel.get(), 4);
     }
 
     #[test]

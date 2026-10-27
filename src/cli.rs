@@ -38,6 +38,16 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SEL")]
     pub target: Vec<String>,
 
+    /// Targets run at once by apply, plan and run, 1..=32
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u8).range(1..=32)
+    )]
+    pub parallel: u8,
+
     /// Test aid, debug builds only: `memory` keeps secrets in this process
     /// instead of the keychain.
     #[cfg(debug_assertions)]
@@ -222,6 +232,7 @@ pub fn run(cli: &Cli) -> Result<(), Failure> {
         Command::Inventory { format } => crate::commands::inventory(cli, &opts, *format),
         Command::Config { format } => crate::commands::config(cli, &opts, *format),
         Command::Doctor => {
+            crate::commands::warn_parallel(cli);
             let config = opts.load_config()?;
             let store = opts.secret_store(&config)?;
             crate::doctor::run(cli, &opts, &config, store.as_ref())
@@ -345,6 +356,17 @@ mod tests {
         assert_eq!(cli.config, Some(PathBuf::from("cfg.toml")));
         assert_eq!(cli.ssh_config, Some(PathBuf::from("ssh_config")));
         assert_eq!(cli.target, ["local", "mac"]);
+    }
+
+    #[test]
+    fn parallel_defaults_to_one_and_takes_one_to_thirty_two() {
+        assert_eq!(parse(&["apply"]).parallel, 1);
+        assert_eq!(parse(&["--parallel", "32", "apply"]).parallel, 32);
+        assert_eq!(parse(&["plan", "--parallel", "1"]).parallel, 1);
+        for value in ["0", "33", "x", "-1", ""] {
+            let err = Cli::try_parse_from(["anvil", "--parallel", value, "apply"]).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "--parallel {value:?}");
+        }
     }
 
     #[test]
