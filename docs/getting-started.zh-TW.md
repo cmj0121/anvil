@@ -29,9 +29,9 @@ make build                 # builds target/release/anvil
 
 ### 預先建置的執行檔
 
-[Releases](https://github.com/mini-poc/anvil/releases) 頁面為每個 `<target>` 提供 `anvil-<version>-<target>.tar.gz` 封存檔與 `.sha256` 檔，
-`<target>` 為 `aarch64-apple-darwin`、`x86_64-apple-darwin` 與 `x86_64-unknown-linux-musl`。
-兩者都下載後，驗證封存檔、解開，再將執行檔放到 `PATH` 上：
+[Releases](https://github.com/mini-poc/anvil/releases) 頁面為每個 `<target>` 提供 `anvil-<version>-<target>.tar.gz` 封存檔、
+`.sha256` 檔與 `.minisig` 簽章，`<target>` 為 `aarch64-apple-darwin`、`x86_64-apple-darwin` 與 `x86_64-unknown-linux-musl`。
+下載它們後，驗證封存檔、解開，再將執行檔放到 `PATH` 上：
 
 ```sh
 shasum -a 256 -c anvil-<version>-<target>.tar.gz.sha256   # macOS
@@ -41,8 +41,24 @@ install -d ~/.local/bin
 install -m 0755 anvil-<version>-<target>/anvil ~/.local/bin/
 ```
 
-macOS 上的執行檔未經簽署。請用 `curl` 下載，它不會加上隔離標記；
+checksum 只能抓出損毀的下載。要確認封存檔是誰做的，請以 [minisign](https://jedisct1.github.io/minisign/)
+與 [`keys/minisign.pub`](https://github.com/mini-poc/anvil/blob/main/keys/minisign.pub) 第二行的金鑰驗證它的簽章：
+
+```sh
+minisign -Vm anvil-<version>-<target>.tar.gz -P <key>   # reads anvil-<version>-<target>.tar.gz.minisig
+```
+
+輸出的最後必須是 `Trusted comment: anvil <version> <target>`，也就是你下載的版本與 target。
+
+macOS 上的執行檔沒有程式碼簽署，也沒有經過 notarization。請用 `curl` 下載，它不會加上隔離標記；
 若是用瀏覽器下載，請在安裝前以 `xattr -d com.apple.quarantine anvil-<version>-<target>/anvil` 清除該標記。
+
+### 更新
+
+安裝後，`anvil update --check` 會告訴你是否有較新的 release，`anvil update` 則下載它、檢查 checksum 與簽章，
+再取代執行檔，並把先前的執行檔保留在旁邊的 `anvil.prev`。請重新啟動正在執行的 anvil（例如 `anvil tui`）以使用新版本。
+它會拒絕套件管理器擁有的執行檔、不屬於你的執行檔，以及位於你無法寫入之目錄中的執行檔；
+細節請見 [cli.zh-TW.md](cli.zh-TW.md#anvil-update---check)。在 release 金鑰編入之前，`anvil update` 會以 `no release key compiled in` 停止。
 
 ## 快速開始
 

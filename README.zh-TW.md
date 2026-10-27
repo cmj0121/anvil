@@ -25,6 +25,8 @@ anvil 是一個安全、單一執行檔的 Rust 工具，從一份宣告式 conf
   它以 JSON 讀取 target 的 facts，並回覆要在該 target 上執行的 sh 腳本。它在清空的環境中執行，拿不到任何 secret。
 - **secret（機密）** 存放在 macOS keychain、age 檔案或 sops 檔案中，`anvil secret --migrate` 可在 backend 之間搬移它們。
 - **終端機介面**：`anvil tui` 在同一個畫面執行所有指令，並保留本次工作階段的結果供瀏覽。
+- **`anvil update`** 以最新的 release 取代執行檔：先以編入 anvil 的公開金鑰檢查它的 `.sha256` 與 `.minisig` 簽章，
+  並把先前的執行檔保留為 `anvil.prev`。金鑰要等專案 owner 加入後才會編入；在那之前，`anvil update` 會回報 `no release key compiled in`。
 - **為 agent 打造**：`--json` 在 stdout 輸出一份可解析的文件；日誌只寫到 stderr。
 - **預設即安全**：絕不自動接受 host 金鑰，sudo 密碼絕不出現在 argv、環境變數或日誌中，
   secret 只以加密形式寫入磁碟，唯一的例外是你編輯時使用的私有編輯器暫存檔。
@@ -54,6 +56,7 @@ anvil plan                 # the steps apply would run on every target, running 
 anvil apply                # install packages, copy matching files and run the steps
 anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
 anvil tui                  # all of the above in one terminal UI
+anvil update --check       # is a newer release out? `anvil update` installs it
 ```
 
 一份在每個 target 上安裝 `fd` 的 config，管理器為 apt 或 dnf 時則安裝 `fd-find`（[別名](docs/packages.zh-TW.md#別名)）：

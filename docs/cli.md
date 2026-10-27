@@ -20,6 +20,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   secret <NAME>                  edit one secret in the editor
   secret --migrate --to BACKEND  move every secret to keychain, age or sops and select it
   tui                            run every command and browse the results in a terminal UI
+  update [--check]               replace this binary with the latest release once it verifies
 ```
 
 ## Common flags
@@ -613,6 +614,116 @@ inventory loads. Quitting exits 0.
 
 The screen, the key table and the TUI's rules are in [tui.md](tui.md).
 
+### `anvil update [--check]`
+
+Replaces the running `anvil` with the latest GitHub release once that release verifies. `--check` only compares:
+
+```sh
+anvil update --check       # current, latest and a verdict; exit 1 when an update is available
+anvil update               # download, verify and replace this binary
+```
+
+`--check` prints three lines on stdout:
+
+```text
+current 0.1.0
+latest  0.2.0 (anvil-v0.2.0-aarch64-apple-darwin.tar.gz)
+update available
+```
+
+The last line is `update available`, `up to date` or `ahead of the latest release`. With an update available it also
+logs ``anvil update: anvil 0.2.0 is available; run `anvil update` `` and exits 1, so a script can test for it. `--json`
+prints the same as one document; `status` is `available`, `current` or `ahead`:
+
+```json
+{
+  "current": "0.1.0",
+  "latest": "0.2.0",
+  "asset": "anvil-v0.2.0-aarch64-apple-darwin.tar.gz",
+  "status": "available"
+}
+```
+
+`anvil update` with nothing newer prints the verdict line (`up to date` or `ahead of the latest release`; with
+`--json`, the `--check` document), downloads nothing and exits 0. A downgrade is never made. After an update it prints
+`updated anvil 0.1.0 → 0.2.0 at PATH (previous kept at PATH.prev)`, or with `--json`:
+
+```json
+{
+  "from": "0.1.0",
+  "to": "0.2.0",
+  "path": "/home/me/.local/bin/anvil",
+  "prev": "/home/me/.local/bin/anvil.prev"
+}
+```
+
+`PATH` is the binary itself: a symlinked `anvil` updates the file the link points at. The new binary is used from the
+next start; an `anvil` already running, such as an open `anvil tui`, keeps running the old one until you restart it.
+The TUI's `u` key runs the same check and update ([tui.md](tui.md)). As for `inventory` and `config`, `--target` is
+ignored with a warning.
+
+**The latest release.** anvil runs the system `curl` (`curl not found on PATH` otherwise) with `-q` first, so
+`~/.curlrc` is not read, and with no token: a set `GITHUB_TOKEN` is ignored. curl still inherits the environment, so
+`https_proxy`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and the CA settings (`CURL_CA_BUNDLE`, `SSL_CERT_FILE`,
+`SSL_CERT_DIR`) apply. It asks `https://api.github.com/repos/mini-poc/anvil/releases/latest`, which skips drafts and
+prereleases; the answer must be at most 1 MiB (`GitHub API answer over 1 MiB`). The API allows 60 requests an hour
+per IP without a token; past that, `GitHub API rate limit reached (60 requests an hour without a token); try again
+after HH:MM UTC`. Other answers: `no release published` (404) and `GitHub API answered HTTP N`.
+
+**The release files.** For tag `vX.Y.Z` and this machine's target (`aarch64-apple-darwin`, `x86_64-apple-darwin`,
+or `x86_64-unknown-linux-musl` for any x86_64 Linux) the release must hold `anvil-vX.Y.Z-<target>.tar.gz`, its
+`.tar.gz.sha256` and its `.tar.gz.minisig` (else `release vX.Y.Z has no asset NAME`); another OS or architecture is
+`no release asset for <os>-<arch>`. Each URL must be
+`https://github.com/mini-poc/anvil/releases/download/vX.Y.Z/NAME` exactly (else `unexpected download URL for NAME`).
+Downloads are https only, with no retries; the tarball may be at most 64 MiB (`NAME is N bytes, over the 64 MiB
+limit`) and take 300 s, the two small files 4 KiB and 30 s each, and each must be the size the release lists; a file
+the release lists as empty is refused (`release vX.Y.Z lists NAME as 0 bytes`). curl before 8.4 may not enforce
+`--max-filesize` on a chunked response; the size check after the transfer still refuses such a file. They land in a
+private 0700 directory `anvil-update-<16 hex>` under `$TMPDIR`, removed when anvil exits normally.
+
+**The checks, in order.** Every one runs before anything is unpacked, and any failure exits 1 with the binary
+untouched:
+
+1. a release key is compiled in (`no release key compiled in`), before any download;
+2. the binary may be replaced (the refusals below), before any download;
+3. the `.sha256` file is one `<64 hex>  NAME` line matching the tarball's SHA-256 (`checksum mismatch for NAME`);
+4. the `.minisig` signature over the tarball is by one of the two compiled-in keys and verifies
+   (`signature check failed for NAME: unknown key id`, `bad signature` or `legacy signature`);
+5. its trusted comment is exactly `anvil vX.Y.Z <target>` (`signature is for "<comment>", not NAME`), so an older
+   signed tarball cannot be passed off as a newer tag or another target;
+6. `tar` unpacks only `anvil-vX.Y.Z-<target>/anvil` from the verified bytes, which must be a regular file of at most
+   128 MiB;
+7. that binary, copied beside the old one as `.anvil.new-<pid>` with the old file's mode, runs `--version` within 10 s
+   (`downloaded binary did not exit in 10 s`) and prints `anvil X.Y.Z` (`downloaded binary reports "<out>", not
+anvil X.Y.Z`).
+
+The signature covers the tarball itself; the `.sha256` file is only a corruption check with a clear message. The
+release keys are those of the anvil release that built this binary: the current key and the next one
+([Security notes](security.md#anvil-update)). The keys are compiled in only once the project owner adds them to the
+source tree; until then `anvil update` reports `no release key compiled in`. `--check` needs no key, so it works in a
+build without one.
+
+**Replacing.** The old binary is kept as a hard link `.anvil.prev-<pid>`, `.anvil.new-<pid>` is renamed over `PATH`,
+and the kept one is renamed to `PATH.prev`, replacing any earlier `.prev`. `PATH` is never missing, even for a
+moment. Where the file system or policy refuses hard links, the old binary is copied instead, with its mode. If that
+last rename fails, the update still succeeds and `previous kept at` names `.anvil.prev-<pid>`. One `.prev` is kept;
+to go back, move it over `PATH` by hand. A `.anvil.new-<pid>` you own, left by an earlier run whose process is gone, is removed.
+
+**Refusals.** These are checked on the path after resolving symlinks, before any download; each exits 1:
+
+- `PATH is managed by a package manager; update it there`: the path is under `/usr/` or `/opt/local/`, has a
+  `Cellar` component (Homebrew and Linuxbrew), or lies in a `.local/share/mise/installs/` or `.asdf/installs/` tree.
+  `/usr/` includes `/usr/local/bin`, so a `/usr/local/bin/anvil` you own is refused too; install into `~/.local/bin`
+  (`make install`) or use the package manager. `~/.cargo/bin` (`cargo install`) is allowed.
+- `PATH is owned by uid N, not you; anvil does not use sudo`: the binary.
+- `DIR is owned by uid N, not you; anvil does not use sudo`: the directory holding it.
+- `DIR is writable by group or others; run chmod go-w on it`: someone else could swap the files in it.
+- `DIR is not writable: <reason>`: the directory, a read-only file system included.
+
+**Ctrl-C.** curl runs in its own process group, so Ctrl-C stops anvil but can leave a download running until its time
+limit, and leaves the `anvil-update-<16 hex>` directory in `$TMPDIR` behind; delete it by hand. The installed binary
+is untouched until the final rename, and a `.anvil.new-<pid>` left beside it is removed by the next `anvil update`.
+
 ### The editor
 
 `[anvil].editor`, else `$VISUAL`, else `$EDITOR`, else `nvim`; split on whitespace into argv (never run through a shell);
@@ -643,6 +754,9 @@ that exits non-zero aborts the command: nothing is written, exit 1.
   attempts, or a secret larger than 1 MiB. For `apply` and `plan`, also a `[plugins]` entry that fails the pin checks
   ([Plugin steps](#plugin-steps)). For `run`, also a script that is empty, over 1 MiB, not UTF-8 or
   unreadable, or a `--timeout` outside 1..=3600. For `tui`, see below.
+- **`update`**: 0 when up to date, ahead of the latest release, or updated. 1 with `--check` when an update is
+  available, and for every failure: the query, a download, a check, a refusal, or `no release key compiled in`; the
+  installed binary is then untouched. 2 for a bad flag or argument.
 - **`tui`**: 0 on quit, whatever the results. 2 when stdin or stdout is not a terminal, for `--json`, or for an unknown
   `--target` (checked only when the inventory loads); an inventory that does not load (any load error, including an
   `--inventory` path not ending in `.toml`) is shown in the header, the status bar and the `t` overlay instead. 1 when
