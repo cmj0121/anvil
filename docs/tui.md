@@ -3,11 +3,12 @@
 English | [繁體中文](tui.zh-TW.md)
 
 `anvil tui` runs the same commands in one screen and keeps every result of the session for browsing. It needs a
-terminal and starts only when asked; the global flags (`--target`, `--inventory`, `--config`, `--ssh-config`, `-v`)
-are its starting state:
+terminal and starts only when asked; the global flags (`--target`, `--inventory`, `--config`, `--ssh-config`, `-v`,
+`--parallel`) are its starting state:
 
 ```sh
 anvil tui                  # or: anvil tui --target linode1
+anvil tui --parallel 4     # apply, plan and run take up to 4 targets at once
 ```
 
 ```text
@@ -41,8 +42,9 @@ Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
 
 - **Header.** `anvil · <kind> · run N/M · targets: <selection>`: the shown result's kind (`doctor`, `apply`, `plan`, `run`
   or what an edit edited) and its place in the history, then the picked targets and `tag:NAME`s, or `all (N)` with none
-  picked. While the shown result is running, its spinner and the running target (`· ⠙ linode1`) come before
-  `targets:`. On the right, `✔ ok  ✘ failed` counts the shown result's targets. Text that does not fit is cut with `…`.
+  picked. While the shown result is running, its spinner and every running target, comma-joined in the order they
+  started (`· ⠙ linode1, pi`), come before `targets:`. On the right, `✔ ok  ✘ failed` counts the shown result's
+  targets. Text that does not fit is cut with `…`.
   An inventory that does not load shows `inventory error` in red instead of the selection, and its error as a notice.
 - **Steps.** The steps apply runs, numbered: `packages` when `[packages]` has work, then `file DEST` for each
   `[[files]]` entry and `service NAME` for each `[[services]]` entry, then each `[[steps]]` command (its first line,
@@ -51,14 +53,19 @@ Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
   target: `✔` exited 0, `✘` exited non-zero or was killed, `⊘` did not run (after a failed step or a cancel, or a file
   or service step skipped because the target does not match). When a transport error ended the target, the step it ended
   is `✘` (with no step run yet, the first: the connect or probe failed), unless a timed-out step kept its output, which
-  is the `✘` row then; the rest are `⊘`. Before the target has a report (queued or running) every row is `·`; the
-  running target has no tab until it ends, and its spinner is in the header and on the last line of Results. On doctor
+  is the `✘` row then; the rest are `⊘`. Before the target has a report (waiting or running) every row is `·`; on a
+  target the run ended without (`✘ not run`, below) every row is `⊘`. On doctor
   and edit results the list is the config's as of the last reload, without marks; so is a plan result's. A run result
   (`x`) lists one step, its script (the first line, with `…` when it has more), marked as on apply. A plugin step is
   listed as `plugin NAME`. A config that does not load shows its error in red instead.
 - **Results.** One tab per section of the shown result, not one per past run. A doctor result has a `local checks` tab
   when local checks exist, then one tab per target, in order; apply, plan and run have one tab per target, in order; an
-  edit has one tab, labeled by what it edited (`inventory`, `config`, `secret NAME`, `migrate → age`). `←` and `→`
+  edit has one tab, labeled by what it edited (`inventory`, `config`, `secret NAME`, `migrate → age`). On apply, plan
+  and run every target has its tab from the start, for every `--parallel`, `1` included, and keeps its place when it
+  ends, so the tabs, the scroll and the cursor never shift. A target not started yet is a dim `· name` tab and a dim
+  `▶ name` section; a running one has the spinner in its tab and `⠙ running` under `▶ name`, and the running targets
+  are also named on the last line of Results. A target still without a report when the run ends (the run failed or
+  panicked) becomes `✘ name`, its section `▶ name` and `✘ not run`, and counts as failed. `←` and `→`
   switch tabs from any pane, except under an overlay, and stop at the ends. The apply and run sections read like the CLI's
   blocks (`▶ name`, `$ command`, its output, `✔ ok · N steps`, `✘ reason` or `⊘ cancelled`); the plan section like
   `anvil plan`'s (`▶ name`, `would $ command`, `✔ N steps`, `✘ reason` or `⊘ cancelled`); the doctor section reads
@@ -130,15 +137,20 @@ greyed in the help and only shows that notice again, until anvil is restarted.
 
 ## Rules
 
+- **`--parallel N`** sets how many targets apply, plan and run (`x`) take at once, as in the CLI
+  ([Running in parallel](cli.md#running-in-parallel)); no key changes it. doctor runs one target at a time and says
+  nothing about the flag.
 - **One run at a time.** While doctor, apply, plan, run or an update runs, `d`, `a`, `p`, `x`, `u`, `i`, `c`, `s`, `m`
   and `o` are refused with `busy: <run> is running (Esc cancels)` on the status bar; for doctor and an update, which
   Esc cannot cancel, it is `busy: <run> is running`. A run keeps the selection and paths it started with.
 - **Esc cancels between steps.** apply checks before each target and each step: the running step finishes, and the rest
   of that target and every later target end as `⊘ cancelled`. A run (`x`) cancels the same way: its script is its one
   step, so the running script finishes first and every later target ends as `⊘ cancelled`. plan checks before each
-  target: the running probe finishes and every later target ends as `⊘ cancelled`. Esc never kills a running step, local
-  or remote; only the step's timeout ends it (300 s for `x`). doctor cannot be cancelled; its probes are bounded by the
-  [ssh timeouts](cli.md#ssh-behaviour).
+  target: the running probe finishes and every later target ends as `⊘ cancelled`. With `--parallel`, every running
+  target finishes its step or probe that way and no other target starts. The notice is
+  `cancelling: the running step finishes first` for apply and run, `cancelling: running targets finish first` for plan.
+  Esc never kills a running step, local or remote; only the step's timeout ends it (300 s for `x`). doctor cannot be
+  cancelled; its probes are bounded by the [ssh timeouts](cli.md#ssh-behaviour).
 - **Handoff.** The editor (`i`, `c`, `s`, `x`), the migration (`m`, so its age passphrase prompt works), ssh's interactive
   retry (a password, passphrase or PIN, see [SSH behaviour](cli.md#ssh-behaviour)) and the
   [age passphrase prompt](secrets.md#the-passphrase-prompt) get the real terminal: the TUI leaves its screen, the
@@ -162,6 +174,6 @@ greyed in the help and only shows that notice again, until anvil is restarted.
 
 ## Build
 
-The TUI is the cargo feature `tui` (ratatui, crossterm and signal-hook), on by default. `cargo build
+The TUI is the cargo feature `tui` (ratatui and crossterm), on by default. `cargo build
 --no-default-features` (or `cargo install --path . --no-default-features`) builds the CLI without it and without those
-crates; that binary has no `tui` command.
+crates (signal-hook stays: the CLI's Ctrl-C handling uses it); that binary has no `tui` command.

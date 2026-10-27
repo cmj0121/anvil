@@ -1,5 +1,5 @@
 //! `anvil plan`: the steps `anvil apply` would run on every selected target,
-//! one target at a time, running none of them.
+//! up to `--parallel` at a time, running none of them.
 //!
 //! Every target is probed, with or without `[packages]` work, so a target
 //! that cannot be reached fails here as it would under apply; then
@@ -11,14 +11,17 @@
 //! shown. A `[[services]]` step shows as `service NAME`, never its script.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::num::NonZeroU8;
+use std::sync::atomic::AtomicBool;
 
 use serde::Serialize;
 
 use crate::apply::{self, Escape, Line, PlannedRun, Style, Unresolved, print_lines};
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
+use crate::fanout::{self, Event};
 use crate::files::{self, Sources};
+use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, YELLOW, paint};
 use crate::options::Options;
@@ -69,23 +72,15 @@ pub struct Plan {
     pub ok: bool,
 }
 
-/// What [`plan_targets`] reports as it goes: a target about to be planned,
-/// and its report once it ends.
-#[cfg_attr(
-    not(any(test, feature = "tui")),
-    expect(dead_code, reason = "read by the TUI")
-)]
-pub enum Progress<'a> {
-    Start(&'a Target),
-    Done(&'a PlanReport),
-}
+/// What [`plan_targets`] reports as it goes: the targets, a target about to
+/// be planned, and its report once it ends.
+pub type Progress<'a> = Event<'a, PlanReport>;
 
 /// Loads the targets and plans `config` for each, as [`plan_targets`]. A
 /// `[[files]]` src that cannot be read fails the command before any target.
 pub fn run_targets(
     opts: &Options,
     config: &Config,
-    cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Plan, Failure> {
     let targets = opts.targets()?;
@@ -93,42 +88,55 @@ pub fn run_targets(
     let sources = files::load(config).map_err(Failure::usage)?;
     Ok(plan_targets(
         &targets,
+        opts.parallel,
         |target| opts.transport(target),
         config,
         &sources,
         &pins,
-        cancel,
+        &opts.cancel,
         on,
     ))
 }
 
-/// Plans `config` for each of `targets` in order. Once `cancel` is set,
-/// every later target is Cancelled.
+/// Plans `config` for each of `targets`, `parallel` at a time. Once
+/// `cancel` is set, every target not started is Cancelled; one whose plan
+/// panics has failed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one input of plan_target, passed through"
+)]
 pub fn plan_targets(
     targets: &[Target],
-    transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError>,
+    parallel: NonZeroU8,
+    transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError> + Sync,
     config: &Config,
     sources: &Sources,
     plugins: &dyn Plugins,
     cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Plan {
-    let mut reports = Vec::with_capacity(targets.len());
-    for target in targets {
-        on(Progress::Start(target));
-        let report = if cancel.load(Ordering::Relaxed) {
-            cancelled(target)
-        } else {
-            plan_target(target, transport(target), config, sources, plugins, cancel)
-        };
-        on(Progress::Done(&report));
-        reports.push(report);
-    }
+    let reports = fanout::fan_out(
+        targets,
+        parallel,
+        cancel,
+        on,
+        |target| plan_target(target, transport(target), config, sources, plugins, cancel),
+        cancelled,
+        |target, message| failed(target, format!("internal error: {message}")),
+    );
     let ok = reports.iter().all(PlanReport::ok);
     Plan {
         executed: false,
         targets: reports,
         ok,
+    }
+}
+
+fn failed(target: &Target, error: String) -> PlanReport {
+    PlanReport::Failed {
+        target: target.name.clone(),
+        error,
+        ok: false,
     }
 }
 
@@ -152,9 +160,8 @@ fn plan_target(
 ) -> PlanReport {
     log::info!("plan {}: start", target.name);
     let runs = transport
-        .map_err(|err| err.to_string())
+        .map_err(|err| Unresolved::Failed(err.to_string()))
         .and_then(|transport| apply::probe(transport.as_ref(), config))
-        .map_err(Unresolved::Failed)
         .and_then(|facts| apply::resolve(target, Some(&facts), config, sources, plugins, cancel));
     match runs {
         Ok(steps) => {
@@ -168,27 +175,21 @@ fn plan_target(
         Err(Unresolved::Cancelled) => cancelled(target),
         Err(Unresolved::Failed(error)) => {
             log::info!("plan {}: failed: {error}", target.name);
-            PlanReport::Failed {
-                target: target.name.clone(),
-                error,
-                ok: false,
-            }
+            failed(target, error)
         }
     }
 }
 
-/// `anvil plan`: prints each target's block as it ends (or one JSON
-/// document), then the summary.
+/// `anvil plan`: prints each target's block once it and every earlier
+/// target have ended (or one JSON document), then the summary.
 pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
     let style = Style::detect();
     let config = opts.load_config()?;
-    // Only the TUI cancels a plan.
-    let cancel = AtomicBool::new(false);
-    let plan = run_targets(opts, &config, &cancel, &mut |progress| {
-        if let Progress::Done(report) = progress
-            && !cli.json
-        {
-            print_lines(&render(report), style);
+    let _interrupt = Interrupt::install(&opts.cancel)?;
+    let mut print = fanout::in_order(|report| print_lines(&render(report), style));
+    let plan = run_targets(opts, &config, &mut |progress| {
+        if !cli.json {
+            print(progress);
         }
     })?;
     let failed = plan.targets.iter().filter(|t| !t.ok()).count();
@@ -268,15 +269,14 @@ fn render_summary(targets: usize, failed: usize, style: Style) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::config::Step;
     use crate::facts;
     use crate::inventory::TargetKind;
     use crate::packages::{Manager, Packages};
-    use crate::test_util::{FakePlugins, json, keys};
+    use crate::test_util::{FakePlugins, Meet, json, keys};
     use crate::transport::{Output, RUN_TIMEOUT};
 
     const ARCH_SUDO: &str = "distro=arch\nuser=cmj\nsudo=binary\npkg=pacman\nanvil-probe-end=1\n";
@@ -285,7 +285,7 @@ mod tests {
     /// Records every script; the probe prints `probe`, anything else would
     /// be a step that ran.
     struct Recorder {
-        log: Rc<RefCell<Vec<String>>>,
+        log: Arc<Mutex<Vec<String>>>,
         probe: &'static str,
     }
 
@@ -299,7 +299,7 @@ mod tests {
             script: &str,
             _timeout: std::time::Duration,
         ) -> Result<Output, TransportError> {
-            self.log.borrow_mut().push(script.to_owned());
+            self.log.lock().unwrap().push(script.to_owned());
             Ok(Output {
                 stdout: self.probe.as_bytes().to_vec(),
                 code: Some(0),
@@ -313,7 +313,7 @@ mod tests {
             _password: &[u8],
             _timeout: std::time::Duration,
         ) -> Result<Output, TransportError> {
-            self.log.borrow_mut().push(script.to_owned());
+            self.log.lock().unwrap().push(script.to_owned());
             Ok(Output::default())
         }
     }
@@ -340,8 +340,8 @@ mod tests {
     fn a_bad_pin_is_exit_two_before_any_target() {
         let (dir, opts, config) = crate::test_util::bad_pin("plan");
         let mut started = 0;
-        let failure = run_targets(&opts, &config, &AtomicBool::new(false), &mut |progress| {
-            if let Progress::Start(_) = progress {
+        let failure = run_targets(&opts, &config, &mut |progress| {
+            if let Progress::Start(..) = progress {
                 started += 1;
             }
         })
@@ -404,17 +404,18 @@ mod tests {
         plugins: &dyn Plugins,
         cancelled: bool,
     ) -> (Plan, Vec<String>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let targets: Vec<Target> = names.iter().map(|name| target(name)).collect();
         let mut events = Vec::new();
         let plan = plan_targets(
             &targets,
+            NonZeroU8::MIN,
             |target| {
                 if Some(target.name.as_str()) == unreachable {
                     return Err(TransportError::HostKey);
                 }
                 Ok(Box::new(Recorder {
-                    log: Rc::clone(&log),
+                    log: Arc::clone(&log),
                     probe,
                 }))
             },
@@ -422,11 +423,11 @@ mod tests {
             &Sources::of(&vec![FILE_TEXT; config.files.len()]),
             plugins,
             &AtomicBool::new(cancelled),
-            &mut |progress| {
-                events.push(match progress {
-                    Progress::Start(target) => format!("start {}", target.name),
-                    Progress::Done(report) => format!("done {}", report.target()),
-                })
+            &mut |progress| match progress {
+                Progress::Begin(targets) => assert_eq!(targets.len(), names.len()),
+                Progress::Start(target) => events.push(format!("start {}", target.name)),
+                Progress::Done(_, report) => events.push(format!("done {}", report.target())),
+                Progress::Ordered(_) => {}
             },
         );
         let order: Vec<String> = names
@@ -434,7 +435,7 @@ mod tests {
             .flat_map(|name| [format!("start {name}"), format!("done {name}")])
             .collect();
         assert_eq!(events, order, "start then done per target, in order");
-        let runs = log.borrow().clone();
+        let runs = log.lock().unwrap().clone();
         (plan, runs)
     }
 
@@ -668,7 +669,7 @@ mod tests {
         });
         let (plan, runs) = plan_with(&["a", "b"], None, ARCH_SUDO, &config, &plugins, false);
         assert_eq!(runs, [facts::PROBE, facts::PROBE], "no step ran");
-        assert_eq!(plugins.seen.borrow().len(), 2);
+        assert_eq!(plugins.seen.lock().unwrap().len(), 2);
         assert_eq!(
             screen(&plan.targets[0]),
             "▶ a\n  would $ one\n  would $ hostname … (from plugin harden)\n  ✔ 2 steps\n\n"
@@ -715,6 +716,7 @@ mod tests {
         }
         let plan = plan_targets(
             &[target("a")],
+            NonZeroU8::MIN,
             |_| Ok(Box::new(Failing)),
             &config(None, &["one"]),
             &Sources::default(),
@@ -756,6 +758,167 @@ mod tests {
         assert_eq!(keys(&value["targets"][0]), ["ok", "steps", "target"]);
         assert_eq!(keys(&value["targets"][1]), ["error", "ok", "target"]);
         assert_eq!(keys(&value["targets"][0]["steps"][0]), ["run"]);
+    }
+
+    /// Probes as [`MAC`] after calling `hook` with its target's name.
+    struct Hooked {
+        name: String,
+        hook: Arc<dyn Fn(&str) + Send + Sync>,
+    }
+
+    impl Transport for Hooked {
+        fn name(&self) -> &str {
+            "hooked"
+        }
+
+        fn run(
+            &self,
+            _script: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Output, TransportError> {
+            (self.hook)(&self.name);
+            Ok(Output {
+                stdout: MAC.as_bytes().to_vec(),
+                code: Some(0),
+                ..Output::default()
+            })
+        }
+
+        fn run_tty(
+            &self,
+            _script: &str,
+            _password: &[u8],
+            _timeout: std::time::Duration,
+        ) -> Result<Output, TransportError> {
+            unreachable!("plan types no password")
+        }
+    }
+
+    /// Plans one step for each of `names`, `parallel` at a time, each probe
+    /// calling `hook`; returns the plan and how many transports were built.
+    fn plan_hooked(
+        names: &[&str],
+        parallel: u8,
+        cancel: &AtomicBool,
+        hook: impl Fn(&str) + Send + Sync + 'static,
+        on: &mut dyn FnMut(Progress<'_>),
+    ) -> (Plan, usize) {
+        let hook: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(hook);
+        let built = Mutex::new(0);
+        let targets: Vec<Target> = names.iter().map(|name| target(name)).collect();
+        let plan = plan_targets(
+            &targets,
+            NonZeroU8::new(parallel).unwrap(),
+            |target| {
+                *built.lock().unwrap() += 1;
+                Ok(Box::new(Hooked {
+                    name: target.name.clone(),
+                    hook: Arc::clone(&hook),
+                }))
+            },
+            &config(None, &["one"]),
+            &Sources::default(),
+            &FakePlugins::none(),
+            cancel,
+            on,
+        );
+        (plan, built.into_inner().unwrap())
+    }
+
+    #[test]
+    fn two_targets_are_probed_at_once_and_shown_in_inventory_order() {
+        let meet = Arc::new(Meet::new(2));
+        let held = Arc::new(Meet::new(2));
+        let (probes, ended) = (Arc::clone(&meet), Arc::clone(&held));
+        let blocks = Mutex::new(Vec::new());
+        let mut ends = Vec::new();
+        let mut print = fanout::in_order(|report: &PlanReport| {
+            blocks.lock().unwrap().push(screen(report));
+        });
+        let (plan, _) = plan_hooked(
+            &["local", "b"],
+            2,
+            &AtomicBool::new(false),
+            // Both probe at once; local's ends only once b's report is in.
+            move |name| {
+                assert!(probes.arrive(), "the two probes ran at once");
+                if name == "local" {
+                    assert!(ended.arrive(), "b never ended");
+                }
+            },
+            &mut |progress| {
+                if let Progress::Done(index, _) = progress {
+                    ends.push(index);
+                    if index == 1 {
+                        assert!(held.arrive());
+                    }
+                }
+                print(progress);
+            },
+        );
+        assert_eq!(ends, [1, 0], "b ended first");
+        assert_eq!(
+            *blocks.lock().unwrap(),
+            [
+                "▶ local\n  would $ one\n  ✔ 1 step\n\n",
+                "▶ b\n  would $ one\n  ✔ 1 step\n\n"
+            ]
+        );
+        let value = json(&plan);
+        assert_eq!(value["targets"][0]["target"], "local");
+        assert_eq!(value["targets"][1]["target"], "b");
+        assert_eq!(value["ok"], true);
+    }
+
+    #[test]
+    fn cancel_with_two_at_once_plans_no_later_target() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let (started, cancelled) = (Meet::new(2), Meet::new(2));
+        let (plan, built) = plan_hooked(
+            &["a", "b", "c"],
+            2,
+            &cancel,
+            move |name| {
+                assert!(started.arrive());
+                // b is mid-probe while a cancels.
+                if name == "a" {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                assert!(cancelled.arrive());
+            },
+            &mut |_| {},
+        );
+        assert!(plan.targets[0].ok() && plan.targets[1].ok(), "{plan:?}");
+        assert_eq!(
+            plan.targets[2],
+            PlanReport::Cancelled {
+                target: "c".to_owned(),
+                ok: false
+            }
+        );
+        assert_eq!(built, 2, "no transport after cancel");
+    }
+
+    #[test]
+    fn a_panicking_target_fails_alone() {
+        let (plan, _) = plan_hooked(
+            &["a", "b", "c"],
+            2,
+            &AtomicBool::new(false),
+            |name| assert_ne!(name, "b", "b blew up"),
+            &mut |_| {},
+        );
+        assert!(plan.targets[0].ok() && plan.targets[2].ok(), "{plan:?}");
+        match &plan.targets[1] {
+            PlanReport::Failed { target, error, ok } => {
+                assert_eq!((target.as_str(), *ok), ("b", false));
+                assert!(error.starts_with("internal error: "), "{error}");
+                assert!(error.contains("b blew up"), "{error}");
+            }
+            other => panic!("expected b to fail: {other:?}"),
+        }
+        assert!(!plan.ok);
     }
 
     #[test]

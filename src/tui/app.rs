@@ -112,7 +112,9 @@ pub enum Pane {
 
 pub struct Running {
     pub kind: RunKind,
-    pub current: Option<String>,
+    /// The targets running now, in the order they started; an update's
+    /// one line instead.
+    pub running: Vec<String>,
     pub cancel: Arc<AtomicBool>,
     pub tick: u8,
 }
@@ -184,6 +186,54 @@ impl EditKind {
     }
 }
 
+/// One target's place in an apply or plan result, in inventory order:
+/// its name until its report comes, so no row moves when one ends. A slot
+/// still pending when the run finishes becomes [`Slot::NotRun`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Slot<R> {
+    Pending(String),
+    Done(R),
+    NotRun(String),
+}
+
+impl<R> Slot<R> {
+    pub fn report(&self) -> Option<&R> {
+        match self {
+            Slot::Pending(_) | Slot::NotRun(_) => None,
+            Slot::Done(report) => Some(report),
+        }
+    }
+}
+
+/// How many of `slots` ended ok and how many did not; a pending one is
+/// neither, one that never ran did not.
+fn slot_counts<R>(slots: &[Slot<R>], ok: impl Fn(&R) -> bool) -> (usize, usize) {
+    let ok = slots
+        .iter()
+        .filter_map(Slot::report)
+        .filter(|report| ok(report))
+        .count();
+    let ended = slots
+        .iter()
+        .filter(|slot| !matches!(slot, Slot::Pending(_)))
+        .count();
+    (ok, ended - ok)
+}
+
+/// Marks every slot still pending as never run.
+fn not_run<R>(slots: &mut [Slot<R>]) {
+    for slot in slots {
+        if let Slot::Pending(name) = slot {
+            *slot = Slot::NotRun(std::mem::take(name));
+        }
+    }
+}
+
+/// Whether every one of `slots` ended, ok.
+fn all_ok<R>(slots: &[Slot<R>], ok: impl Fn(&R) -> bool) -> bool {
+    slots.iter().all(|slot| slot.report().is_some_and(&ok))
+}
+
 pub enum RunResult {
     Doctor {
         local: Option<doctor::LocalReport>,
@@ -199,13 +249,13 @@ pub enum RunResult {
         /// for `x` on a script.
         kind: RunKind,
         steps: Vec<StepRow>,
-        targets: Vec<apply::TargetReport>,
+        targets: Vec<Slot<apply::TargetReport>>,
         ok: Option<bool>,
         error: Option<String>,
     },
     /// `ok` is `None` while running.
     Plan {
-        targets: Vec<plan::PlanReport>,
+        targets: Vec<Slot<plan::PlanReport>>,
         ok: Option<bool>,
         error: Option<String>,
     },
@@ -219,19 +269,15 @@ pub enum RunResult {
 impl RunResult {
     /// How many targets succeeded and failed; `None` for an edit.
     pub fn counts(&self) -> Option<(usize, usize)> {
-        let (ok, all) = match self {
+        match self {
             RunResult::Doctor { targets, .. } => {
-                (targets.iter().filter(|t| t.ok()).count(), targets.len())
+                let ok = targets.iter().filter(|t| t.ok()).count();
+                Some((ok, targets.len() - ok))
             }
-            RunResult::Apply { targets, .. } => {
-                (targets.iter().filter(|t| t.ok()).count(), targets.len())
-            }
-            RunResult::Plan { targets, .. } => {
-                (targets.iter().filter(|t| t.ok()).count(), targets.len())
-            }
-            RunResult::Edit { .. } => return None,
-        };
-        Some((ok, all - ok))
+            RunResult::Apply { targets, .. } => Some(slot_counts(targets, apply::TargetReport::ok)),
+            RunResult::Plan { targets, .. } => Some(slot_counts(targets, plan::PlanReport::ok)),
+            RunResult::Edit { .. } => None,
+        }
     }
 
     /// Doctor: checks when `local` is present, then one tab per target.
@@ -290,10 +336,14 @@ pub enum Msg {
     /// The steps of the config an apply run loaded, or a run's one script,
     /// before its first target.
     Steps(Vec<StepRow>),
+    /// The targets of an apply, plan or run, in inventory order, before any
+    /// starts: one pending slot each.
+    Begin(Vec<String>),
     Start(String),
     DoctorDone(doctor::Report),
-    TargetDone(apply::TargetReport),
-    PlanDone(plan::PlanReport),
+    /// Target `index`'s report, in the order the targets end.
+    TargetDone(usize, apply::TargetReport),
+    PlanDone(usize, plan::PlanReport),
     DoctorTarget(doctor::TargetReport),
     Finished(Result<(), String>),
     Panicked(String),
@@ -742,27 +792,40 @@ impl App {
                     *steps = rows;
                 }
             }
+            Msg::Begin(names) => match self.results.last_mut() {
+                Some(RunResult::Apply { targets, .. }) => {
+                    *targets = names.into_iter().map(Slot::Pending).collect();
+                }
+                Some(RunResult::Plan { targets, .. }) => {
+                    *targets = names.into_iter().map(Slot::Pending).collect();
+                }
+                _ => {}
+            },
             Msg::Start(name) => {
                 if let Some(running) = &mut self.running {
-                    running.current = Some(name);
+                    running.running.push(name);
                 }
             }
             Msg::DoctorTarget(report) => {
-                self.target_ended();
+                self.target_ended(&report.target);
                 if let Some(RunResult::Doctor { targets, .. }) = self.results.last_mut() {
                     targets.push(report);
                 }
             }
-            Msg::TargetDone(report) => {
-                self.target_ended();
-                if let Some(RunResult::Apply { targets, .. }) = self.results.last_mut() {
-                    targets.push(report);
+            Msg::TargetDone(index, report) => {
+                self.target_ended(report.target());
+                if let Some(RunResult::Apply { targets, .. }) = self.results.last_mut()
+                    && let Some(slot) = targets.get_mut(index)
+                {
+                    *slot = Slot::Done(report);
                 }
             }
-            Msg::PlanDone(report) => {
-                self.target_ended();
-                if let Some(RunResult::Plan { targets, .. }) = self.results.last_mut() {
-                    targets.push(report);
+            Msg::PlanDone(index, report) => {
+                self.target_ended(report.target());
+                if let Some(RunResult::Plan { targets, .. }) = self.results.last_mut()
+                    && let Some(slot) = targets.get_mut(index)
+                {
+                    *slot = Slot::Done(report);
                 }
             }
             Msg::DoctorDone(report) => self.doctor_done(report),
@@ -848,14 +911,14 @@ impl App {
             return vec![Effect::Redraw];
         }
         let kind = job.kind();
-        let current = match &job {
-            Job::UpdateCheck => Some("checking for an update".to_owned()),
-            Job::Update(version) => Some(format!("updating anvil to {version}")),
-            _ => None,
+        let running = match &job {
+            Job::UpdateCheck => vec!["checking for an update".to_owned()],
+            Job::Update(version) => vec![format!("updating anvil to {version}")],
+            _ => Vec::new(),
         };
         self.running = Some(Running {
             kind,
-            current,
+            running,
             cancel: Arc::new(AtomicBool::new(false)),
             tick: 0,
         });
@@ -909,15 +972,18 @@ impl App {
             RunKind::Apply | RunKind::Run => {
                 "cancelling: the running step finishes first".to_owned()
             }
-            RunKind::Plan => "cancelling: the running target finishes first".to_owned(),
+            RunKind::Plan => "cancelling: running targets finish first".to_owned(),
             RunKind::Doctor => "doctor cannot be cancelled; it ends with its probes".to_owned(),
             RunKind::Update => "update cannot be cancelled; it ends on its own".to_owned(),
         });
     }
 
-    fn target_ended(&mut self) {
-        if let Some(running) = &mut self.running {
-            running.current = None;
+    /// Takes `name` off the running targets.
+    fn target_ended(&mut self, name: &str) {
+        if let Some(running) = &mut self.running
+            && let Some(at) = running.running.iter().position(|n| n == name)
+        {
+            running.running.remove(at);
         }
     }
 
@@ -986,7 +1052,8 @@ impl App {
                 error: slot,
                 ..
             }) => {
-                *ok = Some(error.is_none() && targets.iter().all(apply::TargetReport::ok));
+                not_run(targets);
+                *ok = Some(error.is_none() && all_ok(targets, apply::TargetReport::ok));
                 *slot = error;
             }
             Some(RunResult::Plan {
@@ -994,7 +1061,8 @@ impl App {
                 ok,
                 error: slot,
             }) => {
-                *ok = Some(error.is_none() && targets.iter().all(plan::PlanReport::ok));
+                not_run(targets);
+                *ok = Some(error.is_none() && all_ok(targets, plan::PlanReport::ok));
                 *slot = error;
             }
             Some(RunResult::Edit { .. }) | None => {}
@@ -1070,9 +1138,12 @@ impl App {
             return;
         }
         let scroll = match self.shown_result() {
-            Some(RunResult::Apply { targets, .. }) => targets.get(self.shown_tab()).map(|report| {
-                ui::step_scroll(report, self.step_cursor(), self.results_width.get())
-            }),
+            Some(RunResult::Apply { targets, .. }) => targets
+                .get(self.shown_tab())
+                .and_then(Slot::report)
+                .map(|report| {
+                    ui::step_scroll(report, self.step_cursor(), self.results_width.get())
+                }),
             _ => None,
         };
         if let Some(scroll) = scroll {
@@ -1233,6 +1304,8 @@ pub mod tests {
             config: None,
             ssh_config: None,
             target: Vec::new(),
+            parallel: std::num::NonZeroU8::MIN,
+            cancel: std::sync::Arc::default(),
             can_prompt: false,
             #[cfg(debug_assertions)]
             secret_store: None,
@@ -1332,6 +1405,16 @@ pub mod tests {
             editor: Ok("/usr/bin/vi".into()),
             secrets: [("API".to_owned(), doctor::SecretStatus::Missing)].into(),
         }
+    }
+
+    /// Sends `Begin` with `names`: one pending slot each.
+    fn begin(app: &mut App, names: &[&str]) {
+        app.on_msg(Msg::Begin(names.iter().map(|n| (*n).to_owned()).collect()));
+    }
+
+    /// The names the running spinner shows.
+    fn running(app: &App) -> Vec<String> {
+        app.running.as_ref().unwrap().running.clone()
     }
 
     fn cancel_flag(app: &App) -> bool {
@@ -1652,8 +1735,8 @@ pub mod tests {
         );
         let running = app.running.as_ref().unwrap();
         assert_eq!(
-            (running.kind, running.current.as_deref()),
-            (RunKind::Apply, None)
+            (running.kind, running.running.is_empty()),
+            (RunKind::Apply, true)
         );
         assert!(matches!(
             app.shown_result(),
@@ -1666,21 +1749,19 @@ pub mod tests {
     fn apply_messages_fill_the_result_then_finish_it() {
         let mut app = app();
         press(&mut app, &[KeyCode::Char('a')]);
+        begin(&mut app, &["local", "pi"]);
         app.on_msg(Msg::Start("local".to_owned()));
-        assert_eq!(
-            app.running.as_ref().unwrap().current.as_deref(),
-            Some("local")
-        );
-        app.on_msg(Msg::TargetDone(ran(
-            "local",
-            vec![step("true", Some(0), "", "")],
-        )));
-        assert_eq!(app.running.as_ref().unwrap().current, None);
+        assert_eq!(running(&app), ["local"]);
+        app.on_msg(Msg::TargetDone(
+            0,
+            ran("local", vec![step("true", Some(0), "", "")]),
+        ));
+        assert!(running(&app).is_empty());
         app.on_msg(Msg::Start("pi".to_owned()));
-        app.on_msg(Msg::TargetDone(ran(
-            "pi",
-            vec![step("false", Some(1), "", "")],
-        )));
+        app.on_msg(Msg::TargetDone(
+            1,
+            ran("pi", vec![step("false", Some(1), "", "")]),
+        ));
         assert_eq!(app.shown_result().unwrap().counts(), Some((1, 1)));
         assert_eq!(app.on_msg(Msg::Finished(Ok(()))), [Effect::Redraw]);
         assert!(app.running.is_none());
@@ -1688,6 +1769,33 @@ pub mod tests {
             app.shown_result(),
             Some(RunResult::Apply { ok: Some(false), error: None, targets, .. }) if targets.len() == 2
         ));
+    }
+
+    #[test]
+    fn slots_still_pending_when_the_run_finishes_did_not_run() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('a')]);
+        begin(&mut app, &["local", "mac", "pi"]);
+        app.on_msg(Msg::Start("local".to_owned()));
+        app.on_msg(Msg::TargetDone(
+            0,
+            ran("local", vec![step("true", Some(0), "", "")]),
+        ));
+        assert_eq!(app.shown_result().unwrap().counts(), Some((1, 0)));
+        app.on_msg(Msg::Finished(Err("boom".to_owned())));
+        let result = app.shown_result().unwrap();
+        assert_eq!(result.counts(), Some((1, 2)), "both count as failed");
+        let RunResult::Apply { targets, ok, .. } = result else {
+            panic!("an apply result");
+        };
+        assert_eq!(
+            targets[1..],
+            [
+                Slot::NotRun("mac".to_owned()),
+                Slot::NotRun("pi".to_owned())
+            ]
+        );
+        assert_eq!(*ok, Some(false));
     }
 
     #[test]
@@ -1709,17 +1817,28 @@ pub mod tests {
         assert_eq!(app.results.len(), 1);
         press(&mut app, &[KeyCode::Esc]);
         assert!(app.running.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("cancelling: running targets finish first")
+        );
+        begin(&mut app, &["local", "pi"]);
         app.on_msg(Msg::Start("local".to_owned()));
-        app.on_msg(Msg::PlanDone(plan::PlanReport::Planned {
-            target: "local".to_owned(),
-            steps: Vec::new(),
-            ok: true,
-        }));
-        assert_eq!(app.running.as_ref().unwrap().current, None);
-        app.on_msg(Msg::PlanDone(plan::PlanReport::Cancelled {
-            target: "pi".to_owned(),
-            ok: false,
-        }));
+        app.on_msg(Msg::PlanDone(
+            0,
+            plan::PlanReport::Planned {
+                target: "local".to_owned(),
+                steps: Vec::new(),
+                ok: true,
+            },
+        ));
+        assert!(running(&app).is_empty());
+        app.on_msg(Msg::PlanDone(
+            1,
+            plan::PlanReport::Cancelled {
+                target: "pi".to_owned(),
+                ok: false,
+            },
+        ));
         app.on_msg(Msg::Finished(Ok(())));
         assert!(app.running.is_none());
         let result = app.shown_result().unwrap();
@@ -1750,7 +1869,9 @@ pub mod tests {
         let mut app = app();
         press(&mut app, &[KeyCode::Char('d')]);
         app.on_msg(Msg::Start("pi".to_owned()));
+        assert_eq!(running(&app), ["pi"]);
         app.on_msg(Msg::DoctorTarget(probed("pi", None)));
+        assert!(running(&app).is_empty(), "the doctor target ended");
         assert!(matches!(
             app.shown_result(),
             Some(RunResult::Doctor { local: None, targets, ok: None, .. }) if targets.len() == 1
@@ -1783,7 +1904,8 @@ pub mod tests {
         app.on_key(key(KeyCode::Esc));
         assert!(cancel_flag(&app));
         assert!(app.notice.as_deref().unwrap().starts_with("cancelling"));
-        app.on_msg(Msg::TargetDone(cancelled("local")));
+        begin(&mut app, &["local"]);
+        app.on_msg(Msg::TargetDone(0, cancelled("local")));
         app.on_msg(Msg::Finished(Ok(())));
         assert_eq!(app.shown_result().unwrap().counts(), Some((0, 1)));
         assert_eq!(app.notice, None, "the key hints come back");
@@ -2014,7 +2136,8 @@ pub mod tests {
             Some("cancelling: the running step finishes first")
         );
         app.on_msg(Msg::Steps(vec![row("sleep 1")]));
-        app.on_msg(Msg::TargetDone(cancelled("local")));
+        begin(&mut app, &["local"]);
+        app.on_msg(Msg::TargetDone(0, cancelled("local")));
         app.on_msg(Msg::Finished(Ok(())));
         assert_eq!(app.shown_steps(), [row("sleep 1")]);
         assert!(matches!(
@@ -2609,8 +2732,9 @@ pub mod tests {
         press(&mut app, &[KeyCode::Char('a')]);
         app.on_msg(Msg::Finished(Ok(())));
         press(&mut app, &[KeyCode::Char('a')]);
-        app.on_msg(Msg::TargetDone(ran("local", Vec::new())));
-        app.on_msg(Msg::TargetDone(ran("pi", Vec::new())));
+        begin(&mut app, &["local", "pi"]);
+        app.on_msg(Msg::TargetDone(0, ran("local", Vec::new())));
+        app.on_msg(Msg::TargetDone(1, ran("pi", Vec::new())));
         app.on_msg(Msg::Finished(Ok(())));
         press(&mut app, &[KeyCode::Right]);
         assert_eq!((app.shown, app.tab), (Some(1), 1));
@@ -2630,15 +2754,71 @@ pub mod tests {
     }
 
     #[test]
-    fn appending_a_target_does_not_change_the_tab() {
+    fn a_slot_filling_moves_no_tab_scroll_or_cursor() {
+        for job in ['a', 'p'] {
+            let mut app = app();
+            app.steps = vec![row("one"), row("two")];
+            press(&mut app, &[KeyCode::Char(job)]);
+            begin(&mut app, &["local", "pi", "mac"]);
+            assert_eq!(app.shown_result().unwrap().tab_count(), 3, "one slot each");
+            assert_eq!(app.shown_result().unwrap().counts(), Some((0, 0)));
+            for name in ["local", "pi", "mac"] {
+                app.on_msg(Msg::Start(name.to_owned()));
+            }
+            press(&mut app, &[KeyCode::Right]);
+            app.scroll = 3;
+            app.cursor = 1;
+            // The last target ends first, then the shown one, then the first.
+            for (index, name) in [(2, "mac"), (1, "pi"), (0, "local")] {
+                app.on_msg(if job == 'a' {
+                    Msg::TargetDone(index, ran(name, Vec::new()))
+                } else {
+                    Msg::PlanDone(
+                        index,
+                        plan::PlanReport::Cancelled {
+                            target: name.to_owned(),
+                            ok: false,
+                        },
+                    )
+                });
+                assert_eq!((app.tab, app.scroll, app.cursor), (1, 3, 1), "{job} {name}");
+            }
+            assert!(running(&app).is_empty());
+            let names: Vec<String> = match app.shown_result().unwrap() {
+                RunResult::Apply { targets, .. } => targets
+                    .iter()
+                    .map(|slot| slot.report().unwrap().target().to_owned())
+                    .collect(),
+                RunResult::Plan { targets, .. } => targets
+                    .iter()
+                    .map(|slot| slot.report().unwrap().target().to_owned())
+                    .collect(),
+                _ => unreachable!(),
+            };
+            assert_eq!(names, ["local", "pi", "mac"], "{job}: inventory order");
+        }
+    }
+
+    #[test]
+    fn every_running_target_is_listed_until_it_ends() {
         let mut app = app();
         press(&mut app, &[KeyCode::Char('a')]);
-        app.on_msg(Msg::TargetDone(ran("local", Vec::new())));
-        app.on_msg(Msg::TargetDone(ran("pi", Vec::new())));
-        press(&mut app, &[KeyCode::Right]);
-        assert_eq!(app.tab, 1);
-        app.on_msg(Msg::TargetDone(ran("mac", Vec::new())));
-        assert_eq!(app.tab, 1);
+        begin(&mut app, &["local", "pi", "mac"]);
+        app.on_msg(Msg::Start("local".to_owned()));
+        app.on_msg(Msg::Start("pi".to_owned()));
+        assert_eq!(running(&app), ["local", "pi"]);
+        app.on_msg(Msg::TargetDone(1, ran("pi", Vec::new())));
+        app.on_msg(Msg::Start("mac".to_owned()));
+        assert_eq!(running(&app), ["local", "mac"]);
+        assert_eq!(app.shown_result().unwrap().counts(), Some((1, 0)));
+        app.on_msg(Msg::Finished(Err("boom".to_owned())));
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Apply {
+                ok: Some(false),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2684,7 +2864,8 @@ pub mod tests {
     fn doctor_done_leaves_an_older_result_on_tab_zero() {
         let mut app = app();
         press(&mut app, &[KeyCode::Char('a')]);
-        app.on_msg(Msg::TargetDone(ran("local", Vec::new())));
+        begin(&mut app, &["local"]);
+        app.on_msg(Msg::TargetDone(0, ran("local", Vec::new())));
         app.on_msg(Msg::Finished(Ok(())));
         press(&mut app, &[KeyCode::Char('d')]);
         app.on_msg(Msg::DoctorTarget(probed("pi", None)));

@@ -28,6 +28,7 @@ fn help_lists_the_subcommands_and_common_flags() {
         "--ssh-config",
         "--json",
         "--target",
+        "--parallel",
     ] {
         assert!(stdout.contains(word), "help lacks {word}:\n{stdout}");
     }
@@ -57,6 +58,51 @@ fn usage_error_exits_two() {
         assert_eq!(out.status.code(), Some(2), "args {args:?}");
         assert!(out.stdout.is_empty(), "args {args:?}");
         assert!(!out.stderr.is_empty(), "args {args:?}");
+    }
+}
+
+#[test]
+fn parallel_out_of_range_exits_two() {
+    for value in ["0", "33", "x"] {
+        let out = anvil(&["--parallel", value, "apply"]);
+        assert_eq!(out.status.code(), Some(2), "--parallel {value}");
+        assert!(out.stdout.is_empty(), "--parallel {value}");
+        assert!(
+            text(&out.stderr).contains("--parallel"),
+            "--parallel {value}: {}",
+            text(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn parallel_is_ignored_with_a_warning_by_commands_that_run_no_targets() {
+    const WARN: &str = "WARN anvil::commands: --parallel is ignored by";
+    let sb = Sandbox::new("ac");
+    for (args, command) in [
+        (&["inventory"][..], "inventory"),
+        (&["config"], "config"),
+        (&["secret", "HOST_SUDO"], "secret"),
+        (&["secret", "--migrate", "--to", "age"], "secret"),
+        (&["doctor"], "doctor"),
+        // Port 9 refuses, so update fails after the warning, offline.
+        (&["update", "--release-url", "http://127.0.0.1:9"], "update"),
+        (
+            &["update", "--check", "--release-url", "http://127.0.0.1:9"],
+            "update",
+        ),
+    ] {
+        let mut warned = vec!["-v", "--parallel", "2"];
+        warned.extend(args);
+        let stderr = text(&sb.edit(&warned, None, None).stderr);
+        assert!(
+            stderr.contains(&format!("{WARN} `{command}`\n")),
+            "{args:?}: {stderr}"
+        );
+        let mut one = vec!["-v", "--parallel", "1"];
+        one.extend(args);
+        let stderr = text(&sb.edit(&one, None, None).stderr);
+        assert!(!stderr.contains(WARN), "{args:?}: {stderr}");
     }
 }
 

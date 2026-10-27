@@ -1,5 +1,5 @@
 //! `anvil run FILE|-`: one ad-hoc POSIX sh script on every selected target,
-//! one target at a time, through apply's step runner.
+//! up to `--parallel` at a time, through apply's step runner.
 //!
 //! The config is never loaded, so a broken one cannot block a run; nothing
 //! is probed, the secret store is never opened and no sudo password is
@@ -16,6 +16,7 @@ use std::time::Duration;
 use crate::apply::{self, PlannedRun, Report, TargetReport};
 use crate::cli::{Cli, Failure};
 use crate::document::{MAX_BYTES, read_capped_from};
+use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::escape_controls;
 use crate::options::Options;
@@ -25,14 +26,13 @@ use crate::transport::{Transport, TransportError};
 /// `--timeout` when unset, in seconds.
 pub const DEFAULT_TIMEOUT: u64 = 300;
 
-/// Loads the targets and runs `script` on each in order, killing it after
-/// `timeout`. Before each target, `cancel` is checked; once set, every later
-/// target is Cancelled.
+/// Loads the targets and runs `script` on each, `opts.parallel` at a time,
+/// killing it after `timeout`. Before each target, `opts.cancel` is checked; once
+/// set, every target not started is Cancelled.
 pub fn run_targets(
     opts: &Options,
     script: String,
     timeout: Duration,
-    cancel: &AtomicBool,
     on: &mut dyn FnMut(apply::Progress<'_>),
 ) -> Result<Report, Failure> {
     let targets = opts.targets()?;
@@ -45,9 +45,14 @@ pub fn run_targets(
         file: None,
         service: None,
     }];
-    Ok(apply::for_each_target(&targets, cancel, on, |target| {
-        run_target(target, opts.transport(target), &runs, cancel)
-    }))
+    let cancel = &opts.cancel;
+    Ok(apply::for_each_target(
+        &targets,
+        opts.parallel,
+        cancel,
+        on,
+        |target| run_target(target, opts.transport(target), &runs, cancel),
+    ))
 }
 
 /// `script` as it travels on the transport's stdin; see the module
@@ -87,12 +92,9 @@ pub fn run(cli: &Cli, opts: &Options, source: &Path, timeout: u64) -> Result<(),
         )));
     }
     let script = read_script(source)?;
-    // Only the TUI cancels a run.
-    let cancel = AtomicBool::new(false);
     let timeout = Duration::from_secs(timeout);
-    apply::print_report(cli, "run", |on| {
-        run_targets(opts, script, timeout, &cancel, on)
-    })
+    let _interrupt = Interrupt::install(&opts.cancel)?;
+    apply::print_report(cli, "run", |on| run_targets(opts, script, timeout, on))
 }
 
 /// The script at `source`, or stdin for `-`: refused when unreadable, over

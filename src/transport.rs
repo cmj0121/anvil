@@ -6,16 +6,17 @@
 //! [`Transport::run_tty`] runs a script on a terminal instead and types a sudo
 //! password into it when sudo shows anvil's per-run prompt (see [`run_tty_with`]).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -63,6 +64,8 @@ pub enum TransportError {
     /// Neither anvil's prompt nor the sudo-ok marker came within the prompt wait
     /// after the script was ready: sudo asked some other way (PAM, 2FA).
     NoPrompt,
+    /// The run was cancelled before a new ssh master was opened.
+    Cancelled,
 }
 
 impl fmt::Display for TransportError {
@@ -94,6 +97,7 @@ impl fmt::Display for TransportError {
             }
             Self::PasswordRejected => f.write_str("sudo rejected the password"),
             Self::NoPrompt => f.write_str("sudo did not show anvil's prompt"),
+            Self::Cancelled => f.write_str("cancelled"),
         }
     }
 }
@@ -105,6 +109,11 @@ pub trait Transport {
     /// Runs `script`, killed after `timeout`; a script that ran to completion
     /// is `Ok` whatever its exit code, which the caller judges.
     fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError>;
+    /// [`Transport::run`] for a cleanup that must run even once the run was
+    /// cancelled.
+    fn run_uncancelled(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
+        self.run(script, timeout)
+    }
     /// Runs `script` on a terminal and types `password` once at sudo's prompt,
     /// per [`run_tty_with`] with `timeout` as [`TtyLimits::run`]. The output's
     /// stdout is the cleaned terminal output.
@@ -168,10 +177,189 @@ fn script_program() -> &'static str {
     }
 }
 
-/// Spawns `command` with piped stdio, writes the script to stdin, closes it and
-/// collects the output within `timeout`. On timeout the child is killed and the
-/// error carries the output read so far.
+/// The process groups of the children anvil is running, so a second Ctrl-C
+/// can kill them all. Once [`Groups::kill_all`] has run the registry is
+/// closed: a child tracked after it is killed at once.
+pub struct Groups {
+    inner: Mutex<GroupsState>,
+}
+
+struct GroupsState {
+    /// Each live group with the number of guards tracking it, so a guard
+    /// left over from a reaped child cannot untrack a reused group id.
+    live: BTreeMap<i32, usize>,
+    closed: bool,
+}
+
+impl Groups {
+    pub const fn new() -> Groups {
+        Groups {
+            inner: Mutex::new(GroupsState {
+                live: BTreeMap::new(),
+                closed: false,
+            }),
+        }
+    }
+
+    /// The registry every transport tracks its children in.
+    pub fn global() -> &'static Groups {
+        static GLOBAL: Groups = Groups::new();
+        &GLOBAL
+    }
+
+    /// Tracks the process group `child` leads (it was spawned with
+    /// `process_group(0)`) until the guard drops; on a closed registry the
+    /// group is killed at once.
+    pub fn track(&self, child: &Child) -> Tracked<'_> {
+        self.track_group(Pid::from_child(child))
+    }
+
+    fn track_group(&self, pid: Pid) -> Tracked<'_> {
+        let group = pid.as_raw_nonzero().get();
+        let mut state = self.lock();
+        if state.closed {
+            let _ = kill_process_group(pid, Signal::KILL);
+        }
+        *state.live.entry(group).or_default() += 1;
+        Tracked {
+            groups: self,
+            group,
+            live: true,
+            kill_on_exit: false,
+        }
+    }
+
+    /// Closes the registry and kills every tracked group.
+    pub fn kill_all(&self) {
+        let mut state = self.lock();
+        state.closed = true;
+        for &group in state.live.keys() {
+            if let Some(pid) = Pid::from_raw(group) {
+                let _ = kill_process_group(pid, Signal::KILL);
+            }
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, GroupsState> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl GroupsState {
+    fn untrack(&mut self, group: i32) {
+        if let Some(count) = self.live.get_mut(&group) {
+            *count -= 1;
+            if *count == 0 {
+                self.live.remove(&group);
+            }
+        }
+    }
+}
+
+/// A tracked process group, untracked once [`Tracked::try_wait`] reaps its
+/// leader, or on drop.
+pub struct Tracked<'a> {
+    groups: &'a Groups,
+    group: i32,
+    live: bool,
+    /// Whether the group is killed once its leader exits, before it is
+    /// reaped.
+    kill_on_exit: bool,
+}
+
+impl Tracked<'_> {
+    /// This guard, killing whatever is left in the group once its leader
+    /// exits: the leader is then still unreaped, so the id is still its own.
+    pub fn killing_leftovers(mut self) -> Self {
+        self.kill_on_exit = true;
+        self
+    }
+
+    /// `child.try_wait()` for the leader of this group, untracking the group
+    /// under the registry's lock as it reaps the leader: once reaped its id
+    /// can be reused, and [`Groups::kill_all`] must never signal it then.
+    pub fn try_wait(&mut self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+        let mut state = self.groups.lock();
+        if self.kill_on_exit && self.live {
+            // Peek without reaping: only an exited, unreaped leader is
+            // reaped here, after its group is killed.
+            let peek = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+            match waitid(WaitId::Pid(Pid::from_child(child)), peek) {
+                Ok(None) => return Ok(None),
+                Ok(Some(_)) => {
+                    if let Some(group) = Pid::from_raw(self.group) {
+                        let _ = kill_process_group(group, Signal::KILL);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        let status = child.try_wait()?;
+        if status.is_some() && std::mem::take(&mut self.live) {
+            state.untrack(self.group);
+        }
+        Ok(status)
+    }
+}
+
+impl Drop for Tracked<'_> {
+    fn drop(&mut self) {
+        if self.live {
+            self.groups.lock().untrack(self.group);
+        }
+    }
+}
+
+/// `child.try_wait()`, through `tracked` when its group is tracked.
+fn try_reap(
+    child: &mut Child,
+    tracked: &mut Option<Tracked<'_>>,
+) -> std::io::Result<Option<ExitStatus>> {
+    match tracked {
+        Some(tracked) => tracked.try_wait(child),
+        None => child.try_wait(),
+    }
+}
+
+/// How often a tracked child is polled while anvil waits for it.
+const REAP_POLL: Duration = Duration::from_millis(10);
+
+/// `child.wait()`; a tracked child is polled through `tracked` instead, so
+/// its group is untracked as it is reaped.
+fn reap(child: &mut Child, tracked: &mut Option<Tracked<'_>>) -> std::io::Result<ExitStatus> {
+    if tracked.is_none() {
+        return child.wait();
+    }
+    loop {
+        if let Some(status) = try_reap(child, tracked)? {
+            return Ok(status);
+        }
+        thread::sleep(REAP_POLL);
+    }
+}
+
+/// Starts a thread running `f`; a thread that cannot start is a spawn error.
+fn spawn_thread(f: impl FnOnce() + Send + 'static) -> Result<(), TransportError> {
+    thread::Builder::new()
+        .spawn(f)
+        .map(drop)
+        .map_err(|err| TransportError::Spawn(format!("cannot start a thread: {err}")))
+}
+
+/// [`run_with_script_in`] the [`Groups::global`] registry.
 pub fn run_with_script(
+    command: &mut Command,
+    script: &str,
+    timeout: Duration,
+) -> Result<Output, TransportError> {
+    run_with_script_in(Groups::global(), command, script, timeout)
+}
+
+/// Spawns `command` with piped stdio, tracked in `groups`, writes the script
+/// to stdin, closes it and collects the output within `timeout`. On timeout
+/// the child is killed and the error carries the output read so far.
+pub fn run_with_script_in(
+    groups: &Groups,
     command: &mut Command,
     script: &str,
     timeout: Duration,
@@ -185,17 +373,28 @@ pub fn run_with_script(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| TransportError::Spawn(err.to_string()))?;
+    let mut tracked = Some(groups.track(&child));
 
     // A script that exits before reading everything closes the pipe early; that is
     // not an error of the transport, the exit code tells.
     let stdin = child.stdin.take().expect("stdin is piped");
     let script = script.to_owned();
-    thread::spawn(move || {
+    let writer = spawn_thread(move || {
         let mut stdin = stdin;
         let _ = stdin.write_all(script.as_bytes());
     });
+    if let Err(err) = writer {
+        kill_and_reap(&mut child, &mut tracked);
+        return Err(err);
+    }
 
-    gather(child, Some(timeout), [OUTPUT_CAP, OUTPUT_CAP], true)
+    gather(
+        child,
+        tracked,
+        Some(timeout),
+        [OUTPUT_CAP, OUTPUT_CAP],
+        true,
+    )
 }
 
 /// The line the tty script prints once the terminal no longer echoes; the
@@ -288,6 +487,16 @@ pub fn run_tty_with(
     password: &[u8],
     limits: TtyLimits,
 ) -> Result<Output, TransportError> {
+    run_tty_with_in(Groups::global(), command, password, limits)
+}
+
+/// [`run_tty_with`], its child tracked in `groups`.
+pub fn run_tty_with_in(
+    groups: &Groups,
+    command: &mut Command,
+    password: &[u8],
+    limits: TtyLimits,
+) -> Result<Output, TransportError> {
     if has_control_bytes(password) {
         return Err(TransportError::Spawn(
             "the password contains control characters".to_owned(),
@@ -301,13 +510,23 @@ pub fn run_tty_with(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| TransportError::Spawn(err.to_string()))?;
+    let mut tracked = Some(groups.track(&child));
     let stdin = child.stdin.take().expect("stdin is piped");
     let (done, finished) = mpsc::channel();
     let stderr = child
         .stderr
         .take()
-        .map(|pipe| spawn_reader(pipe, OUTPUT_CAP, done));
-    let chunks = spawn_chunk_reader(child.stdout.take().expect("stdout is piped"));
+        .map(|pipe| spawn_reader(pipe, OUTPUT_CAP, done))
+        .transpose();
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let (stderr, chunks) = match stderr.and_then(|stderr| Ok((stderr, spawn_chunk_reader(stdout)?)))
+    {
+        Ok(readers) => readers,
+        Err(err) => {
+            kill_and_reap(&mut child, &mut tracked);
+            return Err(err);
+        }
+    };
 
     let mut session = TtySession {
         nonce: nonce.as_str().as_bytes(),
@@ -325,22 +544,23 @@ pub fn run_tty_with(
         answered_at: None,
     };
     let mut timed_out = None;
-    let code = match session.drive(&mut child, &chunks) {
+    let code = match session.drive(&mut child, &mut tracked, &chunks) {
         Ok(status) => status.code(),
         // Killed at the run limit: the output so far is still returned, cleaned.
         Err(TransportError::Timeout { after, .. }) => {
-            kill_and_reap(&mut child);
+            kill_and_reap(&mut child, &mut tracked);
             timed_out = Some(after);
             None
         }
         Err(err) => {
-            kill_and_reap(&mut child);
+            kill_and_reap(&mut child, &mut tracked);
             session.stdin = None;
             session.raw.zeroize();
             discard(&chunks);
             return Err(err);
         }
     };
+    drop(tracked);
     // The child has exited: closing stdin now cannot cut the script short.
     session.stdin = None;
 
@@ -390,9 +610,11 @@ fn discard(chunks: &mpsc::Receiver<Vec<u8>>) {
 
 /// Reads `pipe` in chunks as they arrive and sends each one; the channel
 /// closes at EOF. A chunk the receiver no longer takes is zeroed.
-fn spawn_chunk_reader(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+fn spawn_chunk_reader(
+    mut pipe: impl Read + Send + 'static,
+) -> Result<mpsc::Receiver<Vec<u8>>, TransportError> {
     let (send, chunks) = mpsc::channel();
-    thread::spawn(move || {
+    spawn_thread(move || {
         let mut chunk = [0u8; 8192];
         loop {
             match pipe.read(&mut chunk) {
@@ -408,8 +630,8 @@ fn spawn_chunk_reader(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Ve
             }
         }
         chunk.zeroize();
-    });
-    chunks
+    })?;
+    Ok(chunks)
 }
 
 /// The state of one [`run_tty_with`] run.
@@ -443,12 +665,13 @@ impl TtySession<'_> {
     fn drive(
         &mut self,
         child: &mut Child,
+        tracked: &mut Option<Tracked<'_>>,
         chunks: &mpsc::Receiver<Vec<u8>>,
     ) -> Result<ExitStatus, TransportError> {
         let run_deadline = Instant::now() + self.limits.run;
         let mut stdout_open = true;
         loop {
-            match child.try_wait() {
+            match try_reap(child, tracked) {
                 Ok(Some(status)) => return Ok(status),
                 Ok(None) => {}
                 Err(err) => return Err(TransportError::Spawn(err.to_string())),
@@ -646,9 +869,13 @@ pub fn into_string(bytes: Vec<u8>) -> String {
         .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
 }
 
-/// [`collect_capped`] with both streams capped at [`OUTPUT_CAP`].
-pub fn collect(child: Child, timeout: Option<Duration>) -> Result<Output, TransportError> {
-    collect_capped(child, timeout, [OUTPUT_CAP, OUTPUT_CAP])
+/// [`collect_tracked`] with both streams capped at [`OUTPUT_CAP`].
+pub fn collect(
+    child: Child,
+    tracked: Option<Tracked<'_>>,
+    timeout: Option<Duration>,
+) -> Result<Output, TransportError> {
+    collect_tracked(child, tracked, timeout, [OUTPUT_CAP, OUTPUT_CAP])
 }
 
 /// Waits for `child` and gathers whatever of its stdout and stderr is piped,
@@ -667,35 +894,54 @@ pub fn collect_capped(
     timeout: Option<Duration>,
     caps: [usize; 2],
 ) -> Result<Output, TransportError> {
-    gather(child, timeout, caps, false)
+    gather(child, None, timeout, caps, false)
 }
 
-/// [`collect_capped`]; with `keep_on_timeout` a timeout carries the output read
-/// so far instead of zeroing it.
+/// [`collect_capped`] for a child whose group `tracked` tracks, untracked as
+/// the child is reaped.
+pub fn collect_tracked(
+    child: Child,
+    tracked: Option<Tracked<'_>>,
+    timeout: Option<Duration>,
+    caps: [usize; 2],
+) -> Result<Output, TransportError> {
+    gather(child, tracked, timeout, caps, false)
+}
+
+/// [`collect_tracked`]; with `keep_on_timeout` a timeout carries the output
+/// read so far instead of zeroing it.
 fn gather(
     mut child: Child,
+    mut tracked: Option<Tracked<'_>>,
     timeout: Option<Duration>,
     [stdout_cap, stderr_cap]: [usize; 2],
     keep_on_timeout: bool,
 ) -> Result<Output, TransportError> {
     let (done, finished) = mpsc::channel();
-    let streams = [
-        child
-            .stdout
-            .take()
-            .map(|pipe| spawn_reader(pipe, stdout_cap, done.clone())),
-        child
-            .stderr
-            .take()
-            .map(|pipe| spawn_reader(pipe, stderr_cap, done.clone())),
-    ];
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| spawn_reader(pipe, stdout_cap, done.clone()))
+        .transpose();
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| spawn_reader(pipe, stderr_cap, done.clone()))
+        .transpose();
     drop(done);
+    let streams = match (stdout, stderr) {
+        (Ok(stdout), Ok(stderr)) => [stdout, stderr],
+        (Err(err), _) | (_, Err(err)) => {
+            kill_and_reap(&mut child, &mut tracked);
+            return Err(err);
+        }
+    };
 
     let status = match timeout {
-        Some(timeout) => wait_with_timeout(&mut child, timeout),
-        None => child
-            .wait()
-            .map_err(|err| TransportError::Spawn(err.to_string())),
+        Some(timeout) => wait_with_timeout(&mut child, &mut tracked, timeout),
+        None => {
+            reap(&mut child, &mut tracked).map_err(|err| TransportError::Spawn(err.to_string()))
+        }
     };
 
     let pending = streams.iter().flatten().count();
@@ -767,13 +1013,13 @@ fn spawn_reader(
     mut pipe: impl Read + Send + 'static,
     cap: usize,
     done: mpsc::Sender<()>,
-) -> Arc<Mutex<Captured>> {
+) -> Result<Arc<Mutex<Captured>>, TransportError> {
     let shared = Arc::new(Mutex::new(Captured {
         bytes: Vec::with_capacity(cap),
         ..Captured::default()
     }));
     let buffer = Arc::clone(&shared);
-    thread::spawn(move || {
+    spawn_thread(move || {
         let mut chunk = [0u8; 8192];
         loop {
             match pipe.read(&mut chunk) {
@@ -794,20 +1040,21 @@ fn spawn_reader(
         }
         chunk.zeroize();
         let _ = done.send(());
-    });
-    shared
+    })?;
+    Ok(shared)
 }
 
 fn wait_with_timeout(
     child: &mut Child,
+    tracked: &mut Option<Tracked<'_>>,
     timeout: Duration,
 ) -> Result<std::process::ExitStatus, TransportError> {
     let deadline = Instant::now() + timeout;
     loop {
-        match child.try_wait() {
+        match try_reap(child, tracked) {
             Ok(Some(status)) => return Ok(status),
             Ok(None) if Instant::now() >= deadline => {
-                kill_and_reap(child);
+                kill_and_reap(child, tracked);
                 return Err(TransportError::Timeout {
                     after: timeout,
                     output: None,
@@ -833,11 +1080,12 @@ fn take_captured(stream: Option<&Arc<Mutex<Captured>>>) -> Captured {
     })
 }
 
-/// Kills `child`'s process group and `child`, then reaps it.
-fn kill_and_reap(child: &mut Child) {
+/// Kills `child`'s process group and `child`, then reaps it, through
+/// `tracked` when its group is tracked.
+fn kill_and_reap(child: &mut Child, tracked: &mut Option<Tracked<'_>>) {
     let _ = kill_process_group(Pid::from_child(child), Signal::KILL);
     let _ = child.kill();
-    let _ = child.wait();
+    let _ = reap(child, tracked);
 }
 
 #[cfg(test)]
@@ -1143,6 +1391,41 @@ mod tests {
     }
 
     #[test]
+    fn two_terminal_runs_at_once_each_type_and_scrub_only_their_password() {
+        let dir = crate::test_util::temp_dir("tty-two");
+        // Each waits until both are past their prompt; after 30 s it says
+        // why and exits 1, well inside the run limit below.
+        let barrier = format!(
+            "touch '{d}/'$$; i=0; until [ \"$(ls '{d}' | wc -l)\" -ge 2 ]; do \
+             i=$((i+1)); if [ $i -gt 600 ]; then \
+             echo \"barrier: gave up after 30 s\"; exit 1; fi; sleep 0.05; done",
+            d = dir.display()
+        );
+        let limits = TtyLimits {
+            run: Duration::from_secs(60),
+            ..fast()
+        };
+        let body = format!("stty echo </dev/tty; fake_sudo; {barrier}; echo \"again $pw\"");
+        let outs = thread::scope(|scope| {
+            let runs = [&b"first-password"[..], b"second-password"].map(|password| {
+                let script = wrapped(&body);
+                scope.spawn(move || {
+                    run_tty_with(&mut local_tty_command(&script), password, limits).unwrap()
+                })
+            });
+            runs.map(|run| run.join().unwrap())
+        });
+        for (out, len) in outs.iter().zip([14, 15]) {
+            let shown = text(out);
+            assert_eq!(out.code, Some(0), "{shown:?}");
+            assert!(shown.contains(&format!("got:{len}")), "{shown:?}");
+            assert!(shown.contains("again ***"), "{shown:?}");
+            assert!(!shown.contains("-password"), "{shown:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn the_prompt_twice_is_a_rejected_password() {
         let started = Instant::now();
         let err = tty("fake_sudo; echo 'Sorry, try again.'; fake_sudo", fast()).unwrap_err();
@@ -1420,5 +1703,216 @@ mod tests {
         .unwrap();
         assert!(out.truncated);
         assert_eq!(out.code, Some(0));
+    }
+
+    fn live(groups: &Groups) -> usize {
+        groups.lock().live.len()
+    }
+
+    fn sh() -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-s");
+        command
+    }
+
+    /// Runs `run` on another thread, waits until it has tracked its child in
+    /// `groups`, then kills every group and returns what `run` returned.
+    fn killed_while_running(
+        groups: &Groups,
+        run: impl FnOnce() -> Result<Output, TransportError> + Send,
+    ) -> Result<Output, TransportError> {
+        thread::scope(|scope| {
+            let running = scope.spawn(run);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while live(groups) == 0 {
+                assert!(Instant::now() < deadline, "the child was never tracked");
+                thread::sleep(Duration::from_millis(10));
+            }
+            groups.kill_all();
+            running.join().unwrap()
+        })
+    }
+
+    #[test]
+    fn kill_all_kills_a_running_plain_step() {
+        let groups = Groups::new();
+        let out = killed_while_running(&groups, || {
+            run_with_script_in(&groups, &mut sh(), "sleep 30; echo late", RUN_TIMEOUT)
+        })
+        .unwrap();
+        assert_eq!(out.code, None, "killed by a signal: {out:?}");
+        assert!(out.stdout.is_empty());
+        assert_eq!(live(&groups), 0);
+    }
+
+    #[test]
+    fn kill_all_kills_a_running_tty_step() {
+        let groups = Groups::new();
+        let limits = TtyLimits {
+            run: RUN_TIMEOUT,
+            ..fast()
+        };
+        let script = wrapped("echo anvil-sudo-ok; sleep 30; echo late");
+        let out = killed_while_running(&groups, || {
+            run_tty_with_in(&groups, &mut local_tty_command(&script), PASSWORD, limits)
+        })
+        .unwrap();
+        assert_eq!(out.code, None, "killed by a signal: {out:?}");
+        assert!(!text(&out).contains("late"));
+        assert_eq!(live(&groups), 0);
+    }
+
+    #[test]
+    fn a_child_tracked_after_kill_all_is_killed_at_once() {
+        let groups = Groups::new();
+        groups.kill_all();
+        let out =
+            run_with_script_in(&groups, &mut sh(), "sleep 30; echo late", RUN_TIMEOUT).unwrap();
+        assert_eq!(out.code, None, "killed by a signal: {out:?}");
+        let limits = TtyLimits {
+            run: RUN_TIMEOUT,
+            ..fast()
+        };
+        let script = wrapped("echo anvil-sudo-ok; sleep 30");
+        let out =
+            run_tty_with_in(&groups, &mut local_tty_command(&script), PASSWORD, limits).unwrap();
+        assert_eq!(out.code, None, "killed by a signal: {out:?}");
+        assert_eq!(live(&groups), 0);
+    }
+
+    #[test]
+    fn an_old_guard_does_not_untrack_a_reused_group() {
+        let groups = Groups::new();
+        // Never killed: the registry stays open.
+        let group = Pid::from_raw(i32::MAX).unwrap();
+        let old = groups.track_group(group);
+        let reused = groups.track_group(group);
+        drop(old);
+        assert_eq!(groups.lock().live.get(&i32::MAX), Some(&1));
+        drop(reused);
+        assert_eq!(live(&groups), 0);
+    }
+
+    #[test]
+    fn reaping_the_leader_untracks_its_group_before_the_guard_drops() {
+        let groups = Groups::new();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut tracked = Some(groups.track(&child));
+        assert_eq!(live(&groups), 1);
+        assert!(reap(&mut child, &mut tracked).unwrap().success());
+        // Its id may be reused now: kill_all must not see it.
+        assert_eq!(live(&groups), 0, "untracked as it was reaped");
+        drop(tracked);
+        assert_eq!(live(&groups), 0);
+        // A second guard on the same id keeps it tracked.
+        let group = Pid::from_raw(i32::MAX).unwrap();
+        let other = groups.track_group(group);
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let mut reaped = groups.track_group(group);
+        while reaped.try_wait(&mut child).unwrap().is_none() {
+            thread::sleep(REAP_POLL);
+        }
+        drop(reaped);
+        assert_eq!(
+            groups.lock().live.get(&i32::MAX),
+            Some(&1),
+            "untracked once"
+        );
+        drop(other);
+        assert_eq!(live(&groups), 0);
+    }
+
+    /// Whether the process `pid` still runs.
+    fn running(pid: &str) -> bool {
+        Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// A group leader that leaves a `sleep 30` in its group as it exits,
+    /// with the pid of that `sleep`.
+    fn leaving_a_leftover() -> (Child, String) {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 30 >/dev/null 2>&1 & echo $!"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut pid = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut pid)
+            .unwrap();
+        (child, pid.trim().to_owned())
+    }
+
+    #[test]
+    fn leftovers_are_killed_while_the_leader_is_unreaped() {
+        let groups = Groups::new();
+        let (mut child, leftover) = leaving_a_leftover();
+        let mut tracked = Some(groups.track(&child).killing_leftovers());
+        assert!(reap(&mut child, &mut tracked).unwrap().success());
+        assert_eq!(live(&groups), 0, "untracked as it was reaped");
+        let gone = (0..250).any(|_| {
+            thread::sleep(REAP_POLL);
+            !running(&leftover)
+        });
+        assert!(gone, "the leftover {leftover} is still running");
+
+        // Without it, a leftover outlives its leader.
+        let (mut child, leftover) = leaving_a_leftover();
+        let mut tracked = Some(groups.track(&child));
+        assert!(reap(&mut child, &mut tracked).unwrap().success());
+        assert!(running(&leftover), "only a guard that asks kills");
+        let _ = Command::new("kill").args(["-9", &leftover]).status();
+    }
+
+    #[test]
+    fn the_registry_is_empty_after_ok_error_and_timeout_runs() {
+        let groups = Groups::new();
+        let ok = run_with_script_in(&groups, &mut sh(), "echo hi", RUN_TIMEOUT).unwrap();
+        assert_eq!(ok.code, Some(0));
+        assert_eq!(live(&groups), 0);
+        let failed = run_with_script_in(&groups, &mut sh(), "exit 3", RUN_TIMEOUT).unwrap();
+        assert_eq!(failed.code, Some(3));
+        assert_eq!(live(&groups), 0);
+        let err = run_with_script_in(&groups, &mut sh(), "sleep 30", Duration::from_millis(200))
+            .unwrap_err();
+        assert!(matches!(err, TransportError::Timeout { .. }), "{err:?}");
+        assert_eq!(live(&groups), 0);
+        let mut missing = Command::new("/nonexistent/anvil-test-program");
+        let err = run_with_script_in(&groups, &mut missing, "", RUN_TIMEOUT).unwrap_err();
+        assert!(matches!(err, TransportError::Spawn(_)), "{err:?}");
+        let ok = run_tty_with_in(
+            &groups,
+            &mut local_tty_command(&wrapped("echo anvil-sudo-ok; echo hi")),
+            PASSWORD,
+            fast(),
+        )
+        .unwrap();
+        assert_eq!(ok.code, Some(0));
+        assert_eq!(live(&groups), 0);
+        let err = run_tty_with_in(
+            &groups,
+            &mut local_tty_command(&wrapped("sleep 5")),
+            PASSWORD,
+            fast(),
+        )
+        .unwrap_err();
+        assert_eq!(err, TransportError::NoPrompt);
+        assert_eq!(live(&groups), 0);
+        assert!(!groups.lock().closed);
     }
 }

@@ -10,7 +10,7 @@ Topic guides: [Getting started](getting-started.md), [Configuration](configurati
 [Development](development.md).
 
 ```text
-anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [--target SEL]... <COMMAND>
+anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [--target SEL]... [--parallel N] <COMMAND>
   inventory [--format toml|yaml] edit the inventory; --format picks the edit view, saved as TOML
   config [--format toml|yaml]    edit the config; --format picks the edit view, saved as TOML
   doctor                         local checks + every target's facts and reachability
@@ -35,13 +35,54 @@ Every flag is global: it may come before or after the command.
 | `--ssh-config PATH` | passed to every `ssh` as `-F PATH`                                                                    |
 | `--json`            | print exactly one JSON document on stdout instead of human output                                     |
 | `--target SEL`      | `local`, a host name or a tag; repeat to take the union; none means `local` plus every host           |
+| `--parallel N`      | targets at once for `apply`, `plan`, `run`: 1..=32, default 1 ([parallel](#running-in-parallel))      |
 | `-h`, `--help`      | help                                                                                                  |
 | `-V`, `--version`   | version                                                                                               |
 
 The JSON examples below are pretty-printed; anvil prints each document on one line. An unknown `--target` is a usage
 error (exit 2; for `tui` only when the inventory loads). `inventory`, `config` and `secret` ignore `--target` with a
-warning.
-Targets run one after another, `local` first, then hosts sorted by name; a failing target does not stop the others.
+warning. `--parallel` outside 1..=32 is exit 2 (`invalid value '0' for '--parallel <N>': 0 is not in 1..=32`);
+`inventory`, `config`, `secret`, `doctor` and `update` ignore it, and with N other than 1 log the warning
+``--parallel is ignored by `doctor` `` (with that command's name), shown from `-v`.
+Targets start in order, `local` first, then hosts sorted by name, up to `--parallel N` at a time (one after another by
+default); a failing target does not stop the others.
+
+## Running in parallel
+
+`--parallel N` lets `apply`, `plan` and `run` work on up to N targets at once; `anvil tui` takes it as the starting
+value for its apply, plan and run (`x`), and runs doctor one target at a time without a warning:
+
+```sh
+anvil --parallel 4 apply
+anvil plan --parallel 8 --target linode
+anvil run --parallel 4 fix.sh
+```
+
+- **Order.** Targets start in the same order as with `--parallel 1`: `local` first, then hosts by name. The human output
+  stays in that order: a target's block is printed once it and every target before it have ended, so a slow first target
+  holds the later blocks back (not their work), and nothing new appears on stdout meanwhile. The summary comes last.
+  `--parallel 1` prints exactly what anvil printed before the flag existed.
+- **JSON.** `--json` lists the targets in that same order, with the same shape; nothing says how many ran at once.
+- **Logs stay live.** With `-v` and up the log lines come on stderr as they happen, one whole line at a time, each
+  naming its target (at `-vv`, `apply linode1: start`), so they show what is running while blocks are held.
+- **Ctrl-C** works as for one target: the first press lets the running steps finish and starts no other target, the
+  second stops everything at once ([Ctrl-C](#ctrl-c)).
+- **Exit codes** are unchanged: 1 when any target failed or was cancelled; a failing target never stops the others.
+
+Limitations:
+
+- **A slower first connect at large N.** ssh masters are opened one at a time (see [SSH behaviour](#ssh-behaviour)).
+  A target whose master is alive never waits, but each target that needs a new master waits for the opens queued before
+  it, and each open can take up to 40 s for a host that does not answer (the 10 s `ssh -O check`, then the 30 s key
+  attempt). An interactive retry holds them for as long as the person types.
+- **Two inventory entries for one machine run at the same time.** anvil does not know they are the same host, so their
+  package steps can meet the package manager's lock (pacman's database lock, say) and their files and steps can write
+  the same paths at once. Select one of them with `--target`, or use `--parallel 1`.
+- **Plugins run in parallel.** apply and plan run a plugin once per target on the controller, now up to N at once, so a
+  plugin must be safe to run several times concurrently ([Plugin steps](#plugin-steps)).
+- **A second Ctrl-C stops only what runs here.** It kills anvil's local processes, ssh clients included. A remote
+  command started without a terminal keeps running on its host after its ssh client dies. A `[[files]]` step stopped
+  this way can leave its `/tmp/anvil-` temp file on the target ([File steps](#file-steps)).
 
 ## Commands
 
@@ -251,6 +292,26 @@ Human output is one block per target, a blank line after each, then a summary:
 A target either ran its steps (`steps` and `ok`; a failed step shows its `code`, and `ok` is false) or failed in the
 transport (`error`, `ok: false`, and `steps` only when some steps completed before the error). `code` is `null` when
 the step was killed by a signal or timed out; a timed-out step is the last `steps` entry, next to `error`.
+
+#### Ctrl-C
+
+`apply`, `plan` and `run` handle Ctrl-C the same way, with any `--parallel`:
+
+- **The first press cancels.** anvil prints
+  `interrupted: running targets stop after their current step; Ctrl-C again stops now` on stderr, whatever `-v`. Each
+  running target finishes its current step and then ends as `⊘ cancelled`, keeping the steps that completed; no other
+  target starts, and each target not started yet ends as `⊘ cancelled` with no steps. The summary and `--json` are
+  printed as usual and the command exits 1. plan's running probes finish the same way.
+- **`--parallel 1` waits too.** Where Ctrl-C used to stop anvil at once, the first press now waits for the current
+  step, up to that step's timeout (30 s for a `[[steps]]`, `[[files]]` or plugin step (a password `[[files]]` step can
+  take up to three of those), `[packages].timeout` for the package step, 120 s for a service step, `--timeout` for
+  `anvil run`). Press again to stop at once.
+- **The second press stops everything at once.** anvil kills every step still running, logs
+  `ERROR anvil::interrupt: interrupted` and dies by SIGINT (a shell shows 130), printing no summary and no JSON. A
+  remote command without a terminal keeps running on its host, and a `[[files]]` temp file can be left behind
+  ([Running in parallel](#running-in-parallel)).
+- **A fast double press may count as one.** Two presses very close together can reach anvil as one signal and then
+  count as the first; press again.
 
 ### `anvil plan`
 
@@ -671,9 +732,10 @@ anvil run fix.sh
 printf 'df -h /\nuptime\n' | anvil run --target pi -
 ```
 
-Targets are chosen as for apply (`--target`; none means `local` plus every host) and run one after another; a failing
-target does not stop the others. The script is each target's one step, sent on its stdin to `sh -s` (`/bin/sh -s` for
-`local`), never on an argv. It is always POSIX sh: a shebang line is only a comment. run asks for no confirmation.
+Targets are chosen as for apply (`--target`; none means `local` plus every host) and run as apply runs them, up to
+`--parallel N` at a time ([Running in parallel](#running-in-parallel)); a failing target does not stop the others.
+The script is each target's one step, sent on its stdin to `sh -s` (`/bin/sh -s` for `local`), never on an argv. It
+is always POSIX sh: a shebang line is only a comment. run asks for no confirmation.
 
 - **No config.** run never loads the config, so a broken `[packages]` or `[[steps]]` cannot block it. Nothing is probed,
   the secret store is never opened and no sudo password is typed. For root work call `sudo -n` in the script, or use a
@@ -766,7 +828,8 @@ Runs every command above in one terminal UI and keeps their results for browsing
 `anvil` still prints the help, so a script or an agent never lands in a TUI. stdin and stdout must be a terminal (else
 exit 2, `anvil tui needs a terminal`), and `--json` is refused (exit 2, `anvil tui: --json is not available`), although
 `anvil tui --help` lists it among the global flags. The global flags are the starting state: `--target` preselects
-rows of the `t` overlay, `-v` sets the Log pane level, and `--inventory`, `--config` and `--ssh-config` the paths. An
+rows of the `t` overlay, `-v` sets the Log pane level, `--parallel` how many targets its apply, plan and run take at
+once, and `--inventory`, `--config` and `--ssh-config` the paths. An
 inventory that does not load (any load error: unreadable, such as permission denied or a directory, invalid or
 ambiguous, an `--inventory` path not ending in `.toml`, or no `$HOME`) is not exit 2: the TUI starts and shows
 `inventory error` in red in the header, the error as the status-bar notice and in the `t` overlay in place of its rows;
@@ -908,6 +971,8 @@ that exits non-zero aborts the command: nothing is written, exit 1.
   `plan`: a target could not be reached, probed or resolved.
   `apply`/`plan`: a plugin step's plugin failed on a target ([Plugin steps](#plugin-steps)).
   `run`: a target failed or could not be reached.
+  `apply`/`plan`/`run`: a first Ctrl-C cancelled the run ([Ctrl-C](#ctrl-c)); a second one kills anvil by SIGINT
+  instead, which a shell reports as 130.
   `inventory`/`config`/`secret`: the editor exited non-zero (aborted), a file write failed, or the secret store failed,
   is locked or its passphrase prompt was cancelled.
 - **2**: a bad flag or argument (including an `--inventory` or `--config` path not ending in `.toml`), an unknown
@@ -943,6 +1008,9 @@ from `--ssh-config`; `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE` and `DISPLAY` are remo
   timeout, since a person is typing. Without a terminal the target fails with
   `key auth failed; run interactively for password sign-in`. A refused interactive attempt reports
   `authentication failed after the interactive attempt`.
+- **Master opens wait their turn.** With `--parallel`, a target whose master is alive runs at once; one that needs a new
+  master opens it only after any open already under way, and only one interactive retry prompts at a time. No step
+  opens a new master after a Ctrl-C; a `[[files]]` cleanup still may.
 - **Host keys are never auto-accepted.** An unknown or changed host key fails the target with
   ``host key unknown or changed; run `ssh <host>` once to verify the fingerprint``.
 - **Package step with a sudo password** runs as a `-tt` client instead; see
@@ -959,7 +1027,8 @@ from `--ssh-config`; `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE` and `DISPLAY` are remo
 
 Logs go to stderr as `LEVEL target: message` (in `anvil tui`, to its [Log pane](tui.md) instead); `--json` output
 on stdout stays a single document. The default shows errors only; `-v` adds warnings, `-vv` info, `-vvv` debug, which
-includes the argv of every `ssh` and editor spawn. A fatal error is the last line before a non-zero exit. Control
-characters in a message (ssh's or a host's text) are shown as `\x1b`-style escapes; `doctor`'s human output escapes them
-too. Secret values, probe output and file contents are never logged at any level. There are no log files and no
-`RUST_LOG`.
+includes the argv of every `ssh` and editor spawn. With `--parallel`, the lines of targets that run at once interleave,
+each line whole and naming its target ([Running in parallel](#running-in-parallel)). A fatal error is the last line
+before a non-zero exit. Control characters in a message (ssh's or a host's text) are shown as `\x1b`-style escapes;
+`doctor`'s human output escapes them too. Secret values, probe output and file contents are never logged at any level.
+There are no log files and no `RUST_LOG`.

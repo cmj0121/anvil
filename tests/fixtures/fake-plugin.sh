@@ -10,8 +10,9 @@
 #   FAKE_PLUGIN_SLEEP   seconds to sleep before replying
 #   FAKE_PLUGIN_EXIT    its exit status (0)
 #   FAKE_PLUGIN_KILL    when set, it kills itself with SIGKILL instead
-#   FAKE_PLUGIN_DETACH  when set, leaves `sleep 3` in the background, holding
-#                       stdout and stderr open
+#   FAKE_PLUGIN_DETACH  when set, leaves a 3s sleep in the background, out of
+#                       its process group (perl's `setpgrp`), holding stdout
+#                       and stderr open
 #   FAKE_PLUGIN_HOLD_STDIN  when set, replies without reading stdin and leaves
 #                       `sleep 30` in the background holding it, its pid in
 #                       `./record.holder`
@@ -43,7 +44,11 @@ if [ -n "${FAKE_PLUGIN_STDERR:-}" ]; then
 	printf '%s\n' "$FAKE_PLUGIN_STDERR" >&2
 fi
 if [ -n "${FAKE_PLUGIN_DETACH:-}" ]; then
-	sleep 3 &
+	perl -e 'setpgrp; sleep 3' &
+	# Out of the group before this exits and the group is killed.
+	while [ "$(ps -o pgid= -p "$!" | tr -d ' ')" = "$$" ]; do
+		sleep 0.05
+	done
 fi
 if [ -n "${FAKE_PLUGIN_KILL:-}" ]; then
 	kill -KILL $$

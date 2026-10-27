@@ -1,9 +1,10 @@
 //! `anvil apply`: every config step on every selected target, in
-//! order, one target at a time.
+//! order, up to `--parallel` targets at a time.
 //!
 //! A step that exits non-zero stops that target's remaining steps; a transport
-//! error ends the target with only the error. Neither stops the next target.
-//! Step output is printed, never logged.
+//! error ends the target with only the error. Neither stops another target.
+//! Step output is printed, never logged, each target's block in inventory
+//! order whatever order the targets end in.
 //!
 //! With `[packages]` work to do, each target first runs the probe, and the
 //! install/upgrade script for its package manager runs as step 1. A target
@@ -30,6 +31,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{IsTerminal, Write};
+use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -38,7 +40,9 @@ use serde::Serialize;
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::{Config, StepKind};
 use crate::facts::{self, Facts};
+use crate::fanout::{self, Event};
 use crate::files::{self, Sources};
+use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::{BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, is_escaped, paint};
 use crate::options::Options;
@@ -309,26 +313,19 @@ impl Report {
     }
 }
 
-/// What [`run_targets`] reports as it goes: a target about to run, and its
-/// report once it ends.
-#[cfg_attr(
-    not(any(test, feature = "tui")),
-    expect(dead_code, reason = "read by the TUI")
-)]
-pub enum Progress<'a> {
-    Start(&'a Target),
-    Done(&'a TargetReport),
-}
+/// What [`run_targets`] reports as it goes: the targets, a target about to
+/// run, and its report once it ends.
+pub type Progress<'a> = Event<'a, TargetReport>;
 
-/// Loads the targets and applies `config` to each in order. Before each target
-/// and each step, `cancel` is checked; once set, the current target ends as
-/// Cancelled (keeping its completed steps) and every later target is Cancelled
-/// with no steps. A `[[files]]` src that cannot be read fails the command
-/// before any target.
+/// Loads the targets and applies `config` to each, `opts.parallel` at a
+/// time. Before each target and each step, `opts.cancel` is checked; once set,
+/// each running target ends as Cancelled after its current step (keeping its
+/// completed steps) and every target not started is Cancelled with no steps.
+/// A `[[files]]` src that cannot be read fails the command before any
+/// target.
 pub fn run_targets(
     opts: &Options,
     config: &Config,
-    cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
     let targets = opts.targets()?;
@@ -337,12 +334,13 @@ pub fn run_targets(
     let passwords = load_passwords(&targets, config, || opts.secret_store(config))?;
     Ok(apply_targets(
         &targets,
+        opts.parallel,
         |target| opts.transport(target),
         config,
         &sources,
         &pins,
         &passwords,
-        cancel,
+        &opts.cancel,
         on,
     ))
 }
@@ -418,7 +416,8 @@ fn no_core_dumps() {
 )]
 fn apply_targets(
     targets: &[Target],
-    transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError>,
+    parallel: NonZeroU8,
+    transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError> + Sync,
     config: &Config,
     sources: &Sources,
     plugins: &dyn Plugins,
@@ -426,7 +425,7 @@ fn apply_targets(
     cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Report {
-    for_each_target(targets, cancel, on, |target| {
+    for_each_target(targets, parallel, cancel, on, |target| {
         apply_target(
             target,
             transport(target),
@@ -439,25 +438,25 @@ fn apply_targets(
     })
 }
 
-/// Runs `one` on each of `targets` in order, reporting each as it starts
-/// and ends. Once `cancel` is set, every later target is Cancelled.
+/// Runs `one` on each of `targets`, `parallel` at a time, reporting each as
+/// it starts and ends. Once `cancel` is set, every target not started is
+/// Cancelled; one whose `one` panics has failed.
 pub(crate) fn for_each_target(
     targets: &[Target],
+    parallel: NonZeroU8,
     cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
-    mut one: impl FnMut(&Target) -> TargetReport,
+    one: impl Fn(&Target) -> TargetReport + Sync,
 ) -> Report {
-    let mut reports = Vec::with_capacity(targets.len());
-    for target in targets {
-        on(Progress::Start(target));
-        let report = if cancel.load(Ordering::Relaxed) {
-            cancelled(target, Vec::new())
-        } else {
-            one(target)
-        };
-        on(Progress::Done(&report));
-        reports.push(report);
-    }
+    let reports = fanout::fan_out(
+        targets,
+        parallel,
+        cancel,
+        on,
+        one,
+        |target| cancelled(target, Vec::new()),
+        |target, message| failed(target, Vec::new(), format!("internal error: {message}")),
+    );
     let ok = reports.iter().all(TargetReport::ok);
     Report {
         targets: reports,
@@ -465,27 +464,27 @@ pub(crate) fn for_each_target(
     }
 }
 
-/// `anvil apply`: prints each target's block as it ends (or one JSON
+/// `anvil apply`: prints each target's block in order (or one JSON
 /// document), then the summary.
 pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
-    let cancel = AtomicBool::new(false);
     let config = opts.load_config()?;
-    print_report(cli, "apply", |on| run_targets(opts, &config, &cancel, on))
+    let _interrupt = Interrupt::install(&opts.cancel)?;
+    print_report(cli, "apply", |on| run_targets(opts, &config, on))
 }
 
-/// Prints each target's block as `targets` reports it ends (or one JSON
-/// document), then the summary; any failed target fails `command`.
+/// Prints each target's block once it and every earlier target have ended
+/// (or one JSON document), then the summary; any failed target fails
+/// `command`.
 pub(crate) fn print_report(
     cli: &Cli,
     command: &str,
     targets: impl FnOnce(&mut dyn FnMut(Progress<'_>)) -> Result<Report, Failure>,
 ) -> Result<(), Failure> {
     let style = Style::detect();
+    let mut print = fanout::in_order(|report| print_lines(&render(report, style), style));
     let report = targets(&mut |progress| {
-        if let Progress::Done(report) = progress
-            && !cli.json
-        {
-            print_lines(&render(report, style), style);
+        if !cli.json {
+            print(progress);
         }
     })?;
     let (ok, failed) = report.counts();
@@ -542,14 +541,13 @@ fn apply_target(
         if cancel.load(Ordering::Relaxed) {
             return cancelled(target, Vec::new());
         }
-        match probe(transport.as_ref(), config) {
-            Ok(facts) => Some(facts),
-            Err(error) => return failed(target, Vec::new(), error),
-        }
+        probe(transport.as_ref(), config).map(Some)
     } else {
-        None
+        Ok(None)
     };
-    match resolve(target, facts.as_ref(), config, sources, plugins, cancel) {
+    let runs =
+        facts.and_then(|facts| resolve(target, facts.as_ref(), config, sources, plugins, cancel));
+    match runs {
         Ok(runs) => execute(target, transport.as_ref(), &runs, passwords, cancel),
         Err(Unresolved::Failed(error)) => failed(target, Vec::new(), error),
         Err(Unresolved::Cancelled) => cancelled(target, Vec::new()),
@@ -624,6 +622,8 @@ pub(crate) fn execute(
         };
         let output = match output {
             Ok(output) => output,
+            // ssh would have had to open a master after cancel.
+            Err(TransportError::Cancelled) => return cancelled(target, reports),
             Err(err) => {
                 let error = step_error(&err, password.map(|(name, _)| name), prefix);
                 // A step killed at the limit still shows what it printed.
@@ -662,8 +662,8 @@ pub(crate) fn execute(
 /// The password path of a `[[files]]` step: `upload.stage` writes the bytes
 /// to the temp file over a plain run; unless it failed or `cancel` was set
 /// meanwhile, `run` then installs it on a terminal, typing `password`.
-/// `upload.cleanup` runs after, whatever happened, and its failure is only
-/// logged. The result is the terminal run's; a failed stage is a fixed
+/// `upload.cleanup` runs after, whatever happened and even once cancelled,
+/// and its failure is only logged. The result is the terminal run's; a failed stage is a fixed
 /// message instead of what the shell printed, which names the temp file.
 /// `None` when cancelled.
 fn send_file(
@@ -692,7 +692,7 @@ fn send_file(
         })),
         Err(err) => Some(Err(err)),
     };
-    match transport.run(&upload.cleanup, RUN_TIMEOUT) {
+    match transport.run_uncancelled(&upload.cleanup, RUN_TIMEOUT) {
         Ok(output) if output.code == Some(0) => {}
         Ok(output) => log::debug!(
             "apply {}: removing the temp file exited {:?}",
@@ -726,11 +726,10 @@ fn package_work(config: &Config) -> Option<&Packages> {
 
 /// Runs the probe over `transport`. The error is the target's failure: a
 /// transport error as is, anything else as `packages: <reason>` when
-/// `config`'s `[packages]` has work, else as `probe: <reason>`.
-pub fn probe(transport: &dyn Transport, config: &Config) -> Result<Facts, String> {
-    let output = transport
-        .run(facts::PROBE, RUN_TIMEOUT)
-        .map_err(|err| err.to_string())?;
+/// `config`'s `[packages]` has work, else as `probe: <reason>`; or
+/// Cancelled when the transport was.
+pub fn probe(transport: &dyn Transport, config: &Config) -> Result<Facts, Unresolved> {
+    let output = transport.run(facts::PROBE, RUN_TIMEOUT)?;
     let (prefix, probe) = if package_work(config).is_some() {
         ("packages", "probe ")
     } else {
@@ -739,10 +738,10 @@ pub fn probe(transport: &dyn Transport, config: &Config) -> Result<Facts, String
     let reason = |why: String| format!("{prefix}: {why}");
     match output.code {
         Some(0) => {}
-        Some(code) => return Err(reason(format!("{probe}exited {code}"))),
-        None => return Err(reason(format!("{probe}was killed by a signal"))),
+        Some(code) => return Err(reason(format!("{probe}exited {code}")).into()),
+        None => return Err(reason(format!("{probe}was killed by a signal")).into()),
     }
-    Facts::parse(&output.stdout).map_err(|err| reason(err.to_string()))
+    Facts::parse(&output.stdout).map_err(|err| reason(err.to_string()).into())
 }
 
 /// Why [`resolve`] lists no steps: the target's failure, or `cancel` was
@@ -756,6 +755,15 @@ pub enum Unresolved {
 impl From<String> for Unresolved {
     fn from(error: String) -> Unresolved {
         Unresolved::Failed(error)
+    }
+}
+
+impl From<TransportError> for Unresolved {
+    fn from(err: TransportError) -> Unresolved {
+        match err {
+            TransportError::Cancelled => Unresolved::Cancelled,
+            err => Unresolved::Failed(err.to_string()),
+        }
     }
 }
 
@@ -964,14 +972,22 @@ impl Style {
 }
 
 /// Writes each line to its stream, flushing so a terminal shows them in order.
+/// Each write locks only its own stream, so a stdout blocked on a full pipe
+/// never holds stderr.
 pub(crate) fn print_lines(lines: &[Line], style: Style) {
-    let mut out = std::io::stdout().lock();
-    let mut err = std::io::stderr().lock();
     for line in lines {
-        let stream: &mut dyn Write = if line.stderr { &mut err } else { &mut out };
-        let _ = stream.write_all(line.show(style).as_bytes());
-        let _ = stream.flush();
+        let text = line.show(style);
+        let _ = if line.stderr {
+            write_flushed(&mut std::io::stderr().lock(), &text)
+        } else {
+            write_flushed(&mut std::io::stdout().lock(), &text)
+        };
     }
+}
+
+fn write_flushed(stream: &mut dyn Write, text: &str) -> std::io::Result<()> {
+    stream.write_all(text.as_bytes())?;
+    stream.flush()
 }
 
 /// The step's command as shown in its `$` line: a multi-line script shows its
@@ -1042,63 +1058,62 @@ fn render_summary(ok: usize, failed: usize, style: Style) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::config::{FileEntry, ModeValue, ServiceEntry, Step};
+
+    const ONE: NonZeroU8 = NonZeroU8::MIN;
     use crate::inventory::TargetKind;
-    use crate::test_util::{FakePlugins, json, keys};
+    use crate::test_util::{FakePlugins, Meet, json, keys};
 
     /// Runs nothing: the probe prints `probe` (exiting `probe_code`), `fail`
     /// exits 3, anything else echoes `<script>-out`; every script is
     /// recorded in the shared log.
     struct Fake {
-        log: Rc<RefCell<Vec<String>>>,
+        log: Arc<Mutex<Vec<String>>>,
         /// Returned from the run after `succeed` scripts have run.
         fail_with: Option<TransportError>,
         succeed: usize,
         probe: &'static str,
         probe_code: Option<i32>,
         /// The password of each `run_tty`, which logs its script too.
-        typed: Rc<RefCell<Vec<Vec<u8>>>>,
+        typed: Arc<Mutex<Vec<Vec<u8>>>>,
         /// Returned from `run_tty`.
         tty_fail: Option<TransportError>,
         /// The timeout of each `run` and `run_tty`, in order.
-        timeouts: Rc<RefCell<Vec<Duration>>>,
+        timeouts: Arc<Mutex<Vec<Duration>>>,
         /// A `run` script containing the text prints `shell-err` on stderr
         /// and exits with the code.
         exits: &'static [(&'static str, i32)],
         /// Set once a `run` script containing the text has run.
-        cancel_on: Option<(&'static str, Rc<AtomicBool>)>,
+        cancel_on: Option<(&'static str, Arc<AtomicBool>)>,
+        /// Once that flag is set, `run` (not `run_uncancelled`) fails with
+        /// `Cancelled`, as ssh does when it would open a master.
+        refuse_once_cancelled: bool,
     }
 
     impl Fake {
-        fn new(log: &Rc<RefCell<Vec<String>>>) -> Fake {
+        fn new(log: &Arc<Mutex<Vec<String>>>) -> Fake {
             Fake {
-                log: Rc::clone(log),
+                log: Arc::clone(log),
                 fail_with: None,
                 succeed: 0,
                 probe: "",
                 probe_code: Some(0),
-                typed: Rc::default(),
+                typed: Arc::default(),
                 tty_fail: None,
-                timeouts: Rc::default(),
+                timeouts: Arc::default(),
                 exits: &[],
                 cancel_on: None,
+                refuse_once_cancelled: false,
             }
         }
-    }
 
-    impl Transport for Fake {
-        fn name(&self) -> &str {
-            "fake"
-        }
-
-        fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
-            self.timeouts.borrow_mut().push(timeout);
+        fn answer(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
+            self.timeouts.lock().unwrap().push(timeout);
             let ran = {
-                let mut log = self.log.borrow_mut();
+                let mut log = self.log.lock().unwrap();
                 log.push(script.to_owned());
                 log.len()
             };
@@ -1142,6 +1157,29 @@ mod tests {
                 },
             })
         }
+    }
+
+    impl Transport for Fake {
+        fn name(&self) -> &str {
+            "fake"
+        }
+
+        fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
+            let cancelled =
+                (self.cancel_on.as_ref()).is_some_and(|(_, c)| c.load(Ordering::Relaxed));
+            if self.refuse_once_cancelled && cancelled {
+                return Err(TransportError::Cancelled);
+            }
+            self.answer(script, timeout)
+        }
+
+        fn run_uncancelled(
+            &self,
+            script: &str,
+            timeout: Duration,
+        ) -> Result<Output, TransportError> {
+            self.answer(script, timeout)
+        }
 
         fn run_tty(
             &self,
@@ -1149,9 +1187,9 @@ mod tests {
             password: &[u8],
             timeout: Duration,
         ) -> Result<Output, TransportError> {
-            self.timeouts.borrow_mut().push(timeout);
-            self.log.borrow_mut().push(script.to_owned());
-            self.typed.borrow_mut().push(password.to_vec());
+            self.timeouts.lock().unwrap().push(timeout);
+            self.log.lock().unwrap().push(script.to_owned());
+            self.typed.lock().unwrap().push(password.to_vec());
             match &self.tty_fail {
                 Some(err) => Err(err.clone()),
                 None => Ok(Output {
@@ -1203,7 +1241,7 @@ mod tests {
         succeed: usize,
         fail_with: Option<TransportError>,
     ) -> (TargetReport, Vec<String>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             fail_with,
             succeed,
@@ -1218,8 +1256,25 @@ mod tests {
             &Passwords::new(),
             &AtomicBool::new(false),
         );
-        let runs = log.borrow().clone();
+        let runs = log.lock().unwrap().clone();
         (report, runs)
+    }
+
+    #[test]
+    fn the_runner_inputs_are_shareable_across_threads() {
+        fn assert_sync<T: Sync + ?Sized>() {}
+        fn assert_send<T: Send>() {}
+        assert_sync::<Target>();
+        assert_sync::<Config>();
+        assert_sync::<Sources>();
+        assert_sync::<dyn Plugins>();
+        assert_sync::<plugin::Pins>();
+        assert_sync::<Passwords>();
+        assert_sync::<Options>();
+        assert_sync::<AtomicBool>();
+        assert_sync::<FakePlugins>();
+        assert_send::<TargetReport>();
+        assert_send::<crate::plan::PlanReport>();
     }
 
     /// Neither stream is a terminal, as under a pipe or in CI.
@@ -1608,8 +1663,8 @@ mod tests {
 
     /// Like [`Fake`], but running `stop` sets the shared cancel flag.
     struct Stopper {
-        log: Rc<RefCell<Vec<String>>>,
-        cancel: Rc<AtomicBool>,
+        log: Arc<Mutex<Vec<String>>>,
+        cancel: Arc<AtomicBool>,
     }
 
     impl Transport for Stopper {
@@ -1618,7 +1673,7 @@ mod tests {
         }
 
         fn run(&self, script: &str, _timeout: Duration) -> Result<Output, TransportError> {
-            self.log.borrow_mut().push(script.to_owned());
+            self.log.lock().unwrap().push(script.to_owned());
             if script == "stop" {
                 self.cancel.store(true, Ordering::Relaxed);
             }
@@ -1647,16 +1702,17 @@ mod tests {
         runs: &[&str],
         cancelled: bool,
     ) -> (Report, Vec<String>, Vec<String>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let cancel = Rc::new(AtomicBool::new(cancelled));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cancel = Arc::new(AtomicBool::new(cancelled));
         let targets: Vec<Target> = names.iter().map(|name| target(name)).collect();
         let mut events = Vec::new();
         let report = apply_targets(
             &targets,
+            ONE,
             |_| {
                 Ok(Box::new(Stopper {
-                    log: Rc::clone(&log),
-                    cancel: Rc::clone(&cancel),
+                    log: Arc::clone(&log),
+                    cancel: Arc::clone(&cancel),
                 }))
             },
             &config(None, runs),
@@ -1664,16 +1720,14 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &cancel,
-            &mut |progress| {
-                events.push(match progress {
-                    Progress::Start(target) => format!("start {}", target.name),
-                    Progress::Done(report) => {
-                        format!("done {}", json(report)["target"].as_str().unwrap())
-                    }
-                })
+            &mut |progress| match progress {
+                Progress::Begin(targets) => events.push(format!("begin {}", targets.len())),
+                Progress::Start(target) => events.push(format!("start {}", target.name)),
+                Progress::Done(_, report) => events.push(format!("done {}", report.target())),
+                Progress::Ordered(_) => {}
             },
         );
-        let runs = log.borrow().clone();
+        let runs = log.lock().unwrap().clone();
         (report, runs, events)
     }
 
@@ -1681,7 +1735,10 @@ mod tests {
     fn progress_fires_start_then_done_per_target_in_order() {
         let (report, runs, events) = apply_all(&["a", "b"], &["one"], false);
         assert_eq!(runs, ["one", "one"]);
-        assert_eq!(events, ["start a", "done a", "start b", "done b"]);
+        assert_eq!(
+            events,
+            ["begin 2", "start a", "done a", "start b", "done b"]
+        );
         assert!(report.ok);
         assert_eq!(report.counts(), (2, 0));
     }
@@ -1711,7 +1768,10 @@ mod tests {
                 ok: false,
             }
         );
-        assert_eq!(events, ["start a", "done a", "start b", "done b"]);
+        assert_eq!(
+            events,
+            ["begin 2", "start a", "done a", "start b", "done b"]
+        );
         assert_eq!(
             screen(&report.targets[0], piped()),
             "▶ a\n  $ one\n  one-out\n  $ stop\n  stop-out\n  ✘ cancelled\n\n"
@@ -1766,7 +1826,7 @@ mod tests {
         probe: &'static str,
         runs: &[&str],
     ) -> (TargetReport, Vec<String>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             probe,
             ..Fake::new(&log)
@@ -1780,7 +1840,7 @@ mod tests {
             &Passwords::new(),
             &AtomicBool::new(false),
         );
-        let runs = log.borrow().clone();
+        let runs = log.lock().unwrap().clone();
         (report, runs)
     }
 
@@ -1843,7 +1903,7 @@ mod tests {
 
     #[test]
     fn a_probe_exiting_non_zero_fails_the_target() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let report = apply_target(
             &target("box"),
             Ok(Box::new(Fake {
@@ -1857,7 +1917,7 @@ mod tests {
             &Passwords::new(),
             &AtomicBool::new(false),
         );
-        assert_eq!(*log.borrow(), [facts::PROBE]);
+        assert_eq!(*log.lock().unwrap(), [facts::PROBE]);
         assert_eq!(
             json(&report),
             serde_json::json!({"target": "box", "error": "packages: probe exited 2", "ok": false})
@@ -1888,7 +1948,7 @@ mod tests {
             assert_eq!(screen(&report, piped()), format!("▶ box\n  ✘ {error}\n\n"));
         }
 
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let report = apply_target(
             &target("box"),
             Ok(Box::new(Fake {
@@ -1901,7 +1961,7 @@ mod tests {
             &Passwords::new(),
             &AtomicBool::new(false),
         );
-        assert_eq!(*log.borrow(), [facts::PROBE]);
+        assert_eq!(*log.lock().unwrap(), [facts::PROBE]);
         assert_eq!(
             json(&report),
             serde_json::json!({"target": "box", "error": TransportError::HostKey.to_string(), "ok": false}),
@@ -1918,14 +1978,15 @@ mod tests {
         runs: &[&str],
         cancelled: bool,
     ) -> (Report, Vec<String>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let next = RefCell::new(probes.iter());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let next = Mutex::new(probes.iter());
         let targets: Vec<Target> = names.iter().map(|name| target(name)).collect();
         let report = apply_targets(
             &targets,
+            ONE,
             |_| {
                 Ok(Box::new(Fake {
-                    probe: next.borrow_mut().next().unwrap(),
+                    probe: next.lock().unwrap().next().unwrap(),
                     ..Fake::new(&log)
                 }))
             },
@@ -1936,7 +1997,7 @@ mod tests {
             &AtomicBool::new(cancelled),
             &mut |_| {},
         );
-        let runs = log.borrow().clone();
+        let runs = log.lock().unwrap().clone();
         (report, runs)
     }
 
@@ -1976,7 +2037,7 @@ mod tests {
         assert!(runs.is_empty());
         assert_eq!(report.targets[0].failure().as_deref(), Some("cancelled"));
 
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let report = apply_target(
             &target("a"),
             Ok(Box::new(Fake::new(&log))),
@@ -1986,7 +2047,7 @@ mod tests {
             &Passwords::new(),
             &AtomicBool::new(true),
         );
-        assert!(log.borrow().is_empty(), "the probe does not run");
+        assert!(log.lock().unwrap().is_empty(), "the probe does not run");
         assert_eq!(
             report,
             TargetReport::Cancelled {
@@ -2032,13 +2093,13 @@ mod tests {
         password: Option<&[u8]>,
         tty_fail: Option<TransportError>,
     ) -> (TargetReport, Vec<String>, Vec<Vec<u8>>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             probe,
             tty_fail,
             ..Fake::new(&log)
         };
-        let typed = Rc::clone(&fake.typed);
+        let typed = Arc::clone(&fake.typed);
         let report = apply_target(
             &target("local"),
             Ok(Box::new(fake)),
@@ -2048,8 +2109,8 @@ mod tests {
             &local_passwords(password),
             &AtomicBool::new(false),
         );
-        let runs = log.borrow().clone();
-        let typed = typed.borrow().clone();
+        let runs = log.lock().unwrap().clone();
+        let typed = typed.lock().unwrap().clone();
         (report, runs, typed)
     }
 
@@ -2066,13 +2127,13 @@ mod tests {
                 Some(_) => local_sudo(pkgs.clone()),
             };
             let passwords = local_passwords(password);
-            let log = Rc::new(RefCell::new(Vec::new()));
+            let log = Arc::new(Mutex::new(Vec::new()));
             let fake = Fake {
                 probe,
                 ..Fake::new(&log)
             };
-            let timeouts = Rc::clone(&fake.timeouts);
-            let typed = Rc::clone(&fake.typed);
+            let timeouts = Arc::clone(&fake.timeouts);
+            let typed = Arc::clone(&fake.typed);
             let report = apply_target(
                 &target("local"),
                 Ok(Box::new(fake)),
@@ -2083,9 +2144,9 @@ mod tests {
                 &AtomicBool::new(false),
             );
             assert!(report.ok(), "{probe}");
-            assert_eq!(typed.borrow().len(), usize::from(password.is_some()));
+            assert_eq!(typed.lock().unwrap().len(), usize::from(password.is_some()));
             assert_eq!(
-                *timeouts.borrow(),
+                *timeouts.lock().unwrap(),
                 [RUN_TIMEOUT, package_step, RUN_TIMEOUT, RUN_TIMEOUT],
                 "{probe}"
             );
@@ -2237,7 +2298,7 @@ mod tests {
 
     #[test]
     fn a_timed_out_probe_shows_no_step() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             fail_with: Some(TransportError::Timeout {
                 after: RUN_TIMEOUT,
@@ -2425,7 +2486,7 @@ mod tests {
         );
         assert_eq!(runs[1].run, crate::run::wrap("hostname"));
         assert_eq!(
-            *plugins.seen.borrow(),
+            *plugins.seen.lock().unwrap(),
             [(
                 "harden".to_owned(),
                 serde_json::json!({
@@ -2448,7 +2509,7 @@ mod tests {
             &cancel,
         )
         .unwrap();
-        let (_, request) = &plugins.seen.borrow()[0];
+        let (_, request) = &plugins.seen.lock().unwrap()[0];
         assert_eq!(request["tags"], serde_json::json!([]));
         assert_eq!(request["args"], serde_json::json!({}), "no args is {{}}");
     }
@@ -2474,7 +2535,7 @@ mod tests {
 
     #[test]
     fn a_plugin_only_config_probes_then_runs_the_returned_script() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let report = apply_target(
             &target("box"),
             Ok(Box::new(Fake {
@@ -2487,7 +2548,7 @@ mod tests {
             &Passwords::new(),
             &AtomicBool::new(false),
         );
-        assert_eq!(*log.borrow(), [facts::PROBE, "{ :\nhostname\n}\n"]);
+        assert_eq!(*log.lock().unwrap(), [facts::PROBE, "{ :\nhostname\n}\n"]);
         assert!(report.ok());
         assert_eq!(
             report.steps()[0].run,
@@ -2498,7 +2559,7 @@ mod tests {
 
     #[test]
     fn a_plugin_failure_fails_only_its_target_before_any_of_its_steps() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let error = "plugin harden: exited 3: no profile";
         let plugins = FakePlugins::new(move |_, request| match request.target {
             "a" => Err(error.to_owned()),
@@ -2506,6 +2567,7 @@ mod tests {
         });
         let report = apply_targets(
             &[target("a"), target("b")],
+            ONE,
             |_| {
                 Ok(Box::new(Fake {
                     probe: ARCH_ROOT,
@@ -2521,7 +2583,7 @@ mod tests {
         );
         let wrapped = crate::run::wrap("hostname");
         assert_eq!(
-            *log.borrow(),
+            *log.lock().unwrap(),
             [facts::PROBE, facts::PROBE, "one", wrapped.as_str()],
             "a ran only its probe"
         );
@@ -2534,9 +2596,9 @@ mod tests {
 
     #[test]
     fn cancel_before_a_plugin_step_spawns_nothing_more() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let cancel = Rc::new(AtomicBool::new(false));
-        let stop = Rc::clone(&cancel);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
         // Cancelled while the first plugin runs: the second never starts.
         let plugins = FakePlugins::new(move |_, _| {
             stop.store(true, Ordering::Relaxed);
@@ -2556,12 +2618,13 @@ mod tests {
         );
         let seen: Vec<String> = plugins
             .seen
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
         assert_eq!(seen, ["harden"]);
-        assert_eq!(*log.borrow(), [facts::PROBE], "no step ran");
+        assert_eq!(*log.lock().unwrap(), [facts::PROBE], "no step ran");
         assert_eq!(
             report,
             TargetReport::Cancelled {
@@ -2596,7 +2659,7 @@ mod tests {
                 "probe: probe output has no end marker",
             ),
         ] {
-            let log = Rc::new(RefCell::new(Vec::new()));
+            let log = Arc::new(Mutex::new(Vec::new()));
             let report = apply_target(
                 &target("box"),
                 Ok(Box::new(Fake {
@@ -2610,7 +2673,7 @@ mod tests {
                 &Passwords::new(),
                 &AtomicBool::new(false),
             );
-            assert_eq!(*log.borrow(), [facts::PROBE]);
+            assert_eq!(*log.lock().unwrap(), [facts::PROBE]);
             assert_eq!(report.failure().as_deref(), Some(error));
         }
     }
@@ -2619,8 +2682,8 @@ mod tests {
     fn a_bad_pin_is_exit_two_before_any_target() {
         let (dir, opts, config) = crate::test_util::bad_pin("apply");
         let mut started = 0;
-        let failure = run_targets(&opts, &config, &AtomicBool::new(false), &mut |progress| {
-            if let Progress::Start(_) = progress {
+        let failure = run_targets(&opts, &config, &mut |progress| {
+            if let Progress::Start(..) = progress {
                 started += 1;
             }
         })
@@ -2653,8 +2716,8 @@ mod tests {
 
     #[test]
     fn apply_targets_hands_each_target_its_own_secret() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let typed = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let typed = Arc::new(Mutex::new(Vec::new()));
         let mut a = target("a");
         a.sudo_secret = Some("A_SUDO".to_owned());
         let mut b = target("b");
@@ -2673,10 +2736,11 @@ mod tests {
         ]);
         let report = apply_targets(
             &[local, a, b],
+            ONE,
             |_| {
                 Ok(Box::new(Fake {
                     probe: ARCH_SUDO,
-                    typed: Rc::clone(&typed),
+                    typed: Arc::clone(&typed),
                     ..Fake::new(&log)
                 }))
             },
@@ -2687,7 +2751,7 @@ mod tests {
             &AtomicBool::new(false),
             &mut |_| {},
         );
-        assert_eq!(*typed.borrow(), [&b"pw-local"[..], b"pw-a"]);
+        assert_eq!(*typed.lock().unwrap(), [&b"pw-local"[..], b"pw-a"]);
         assert_eq!(report.counts(), (2, 1));
         assert_eq!(
             report.targets[2].failure().unwrap(),
@@ -2816,12 +2880,12 @@ mod tests {
         probe: &'static str,
         passwords: &Passwords,
     ) -> (TargetReport, Vec<String>, Vec<Vec<u8>>) {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             probe,
             ..Fake::new(&log)
         };
-        let typed = Rc::clone(&fake.typed);
+        let typed = Arc::clone(&fake.typed);
         let report = apply_target(
             target,
             Ok(Box::new(fake)),
@@ -2831,8 +2895,8 @@ mod tests {
             passwords,
             &AtomicBool::new(false),
         );
-        let runs = log.borrow().clone();
-        let typed = typed.borrow().clone();
+        let runs = log.lock().unwrap().clone();
+        let typed = typed.lock().unwrap().clone();
         (report, runs, typed)
     }
 
@@ -2945,16 +3009,16 @@ mod tests {
     /// as `ARCH_SUDO`, with `LOCAL_SUDO` holding `password` (unset when
     /// `None`); returns the report, the scripts run and the passwords typed.
     fn apply_password_file(
-        log: &Rc<RefCell<Vec<String>>>,
+        log: &Arc<Mutex<Vec<String>>>,
         fake: Fake,
         password: Option<&[u8]>,
     ) -> (TargetReport, Vec<String>, Vec<Vec<u8>>) {
         let (local, config) = password_file();
-        let typed = Rc::clone(&fake.typed);
+        let typed = Arc::clone(&fake.typed);
         let cancel = fake
             .cancel_on
             .as_ref()
-            .map_or_else(Rc::default, |(_, flag)| Rc::clone(flag));
+            .map_or_else(Arc::default, |(_, flag)| Arc::clone(flag));
         let report = apply_target(
             &local,
             Ok(Box::new(Fake {
@@ -2967,8 +3031,8 @@ mod tests {
             &local_passwords(password),
             &cancel,
         );
-        let runs = log.borrow().clone();
-        let typed = typed.borrow().clone();
+        let runs = log.lock().unwrap().clone();
+        let typed = typed.lock().unwrap().clone();
         (report, runs, typed)
     }
 
@@ -2984,7 +3048,7 @@ mod tests {
 
     #[test]
     fn a_password_file_is_staged_then_installed_on_a_terminal_then_removed() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let (report, runs, typed) =
             apply_password_file(&log, Fake::new(&log), Some(PASSWORD.as_bytes()));
         assert!(report.ok(), "{report:?}");
@@ -3021,7 +3085,7 @@ mod tests {
 
     #[test]
     fn a_failed_stage_installs_nothing_and_still_removes_the_temp_file() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             exits: &[("set -C", 1)],
             ..Fake::new(&log)
@@ -3042,7 +3106,7 @@ mod tests {
         temp_of(&runs[2]);
         assert!(typed.is_empty());
 
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             fail_with: Some(TransportError::HostKey),
             succeed: 1,
@@ -3061,9 +3125,9 @@ mod tests {
 
     #[test]
     fn a_cancel_after_the_stage_removes_the_temp_file_and_installs_nothing() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
-            cancel_on: Some(("set -C", Rc::new(AtomicBool::new(false)))),
+            cancel_on: Some(("set -C", Arc::new(AtomicBool::new(false)))),
             ..Fake::new(&log)
         };
         let (report, runs, typed) = apply_password_file(&log, fake, Some(PASSWORD.as_bytes()));
@@ -3075,6 +3139,82 @@ mod tests {
         assert_eq!(runs.len(), 3, "probe, stage, cleanup: {runs:?}");
         temp_of(&runs[2]);
         assert!(typed.is_empty(), "no password is typed");
+    }
+
+    #[test]
+    fn the_cleanup_runs_where_a_cancelled_transport_refuses_new_work() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let fake = Fake {
+            cancel_on: Some(("set -C", Arc::new(AtomicBool::new(false)))),
+            refuse_once_cancelled: true,
+            ..Fake::new(&log)
+        };
+        let (report, runs, typed) = apply_password_file(&log, fake, Some(PASSWORD.as_bytes()));
+        assert!(
+            matches!(report, TargetReport::Cancelled { .. }),
+            "{report:?}"
+        );
+        assert_eq!(runs.len(), 3, "probe, stage, cleanup: {runs:?}");
+        temp_of(&runs[2]);
+        assert!(typed.is_empty(), "no password is typed");
+    }
+
+    #[test]
+    fn a_cancelled_transport_ends_the_target_as_cancelled_with_its_steps() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let fake = Fake {
+            cancel_on: Some(("one", Arc::clone(&cancel))),
+            refuse_once_cancelled: true,
+            ..Fake::new(&log)
+        };
+        // `cancel` stays unset for execute: only the transport refuses.
+        let report = execute(
+            &target("box"),
+            &fake,
+            &[
+                planned("one", None, RUN_TIMEOUT),
+                planned("two", None, RUN_TIMEOUT),
+            ],
+            &Passwords::new(),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            report,
+            TargetReport::Cancelled {
+                target: "box".to_owned(),
+                steps: vec![step("one", Some(0), "one-out\n", "")],
+                ok: false,
+            }
+        );
+        assert_eq!(report.failure().unwrap(), "cancelled");
+
+        // The probe too.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cancel = Arc::new(AtomicBool::new(true));
+        let fake = Fake {
+            cancel_on: Some(("never", cancel)),
+            refuse_once_cancelled: true,
+            ..Fake::new(&log)
+        };
+        let report = apply_target(
+            &target("box"),
+            Ok(Box::new(fake)),
+            &config(Some(&packages(&["git"], false)), &["one"]),
+            &Sources::default(),
+            &FakePlugins::none(),
+            &Passwords::new(),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            report,
+            TargetReport::Cancelled {
+                target: "box".to_owned(),
+                steps: vec![],
+                ok: false,
+            }
+        );
+        assert!(log.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -3094,7 +3234,7 @@ mod tests {
             ),
             (timeout.clone(), timeout.to_string()),
         ] {
-            let log = Rc::new(RefCell::new(Vec::new()));
+            let log = Arc::new(Mutex::new(Vec::new()));
             let fake = Fake {
                 tty_fail: Some(err),
                 ..Fake::new(&log)
@@ -3110,7 +3250,7 @@ mod tests {
 
     #[test]
     fn a_cleanup_on_a_dead_transport_keeps_the_step_result() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         // The probe, the stage and the terminal run pass; the cleanup and
         // `one` hit the dead transport.
         let fake = Fake {
@@ -3133,7 +3273,7 @@ mod tests {
 
     #[test]
     fn an_unset_secret_fails_its_target_before_staging_and_the_others_run() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let (report, runs, _) = apply_password_file(&log, Fake::new(&log), None);
         assert_eq!(
             report.failure().unwrap(),
@@ -3144,9 +3284,10 @@ mod tests {
         let (local, config) = password_file();
         let mut unset = target("b");
         unset.sudo_secret = Some("B_SUDO".to_owned());
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let report = apply_targets(
             &[unset, local],
+            ONE,
             |_| {
                 Ok(Box::new(Fake {
                     probe: ARCH_SUDO,
@@ -3250,12 +3391,12 @@ mod tests {
             ],
             &["one"],
         );
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             probe: ARCH_ROOT,
             ..Fake::new(&log)
         };
-        let timeouts = Rc::clone(&fake.timeouts);
+        let timeouts = Arc::clone(&fake.timeouts);
         let report = apply_target(
             &target("local"),
             Ok(Box::new(fake)),
@@ -3266,7 +3407,7 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert!(report.ok(), "{report:?}");
-        let runs = log.borrow().clone();
+        let runs = log.lock().unwrap().clone();
         assert_eq!(
             runs.len(),
             5,
@@ -3282,8 +3423,8 @@ mod tests {
         assert!(!runs[3].contains("sudo"), "root runs systemctl itself");
         assert_eq!(runs[4], "one");
         assert!(!runs.iter().any(|run| run.contains("cron")), "{runs:?}");
-        assert_eq!(timeouts.borrow()[3], services::SERVICE_TIMEOUT);
-        assert_eq!(timeouts.borrow()[4], RUN_TIMEOUT);
+        assert_eq!(timeouts.lock().unwrap()[3], services::SERVICE_TIMEOUT);
+        assert_eq!(timeouts.lock().unwrap()[4], RUN_TIMEOUT);
 
         let shown: Vec<(&str, bool)> = report
             .steps()
@@ -3364,13 +3505,14 @@ mod tests {
             ),
             (no_sudo, "services: needs root and sudo is not installed"),
         ] {
-            let log = Rc::new(RefCell::new(Vec::new()));
-            let next = RefCell::new([probe, ARCH_ROOT].into_iter());
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let next = Mutex::new([probe, ARCH_ROOT].into_iter());
             let report = apply_targets(
                 &[target("a"), target("b")],
+                ONE,
                 |_| {
                     Ok(Box::new(Fake {
-                        probe: next.borrow_mut().next().unwrap(),
+                        probe: next.lock().unwrap().next().unwrap(),
                         ..Fake::new(&log)
                     }))
                 },
@@ -3384,7 +3526,7 @@ mod tests {
             assert_eq!(report.counts(), (1, 1), "{report:?}");
             assert_eq!(report.targets[0].failure().unwrap(), error);
             assert!(report.targets[0].steps().is_empty());
-            let runs = log.borrow().clone();
+            let runs = log.lock().unwrap().clone();
             assert_eq!(runs.len(), 4, "probe a; probe b, service, one: {runs:?}");
             assert_eq!(runs[3], "one");
         }
@@ -3414,7 +3556,7 @@ mod tests {
             ],
             &["one"],
         );
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let report = apply_target(
             &target("local"),
             Ok(Box::new(Fake {
@@ -3435,7 +3577,7 @@ mod tests {
             (steps[0].run.as_str(), steps[0].code),
             ("service sshd", Some(1))
         );
-        assert_eq!(log.borrow().len(), 2, "cron and one never run");
+        assert_eq!(log.lock().unwrap().len(), 2, "cron and one never run");
     }
 
     /// Applies one `sshd` entry to `local`, whose sudo asks for a password
@@ -3451,13 +3593,13 @@ mod tests {
             vec![service_entry("sshd", "started", Some(true), &[])],
             &["one"],
         );
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             probe: ARCH_SUDO,
             tty_fail,
             ..Fake::new(&log)
         };
-        let typed = Rc::clone(&fake.typed);
+        let typed = Arc::clone(&fake.typed);
         let report = apply_target(
             &local,
             Ok(Box::new(fake)),
@@ -3467,8 +3609,8 @@ mod tests {
             &local_passwords(password),
             &AtomicBool::new(false),
         );
-        let runs = log.borrow().clone();
-        let typed = typed.borrow().clone();
+        let runs = log.lock().unwrap().clone();
+        let typed = typed.lock().unwrap().clone();
         (report, runs, typed, config)
     }
 
@@ -3574,5 +3716,340 @@ mod tests {
             result.unwrap().get("LOCAL_SUDO").map(|pw| pw.as_slice()),
             Some(&b"pw"[..])
         );
+    }
+
+    /// What a [`Hooked`] transport calls before each script: the target's
+    /// name and the script; an `Err` code is the script's exit code.
+    type Hook = dyn Fn(&str, &str) -> Result<(), i32> + Send + Sync;
+
+    /// Each `run_tty`'s target and the password typed.
+    type Typed = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// Runs every script through `hook`, then echoes `<script>-out`; each
+    /// `run_tty` is recorded in `typed`.
+    struct Hooked {
+        name: String,
+        hook: Arc<Hook>,
+        typed: Typed,
+    }
+
+    impl Hooked {
+        fn output(&self, script: &str) -> Result<Output, TransportError> {
+            let code = (self.hook)(&self.name, script).err().unwrap_or(0);
+            Ok(Output {
+                stdout: format!("{script}-out\n").into_bytes(),
+                code: Some(code),
+                ..Output::default()
+            })
+        }
+    }
+
+    impl Transport for Hooked {
+        fn name(&self) -> &str {
+            "hooked"
+        }
+
+        fn run(&self, script: &str, _timeout: Duration) -> Result<Output, TransportError> {
+            self.output(script)
+        }
+
+        fn run_tty(
+            &self,
+            script: &str,
+            password: &[u8],
+            _timeout: Duration,
+        ) -> Result<Output, TransportError> {
+            let output = self.output(script);
+            (self.typed.lock().unwrap()).push((self.name.clone(), password.to_vec()));
+            output
+        }
+    }
+
+    /// Applies `runs` to `names` over [`Hooked`] transports, `parallel` at a
+    /// time; `on` sees every event. Returns the report and how many
+    /// transports were built.
+    fn apply_hooked(
+        names: &[&str],
+        parallel: u8,
+        runs: &[&str],
+        cancel: &AtomicBool,
+        hook: impl Fn(&str, &str) -> Result<(), i32> + Send + Sync + 'static,
+        on: &mut dyn FnMut(Progress<'_>),
+    ) -> (Report, usize) {
+        let hook: Arc<Hook> = Arc::new(hook);
+        let built = std::sync::atomic::AtomicUsize::new(0);
+        let targets: Vec<Target> = names.iter().map(|name| target(name)).collect();
+        let report = apply_targets(
+            &targets,
+            NonZeroU8::new(parallel).unwrap(),
+            |target| {
+                built.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(Hooked {
+                    name: target.name.clone(),
+                    hook: Arc::clone(&hook),
+                    typed: Arc::default(),
+                }))
+            },
+            &config(None, runs),
+            &Sources::default(),
+            &FakePlugins::none(),
+            &Passwords::new(),
+            cancel,
+            on,
+        );
+        (report, built.into_inner())
+    }
+
+    #[test]
+    fn blocks_and_json_keep_inventory_order_when_a_later_target_ends_first() {
+        let meet = Arc::new(Meet::new(2));
+        let held = Arc::clone(&meet);
+        let blocks = Mutex::new(Vec::new());
+        let mut ends = Vec::new();
+        let mut print = fanout::in_order(|report: &TargetReport| {
+            blocks.lock().unwrap().push(screen(report, piped()));
+        });
+        let (report, _) = apply_hooked(
+            &["local", "b"],
+            2,
+            &["one"],
+            &AtomicBool::new(false),
+            // local's step ends only once b's report is in.
+            move |name, _| {
+                if name == "local" {
+                    assert!(held.arrive(), "b never ended");
+                }
+                Ok(())
+            },
+            &mut |progress| {
+                if let Progress::Done(index, _) = progress {
+                    ends.push(index);
+                    if index == 1 {
+                        assert!(meet.arrive());
+                    }
+                }
+                print(progress);
+            },
+        );
+        assert_eq!(ends, [1, 0], "b ended first");
+        assert_eq!(
+            *blocks.lock().unwrap(),
+            [
+                "▶ local\n  $ one\n  one-out\n  ✔ ok · 1 step\n\n",
+                "▶ b\n  $ one\n  one-out\n  ✔ ok · 1 step\n\n"
+            ]
+        );
+        let value = json(&report);
+        assert_eq!(value["targets"][0]["target"], "local");
+        assert_eq!(value["targets"][1]["target"], "b");
+    }
+
+    #[test]
+    fn cancel_ends_the_running_targets_after_their_step_and_builds_no_more() {
+        for parallel in [1, 2] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&cancel);
+            let parties = usize::from(parallel);
+            let (started, cancelled) = (Meet::new(parties), Meet::new(parties));
+            let (report, built) = apply_hooked(
+                &["a", "b", "c"],
+                parallel,
+                &["meet", "two"],
+                &cancel,
+                move |name, _| {
+                    // With two at once, b is mid-step while a cancels.
+                    assert!(started.arrive());
+                    if name == "a" {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    assert!(cancelled.arrive());
+                    Ok(())
+                },
+                &mut |_| {},
+            );
+            let ran = step("meet", Some(0), "meet-out\n", "");
+            let expected: Vec<TargetReport> = [("a", true), ("b", parallel == 2), ("c", false)]
+                .into_iter()
+                .map(|(name, started)| TargetReport::Cancelled {
+                    target: name.to_owned(),
+                    steps: if started { vec![ran.clone()] } else { vec![] },
+                    ok: false,
+                })
+                .collect();
+            assert_eq!(report.targets, expected, "--parallel {parallel}");
+            assert_eq!(built, parties, "no transport after cancel");
+        }
+    }
+
+    #[test]
+    fn a_failing_or_panicking_target_leaves_the_others_running() {
+        let meet = Arc::new(Meet::new(3));
+        let (report, _) = apply_hooked(
+            &["a", "b", "c"],
+            3,
+            &["one", "two"],
+            &AtomicBool::new(false),
+            move |name, script| {
+                if script == "one" {
+                    assert!(meet.arrive());
+                }
+                match (name, script) {
+                    ("a", "one") => Err(3),
+                    ("b", "two") => panic!("b blew up"),
+                    _ => Ok(()),
+                }
+            },
+            &mut |_| {},
+        );
+        assert_eq!(report.targets[0].failure().unwrap(), "step 1 exited 3");
+        assert_eq!(
+            report.targets[1],
+            TargetReport::Failed {
+                target: "b".to_owned(),
+                steps: vec![],
+                error: "internal error: b blew up".to_owned(),
+                ok: false,
+            }
+        );
+        assert!(report.targets[2].ok(), "{:?}", report.targets[2]);
+        assert_eq!(report.targets[2].steps().len(), 2);
+        assert_eq!(report.counts(), (1, 2));
+    }
+
+    #[test]
+    fn two_password_steps_at_once_each_type_their_own_password() {
+        let meet = Arc::new(Meet::new(2));
+        let typed = Typed::default();
+        let passwords = Passwords::from([
+            ("A_SUDO".to_owned(), b"pw-a".to_vec().into()),
+            ("B_SUDO".to_owned(), b"pw-b".to_vec().into()),
+        ]);
+        let targets = [target("a"), target("b")];
+        let cancel = AtomicBool::new(false);
+        let report = for_each_target(
+            &targets,
+            NonZeroU8::new(2).unwrap(),
+            &cancel,
+            &mut |_| {},
+            |t| {
+                let meet = Arc::clone(&meet);
+                let transport = Hooked {
+                    name: t.name.clone(),
+                    hook: Arc::new(move |_, _| {
+                        assert!(meet.arrive(), "the two steps ran at once");
+                        Ok(())
+                    }),
+                    typed: Arc::clone(&typed),
+                };
+                let secret = format!("{}_SUDO", t.name.to_uppercase());
+                let runs = [planned("install", Some(&secret), RUN_TIMEOUT)];
+                execute(t, &transport, &runs, &passwords, &cancel)
+            },
+        );
+        assert!(report.ok, "{report:?}");
+        let mut typed = typed.lock().unwrap().clone();
+        typed.sort();
+        assert_eq!(
+            typed,
+            [
+                ("a".to_owned(), b"pw-a".to_vec()),
+                ("b".to_owned(), b"pw-b".to_vec())
+            ]
+        );
+    }
+
+    /// An ssh transport through `tests/fixtures/fake-ssh.sh` under `home`
+    /// whose master exits when the stage has run, and that sets `cancel`
+    /// then.
+    #[cfg(debug_assertions)]
+    struct DiesAfterStage {
+        ssh: crate::ssh::Ssh,
+        stage: String,
+        marker: std::path::PathBuf,
+        cancel: Arc<AtomicBool>,
+    }
+
+    #[cfg(debug_assertions)]
+    impl Transport for DiesAfterStage {
+        fn name(&self) -> &str {
+            "ssh"
+        }
+
+        fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
+            let output = self.ssh.run(script, timeout);
+            if script == self.stage {
+                std::fs::remove_file(&self.marker).unwrap();
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            output
+        }
+
+        fn run_uncancelled(
+            &self,
+            script: &str,
+            timeout: Duration,
+        ) -> Result<Output, TransportError> {
+            self.ssh.run_uncancelled(script, timeout)
+        }
+
+        fn run_tty(&self, _: &str, _: &[u8], _: Duration) -> Result<Output, TransportError> {
+            unreachable!("cancelled before the install")
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn over_ssh_the_cleanup_reopens_a_dead_master_after_cancel() {
+        let home = crate::test_util::temp_dir("apply-cleanup");
+        let log = home.join("argv.log");
+        crate::test_util::write_knobs(
+            &home.join("fake-ssh.env"),
+            &[("FAKE_SSH_LOG", log.to_str().unwrap())],
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut ssh = crate::ssh::Ssh::new(
+            crate::ssh::SshSettings {
+                program: crate::test_util::fixture("fake-ssh.sh"),
+                can_prompt: false,
+                key_timeout: crate::ssh::KEY_TIMEOUT,
+                check_timeout: crate::ssh::CHECK_TIMEOUT,
+                cancel: Arc::clone(&cancel),
+            },
+            None,
+            "box",
+            None,
+            None,
+        )
+        .unwrap();
+        ssh.home = home.clone();
+        let temp = home.join("staged");
+        let upload = Upload {
+            stage: format!("echo bytes > '{}'", temp.display()),
+            cleanup: format!("rm -f '{}'", temp.display()),
+        };
+        let transport = DiesAfterStage {
+            ssh,
+            stage: upload.stage.clone(),
+            marker: home.join(".ssh/anvil/box.master"),
+            cancel: Arc::clone(&cancel),
+        };
+        let result = send_file(
+            &target("box"),
+            &transport,
+            &upload,
+            "install",
+            b"pw",
+            RUN_TIMEOUT,
+            &cancel,
+        );
+        assert!(result.is_none(), "cancelled");
+        assert!(!temp.exists(), "the cleanup removed the temp file");
+        let masters = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains(" -M "))
+            .count();
+        assert_eq!(masters, 2, "the cleanup opened a new master");
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }

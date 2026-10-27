@@ -4,7 +4,6 @@
 //! update's check or install sends only `UpdateChecked` or `Updated`. A panic
 //! in the run becomes `Msg::Panicked`, caught by joining the run's thread.
 
-use std::any::Any;
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -14,8 +13,9 @@ use std::time::Duration;
 
 use super::app::{self, Job, Msg};
 use crate::cli::Failure;
+use crate::inventory::Target;
 use crate::options::Options;
-use crate::{apply, doctor, plan, run, update};
+use crate::{apply, doctor, fanout, plan, run, update};
 
 /// A run in progress; [`Worker::join`] waits for it, which is quick once
 /// `Finished` or `Panicked` has arrived.
@@ -35,11 +35,12 @@ impl Worker {
 /// Starts `job` with `opts` (its targets already selected); `cancel` stops
 /// apply and run between targets and steps, and plan between targets.
 pub fn spawn(job: Job, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) -> Worker {
+    let opts = job_opts(&job, opts, &cancel);
     match job {
         Job::Doctor => spawn_job(tx, move |tx| run_doctor(&opts, tx)),
-        Job::Apply => spawn_job(tx, move |tx| run_apply(&opts, &cancel, tx)),
-        Job::Plan => spawn_job(tx, move |tx| run_plan(&opts, &cancel, tx)),
-        Job::Run(script) => spawn_job(tx, move |tx| run_script(&opts, script, &cancel, tx)),
+        Job::Apply => spawn_job(tx, move |tx| run_apply(&opts, tx)),
+        Job::Plan => spawn_job(tx, move |tx| run_plan(&opts, tx)),
+        Job::Run(script) => spawn_job(tx, move |tx| run_script(&opts, script, tx)),
         // curl, tar and the smoke run capture their output and read no
         // stdin, so nothing reaches the screen.
         Job::UpdateCheck => spawn_task(tx, move |_| {
@@ -53,6 +54,15 @@ pub fn spawn(job: Job, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) 
             )
         }),
     }
+}
+
+/// `opts` as `job` runs with them: apply, plan and run carry `cancel`, which
+/// ssh checks before opening a master.
+fn job_opts(job: &Job, mut opts: Options, cancel: &Arc<AtomicBool>) -> Options {
+    if matches!(job, Job::Apply | Job::Plan | Job::Run(_)) {
+        opts.cancel = Arc::clone(cancel);
+    }
+    opts
 }
 
 thread_local! {
@@ -87,7 +97,7 @@ fn spawn_task(tx: Sender<Msg>, task: impl FnOnce(&Sender<Msg>) -> Msg + Send + '
             })
         };
         if let Err(payload) = run.join() {
-            let _ = tx.send(Msg::Panicked(panic_message(payload.as_ref())));
+            let _ = tx.send(Msg::Panicked(fanout::panic_message(payload.as_ref())));
         }
     }))
 }
@@ -110,56 +120,54 @@ fn run_doctor(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
 /// As [`run_doctor`]: the config, and the secret store when a target types a
 /// sudo password (in [`apply::run_targets`]), are opened here, on the worker.
 /// The steps sent are this config's, which may be newer than the app's.
-fn run_apply(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(), Failure> {
+fn run_apply(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
     let config = opts.load_config()?;
     let _ = tx.send(Msg::Steps(app::step_rows(&config)));
-    apply::run_targets(opts, &config, cancel, &mut send_progress(tx))?;
+    apply::run_targets(opts, &config, &mut send_progress(tx))?;
     Ok(())
 }
 
 /// Sends each of apply's (or run's) progress events to the main loop.
 fn send_progress(tx: &Sender<Msg>) -> impl FnMut(apply::Progress<'_>) + '_ {
     |progress| {
-        let _ = tx.send(match progress {
+        let msg = match progress {
+            apply::Progress::Begin(targets) => Msg::Begin(names(targets)),
             apply::Progress::Start(target) => Msg::Start(target.name.clone()),
-            apply::Progress::Done(report) => Msg::TargetDone(report.clone()),
-        });
+            apply::Progress::Done(index, report) => Msg::TargetDone(index, report.clone()),
+            // The fixed slots place each report by its index.
+            apply::Progress::Ordered(_) => return,
+        };
+        let _ = tx.send(msg);
     }
+}
+
+fn names(targets: &[Target]) -> Vec<String> {
+    targets.iter().map(|target| target.name.clone()).collect()
 }
 
 /// As `anvil run`: no config and no secret store, the default timeout. The
 /// one step sent is the script, as its `$` line shows it.
-fn run_script(
-    opts: &Options,
-    script: String,
-    cancel: &AtomicBool,
-    tx: &Sender<Msg>,
-) -> Result<(), Failure> {
+fn run_script(opts: &Options, script: String, tx: &Sender<Msg>) -> Result<(), Failure> {
     let label = apply::command(&script);
     let _ = tx.send(Msg::Steps(vec![app::StepRow { label }]));
     let timeout = Duration::from_secs(run::DEFAULT_TIMEOUT);
-    run::run_targets(opts, script, timeout, cancel, &mut send_progress(tx))?;
+    run::run_targets(opts, script, timeout, &mut send_progress(tx))?;
     Ok(())
 }
 
 /// Plan opens no secret store; the steps pane keeps the app's list.
-fn run_plan(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(), Failure> {
+fn run_plan(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
     let config = opts.load_config()?;
-    plan::run_targets(opts, &config, cancel, &mut |progress| {
-        let _ = tx.send(match progress {
+    plan::run_targets(opts, &config, &mut |progress| {
+        let msg = match progress {
+            plan::Progress::Begin(targets) => Msg::Begin(names(targets)),
             plan::Progress::Start(target) => Msg::Start(target.name.clone()),
-            plan::Progress::Done(report) => Msg::PlanDone(report.clone()),
-        });
+            plan::Progress::Done(index, report) => Msg::PlanDone(index, report.clone()),
+            plan::Progress::Ordered(_) => return,
+        };
+        let _ = tx.send(msg);
     })?;
     Ok(())
-}
-
-fn panic_message(payload: &(dyn Any + Send)) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_owned())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "unknown panic".to_owned())
 }
 
 #[cfg(test)]
@@ -171,7 +179,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
-    use crate::test_util::temp_dir;
+    use crate::test_util::{temp_dir, wait_for};
     use crate::tui::app::tests::{opts, row};
     use crate::tui::app::{App, RunResult};
 
@@ -261,9 +269,10 @@ mod tests {
         msgs.iter()
             .map(|msg| match msg {
                 Msg::Steps(rows) => format!("steps {}", rows.len()),
+                Msg::Begin(names) => format!("begin {}", names.join(" ")),
                 Msg::Start(name) => format!("start {name}"),
-                Msg::TargetDone(report) => format!("done {}", report.target()),
-                Msg::PlanDone(report) => format!("done {}", report.target()),
+                Msg::TargetDone(index, report) => format!("done {index} {}", report.target()),
+                Msg::PlanDone(index, report) => format!("done {index} {}", report.target()),
                 Msg::DoctorTarget(report) => format!("done {}", report.target),
                 Msg::DoctorDone(_) => "doctor done".to_owned(),
                 Msg::Finished(result) => format!("finished {result:?}"),
@@ -290,28 +299,32 @@ mod tests {
             order(&msgs),
             [
                 "steps 1",
+                "begin down up",
                 "start down",
-                "done down",
+                "done 0 down",
                 "start up",
-                "done up",
+                "done 1 up",
                 "finished Ok(())"
             ]
         );
-        match &msgs[2] {
-            Msg::TargetDone(apply::TargetReport::Failed {
-                target,
-                steps,
-                error,
-                ok,
-            }) => {
+        match &msgs[3] {
+            Msg::TargetDone(
+                _,
+                apply::TargetReport::Failed {
+                    target,
+                    steps,
+                    error,
+                    ok,
+                },
+            ) => {
                 assert_eq!((target.as_str(), *ok), ("down", false));
                 assert!(steps.is_empty());
                 assert_eq!(error, &format!("cannot connect: {REFUSED}"));
             }
             _ => panic!("expected a Failed report for down"),
         }
-        match &msgs[4] {
-            Msg::TargetDone(apply::TargetReport::Ran { target, steps, ok }) => {
+        match &msgs[5] {
+            Msg::TargetDone(_, apply::TargetReport::Ran { target, steps, ok }) => {
                 assert_eq!((target.as_str(), *ok), ("up", true));
                 assert_eq!(steps[0].stdout, "hi\n");
             }
@@ -358,17 +371,18 @@ mod tests {
         let opts = local_opts("tui-worker-apply", &["printf 'hi\\n'"]);
         let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
         let msgs = collect(worker, &rx);
-        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs.len(), 5);
         assert!(matches!(&msgs[0], Msg::Steps(rows) if rows[..] == [row("printf 'hi\\n'")]));
-        assert!(matches!(&msgs[1], Msg::Start(name) if name == "local"));
-        match &msgs[2] {
-            Msg::TargetDone(apply::TargetReport::Ran { target, steps, ok }) => {
+        assert!(matches!(&msgs[1], Msg::Begin(names) if names[..] == ["local"]));
+        assert!(matches!(&msgs[2], Msg::Start(name) if name == "local"));
+        match &msgs[3] {
+            Msg::TargetDone(_, apply::TargetReport::Ran { target, steps, ok }) => {
                 assert_eq!((target.as_str(), *ok), ("local", true));
                 assert_eq!(steps[0].stdout, "hi\n");
             }
             _ => panic!("expected TargetDone"),
         }
-        assert!(matches!(&msgs[3], Msg::Finished(Ok(()))));
+        assert!(matches!(&msgs[4], Msg::Finished(Ok(()))));
     }
 
     #[test]
@@ -384,11 +398,11 @@ mod tests {
             tx,
         );
         let msgs = collect(worker, &rx);
-        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs.len(), 5);
         assert!(matches!(&msgs[0], Msg::Steps(rows) if rows[..] == [row("printf 'one\\n' …")]));
-        assert!(matches!(&msgs[1], Msg::Start(name) if name == "local"));
-        match &msgs[2] {
-            Msg::TargetDone(apply::TargetReport::Ran { target, steps, ok }) => {
+        assert!(matches!(&msgs[2], Msg::Start(name) if name == "local"));
+        match &msgs[3] {
+            Msg::TargetDone(_, apply::TargetReport::Ran { target, steps, ok }) => {
                 assert_eq!((target.as_str(), *ok), ("local", true));
                 assert_eq!(
                     (steps[0].run.as_str(), steps[0].stdout.as_str()),
@@ -397,15 +411,15 @@ mod tests {
             }
             _ => panic!("expected TargetDone"),
         }
-        assert!(matches!(&msgs[3], Msg::Finished(Ok(()))));
+        assert!(matches!(&msgs[4], Msg::Finished(Ok(()))));
 
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-run-cancel", &[]);
         let cancel = Arc::new(AtomicBool::new(true));
         let worker = spawn(Job::Run("true".to_owned()), opts, cancel, tx);
         assert!(matches!(
-            &collect(worker, &rx)[2],
-            Msg::TargetDone(apply::TargetReport::Cancelled { .. })
+            &collect(worker, &rx)[3],
+            Msg::TargetDone(_, apply::TargetReport::Cancelled { .. })
         ));
     }
 
@@ -422,16 +436,17 @@ mod tests {
         .unwrap();
         let worker = spawn(Job::Plan, opts, Arc::new(AtomicBool::new(false)), tx);
         let msgs = collect(worker, &rx);
-        assert_eq!(msgs.len(), 3);
-        assert!(matches!(&msgs[0], Msg::Start(name) if name == "local"));
-        match &msgs[1] {
-            Msg::PlanDone(plan::PlanReport::Planned { target, steps, ok }) => {
+        assert_eq!(msgs.len(), 4);
+        assert!(matches!(&msgs[0], Msg::Begin(names) if names[..] == ["local"]));
+        assert!(matches!(&msgs[1], Msg::Start(name) if name == "local"));
+        match &msgs[2] {
+            Msg::PlanDone(_, plan::PlanReport::Planned { target, steps, ok }) => {
                 assert_eq!((target.as_str(), *ok), ("local", true));
                 assert_eq!(steps[0].run, format!("touch {}", ran.display()));
             }
             _ => panic!("expected PlanDone"),
         }
-        assert!(matches!(&msgs[2], Msg::Finished(Ok(()))));
+        assert!(matches!(&msgs[3], Msg::Finished(Ok(()))));
         assert!(!ran.exists(), "the step did not run");
 
         let (tx, rx) = mpsc::channel();
@@ -439,8 +454,8 @@ mod tests {
         let worker = spawn(Job::Plan, opts, Arc::new(AtomicBool::new(true)), tx);
         let msgs = collect(worker, &rx);
         assert!(matches!(
-            &msgs[1],
-            Msg::PlanDone(plan::PlanReport::Cancelled { .. })
+            &msgs[2],
+            Msg::PlanDone(_, plan::PlanReport::Cancelled { .. })
         ));
     }
 
@@ -451,9 +466,83 @@ mod tests {
         let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(true)), tx);
         let msgs = collect(worker, &rx);
         assert!(matches!(
-            &msgs[2],
-            Msg::TargetDone(apply::TargetReport::Cancelled { steps, .. }) if steps.is_empty()
+            &msgs[3],
+            Msg::TargetDone(_, apply::TargetReport::Cancelled { steps, .. }) if steps.is_empty()
         ));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn esc_reaches_the_ssh_check_of_a_running_target() {
+        let mut opts = fake_ssh_opts("tw-esc", &["true"]);
+        opts.target = vec!["down".to_owned()];
+        let home = opts.ssh_home.clone().unwrap();
+        let gate = home.join("gate");
+        crate::test_util::write_knobs(
+            &home.join("fake-ssh.env"),
+            &[("FAKE_SSH_GATE", gate.to_str().unwrap())],
+        );
+        let mut app = App::with_inventory(opts, Err("not loaded yet".to_owned()), Ok(Vec::new()));
+        app.reload();
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let (tx, rx) = mpsc::channel();
+        let cancel = app.running.as_ref().unwrap().cancel.clone();
+        let worker = spawn(Job::Apply, app.opts.clone(), cancel, tx);
+        // down's key attempt is under way: Esc, then it is refused.
+        wait_for(&home.join("gate.wait"));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        fs::write(&gate, "").unwrap();
+        let msgs = collect(worker, &rx);
+        assert!(
+            matches!(
+                &msgs[3],
+                Msg::TargetDone(_, apply::TargetReport::Cancelled { target, steps, .. })
+                    if target == "down" && steps.is_empty()
+            ),
+            "the refused master is cancelled, not a failure"
+        );
+    }
+
+    #[test]
+    fn apply_plan_and_run_carry_the_cancel_flag_and_the_parallel_count() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        for job in [
+            Job::Apply,
+            Job::Plan,
+            Job::Run("true".to_owned()),
+            Job::Doctor,
+        ] {
+            let mut opts = opts();
+            opts.parallel = std::num::NonZeroU8::new(4).unwrap();
+            let opts = job_opts(&job, opts, &cancel);
+            assert_eq!(opts.parallel.get(), 4);
+            let carried = Arc::ptr_eq(&opts.cancel, &cancel);
+            assert_eq!(carried, !matches!(job, Job::Doctor));
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_cancelled_plan_reaches_the_ssh_check_of_its_probe() {
+        let mut opts = fake_ssh_opts("tw-plan-esc", &["true"]);
+        opts.target = vec!["down".to_owned()];
+        let home = opts.ssh_home.clone().unwrap();
+        let gate = home.join("gate");
+        crate::test_util::write_knobs(
+            &home.join("fake-ssh.env"),
+            &[("FAKE_SSH_GATE", gate.to_str().unwrap())],
+        );
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = spawn(Job::Plan, opts, Arc::clone(&cancel), tx);
+        wait_for(&home.join("gate.wait"));
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        fs::write(&gate, "").unwrap();
+        let msgs = collect(worker, &rx);
+        assert!(
+            matches!(&msgs[2], Msg::PlanDone(_, plan::PlanReport::Cancelled { target, .. }) if target == "down"),
+            "the refused probe is cancelled, not a failure"
+        );
     }
 
     #[test]

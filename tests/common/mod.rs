@@ -206,9 +206,49 @@ impl Sandbox {
         self.root.join("plugins")
     }
 
+    /// Forgets every master fake-ssh opened, as if each had exited.
+    pub fn close_masters(&self) {
+        let control = self.root.join("h/.ssh/anvil");
+        for entry in fs::read_dir(control).into_iter().flatten().flatten() {
+            if entry.path().extension().is_some_and(|ext| ext == "master") {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+    }
+
     /// One inventory host, `fake`, reached through `fake-ssh.sh`.
     pub fn with_fake_host(&self) {
         self.write_config("inventory.toml", "[hosts.fake]\nhost = \"fakehost\"\n");
+    }
+
+    /// Two inventory hosts, `alpha` and `beta`, reached through
+    /// `fake-ssh.sh`.
+    pub fn with_two_fake_hosts(&self) {
+        self.write_config(
+            "inventory.toml",
+            "[hosts.alpha]\nhost = \"alpha.example\"\n\n[hosts.beta]\nhost = \"beta.example\"\n",
+        );
+    }
+
+    /// A step that waits until two runs of it have started, then prints
+    /// `met`: it passes only when two targets run at once. After 30 s it
+    /// gives up: it says why on stderr and exits 1.
+    pub fn barrier_step(&self) -> String {
+        self.barrier_step_within(30)
+    }
+
+    /// [`Sandbox::barrier_step`], giving up after `secs` seconds instead.
+    pub fn barrier_step_within(&self, secs: u32) -> String {
+        let dir = self.root.join("barrier");
+        fs::create_dir_all(&dir).unwrap();
+        let dir = dir.display();
+        let polls = secs * 20;
+        format!(
+            "touch {dir}/$$; i=0; until [ \"$(ls {dir} | wc -l)\" -ge 2 ]; do \
+             i=$((i+1)); if [ $i -gt {polls} ]; then \
+             echo \"barrier: gave up after {secs} s, $(ls {dir} | wc -l) of 2 runs started\" >&2; \
+             exit 1; fi; sleep 0.05; done; echo met"
+        )
     }
 
     /// `program` in the sandbox's environment: its config dir, `$HOME`,

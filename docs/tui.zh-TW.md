@@ -3,10 +3,12 @@
 [English](tui.md) | 繁體中文
 
 `anvil tui` 在同一個畫面中執行相同的指令，並保留本次工作階段的每個結果供瀏覽。
-它需要終端機，且只有在要求時才會啟動；全域旗標（`--target`、`--inventory`、`--config`、`--ssh-config`、`-v`）是它的初始狀態：
+它需要終端機，且只有在要求時才會啟動；全域旗標（`--target`、`--inventory`、`--config`、`--ssh-config`、`-v`、`--parallel`）
+是它的初始狀態：
 
 ```sh
 anvil tui                  # or: anvil tui --target linode1
+anvil tui --parallel 4     # apply, plan and run take up to 4 targets at once
 ```
 
 ```text
@@ -40,7 +42,8 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
 
 - **標頭。** `anvil · <kind> · run N/M · targets: <selection>`：顯示中結果的種類（`doctor`、`apply`、`plan`、`run` 或 edit 編輯的對象）
   與它在歷史紀錄中的位置，接著是挑選的 target 與 `tag:NAME`，沒有挑選時為 `all (N)`。
-  顯示中的結果正在執行時，它的 spinner 與正在執行的 target（`· ⠙ linode1`）會出現在 `targets:` 之前。
+  顯示中的結果正在執行時，它的 spinner 與每個正在執行的 target（依啟動順序以逗號連接，`· ⠙ linode1, pi`）
+  會出現在 `targets:` 之前。
   右側的 `✔ ok  ✘ failed` 計算顯示中結果的 target。放不下的文字以 `…` 截斷。
   inventory 載入失敗時，選擇的位置改以紅色顯示 `inventory error`，錯誤本身則顯示為通知。
 - **Steps。** apply 會執行的 step，附編號：`[packages]` 有工作時為 `packages`，接著是每個 `[[files]]` 項目的 `file DEST`
@@ -49,14 +52,19 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
   在 apply 結果上，列表是該次執行載入的 config 的 step，每列依顯示中分頁的 target 標上記號：
   `✔` 結束碼為 0，`✘` 結束碼非 0 或被終止，`⊘` 未執行（在失敗的 step 或取消之後，或因 target 不符合而被略過的 file 或 service step）。
   傳輸錯誤結束 target 時，被它結束的 step 為 `✘`（尚未執行任何 step 時為第一個：連線或探測失敗），
-  但若有逾時的 step 保留了輸出，則該列為 `✘`；其餘為 `⊘`。target 還沒有報告時（排隊中或執行中）每列皆為 `·`；
-  正在執行的 target 在結束前沒有分頁，它的 spinner 在標頭與 Results 的最後一行。
+  但若有逾時的 step 保留了輸出，則該列為 `✘`；其餘為 `⊘`。target 還沒有報告時（等待中或執行中）每列皆為 `·`；
+  執行結束時仍未執行的 target（`✘ not run`，見下方）每列皆為 `⊘`。
   在 doctor、edit 與 plan 結果上，列表是上次重新載入時 config 的 step，沒有記號。
   run 結果（`x`）只列出一個 step，即它的腳本（第一行，還有更多行時加上 `…`），記號與 apply 相同。
   plugin step 列為 `plugin NAME`。config 載入失敗時改以紅色顯示錯誤。
 - **Results。** 顯示中結果的每個區段一個分頁，而不是每次過去的執行一個分頁。
   doctor 結果在有本機檢查時有一個 `local checks` 分頁，接著依序每個 target 一個分頁；apply、plan 與 run 依序每個 target 一個分頁；
   edit 只有一個分頁，以它編輯的對象命名（`inventory`、`config`、`secret NAME`、`migrate → age`）。
+  在 apply、plan 與 run 上，每個 target 從一開始就有自己的分頁，不論 `--parallel` 為何（包括 `1`），
+  且結束時位置不變，因此分頁、捲動位置與游標都不會移動。
+  尚未啟動的 target 是暗色的 `· name` 分頁與暗色的 `▶ name` 區段；
+  執行中的 target 分頁上有 spinner，`▶ name` 下方有 `⠙ running`，Results 的最後一行也會列出執行中的 target。
+  執行結束時仍沒有報告的 target（執行失敗或 panic）會變成 `✘ name`，區段為 `▶ name` 與 `✘ not run`，並算作失敗。
   `←` 與 `→` 在任何窗格都能切換分頁（overlay 開啟時除外），到兩端就停止。
   apply 與 run 區段讀起來像 CLI 的區塊（`▶ name`、`$ command`、它的輸出、`✔ ok · N steps`、`✘ reason` 或 `⊘ cancelled`）；
   plan 區段像 `anvil plan` 的區塊（`▶ name`、`would $ command`、`✔ N steps`、`✘ reason` 或 `⊘ cancelled`）；
@@ -125,6 +133,8 @@ curl、tar 與新執行檔的 `--version` 執行時輸出都會被擷取，不�
 
 ## 規則
 
+- **`--parallel N`** 設定 apply、plan 與 run（`x`）同時處理的 target 數，與 CLI 相同
+  （[平行執行](cli.zh-TW.md#平行執行)）；沒有按鍵可以變更它。doctor 一次處理一個 target，且不提這個旗標。
 - **一次一個執行。** doctor、apply、plan、run 或更新執行期間，`d`、`a`、`p`、`x`、`u`、`i`、`c`、`s`、`m` 與 `o`
   會被拒絕，狀態列顯示 `busy: <run> is running (Esc cancels)`；doctor 與更新無法以 Esc 取消，因此顯示
   `busy: <run> is running`。執行會保留它開始時的選擇與路徑。
@@ -132,6 +142,8 @@ curl、tar 與新執行檔的 `--version` 執行時輸出都會被擷取，不�
   該 target 剩下的部分以及之後的每個 target 都以 `⊘ cancelled` 結束。
   run（`x`）以相同方式取消：它的腳本是唯一的 step，因此正在執行的腳本會先跑完，之後的每個 target 都以 `⊘ cancelled` 結束。
   plan 在每個 target 之前檢查：正在執行的探測會跑完，之後的每個 target 都以 `⊘ cancelled` 結束。
+  使用 `--parallel` 時，每個執行中的 target 都這樣跑完它的 step 或探測，且不再啟動其他 target。
+  通知在 apply 與 run 為 `cancelling: the running step finishes first`，在 plan 為 `cancelling: running targets finish first`。
   Esc 從不終止正在執行的 step，不論本機或遠端；只有該 step 的逾時會結束它（`x` 為 300 秒）。
   doctor 無法取消；它的探測受 [ssh 逾時](cli.zh-TW.md#ssh-行為)限制。
 - **交接。** 編輯器（`i`、`c`、`s`、`x`）、遷移（`m`，讓它的 age 密碼短語提示能運作）、
@@ -156,6 +168,7 @@ curl、tar 與新執行檔的 `--version` 執行時輸出都會被擷取，不�
 
 ## 建置
 
-TUI 是 cargo feature `tui`（ratatui、crossterm 與 signal-hook），預設啟用。
-`cargo build --no-default-features`（或 `cargo install --path . --no-default-features`）會建置不含它及那些 crate 的 CLI；
+TUI 是 cargo feature `tui`（ratatui 與 crossterm），預設啟用。
+`cargo build --no-default-features`（或 `cargo install --path . --no-default-features`）會建置不含它及那些 crate 的 CLI
+（signal-hook 仍保留：CLI 的 Ctrl-C 處理用到它）；
 該執行檔沒有 `tui` 指令。

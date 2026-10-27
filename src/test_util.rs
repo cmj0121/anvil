@@ -1,10 +1,12 @@
 //! Helpers shared by the unit tests.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -19,6 +21,15 @@ use crate::secret::{BackendKind, SecretError, Store, Vault};
 
 pub fn json(value: &impl Serialize) -> serde_json::Value {
     serde_json::to_value(value).unwrap()
+}
+
+/// Waits (30 s at most) until `path` exists.
+pub fn wait_for(path: &Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !path.exists() {
+        assert!(std::time::Instant::now() < deadline, "{path:?} never came");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// The keys of a JSON object, in the order `serde_json` keeps them (sorted).
@@ -132,21 +143,77 @@ pub fn write_knobs(path: &Path, vars: &[(&str, &str)]) {
     fs::write(path, body).unwrap();
 }
 
+/// A Condvar barrier: [`Meet::arrive`] returns once `parties` threads have
+/// arrived, so a test sees them run at once without timing anything.
+pub struct Meet {
+    arrived: Mutex<usize>,
+    all: Condvar,
+    parties: usize,
+}
+
+impl Meet {
+    pub fn new(parties: usize) -> Meet {
+        Meet {
+            arrived: Mutex::new(0),
+            all: Condvar::new(),
+            parties,
+        }
+    }
+
+    /// Waits until every party has arrived: true, or false after 30 s, a
+    /// fail-safe for a run that is not parallel.
+    pub fn arrive(&self) -> bool {
+        let mut arrived = self.arrived.lock().unwrap();
+        *arrived += 1;
+        self.all.notify_all();
+        let (arrived, wait) = self
+            .all
+            .wait_timeout_while(arrived, Duration::from_secs(30), |n| *n < self.parties)
+            .unwrap();
+        drop(arrived);
+        !wait.timed_out()
+    }
+}
+
+/// How many threads are inside at once, and the most there ever were.
+#[derive(Default)]
+pub struct Gauge {
+    now_and_peak: Mutex<(usize, usize)>,
+}
+
+impl Gauge {
+    pub fn enter(&self) {
+        let mut state = self.now_and_peak.lock().unwrap();
+        state.0 += 1;
+        state.1 = state.1.max(state.0);
+    }
+
+    pub fn leave(&self) {
+        self.now_and_peak.lock().unwrap().0 -= 1;
+    }
+
+    pub fn peak(&self) -> usize {
+        self.now_and_peak.lock().unwrap().1
+    }
+}
+
 /// How [`FakePlugins`] replies to plugin `name`.
-type Reply = dyn Fn(&str, &Request) -> Result<String, String>;
+type Reply = dyn Fn(&str, &Request) -> Result<String, String> + Send + Sync;
 
 /// Plugins that reply as `reply` says, recording each call's plugin name
 /// and request.
 pub struct FakePlugins {
     reply: Box<Reply>,
-    pub seen: RefCell<Vec<(String, serde_json::Value)>>,
+    pub seen: Mutex<Vec<(String, serde_json::Value)>>,
 }
 
 impl FakePlugins {
-    pub fn new(reply: impl Fn(&str, &Request) -> Result<String, String> + 'static) -> FakePlugins {
+    pub fn new(
+        reply: impl Fn(&str, &Request) -> Result<String, String> + Send + Sync + 'static,
+    ) -> FakePlugins {
         FakePlugins {
             reply: Box::new(reply),
-            seen: RefCell::default(),
+            seen: Mutex::default(),
         }
     }
 
@@ -159,7 +226,8 @@ impl FakePlugins {
 impl Plugins for FakePlugins {
     fn script(&self, name: &str, request: &Request) -> Result<String, String> {
         self.seen
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((name.to_owned(), json(request)));
         (self.reply)(name, request)
     }

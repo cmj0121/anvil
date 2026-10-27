@@ -314,3 +314,65 @@ fn a_script_that_is_not_utf8_is_refused() {
     let out = anvil_stdin(&sandbox, &["run", "-"], &[], b"echo \xff\n");
     assert!(refused(&out).contains("run: the script is not UTF-8"));
 }
+
+#[test]
+fn parallel_two_runs_the_script_on_two_hosts_at_once_in_inventory_order() {
+    let sandbox = Sandbox::new("ru");
+    sandbox.with_two_fake_hosts();
+    let step = sandbox.barrier_step();
+    let path = script(&sandbox, format!("{step}\n").as_bytes());
+    let args = [
+        "--parallel",
+        "2",
+        "run",
+        path.to_str().unwrap(),
+        "--target",
+        "beta",
+        "--target",
+        "alpha",
+    ];
+    let out = sandbox.anvil(&args, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let block = |name: &str| format!("▶ {name}\n  $ {step}\n  met\n  ✔ ok · 1 step\n\n");
+    assert_eq!(
+        text(&out.stdout),
+        format!("{}{}2 ok, 0 failed\n", block("alpha"), block("beta"))
+    );
+
+    fs::remove_dir_all(sandbox.root().join("barrier")).unwrap();
+    sandbox.barrier_step();
+    let out = sandbox.anvil(&[&["--json"][..], &args].concat(), &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(value["targets"][0]["target"], "alpha");
+    assert_eq!(value["targets"][1]["target"], "beta");
+}
+
+#[test]
+fn parallel_one_prints_exactly_what_the_default_prints() {
+    let sandbox = Sandbox::new("ru");
+    sandbox.with_fake_host();
+    let path = script(&sandbox, b"echo hello\n");
+    let path = path.to_str().unwrap();
+    for flag in [&[][..], &["--json"]] {
+        let default = sandbox.anvil(&[flag, &["run", path]].concat(), &[]);
+        let one = sandbox.anvil(&[flag, &["--parallel", "1", "run", path]].concat(), &[]);
+        assert_eq!(one.status.code(), Some(0), "{}", text(&one.stderr));
+        assert_eq!(one.stdout, default.stdout, "{flag:?}");
+    }
+    let out = sandbox.anvil(&["--parallel", "1", "run", path], &[]);
+    assert_eq!(
+        text(&out.stdout),
+        "▶ local\n  $ echo hello\n  hello\n  ✔ ok · 1 step\n\n\
+         ▶ fake\n  $ echo hello\n  hello\n  ✔ ok · 1 step\n\n\
+         2 ok, 0 failed\n"
+    );
+    let out = sandbox.anvil(&["--json", "--parallel", "1", "run", path], &[]);
+    let step = r#"[{"run":"echo hello\n","code":0,"stdout":"hello\n","stderr":""}]"#;
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            r#"{{"targets":[{{"target":"local","steps":{step},"ok":true}},{{"target":"fake","steps":{step},"ok":true}}],"ok":true}}"#
+        ) + "\n"
+    );
+}

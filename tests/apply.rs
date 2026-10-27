@@ -6,7 +6,12 @@
 
 mod common;
 
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 
 use common::{
     AUTH_DENIED, AUTH_DENIED_MESSAGE, CONNECT_REFUSED, CONNECT_REFUSED_MESSAGE, Sandbox, json,
@@ -304,13 +309,20 @@ fn a_bad_src_exits_two_before_any_target_but_config_still_opens() {
 /// the probe reports `sudo=binary`; `-v` prints `$SUDO_PROMPT` on the
 /// terminal and accepts `$FAKE_SUDO_PW`; `find` prints its start path, so
 /// each directory of the sandbox passes as root-only; anything else runs as
-/// the user. Each call's argv is appended to `$FAKE_SUDO_LOG`.
+/// the user, `install` after the heartbeat of [`heartbeat`] in
+/// `$FAKE_SUDO_BEAT` when set. Each call's argv is appended to
+/// `$FAKE_SUDO_LOG`.
 const FAKE_SUDO: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >>"$FAKE_SUDO_LOG"
 case "$1" in
   -n) echo 'sudo: a password is required' >&2; exit 1 ;;
   -k) exit 0 ;;
   find) printf '%s\n' "$2"; exit 0 ;;
+  install)
+    D=$FAKE_SUDO_BEAT
+    if [ -n "$D" ]; then
+      i=0; until [ -e "$D/go" ]; do i=$((i+1)); echo $i >"$D/beat"; [ $i -gt 600 ] && exit 1; sleep 0.05; done
+    fi ;;
   -v)
     printf %s "$SUDO_PROMPT" >/dev/tty
     IFS= read -r pw </dev/tty
@@ -334,21 +346,22 @@ fn temp_files() -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
+/// Whether script(1) is there: fake-ssh runs a `-tt` client under it.
+fn have_script() -> bool {
+    ["/usr/bin/script", "/bin/script"]
+        .iter()
+        .any(|path| std::path::Path::new(path).exists())
+}
+
+/// A sandbox without the debug flags whose host `fake` types the sudo
+/// password `PW_SUDO` from an age store, set as `anvil secret` sets it, and
+/// [`FAKE_SUDO`] in `<root>/bin`. Returns the sandbox, the `[secrets]` table
+/// every config must start with, and a `PATH` with that sudo first.
+fn sudo_sandbox() -> (Sandbox, &'static str, String) {
     use std::os::unix::fs::PermissionsExt;
 
     use age::secrecy::ExposeSecret;
 
-    // fake-ssh runs a `-tt` client under script(1).
-    if !["/usr/bin/script", "/bin/script"]
-        .iter()
-        .any(|path| std::path::Path::new(path).exists())
-    {
-        eprintln!("skip: no script(1) for fake-ssh -tt");
-        return;
-    }
-    // An age store holding `PW_SUDO`, set as `anvil secret` sets it.
     let sandbox = Sandbox::new("aa").without_debug_flags();
     let identity = age::x25519::Identity::generate();
     common::write_private(
@@ -369,6 +382,19 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
         "inventory.toml",
         "[hosts.fake]\nhost = \"fakehost\"\nsudo_secret = \"PW_SUDO\"\n",
     );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    (sandbox, secrets, path)
+}
+
+#[test]
+fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !have_script() {
+        eprintln!("skip: no script(1) for fake-ssh -tt");
+        return;
+    }
+    let (sandbox, secrets, path) = sudo_sandbox();
     std::fs::create_dir(sandbox.root().join("out")).unwrap();
     std::fs::write(sandbox.config_dir().join("motd.txt"), FILE_TEXT).unwrap();
     let dest = sandbox.root().join("out/pw.conf");
@@ -384,7 +410,6 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
         sandbox.root().join("ssh.log"),
         sandbox.root().join("sudo.log"),
     );
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let before = temp_files();
     let apply = |args: &[&str], password: &str| {
         let _ = std::fs::remove_file(&sudo_log);
@@ -464,4 +489,370 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
         ["-n true", "-v", "-k"],
         "only the probe, the failed -v and the ticket drop"
     );
+}
+
+#[test]
+fn parallel_two_runs_two_hosts_at_once_and_keeps_inventory_order() {
+    let sandbox = Sandbox::new("aa");
+    sandbox.with_two_fake_hosts();
+    let step = sandbox.barrier_step();
+    sandbox.write_config("config.toml", &format!("[[steps]]\nrun = '{step}'\n"));
+    let args = [
+        "--parallel",
+        "2",
+        "apply",
+        "--target",
+        "beta",
+        "--target",
+        "alpha",
+    ];
+    let out = sandbox.anvil(&args, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let block = |name: &str| format!("▶ {name}\n  $ {step}\n  met\n  ✔ ok · 1 step\n\n");
+    assert_eq!(
+        text(&out.stdout),
+        format!("{}{}2 ok, 0 failed\n", block("alpha"), block("beta"))
+    );
+
+    std::fs::remove_dir_all(sandbox.root().join("barrier")).unwrap();
+    sandbox.barrier_step();
+    let out = sandbox.anvil(&[&["--json"][..], &args].concat(), &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let targets = value["targets"].as_array().unwrap();
+    assert_eq!(targets[0]["target"], "alpha");
+    assert_eq!(targets[1]["target"], "beta");
+    assert_eq!(value["ok"], true);
+}
+
+#[test]
+fn parallel_one_prints_exactly_what_the_default_prints() {
+    let sandbox = Sandbox::new("aa");
+    sandbox.with_fake_host();
+    for json in [false, true] {
+        let flag: &[&str] = if json { &["--json"] } else { &[] };
+        let default = sandbox.anvil(&[flag, &["apply"]].concat(), &[]);
+        let one = sandbox.anvil(&[flag, &["--parallel", "1", "apply"]].concat(), &[]);
+        assert_eq!(default.status.code(), Some(0), "{}", text(&default.stderr));
+        assert_eq!(one.status.code(), Some(0), "{}", text(&one.stderr));
+        assert_eq!(text(&one.stdout), text(&default.stdout), "--json {json}");
+    }
+    let name = local_hostname();
+    let name = name.trim_end();
+    let out = sandbox.anvil(&["--parallel", "1", "apply"], &[]);
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  $ hostname\n  {name}\n  ✔ ok · 1 step\n\n\
+             ▶ fake\n  $ hostname\n  {name}\n  ✔ ok · 1 step\n\n\
+             2 ok, 0 failed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "--parallel", "1", "apply"], &[]);
+    let step = format!(r#"[{{"run":"hostname","code":0,"stdout":"{name}\n","stderr":""}}]"#);
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            r#"{{"targets":[{{"target":"local","steps":{step},"ok":true}},{{"target":"fake","steps":{step},"ok":true}}],"ok":true}}"#
+        ) + "\n"
+    );
+}
+
+/// A step that writes a growing counter to `<dir>/beat` every 50 ms until
+/// `<dir>/go` exists; after 30 s it gives up and exits 1.
+fn heartbeat(dir: &Path) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    let dir = dir.display();
+    format!(
+        "i=0; until [ -e {dir}/go ]; do i=$((i+1)); echo $i >{dir}/beat; \
+         [ $i -gt 600 ] && exit 1; sleep 0.05; done"
+    )
+}
+
+/// How a step under SIGINT runs: a plain step, a `[[files]]` install
+/// through sudo on a terminal, an `anvil run` script, or a plain step on
+/// `fake` while `local`'s block, larger than a pipe buffer, waits on a
+/// stdout nobody reads.
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+    Plain,
+    Tty,
+    Run,
+    Paused,
+}
+
+/// anvil, running, with each stderr line sent on `lines`; the heartbeat
+/// lives in `beat`.
+struct Running {
+    child: Child,
+    lines: Receiver<String>,
+    beat: PathBuf,
+    second: PathBuf,
+    _sandbox: Sandbox,
+}
+
+/// Starts `anvil --json apply` whose first step beats a [`heartbeat`] and
+/// whose second creates `<root>/second`: on `local` then `fake` for
+/// [`Kind::Plain`], on `fake` for [`Kind::Tty`]. [`Kind::Run`] runs the
+/// heartbeat as an `anvil --json run` script on `local` then `fake`.
+/// [`Kind::Paused`] runs `anvil --parallel 2 apply`: `local` prints 512 KiB
+/// and `fake` beats; it returns once `local` has ended. Returns once the
+/// first beat is there.
+fn beating(kind: Kind) -> Running {
+    beating_into(kind, None)
+}
+
+/// [`beating`], with anvil's stderr sent to `stderr` when given; `lines`
+/// then hears nothing.
+fn beating_into(kind: Kind, stderr: Option<Stdio>) -> Running {
+    let (sandbox, secrets, mut command) = match kind {
+        Kind::Plain | Kind::Run | Kind::Paused => {
+            let sandbox = Sandbox::new("ai");
+            sandbox.with_fake_host();
+            let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
+            command
+                .args(["--secret-store", "memory", "--ssh-program"])
+                .arg(common::fixture("fake-ssh.sh"));
+            (sandbox, "", command)
+        }
+        Kind::Tty => {
+            let (sandbox, secrets, path) = sudo_sandbox();
+            let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
+            command
+                .arg("--ssh-program")
+                .arg(common::fixture("fake-ssh.sh"))
+                .env("PATH", path)
+                .env("FAKE_SUDO_LOG", sandbox.root().join("sudo.log"))
+                .env("FAKE_SUDO_PW", common::VALUE)
+                .env("FAKE_SUDO_BEAT", sandbox.root().join("beat"));
+            (sandbox, secrets, command)
+        }
+    };
+    let dir = sandbox.root().join("beat");
+    let second = sandbox.root().join("second");
+    let first = heartbeat(&dir);
+    let touch = format!("[[steps]]\nrun = 'touch {}'\n", second.display());
+    match kind {
+        Kind::Plain => {
+            sandbox.write_config(
+                "config.toml",
+                &format!("[[steps]]\nrun = '{first}'\n{touch}"),
+            );
+            command.args(["--json", "apply"]);
+        }
+        Kind::Tty => {
+            std::fs::write(sandbox.config_dir().join("motd.txt"), "motd\n").unwrap();
+            let dest = sandbox.root().join("motd");
+            sandbox.write_config(
+                "config.toml",
+                &format!(
+                    "{secrets}[[files]]\nsrc = \"motd.txt\"\ndest = \"{}\"\nmode = \"0644\"\n\n{touch}",
+                    dest.display()
+                ),
+            );
+            command.args(["--json", "apply", "--target", "fake"]);
+        }
+        Kind::Run => {
+            let script = sandbox.root().join("script.sh");
+            std::fs::write(&script, format!("{first}\n")).unwrap();
+            command.args(["--json", "run"]).arg(script);
+        }
+        Kind::Paused => {
+            // Exported by fake-ssh to its client, so only `fake` beats.
+            let ssh = sandbox.root().join("h");
+            std::fs::create_dir_all(&ssh).unwrap();
+            std::fs::write(ssh.join("fake-ssh.env"), "export ON_FAKE=1\n").unwrap();
+            let printed = sandbox.root().join("printed");
+            sandbox.write_config(
+                "config.toml",
+                &format!(
+                    "[[steps]]\nrun = 'if [ -n \"${{ON_FAKE-}}\" ]; then {first}; else \
+                     head -c 524288 /dev/zero | tr \"\\\\0\" a; echo; touch {}; fi'\n",
+                    printed.display()
+                ),
+            );
+            command.args(["--parallel", "2", "apply"]);
+        }
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(stderr.unwrap_or_else(Stdio::piped))
+        .spawn()
+        .expect("spawn anvil");
+    let (tx, lines) = mpsc::channel();
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+    }
+    let beat = dir.join("beat");
+    until(|| beat.exists(), "the first beat");
+    if let Kind::Paused = kind {
+        let printed = sandbox.root().join("printed");
+        until(|| printed.exists(), "local's output");
+        // anvil is blocked once the pipe stops filling short of local's
+        // 512 KiB block: the rest of it, and the summary, are still to come.
+        let stdout = child.stdout.as_ref().unwrap();
+        let mut held = 0;
+        until(
+            || {
+                std::thread::sleep(Duration::from_millis(100));
+                let now = rustix::io::ioctl_fionread(stdout).unwrap();
+                std::mem::replace(&mut held, now) == now && now > 0
+            },
+            "the stdout pipe to fill",
+        );
+        assert!(
+            held < 524_288,
+            "local's block fit in the pipe: {held} bytes"
+        );
+    }
+    Running {
+        child,
+        lines,
+        beat,
+        second,
+        _sandbox: sandbox,
+    }
+}
+
+/// Waits until `done`, failing after 20 s, a fail-safe only.
+fn until(mut done: impl FnMut() -> bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !done() {
+        assert!(Instant::now() < deadline, "gave up waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+impl Running {
+    fn interrupt(&self) {
+        let pid = rustix::process::Pid::from_child(&self.child);
+        rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
+    }
+
+    /// Waits for the line the first SIGINT prints on stderr.
+    fn notice(&self) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let line = self.lines.recv_timeout(left).expect("no interrupted: line");
+            if line.starts_with("interrupted: running targets stop after their current step") {
+                return;
+            }
+        }
+    }
+
+    fn beats(&self) -> String {
+        std::fs::read_to_string(&self.beat).unwrap_or_default()
+    }
+}
+
+#[test]
+fn one_ctrl_c_lets_the_running_step_end_and_cancels_the_rest() {
+    for kind in [Kind::Plain, Kind::Tty, Kind::Run] {
+        if matches!(kind, Kind::Tty) && !have_script() {
+            eprintln!("skip: no script(1) for fake-ssh -tt");
+            continue;
+        }
+        let mut running = beating(kind);
+        running.interrupt();
+        running.notice();
+        let before = running.beats();
+        until(|| running.beats() != before, "a beat after the SIGINT");
+        std::fs::write(running.beat.with_file_name("go"), "").unwrap();
+        let mut stdout = String::new();
+        std::io::Read::read_to_string(running.child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+        let status = running.child.wait().unwrap();
+        assert_eq!(status.code(), Some(1), "{kind:?}");
+        let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let targets = value["targets"].as_array().unwrap();
+        let first = &targets[0];
+        // A run script is one step, so `local` ends ok; apply cancelled
+        // its second step.
+        let whole = matches!(kind, Kind::Run);
+        assert_eq!(first["ok"], whole, "{kind:?}: {first}");
+        let steps = first["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 1, "{kind:?}: only the running step: {first}");
+        assert_eq!(steps[0]["code"], 0, "{kind:?}: it ended on its own");
+        if let Kind::Plain | Kind::Run = kind {
+            assert_eq!(
+                targets[1],
+                serde_json::json!({"target": "fake", "steps": [], "ok": false}),
+                "fake never started"
+            );
+        }
+        assert!(!running.second.exists(), "{kind:?}: no later step ran");
+    }
+}
+
+/// A pipe that is full, so a write to it blocks until `PipeReader` is read.
+fn full_pipe() -> (std::io::PipeReader, Stdio) {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    let (reader, writer) = std::io::pipe().unwrap();
+    let flags = fcntl_getfl(&writer).unwrap();
+    fcntl_setfl(&writer, flags | OFlags::NONBLOCK).unwrap();
+    // Large writes first, which a growable pipe grows for, then single
+    // bytes until not one more fits.
+    for chunk in [65_536, 1] {
+        while rustix::io::write(&writer, &vec![b'x'; chunk]).is_ok() {}
+    }
+    fcntl_setfl(&writer, flags).unwrap();
+    (reader, writer.into())
+}
+
+#[test]
+fn two_ctrl_c_kill_anvil_even_when_stderr_is_full() {
+    let (_unread, stderr) = full_pipe();
+    let mut running = beating_into(Kind::Plain, Some(stderr));
+    running.interrupt();
+    // The notice cannot be read; this keeps the presses from merging.
+    std::thread::sleep(Duration::from_millis(300));
+    running.interrupt();
+    until(
+        || running.child.try_wait().unwrap().is_some(),
+        "anvil to die",
+    );
+    let status = running.child.wait().unwrap();
+    assert_eq!(status.signal(), Some(2), "died by SIGINT, {status:?}");
+}
+
+#[test]
+fn a_second_ctrl_c_kills_the_running_step_and_anvil_dies_by_sigint() {
+    for kind in [Kind::Plain, Kind::Tty, Kind::Paused] {
+        if matches!(kind, Kind::Tty) && !have_script() {
+            eprintln!("skip: no script(1) for fake-ssh -tt");
+            continue;
+        }
+        let mut running = beating(kind);
+        running.interrupt();
+        running.notice();
+        running.interrupt();
+        until(
+            || running.child.try_wait().unwrap().is_some(),
+            "anvil to die",
+        );
+        let status = running.child.wait().unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(2),
+            "{kind:?}: died by SIGINT, {status:?}"
+        );
+        // The step's group was killed before anvil died: past a beat in
+        // flight, the counter stays put for a second.
+        std::thread::sleep(Duration::from_millis(100));
+        let last = running.beats();
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(running.beats(), last, "{kind:?}: the heartbeat stopped");
+        let mut stdout = Vec::new();
+        std::io::Read::read_to_end(running.child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+        if let Kind::Paused = kind {
+            assert!(!stdout.ends_with(b"failed\n"), "{kind:?}: no summary");
+        } else {
+            assert_eq!(text(&stdout), "", "{kind:?}: no JSON");
+        }
+        assert!(!running.second.exists(), "{kind:?}: no later step ran");
+    }
 }

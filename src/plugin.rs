@@ -28,7 +28,6 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use rustix::process::{Pid, Signal, kill_process_group};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -39,7 +38,7 @@ use crate::document::MAX_BYTES;
 use crate::facts::Facts;
 use crate::logger::escape_controls;
 use crate::secret::{check_dir, check_owner, open_regular, shown_name};
-use crate::transport::{TransportError, collect_capped};
+use crate::transport::{Groups, TransportError, collect_tracked};
 
 /// Largest plugin file hashed, in bytes.
 const PLUGIN_LIMIT: u64 = 64 << 20;
@@ -88,7 +87,7 @@ struct Reply {
 
 /// Turns a plugin step into the script it runs; the error is the target's
 /// failure, as `plugin <name>: <reason>`.
-pub trait Plugins {
+pub trait Plugins: Sync {
     fn script(&self, name: &str, request: &Request) -> Result<String, String>;
 }
 
@@ -250,7 +249,9 @@ fn spawn(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| fail(&format_args!("cannot start {real}: {err}")))?;
-    let group = Pid::from_child(&child);
+    // Whatever it leaves in its group dies as it exits, so nothing keeps
+    // running or holds stdin and blocks the writer joined below.
+    let tracked = Groups::global().track(&child).killing_leftovers();
     let stdin = child.stdin.take();
     let output = thread::scope(|scope| {
         if let Some(mut stdin) = stdin {
@@ -260,11 +261,12 @@ fn spawn(
             });
         }
         // One byte past the limit tells an oversize reply.
-        let output = collect_capped(child, Some(timeout), [REPLY_LIMIT + 1, STDERR_LIMIT]);
-        // Whatever it left in its group dies with it, so nothing keeps
-        // running or holds stdin and blocks the writer joined above.
-        let _ = kill_process_group(group, Signal::KILL);
-        output
+        collect_tracked(
+            child,
+            Some(tracked),
+            Some(timeout),
+            [REPLY_LIMIT + 1, STDERR_LIMIT],
+        )
     })
     .map_err(|err| match err {
         TransportError::Timeout { after, .. } => {
@@ -744,6 +746,13 @@ mod tests {
 
     #[test]
     fn a_reply_with_a_detached_process_holding_stdout_is_refused() {
+        // The holder leaves the group, so killing the group misses it.
+        let perl =
+            crate::paths::find_program(Path::new("perl"), std::env::var_os("PATH").as_deref());
+        if perl.is_none() {
+            eprintln!("skipped: perl not found");
+            return;
+        }
         let (root, pins) = fake("plugin-detach", &[("FAKE_PLUGIN_DETACH", "1")]);
         assert_eq!(
             ask(&pins, &Map::new()).unwrap_err(),
