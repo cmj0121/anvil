@@ -224,3 +224,38 @@ fn secrets_in_the_anvil_environment_do_not_reach_the_plugin() {
         "it runs in its own directory"
     );
 }
+
+#[test]
+fn on_doctor_loads_and_a_step_naming_it_exits_two() {
+    let sandbox = Sandbox::new("pg");
+    sandbox.with_fake_host();
+    let (path, sha256) = sandbox.plugin("audit", &fs::read(fixture("fake-plugin.sh")).unwrap());
+    let entry = |on: &str| {
+        format!(
+            "[plugins.audit]\npath = \"{}\"\nsha256 = \"{sha256}\"\non = \"{on}\"\n",
+            path.display()
+        )
+    };
+
+    sandbox.write_config("config.toml", &entry("doctor"));
+    let out = sandbox.anvil(&["plan", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+
+    for (body, needle) in [
+        (
+            format!("{}\n[[steps]]\nplugin = \"audit\"\n", entry("doctor")),
+            "steps[0].plugin `audit`: names an on = \"doctor\" plugin; only doctor runs it",
+        ),
+        (entry("x"), "plugins.audit.on `x`: must be step or doctor"),
+    ] {
+        sandbox.write_config("config.toml", &body);
+        for command in ["apply", "plan", "doctor"] {
+            let (out, log) = logged(&sandbox, &[command]);
+            let stderr = text(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{command}: {stderr}");
+            assert!(stderr.contains(needle), "{command}: {stderr}");
+            assert_eq!(log, "", "{command}: no target was contacted");
+        }
+    }
+    assert_eq!(record(&sandbox, "stdin"), "", "the plugin never ran");
+}

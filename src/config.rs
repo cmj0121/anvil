@@ -30,7 +30,7 @@ pub const ARGS_LIMIT: usize = 32 << 10;
 pub const MAX_FILES: usize = 64;
 
 /// Longest `[[files]]` dest, in bytes: Linux's `PATH_MAX`.
-const MAX_DEST_BYTES: usize = 4096;
+pub(crate) const MAX_DEST_BYTES: usize = 4096;
 
 /// Most `[[services]]` entries in one config.
 pub const MAX_SERVICES: usize = 64;
@@ -224,6 +224,16 @@ impl Plugin {
 
     fn is_default_on(on: &str) -> bool {
         on == "step"
+    }
+
+    /// Run by a step: `apply` and `plan` take its script.
+    pub fn is_step(&self) -> bool {
+        self.on == "step"
+    }
+
+    /// Run by `doctor` only, never by a step.
+    pub fn is_doctor(&self) -> bool {
+        self.on == "doctor"
     }
 }
 
@@ -508,9 +518,9 @@ impl Config {
                     secret::shown_name(&plugin.sha256)
                 ));
             }
-            if plugin.on != "step" {
+            if !plugin.is_step() && !plugin.is_doctor() {
                 return Err(format!(
-                    "plugins.{name}.on `{}`: must be step",
+                    "plugins.{name}.on `{}`: must be step or doctor",
                     secret::shown_name(&plugin.on)
                 ));
             }
@@ -539,13 +549,22 @@ impl Config {
                     ));
                 }
             }
-            if let Some(plugin) = &step.plugin
-                && !self.plugins.contains_key(plugin)
-            {
-                return Err(format!(
-                    "steps[{i}].plugin `{}`: must name a [plugins] entry",
-                    secret::shown_name(plugin)
-                ));
+            if let Some(name) = &step.plugin {
+                match self.plugins.get(name) {
+                    None => {
+                        return Err(format!(
+                            "steps[{i}].plugin `{}`: must name a [plugins] entry",
+                            secret::shown_name(name)
+                        ));
+                    }
+                    Some(plugin) if plugin.is_doctor() => {
+                        return Err(format!(
+                            "steps[{i}].plugin `{name}`: names an on = \"doctor\" plugin; \
+                             only doctor runs it"
+                        ));
+                    }
+                    Some(_) => {}
+                }
             }
             if let Some(run) = &step.run {
                 if run.trim().is_empty() {
@@ -2168,6 +2187,27 @@ mod tests {
     }
 
     #[test]
+    fn a_doctor_plugin_loads_validates_and_round_trips() {
+        let config = parse(&plugin_config(
+            "on = \"doctor\"",
+            "[[steps]]\nrun = \"hostname\"\n",
+        ));
+        config.check_plugins(home()).unwrap();
+        config.check_steps().unwrap();
+        let plugin = &config.plugins["harden"];
+        assert_eq!(plugin.on, "doctor");
+        assert!(plugin.is_doctor() && !plugin.is_step());
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&config, format).unwrap();
+            let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(back, config, "{text}");
+            assert!(text.contains("doctor"), "{text}");
+        }
+        let step = &parse(&plugin_config("on = \"step\"", "")).plugins["harden"];
+        assert!(step.is_step() && !step.is_doctor());
+    }
+
+    #[test]
     fn a_plugin_entry_needs_path_and_sha256_and_no_other_key() {
         for (text, needle) in [
             (format!("[plugins.harden]\nsha256 = \"{SHA}\"\n"), "path"),
@@ -2217,8 +2257,17 @@ mod tests {
                 "must be 64 lowercase hex digits".to_owned(),
             ),
             (
+                plugin_config("on = \"x\"", ""),
+                "plugins.harden.on `x`: must be step or doctor".to_owned(),
+            ),
+            (
+                plugin_config("on = \"Step\"", step),
+                "plugins.harden.on `Step`: must be step or doctor".to_owned(),
+            ),
+            (
                 plugin_config("on = \"doctor\"", step),
-                "plugins.harden.on `doctor`: must be step".to_owned(),
+                "steps[0].plugin `harden`: names an on = \"doctor\" plugin; only doctor runs it"
+                    .to_owned(),
             ),
             (
                 plugin_config("", "[[steps]]\nrun = \"ls\"\nplugin = \"harden\"\n"),
