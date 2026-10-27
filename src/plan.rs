@@ -5,19 +5,21 @@
 //! that cannot be reached fails here as it would under apply; then
 //! [`apply::resolve`] lists its steps. The secret store is never opened: a
 //! step that would type a sudo password names its secret, and whether that
-//! secret is set is `anvil doctor`'s job.
+//! secret is set is `anvil doctor`'s job. A plugin step runs its plugin, on
+//! the controller only, to list the script it returns.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
-use crate::apply::{self, Escape, Line, PlannedRun, Style, print_lines};
+use crate::apply::{self, Escape, Line, PlannedRun, Style, Unresolved, print_lines};
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, YELLOW, paint};
 use crate::options::Options;
+use crate::plugin::{self, Plugins};
 use crate::transport::{Transport, TransportError};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -83,10 +85,12 @@ pub fn run_targets(
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Plan, Failure> {
     let targets = opts.targets()?;
+    let pins = plugin::verify(config).map_err(Failure::usage)?;
     Ok(plan_targets(
         &targets,
         |target| opts.transport(target),
         config,
+        &pins,
         cancel,
         on,
     ))
@@ -98,6 +102,7 @@ pub fn plan_targets(
     targets: &[Target],
     transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError>,
     config: &Config,
+    plugins: &dyn Plugins,
     cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Plan {
@@ -105,13 +110,9 @@ pub fn plan_targets(
     for target in targets {
         on(Progress::Start(target));
         let report = if cancel.load(Ordering::Relaxed) {
-            log::info!("plan {}: cancelled", target.name);
-            PlanReport::Cancelled {
-                target: target.name.clone(),
-                ok: false,
-            }
+            cancelled(target)
         } else {
-            plan_target(target, transport(target), config)
+            plan_target(target, transport(target), config, plugins, cancel)
         };
         on(Progress::Done(&report));
         reports.push(report);
@@ -124,17 +125,29 @@ pub fn plan_targets(
     }
 }
 
-/// Probes `target`, then lists the steps apply would run on it.
+fn cancelled(target: &Target) -> PlanReport {
+    log::info!("plan {}: cancelled", target.name);
+    PlanReport::Cancelled {
+        target: target.name.clone(),
+        ok: false,
+    }
+}
+
+/// Probes `target`, then lists the steps apply would run on it, running
+/// its plugins; `cancel` is checked before each.
 fn plan_target(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
     config: &Config,
+    plugins: &dyn Plugins,
+    cancel: &AtomicBool,
 ) -> PlanReport {
     log::info!("plan {}: start", target.name);
     let runs = transport
         .map_err(|err| err.to_string())
-        .and_then(|transport| apply::probe(transport.as_ref()))
-        .and_then(|facts| apply::resolve(target, Some(&facts), config));
+        .and_then(|transport| apply::probe(transport.as_ref(), config))
+        .map_err(Unresolved::Failed)
+        .and_then(|facts| apply::resolve(target, Some(&facts), config, plugins, cancel));
     match runs {
         Ok(steps) => {
             log::info!("plan {}: {} steps", target.name, steps.len());
@@ -144,7 +157,8 @@ fn plan_target(
                 ok: true,
             }
         }
-        Err(error) => {
+        Err(Unresolved::Cancelled) => cancelled(target),
+        Err(Unresolved::Failed(error)) => {
             log::info!("plan {}: failed: {error}", target.name);
             PlanReport::Failed {
                 target: target.name.clone(),
@@ -214,15 +228,20 @@ pub fn render(report: &PlanReport) -> Vec<Line> {
     lines
 }
 
-/// `would $ command`, then the secret whose password it would type, if any;
-/// unescaped.
+/// `would $ command`, then the secret whose password it would type and the
+/// plugin that returned it, if any; unescaped.
 pub fn would_text(step: &PlannedRun) -> String {
     let secret = step
         .sudo_secret
         .as_ref()
         .map(|name| format!(" (sudo password from secret {name})"))
         .unwrap_or_default();
-    format!("would $ {}{secret}", apply::command(&step.run))
+    let from = step
+        .plugin
+        .as_ref()
+        .map(|name| format!(" (from plugin {name})"))
+        .unwrap_or_default();
+    format!("would $ {}{secret}{from}", apply::command(step.shown()))
 }
 
 /// The last line of the human output: `N targets, [M failed, ]nothing executed`.
@@ -249,7 +268,7 @@ mod tests {
     use crate::facts;
     use crate::inventory::TargetKind;
     use crate::packages::{Manager, Packages};
-    use crate::test_util::{json, keys};
+    use crate::test_util::{FakePlugins, json, keys};
     use crate::transport::{Output, RUN_TIMEOUT};
 
     const ARCH_SUDO: &str = "distro=arch\nuser=cmj\nsudo=binary\npkg=pacman\nanvil-probe-end=1\n";
@@ -297,20 +316,36 @@ mod tests {
             kind: TargetKind::Local,
             pkg: None,
             sudo_secret: None,
+            tags: Vec::new(),
         }
     }
 
     fn config(packages: Option<Packages>, runs: &[&str]) -> Config {
         Config {
             packages,
-            steps: runs
-                .iter()
-                .map(|run| Step {
-                    run: (*run).to_owned(),
-                })
-                .collect(),
+            steps: runs.iter().map(|run| Step::script(*run)).collect(),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn a_bad_pin_is_exit_two_before_any_target() {
+        let (dir, opts, config) = crate::test_util::bad_pin("plan");
+        let mut started = 0;
+        let failure = run_targets(&opts, &config, &AtomicBool::new(false), &mut |progress| {
+            if let Progress::Start(_) = progress {
+                started += 1;
+            }
+        })
+        .unwrap_err();
+        assert_eq!(failure.code, 2, "{}", failure.message);
+        assert!(
+            failure.message.starts_with("plugins.harden.path `"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(started, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn git() -> Packages {
@@ -321,6 +356,19 @@ mod tests {
         }
     }
 
+    /// [`apply::resolve`] for target `local` and a config without plugin
+    /// steps.
+    fn resolve(facts: &facts::Facts, config: &Config) -> Result<Vec<PlannedRun>, Unresolved> {
+        let cancel = AtomicBool::new(false);
+        apply::resolve(
+            &target("local"),
+            Some(facts),
+            config,
+            &FakePlugins::none(),
+            &cancel,
+        )
+    }
+
     /// Plans `config` for each of `names` over [`Recorder`]s probing as
     /// `probe`, the transport of `unreachable` failing; returns the plan
     /// and the scripts run.
@@ -329,6 +377,19 @@ mod tests {
         unreachable: Option<&str>,
         probe: &'static str,
         config: &Config,
+        cancelled: bool,
+    ) -> (Plan, Vec<String>) {
+        let plugins = FakePlugins::none();
+        plan_with(names, unreachable, probe, config, &plugins, cancelled)
+    }
+
+    /// [`plan`] with `plugins`.
+    fn plan_with(
+        names: &[&str],
+        unreachable: Option<&str>,
+        probe: &'static str,
+        config: &Config,
+        plugins: &dyn Plugins,
         cancelled: bool,
     ) -> (Plan, Vec<String>) {
         let log = Rc::new(RefCell::new(Vec::new()));
@@ -346,6 +407,7 @@ mod tests {
                 }))
             },
             config,
+            plugins,
             &AtomicBool::new(cancelled),
             &mut |progress| {
                 events.push(match progress {
@@ -382,18 +444,21 @@ mod tests {
                     run: one_liner.to_owned(),
                     label: None,
                     sudo_secret: Some("LOCAL_SUDO".to_owned()),
+                    plugin: None,
                     timeout: git().timeout(),
                 },
                 PlannedRun {
                     run: "one".to_owned(),
                     label: None,
                     sudo_secret: None,
+                    plugin: None,
                     timeout: RUN_TIMEOUT,
                 },
                 PlannedRun {
                     run: "two".to_owned(),
                     label: None,
                     sudo_secret: None,
+                    plugin: None,
                     timeout: RUN_TIMEOUT,
                 },
             ],
@@ -448,7 +513,9 @@ mod tests {
         let (plan, runs) = plan(&["local"], None, ARCH_SUDO, &config, false);
         assert_eq!(runs, [facts::PROBE]);
         let facts = facts::Facts::parse(ARCH_SUDO.as_bytes()).unwrap();
-        let error = apply::resolve(&target("local"), Some(&facts), &config).unwrap_err();
+        let Err(Unresolved::Failed(error)) = resolve(&facts, &config) else {
+            panic!("resolved");
+        };
         assert_eq!(error, "packages: `apt` is not installed on this target");
         assert_eq!(
             json(&plan.targets[0]),
@@ -471,8 +538,8 @@ mod tests {
         let error = "packages: pin is not one-shot on brew: git, curl";
         let facts = facts::Facts::parse(MAC.as_bytes()).unwrap();
         assert_eq!(
-            apply::resolve(&target("local"), Some(&facts), &config),
-            Err(error.to_owned())
+            resolve(&facts, &config),
+            Err(Unresolved::Failed(error.to_owned()))
         );
         assert_eq!(
             json(&plan.targets[0]),
@@ -482,6 +549,76 @@ mod tests {
             screen(&plan.targets[0]),
             format!("▶ local\n  ✘ {error}\n\n")
         );
+    }
+
+    #[test]
+    fn a_plugin_step_lists_the_script_it_returns_and_runs_nothing_on_the_target() {
+        let mut config = config(None, &["one"]);
+        config.steps.push(Step {
+            plugin: Some("harden".to_owned()),
+            ..Step::default()
+        });
+        let plugins = FakePlugins::new(|_, request| match request.target {
+            "a" => Ok("hostname\nid".to_owned()),
+            _ => Err("plugin harden: timed out after 30s".to_owned()),
+        });
+        let (plan, runs) = plan_with(&["a", "b"], None, ARCH_SUDO, &config, &plugins, false);
+        assert_eq!(runs, [facts::PROBE, facts::PROBE], "no step ran");
+        assert_eq!(plugins.seen.borrow().len(), 2);
+        assert_eq!(
+            screen(&plan.targets[0]),
+            "▶ a\n  would $ one\n  would $ hostname … (from plugin harden)\n  ✔ 2 steps\n\n"
+        );
+        assert_eq!(
+            json(&plan.targets[0])["steps"][1],
+            serde_json::json!({"run": "hostname\nid", "plugin": "harden"}),
+            "the script as returned, never the wrapper"
+        );
+        assert!(!serde_json::to_string(&plan).unwrap().contains("{ :"));
+        assert_eq!(
+            json(&plan.targets[1]),
+            serde_json::json!({"target": "b", "error": "plugin harden: timed out after 30s", "ok": false})
+        );
+    }
+
+    #[test]
+    fn a_probe_failure_without_package_work_reads_probe() {
+        struct Failing;
+        impl Transport for Failing {
+            fn name(&self) -> &str {
+                "failing"
+            }
+
+            fn run(
+                &self,
+                _script: &str,
+                _timeout: std::time::Duration,
+            ) -> Result<Output, TransportError> {
+                Ok(Output {
+                    code: Some(3),
+                    ..Output::default()
+                })
+            }
+
+            fn run_tty(
+                &self,
+                _script: &str,
+                _password: &[u8],
+                _timeout: std::time::Duration,
+            ) -> Result<Output, TransportError> {
+                unreachable!("plan types no password")
+            }
+        }
+        let plan = plan_targets(
+            &[target("a")],
+            |_| Ok(Box::new(Failing)),
+            &config(None, &["one"]),
+            &FakePlugins::none(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        );
+        assert!(!plan.targets[0].ok());
+        assert_eq!(screen(&plan.targets[0]), "▶ a\n  ✘ probe: exited 3\n\n");
     }
 
     #[test]

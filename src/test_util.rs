@@ -1,6 +1,6 @@
 //! Helpers shared by the unit tests.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -8,8 +8,13 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::cli::Cli;
+use crate::config::Config;
+use crate::document::{self, Format};
 use crate::editor::random;
+use crate::options::Options;
 use crate::paths::DocPath;
+use crate::plugin::{Plugins, Request};
 use crate::secret::{BackendKind, SecretError, Store, Vault};
 
 pub fn json(value: &impl Serialize) -> serde_json::Value {
@@ -92,6 +97,31 @@ pub fn assert_no_plaintext(dir: &Path, needle: &str) {
     }
 }
 
+/// A new temp dir, options for `command` over an inventory of one host
+/// in it, and a config whose `[plugins.harden]` names a missing file there.
+pub fn bad_pin(command: &str) -> (PathBuf, Options, Config) {
+    let dir = temp_dir("bad-pin");
+    let inventory = dir.join("inventory.toml");
+    fs::write(&inventory, "[hosts.fake]\nhost = \"fakehost\"\n").unwrap();
+    let cli = <Cli as clap::Parser>::try_parse_from([
+        "anvil",
+        "--inventory",
+        inventory.to_str().unwrap(),
+        command,
+    ])
+    .unwrap();
+    let config = document::from_str(
+        &format!(
+            "[plugins.harden]\npath = \"{}\"\nsha256 = \"{}\"\n",
+            dir.join("missing").display(),
+            "0".repeat(64)
+        ),
+        Format::Toml,
+    )
+    .unwrap();
+    (dir, Options::from_cli(&cli), config)
+}
+
 /// Writes a fake's knobs to `path` as shell assignments, for a fake that
 /// reads them from a file rather than its env.
 pub fn write_knobs(path: &Path, vars: &[(&str, &str)]) {
@@ -100,6 +130,39 @@ pub fn write_knobs(path: &Path, vars: &[(&str, &str)]) {
         .map(|(name, value)| format!("{name}='{value}'\n"))
         .collect();
     fs::write(path, body).unwrap();
+}
+
+/// How [`FakePlugins`] replies to plugin `name`.
+type Reply = dyn Fn(&str, &Request) -> Result<String, String>;
+
+/// Plugins that reply as `reply` says, recording each call's plugin name
+/// and request.
+pub struct FakePlugins {
+    reply: Box<Reply>,
+    pub seen: RefCell<Vec<(String, serde_json::Value)>>,
+}
+
+impl FakePlugins {
+    pub fn new(reply: impl Fn(&str, &Request) -> Result<String, String> + 'static) -> FakePlugins {
+        FakePlugins {
+            reply: Box::new(reply),
+            seen: RefCell::default(),
+        }
+    }
+
+    /// For a config without plugin steps.
+    pub fn none() -> FakePlugins {
+        FakePlugins::new(|name, _| panic!("plugin {name} ran"))
+    }
+}
+
+impl Plugins for FakePlugins {
+    fn script(&self, name: &str, request: &Request) -> Result<String, String> {
+        self.seen
+            .borrow_mut()
+            .push((name.to_owned(), json(request)));
+        (self.reply)(name, request)
+    }
 }
 
 /// A store that fails to open with `error()`, like a locked age identity,

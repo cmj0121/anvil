@@ -52,7 +52,7 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
   正在執行的 target 在結束前沒有分頁，它的 spinner 在標頭與 Results 的最後一行。
   在 doctor、edit 與 plan 結果上，列表是上次重新載入時 config 的 step，沒有記號。
   run 結果（`x`）只列出一個 step，即它的腳本（第一行，還有更多行時加上 `…`），記號與 apply 相同。
-  config 載入失敗時改以紅色顯示錯誤。
+  plugin step 列為 `plugin NAME`。config 載入失敗時改以紅色顯示錯誤。
 - **Results。** 顯示中結果的每個區段一個分頁，而不是每次過去的執行一個分頁。
   doctor 結果在有本機檢查時有一個 `local checks` 分頁，接著依序每個 target 一個分頁；apply、plan 與 run 依序每個 target 一個分頁；
   edit 只有一個分頁，以它編輯的對象命名（`inventory`、`config`、`secret NAME`、`migrate → age`）。

@@ -1730,6 +1730,7 @@ mod tests {
             kind: TargetKind::Local,
             pkg: None,
             sudo_secret: None,
+            tags: Vec::new(),
         };
         let host = Target {
             name: "box".into(),
@@ -1740,6 +1741,7 @@ mod tests {
             },
             pkg: None,
             sudo_secret: None,
+            tags: Vec::new(),
         };
         let p = Packages {
             manager: Choice::Is(Manager::Pacman),
@@ -1901,6 +1903,7 @@ mod tests {
             kind: TargetKind::Local,
             pkg: None,
             sudo_secret: None,
+            tags: Vec::new(),
         };
         let host = Target {
             name: "box".into(),
@@ -1911,6 +1914,7 @@ mod tests {
             },
             pkg: None,
             sudo_secret: None,
+            tags: Vec::new(),
         };
         let p = Packages {
             local_sudo_secret: Some("LOCAL_SUDO".into()),

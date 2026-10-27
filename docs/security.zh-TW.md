@@ -34,3 +34,19 @@
   較短的密碼則不會被清除。
   sudo 必須顯示 anvil 自己的提示；其他類型的 PAM 提示（2FA、指紋）會讓該 target 在 15 秒後失敗。
   請參閱[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)。
+- **plugin 是被釘選，而不是被沙箱隔離**。只有當 `[plugins]` 項目指定了它的檔案，且檔案位元組的雜湊等於其 `sha256` 時，
+  plugin 才會執行（[Plugins](configuration.zh-TW.md#plugins)）。它涵蓋與不涵蓋的範圍：
+  - 只檢查檔案本身與它所在的目錄（屬於你、群組與其他人沒有寫入位元），不檢查更上層的目錄。
+    其他人能寫入的上層目錄，可能讓他們把 plugin 所在的目錄移開、換成另一個；請讓整條路徑都屬於你。
+  - 釘選只涵蓋入口檔案的位元組。它的直譯器（`#!` 行）、它 import 或 source 的任何東西，以及它旁邊的任何檔案都不會被雜湊：
+    一個執行 `python3` 或讀取 `./lib.sh` 的已釘選腳本，執行的是它們當下的內容。
+  - 沒有沙箱。plugin 以你的身分在控制端執行，帶有 `PATH`、`HOME`、`TMPDIR`、`LANG`，
+    以及 `LC_ALL`、`LC_CTYPE`、`LC_COLLATE`、`LC_MESSAGES`、`LC_MONETARY`、`LC_NUMERIC` 與 `LC_TIME` 這些語系變數，
+    因此你能讀寫的東西它都能讀寫。anvil 只是讓 secret 遠離它：絕不把任何 secret 的值放進它的環境變數或 argv，
+    你環境中的其他變數（雲端憑證、`GNUPGHOME`、`SSH_AUTH_SOCK`）也都會被清除。
+  - 檢查之後被變更的檔案會在啟動時依其 stat（device、inode、大小、mtime、ctime）被拒絕，而不是重新雜湊。
+    由你自己的使用者進行的替換不在範圍內：以你身分執行的行程本來就能以你的身分執行任何東西。
+  - plugin 從不在 target 上執行，只有它回傳的腳本會。它的 stderr 從不原樣寫入日誌或印出：
+    只有最後一個非空行會放進失敗訊息，截至 64 個字元，控制字元會被跳脫。
+    該訊息會被顯示，也會以 info 層級（`-vv`）寫入日誌，因此 plugin 不應把 secret 寫到 stderr。
+  - `anvil plan` 也會執行 plugin，因此 plugin 不可以有副作用。

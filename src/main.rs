@@ -14,6 +14,7 @@ mod options;
 mod packages;
 mod paths;
 mod plan;
+mod plugin;
 mod run;
 mod secret;
 mod ssh;

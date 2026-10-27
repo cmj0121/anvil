@@ -10,7 +10,7 @@ use std::sync::mpsc::Sender;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::config::Config;
+use crate::config::{Config, StepKind};
 use crate::document::{Format, MAX_BYTES};
 use crate::inventory::{Inventory, LOCAL, Sel, Target, UnknownSel};
 use crate::options::Options;
@@ -314,13 +314,17 @@ pub fn load_steps(opts: &Options) -> Result<Vec<StepRow>, String> {
 }
 
 /// The steps apply runs for `config`: `packages` first when it has work,
-/// then each step's command as its `$` line shows it.
+/// then each step's command as its `$` line shows it, or `plugin <name>`
+/// for a plugin step, whose script is known only once it has run.
 pub fn step_rows(config: &Config) -> Vec<StepRow> {
     let packages = config.packages.as_ref().is_some_and(|p| p.has_work());
     packages
         .then(|| "packages".to_owned())
         .into_iter()
-        .chain(config.steps.iter().map(|step| apply::command(&step.run)))
+        .chain(config.steps.iter().map(|step| match step.kind() {
+            StepKind::Plugin(name) => format!("plugin {name}"),
+            StepKind::Run(run) => apply::command(run),
+        }))
         .map(|label| StepRow { label })
         .collect()
 }
@@ -1108,6 +1112,7 @@ pub mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::config::Step;
     use crate::inventory::Host;
 
     pub fn opts() -> Options {
@@ -1301,6 +1306,21 @@ pub mod tests {
             [row("packages"), row("hostname"), row("mkdir -p ~/.local …")]
         );
         assert_eq!(app.config_error, None);
+    }
+
+    #[test]
+    fn a_plugin_step_row_names_its_plugin() {
+        let config = Config {
+            steps: vec![
+                Step::script("ls"),
+                Step {
+                    plugin: Some("harden".to_owned()),
+                    ..Step::default()
+                },
+            ],
+            ..Config::default()
+        };
+        assert_eq!(step_rows(&config), [row("ls"), row("plugin harden")]);
     }
 
     #[test]

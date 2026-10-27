@@ -169,6 +169,7 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "serde_json",
+ "sha2 0.10.9",
  "signal-hook",
  "toml 1.1.8+spec-1.1.0",
  "zeroize",
