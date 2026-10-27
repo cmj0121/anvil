@@ -1,0 +1,8 @@
+{
+  "target": "linode1",
+  "facts": { "hostname": "linode1", "kernel": "6.2" },
+  "tags": ["linode"],
+  "args": {},
+  "last_apply": null,
+  "current_files": []
+}

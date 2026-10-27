@@ -5,6 +5,11 @@ edition = "2024"
 rust-version = "1.89"
 description = "Setup your env, both for human and agent, in one command."
 
+[workspace]
+members = [".", "plugins/anvil-audit"]
+# cargo build, run and install touch only anvil; make audit-plugin builds the plugin.
+default-members = ["."]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

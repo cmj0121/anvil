@@ -1,0 +1,145 @@
+{
+  "target": "linode1",
+  "facts": {
+    "hostname": "linode1",
+    "kernel": "6.2",
+    "os": "arch",
+    "sudo": "binary=/usr/bin/sudo nopasswd=no"
+  },
+  "tags": ["linode"],
+  "args": {},
+  "future": "ignored",
+  "last_apply": {
+    "at": 100,
+    "anvil": "0.1.0",
+    "facts": {
+      "gone": "x",
+      "hostname": "linode1",
+      "kernel": "6.1",
+      "sudo": "binary=/usr/bin/sudo nopasswd=yes"
+    },
+    "files": [
+      {
+        "dest": "/etc/same",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "written"
+      },
+      {
+        "dest": "/etc/changed",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "written"
+      },
+      {
+        "dest": "/etc/absent",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "written"
+      },
+      {
+        "dest": "/etc/dangling",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "written"
+      },
+      {
+        "dest": "/etc/symlink",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "written"
+      },
+      {
+        "dest": "/etc/dir",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "written"
+      },
+      {
+        "dest": "/etc/unread",
+        "mode": "0600",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "written"
+      },
+      {
+        "dest": "/etc/open/conf",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "written"
+      },
+      {
+        "dest": "/etc/nohash",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "written"
+      },
+      {
+        "dest": "/etc/nosudo",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "written"
+      },
+      {
+        "dest": "/etc/midway",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "failed_midway"
+      },
+      {
+        "dest": "/etc/midway-same",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "failed_midway"
+      },
+      {
+        "dest": "/etc/midway-absent",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "failed_midway"
+      },
+      {
+        "dest": "/etc/rolled",
+        "mode": "0644",
+        "written_tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "write": "written"
+      }
+    ],
+    "rolled_back": { "at": 200, "dests": ["/etc/rolled"] }
+  },
+  "current_files": [
+    {
+      "dest": "/etc/rolled",
+      "state": "file",
+      "tag": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "dest": "/etc/same",
+      "state": "file",
+      "tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "dest": "/etc/changed",
+      "state": "file",
+      "tag": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    { "dest": "/etc/absent", "state": "absent" },
+    { "dest": "/etc/dangling", "state": "dangling" },
+    { "dest": "/etc/symlink", "state": "symlink" },
+    { "dest": "/etc/dir", "state": "not_regular" },
+    { "dest": "/etc/unread", "state": "unreadable" },
+    { "dest": "/etc/open/conf", "state": "not_root_only" },
+    { "dest": "/etc/nohash", "state": "no_hash" },
+    { "dest": "/etc/nosudo", "state": "no_sudo" },
+    {
+      "dest": "/etc/midway",
+      "state": "file",
+      "tag": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "dest": "/etc/midway-same",
+      "state": "file",
+      "tag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    { "dest": "/etc/midway-absent", "state": "absent" }
+  ]
+}
