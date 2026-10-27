@@ -1,6 +1,10 @@
 //! `anvil update`: this binary against the latest GitHub release.
 
+#[cfg_attr(not(test), expect(dead_code, reason = "wired up by #33 U3"))]
+pub mod keys;
 mod release;
+#[cfg_attr(not(test), expect(dead_code, reason = "wired up by #33 U3"))]
+pub mod verify;
 
 use std::fmt;
 
