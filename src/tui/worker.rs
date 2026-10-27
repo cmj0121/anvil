@@ -452,6 +452,23 @@ mod tests {
     }
 
     #[test]
+    fn a_set_cancel_flag_ends_the_doctor_targets_cancelled() {
+        let (tx, rx) = mpsc::channel();
+        let opts = local_opts("tui-worker-doctor-cancel", &[]);
+        let worker = spawn(Job::Doctor, opts, Arc::new(AtomicBool::new(true)), tx);
+        let msgs = collect(worker, &rx);
+        let report = msgs
+            .iter()
+            .find_map(|msg| match msg {
+                Msg::DoctorDone(report) => Some(report),
+                _ => None,
+            })
+            .expect("doctor ends with its report");
+        assert!(report.cancelled && !report.ok);
+        assert_eq!(report.targets[0].error.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
     fn plan_sends_start_the_target_plan_then_finished_and_runs_nothing() {
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-plan", &["touch ran"]);

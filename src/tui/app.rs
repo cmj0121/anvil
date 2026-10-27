@@ -994,14 +994,17 @@ impl App {
     fn busy(&self) -> Option<String> {
         let running = self.running.as_ref()?;
         let hint = match running.kind {
-            RunKind::Apply | RunKind::Plan | RunKind::Run | RunKind::Rollback => " (Esc cancels)",
-            RunKind::Doctor | RunKind::Update => "",
+            RunKind::Apply | RunKind::Plan | RunKind::Run | RunKind::Rollback | RunKind::Doctor => {
+                " (Esc cancels)"
+            }
+            RunKind::Update => "",
         };
         Some(format!("busy: {} is running{hint}", running.kind.as_str()))
     }
 
     /// Sets the cancel flag: apply, run and rollback stop before their next
-    /// target or step, plan before its next target, doctor runs to the end (D3).
+    /// target or step, plan before its next target, doctor before its next
+    /// target or doctor plugin.
     fn cancel(&mut self) {
         let Some(running) = &self.running else {
             return;
@@ -1012,7 +1015,7 @@ impl App {
                 "cancelling: the running step finishes first".to_owned()
             }
             RunKind::Plan => "cancelling: running targets finish first".to_owned(),
-            RunKind::Doctor => "doctor cannot be cancelled; it ends with its probes".to_owned(),
+            RunKind::Doctor => "cancelling: the running check finishes first".to_owned(),
             RunKind::Update => "update cannot be cancelled; it ends on its own".to_owned(),
         });
     }
@@ -1958,12 +1961,28 @@ pub mod tests {
     }
 
     #[test]
+    fn esc_cancels_doctor_with_the_cancelling_notice() {
+        let mut app = app();
+        press(&mut app, &[KeyCode::Char('d')]);
+        assert!(!cancel_flag(&app));
+        app.on_key(key(KeyCode::Esc));
+        assert!(cancel_flag(&app));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("cancelling: the running check finishes first")
+        );
+    }
+
+    #[test]
     fn a_second_run_and_the_editor_keys_are_refused_while_running() {
         let mut app = app();
         press(&mut app, &[KeyCode::Char('d')]);
         for c in ['d', 'a', 'i', 'c', 's', 'm', 'o', 'x', 'u', 'b'] {
             assert_eq!(app.on_key(key(KeyCode::Char(c))), [Effect::Redraw], "{c}");
-            assert_eq!(app.notice.as_deref(), Some("busy: doctor is running"));
+            assert_eq!(
+                app.notice.as_deref(),
+                Some("busy: doctor is running (Esc cancels)")
+            );
             assert!(app.overlay.is_none(), "{c}");
         }
         assert_eq!(app.results.len(), 1);
