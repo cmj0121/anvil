@@ -275,7 +275,7 @@ impl fmt::Display for Body<'_> {
 }
 
 /// `s` in single quotes for `sh`.
-fn quote(s: &str) -> String {
+pub(crate) fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 

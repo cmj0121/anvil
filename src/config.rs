@@ -757,7 +757,7 @@ const NON_SERVICE_UNITS: [&str; 7] = [
 /// A service name: at most systemd's unit name limit, in a charset that
 /// needs no shell quoting, not read as an option or a hidden file, and not
 /// a systemd unit of another type.
-fn check_service_name(name: &str) -> Result<(), String> {
+pub(crate) fn check_service_name(name: &str) -> Result<(), String> {
     if name.len() > MAX_SERVICE_NAME_BYTES {
         return Err(format!(
             "{} bytes exceeds the {MAX_SERVICE_NAME_BYTES} byte limit",

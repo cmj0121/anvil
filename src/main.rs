@@ -18,6 +18,11 @@ mod plan;
 mod plugin;
 mod run;
 mod secret;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "apply runs services from U3 on")
+)]
+mod services;
 mod ssh;
 mod term;
 #[cfg(test)]
