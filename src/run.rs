@@ -1,5 +1,5 @@
 //! `anvil run FILE|-`: one ad-hoc POSIX sh script on every selected target,
-//! one target at a time, through apply's step runner.
+//! up to `--parallel` at a time, through apply's step runner.
 //!
 //! The config is never loaded, so a broken one cannot block a run; nothing
 //! is probed, the secret store is never opened and no sudo password is
@@ -25,9 +25,9 @@ use crate::transport::{Transport, TransportError};
 /// `--timeout` when unset, in seconds.
 pub const DEFAULT_TIMEOUT: u64 = 300;
 
-/// Loads the targets and runs `script` on each in order, killing it after
-/// `timeout`. Before each target, `cancel` is checked; once set, every later
-/// target is Cancelled.
+/// Loads the targets and runs `script` on each, `opts.parallel` at a time,
+/// killing it after `timeout`. Before each target, `cancel` is checked; once
+/// set, every target not started is Cancelled.
 pub fn run_targets(
     opts: &Options,
     script: String,
@@ -45,9 +45,13 @@ pub fn run_targets(
         file: None,
         service: None,
     }];
-    Ok(apply::for_each_target(&targets, cancel, on, |target| {
-        run_target(target, opts.transport(target), &runs, cancel)
-    }))
+    Ok(apply::for_each_target(
+        &targets,
+        opts.parallel,
+        cancel,
+        on,
+        |target| run_target(target, opts.transport(target), &runs, cancel),
+    ))
 }
 
 /// `script` as it travels on the transport's stdin; see the module

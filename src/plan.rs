@@ -152,9 +152,8 @@ fn plan_target(
 ) -> PlanReport {
     log::info!("plan {}: start", target.name);
     let runs = transport
-        .map_err(|err| err.to_string())
+        .map_err(|err| Unresolved::Failed(err.to_string()))
         .and_then(|transport| apply::probe(transport.as_ref(), config))
-        .map_err(Unresolved::Failed)
         .and_then(|facts| apply::resolve(target, Some(&facts), config, sources, plugins, cancel));
     match runs {
         Ok(steps) => {

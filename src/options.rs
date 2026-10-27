@@ -29,10 +29,6 @@ pub struct Options {
     pub ssh_config: Option<PathBuf>,
     pub target: Vec<String>,
     /// Targets apply, plan and run work on at once.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read once targets run in parallel")
-    )]
     pub parallel: NonZeroU8,
     /// The run's cancel flag; ssh checks it before opening a master.
     pub cancel: Arc<AtomicBool>,

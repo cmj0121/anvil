@@ -179,7 +179,8 @@ impl Ssh {
     /// takes no lock. Otherwise, under [`MASTER`], the master is checked again
     /// (another thread may just have opened it, for an alias with the same
     /// `%C` too), and a still dead one is opened unless `cancellable` and the
-    /// run was cancelled.
+    /// run was cancelled; when cancelled while it opens, a connect or auth
+    /// failure is `Cancelled`.
     fn connected(&self, cancellable: bool) -> Result<&Path, TransportError> {
         let control_dir = self.control_dir()?;
         if self.master_alive(control_dir) {
@@ -189,10 +190,19 @@ impl Ssh {
         if self.master_alive(control_dir) {
             return Ok(control_dir);
         }
-        if cancellable && self.cancel.load(Ordering::Relaxed) {
+        let cancelled = || cancellable && self.cancel.load(Ordering::Relaxed);
+        if cancelled() {
             return Err(TransportError::Cancelled);
         }
-        self.open_master(control_dir)?;
+        // A master that could not connect or sign in once the run was
+        // cancelled (a prompt left unanswered, say) ends the target as
+        // cancelled; any other failure, a bad host key above all, stays.
+        self.open_master(control_dir).map_err(|err| match err {
+            TransportError::Connect { .. } | TransportError::AuthDenied { .. } if cancelled() => {
+                TransportError::Cancelled
+            }
+            err => err,
+        })?;
         Ok(control_dir)
     }
 
@@ -453,7 +463,7 @@ mod tests {
     use super::*;
     use crate::facts::{Facts, PROBE};
     use crate::term::testing::{Event, Recorder};
-    use crate::test_util::{temp_dir, write_knobs};
+    use crate::test_util::{temp_dir, wait_for, write_knobs};
     use crate::transport::RUN_TIMEOUT;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1311,6 +1321,53 @@ mod tests {
         let out = cancelled(ssh).run("echo hi", RUN_TIMEOUT).unwrap();
         assert_eq!(out.stdout, b"hi\n");
         assert_eq!(masters(&log), 0);
+    }
+
+    /// Runs `true` over a fake whose key attempt fails with `stderr`,
+    /// setting cancel while that attempt is under way when `cancel`.
+    fn master_fails_with(stderr: &str, cancel: bool) -> TransportError {
+        let home = temp_home();
+        let gate = home.join("gate");
+        let shown = gate.display().to_string();
+        let knobs = [
+            ("FAKE_SSH_EXIT", "255"),
+            ("FAKE_SSH_STDERR", stderr),
+            ("FAKE_SSH_GATE", shown.as_str()),
+        ];
+        let (ssh, _) = fake_with(&home, &knobs);
+        let flag = Arc::clone(&ssh.cancel);
+        std::thread::scope(|scope| {
+            let run = scope.spawn(move || ssh.run("true", RUN_TIMEOUT));
+            wait_for(&home.join("gate.wait"));
+            flag.store(cancel, Ordering::Relaxed);
+            fs::write(&gate, "").unwrap();
+            run.join().unwrap().unwrap_err()
+        })
+    }
+
+    #[test]
+    fn a_connect_or_auth_failure_once_cancelled_is_cancelled() {
+        let refused = "ssh: connect to host box port 22: Connection refused";
+        let denied = "me@box: Permission denied (publickey).";
+        for stderr in [refused, denied] {
+            assert_eq!(master_fails_with(stderr, true), TransportError::Cancelled);
+        }
+        assert!(matches!(
+            master_fails_with(refused, false),
+            TransportError::Connect { .. }
+        ));
+        assert_eq!(
+            master_fails_with(denied, false),
+            TransportError::AuthDenied {
+                after_prompt: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_bad_host_key_stays_a_host_key_error_once_cancelled() {
+        let err = master_fails_with("Host key verification failed.", true);
+        assert_eq!(err, TransportError::HostKey);
     }
 
     #[test]

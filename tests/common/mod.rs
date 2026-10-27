@@ -221,6 +221,30 @@ impl Sandbox {
         self.write_config("inventory.toml", "[hosts.fake]\nhost = \"fakehost\"\n");
     }
 
+    /// Two inventory hosts, `alpha` and `beta`, reached through
+    /// `fake-ssh.sh`.
+    pub fn with_two_fake_hosts(&self) {
+        self.write_config(
+            "inventory.toml",
+            "[hosts.alpha]\nhost = \"alpha.example\"\n\n[hosts.beta]\nhost = \"beta.example\"\n",
+        );
+    }
+
+    /// A step that waits until two runs of it have started, then prints
+    /// `met`: it passes only when two targets run at once. After 30 s it
+    /// gives up: it says why on stderr and exits 1.
+    pub fn barrier_step(&self) -> String {
+        let dir = self.root.join("barrier");
+        fs::create_dir_all(&dir).unwrap();
+        let dir = dir.display();
+        format!(
+            "touch {dir}/$$; i=0; until [ \"$(ls {dir} | wc -l)\" -ge 2 ]; do \
+             i=$((i+1)); if [ $i -gt 600 ]; then \
+             echo \"barrier: gave up after 30 s, $(ls {dir} | wc -l) of 2 runs started\" >&2; \
+             exit 1; fi; sleep 0.05; done; echo met"
+        )
+    }
+
     /// `program` in the sandbox's environment: its config dir, `$HOME`,
     /// temp dir and the fake editor, with no fake's knobs of this process.
     pub fn command(&self, program: impl AsRef<OsStr>) -> Command {

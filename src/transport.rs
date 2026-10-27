@@ -111,10 +111,6 @@ pub trait Transport {
     fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError>;
     /// [`Transport::run`] for a cleanup that must run even once the run was
     /// cancelled.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the [[files]] cleanup calls it")
-    )]
     fn run_uncancelled(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
         self.run(script, timeout)
     }
@@ -1393,6 +1389,41 @@ mod tests {
         let shown = text(&out);
         assert!(!shown.contains("hunter2"), "{shown:?}");
         assert!(shown.contains("again ***"), "{shown:?}");
+    }
+
+    #[test]
+    fn two_terminal_runs_at_once_each_type_and_scrub_only_their_password() {
+        let dir = crate::test_util::temp_dir("tty-two");
+        // Each waits until both are past their prompt; after 30 s it says
+        // why and exits 1, well inside the run limit below.
+        let barrier = format!(
+            "touch '{d}/'$$; i=0; until [ \"$(ls '{d}' | wc -l)\" -ge 2 ]; do \
+             i=$((i+1)); if [ $i -gt 600 ]; then \
+             echo \"barrier: gave up after 30 s\"; exit 1; fi; sleep 0.05; done",
+            d = dir.display()
+        );
+        let limits = TtyLimits {
+            run: Duration::from_secs(60),
+            ..fast()
+        };
+        let body = format!("stty echo </dev/tty; fake_sudo; {barrier}; echo \"again $pw\"");
+        let outs = thread::scope(|scope| {
+            let runs = [&b"first-password"[..], b"second-password"].map(|password| {
+                let script = wrapped(&body);
+                scope.spawn(move || {
+                    run_tty_with(&mut local_tty_command(&script), password, limits).unwrap()
+                })
+            });
+            runs.map(|run| run.join().unwrap())
+        });
+        for (out, len) in outs.iter().zip([14, 15]) {
+            let shown = text(out);
+            assert_eq!(out.code, Some(0), "{shown:?}");
+            assert!(shown.contains(&format!("got:{len}")), "{shown:?}");
+            assert!(shown.contains("again ***"), "{shown:?}");
+            assert!(!shown.contains("-password"), "{shown:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

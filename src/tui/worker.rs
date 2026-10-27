@@ -4,7 +4,6 @@
 //! update's check or install sends only `UpdateChecked` or `Updated`. A panic
 //! in the run becomes `Msg::Panicked`, caught by joining the run's thread.
 
-use std::any::Any;
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -15,7 +14,7 @@ use std::time::Duration;
 use super::app::{self, Job, Msg};
 use crate::cli::Failure;
 use crate::options::Options;
-use crate::{apply, doctor, plan, run, update};
+use crate::{apply, doctor, fanout, plan, run, update};
 
 /// A run in progress; [`Worker::join`] waits for it, which is quick once
 /// `Finished` or `Panicked` has arrived.
@@ -35,6 +34,7 @@ impl Worker {
 /// Starts `job` with `opts` (its targets already selected); `cancel` stops
 /// apply and run between targets and steps, and plan between targets.
 pub fn spawn(job: Job, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) -> Worker {
+    let opts = job_opts(&job, opts, &cancel);
     match job {
         Job::Doctor => spawn_job(tx, move |tx| run_doctor(&opts, tx)),
         Job::Apply => spawn_job(tx, move |tx| run_apply(&opts, &cancel, tx)),
@@ -53,6 +53,18 @@ pub fn spawn(job: Job, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) 
             )
         }),
     }
+}
+
+/// `opts` as `job` runs with them: apply, plan and run carry `cancel`, which
+/// ssh checks before opening a master.
+fn job_opts(job: &Job, mut opts: Options, cancel: &Arc<AtomicBool>) -> Options {
+    if matches!(job, Job::Apply | Job::Plan | Job::Run(_)) {
+        opts.cancel = Arc::clone(cancel);
+    }
+    // One target at a time until the TUI shows every running target in
+    // fixed rows; U8 removes this clamp.
+    opts.parallel = std::num::NonZeroU8::MIN;
+    opts
 }
 
 thread_local! {
@@ -87,7 +99,7 @@ fn spawn_task(tx: Sender<Msg>, task: impl FnOnce(&Sender<Msg>) -> Msg + Send + '
             })
         };
         if let Err(payload) = run.join() {
-            let _ = tx.send(Msg::Panicked(panic_message(payload.as_ref())));
+            let _ = tx.send(Msg::Panicked(fanout::panic_message(payload.as_ref())));
         }
     }))
 }
@@ -120,10 +132,14 @@ fn run_apply(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<()
 /// Sends each of apply's (or run's) progress events to the main loop.
 fn send_progress(tx: &Sender<Msg>) -> impl FnMut(apply::Progress<'_>) + '_ {
     |progress| {
-        let _ = tx.send(match progress {
-            apply::Progress::Start(target) => Msg::Start(target.name.clone()),
-            apply::Progress::Done(report) => Msg::TargetDone(report.clone()),
-        });
+        let msg = match progress {
+            // The slots come with the TUI's parallel view.
+            apply::Progress::Begin(_) => return,
+            apply::Progress::Start(_, target) => Msg::Start(target.name.clone()),
+            apply::Progress::Done(_, report) => Msg::TargetDone(report.clone()),
+            apply::Progress::Ordered(_) => return,
+        };
+        let _ = tx.send(msg);
     }
 }
 
@@ -154,14 +170,6 @@ fn run_plan(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(),
     Ok(())
 }
 
-fn panic_message(payload: &(dyn Any + Send)) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_owned())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "unknown panic".to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -171,7 +179,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
-    use crate::test_util::temp_dir;
+    use crate::test_util::{temp_dir, wait_for};
     use crate::tui::app::tests::{opts, row};
     use crate::tui::app::{App, RunResult};
 
@@ -454,6 +462,80 @@ mod tests {
             &msgs[2],
             Msg::TargetDone(apply::TargetReport::Cancelled { steps, .. }) if steps.is_empty()
         ));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn esc_reaches_the_ssh_check_of_a_running_target() {
+        let mut opts = fake_ssh_opts("tw-esc", &["true"]);
+        opts.target = vec!["down".to_owned()];
+        let home = opts.ssh_home.clone().unwrap();
+        let gate = home.join("gate");
+        crate::test_util::write_knobs(
+            &home.join("fake-ssh.env"),
+            &[("FAKE_SSH_GATE", gate.to_str().unwrap())],
+        );
+        let mut app = App::with_inventory(opts, Err("not loaded yet".to_owned()), Ok(Vec::new()));
+        app.reload();
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let (tx, rx) = mpsc::channel();
+        let cancel = app.running.as_ref().unwrap().cancel.clone();
+        let worker = spawn(Job::Apply, app.opts.clone(), cancel, tx);
+        // down's key attempt is under way: Esc, then it is refused.
+        wait_for(&home.join("gate.wait"));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        fs::write(&gate, "").unwrap();
+        let msgs = collect(worker, &rx);
+        assert!(
+            matches!(
+                &msgs[2],
+                Msg::TargetDone(apply::TargetReport::Cancelled { target, steps, .. })
+                    if target == "down" && steps.is_empty()
+            ),
+            "the refused master is cancelled, not a failure"
+        );
+    }
+
+    #[test]
+    fn apply_plan_and_run_carry_the_cancel_flag_and_run_one_target_at_a_time() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        for job in [
+            Job::Apply,
+            Job::Plan,
+            Job::Run("true".to_owned()),
+            Job::Doctor,
+        ] {
+            let mut opts = opts();
+            opts.parallel = std::num::NonZeroU8::new(4).unwrap();
+            let opts = job_opts(&job, opts, &cancel);
+            assert_eq!(opts.parallel.get(), 1);
+            let carried = Arc::ptr_eq(&opts.cancel, &cancel);
+            assert_eq!(carried, !matches!(job, Job::Doctor));
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_cancelled_plan_reaches_the_ssh_check_of_its_probe() {
+        let mut opts = fake_ssh_opts("tw-plan-esc", &["true"]);
+        opts.target = vec!["down".to_owned()];
+        let home = opts.ssh_home.clone().unwrap();
+        let gate = home.join("gate");
+        crate::test_util::write_knobs(
+            &home.join("fake-ssh.env"),
+            &[("FAKE_SSH_GATE", gate.to_str().unwrap())],
+        );
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = spawn(Job::Plan, opts, Arc::clone(&cancel), tx);
+        wait_for(&home.join("gate.wait"));
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        fs::write(&gate, "").unwrap();
+        let msgs = collect(worker, &rx);
+        assert!(
+            matches!(&msgs[1], Msg::PlanDone(plan::PlanReport::Cancelled { target, .. }) if target == "down"),
+            "the refused probe is cancelled, not a failure"
+        );
     }
 
     #[test]

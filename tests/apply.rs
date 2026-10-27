@@ -465,3 +465,70 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
         "only the probe, the failed -v and the ticket drop"
     );
 }
+
+#[test]
+fn parallel_two_runs_two_hosts_at_once_and_keeps_inventory_order() {
+    let sandbox = Sandbox::new("aa");
+    sandbox.with_two_fake_hosts();
+    let step = sandbox.barrier_step();
+    sandbox.write_config("config.toml", &format!("[[steps]]\nrun = '{step}'\n"));
+    let args = [
+        "--parallel",
+        "2",
+        "apply",
+        "--target",
+        "beta",
+        "--target",
+        "alpha",
+    ];
+    let out = sandbox.anvil(&args, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let block = |name: &str| format!("▶ {name}\n  $ {step}\n  met\n  ✔ ok · 1 step\n\n");
+    assert_eq!(
+        text(&out.stdout),
+        format!("{}{}2 ok, 0 failed\n", block("alpha"), block("beta"))
+    );
+
+    std::fs::remove_dir_all(sandbox.root().join("barrier")).unwrap();
+    sandbox.barrier_step();
+    let out = sandbox.anvil(&[&["--json"][..], &args].concat(), &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let targets = value["targets"].as_array().unwrap();
+    assert_eq!(targets[0]["target"], "alpha");
+    assert_eq!(targets[1]["target"], "beta");
+    assert_eq!(value["ok"], true);
+}
+
+#[test]
+fn parallel_one_prints_exactly_what_the_default_prints() {
+    let sandbox = Sandbox::new("aa");
+    sandbox.with_fake_host();
+    for json in [false, true] {
+        let flag: &[&str] = if json { &["--json"] } else { &[] };
+        let default = sandbox.anvil(&[flag, &["apply"]].concat(), &[]);
+        let one = sandbox.anvil(&[flag, &["--parallel", "1", "apply"]].concat(), &[]);
+        assert_eq!(default.status.code(), Some(0), "{}", text(&default.stderr));
+        assert_eq!(one.status.code(), Some(0), "{}", text(&one.stderr));
+        assert_eq!(text(&one.stdout), text(&default.stdout), "--json {json}");
+    }
+    let name = local_hostname();
+    let name = name.trim_end();
+    let out = sandbox.anvil(&["--parallel", "1", "apply"], &[]);
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  $ hostname\n  {name}\n  ✔ ok · 1 step\n\n\
+             ▶ fake\n  $ hostname\n  {name}\n  ✔ ok · 1 step\n\n\
+             2 ok, 0 failed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "--parallel", "1", "apply"], &[]);
+    let step = format!(r#"[{{"run":"hostname","code":0,"stdout":"{name}\n","stderr":""}}]"#);
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            r#"{{"targets":[{{"target":"local","steps":{step},"ok":true}},{{"target":"fake","steps":{step},"ok":true}}],"ok":true}}"#
+        ) + "\n"
+    );
+}

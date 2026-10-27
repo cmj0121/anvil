@@ -9,6 +9,9 @@
 #   FAKE_SSH_SLEEP          seconds the key master attempt sleeps first
 #   FAKE_SSH_STDERR         stderr text of the key master attempt
 #   FAKE_SSH_STDERR_BYTES   bytes of filler the key master attempt writes to stderr
+#   FAKE_SSH_GATE           the key master attempt creates `$FAKE_SSH_GATE.wait`,
+#                           then waits until `$FAKE_SSH_GATE` exists; after 30 s it
+#                           says so on stderr and goes on
 #   FAKE_SSH_RETRY_EXIT     exit code of the interactive master attempt (default 0)
 #   FAKE_SSH_RETRY_STDERR   stderr text of the interactive master attempt
 #   FAKE_SSH_RETRY_SLEEP    seconds the interactive master attempt sleeps first
@@ -68,6 +71,18 @@ case "$kind" in
   master)
     if [ "$batch" = yes ]; then
       [ -n "${FAKE_SSH_SLEEP-}" ] && sleep "$FAKE_SSH_SLEEP"
+      if [ -n "${FAKE_SSH_GATE-}" ]; then
+        : >"$FAKE_SSH_GATE.wait"
+        i=0
+        until [ -e "$FAKE_SSH_GATE" ]; do
+          i=$((i + 1))
+          if [ $i -gt 600 ]; then
+            echo "fake-ssh: gave up after 30 s waiting for $FAKE_SSH_GATE" >&2
+            break
+          fi
+          sleep 0.05
+        done
+      fi
       [ -n "${FAKE_SSH_STDERR_BYTES-}" ] && yes | head -c "$FAKE_SSH_STDERR_BYTES" >&2
       [ -n "${FAKE_SSH_STDERR-}" ] && printf '%s\n' "$FAKE_SSH_STDERR" >&2
       code=${FAKE_SSH_EXIT-0}
