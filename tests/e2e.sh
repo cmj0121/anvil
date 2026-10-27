@@ -2,8 +2,11 @@
 # End-to-end checks against an Arch sshd container, through the real
 # commands: a temp XDG_CONFIG_HOME holds the inventory (the container as `arch`
 # for the key user and `archpw` for the password user, `closed` on a closed
-# port) and a config with
-# no secret names, so the keychain is never touched.
+# port, `archsd` for a second container with systemd as PID 1) and a config
+# with no secret names, so the keychain is never touched.
+# The systemd container needs --privileged; when it cannot boot, the summary
+# says `SKIP systemd: <reason>` and the run still passes, unless
+# ANVIL_E2E_SYSTEMD=1, which turns that skip into a failure.
 # Never touches the real ~/.ssh or a real host. The isolation rests on `-F` with
 # a temp ssh config setting UserKnownHostsFile, IdentityFile and IdentitiesOnly
 # yes: ssh resolves `~` from the passwd entry, not from $HOME, so the temp HOME
@@ -18,6 +21,7 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
 fi
 
 IMAGE=anvil-e2e-sshd
+SD_IMAGE=anvil-e2e-systemd
 # Base images pinned by manifest-list digest. To bump: `docker buildx imagetools
 # inspect archlinux:latest` (and lopsided/archlinux:latest), copy the Digest line.
 ARCH_AMD64=archlinux@sha256:52dfbd5afb23a220d5ee92dafcb4c788d96c026ed04179890c23adef4c897fa0
@@ -29,6 +33,14 @@ case "$(uname -m)" in
   *) BASE=$ARCH_AMD64; PLATFORM=linux/amd64 ;;
 esac
 NAME="anvil-e2e-$$"
+SD_NAME="$NAME-sd"
+# The least-privileged set that boots systemd under Docker's cgroup v2: without
+# --privileged, Docker mounts /sys/fs/cgroup read-only and PID 1 exits.
+SD_FLAGS="--cgroupns=private --tmpfs /run --tmpfs /tmp --privileged"
+# Seconds from `docker run` until systemd is up and its sshd answers.
+SD_DEADLINE=60
+# Why the systemd block was skipped; empty when it ran.
+sd_skip=""
 # The container's test-only password for the `pw` user (tests/e2e/Dockerfile).
 PASSWORD=pw-secret
 # Short: the control socket path must fit sun_path, and macOS' $TMPDIR is long.
@@ -42,7 +54,7 @@ KEY="$TMP/id_ed25519"
 fails=0
 
 cleanup() {
-  docker rm -f "$NAME" >/dev/null 2>&1
+  docker rm -f "$NAME" "$SD_NAME" >/dev/null 2>&1
   rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
@@ -59,22 +71,48 @@ fail() {
   cat "$TMP/out" "$TMP/err" 2>/dev/null
 }
 
-step "build image and binary"
-docker build -q --platform "$PLATFORM" --build-arg "BASE=$BASE" -t "$IMAGE" tests/e2e >/dev/null &
+# A run killed by SIGKILL skips its trap and leaves its containers behind.
+# Each container names its run's shell in anvil-e2e.pid; only those whose run
+# is gone are removed, so concurrent runs in other worktrees keep theirs.
+for id in $(docker ps -aq --filter label=anvil-e2e=1); do
+  pid=$(docker inspect -f '{{index .Config.Labels "anvil-e2e.pid"}}' "$id" 2>/dev/null)
+  kill -0 "$pid" 2>/dev/null || docker rm -f "$id" >/dev/null 2>&1
+done
+
+step "build images and binary"
+docker build -q --platform "$PLATFORM" --build-arg "BASE=$BASE" --target sshd -t "$IMAGE" tests/e2e >/dev/null &
 image=$!
+docker build -q --platform "$PLATFORM" --build-arg "BASE=$BASE" --target systemd -t "$SD_IMAGE" tests/e2e \
+  >"$TMP/sd-build" 2>&1 &
+sd_image=$!
 cargo build --quiet || exit 1
 wait "$image" || exit 1
+wait "$sd_image" || { sd_skip="image build failed"; cat "$TMP/sd-build"; }
 ANVIL=$(pwd)/target/debug/anvil
 FAKE_EDITOR=$(pwd)/tests/fixtures/fake-editor.sh
 
 step "start sshd"
 ssh-keygen -q -t ed25519 -N '' -f "$KEY" || exit 1
-docker run -d --rm --platform "$PLATFORM" --name "$NAME" -p 127.0.0.1::22 \
+docker run -d --rm --platform "$PLATFORM" --name "$NAME" \
+  --label anvil-e2e=1 --label "anvil-e2e.pid=$$" -p 127.0.0.1::22 \
   -e AUTHORIZED_KEY="$(cat "$KEY.pub")" "$IMAGE" >/dev/null || exit 1
 PORT=$(docker port "$NAME" 22/tcp | head -n1 | sed 's/.*://')
 [ -n "$PORT" ] || { echo "no mapped port"; exit 1; }
 REMOTE_HOSTNAME=$(docker inspect -f '{{.Config.Hostname}}' "$NAME")
 LOCAL_HOSTNAME=$(hostname)
+
+# systemd boots while the sshd cases run; its block waits for it.
+if [ -z "$sd_skip" ]; then
+  # The host's kernel setting, read before the privileged boot from the
+  # unprivileged sshd container, which cannot change it; block (n) checks it again.
+  core_pattern=$(docker exec "$NAME" cat /proc/sys/kernel/core_pattern)
+  sd_started=$(date +%s)
+  # -t: systemd logs to the console, so `docker logs` holds the boot messages.
+  # shellcheck disable=SC2086 # SD_FLAGS is a list of flags
+  docker run -d -t --platform "$PLATFORM" --name "$SD_NAME" \
+    --label anvil-e2e=1 --label "anvil-e2e.pid=$$" $SD_FLAGS -p 127.0.0.1::22 "$SD_IMAGE" \
+    >"$TMP/sd-run" 2>&1 || { sd_skip="docker run failed: $(tail -n1 "$TMP/sd-run")"; }
+fi
 
 # The scan that finds sshd up is also the known_hosts entry.
 i=0
@@ -572,6 +610,71 @@ else
   echo "skip (no python3 with os.login_tty, 3.11 or newer)"
 fi
 
+step "(n) systemd as PID 1: boots within ${SD_DEADLINE} s, sshd answers, anvil run reaches archsd"
+# SD_DEADLINE s after docker run, and never less than 30 s from here.
+sd_deadline=$((${sd_started:-0} + SD_DEADLINE))
+[ "$sd_deadline" -ge $(($(date +%s) + 30)) ] || sd_deadline=$(($(date +%s) + 30))
+# Polls `is-system-running` without --wait, which would block past the deadline.
+sd_wait() {
+  while :; do
+    sd_state=$(docker exec "$SD_NAME" systemctl is-system-running 2>/dev/null)
+    case $sd_state in running | degraded) return 0 ;; esac
+    if [ "$(docker inspect -f '{{.State.Running}}' "$SD_NAME" 2>/dev/null)" != true ]; then
+      docker logs "$SD_NAME" 2>&1 | tr -d '\033\r' | sed 's/\[[0-9;?]*[A-Za-z]//g' >"$TMP/sd-log"
+      sd_state=$(grep -a -m1 -oE '(Failed|failed|Error|error).*' "$TMP/sd-log") \
+        || sd_state=$(tail -n1 "$TMP/sd-log")
+      sd_state="exited: $sd_state"
+      return 1
+    fi
+    [ "$(date +%s)" -lt "$sd_deadline" ] || return 1
+    sleep 1
+  done
+}
+if [ -z "$sd_skip" ] && ! sd_wait; then
+  sd_skip="systemd did not boot (${sd_state:-no state}; flags: $SD_FLAGS)"
+fi
+if [ -z "$sd_skip" ]; then
+  docker exec -i "$SD_NAME" sh -c 'install -d -m 700 -o key -g key /home/key/.ssh \
+    && cat > /home/key/.ssh/authorized_keys && chown key:key /home/key/.ssh/authorized_keys \
+    && chmod 600 /home/key/.ssh/authorized_keys' <"$KEY.pub"
+  SD_PORT=$(docker port "$SD_NAME" 22/tcp | head -n1 | sed 's/.*://')
+  until ssh-keyscan -T 2 -p "$SD_PORT" 127.0.0.1 2>/dev/null | grep ssh-ed25519 >>"$KNOWN"; do
+    [ "$(date +%s)" -lt "$sd_deadline" ] \
+      || { sd_skip="sshd did not answer by the deadline (systemd $sd_state)"; break; }
+    sleep 1
+  done
+fi
+if [ -z "$sd_skip" ]; then
+  printf 'systemd %s, %s, flags: %s\n' "$sd_state" \
+    "$(docker exec "$SD_NAME" systemd-analyze 2>/dev/null | head -n1)" "$SD_FLAGS"
+  cat >>"$XDG/anvil/inventory.toml" <<INV
+
+[hosts.archsd]
+host = "127.0.0.1"
+user = "key"
+port = $SD_PORT
+tags = ["sd"]
+INV
+  SD_HOSTNAME=$(docker inspect -f '{{.Config.Hostname}}' "$SD_NAME")
+  printf 'hostname\n' >"$TMP/hostname.sh"
+  anvil run --target sd "$TMP/hostname.sh"
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF "  $SD_HOSTNAME" "$TMP/out" && grep -qxF '1 ok, 0 failed' "$TMP/out" \
+    && [ "$(docker exec "$SD_NAME" cat /proc/1/comm)" = systemd ]; then
+    pass "PID 1 is systemd, anvil run printed $SD_HOSTNAME"
+  else
+    fail "anvil run on archsd: exit $code"
+  fi
+  after=$(docker exec "$NAME" cat /proc/sys/kernel/core_pattern)
+  if [ -n "$core_pattern" ] && [ "$after" = "$core_pattern" ]; then
+    pass "the host's kernel.core_pattern is unchanged by the boot"
+  else
+    fail "kernel.core_pattern was '$core_pattern', now '$after'"
+  fi
+else
+  printf 'SKIP  systemd: %s (%s)\n' "$sd_skip" "$(took)"
+fi
+
 step "(f) unknown host key is refused with the ssh hint"
 sed "s|UserKnownHostsFile .*|UserKnownHostsFile $EMPTY_KNOWN|" "$CFG" >"$CFG.unknown"
 mv "$CFG.unknown" "$CFG"
@@ -625,6 +728,13 @@ else
   fail "sops not found on PATH: install sops (e.g. \`brew install sops\`) to run this check"
 fi
 
+if [ -n "$sd_skip" ]; then
+  echo "SKIP systemd: $sd_skip"
+  if [ "${ANVIL_E2E_SYSTEMD:-}" = 1 ]; then
+    echo "ANVIL_E2E_SYSTEMD=1: the systemd skip counts as a failure"
+    fails=$((fails + 1))
+  fi
+fi
 if [ "$fails" -eq 0 ]; then
   echo "e2e: all checks passed"
 else
