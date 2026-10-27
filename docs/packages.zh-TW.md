@@ -235,7 +235,7 @@ step 只有一行，各部分以 `&&` 連接：升級、安裝、缺少的鎖定
 
 | 管理器 | 部分 | 指令                                                             |
 | ------ | ---- | ---------------------------------------------------------------- |
-| brew   | 升級 | `brew update && brew upgrade`                                    |
+| brew   | 升級 | `brew update && brew upgrade --formula`                          |
 | brew   | 安裝 | `brew install P`                                                 |
 | pacman | 升級 | `S pacman -Syu --noconfirm --needed P`（單一指令，也會安裝 `P`） |
 | pacman | 安裝 | `S pacman -S --noconfirm --needed P`                             |
@@ -279,19 +279,25 @@ brew、apt 與 apk 拒絕鎖定（見上文）。
   把 `/opt/homebrew/bin`、`/usr/local/bin` 與 `/home/linuxbrew/.linuxbrew/bin` 附加到 `$PATH`，
   因為非登入的 ssh shell 可能不會把 Homebrew 放進 `PATH`。它們放在 `$PATH` 之後，因此使用者自己的 `PATH` 優先，
   其他帳號前綴下的執行檔永遠不會遮蔽它。全部是一行，所以 apply 的 `$` 行會顯示整個腳本。
+- **brew 從不提示輸入。** brew 那一行接著匯出 `SUDO_ASKPASS="${SUDO_ASKPASS:-/usr/bin/false}"`，
+  因此 brew 內部的 `sudo`（例如某個 cask 的安裝程式）會以 `sudo: a password is required` 失敗，
+  而不是在終端機上提示輸入密碼、讓 step 卡住。你自己設定的 `SUDO_ASKPASS` 會保留，target 上仍快取著的 sudo ticket 也會讓 `sudo` 通過。
+- **brew 只升級 formula。** brew 的升級是 `brew upgrade --formula`：它從不升級任何 cask，即使該 cask 在 `install` 中。
+  anvil 管理的是 formula；cask 只會透過它自己的更新程式，或你手動執行的 `brew upgrade --cask` 升級。
 - **名稱原樣傳遞。** `install` 名稱原樣、不加引號地傳給管理器（名稱規則排除了 shell 語法）。
   含有 `/` 的名稱是 brew tap：`owner/repo/formula` 會加入第三方 tap `owner/repo` 並從中安裝。
   config 決定每個 target 安裝什麼、從哪裡安裝，因此只使用你信任的 config。
 
-`install = ["git", "curl"]` 分別在 Debian 上以 NOPASSWD 使用者、在 Arch 上以 root，以及在 Mac 上：
+`install = ["git", "curl"]` 分別在 Debian 上以 NOPASSWD 使用者、在 Arch 上以 root，以及在 Mac 上（Mac 那一行此處以 `\` 換行）：
 
 ```sh
 sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y git curl
 pacman -S --noconfirm --needed git curl
-export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; brew install git curl
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; \
+  export SUDO_ASKPASS="${SUDO_ASKPASS:-/usr/bin/false}"; brew install git curl
 ```
 
-再加上 `upgrade = true` 時，Mac 那一行的結尾是 `brew update && brew upgrade && brew install git curl`，
+再加上 `upgrade = true` 時，Mac 那一行的結尾是 `brew update && brew upgrade --formula && brew install git curl`，
 而 Arch 的則是 `pacman -Syu --noconfirm --needed git curl`。
 
 [鎖定與移除](#鎖定與移除)的範例在 Arch 上以 root 執行時是這一行（此處以 `\` 換行）：

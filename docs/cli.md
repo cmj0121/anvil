@@ -601,7 +601,8 @@ secret is set and free of control characters is not checked, so plan can pass wh
 
 ```text
 ▶ local
-  would $ export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; brew install git
+  would $ export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; \
+    export SUDO_ASKPASS="${SUDO_ASKPASS:-/usr/bin/false}"; brew install git
   would $ hostname
   ✔ 2 steps
 

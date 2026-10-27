@@ -40,7 +40,7 @@ local = "brew"             # optional; the choice for `local`, which has no inve
 install = ["git", "curl"]  # default []
 pin = ["vim"]              # installed when missing, skipped by the upgrade; pacman and dnf only; default []
 remove = ["nano"]          # removed after the install when installed; default []
-upgrade = false            # upgrade every installed package first; default false
+upgrade = false            # upgrade every installed package first (brew: formulae, never casks); default false
 local_sudo_secret = "LOCAL_SUDO" # optional; the secret holding this machine's sudo password
 timeout = 300              # seconds the package step may run, 1..=3600; default 300
 
@@ -147,7 +147,7 @@ local = "brew"             # optional; the choice for the local target; default:
 install = ["git", "curl"]  # names to install; default []
 pin = ["vim"]              # names this run never upgrades, installed when missing; brew, apt, apk refuse; default []
 remove = ["nano"]          # names to remove after the install, when installed; not in install or pin; default []
-upgrade = false            # upgrade every installed package first; default false
+upgrade = false            # upgrade every installed package first (brew: formulae, never casks); default false
 local_sudo_secret = "LOCAL_SUDO" # optional: [A-Z][A-Z0-9_]*, the local target's sudo password secret
 timeout = 300              # seconds the package step may run, 1..=3600; default 300
 

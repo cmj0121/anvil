@@ -254,7 +254,7 @@ the same pin names joined by commas:
 
 | Manager | Part    | Command                                                                   |
 | ------- | ------- | ------------------------------------------------------------------------- |
-| brew    | upgrade | `brew update && brew upgrade`                                             |
+| brew    | upgrade | `brew update && brew upgrade --formula`                                   |
 | brew    | install | `brew install P`                                                          |
 | pacman  | upgrade | `S pacman -Syu --noconfirm --needed P` (one command, it installs `P` too) |
 | pacman  | install | `S pacman -S --noconfirm --needed P`                                      |
@@ -300,20 +300,28 @@ brew, apt and apk refuse a pin (above).
   and `/home/linuxbrew/.linuxbrew/bin` to `$PATH`, since a non-login ssh shell may leave Homebrew off `PATH`. They go
   after `$PATH`, so the user's own `PATH` wins and a binary under another account's prefix never shadows it. It is all
   one line, so apply's `$` line shows the whole script.
+- **brew never prompts.** The brew line then exports `SUDO_ASKPASS="${SUDO_ASKPASS:-/usr/bin/false}"`, so a `sudo`
+  inside brew (a cask's installer, say) fails with `sudo: a password is required` instead of prompting on the
+  terminal and hanging the step. A `SUDO_ASKPASS` you set yourself is kept, and a sudo ticket still cached on the
+  target lets the `sudo` through.
+- **brew upgrades formulae only.** brew's upgrade is `brew upgrade --formula`: it never upgrades a cask, not even one
+  in `install`. anvil manages formulae; a cask upgrades only through its own updater or a hand-run
+  `brew upgrade --cask`.
 - **Names as is.** The `install` names are passed to the manager as is, unquoted (the name rule keeps shell syntax
   out). A name containing `/` is a brew tap: `owner/repo/formula` adds the third-party tap `owner/repo` and installs
   from it. A config decides what every target installs and from where, so only use configs you trust.
 
-`install = ["git", "curl"]` on Debian as a NOPASSWD user, on Arch as root, and on a Mac:
+`install = ["git", "curl"]` on Debian as a NOPASSWD user, on Arch as root, and on a Mac (wrapped here with `\`):
 
 ```sh
 sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y git curl
 pacman -S --noconfirm --needed git curl
-export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; brew install git curl
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; \
+  export SUDO_ASKPASS="${SUDO_ASKPASS:-/usr/bin/false}"; brew install git curl
 ```
 
-With `upgrade = true` as well, the Mac's line ends `brew update && brew upgrade && brew install git curl`, and Arch's
-is `pacman -Syu --noconfirm --needed git curl`.
+With `upgrade = true` as well, the Mac's line ends `brew update && brew upgrade --formula && brew install git curl`,
+and Arch's is `pacman -Syu --noconfirm --needed git curl`.
 
 The [Pin and remove](#pin-and-remove) example on Arch as root is this one line (wrapped here with `\`):
 
