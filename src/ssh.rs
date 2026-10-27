@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::paths::{self, PrivateDirError};
 use crate::term;
 use crate::transport::{
-    Output, Transport, TransportError, TtyLimits, collect, into_string, run_tty_with,
+    Groups, Output, Transport, TransportError, TtyLimits, collect, into_string, run_tty_with,
     run_with_script,
 };
 
@@ -211,7 +211,10 @@ impl Ssh {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|err| TransportError::Spawn(err.to_string()))
-            .and_then(|child| collect(child, Some(self.check_timeout)))
+            .and_then(|child| {
+                let tracked = Groups::global().track(&child);
+                collect(child, Some(tracked), Some(self.check_timeout))
+            })
             .is_ok_and(|output| output.code == Some(0))
     }
 
@@ -256,7 +259,10 @@ impl Ssh {
         let child = command
             .spawn()
             .map_err(|err| TransportError::Spawn(err.to_string()))?;
-        let output = collect(child, timeout)?;
+        // Only the key attempt leads a group of its own; the retry is in
+        // anvil's group, which must never be killed with the children.
+        let tracked = batch.then(|| Groups::global().track(&child));
+        let output = collect(child, tracked, timeout)?;
         if output.code == Some(0) {
             return Ok(MasterOutcome::Connected);
         }
