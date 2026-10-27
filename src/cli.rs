@@ -93,6 +93,21 @@ pub enum Command {
     Apply,
     /// Show the steps apply would run on every target, running none
     Plan,
+    /// Restore the files the last apply wrote, on every selected target
+    Rollback {
+        /// Restore DEST even if it changed since the last apply (repeatable)
+        #[arg(long, value_name = "DEST")]
+        force: Vec<String>,
+        /// Restore every file even if it changed since the last apply
+        #[arg(long, conflicts_with = "force")]
+        force_all: bool,
+        /// Roll back even if the target's machine-id or hostname differs from the record
+        #[arg(long)]
+        allow_host_change: bool,
+        /// List what would be restored, connecting to nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run a POSIX sh script on every target, read from FILE or stdin (`-`)
     Run {
         /// The script file, or `-` for stdin
@@ -142,6 +157,7 @@ impl Command {
             Command::Doctor => "doctor",
             Command::Apply => "apply",
             Command::Plan => "plan",
+            Command::Rollback { .. } => "rollback",
             Command::Run { .. } => "run",
             Command::Secret { .. } => "secret",
             #[cfg(feature = "tui")]
@@ -239,6 +255,12 @@ pub fn run(cli: &Cli) -> Result<(), Failure> {
         }
         Command::Apply => crate::apply::run(cli, &opts),
         Command::Plan => crate::plan::run(cli, &opts),
+        Command::Rollback {
+            force,
+            force_all,
+            allow_host_change,
+            dry_run,
+        } => crate::rollback::run(cli, &opts, force, *force_all, *allow_host_change, *dry_run),
         Command::Run { script, timeout } => crate::run::run(cli, &opts, script, *timeout),
         Command::Secret { to: Some(to), .. } => crate::commands::migrate(cli, &opts, *to),
         Command::Secret { name, .. } => {
@@ -325,6 +347,51 @@ mod tests {
                 assert_eq!(to, Some(BackendKind::Age));
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rollback_takes_force_repeated_or_force_all() {
+        match parse(&[
+            "rollback", "--force", "/etc/a", "--force", "/etc/b", "--json",
+        ])
+        .command
+        {
+            Command::Rollback {
+                force,
+                force_all,
+                allow_host_change,
+                dry_run,
+            } => {
+                assert_eq!(force, ["/etc/a", "/etc/b"]);
+                assert!(!force_all && !allow_host_change && !dry_run);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            parse(&[
+                "rollback",
+                "--force-all",
+                "--allow-host-change",
+                "--dry-run"
+            ])
+            .command,
+            Command::Rollback {
+                force_all: true,
+                allow_host_change: true,
+                dry_run: true,
+                ..
+            }
+        ));
+        assert_eq!(parse(&["rollback"]).command.name(), "rollback");
+        for args in [
+            ["rollback", "--force-all", "--force", "/etc/a"].as_slice(),
+            ["rollback", "--force"].as_slice(),
+            ["rollback", "/etc/a"].as_slice(),
+        ] {
+            let err = Cli::try_parse_from(std::iter::once("anvil").chain(args.iter().copied()))
+                .unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{args:?}");
         }
     }
 

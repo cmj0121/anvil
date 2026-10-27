@@ -254,7 +254,7 @@ pub fn would_text(step: &PlannedRun) -> String {
 }
 
 /// The last line of the human output: `N targets, [M failed, ]nothing executed`.
-fn render_summary(targets: usize, failed: usize, style: Style) -> String {
+pub(crate) fn render_summary(targets: usize, failed: usize, style: Style) -> String {
     let plural = if targets == 1 { "" } else { "s" };
     let failed = if failed == 0 {
         String::new()

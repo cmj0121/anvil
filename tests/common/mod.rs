@@ -454,3 +454,69 @@ impl FixtureServer {
         self.requests.lock().unwrap().clone()
     }
 }
+
+/// A stand-in sudo, first on the target's `PATH`: `-n` needs a password, so
+/// the probe reports `sudo=binary`; `-v` prints `$SUDO_PROMPT` on the
+/// terminal and accepts `$FAKE_SUDO_PW`; `find` prints its start path, so
+/// each directory of the sandbox passes as root-only; anything else runs as
+/// the user, `install` after the heartbeat of `tests/apply.rs`'s `heartbeat` in
+/// `$FAKE_SUDO_BEAT` when set. Each call's argv is appended to
+/// `$FAKE_SUDO_LOG`.
+pub const FAKE_SUDO: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >>"$FAKE_SUDO_LOG"
+case "$1" in
+  -n) echo 'sudo: a password is required' >&2; exit 1 ;;
+  -k) exit 0 ;;
+  find) printf '%s\n' "$2"; exit 0 ;;
+  install)
+    D=$FAKE_SUDO_BEAT
+    if [ -n "$D" ]; then
+      i=0; until [ -e "$D/go" ]; do i=$((i+1)); echo $i >"$D/beat"; [ $i -gt 600 ] && exit 1; sleep 0.05; done
+    fi ;;
+  -v)
+    printf %s "$SUDO_PROMPT" >/dev/tty
+    IFS= read -r pw </dev/tty
+    [ "$pw" = "$FAKE_SUDO_PW" ] && exit 0
+    echo 'Sorry, try again.' >/dev/tty
+    exit 1 ;;
+esac
+exec "$@"
+"#;
+
+/// Whether script(1) is there: fake-ssh runs a `-tt` client under it.
+pub fn have_script() -> bool {
+    ["/usr/bin/script", "/bin/script"]
+        .iter()
+        .any(|path| std::path::Path::new(path).exists())
+}
+
+/// A sandbox without the debug flags whose host `fake` types the sudo
+/// password `PW_SUDO` from an age store, set as `anvil secret` sets it, and
+/// [`FAKE_SUDO`] in `<root>/bin`. Returns the sandbox, the `[secrets]` table
+/// every config must start with, and a `PATH` with that sudo first.
+pub fn sudo_sandbox(prefix: &str) -> (Sandbox, &'static str, String) {
+    use age::secrecy::ExposeSecret;
+
+    let sandbox = Sandbox::new(prefix).without_debug_flags();
+    let identity = age::x25519::Identity::generate();
+    write_private(
+        &sandbox.root().join("h/key.txt"),
+        format!("{}\n", identity.to_string().expose_secret()).as_bytes(),
+    );
+    let secrets = "[secrets]\nbackend = \"age\"\n\n\
+                   [secrets.age]\npath = \"~/secrets.age\"\nidentity = \"~/key.txt\"\n\n";
+    sandbox.write_config("config.toml", secrets);
+    let out = sandbox.edit(&["secret", "PW_SUDO"], Some(&sandbox.typed()), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+
+    let bin = sandbox.root().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(bin.join("sudo"), FAKE_SUDO).unwrap();
+    std::fs::set_permissions(bin.join("sudo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    sandbox.write_config(
+        "inventory.toml",
+        "[hosts.fake]\nhost = \"fakehost\"\nsudo_secret = \"PW_SUDO\"\n",
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    (sandbox, secrets, path)
+}

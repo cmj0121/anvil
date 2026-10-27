@@ -226,6 +226,13 @@ impl Record {
     }
 }
 
+/// Seconds since the epoch, as `at` holds them.
+pub fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// `last-apply.json` in the state directory from the environment.
 pub fn path() -> Result<PathBuf, PathsError> {
     Ok(paths::state_dir()?.join(FILE_NAME))
@@ -448,6 +455,11 @@ impl Session {
         }
     }
 
+    /// The record as loaded, with every change merged since.
+    pub fn record(&self) -> &Record {
+        &self.record
+    }
+
     /// Records that this apply reached `name` but wrote no file there:
     /// its entry's `at`, anvil version and facts become `target`'s, while
     /// its files, `ok` and `cannot_undo` stay, as a rollback still needs
@@ -469,10 +481,6 @@ impl Session {
     }
 
     /// Sets `rolled_back` on `name`'s entry, the only change a rollback makes.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "anvil rollback marks from #18 U8 on")
-    )]
     pub fn mark_rolled_back(&mut self, name: &str, rolled_back: RolledBack) {
         if let Some(target) = self.record.targets.get_mut(name) {
             target.rolled_back = Some(rolled_back);

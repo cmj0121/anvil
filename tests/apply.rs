@@ -305,34 +305,6 @@ fn a_bad_src_exits_two_before_any_target_but_config_still_opens() {
     assert!(!ran.exists(), "no target ran");
 }
 
-/// A stand-in sudo, first on the target's `PATH`: `-n` needs a password, so
-/// the probe reports `sudo=binary`; `-v` prints `$SUDO_PROMPT` on the
-/// terminal and accepts `$FAKE_SUDO_PW`; `find` prints its start path, so
-/// each directory of the sandbox passes as root-only; anything else runs as
-/// the user, `install` after the heartbeat of [`heartbeat`] in
-/// `$FAKE_SUDO_BEAT` when set. Each call's argv is appended to
-/// `$FAKE_SUDO_LOG`.
-const FAKE_SUDO: &str = r#"#!/bin/sh
-printf '%s\n' "$*" >>"$FAKE_SUDO_LOG"
-case "$1" in
-  -n) echo 'sudo: a password is required' >&2; exit 1 ;;
-  -k) exit 0 ;;
-  find) printf '%s\n' "$2"; exit 0 ;;
-  install)
-    D=$FAKE_SUDO_BEAT
-    if [ -n "$D" ]; then
-      i=0; until [ -e "$D/go" ]; do i=$((i+1)); echo $i >"$D/beat"; [ $i -gt 600 ] && exit 1; sleep 0.05; done
-    fi ;;
-  -v)
-    printf %s "$SUDO_PROMPT" >/dev/tty
-    IFS= read -r pw </dev/tty
-    [ "$pw" = "$FAKE_SUDO_PW" ] && exit 0
-    echo 'Sorry, try again.' >/dev/tty
-    exit 1 ;;
-esac
-exec "$@"
-"#;
-
 /// Every `/tmp/anvil-<32 hex>` temp file name.
 fn temp_files() -> Vec<String> {
     std::fs::read_dir("/tmp")
@@ -346,55 +318,15 @@ fn temp_files() -> Vec<String> {
         .collect()
 }
 
-/// Whether script(1) is there: fake-ssh runs a `-tt` client under it.
-fn have_script() -> bool {
-    ["/usr/bin/script", "/bin/script"]
-        .iter()
-        .any(|path| std::path::Path::new(path).exists())
-}
-
-/// A sandbox without the debug flags whose host `fake` types the sudo
-/// password `PW_SUDO` from an age store, set as `anvil secret` sets it, and
-/// [`FAKE_SUDO`] in `<root>/bin`. Returns the sandbox, the `[secrets]` table
-/// every config must start with, and a `PATH` with that sudo first.
-fn sudo_sandbox() -> (Sandbox, &'static str, String) {
-    use std::os::unix::fs::PermissionsExt;
-
-    use age::secrecy::ExposeSecret;
-
-    let sandbox = Sandbox::new("aa").without_debug_flags();
-    let identity = age::x25519::Identity::generate();
-    common::write_private(
-        &sandbox.root().join("h/key.txt"),
-        format!("{}\n", identity.to_string().expose_secret()).as_bytes(),
-    );
-    let secrets = "[secrets]\nbackend = \"age\"\n\n\
-                   [secrets.age]\npath = \"~/secrets.age\"\nidentity = \"~/key.txt\"\n\n";
-    sandbox.write_config("config.toml", secrets);
-    let out = sandbox.edit(&["secret", "PW_SUDO"], Some(&sandbox.typed()), None);
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-
-    let bin = sandbox.root().join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    std::fs::write(bin.join("sudo"), FAKE_SUDO).unwrap();
-    std::fs::set_permissions(bin.join("sudo"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    sandbox.write_config(
-        "inventory.toml",
-        "[hosts.fake]\nhost = \"fakehost\"\nsudo_secret = \"PW_SUDO\"\n",
-    );
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    (sandbox, secrets, path)
-}
-
 #[test]
 fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
     use std::os::unix::fs::PermissionsExt;
 
-    if !have_script() {
+    if !common::have_script() {
         eprintln!("skip: no script(1) for fake-ssh -tt");
         return;
     }
-    let (sandbox, secrets, path) = sudo_sandbox();
+    let (sandbox, secrets, path) = common::sudo_sandbox("aa");
     std::fs::create_dir(sandbox.root().join("out")).unwrap();
     std::fs::write(sandbox.config_dir().join("motd.txt"), FILE_TEXT).unwrap();
     let dest = sandbox.root().join("out/pw.conf");
@@ -616,7 +548,7 @@ fn beating_into(kind: Kind, stderr: Option<Stdio>) -> Running {
             (sandbox, "", command)
         }
         Kind::Tty => {
-            let (sandbox, secrets, path) = sudo_sandbox();
+            let (sandbox, secrets, path) = common::sudo_sandbox("aa");
             let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
             command
                 .arg("--ssh-program")
@@ -753,7 +685,7 @@ impl Running {
 #[test]
 fn one_ctrl_c_lets_the_running_step_end_and_cancels_the_rest() {
     for kind in [Kind::Plain, Kind::Tty, Kind::Run] {
-        if matches!(kind, Kind::Tty) && !have_script() {
+        if matches!(kind, Kind::Tty) && !common::have_script() {
             eprintln!("skip: no script(1) for fake-ssh -tt");
             continue;
         }
@@ -822,7 +754,7 @@ fn two_ctrl_c_kill_anvil_even_when_stderr_is_full() {
 #[test]
 fn a_second_ctrl_c_kills_the_running_step_and_anvil_dies_by_sigint() {
     for kind in [Kind::Plain, Kind::Tty, Kind::Paused] {
-        if matches!(kind, Kind::Tty) && !have_script() {
+        if matches!(kind, Kind::Tty) && !common::have_script() {
             eprintln!("skip: no script(1) for fake-ssh -tt");
             continue;
         }
@@ -1011,11 +943,11 @@ fn a_target_that_ended_is_saved_while_the_next_runs_and_holds_the_lock() {
 
 #[test]
 fn the_password_path_capture_leaks_no_byte_at_trace_level() {
-    if !have_script() {
+    if !common::have_script() {
         eprintln!("skip: no script(1) for fake-ssh -tt");
         return;
     }
-    let (sandbox, secrets, path) = sudo_sandbox();
+    let (sandbox, secrets, path) = common::sudo_sandbox("aa");
     std::fs::create_dir(sandbox.root().join("out")).unwrap();
     std::fs::write(sandbox.config_dir().join("motd.txt"), FILE_TEXT).unwrap();
     let dest = sandbox.root().join("out/pw.conf");

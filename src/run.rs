@@ -47,6 +47,7 @@ pub fn run_targets(
     }];
     let cancel = &opts.cancel;
     Ok(apply::for_each_target(
+        "run",
         &targets,
         opts.parallel,
         cancel,
@@ -72,6 +73,7 @@ fn run_target(
         Ok(transport) => {
             log::info!("run {}: over {}", target.name, transport.name());
             apply::execute(
+                "run",
                 target,
                 transport.as_ref(),
                 runs,
@@ -80,7 +82,7 @@ fn run_target(
                 None,
             )
         }
-        Err(err) => apply::failed(target, Vec::new(), err.to_string()),
+        Err(err) => apply::failed("run", target, Vec::new(), err.to_string()),
     }
 }
 

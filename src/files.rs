@@ -962,10 +962,6 @@ pub(crate) fn parse_od(text: &str, size: u64) -> Result<Zeroizing<Vec<u8>>, Stri
     Ok(bytes)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "anvil rollback restores from #18 U8 on")
-)]
 /// The dests whose conflict guard a rollback drops.
 pub(crate) enum Force {
     None,
@@ -983,25 +979,21 @@ impl Force {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "anvil rollback restores from #18 U8 on")
-)]
 /// Where a rollback's refusals send the user for `--force DEST`.
 #[derive(Clone, Copy)]
 pub(crate) enum Wording {
     Cli,
     /// The TUI cannot force, so the message points to a terminal.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the TUI rolls back from #18 U9 on")
+    )]
     Tui,
 }
 
 /// The exit status of a restore that DEST's current state refused.
 pub(crate) const CONFLICT: i32 = 3;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "anvil rollback restores from #18 U8 on")
-)]
 /// One step per recorded file, last written first, that puts back what
 /// DEST held before the apply: `restore DEST` for a file, `remove DEST` for
 /// one that was absent or a dangling link, or a skip `cannot undo: DEST

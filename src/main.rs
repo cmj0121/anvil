@@ -20,6 +20,7 @@ mod plan;
 mod plugin;
 mod private;
 mod record;
+mod rollback;
 mod run;
 mod secret;
 mod services;

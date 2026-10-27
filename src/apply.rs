@@ -215,7 +215,7 @@ impl StepReport {
     }
 
     /// A step that ran nothing and passed.
-    fn skipped(run: &str) -> StepReport {
+    pub(crate) fn skipped(run: &str) -> StepReport {
         StepReport {
             run: run.to_owned(),
             code: Some(0),
@@ -404,6 +404,17 @@ fn load_passwords(
             })
             .filter_map(|target| files::sudo_secret_for(config, target)),
     );
+    read_passwords(names, store)
+}
+
+/// The sudo password of each secret in `names`, read from the store
+/// `store` builds, opened once and only when there are names; an unset
+/// one is absent. One trailing newline is trimmed. Core dumps are turned
+/// off first.
+pub(crate) fn read_passwords(
+    names: BTreeSet<&str>,
+    store: impl FnOnce() -> Result<Box<dyn Store>, Failure>,
+) -> Result<Passwords, Failure> {
     let mut passwords = Passwords::new();
     if names.is_empty() {
         return Ok(passwords);
@@ -426,7 +437,7 @@ fn load_passwords(
 /// Keeps the passwords about to be read out of a core dump: the soft core
 /// limit becomes 0 and, on Linux, the process is no longer dumpable. Best
 /// effort; a failure is only logged.
-fn no_core_dumps() {
+pub(crate) fn no_core_dumps() {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
     let limit = Rlimit {
         current: Some(0),
@@ -496,10 +507,10 @@ fn apply_targets(
                 cancel,
             )
         },
-        |target| Applied::unrecorded(cancelled(target, Vec::new())),
+        |target| Applied::unrecorded(cancelled("apply", target, Vec::new())),
         |target, message| {
             let error = format!("internal error: {message}");
-            Applied::unrecorded(failed(target, Vec::new(), error))
+            Applied::unrecorded(failed("apply", target, Vec::new(), error))
         },
     );
     let order: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
@@ -598,8 +609,10 @@ struct Reached {
 
 /// Runs `one` on each of `targets`, `parallel` at a time, reporting each as
 /// it starts and ends. Once `cancel` is set, every target not started is
-/// Cancelled; one whose `one` panics has failed.
+/// Cancelled; one whose `one` panics has failed. `command` names the run in
+/// the log.
 pub(crate) fn for_each_target(
+    command: &str,
     targets: &[Target],
     parallel: NonZeroU8,
     cancel: &AtomicBool,
@@ -612,8 +625,15 @@ pub(crate) fn for_each_target(
         cancel,
         on,
         one,
-        |target| cancelled(target, Vec::new()),
-        |target, message| failed(target, Vec::new(), format!("internal error: {message}")),
+        |target| cancelled(command, target, Vec::new()),
+        |target, message| {
+            failed(
+                command,
+                target,
+                Vec::new(),
+                format!("internal error: {message}"),
+            )
+        },
     );
     let ok = reports.iter().all(TargetReport::ok);
     Report {
@@ -668,8 +688,9 @@ pub(crate) fn print_report(
     }
 }
 
-pub(crate) fn cancelled(target: &Target, steps: Vec<StepReport>) -> TargetReport {
-    log::info!("apply {}: cancelled", target.name);
+/// `target` of `command` (apply, rollback, run) ended by cancel, after `steps`.
+pub(crate) fn cancelled(command: &str, target: &Target, steps: Vec<StepReport>) -> TargetReport {
+    log::info!("{command} {}: cancelled", target.name);
     TargetReport::Cancelled {
         target: target.name.clone(),
         steps,
@@ -702,20 +723,22 @@ fn apply_target(
     log::info!("apply {}: start", target.name);
     let transport = match transport {
         Ok(transport) => transport,
-        Err(err) => return Applied::unrecorded(failed(target, Vec::new(), err.to_string())),
+        Err(err) => {
+            return Applied::unrecorded(failed("apply", target, Vec::new(), err.to_string()));
+        }
     };
     log::info!("apply {}: over {}", target.name, transport.name());
     let facts = if needs_facts(config) {
         if cancel.load(Ordering::Relaxed) {
-            return Applied::unrecorded(cancelled(target, Vec::new()));
+            return Applied::unrecorded(cancelled("apply", target, Vec::new()));
         }
         match probe(transport.as_ref(), config) {
             Ok(facts) => Some(facts),
             Err(Unresolved::Failed(error)) => {
-                return Applied::unrecorded(failed(target, Vec::new(), error));
+                return Applied::unrecorded(failed("apply", target, Vec::new(), error));
             }
             Err(Unresolved::Cancelled) => {
-                return Applied::unrecorded(cancelled(target, Vec::new()));
+                return Applied::unrecorded(cancelled("apply", target, Vec::new()));
             }
         }
     } else {
@@ -725,6 +748,7 @@ fn apply_target(
     let (report, runs) = match resolve(target, facts.as_ref(), config, sources, plugins, cancel) {
         Ok(runs) => {
             let report = execute(
+                "apply",
                 target,
                 transport.as_ref(),
                 &runs,
@@ -734,8 +758,8 @@ fn apply_target(
             );
             (report, runs)
         }
-        Err(Unresolved::Failed(error)) => (failed(target, Vec::new(), error), Vec::new()),
-        Err(Unresolved::Cancelled) => (cancelled(target, Vec::new()), Vec::new()),
+        Err(Unresolved::Failed(error)) => (failed("apply", target, Vec::new(), error), Vec::new()),
+        Err(Unresolved::Cancelled) => (cancelled("apply", target, Vec::new()), Vec::new()),
     };
     let reached = facts.map(|facts| {
         let cannot_undo = cannot_undo(config, &runs, report.steps());
@@ -765,12 +789,9 @@ impl<'a> Recorder<'a> {
 
     /// The target's record, stamped now.
     fn finish(self, facts: Facts, ok: bool, cannot_undo: Vec<String>) -> Reached {
-        let at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
         Reached {
             record: TargetRecord {
-                at,
+                at: record::now(),
                 anvil: env!("CARGO_PKG_VERSION").to_owned(),
                 ok,
                 facts,
@@ -806,9 +827,15 @@ fn cannot_undo(config: &Config, runs: &[PlannedRun], steps: &[StepReport]) -> Ve
         .collect()
 }
 
-/// `target` ended by a transport error, after `steps`.
-pub(crate) fn failed(target: &Target, steps: Vec<StepReport>, error: String) -> TargetReport {
-    log::info!("apply {}: failed: {error}", target.name);
+/// `target` of `command` (apply, rollback, run) ended by a transport error,
+/// after `steps`.
+pub(crate) fn failed(
+    command: &str,
+    target: &Target,
+    steps: Vec<StepReport>,
+    error: String,
+) -> TargetReport {
+    log::info!("{command} {}: failed: {error}", target.name);
     TargetReport::Failed {
         target: target.name.clone(),
         steps,
@@ -825,6 +852,7 @@ pub(crate) fn failed(target: &Target, steps: Vec<StepReport>, error: String) -> 
 /// ([`capture`]), then writes only if DEST still holds what it captured,
 /// and the recorder keeps both and how the write ended.
 pub(crate) fn execute(
+    command: &str,
     target: &Target,
     transport: &dyn Transport,
     runs: &[PlannedRun],
@@ -836,7 +864,7 @@ pub(crate) fn execute(
     let mut ok = true;
     for planned in runs {
         if cancel.load(Ordering::Relaxed) {
-            return cancelled(target, reports);
+            return cancelled(command, target, reports);
         }
         let label = planned.shown();
         if planned.file.as_ref().is_some_and(|file| file.skip)
@@ -854,7 +882,7 @@ pub(crate) fn execute(
             None => None,
             Some(name) => match sudo_password(passwords, name, prefix) {
                 Ok(password) => Some((name, password)),
-                Err(error) => return failed(target, reports, error),
+                Err(error) => return failed(command, target, reports, error),
             },
         };
         let (mut run, timeout) = (planned.run.as_str(), planned.timeout);
@@ -874,19 +902,19 @@ pub(crate) fn execute(
                     break;
                 }
                 Err(Uncaptured::Transport(TransportError::Cancelled)) => {
-                    return cancelled(target, reports);
+                    return cancelled(command, target, reports);
                 }
                 Err(Uncaptured::Transport(err)) => {
                     let error = step_error(&err, password.map(|(name, _)| name), prefix);
-                    return failed(target, reports, error);
+                    return failed(command, target, reports, error);
                 }
             };
             if cancel.load(Ordering::Relaxed) {
-                return cancelled(target, reports);
+                return cancelled(command, target, reports);
             }
             rebuilt = match files::write_script(write, recorder.sources, &found.expected()) {
                 Ok(rebuilt) => rebuilt,
-                Err(error) => return failed(target, reports, error),
+                Err(error) => return failed(command, target, reports, error),
             };
             (run, upload) = (rebuilt.0.as_str(), rebuilt.1.as_ref());
             recorder.wrote = true;
@@ -897,19 +925,21 @@ pub(crate) fn execute(
             (None, None) => transport.run(run, timeout),
             (None, Some(_)) => {
                 let error = format!("files: internal error: {label} has no sudo secret");
-                return failed(target, reports, error);
+                return failed(command, target, reports, error);
             }
             (Some((_, password)), None) => {
                 transport.run_tty(&packages::with_password(run), password, timeout)
             }
             (Some((_, password)), Some(upload)) => {
-                match send_file(target, transport, upload, run, password, timeout, cancel) {
+                match send_file(
+                    command, target, transport, upload, run, password, timeout, cancel,
+                ) {
                     Sent::Installed(output) => output,
                     Sent::Unstaged(output) => {
                         staged = false;
                         output
                     }
-                    Sent::Cancelled => return cancelled(target, reports),
+                    Sent::Cancelled => return cancelled(command, target, reports),
                 }
             }
         };
@@ -945,7 +975,7 @@ pub(crate) fn execute(
         let output = match output {
             Ok(output) => output,
             // ssh would have had to open a master after cancel.
-            Err(TransportError::Cancelled) => return cancelled(target, reports),
+            Err(TransportError::Cancelled) => return cancelled(command, target, reports),
             Err(err) => {
                 let error = step_error(&err, password.map(|(name, _)| name), prefix);
                 // A step killed at the limit still shows what it printed.
@@ -956,12 +986,12 @@ pub(crate) fn execute(
                 {
                     reports.push(StepReport::from_output(label, *output));
                 }
-                return failed(target, reports, error);
+                return failed(command, target, reports, error);
             }
         };
         let succeeded = output.code == Some(0);
         if succeeded && output.truncated {
-            log::warn!("apply {}: step output cut at 1 MiB", target.name);
+            log::warn!("{command} {}: step output cut at 1 MiB", target.name);
         }
         reports.push(StepReport::from_output(label, output));
         if !succeeded {
@@ -970,7 +1000,7 @@ pub(crate) fn execute(
         }
     }
     log::info!(
-        "apply {}: {}",
+        "{command} {}: {}",
         target.name,
         if ok { "done" } else { "a step failed" }
     );
@@ -1061,8 +1091,13 @@ fn capture(
 /// to the temp file over a plain run; unless it failed or `cancel` was set
 /// meanwhile, `run` then installs it on a terminal, typing `password`.
 /// `upload.cleanup` runs after, whatever happened and even once cancelled,
-/// and its failure is only logged.
+/// and its failure is only logged. `command` names the run in the log.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one input of the file step, passed through"
+)]
 fn send_file(
+    command: &str,
     target: &Target,
     transport: &dyn Transport,
     upload: &Upload,
@@ -1073,7 +1108,7 @@ fn send_file(
 ) -> Sent {
     let sent = match transport.run(&upload.stage, timeout) {
         Ok(staged) if staged.code == Some(0) => {
-            log::debug!("apply {}: file staged", target.name);
+            log::debug!("{command} {}: file staged", target.name);
             match cancel.load(Ordering::Relaxed) {
                 true => Sent::Cancelled,
                 false => Sent::Installed(transport.run_tty(
@@ -1099,11 +1134,14 @@ fn send_file(
     match transport.run_uncancelled(&upload.cleanup, RUN_TIMEOUT) {
         Ok(output) if output.code == Some(0) => {}
         Ok(output) => log::debug!(
-            "apply {}: removing the temp file exited {:?}",
+            "{command} {}: removing the temp file exited {:?}",
             target.name,
             output.code
         ),
-        Err(err) => log::debug!("apply {}: cannot remove the temp file: {err}", target.name),
+        Err(err) => log::debug!(
+            "{command} {}: cannot remove the temp file: {err}",
+            target.name
+        ),
     }
     sent
 }
@@ -1401,7 +1439,7 @@ pub(crate) fn print_lines(lines: &[Line], style: Style) {
     }
 }
 
-fn write_flushed(stream: &mut dyn Write, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_flushed(stream: &mut dyn Write, text: &str) -> std::io::Result<()> {
     stream.write_all(text.as_bytes())?;
     stream.flush()
 }
@@ -3663,6 +3701,7 @@ mod tests {
         };
         // `cancel` stays unset for execute: only the transport refuses.
         let report = execute(
+            "apply",
             &target("box"),
             &fake,
             &[
@@ -4431,6 +4470,7 @@ mod tests {
         let targets = [target("a"), target("b")];
         let cancel = AtomicBool::new(false);
         let report = for_each_target(
+            "apply",
             &targets,
             NonZeroU8::new(2).unwrap(),
             &cancel,
@@ -4447,7 +4487,7 @@ mod tests {
                 };
                 let secret = format!("{}_SUDO", t.name.to_uppercase());
                 let runs = [planned("install", Some(&secret), RUN_TIMEOUT)];
-                execute(t, &transport, &runs, &passwords, &cancel, None)
+                execute("apply", t, &transport, &runs, &passwords, &cancel, None)
             },
         );
         assert!(report.ok, "{report:?}");
@@ -4538,6 +4578,7 @@ mod tests {
             cancel: Arc::clone(&cancel),
         };
         let result = send_file(
+            "apply",
             &target("box"),
             &transport,
             &upload,
@@ -5217,7 +5258,7 @@ mod tests {
         assert!(done[0].ok(), "a ran: {:?}", done[0]);
         assert_eq!(
             done[1],
-            cancelled(&target("b"), Vec::new()),
+            cancelled("apply", &target("b"), Vec::new()),
             "b never started once a could not be saved"
         );
         std::fs::remove_dir_all(&root).unwrap();
