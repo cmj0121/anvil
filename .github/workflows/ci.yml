@@ -127,7 +127,10 @@ jobs:
       - name: Install sops
         run: sh .github/install-sops.sh
       # e2e.sh exits 0 with "skip" when docker is missing; in CI that is a failure.
+      # The runner boots the systemd container, so a systemd skip fails the job.
       - name: Run the e2e suite
+        env:
+          ANVIL_E2E_SYSTEMD: "1"
         run: |
           make e2e 2>&1 | tee e2e.log
           code=$?

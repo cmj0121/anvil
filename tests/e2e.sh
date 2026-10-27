@@ -610,7 +610,7 @@ else
   echo "skip (no python3 with os.login_tty, 3.11 or newer)"
 fi
 
-step "(n) systemd as PID 1: boots within ${SD_DEADLINE} s, sshd answers, anvil run reaches archsd"
+step "(n) systemd as PID 1: boots within ${SD_DEADLINE} s, anvil run reaches archsd, [[services]] starts, enables, stops and disables a unit"
 # SD_DEADLINE s after docker run, and never less than 30 s from here.
 sd_deadline=$((${sd_started:-0} + SD_DEADLINE))
 [ "$sd_deadline" -ge $(($(date +%s) + 30)) ] || sd_deadline=$(($(date +%s) + 30))
@@ -670,6 +670,91 @@ INV
     pass "the host's kernel.core_pattern is unchanged by the boot"
   else
     fail "kernel.core_pattern was '$core_pattern', now '$after'"
+  fi
+
+  # [[services]] on archsd: key's sudo is NOPASSWD, so each command goes through `sudo -n`.
+  SVC_DIR="$TMP/services"
+  mkdir -p "$SVC_DIR"
+  svc_config() { # FILE STATE ENABLED
+    printf '[[services]]\nname = "anvil-e2e"\nstate = "%s"\nenabled = %s\ntags = ["sd"]\n' "$2" "$3" >"$SVC_DIR/$1"
+  }
+  svc_config start.toml started true
+  svc_config stop.toml stopped false
+  cat >"$SVC_DIR/missing.toml" <<CONF
+[[services]]
+name = "anvil-e2e-missing"
+state = "started"
+tags = ["sd"]
+
+[[steps]]
+run = "hostname"
+CONF
+  # Exact stdout, the default hostname step included: the service step prints
+  # anvil's lines, never systemctl's chatter (that goes to stderr).
+  svc_out() {
+    printf '▶ archsd\n  $ service anvil-e2e\n'
+    printf '  %s\n' "$@"
+    printf '  $ hostname\n  %s\n  ✔ ok · 2 steps\n\n1 ok, 0 failed' "$SD_HOSTNAME"
+  }
+  svc_unit() { # ACTIVE ENABLED
+    [ "$(docker exec "$SD_NAME" systemctl is-active anvil-e2e)" = "$1" ] \
+      && [ "$(docker exec "$SD_NAME" systemctl is-enabled anvil-e2e)" = "$2" ]
+  }
+  # sudo logs each command it runs to the journal; sync it before counting.
+  svc_sudo() {
+    docker exec "$SD_NAME" sh -c 'journalctl --sync; journalctl -q --no-pager _COMM=sudo' | grep -cF "COMMAND=/usr/bin/systemctl --no-ask-password $1 -- anvil-e2e"
+  }
+
+  anvil --config "$SVC_DIR/start.toml" apply --target sd
+  code=$?
+  expected=$(svc_out 'enabled service anvil-e2e' 'started service anvil-e2e')
+  if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ] && svc_unit active enabled \
+    && [ "$(svc_sudo 'enable --now')" -eq 1 ]; then
+    pass "started + enabled: enable --now through sudo -n, unit active and enabled"
+  else
+    fail "apply started + enabled: exit $code, expected:"
+    printf '%s\n' "$expected"
+    docker exec "$SD_NAME" systemctl is-active anvil-e2e
+    docker exec "$SD_NAME" systemctl is-enabled anvil-e2e
+  fi
+  anvil --config "$SVC_DIR/start.toml" apply --target sd
+  code=$?
+  expected=$(svc_out 'unchanged service anvil-e2e')
+  if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ] && svc_unit active enabled \
+    && [ "$(svc_sudo 'enable --now')" -eq 1 ]; then
+    pass "a rerun prints unchanged and changes nothing"
+  else
+    fail "rerun started + enabled: exit $code, expected:"
+    printf '%s\n' "$expected"
+  fi
+  anvil --config "$SVC_DIR/stop.toml" apply --target sd
+  code=$?
+  expected=$(svc_out 'disabled service anvil-e2e' 'stopped service anvil-e2e')
+  if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ] && svc_unit inactive disabled \
+    && [ "$(svc_sudo 'disable --now')" -eq 1 ]; then
+    pass "stopped + disabled: disable --now through sudo -n, unit inactive and disabled"
+  else
+    fail "apply stopped + disabled: exit $code, expected:"
+    printf '%s\n' "$expected"
+  fi
+  anvil --config "$SVC_DIR/stop.toml" apply --target sd
+  code=$?
+  expected=$(svc_out 'unchanged service anvil-e2e')
+  if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ] && svc_unit inactive disabled \
+    && [ "$(svc_sudo 'disable --now')" -eq 1 ]; then
+    pass "a rerun prints unchanged and changes nothing"
+  else
+    fail "rerun stopped + disabled: exit $code, expected:"
+    printf '%s\n' "$expected"
+  fi
+  anvil --config "$SVC_DIR/missing.toml" apply --target archsd --target arch
+  code=$?
+  if [ "$code" -ne 0 ] && grep -qF 'services: anvil-e2e-missing: not found by systemd' "$TMP/out" "$TMP/err" \
+    && grep -qxF '  $ skipped service anvil-e2e-missing: no match' "$TMP/out" \
+    && grep -qxF "  $REMOTE_HOSTNAME" "$TMP/out" && grep -qxF '1 ok, 1 failed' "$TMP/out"; then
+    pass "an unknown unit fails archsd; arch skips it (no match) and runs hostname"
+  else
+    fail "apply anvil-e2e-missing: exit $code"
   fi
 else
   printf 'SKIP  systemd: %s (%s)\n' "$sd_skip" "$(took)"
