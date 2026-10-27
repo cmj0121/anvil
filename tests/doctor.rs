@@ -553,3 +553,137 @@ fn without_a_doctor_plugin_the_output_has_no_plugin_rows_or_keys() {
         ["connectable", "facts", "target"]
     );
 }
+
+/// A doctor plugin that records its pid in `<name>.pid`, beats into
+/// `<name>.beat` until `go` exists beside it (20 s at most), then replies
+/// with no finding.
+fn gated_plugin(sandbox: &Sandbox, name: &str) -> String {
+    let body = format!(
+        "#!/bin/sh\ncat >/dev/null\necho $$ >{name}.pid\ni=0\n\
+         while [ ! -e go ] && [ $i -lt 400 ]; do i=$((i+1)); echo $i >{name}.beat; sleep 0.05; done\n\
+         echo '{EMPTY_REPLY}'\n"
+    );
+    let (path, sha256) = sandbox.plugin(name, body.as_bytes());
+    format!(
+        "[plugins.{name}]\npath = \"{}\"\nsha256 = \"{sha256}\"\non = \"doctor\"\n\n",
+        path.display()
+    )
+}
+
+/// `anvil --json doctor` over `local` and `fake` with the gated plugins
+/// `a` and `b`, started once `a` beats; stderr's lines come on the channel.
+fn gated_doctor(sandbox: &Sandbox) -> (std::process::Child, std::sync::mpsc::Receiver<String>) {
+    use std::io::BufRead;
+    use std::process::Stdio;
+    sandbox.with_fake_host();
+    let config = format!(
+        "{}{}",
+        gated_plugin(sandbox, "a"),
+        gated_plugin(sandbox, "b")
+    );
+    sandbox.write_config("config.toml", &config);
+    let mut child = sandbox
+        .command(env!("CARGO_BIN_EXE_anvil"))
+        .args(["--secret-store", "memory", "--ssh-program"])
+        .arg(fixture("fake-ssh.sh"))
+        .args(["--json", "doctor"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn anvil");
+    let (tx, lines) = std::sync::mpsc::channel();
+    let stderr = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = tx.send(line);
+        }
+    });
+    let beat = sandbox.plugin_dir().join("a.beat");
+    until(|| beat.exists(), "plugin a to start");
+    (child, lines)
+}
+
+/// Waits until `done`, failing after 20 s, a fail-safe only.
+fn until(mut done: impl FnMut() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !done() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gave up waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn interrupt(child: &std::process::Child) {
+    let pid = rustix::process::Pid::from_child(child);
+    rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
+}
+
+/// Waits for the line the first SIGINT prints on stderr.
+fn notice(lines: &std::sync::mpsc::Receiver<String>) {
+    loop {
+        let line = lines
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("no interrupted: line");
+        if line.starts_with("interrupted: ") {
+            return;
+        }
+    }
+}
+
+#[test]
+fn one_ctrl_c_lets_the_running_plugin_end_and_cancels_the_rest() {
+    let sandbox = Sandbox::new("ad");
+    let (mut child, lines) = gated_doctor(&sandbox);
+    interrupt(&child);
+    notice(&lines);
+    fs::write(sandbox.plugin_dir().join("go"), "").unwrap();
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(1));
+    let rest: Vec<String> = lines.try_iter().collect();
+    assert!(
+        rest.iter().any(|line| line.contains("doctor: cancelled")),
+        "{rest:?}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        value["targets"][0]["plugins"],
+        serde_json::json!([
+            {"plugin": "a", "ok": true, "notice": "no apply recorded"},
+            {"plugin": "b", "ok": false, "error": "cancelled"},
+        ])
+    );
+    assert_eq!(
+        value["targets"][1],
+        serde_json::json!({"target": "fake", "connectable": false, "error": "cancelled"})
+    );
+    assert!(!sandbox.plugin_dir().join("b.pid").exists(), "b never ran");
+}
+
+#[test]
+fn a_second_ctrl_c_kills_the_running_plugin_and_anvil_dies_by_sigint() {
+    use std::os::unix::process::ExitStatusExt;
+    let sandbox = Sandbox::new("ad");
+    let (mut child, lines) = gated_doctor(&sandbox);
+    interrupt(&child);
+    notice(&lines);
+    interrupt(&child);
+    until(|| child.try_wait().unwrap().is_some(), "anvil to die");
+    let status = child.wait().unwrap();
+    assert_eq!(status.signal(), Some(2), "died by SIGINT, {status:?}");
+    let beat = sandbox.plugin_dir().join("a.beat");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let last = fs::read_to_string(&beat).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    assert_eq!(
+        fs::read_to_string(&beat).unwrap(),
+        last,
+        "the plugin was killed"
+    );
+}

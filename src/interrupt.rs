@@ -1,7 +1,8 @@
-//! Ctrl-C for the CLI's apply, plan and run.
+//! Ctrl-C for the CLI's apply, plan, run, rollback and doctor.
 //!
 //! The first SIGINT sets the run's cancel flag, as Esc does in the TUI: each
-//! running target ends after its current step and no other target starts.
+//! running target ends after its current step and no other target starts;
+//! doctor ends its running probe, hash run or plugin and starts no other.
 //! That holds with `--parallel 1` too, so a first Ctrl-C now waits for the
 //! current step, up to its timeout, where anvil used to die at once. The
 //! second SIGINT kills every tracked child process group and anvil dies by

@@ -35,6 +35,7 @@ use crate::config::{Config, MAX_FILES, Plugin};
 use crate::editor::{Editor, EditorError, Fallback};
 use crate::facts::{self, Facts, PROBE};
 use crate::files::{self, FileState, HashDest};
+use crate::interrupt::Interrupt;
 use crate::inventory::{Target, TargetKind};
 use crate::logger::{escape_controls, is_invisible};
 use crate::options::Options;
@@ -595,7 +596,10 @@ fn summary(
 }
 
 /// `anvil doctor`: prints the whole report (or one JSON document) at the end.
+/// The first Ctrl-C cancels before the next target or plugin, the second
+/// kills the running probe, hash run or plugin ([`Interrupt`]).
 pub fn run(cli: &Cli, opts: &Options, config: &Config, store: &dyn Store) -> Result<(), Failure> {
+    let _interrupt = Interrupt::install(&opts.cancel)?;
     let report = check(opts, config, store, &opts.cancel, &mut |_| {})?;
     if cli.json {
         print_json(&report, Failure::failed)?;
