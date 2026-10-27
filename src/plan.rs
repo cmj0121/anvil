@@ -446,6 +446,7 @@ mod tests {
                     sudo_secret: Some("LOCAL_SUDO".to_owned()),
                     plugin: None,
                     timeout: git().timeout(),
+                    file: None,
                 },
                 PlannedRun {
                     run: "one".to_owned(),
@@ -453,6 +454,7 @@ mod tests {
                     sudo_secret: None,
                     plugin: None,
                     timeout: RUN_TIMEOUT,
+                    file: None,
                 },
                 PlannedRun {
                     run: "two".to_owned(),
@@ -460,6 +462,7 @@ mod tests {
                     sudo_secret: None,
                     plugin: None,
                     timeout: RUN_TIMEOUT,
+                    file: None,
                 },
             ],
             ok: true,

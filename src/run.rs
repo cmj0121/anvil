@@ -42,6 +42,7 @@ pub fn run_targets(
         sudo_secret: None,
         plugin: None,
         timeout,
+        file: None,
     }];
     Ok(apply::for_each_target(&targets, cancel, on, |target| {
         run_target(target, opts.transport(target), &runs, cancel)

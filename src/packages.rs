@@ -454,7 +454,7 @@ pub fn resolve(choice: Choice, facts: &Facts, sudo_secret: bool) -> Result<Manag
 /// Whether `manager`, resolved on the target `facts` describe, runs through
 /// sudo with a password: not brew, not root, and sudo without NOPASSWD.
 pub fn uses_password(manager: Manager, facts: &Facts) -> bool {
-    manager != Manager::Brew && !facts.is_root() && facts.get("sudo") == Some("binary")
+    manager != Manager::Brew && facts.sudo_asks_password()
 }
 
 /// `script` (from [`script`]) wrapped to run on a terminal: it turns echo off,

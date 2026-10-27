@@ -56,7 +56,7 @@ fn sudo_password<'a>(passwords: &'a Passwords, name: &str) -> Result<&'a [u8], S
 /// is typed when it runs through sudo with a password, the plugin that
 /// returned it, and its time limit. It serializes as the user sees it:
 /// `run` is the label when there is one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PlannedRun {
     pub run: String,
     /// What the step's report shows instead of `run`, when what is sent
@@ -65,6 +65,62 @@ pub struct PlannedRun {
     pub sudo_secret: Option<String>,
     pub plugin: Option<String>,
     pub timeout: Duration,
+    /// Set for a `[[files]]` step, whose `run` carries the file's bytes.
+    pub file: Option<FileRun>,
+}
+
+/// By hand: a `[[files]]` step's `run` is shown only by its length.
+impl std::fmt::Debug for PlannedRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("PlannedRun");
+        match self.file {
+            Some(_) => debug.field("run", &Redacted(self.run.len())),
+            None => debug.field("run", &self.run),
+        };
+        debug
+            .field("label", &self.label)
+            .field("sudo_secret", &self.sudo_secret)
+            .field("plugin", &self.plugin)
+            .field("timeout", &self.timeout)
+            .field("file", &self.file)
+            .finish()
+    }
+}
+
+/// A `[[files]]` step: its entry's index, the temp-file scripts of the
+/// password path, and whether the entry matched no tag or fact of the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRun {
+    pub entry: usize,
+    pub upload: Option<Upload>,
+    pub skip: bool,
+}
+
+/// The password path's plain scripts around `run`: `stage` writes the bytes
+/// to the temp file, `cleanup` removes it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Upload {
+    pub stage: String,
+    pub cleanup: String,
+}
+
+/// By hand: `stage` carries the file's bytes.
+impl std::fmt::Debug for Upload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Upload")
+            .field("stage", &Redacted(self.stage.len()))
+            .field("cleanup", &self.cleanup)
+            .finish()
+    }
+}
+
+/// A script's length in place of its text, for `Debug`.
+struct Redacted(usize);
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes redacted>", self.0)
+    }
 }
 
 impl PlannedRun {
@@ -605,6 +661,7 @@ pub fn resolve(
                 sudo_secret: sudo_secret.map(str::to_owned),
                 plugin: None,
                 timeout: packages.timeout(),
+                file: None,
             });
         }
     }
@@ -630,6 +687,7 @@ pub fn resolve(
                     sudo_secret: None,
                     plugin: Some(name.to_owned()),
                     timeout: RUN_TIMEOUT,
+                    file: None,
                 });
             }
             StepKind::Run(run) => runs.push(PlannedRun {
@@ -638,6 +696,7 @@ pub fn resolve(
                 sudo_secret: None,
                 plugin: None,
                 timeout: RUN_TIMEOUT,
+                file: None,
             }),
         }
     }
@@ -2047,6 +2106,7 @@ mod tests {
             sudo_secret: sudo_secret.map(str::to_owned),
             plugin: None,
             timeout,
+            file: None,
         }
     }
 
@@ -2141,6 +2201,7 @@ mod tests {
             sudo_secret: None,
             plugin: Some(name.to_owned()),
             timeout: RUN_TIMEOUT,
+            file: None,
         }
     }
 

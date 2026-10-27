@@ -232,7 +232,7 @@ pub struct Step {
 
 /// A `[[files]]` entry: `src` beside the config, copied to `dest` on each
 /// target whose tags and facts all match.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileEntry {
     pub src: String,
@@ -248,6 +248,21 @@ pub struct FileEntry {
     /// `false`: write as the connecting user, no sudo, temp file, tty or secret.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub sudo: bool,
+}
+
+/// By hand, so a field added later must be chosen for `Debug` rather than
+/// shown by default: the file's bytes must never reach it.
+impl std::fmt::Debug for FileEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileEntry")
+            .field("src", &self.src)
+            .field("dest", &self.dest)
+            .field("mode", &self.mode)
+            .field("tags", &self.tags)
+            .field("facts", &self.facts)
+            .field("sudo", &self.sudo)
+            .finish()
+    }
 }
 
 /// A `[[files]]` mode as written: a quoted string, or the number an unquoted
@@ -637,7 +652,7 @@ fn check_mode(mode: Option<&ModeValue>) -> Result<(), String> {
         Some(ModeValue::Text(mode)) => mode,
     };
     let shown = secret::shown_name(mode);
-    if !(3..=4).contains(&mode.len()) || !mode.bytes().all(|b| matches!(b, b'0'..=b'7')) {
+    if !is_mode(mode) {
         return Err(format!(" `{shown}`: must be 3 or 4 octal digits"));
     }
     let bits = u32::from_str_radix(mode, 8).expect("checked: 3 or 4 octal digits");
@@ -645,6 +660,11 @@ fn check_mode(mode: Option<&ModeValue>) -> Result<(), String> {
         return Err(format!(" `{shown}`: setuid and setgid are refused"));
     }
     Ok(())
+}
+
+/// Whether `mode` is 3 or 4 octal digits.
+pub(crate) fn is_mode(mode: &str) -> bool {
+    (3..=4).contains(&mode.len()) && mode.bytes().all(|b| matches!(b, b'0'..=b'7'))
 }
 
 /// A `[[files]]` fact: a key the probe reports, and a value it could report.

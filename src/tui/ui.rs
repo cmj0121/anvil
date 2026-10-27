@@ -1853,6 +1853,7 @@ mod tests {
                                 sudo_secret: Some("LOCAL_SUDO".to_owned()),
                                 plugin: None,
                                 timeout: RUN_TIMEOUT,
+                                file: None,
                             },
                             PlannedRun {
                                 run: "hostname".to_owned(),
@@ -1860,6 +1861,7 @@ mod tests {
                                 sudo_secret: None,
                                 plugin: None,
                                 timeout: RUN_TIMEOUT,
+                                file: None,
                             },
                         ],
                         ok: true,

@@ -85,6 +85,12 @@ impl Facts {
     pub fn is_root(&self) -> bool {
         self.get("user") == Some("root")
     }
+
+    /// Whether sudo asks this target for a password: not root, and sudo
+    /// without NOPASSWD.
+    pub fn sudo_asks_password(&self) -> bool {
+        !self.is_root() && self.get("sudo") == Some("binary")
+    }
 }
 
 fn clean_value(value: &str) -> String {
