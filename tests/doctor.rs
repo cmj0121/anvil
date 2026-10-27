@@ -414,3 +414,142 @@ fn a_steps_only_config_with_a_doctor_plugin_records_the_facts() {
     let record = sandbox.last_apply().expect("apply recorded the target");
     assert!(record["targets"]["local"]["facts"]["hostname"].is_string());
 }
+
+/// Whether `s` holds 64 or more hex digits in a row.
+fn has_hex_run(s: &str) -> bool {
+    let mut run = 0;
+    s.chars().any(|c| {
+        run = if c.is_ascii_hexdigit() { run + 1 } else { 0 };
+        run >= 64
+    })
+}
+
+/// A sandbox whose `local` was applied with [`marker_file`] and the doctor
+/// plugin `audit` replying `reply`; doctor's output, human and `--json`.
+fn doctored(reply: &str) -> (std::process::Output, std::process::Output) {
+    let sandbox = Sandbox::new("ad");
+    let (files, _) = marker_file(&sandbox);
+    let plugin = doctor_plugin(&sandbox, "audit", reply, None);
+    sandbox.write_config("config.toml", &format!("{plugin}{files}"));
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let human = sandbox.anvil(&["doctor", "--target", "local"], &[]);
+    let json = sandbox.anvil(&["--json", "doctor", "--target", "local"], &[]);
+    for out in [&human, &json] {
+        for shown in [text(&out.stdout), text(&out.stderr)] {
+            assert!(!has_hex_run(&shown), "a hash or a tag is shown: {shown}");
+        }
+    }
+    (human, json)
+}
+
+#[test]
+fn drift_exits_one_with_its_own_message_and_a_row_per_finding() {
+    let reply =
+        r#"{"ok":true,"findings":[{"target":"local","item":"kernel","was":"6.1","now":"6.2"}]}"#;
+    let (human, json_out) = doctored(reply);
+    assert_eq!(human.status.code(), Some(1));
+    assert!(
+        text(&human.stderr).contains("doctor: drift since the last apply"),
+        "{}",
+        text(&human.stderr)
+    );
+    assert!(
+        text(&human.stdout).ends_with("  audit           drift: kernel was 6.1, now 6.2\n"),
+        "{}",
+        text(&human.stdout)
+    );
+    assert_eq!(json_out.status.code(), Some(1));
+    let value = json(&json_out);
+    assert_eq!(value["ok"], false);
+    assert_eq!(
+        value["targets"][0]["plugins"],
+        serde_json::json!([{"plugin": "audit", "ok": true, "findings": [
+            {"target": "local", "item": "kernel", "was": "6.1", "now": "6.2",
+             "severity": "drift", "text": null}
+        ]}])
+    );
+}
+
+#[test]
+fn notices_alone_exit_zero() {
+    let reply = r#"{"ok":true,"findings":[{"target":"local","item":"kernel","severity":"notice","text":"just so you know"}]}"#;
+    let (human, json_out) = doctored(reply);
+    assert_eq!(human.status.code(), Some(0), "{}", text(&human.stderr));
+    assert!(
+        text(&human.stdout).ends_with("  audit           notice: kernel (just so you know)\n"),
+        "{}",
+        text(&human.stdout)
+    );
+    assert_eq!(json(&json_out)["ok"], true);
+}
+
+#[test]
+fn a_failing_or_not_ok_plugin_exits_one_naming_it() {
+    let (human, _) = doctored(r#"{"ok":true,"findings":[{"target":"other","item":"k"}]}"#);
+    assert_eq!(human.status.code(), Some(1));
+    assert!(
+        text(&human.stdout).ends_with(
+            "  audit           error: plugin audit: reply finding 0: target is not the request's\n"
+        ),
+        "{}",
+        text(&human.stdout)
+    );
+    assert!(
+        text(&human.stderr).contains("doctor: a check or a target failed"),
+        "{}",
+        text(&human.stderr)
+    );
+
+    let (human, json_out) = doctored(r#"{"ok":false,"findings":[]}"#);
+    assert_eq!(human.status.code(), Some(1));
+    assert!(
+        text(&human.stdout).ends_with("  audit           error: it replied ok: false\n"),
+        "{}",
+        text(&human.stdout)
+    );
+    assert_eq!(
+        json(&json_out)["targets"][0]["plugins"],
+        serde_json::json!([{"plugin": "audit", "ok": false}])
+    );
+}
+
+#[test]
+fn no_apply_recorded_alone_exits_zero() {
+    let sandbox = Sandbox::new("ad");
+    let plugin = doctor_plugin(&sandbox, "audit", EMPTY_REPLY, None);
+    sandbox.write_config("config.toml", &plugin);
+    let out = sandbox.anvil(&["doctor", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("  plugin audit    pinned\n  record          none\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.ends_with("  audit           no apply recorded\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn without_a_doctor_plugin_the_output_has_no_plugin_rows_or_keys() {
+    let sandbox = Sandbox::new("ad");
+    let (files, _) = marker_file(&sandbox);
+    sandbox.write_config("config.toml", &files);
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let out = sandbox.anvil(&["doctor", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    for row in ["  plugin ", "  record ", "not compared", "WARNING"] {
+        assert!(!stdout.contains(row), "{row}: {stdout}");
+    }
+    let out = sandbox.anvil(&["--json", "doctor", "--target", "local"], &[]);
+    let value = json(&out);
+    assert_eq!(keys(&value["local"]), ["editor", "secrets", "sh", "ssh"]);
+    assert_eq!(
+        keys(&value["targets"][0]),
+        ["connectable", "facts", "target"]
+    );
+}

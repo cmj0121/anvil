@@ -18,6 +18,8 @@
 //! sha256 ([`plugin::tag`]), never a hash or a byte of a file. A bad pin
 //! skips only that plugin; a record or key error runs none. A cancel flag,
 //! checked before each target and each plugin, ends the rest `cancelled`.
+//! A drift finding, `ok: false` or a plugin error exits 1, as an
+//! unreachable target does; notices alone do not. No hash or tag is shown.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -228,6 +230,20 @@ pub struct Report {
 }
 
 impl Report {
+    /// Whether a drift finding is all that failed.
+    fn drift_only(&self) -> bool {
+        let plugins = || self.targets.iter().flat_map(|target| &target.plugins);
+        self.local.ok()
+            && self
+                .targets
+                .iter()
+                .all(|target| target.connectable && target.manager_error.is_none())
+            && plugins().all(|plugin| plugin.error.is_none() && plugin.ok)
+            && plugins()
+                .flat_map(|plugin| &plugin.findings)
+                .any(|finding| finding.severity == Severity::Drift)
+    }
+
     fn new(local: LocalReport, targets: Vec<TargetReport>) -> Report {
         let ok = local.ok() && targets.iter().all(TargetReport::ok);
         Report {
@@ -573,11 +589,7 @@ fn summary(
         summary.not_compared += 1;
     }
     if summary.no_sudo > 0 {
-        log::warn!(
-            "doctor {name}: {} root-only files not compared: sudo asks for a password \
-             and doctor never types it",
-            summary.no_sudo
-        );
+        log::warn!("doctor {name}: {}", no_sudo_warning(summary.no_sudo));
     }
     (summary.not_compared > 0).then_some(summary)
 }
@@ -590,10 +602,11 @@ pub fn run(cli: &Cli, opts: &Options, config: &Config, store: &dyn Store) -> Res
     } else {
         print!("{}", render(&report));
     }
-    if report.ok {
-        Ok(())
-    } else {
-        Err(Failure::failed("doctor: a check or a target failed"))
+    match () {
+        _ if report.ok => Ok(()),
+        _ if report.cancelled => Err(Failure::failed("doctor: cancelled")),
+        _ if report.drift_only() => Err(Failure::failed("doctor: drift since the last apply")),
+        _ => Err(Failure::failed("doctor: a check or a target failed")),
     }
 }
 
@@ -810,6 +823,22 @@ fn render(report: &Report) -> String {
             status.as_str()
         );
     }
+    for (name, error) in &local.plugins {
+        let label = format!("plugin {name}");
+        let _ = match error {
+            None => writeln!(out, "  {label:<15} pinned"),
+            Some(error) => writeln!(out, "  {label:<15} error: {error}"),
+        };
+    }
+    if let Some(record) = &local.record {
+        let _ = match local.record_failed() {
+            false => writeln!(out, "  {:<15} {record}", "record"),
+            true => writeln!(out, "  {:<15} error: {record}", "record"),
+        };
+    }
+    if let Some(error) = &local.tag_key {
+        let _ = writeln!(out, "  {:<15} error: {error}", "tag key");
+    }
     for target in &report.targets {
         let _ = writeln!(out, "\n{}", target.target);
         let _ = writeln!(out, "  {:<15} {}", "transport", target.transport);
@@ -825,8 +854,128 @@ fn render(report: &Report) -> String {
         if let Some(error) = &target.error {
             let _ = writeln!(out, "  {:<15} {error}", "error");
         }
+        for plugin in &target.plugins {
+            for (_, row) in plugin_rows(plugin) {
+                let _ = writeln!(out, "  {:<15} {row}", plugin.plugin);
+            }
+        }
+        if let Some(drift) = &target.drift {
+            for (label, row) in drift_rows(drift) {
+                let _ = writeln!(out, "  {label:<15} {row}");
+            }
+        }
     }
     escape_controls(&out).into_owned()
+}
+
+/// How a plugin row is shown: failed (drift and errors), dim (notices) or
+/// plain (`no drift`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    Failed,
+    Dim,
+    Plain,
+}
+
+/// A plugin run's rows, after its name: an error, `not ok`, the notice,
+/// each finding, or `no drift`.
+pub fn plugin_rows(plugin: &PluginReport) -> Vec<(RowKind, String)> {
+    if let Some(error) = &plugin.error {
+        return vec![(RowKind::Failed, format!("error: {error}"))];
+    }
+    let mut rows = Vec::new();
+    if !plugin.ok {
+        rows.push((RowKind::Failed, "error: it replied ok: false".to_owned()));
+    }
+    rows.extend(plugin.notice.clone().map(|notice| (RowKind::Dim, notice)));
+    rows.extend(plugin.findings.iter().map(|finding| {
+        let kind = match finding.severity {
+            Severity::Drift => RowKind::Failed,
+            Severity::Notice => RowKind::Dim,
+        };
+        (kind, finding_row(finding))
+    }));
+    if rows.is_empty() {
+        rows.push((RowKind::Plain, "no drift".to_owned()));
+    }
+    rows
+}
+
+/// `drift: ITEM was WAS, now NOW (TEXT)`, or `notice: …`, leaving out the
+/// parts the finding has not.
+fn finding_row(finding: &Finding) -> String {
+    let mut row = match finding.severity {
+        Severity::Drift => "drift: ",
+        Severity::Notice => "notice: ",
+    }
+    .to_owned();
+    row.push_str(&shown_item(&finding.item));
+    match (&finding.was, &finding.now) {
+        (Some(was), Some(now)) => {
+            let _ = write!(row, " was {was}, now {now}");
+        }
+        (Some(was), None) => {
+            let _ = write!(row, " was {was}");
+        }
+        (None, Some(now)) => {
+            let _ = write!(row, " now {now}");
+        }
+        (None, None) => {}
+    }
+    if let Some(text) = &finding.text {
+        let _ = write!(row, " ({text})");
+    }
+    row
+}
+
+/// A finding's item as a row shows it: runs of spaces as one, cut to
+/// [`ROW_ITEM_BYTES`] bytes and `…`. JSON keeps the whole item.
+fn shown_item(item: &str) -> String {
+    let mut shown = String::with_capacity(item.len().min(ROW_ITEM_BYTES + 3));
+    for c in item.chars() {
+        if c == ' ' && shown.ends_with(' ') {
+            continue;
+        }
+        if shown.len() + c.len_utf8() > ROW_ITEM_BYTES {
+            shown.push('…');
+            break;
+        }
+        shown.push(c);
+    }
+    shown
+}
+
+/// Most bytes of a finding's item in a row.
+const ROW_ITEM_BYTES: usize = 256;
+
+/// The `files` row of what was not compared, then, with any `no_sudo`,
+/// the `sudo` warning; as `(label, row)`.
+pub fn drift_rows(drift: &DriftSummary) -> Vec<(&'static str, String)> {
+    let parts: Vec<String> = [
+        (drift.no_sudo, "no sudo"),
+        (drift.no_hash, "no hash tool"),
+        (drift.rolled_back, "rolled back"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, why)| format!("{count} {why}"))
+    .collect();
+    let mut rows = vec![(
+        "files",
+        format!("{} not compared ({})", drift.not_compared, parts.join(", ")),
+    )];
+    if drift.no_sudo > 0 {
+        rows.push(("sudo", no_sudo_warning(drift.no_sudo)));
+    }
+    rows
+}
+
+/// The one loud line for a target's `no_sudo` files; the log says it too.
+fn no_sudo_warning(count: usize) -> String {
+    format!(
+        "WARNING: sudo -n was refused or asks for a password; \
+         {count} root-only files were not compared"
+    )
 }
 
 #[cfg(test)]
@@ -1818,5 +1967,208 @@ mod tests {
             keys(&json(&report.targets[1])),
             ["connectable", "error", "target"]
         );
+    }
+
+    fn finding(
+        item: &str,
+        was: &str,
+        now: &str,
+        severity: Severity,
+        text: Option<&str>,
+    ) -> Finding {
+        Finding {
+            target: "up".to_owned(),
+            item: item.to_owned(),
+            was: Some(was.to_owned()),
+            now: Some(now.to_owned()),
+            severity,
+            text: text.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn plugin_rows_summary_and_the_sudo_warning_sit_under_the_target() {
+        let mut report = check_target(&host("up"), &fake(Ok(FACTS)));
+        report.plugins = vec![
+            PluginReport {
+                plugin: "audit".to_owned(),
+                ok: true,
+                error: None,
+                notice: None,
+                findings: vec![
+                    finding("kernel", "6.1", "6.2", Severity::Drift, None),
+                    finding("/etc/app.conf", "written", "changed", Severity::Drift, None),
+                    finding(
+                        "/etc/b.conf",
+                        "written",
+                        "changed",
+                        Severity::Notice,
+                        Some("the last apply failed while writing it"),
+                    ),
+                ],
+            },
+            PluginReport {
+                plugin: "first".to_owned(),
+                ok: true,
+                error: None,
+                notice: Some(NO_APPLY.to_owned()),
+                findings: Vec::new(),
+            },
+            PluginReport::failed("slow", "plugin slow: timed out after 30s".to_owned()),
+            PluginReport {
+                plugin: "quiet".to_owned(),
+                ok: true,
+                error: None,
+                notice: None,
+                findings: Vec::new(),
+            },
+        ];
+        report.drift = Some(DriftSummary {
+            not_compared: 3,
+            no_sudo: 2,
+            no_hash: 0,
+            rolled_back: 1,
+        });
+        let store = Memory::default();
+        let text = render(&Report::new(healthy_local(&store, &[]), vec![report]));
+        assert!(
+            text.ends_with(
+                "  pkg             pacman, apt\n\
+                 \x20 audit           drift: kernel was 6.1, now 6.2\n\
+                 \x20 audit           drift: /etc/app.conf was written, now changed\n\
+                 \x20 audit           notice: /etc/b.conf was written, now changed \
+                 (the last apply failed while writing it)\n\
+                 \x20 first           no apply recorded\n\
+                 \x20 slow            error: plugin slow: timed out after 30s\n\
+                 \x20 quiet           no drift\n\
+                 \x20 files           3 not compared (2 no sudo, 1 rolled back)\n\
+                 \x20 sudo            WARNING: sudo -n was refused or asks for a \
+                 password; 2 root-only files were not compared\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(text.matches("WARNING").count(), 1);
+    }
+
+    #[test]
+    fn plugin_text_is_escaped_and_a_partial_finding_leaves_out_what_it_lacks() {
+        let row = finding_row(&Finding {
+            was: None,
+            ..finding("kernel", "", "6.2", Severity::Drift, None)
+        });
+        assert_eq!(row, "drift: kernel now 6.2");
+        let row = finding_row(&Finding {
+            now: None,
+            ..finding("kernel", "6.1", "", Severity::Notice, None)
+        });
+        assert_eq!(row, "notice: kernel was 6.1");
+        let row = finding_row(&Finding {
+            was: None,
+            now: None,
+            ..finding("x", "", "", Severity::Drift, None)
+        });
+        assert_eq!(row, "drift: x");
+        let row = finding_row(&Finding {
+            was: None,
+            now: None,
+            ..finding(
+                &format!("/a   b{}", "é".repeat(200)),
+                "",
+                "",
+                Severity::Drift,
+                None,
+            )
+        });
+        assert_eq!(row, format!("drift: /a b{}…", "é".repeat(126)));
+        let not_ok = PluginReport {
+            plugin: "audit".to_owned(),
+            ok: false,
+            error: None,
+            notice: None,
+            findings: Vec::new(),
+        };
+        assert_eq!(
+            plugin_rows(&not_ok),
+            [(RowKind::Failed, "error: it replied ok: false".to_owned())]
+        );
+        let mut report = check_target(&host("up"), &fake(Ok(FACTS)));
+        report.plugins = vec![PluginReport::failed("audit", "bad\x1b[2J".to_owned())];
+        let store = Memory::default();
+        let text = render(&Report::new(healthy_local(&store, &[]), vec![report]));
+        assert!(
+            text.contains("  audit           error: bad\\x1b[2J\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn local_rows_show_each_doctor_pin_the_record_and_the_key() {
+        let store = Memory::default();
+        let mut local = healthy_local(&store, &[]);
+        local.plugins = BTreeMap::from([
+            ("audit".to_owned(), None),
+            (
+                "stale".to_owned(),
+                Some("plugins.stale.sha256: does not match".to_owned()),
+            ),
+        ]);
+        local.record = Some(FOUND_RECORD.to_owned());
+        assert!(!local.ok(), "a bad pin fails doctor");
+        let text = render(&Report::new(local, vec![]));
+        assert!(
+            text.ends_with(
+                "  plugin audit    pinned\n\
+                 \x20 plugin stale    error: plugins.stale.sha256: does not match\n\
+                 \x20 record          found\n"
+            ),
+            "{text}"
+        );
+
+        let mut local = healthy_local(&store, &[]);
+        local.record = Some("/s/last-apply.json: cannot parse".to_owned());
+        local.tag_key = Some("cannot read /dev/urandom: gone".to_owned());
+        assert!(!local.ok());
+        let value = json(&local);
+        assert_eq!(value["record"], "/s/last-apply.json: cannot parse");
+        assert_eq!(value["tag_key"], "cannot read /dev/urandom: gone");
+        let text = render(&Report::new(local, vec![]));
+        assert!(
+            text.ends_with(
+                "  record          error: /s/last-apply.json: cannot parse\n\
+                 \x20 tag key         error: cannot read /dev/urandom: gone\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn drift_alone_is_drift_and_anything_else_is_not() {
+        let store = Memory::default();
+        let passing = PluginReport {
+            plugin: "audit".to_owned(),
+            ok: true,
+            error: None,
+            notice: None,
+            findings: vec![finding("kernel", "6.1", "6.2", Severity::Notice, None)],
+        };
+        let with = |plugins: Vec<PluginReport>, connectable: bool| {
+            let mut report = check_target(&host("up"), &fake(Ok(FACTS)));
+            report.plugins = plugins;
+            report.connectable = connectable;
+            Report::new(healthy_local(&store, &[]), vec![report])
+        };
+        let notice = with(vec![passing.clone()], true);
+        assert!(notice.ok && !notice.drift_only());
+        let drift = PluginReport {
+            findings: vec![finding("kernel", "6.1", "6.2", Severity::Drift, None)],
+            ..passing.clone()
+        };
+        let report = with(vec![drift.clone()], true);
+        assert!(!report.ok && report.drift_only());
+        let report = with(vec![drift.clone()], false);
+        assert!(!report.drift_only(), "an unreachable target is not drift");
+        let failed = PluginReport::failed("other", "plugin other: exited 3".to_owned());
+        let report = with(vec![drift, failed], true);
+        assert!(!report.drift_only(), "a plugin error is not drift");
     }
 }
