@@ -1,6 +1,7 @@
 //! The `examples/` scenarios: each TOML pair loads and validates the way
 //! `--inventory` / `--config` do, every `[[files]]` src exists, and the
-//! `yaml/` edit view of each document is the same document.
+//! `yaml/` edit view of each document is the same document; the READMEs' minimal
+//! example is `examples/minimal` byte for byte.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -58,5 +59,31 @@ fn every_scenario_loads_and_its_yaml_twin_is_equal() {
             let src = dir.join(&entry.src);
             assert!(src.is_file(), "missing src {}", src.display());
         }
+    }
+}
+
+/// The two ```toml fences after `<!-- example:minimal -->` in `readme`.
+fn minimal_fences(readme: &str) -> [&str; 2] {
+    let (_, rest) = readme
+        .split_once("<!-- example:minimal -->")
+        .expect("no <!-- example:minimal --> marker");
+    let mut fences = rest
+        .split("```toml\n")
+        .skip(1)
+        .map(|fence| fence.split_once("```").expect("unclosed ```toml fence").0);
+    [fences.next().unwrap(), fences.next().unwrap()]
+}
+
+#[test]
+fn readme_minimal_example_is_examples_minimal() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let minimal = root.join("examples/minimal");
+    let inventory = fs::read_to_string(minimal.join("inventory.toml")).unwrap();
+    let config = fs::read_to_string(minimal.join("config.toml")).unwrap();
+    for name in ["README.md", "README.zh-TW.md"] {
+        let readme = fs::read_to_string(root.join(name)).unwrap();
+        let [inventory_fence, config_fence] = minimal_fences(&readme);
+        assert_eq!(inventory_fence, inventory, "{name}: inventory fence");
+        assert_eq!(config_fence, config, "{name}: config fence");
     }
 }

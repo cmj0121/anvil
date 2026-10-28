@@ -4,6 +4,8 @@
 
 ## 速覽
 
+可直接複製試用的完整情境請見 [examples/](../examples/)。
+
 ### `inventory.toml`
 
 `~/.config/anvil/inventory.toml`（或 `$XDG_CONFIG_HOME/anvil/`）：
