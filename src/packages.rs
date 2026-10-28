@@ -1,7 +1,7 @@
 //! `[packages]`: the package manager each target uses, and the one-line
 //! script that installs or upgrades packages with it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
 
@@ -65,7 +65,7 @@ impl Manager {
         }
     }
 
-    fn parse(s: &str) -> Option<Manager> {
+    pub(crate) fn parse(s: &str) -> Option<Manager> {
         Manager::ALL.into_iter().find(|m| m.as_str() == s)
     }
 
@@ -496,6 +496,110 @@ fn guarded(var: char, names: &str, check: &str, keep: &str, command: &str) -> St
     )
 }
 
+/// Marker emitted on stderr for a validated name absent from the repositories.
+pub const UNKNOWN_PACKAGE: &str = "anvil-unknown-package ";
+
+/// A successful sentinel query establishes that repository lookups are usable.
+/// Failure keeps every name, so an empty cache cannot create false warnings.
+fn known_db(manager: Manager, cache_only: bool) -> String {
+    let check = match manager {
+        Manager::Brew => "brew info bash >/dev/null 2>&1",
+        Manager::Pacman => "pacman -Si pacman >/dev/null 2>&1",
+        Manager::Apt => "apt-cache show apt >/dev/null 2>&1",
+        Manager::Dnf if cache_only => {
+            "v=$(dnf -C -q repoquery --whatprovides dnf 2>/dev/null) && [ -n \"$v\" ]"
+        }
+        Manager::Dnf => "v=$(dnf -q repoquery --whatprovides dnf 2>/dev/null) && [ -n \"$v\" ]",
+        Manager::Apk => "v=$(apk search -x -q apk-tools 2>/dev/null) && [ -n \"$v\" ]",
+    };
+    format!("{{ anvil_db=1; {{ {check}; }} || anvil_db=0; }}")
+}
+
+/// The repository predicate for `n`. Special syntax belongs to the manager;
+/// a missing database or an unsuccessful query must not reject that name.
+fn known_check(manager: Manager, cache_only: bool) -> String {
+    let check = match manager {
+        Manager::Brew => "brew info \"$n\" >/dev/null 2>&1; [ $? -ne 1 ]",
+        Manager::Pacman => {
+            "pacman -Si \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; \
+                 c=$?; [ \"$c\" -ne 1 ]"
+        }
+        Manager::Apt => {
+            "apt-cache show \"$n\" >/dev/null 2>&1 || { v=$(apt-cache showpkg \"$n\" 2>/dev/null); c=$?; [ \
+                 \"$c\" -ne 0 ] || printf '%s\\n' \"$v\" | awk '/^Reverse Provides:/{p=1;next} p && NF {f=1} END \
+                 {exit !f}' || [ $? -gt 1 ]; }"
+        }
+        Manager::Dnf if cache_only => {
+            "v=$(dnf -C -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ -n \"$v\" ]"
+        }
+        Manager::Dnf => {
+            "v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ -n \"$v\" ]"
+        }
+        Manager::Apk => "v=$(apk search -x -q \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ -n \"$v\" ]",
+    };
+    format!(
+        "case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || {{ {check}; }};; esac"
+    )
+}
+
+/// Collects known names, reports unknown ones, and runs `command` only
+/// when at least one name is known; `command` uses `$a`. Its status is the command's, or 0.
+fn known(manager: Manager, names: &str, command: &str) -> String {
+    let check = known_check(manager, false);
+    format!(
+        "{{ a=$(for n in {names}; do if {check}; then printf '%s ' \"$n\"; \
+         else printf '{UNKNOWN_PACKAGE}%s\\n' \"$n\" >&2; fi; done); \
+         [ -z \"$a\" ] || {command}; }}"
+    )
+}
+
+/// A read-only check of resolved install and pin names, without sudo or
+/// refreshing any database. Names must have passed [`Packages::validate`].
+pub fn known_script(manager: Manager, packages: &Packages) -> String {
+    assert!(packages.validate().is_ok());
+    let mut names = packages.names_for(packages.install.iter().chain(&packages.pin), manager);
+    let mut seen = BTreeSet::new();
+    names.retain(|name| seen.insert(*name));
+    let check = known_check(manager, true);
+    let body = format!(
+        "{} && for n in {}; do if {check}; then :; else \
+         printf '{UNKNOWN_PACKAGE}%s\\n' \"$n\" >&2; fi; done",
+        known_db(manager, true),
+        names.join(" ")
+    );
+    let body = if names.is_empty() {
+        ":".to_owned()
+    } else {
+        body
+    };
+    if manager == Manager::Brew {
+        format!("{BREW_ENV}{body}")
+    } else {
+        body
+    }
+}
+
+/// Removes only complete, validated marker lines, preserving other output.
+pub fn take_unknown(output: &mut String) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut kept = String::new();
+    for line in output.split_inclusive('\n') {
+        if let Some(name) = line
+            .trim_end_matches(['\r', '\n'])
+            .strip_prefix(UNKNOWN_PACKAGE)
+            && check_name(name).is_ok()
+        {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_owned());
+            }
+        } else {
+            kept.push_str(line);
+        }
+    }
+    *output = kept;
+    names
+}
+
 /// The one-line script that upgrades `packages` with `manager` (skipping
 /// the `pin` names), installs the missing pins and the `install` names
 /// whose resolved name is not a pin's, then removes the `remove` names that are
@@ -527,23 +631,38 @@ pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<Strin
                 parts.push("brew update && brew upgrade --formula".to_string());
             }
             if install {
-                parts.push(format!("brew install {p}"));
+                parts.push(known_db(manager, false));
+                parts.push(known(manager, &p, "brew install $a"));
             }
         }
         Manager::Pacman => {
-            if packages.upgrade || install {
-                let flags = if packages.upgrade { "-Syu" } else { "-S" };
-                let ignore = if packages.upgrade && pin {
+            if packages.upgrade {
+                let ignore = if pin {
                     format!(" --ignore {k_list}")
                 } else {
                     String::new()
                 };
-                let command = format!("{s}pacman {flags} --noconfirm --needed{ignore} {p}");
-                parts.push(command.trim_end().to_string());
+                parts.push(format!("{s}pacman -Syu --noconfirm{ignore}"));
+            }
+            if install || pin {
+                parts.push(known_db(manager, false));
+            }
+            if install {
+                parts.push(known(
+                    manager,
+                    &p,
+                    &format!("{s}pacman -S --noconfirm --needed $a"),
+                ));
             }
             if pin {
-                let command = format!("{s}pacman -S --noconfirm");
-                parts.push(guarded('m', &k, "pacman -T", "||", &command));
+                let command = guarded(
+                    'm',
+                    "$a",
+                    "pacman -T",
+                    "||",
+                    &format!("{s}pacman -S --noconfirm"),
+                );
+                parts.push(known(manager, &k, &command));
             }
         }
         Manager::Apt => {
@@ -556,8 +675,11 @@ pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<Strin
                 ));
             }
             if install {
-                parts.push(format!(
-                    "{s}env DEBIAN_FRONTEND=noninteractive apt-get install -y {p}"
+                parts.push(known_db(manager, false));
+                parts.push(known(
+                    manager,
+                    &p,
+                    &format!("{s}env DEBIAN_FRONTEND=noninteractive apt-get install -y $a"),
                 ));
             }
         }
@@ -570,20 +692,32 @@ pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<Strin
             if packages.upgrade {
                 parts.push(format!("{s}dnf -y upgrade{exclude}"));
             }
+            if install || pin {
+                parts.push(known_db(manager, false));
+            }
             if pin {
                 let command = format!("{s}dnf -y install");
-                parts.push(guarded('m', &k, "rpm -q --whatprovides", "||", &command));
+                let command = guarded('m', "$a", "rpm -q --whatprovides", "||", &command);
+                parts.push(known(manager, &k, &command));
             }
             if install {
-                parts.push(format!("{s}dnf -y install{exclude} {p}"));
+                parts.push(known(
+                    manager,
+                    &p,
+                    &format!("{s}dnf -y install{exclude} $a"),
+                ));
             }
         }
         Manager::Apk => {
+            if packages.upgrade || install {
+                parts.push(format!("{s}apk update"));
+            }
             if packages.upgrade {
-                parts.push(format!("{s}apk update && {s}apk upgrade"));
+                parts.push(format!("{s}apk upgrade"));
             }
             if install {
-                parts.push(format!("{s}apk add --update-cache {p}"));
+                parts.push(known_db(manager, false));
+                parts.push(known(manager, &p, &format!("{s}apk add $a")));
             }
         }
     }
@@ -642,6 +776,355 @@ mod tests {
         script(Manager::Apt, &packages(&["git; rm -rf ~"], false), true);
     }
 
+    /// All lookups are local shell functions; no real manager is called.
+    fn run_with_stub_managers(line: &str, fail: bool) -> std::process::Output {
+        let stub = r#"
+[ -z "$LOOKUPS" ] || printf '%s %s\n' "${0##*/}" "$*" >>"$LOOKUPS"
+known_name() { [ "$1" = git ] || [ "$1" = vim ]; }
+db_present() { [ "$EMPTY_DB" != 1 ]; }
+brew() { case $1 in
+info) if [ "$2" = bash ]; then db_present; else [ "$2" != broken ] || return 2; known_name "$2"; fi;;
+install) echo "install $*"; return "$FAIL";; *) :;; esac; }
+pacman() { case $1 in
+-Si) if [ "$2" = pacman ]; then db_present; else [ "$2" != broken ] || return 2; known_name "$2"; fi;;
+-Sg) [ "$2" = group ];;
+-T) return 1;;
+-Syu) echo upgrade; return "$FAIL";;
+-S) echo "install $*"; return "$FAIL";;
+*) return 1;; esac; }
+apt_cache() { case $1 in
+show) if [ "$2" = apt ]; then db_present; else [ "$2" != broken ] || return 2; known_name "$2"; fi;;
+showpkg) [ "$2" != broken ] || return 2; printf 'Package: %s\nReverse Provides:\n' "$2"
+    [ "$2" != virtual ] || echo 'provider 1.0'; return 0;;
+esac; }
+apt_get() { case $1 in update) echo refresh;; install) echo "install $*"; return "$FAIL";; esac; }
+dnf() {
+[ "$1" != -C ] || shift
+case "$*" in
+'-q repoquery --whatprovides '*)
+    if [ "$4" = dnf ]; then db_present && echo dnf; return; fi
+    if [ "$4" = broken ]; then return 2; fi
+    if known_name "$4" || [ "$4" = provided ]; then echo "$4"; fi; return 0;;
+'-y install '*) echo "install $*"; return "$FAIL";;
+*) return 1;; esac; }
+rpm() { [ "$3" = provided ]; }
+apk() { case $1 in
+update) echo refresh;;
+search)
+    if [ "$4" = apk-tools ]; then db_present && echo apk-tools; return; fi
+    if [ "$4" = broken ]; then return 2; fi
+    known_name "$4" && echo "$4"; return 0;;
+add) echo "install $*"; return "$FAIL";; esac; }
+"#;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir("known-packages");
+        for name in [
+            "brew",
+            "pacman",
+            "apt-cache",
+            "apt-get",
+            "dnf",
+            "rpm",
+            "apk",
+        ] {
+            let path = dir.join(name);
+            let function = name.replace('-', "_");
+            std::fs::write(&path, format!("#!/bin/sh\n{stub}\n{function} \"$@\"\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", line])
+            .env(
+                "PATH",
+                format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("FAIL", if fail { "7" } else { "0" })
+            .env("EMPTY_DB", "0")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        out
+    }
+
+    #[test]
+    fn unknown_names_warn_while_known_names_install_and_failures_still_fail() {
+        for manager in Manager::ALL {
+            let line = script(manager, &packages(&["git", "missing"], false), true).unwrap();
+            for fail in [false, true] {
+                let out = run_with_stub_managers(&line, fail);
+                assert_eq!(
+                    out.status.code(),
+                    Some(if fail { 7 } else { 0 }),
+                    "{manager}: {out:?}"
+                );
+                assert_eq!(
+                    String::from_utf8(out.stderr).unwrap(),
+                    "anvil-unknown-package missing\n"
+                );
+                let stdout = String::from_utf8(out.stdout).unwrap();
+                assert!(
+                    stdout.contains("install ") && stdout.contains("git"),
+                    "{manager}: {stdout}"
+                );
+                assert!(!stdout.contains("missing"), "{manager}: {stdout}");
+                if matches!(manager, Manager::Apt | Manager::Apk) {
+                    assert!(
+                        stdout.starts_with("refresh\ninstall "),
+                        "{manager}: {stdout}"
+                    );
+                }
+            }
+            let line = script(manager, &packages(&["missing"], false), true).unwrap();
+            let out = run_with_stub_managers(&line, true);
+            assert!(out.status.success(), "{manager}: {out:?}");
+            assert!(!String::from_utf8(out.stdout).unwrap().contains("install"));
+            assert_eq!(out.stderr, b"anvil-unknown-package missing\n");
+        }
+    }
+
+    #[test]
+    fn unknown_pins_are_skipped_and_installed_providers_are_known() {
+        for manager in [Manager::Pacman, Manager::Dnf] {
+            let p = Packages {
+                pin: vec!["vim".into(), "missing".into()],
+                ..Packages::default()
+            };
+            let out = run_with_stub_managers(&script(manager, &p, true).unwrap(), false);
+            assert!(out.status.success(), "{manager}: {out:?}");
+            assert_eq!(out.stderr, b"anvil-unknown-package missing\n");
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            assert!(
+                stdout.contains("vim") && !stdout.contains("missing"),
+                "{stdout}"
+            );
+            let out = run_with_stub_managers(&script(manager, &p, true).unwrap(), true);
+            assert_eq!(out.status.code(), Some(7));
+        }
+        let line = script(Manager::Dnf, &packages(&["provided"], false), true).unwrap();
+        let out = run_with_stub_managers(&line, false);
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty());
+        assert!(String::from_utf8(out.stdout).unwrap().contains("provided"));
+    }
+
+    #[test]
+    fn pacman_groups_empty_databases_and_upgrade_order() {
+        let line = script(Manager::Pacman, &packages(&["group"], false), true).unwrap();
+        let out = run_with_stub_managers(&line, false);
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty());
+        assert!(String::from_utf8(out.stdout).unwrap().contains("group"));
+        let line = script(Manager::Pacman, &packages(&["missing"], false), true).unwrap();
+        let out = run_with_stub_managers(&format!("export EMPTY_DB=1; {line}"), false);
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty());
+        assert!(String::from_utf8(out.stdout).unwrap().contains("missing"));
+        let line = script(Manager::Pacman, &packages(&["git", "missing"], true), true).unwrap();
+        let out = run_with_stub_managers(&line, false);
+        assert!(
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .starts_with("upgrade\ninstall -S ")
+        );
+        let out = run_with_stub_managers(&line, true);
+        assert_eq!(out.status.code(), Some(7));
+        assert_eq!(out.stdout, b"upgrade\n");
+        assert!(
+            out.stderr.is_empty(),
+            "lookups must follow the successful upgrade"
+        );
+    }
+
+    #[test]
+    fn read_only_checks_resolve_aliases_and_never_refresh_or_install() {
+        for manager in Manager::ALL {
+            let p = Packages {
+                install: vec!["alias".into()],
+                pin: vec!["missing".into()],
+                alias: BTreeMap::from([(
+                    "alias".into(),
+                    BTreeMap::from([(manager.to_string(), "git".into())]),
+                )]),
+                ..Packages::default()
+            };
+            let line = known_script(manager, &p);
+            assert!(!line.contains("sudo"));
+            let out = run_with_stub_managers(&line, true);
+            assert!(out.status.success(), "{manager}: {out:?}");
+            assert!(out.stdout.is_empty());
+            assert_eq!(out.stderr, b"anvil-unknown-package missing\n");
+        }
+    }
+
+    #[test]
+    fn special_syntax_is_installed_without_a_repository_lookup() {
+        let names = ["@group", "pkg@edge", "cmd:foo", "owner/repo/formula"];
+        for manager in Manager::ALL {
+            let dir = crate::test_util::temp_dir("special-package-lookups");
+            let log = dir.join("lookups");
+            let line = script(manager, &packages(&names, false), true).unwrap();
+            let out =
+                run_with_stub_managers(&format!("export LOOKUPS={}; {line}", log.display()), false);
+            assert!(out.status.success(), "{manager}: {out:?}");
+            assert!(out.stderr.is_empty(), "{manager}: {out:?}");
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            let calls = std::fs::read_to_string(&log).unwrap();
+            for name in names {
+                assert!(stdout.contains(name), "{manager}: {stdout}");
+                for call in calls.lines().filter(|call| {
+                    !call.contains("install")
+                        && !call.contains(" add ")
+                        && !call.starts_with("pacman -S ")
+                }) {
+                    assert!(!call.contains(name), "{manager}: {call}");
+                }
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn apt_virtual_packages_with_reverse_provides_are_known() {
+        let line = script(
+            Manager::Apt,
+            &packages(&["virtual", "missing"], false),
+            true,
+        )
+        .unwrap();
+        let out = run_with_stub_managers(&line, false);
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(out.stderr, b"anvil-unknown-package missing\n");
+        assert_eq!(out.stdout, b"refresh\ninstall install -y virtual\n");
+    }
+
+    #[test]
+    fn unavailable_databases_keep_all_names_without_per_name_lookups() {
+        for manager in Manager::ALL {
+            let p = packages(&["missing", "other"], false);
+            for doctor in [false, true] {
+                let dir = crate::test_util::temp_dir("empty-package-db");
+                let log = dir.join("lookups");
+                let line = if doctor {
+                    known_script(manager, &p)
+                } else {
+                    script(manager, &p, true).unwrap()
+                };
+                let out = run_with_stub_managers(
+                    &format!("export EMPTY_DB=1 LOOKUPS={}; {line}", log.display()),
+                    false,
+                );
+                assert!(out.status.success(), "{manager} doctor={doctor}: {out:?}");
+                assert!(out.stderr.is_empty(), "{manager}: {out:?}");
+                if doctor {
+                    assert!(out.stdout.is_empty());
+                } else {
+                    let stdout = String::from_utf8(out.stdout).unwrap();
+                    assert!(stdout.contains("missing other"), "{manager}: {stdout}");
+                }
+                let calls = std::fs::read_to_string(&log).unwrap();
+                for call in calls.lines().filter(|call| {
+                    !call.contains("install")
+                        && !call.contains(" add ")
+                        && !call.starts_with("pacman -S ")
+                }) {
+                    assert!(
+                        !call.contains("missing") && !call.contains("other"),
+                        "{manager}: {call}"
+                    );
+                }
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_checks_unique_resolved_names_once_in_first_seen_order() {
+        for manager in Manager::ALL {
+            let dir = crate::test_util::temp_dir("unique-package-lookups");
+            let log = dir.join("lookups");
+            let p = Packages {
+                pin: vec!["git".into(), "missing".into()],
+                ..packages(&["git", "missing", "git", "vim"], false)
+            };
+            let line = known_script(manager, &p);
+            let out =
+                run_with_stub_managers(&format!("export LOOKUPS={}; {line}", log.display()), false);
+            assert!(out.status.success(), "{manager}: {out:?}");
+            assert_eq!(out.stderr, b"anvil-unknown-package missing\n");
+            let calls = std::fs::read_to_string(&log).unwrap();
+            let lookup = match manager {
+                Manager::Brew => "brew info",
+                Manager::Pacman => "pacman -Si",
+                Manager::Apt => "apt-cache show",
+                Manager::Dnf => "dnf -C -q repoquery --whatprovides",
+                Manager::Apk => "apk search -x -q",
+            };
+            let queries: Vec<_> = calls
+                .lines()
+                .filter(|call| call.starts_with(&format!("{lookup} ")))
+                .collect();
+            assert_eq!(
+                queries.len(),
+                4,
+                "one db probe and three unique names: {calls}"
+            );
+            assert_eq!(
+                queries[1..],
+                [
+                    format!("{lookup} git"),
+                    format!("{lookup} missing"),
+                    format!("{lookup} vim")
+                ]
+            );
+            if manager == Manager::Dnf {
+                assert!(
+                    calls.lines().all(|call| call.starts_with("dnf -C ")),
+                    "{calls}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn the_database_probe_runs_once_for_install_and_pin_together() {
+        for manager in [Manager::Pacman, Manager::Dnf] {
+            let dir = crate::test_util::temp_dir("single-package-db-probe");
+            let log = dir.join("lookups");
+            let p = Packages {
+                pin: vec!["vim".into()],
+                ..packages(&["git", "missing"], false)
+            };
+            let line = script(manager, &p, true).unwrap();
+            let out =
+                run_with_stub_managers(&format!("export LOOKUPS={}; {line}", log.display()), false);
+            assert!(out.status.success(), "{manager}: {out:?}");
+            let calls = std::fs::read_to_string(&log).unwrap();
+            let probe = if manager == Manager::Pacman {
+                "pacman -Si pacman"
+            } else {
+                "dnf -q repoquery --whatprovides dnf"
+            };
+            assert_eq!(
+                calls.lines().filter(|call| *call == probe).count(),
+                1,
+                "{calls}"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn failed_queries_are_kept_for_the_manager_to_decide() {
+        for manager in Manager::ALL {
+            let line = script(manager, &packages(&["broken"], false), true).unwrap();
+            let out = run_with_stub_managers(&line, false);
+            assert!(out.status.success(), "{manager}: {out:?}");
+            assert!(out.stderr.is_empty());
+            assert!(String::from_utf8(out.stdout).unwrap().contains("broken"));
+        }
+    }
+
     #[test]
     fn nothing_to_do_is_no_script() {
         for manager in Manager::ALL {
@@ -655,38 +1138,75 @@ mod tests {
     fn scripts_per_manager_with_and_without_upgrade() {
         let brew = BREW_ENV;
         let cases = [
-            (Manager::Brew, false, true, format!("{brew}brew install git curl")),
-            (Manager::Brew, true, false, format!("{brew}brew update && brew upgrade --formula")),
+            (
+                Manager::Brew,
+                false,
+                true,
+                format!(
+                    "{brew}{{ anvil_db=1; {{ brew info bash >/dev/null 2>&1; }} || anvil_db=0; }} && {{ a=$(for n in git \
+                 curl; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || {{ brew info \"$n\" \
+                 >/dev/null 2>&1; [ $? -ne 1 ]; }};; esac; then printf '%s ' \"$n\"; else printf \
+                 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || brew install $a; }}"
+                ),
+            ),
+            (
+                Manager::Brew,
+                true,
+                false,
+                format!("{brew}brew update && brew upgrade --formula"),
+            ),
             (
                 Manager::Brew,
                 true,
                 true,
-                format!("{brew}brew update && brew upgrade --formula && brew install git curl"),
+                format!(
+                    "{brew}brew update && brew upgrade --formula && {{ anvil_db=1; {{ brew info bash >/dev/null 2>&1; }} \
+                 || anvil_db=0; }} && {{ a=$(for n in git curl; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || {{ brew info \"$n\" >/dev/null 2>&1; [ $? -ne 1 ]; }};; esac; then printf \
+                 '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || \
+                 brew install $a; }}"
+                ),
             ),
             (
                 Manager::Pacman,
                 false,
                 true,
-                "sudo -n pacman -S --noconfirm --needed git curl".to_string(),
+                "{ anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git curl; \
+                 do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" \
+                 >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 \
+                 ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; \
+                 done); [ -z \"$a\" ] || sudo -n pacman -S --noconfirm --needed $a; }"
+                    .to_string(),
             ),
             (
                 Manager::Pacman,
                 true,
                 false,
-                "sudo -n pacman -Syu --noconfirm --needed".to_string(),
+                "sudo -n pacman -Syu --noconfirm".to_string(),
             ),
             (
                 Manager::Pacman,
                 true,
                 true,
-                "sudo -n pacman -Syu --noconfirm --needed git curl".to_string(),
+                "sudo -n pacman -Syu --noconfirm && { anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || \
+                 anvil_db=0; } && { a=$(for n in git curl; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \
+                 \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; esac; then printf '%s ' \"$n\"; else printf \
+                 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || sudo -n pacman -S --noconfirm \
+                 --needed $a; }"
+                    .to_string(),
             ),
             (
                 Manager::Apt,
                 false,
                 true,
-                "sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive \
-                 apt-get install -y git curl"
+                "sudo -n apt-get update && { anvil_db=1; { apt-cache show apt >/dev/null 2>&1; } || anvil_db=0; } && \
+                 { a=$(for n in git curl; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { \
+                 apt-cache show \"$n\" >/dev/null 2>&1 || { v=$(apt-cache showpkg \"$n\" 2>/dev/null); c=$?; [ \
+                 \"$c\" -ne 0 ] || printf '%s\\n' \"$v\" | awk '/^Reverse Provides:/{p=1;next} p && NF {f=1} END \
+                 {exit !f}' || [ $? -gt 1 ]; }; };; esac; then printf '%s ' \"$n\"; else printf \
+                 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || sudo -n env \
+                 DEBIAN_FRONTEND=noninteractive apt-get install -y $a; }"
                     .to_string(),
             ),
             (
@@ -701,29 +1221,53 @@ mod tests {
                 Manager::Apt,
                 true,
                 true,
-                "sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive \
-                 apt-get upgrade -y && sudo -n env DEBIAN_FRONTEND=noninteractive \
-                 apt-get install -y git curl"
+                "sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && { \
+                 anvil_db=1; { apt-cache show apt >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git curl; do \
+                 if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { apt-cache show \"$n\" \
+                 >/dev/null 2>&1 || { v=$(apt-cache showpkg \"$n\" 2>/dev/null); c=$?; [ \"$c\" -ne 0 ] || printf \
+                 '%s\\n' \"$v\" | awk '/^Reverse Provides:/{p=1;next} p && NF {f=1} END {exit !f}' || [ $? -gt 1 ]; \
+                 }; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; \
+                 done); [ -z \"$a\" ] || sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y $a; }"
                     .to_string(),
             ),
             (
                 Manager::Dnf,
                 false,
                 true,
-                "sudo -n dnf -y install git curl".to_string(),
+                "{ anvil_db=1; { v=$(dnf -q repoquery --whatprovides dnf 2>/dev/null) && [ -n \"$v\" ]; } || \
+                 anvil_db=0; } && { a=$(for n in git curl; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || { v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ \
+                 -n \"$v\" ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" \
+                 >&2; fi; done); [ -z \"$a\" ] || sudo -n dnf -y install $a; }"
+                    .to_string(),
             ),
-            (Manager::Dnf, true, false, "sudo -n dnf -y upgrade".to_string()),
+            (
+                Manager::Dnf,
+                true,
+                false,
+                "sudo -n dnf -y upgrade".to_string(),
+            ),
             (
                 Manager::Dnf,
                 true,
                 true,
-                "sudo -n dnf -y upgrade && sudo -n dnf -y install git curl".to_string(),
+                "sudo -n dnf -y upgrade && { anvil_db=1; { v=$(dnf -q repoquery --whatprovides dnf 2>/dev/null) && [ \
+                 -n \"$v\" ]; } || anvil_db=0; } && { a=$(for n in git curl; do if case \"$n\" in (*@*|*:*|*/*) \
+                 true;; (*) [ \"$anvil_db\" = 0 ] || { v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? \
+                 -ne 0 ] || [ -n \"$v\" ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package \
+                 %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || sudo -n dnf -y install $a; }"
+                    .to_string(),
             ),
             (
                 Manager::Apk,
                 false,
                 true,
-                "sudo -n apk add --update-cache git curl".to_string(),
+                "sudo -n apk update && { anvil_db=1; { v=$(apk search -x -q apk-tools 2>/dev/null) && [ -n \"$v\" ]; \
+                 } || anvil_db=0; } && { a=$(for n in git curl; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || { v=$(apk search -x -q \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ -n \"$v\" ]; \
+                 };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; \
+                 done); [ -z \"$a\" ] || sudo -n apk add $a; }"
+                    .to_string(),
             ),
             (
                 Manager::Apk,
@@ -735,7 +1279,11 @@ mod tests {
                 Manager::Apk,
                 true,
                 true,
-                "sudo -n apk update && sudo -n apk upgrade && sudo -n apk add --update-cache git curl"
+                "sudo -n apk update && sudo -n apk upgrade && { anvil_db=1; { v=$(apk search -x -q apk-tools \
+                 2>/dev/null) && [ -n \"$v\" ]; } || anvil_db=0; } && { a=$(for n in git curl; do if case \"$n\" in \
+                 (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { v=$(apk search -x -q \"$n\" 2>/dev/null); [ $? \
+                 -ne 0 ] || [ -n \"$v\" ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package \
+                 %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || sudo -n apk add $a; }"
                     .to_string(),
             ),
         ];
@@ -763,54 +1311,111 @@ mod tests {
         let brew = BREW_ENV;
         let apt = "sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive";
         let cases = [
-            (Manager::Brew, false, format!("{brew}brew install git fd")),
+            (
+                Manager::Brew,
+                false,
+                format!(
+                    "{brew}{{ anvil_db=1; {{ brew info bash >/dev/null 2>&1; }} || anvil_db=0; }} && {{ a=$(for n in git \
+                 fd; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || {{ brew info \"$n\" \
+                 >/dev/null 2>&1; [ $? -ne 1 ]; }};; esac; then printf '%s ' \"$n\"; else printf \
+                 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || brew install $a; }}"
+                ),
+            ),
             (
                 Manager::Brew,
                 true,
-                format!("{brew}brew update && brew upgrade --formula && brew install git fd"),
+                format!(
+                    "{brew}brew update && brew upgrade --formula && {{ anvil_db=1; {{ brew info bash >/dev/null 2>&1; }} \
+                 || anvil_db=0; }} && {{ a=$(for n in git fd; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || {{ brew info \"$n\" >/dev/null 2>&1; [ $? -ne 1 ]; }};; esac; then printf \
+                 '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || \
+                 brew install $a; }}"
+                ),
             ),
             (
                 Manager::Pacman,
                 false,
-                "sudo -n pacman -S --noconfirm --needed git fd".to_string(),
+                "{ anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git fd; do \
+                 if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null \
+                 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; \
+                 esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ \
+                 -z \"$a\" ] || sudo -n pacman -S --noconfirm --needed $a; }"
+                    .to_string(),
             ),
             (
                 Manager::Pacman,
                 true,
-                "sudo -n pacman -Syu --noconfirm --needed git fd".to_string(),
+                "sudo -n pacman -Syu --noconfirm && { anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || \
+                 anvil_db=0; } && { a=$(for n in git fd; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \
+                 \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; esac; then printf '%s ' \"$n\"; else printf \
+                 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || sudo -n pacman -S --noconfirm \
+                 --needed $a; }"
+                    .to_string(),
             ),
             (
                 Manager::Apt,
                 false,
-                format!("{apt} apt-get install -y git fd-find"),
+                "sudo -n apt-get update && { anvil_db=1; { apt-cache show apt >/dev/null 2>&1; } || anvil_db=0; } && \
+                 { a=$(for n in git fd-find; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || \
+                 { apt-cache show \"$n\" >/dev/null 2>&1 || { v=$(apt-cache showpkg \"$n\" 2>/dev/null); c=$?; [ \
+                 \"$c\" -ne 0 ] || printf '%s\\n' \"$v\" | awk '/^Reverse Provides:/{p=1;next} p && NF {f=1} END \
+                 {exit !f}' || [ $? -gt 1 ]; }; };; esac; then printf '%s ' \"$n\"; else printf \
+                 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || sudo -n env \
+                 DEBIAN_FRONTEND=noninteractive apt-get install -y $a; }"
+                    .to_string(),
             ),
             (
                 Manager::Apt,
                 true,
                 format!(
-                    "{apt} apt-get upgrade -y && sudo -n env DEBIAN_FRONTEND=noninteractive \
-                     apt-get install -y git fd-find"
+                    "{apt} apt-get upgrade -y && {{ anvil_db=1; {{ apt-cache show apt >/dev/null 2>&1; }} || anvil_db=0; \
+                 }} && {{ a=$(for n in git fd-find; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = \
+                 0 ] || {{ apt-cache show \"$n\" >/dev/null 2>&1 || {{ v=$(apt-cache showpkg \"$n\" 2>/dev/null); \
+                 c=$?; [ \"$c\" -ne 0 ] || printf '%s\\n' \"$v\" | awk '/^Reverse Provides:/{{p=1;next}} p && NF \
+                 {{f=1}} END {{exit !f}}' || [ $? -gt 1 ]; }}; }};; esac; then printf '%s ' \"$n\"; else printf \
+                 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || sudo -n env \
+                 DEBIAN_FRONTEND=noninteractive apt-get install -y $a; }}"
                 ),
             ),
             (
                 Manager::Dnf,
                 false,
-                "sudo -n dnf -y install git fd-find".to_string(),
+                "{ anvil_db=1; { v=$(dnf -q repoquery --whatprovides dnf 2>/dev/null) && [ -n \"$v\" ]; } || \
+                 anvil_db=0; } && { a=$(for n in git fd-find; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || { v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ \
+                 -n \"$v\" ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" \
+                 >&2; fi; done); [ -z \"$a\" ] || sudo -n dnf -y install $a; }"
+                    .to_string(),
             ),
             (
                 Manager::Dnf,
                 true,
-                "sudo -n dnf -y upgrade && sudo -n dnf -y install git fd-find".to_string(),
+                "sudo -n dnf -y upgrade && { anvil_db=1; { v=$(dnf -q repoquery --whatprovides dnf 2>/dev/null) && [ \
+                 -n \"$v\" ]; } || anvil_db=0; } && { a=$(for n in git fd-find; do if case \"$n\" in (*@*|*:*|*/*) \
+                 true;; (*) [ \"$anvil_db\" = 0 ] || { v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? \
+                 -ne 0 ] || [ -n \"$v\" ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package \
+                 %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || sudo -n dnf -y install $a; }"
+                    .to_string(),
             ),
             (
                 Manager::Apk,
                 false,
-                "sudo -n apk add --update-cache git fd".to_string(),
+                "sudo -n apk update && { anvil_db=1; { v=$(apk search -x -q apk-tools 2>/dev/null) && [ -n \"$v\" ]; \
+                 } || anvil_db=0; } && { a=$(for n in git fd; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || { v=$(apk search -x -q \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ -n \"$v\" ]; \
+                 };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; \
+                 done); [ -z \"$a\" ] || sudo -n apk add $a; }"
+                    .to_string(),
             ),
             (
                 Manager::Apk,
                 true,
-                "sudo -n apk update && sudo -n apk upgrade && sudo -n apk add --update-cache git fd"
+                "sudo -n apk update && sudo -n apk upgrade && { anvil_db=1; { v=$(apk search -x -q apk-tools \
+                 2>/dev/null) && [ -n \"$v\" ]; } || anvil_db=0; } && { a=$(for n in git fd; do if case \"$n\" in \
+                 (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { v=$(apk search -x -q \"$n\" 2>/dev/null); [ $? \
+                 -ne 0 ] || [ -n \"$v\" ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package \
+                 %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || sudo -n apk add $a; }"
                     .to_string(),
             ),
         ];
@@ -850,11 +1455,20 @@ mod tests {
         assert_eq!(p.validate(), Ok(()));
         assert_eq!(
             script(Manager::Dnf, &p, false).unwrap(),
-            "sudo -n dnf -y install fd-find fd-find"
+            "{ anvil_db=1; { v=$(dnf -q repoquery --whatprovides dnf 2>/dev/null) && [ -n \"$v\" ]; } || \
+                 anvil_db=0; } && { a=$(for n in fd-find fd-find; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || { v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ \
+                 -n \"$v\" ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" \
+                 >&2; fi; done); [ -z \"$a\" ] || sudo -n dnf -y install $a; }"
         );
         assert_eq!(
             script(Manager::Brew, &p, false).unwrap(),
-            format!("{BREW_ENV}brew install fd fdfind")
+            format!(
+                "{BREW_ENV}{{ anvil_db=1; {{ brew info bash >/dev/null 2>&1; }} || anvil_db=0; }} && {{ a=$(for n in \
+                 fd fdfind; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || {{ brew info \
+                 \"$n\" >/dev/null 2>&1; [ $? -ne 1 ]; }};; esac; then printf '%s ' \"$n\"; else printf \
+                 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || brew install $a; }}"
+            )
         );
     }
 
@@ -863,28 +1477,48 @@ mod tests {
         let both = packages(&["git"], true);
         assert_eq!(
             script(Manager::Pacman, &both, true).unwrap(),
-            "pacman -Syu --noconfirm --needed git"
+            "pacman -Syu --noconfirm && { anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && \
+                 { a=$(for n in git; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman \
+                 -Si \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \
+                 \"$c\" -ne 1 ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \
+                 \"$n\" >&2; fi; done); [ -z \"$a\" ] || pacman -S --noconfirm --needed $a; }"
         );
         assert_eq!(
             script(Manager::Apt, &both, true).unwrap(),
-            "apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && \
-             env DEBIAN_FRONTEND=noninteractive apt-get install -y git"
+            "apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && { anvil_db=1; { \
+                 apt-cache show apt >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git; do if case \"$n\" in \
+                 (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { apt-cache show \"$n\" >/dev/null 2>&1 || { \
+                 v=$(apt-cache showpkg \"$n\" 2>/dev/null); c=$?; [ \"$c\" -ne 0 ] || printf '%s\\n' \"$v\" | awk \
+                 '/^Reverse Provides:/{p=1;next} p && NF {f=1} END {exit !f}' || [ $? -gt 1 ]; }; };; esac; then \
+                 printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] \
+                 || env DEBIAN_FRONTEND=noninteractive apt-get install -y $a; }"
         );
         assert_eq!(
             script(Manager::Dnf, &both, true).unwrap(),
-            "dnf -y upgrade && dnf -y install git"
+            "dnf -y upgrade && { anvil_db=1; { v=$(dnf -q repoquery --whatprovides dnf 2>/dev/null) && [ -n \
+                 \"$v\" ]; } || anvil_db=0; } && { a=$(for n in git; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || { v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ \
+                 -n \"$v\" ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" \
+                 >&2; fi; done); [ -z \"$a\" ] || dnf -y install $a; }"
         );
         assert_eq!(
             script(Manager::Apk, &both, true).unwrap(),
-            "apk update && apk upgrade && apk add --update-cache git"
+            "apk update && apk upgrade && { anvil_db=1; { v=$(apk search -x -q apk-tools 2>/dev/null) && [ -n \
+                 \"$v\" ]; } || anvil_db=0; } && { a=$(for n in git; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || { v=$(apk search -x -q \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ -n \"$v\" ]; \
+                 };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; \
+                 done); [ -z \"$a\" ] || apk add $a; }"
         );
         for root in [true, false] {
             let brew = script(Manager::Brew, &both, root).unwrap();
             assert_eq!(
                 brew,
-                "export PATH=\"$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin\"; \
-                 export SUDO_ASKPASS=\"${SUDO_ASKPASS:-/usr/bin/false}\"; \
-                 brew update && brew upgrade --formula && brew install git"
+                "export PATH=\"$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin\"; export \
+                 SUDO_ASKPASS=\"${SUDO_ASKPASS:-/usr/bin/false}\"; brew update && brew upgrade --formula && { \
+                 anvil_db=1; { brew info bash >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git; do if case \
+                 \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { brew info \"$n\" >/dev/null 2>&1; [ \
+                 $? -ne 1 ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" \
+                 >&2; fi; done); [ -z \"$a\" ] || brew install $a; }"
             );
             assert!(!brew.contains("sudo"), "{brew}");
         }
@@ -1238,11 +1872,15 @@ mod tests {
         assert_eq!(
             script(Manager::Apt, &removing(&["git", "curl"], true), false).as_deref(),
             Some(
-                "sudo -n apt-get update && \
-                 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && \
-                 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y git curl && \
-                 { r=$(for n in nano fd-find; do dpkg -s \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); \
-                 [ -z \"$r\" ] || sudo -n env DEBIAN_FRONTEND=noninteractive apt-get remove -y $r; }"
+                "sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && { \
+                 anvil_db=1; { apt-cache show apt >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git curl; do \
+                 if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { apt-cache show \"$n\" \
+                 >/dev/null 2>&1 || { v=$(apt-cache showpkg \"$n\" 2>/dev/null); c=$?; [ \"$c\" -ne 0 ] || printf \
+                 '%s\\n' \"$v\" | awk '/^Reverse Provides:/{p=1;next} p && NF {f=1} END {exit !f}' || [ $? -gt 1 ]; \
+                 }; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; \
+                 done); [ -z \"$a\" ] || sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y $a; } && { \
+                 r=$(for n in nano fd-find; do dpkg -s \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); [ -z \
+                 \"$r\" ] || sudo -n env DEBIAN_FRONTEND=noninteractive apt-get remove -y $r; }"
             )
         );
         for manager in Manager::ALL {
@@ -1298,6 +1936,7 @@ mod tests {
     /// the output.
     fn run_with_stub_pacman(line: &str, sync: u8, have: &str, del: u8) -> (Option<i32>, String) {
         let stub = "pacman() { case $1 in \
+                    -Si) return 0;; \
                     -Q) case \" $HAVE \" in *\" $2 \"*) return 0;; esac; return 1;; \
                     -T) case \" $HAVE \" in *\" $2 \"*) return 0;; esac; return 127;; \
                     -R) shift; echo \"removed $*\"; return $DEL;; \
@@ -1354,8 +1993,26 @@ mod tests {
         }
     }
 
+    /// Add the one-time database probe to a script assembled from test fragments.
+    fn with_db(manager: Manager, expected: String) -> String {
+        let expected = expected.replace(&format!("{} && ", known_db(manager, false)), "");
+        let start = expected.find("{ a=$(").expect("name filter");
+        format!(
+            "{}{} && {}",
+            &expected[..start],
+            known_db(manager, false),
+            &expected[start..]
+        )
+    }
+
     fn pin_group(check: &str, k: &str, command: &str) -> String {
-        expected_group('m', "||", check, k, command)
+        let manager = if check == "pacman -T" {
+            Manager::Pacman
+        } else {
+            Manager::Dnf
+        };
+        let inner = expected_group('m', "||", check, "$a", command);
+        known(manager, k, &inner)
     }
 
     #[test]
@@ -1369,16 +2026,31 @@ mod tests {
         assert_eq!(
             script(Manager::Dnf, &p, true).as_deref(),
             Some(
-                "{ m=$(for n in fd-find; do rpm -q --whatprovides \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); \
-                 [ -z \"$m\" ] || dnf -y install $m; } && dnf -y install --exclude=fd-find git"
+                "{ anvil_db=1; { v=$(dnf -q repoquery --whatprovides dnf 2>/dev/null) && [ -n \"$v\" ]; } || \
+                 anvil_db=0; } && { a=$(for n in fd-find; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || { v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ \
+                 -n \"$v\" ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" \
+                 >&2; fi; done); [ -z \"$a\" ] || { m=$(for n in $a; do rpm -q --whatprovides \"$n\" >/dev/null 2>&1 \
+                 || printf '%s ' \"$n\"; done); [ -z \"$m\" ] || dnf -y install $m; }; } && { a=$(for n in git; do \
+                 if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { v=$(dnf -q repoquery \
+                 --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ -n \"$v\" ]; };; esac; then printf '%s ' \
+                 \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || dnf -y \
+                 install --exclude=fd-find $a; }"
             )
         );
         assert_eq!(
             script(Manager::Pacman, &p, true).as_deref(),
             Some(
-                "pacman -S --noconfirm --needed git && \
-                 { m=$(for n in fd-find; do pacman -T \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); \
-                 [ -z \"$m\" ] || pacman -S --noconfirm $m; }"
+                "{ anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git; do if \
+                 case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null \
+                 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; \
+                 esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ \
+                 -z \"$a\" ] || pacman -S --noconfirm --needed $a; } && { a=$(for n in fd-find; do if case \"$n\" in \
+                 (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null 2>&1; c=$?; [ \
+                 \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; esac; then printf \
+                 '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || { \
+                 m=$(for n in $a; do pacman -T \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); [ -z \"$m\" ] \
+                 || pacman -S --noconfirm $m; }; }"
             )
         );
     }
@@ -1390,33 +2062,50 @@ mod tests {
             (
                 &["git", "fd"][..],
                 true,
-                format!("sudo -n pacman -Syu --noconfirm --needed --ignore vim,fd git && {group}"),
+                format!(
+                    "sudo -n pacman -Syu --noconfirm --ignore vim,fd && {{ anvil_db=1; {{ pacman -Si pacman >/dev/null \
+                 2>&1; }} || anvil_db=0; }} && {{ a=$(for n in git; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || {{ pacman -Si \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \
+                 \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; }};; esac; then printf '%s ' \"$n\"; else printf \
+                 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || sudo -n pacman -S --noconfirm \
+                 --needed $a; }} && {group}"
+                ),
             ),
             (
                 &[],
                 true,
-                format!("sudo -n pacman -Syu --noconfirm --needed --ignore vim,fd && {group}"),
+                format!("sudo -n pacman -Syu --noconfirm --ignore vim,fd && {group}"),
             ),
             (
                 &["git", "fd"],
                 false,
-                format!("sudo -n pacman -S --noconfirm --needed git && {group}"),
+                format!(
+                    "{{ anvil_db=1; {{ pacman -Si pacman >/dev/null 2>&1; }} || anvil_db=0; }} && {{ a=$(for n in git; \
+                 do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || {{ pacman -Si \"$n\" \
+                 >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 \
+                 ]; }};; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; \
+                 done); [ -z \"$a\" ] || sudo -n pacman -S --noconfirm --needed $a; }} && {group}"
+                ),
             ),
             (&["fd"], false, group.clone()),
             (&[], false, group.clone()),
         ] {
             assert_eq!(
                 script(Manager::Pacman, &pinning(install, upgrade), false),
-                Some(expected),
+                Some(with_db(Manager::Pacman, expected)),
                 "{install:?} {upgrade}"
             );
         }
         assert_eq!(
             script(Manager::Pacman, &pinning(&[], true), true).as_deref(),
             Some(
-                "pacman -Syu --noconfirm --needed --ignore vim,fd && \
-                 { m=$(for n in vim fd; do pacman -T \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); \
-                 [ -z \"$m\" ] || pacman -S --noconfirm $m; }"
+                "pacman -Syu --noconfirm --ignore vim,fd && { anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || \
+                 anvil_db=0; } && { a=$(for n in vim fd; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \
+                 \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; esac; then printf '%s ' \"$n\"; else printf \
+                 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || { m=$(for n in $a; do pacman \
+                 -T \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); [ -z \"$m\" ] || pacman -S --noconfirm $m; \
+                 }; }"
             )
         );
     }
@@ -1433,8 +2122,12 @@ mod tests {
                 &["git", "fd"][..],
                 true,
                 format!(
-                    "sudo -n dnf -y upgrade --exclude=vim,fd-find && {group} && \
-                     sudo -n dnf -y install --exclude=vim,fd-find git"
+                    "sudo -n dnf -y upgrade --exclude=vim,fd-find && {group} && {{ anvil_db=1; {{ v=$(dnf -q repoquery \
+                 --whatprovides dnf 2>/dev/null) && [ -n \"$v\" ]; }} || anvil_db=0; }} && {{ a=$(for n in git; do \
+                 if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || {{ v=$(dnf -q repoquery \
+                 --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ -n \"$v\" ]; }};; esac; then printf '%s ' \
+                 \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || sudo -n \
+                 dnf -y install --exclude=vim,fd-find $a; }}"
                 ),
             ),
             (
@@ -1445,13 +2138,19 @@ mod tests {
             (
                 &["git", "fd"],
                 false,
-                format!("{group} && sudo -n dnf -y install --exclude=vim,fd-find git"),
+                format!(
+                    "{group} && {{ anvil_db=1; {{ v=$(dnf -q repoquery --whatprovides dnf 2>/dev/null) && [ -n \"$v\" ]; \
+                 }} || anvil_db=0; }} && {{ a=$(for n in git; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || {{ v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || \
+                 [ -n \"$v\" ]; }};; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \
+                 \"$n\" >&2; fi; done); [ -z \"$a\" ] || sudo -n dnf -y install --exclude=vim,fd-find $a; }}"
+                ),
             ),
             (&["fd"], false, group.clone()),
         ] {
             assert_eq!(
                 script(Manager::Dnf, &pinning(install, upgrade), false),
-                Some(expected),
+                Some(with_db(Manager::Dnf, expected)),
                 "{install:?} {upgrade}"
             );
         }
@@ -1466,21 +2165,35 @@ mod tests {
         assert_eq!(
             script(Manager::Pacman, &p, true).as_deref(),
             Some(
-                "pacman -Syu --noconfirm --needed --ignore vim,fd git && \
-                 { m=$(for n in vim fd; do pacman -T \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); \
-                 [ -z \"$m\" ] || pacman -S --noconfirm $m; } && \
-                 { r=$(for n in nano; do pacman -Q \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); \
-                 [ -z \"$r\" ] || pacman -R --noconfirm $r; }"
+                "pacman -Syu --noconfirm --ignore vim,fd && { anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || \
+                 anvil_db=0; } && { a=$(for n in git; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" \
+                 = 0 ] || { pacman -Si \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" \
+                 >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; esac; then printf '%s ' \"$n\"; else printf \
+                 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || pacman -S --noconfirm \
+                 --needed $a; } && { a=$(for n in vim fd; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
+                 \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \
+                 \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; esac; then printf '%s ' \"$n\"; else printf \
+                 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || { m=$(for n in $a; do pacman \
+                 -T \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); [ -z \"$m\" ] || pacman -S --noconfirm $m; \
+                 }; } && { r=$(for n in nano; do pacman -Q \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); [ \
+                 -z \"$r\" ] || pacman -R --noconfirm $r; }"
             )
         );
         assert_eq!(
             script(Manager::Dnf, &p, true).as_deref(),
             Some(
-                "dnf -y upgrade --exclude=vim,fd-find && \
-                 { m=$(for n in vim fd-find; do rpm -q --whatprovides \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); \
-                 [ -z \"$m\" ] || dnf -y install $m; } && dnf -y install --exclude=vim,fd-find git && \
-                 { r=$(for n in nano; do rpm -q --whatprovides \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); \
-                 [ -z \"$r\" ] || dnf -y remove --setopt=clean_requirements_on_remove=False $r; }"
+                "dnf -y upgrade --exclude=vim,fd-find && { anvil_db=1; { v=$(dnf -q repoquery --whatprovides dnf \
+                 2>/dev/null) && [ -n \"$v\" ]; } || anvil_db=0; } && { a=$(for n in vim fd-find; do if case \"$n\" \
+                 in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { v=$(dnf -q repoquery --whatprovides \"$n\" \
+                 2>/dev/null); [ $? -ne 0 ] || [ -n \"$v\" ]; };; esac; then printf '%s ' \"$n\"; else printf \
+                 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || { m=$(for n in $a; do rpm -q \
+                 --whatprovides \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); [ -z \"$m\" ] || dnf -y \
+                 install $m; }; } && { a=$(for n in git; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" \
+                 = 0 ] || { v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ -n \"$v\" ]; \
+                 };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; \
+                 done); [ -z \"$a\" ] || dnf -y install --exclude=vim,fd-find $a; } && { r=$(for n in nano; do rpm \
+                 -q --whatprovides \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); [ -z \"$r\" ] || dnf -y \
+                 remove --setopt=clean_requirements_on_remove=False $r; }"
             )
         );
     }
@@ -1490,15 +2203,19 @@ mod tests {
         let one_liner = script(Manager::Dnf, &pinning(&["git"], true), false).unwrap();
         assert_eq!(
             with_password(&one_liner),
-            "export TERM=dumb\n\
-             mesg n </dev/tty 2>/dev/null; stty -echo </dev/tty; echo anvil-tty-ready\n\
-             IFS= read -r n </dev/tty\n\
-             trap 'sudo -k' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM\n\
-             LC_ALL=C SUDO_PROMPT=\"$n\" sudo -v </dev/tty && echo anvil-sudo-ok && \
-             sudo -n dnf -y upgrade --exclude=vim,fd-find && \
-             { m=$(for n in vim fd-find; do rpm -q --whatprovides \"$n\" >/dev/null 2>&1 || printf '%s ' \"$n\"; done); \
-             [ -z \"$m\" ] || sudo -n dnf -y install $m; } && \
-             sudo -n dnf -y install --exclude=vim,fd-find git\n"
+            "export TERM=dumb\nmesg n </dev/tty 2>/dev/null; stty -echo </dev/tty; echo anvil-tty-ready\nIFS= \
+                 read -r n </dev/tty\ntrap 'sudo -k' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' \
+                 TERM\nLC_ALL=C SUDO_PROMPT=\"$n\" sudo -v </dev/tty && echo anvil-sudo-ok && sudo -n dnf -y upgrade \
+                 --exclude=vim,fd-find && { anvil_db=1; { v=$(dnf -q repoquery --whatprovides dnf 2>/dev/null) && [ \
+                 -n \"$v\" ]; } || anvil_db=0; } && { a=$(for n in vim fd-find; do if case \"$n\" in (*@*|*:*|*/*) \
+                 true;; (*) [ \"$anvil_db\" = 0 ] || { v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? \
+                 -ne 0 ] || [ -n \"$v\" ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package \
+                 %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || { m=$(for n in $a; do rpm -q --whatprovides \"$n\" \
+                 >/dev/null 2>&1 || printf '%s ' \"$n\"; done); [ -z \"$m\" ] || sudo -n dnf -y install $m; }; } && \
+                 { a=$(for n in git; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { \
+                 v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ -n \"$v\" ]; };; esac; \
+                 then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \
+                 \"$a\" ] || sudo -n dnf -y install --exclude=vim,fd-find $a; }\n"
         );
     }
 
@@ -1820,12 +2537,14 @@ mod tests {
         let one_liner = script(Manager::Pacman, &packages(&["git"], false), false).unwrap();
         assert_eq!(
             with_password(&one_liner),
-            "export TERM=dumb\n\
-             mesg n </dev/tty 2>/dev/null; stty -echo </dev/tty; echo anvil-tty-ready\n\
-             IFS= read -r n </dev/tty\n\
-             trap 'sudo -k' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM\n\
-             LC_ALL=C SUDO_PROMPT=\"$n\" sudo -v </dev/tty && echo anvil-sudo-ok && \
-             sudo -n pacman -S --noconfirm --needed git\n"
+            "export TERM=dumb\nmesg n </dev/tty 2>/dev/null; stty -echo </dev/tty; echo anvil-tty-ready\nIFS= \
+                 read -r n </dev/tty\ntrap 'sudo -k' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' \
+                 TERM\nLC_ALL=C SUDO_PROMPT=\"$n\" sudo -v </dev/tty && echo anvil-sudo-ok && { anvil_db=1; { pacman \
+                 -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git; do if case \"$n\" in \
+                 (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null 2>&1; c=$?; [ \
+                 \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; esac; then printf \
+                 '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ -z \"$a\" ] || \
+                 sudo -n pacman -S --noconfirm --needed $a; }\n"
         );
     }
 

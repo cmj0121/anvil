@@ -86,6 +86,8 @@ fn sudo_password<'a>(
 /// `run` is the label when there is one.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PlannedRun {
+    /// Set only for the package step, for marker extraction.
+    pub package_manager: Option<packages::Manager>,
     /// Zeroed when dropped: a `[[files]]` step's carries the file's bytes.
     pub run: Zeroizing<String>,
     /// What the step's report shows instead of `run`, when what is sent
@@ -231,6 +233,8 @@ impl StepReport {
 pub enum TargetReport {
     Ran {
         target: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
         steps: Vec<StepReport>,
         ok: bool,
     },
@@ -240,6 +244,8 @@ pub enum TargetReport {
     Failed {
         target: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
         steps: Vec<StepReport>,
         error: String,
         ok: bool,
@@ -248,12 +254,53 @@ pub enum TargetReport {
     /// before it. `ok` is always false.
     Cancelled {
         target: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
         steps: Vec<StepReport>,
         ok: bool,
     },
 }
 
 impl TargetReport {
+    pub fn warnings(&self) -> &[String] {
+        match self {
+            Self::Ran { warnings, .. }
+            | Self::Failed { warnings, .. }
+            | Self::Cancelled { warnings, .. } => warnings,
+        }
+    }
+
+    /// Lift package markers after execution, including partial timeout output.
+    fn collect_warnings(&mut self, runs: &[PlannedRun]) {
+        let (steps, warnings) = match self {
+            Self::Ran {
+                steps, warnings, ..
+            }
+            | Self::Failed {
+                steps, warnings, ..
+            }
+            | Self::Cancelled {
+                steps, warnings, ..
+            } => (steps, warnings),
+        };
+        for (step, run) in steps.iter_mut().zip(runs) {
+            if let Some(manager) = run.package_manager {
+                let mut names = packages::take_unknown(&mut step.stdout);
+                for name in packages::take_unknown(&mut step.stderr) {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                if !names.is_empty() {
+                    warnings.push(format!(
+                        "packages: not found by {manager}: {} (add [packages.alias.NAME])",
+                        names.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+
     pub fn ok(&self) -> bool {
         match self {
             TargetReport::Ran { ok, .. }
@@ -692,6 +739,7 @@ pub(crate) fn print_report(
 pub(crate) fn cancelled(command: &str, target: &Target, steps: Vec<StepReport>) -> TargetReport {
     log::info!("{command} {}: cancelled", target.name);
     TargetReport::Cancelled {
+        warnings: Vec::new(),
         target: target.name.clone(),
         steps,
         ok: false,
@@ -839,6 +887,7 @@ pub(crate) fn failed(
 ) -> TargetReport {
     log::info!("{command} {}: failed: {error}", target.name);
     TargetReport::Failed {
+        warnings: Vec::new(),
         target: target.name.clone(),
         steps,
         error,
@@ -854,6 +903,22 @@ pub(crate) fn failed(
 /// ([`capture`]), then writes only if DEST still holds what it captured,
 /// and the recorder keeps both and how the write ended.
 pub(crate) fn execute(
+    command: &str,
+    target: &Target,
+    transport: &dyn Transport,
+    runs: &[PlannedRun],
+    passwords: &Passwords,
+    cancel: &AtomicBool,
+    recorder: Option<&mut Recorder<'_>>,
+) -> TargetReport {
+    let mut report = execute_inner(
+        command, target, transport, runs, passwords, cancel, recorder,
+    );
+    report.collect_warnings(runs);
+    report
+}
+
+fn execute_inner(
     command: &str,
     target: &Target,
     transport: &dyn Transport,
@@ -1007,6 +1072,7 @@ pub(crate) fn execute(
         if ok { "done" } else { "a step failed" }
     );
     TargetReport::Ran {
+        warnings: Vec::new(),
         target: target.name.clone(),
         steps: reports,
         ok,
@@ -1267,6 +1333,7 @@ pub fn resolve(
                 plugin: None,
                 timeout: packages.timeout(),
                 file: None,
+                package_manager: Some(manager),
                 service: None,
             });
         }
@@ -1296,6 +1363,7 @@ pub fn resolve(
                     plugin: Some(name.to_owned()),
                     timeout: RUN_TIMEOUT,
                     file: None,
+                    package_manager: None,
                     service: None,
                 });
             }
@@ -1306,6 +1374,7 @@ pub fn resolve(
                 plugin: None,
                 timeout: RUN_TIMEOUT,
                 file: None,
+                package_manager: None,
                 service: None,
             }),
         }
@@ -1490,6 +1559,13 @@ fn render(report: &TargetReport, style: Style) -> Vec<Line> {
                 ..Line::out(format!("{prefix}{line}"), Escape::Always, Some(YELLOW))
             });
         }
+    }
+    for warning in report.warnings() {
+        lines.push(Line::out(
+            format!("⚠ {warning}"),
+            Escape::Always,
+            Some(YELLOW),
+        ));
     }
     let end = match report.failure() {
         Some(reason) => Line::out(format!("✘ {reason}"), Escape::Always, Some(RED)),
@@ -1977,6 +2053,7 @@ mod tests {
     #[test]
     fn an_ok_target_lists_each_step_and_counts_them() {
         let report = TargetReport::Ran {
+            warnings: Vec::new(),
             target: "local".to_owned(),
             steps: vec![
                 step("hostname", Some(0), "mac.local\n", ""),
@@ -2019,6 +2096,7 @@ mod tests {
         );
 
         let report = TargetReport::Ran {
+            warnings: Vec::new(),
             target: "box".to_owned(),
             steps: vec![step("sleep 9", None, "", "")],
             ok: false,
@@ -2032,6 +2110,7 @@ mod tests {
     #[test]
     fn a_transport_error_shows_the_completed_steps_then_the_error() {
         let report = TargetReport::Failed {
+            warnings: Vec::new(),
             target: "box".to_owned(),
             steps: vec![step("one", Some(0), "one-out\n", "")],
             error: "timed out after 30 s".to_owned(),
@@ -2069,6 +2148,7 @@ mod tests {
     #[test]
     fn a_multi_line_run_shows_its_first_line_and_an_ellipsis() {
         let report = TargetReport::Ran {
+            warnings: Vec::new(),
             target: "local".to_owned(),
             steps: vec![step(
                 "\n  set -e\n  echo hi\n",
@@ -2122,6 +2202,7 @@ mod tests {
     #[test]
     fn host_control_characters_are_escaped_in_human_output_only() {
         let report = TargetReport::Failed {
+            warnings: Vec::new(),
             target: "box".to_owned(),
             steps: vec![step(
                 "run",
@@ -2162,6 +2243,7 @@ mod tests {
     #[test]
     fn a_control_character_at_the_edge_of_a_run_stays_visible() {
         let report = TargetReport::Ran {
+            warnings: Vec::new(),
             target: "local".to_owned(),
             steps: vec![step("\r echo a\r\n echo b\x0b", Some(0), "", "")],
             ok: true,
@@ -2276,6 +2358,7 @@ mod tests {
         assert_eq!(
             report.targets[1],
             TargetReport::Cancelled {
+                warnings: Vec::new(),
                 target: "b".to_owned(),
                 steps: vec![],
                 ok: false,
@@ -2360,6 +2443,78 @@ mod tests {
     }
 
     #[test]
+    fn package_markers_become_warnings_without_stopping_later_steps() {
+        struct Markers {
+            code: i32,
+            timeout: bool,
+        }
+        impl Transport for Markers {
+            fn name(&self) -> &str {
+                "markers"
+            }
+            fn run(&self, script: &str, _: Duration) -> Result<Output, TransportError> {
+                let output = Output {
+                    stdout: b"progress\nanvil-unknown-package nvim\n".to_vec(),
+                    stderr:
+                        b"anvil-unknown-package watch\nanvil-unknown-package nvim\nordinary error\n"
+                            .to_vec(),
+                    code: Some(self.code),
+                    ..Output::default()
+                };
+                if self.timeout && script == "package" {
+                    Err(TransportError::Timeout {
+                        after: RUN_TIMEOUT,
+                        output: Some(Box::new(output)),
+                    })
+                } else {
+                    Ok(output)
+                }
+            }
+            fn run_tty(
+                &self,
+                script: &str,
+                _: &[u8],
+                timeout: Duration,
+            ) -> Result<Output, TransportError> {
+                self.run(script, timeout)
+            }
+        }
+        let mut package = planned("package", None, RUN_TIMEOUT);
+        package.package_manager = Some(packages::Manager::Pacman);
+        let runs = [package, planned("user", None, RUN_TIMEOUT)];
+        let warning = "packages: not found by pacman: nvim, watch (add [packages.alias.NAME])";
+        for (code, timeout) in [(0, false), (7, false), (0, true)] {
+            let report = execute(
+                "apply",
+                &target("box"),
+                &Markers { code, timeout },
+                &runs,
+                &Passwords::new(),
+                &AtomicBool::new(false),
+                None,
+            );
+            assert_eq!(report.ok(), code == 0 && !timeout);
+            assert_eq!(report.warnings(), [warning]);
+            assert_eq!(report.steps()[0].stdout, "progress\n");
+            assert_eq!(report.steps()[0].stderr, "ordinary error\n");
+            assert_eq!(json(&report)["warnings"], serde_json::json!([warning]));
+            let shown = screen(&report, piped());
+            assert!(shown.contains(&format!("  ⚠ {warning}\n")), "{shown}");
+            if report.ok() {
+                assert_eq!(report.steps().len(), 2);
+                assert!(
+                    report.steps()[1]
+                        .stdout
+                        .contains("anvil-unknown-package nvim")
+                );
+                assert!(shown.ends_with("  ✔ ok · 2 steps\n\n"));
+            } else {
+                assert_eq!(report.steps().len(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn packages_probe_then_run_their_script_as_step_one() {
         let pkgs = packages(&["git", "curl"], false);
         let (report, runs) = apply_packages("local", &pkgs, MAC, &["one"]);
@@ -2374,7 +2529,7 @@ mod tests {
         assert_eq!(dollar.len(), 2, "{shown}");
         let line = dollar[0].strip_prefix("  $ ").unwrap();
         assert!(line.starts_with("export PATH="), "{line}");
-        assert!(line.contains("brew install git curl"), "{line}");
+        assert!(line.contains("brew install $a"), "{line}");
         assert_eq!(line, brew, "the whole script is the $ line");
         assert!(shown.ends_with("  ✔ ok · 2 steps\n\n"), "{shown}");
 
@@ -2387,7 +2542,7 @@ mod tests {
             ARCH_ROOT,
             &[],
         );
-        assert_eq!(runs, [facts::PROBE, "pacman -Syu --noconfirm --needed"]);
+        assert_eq!(runs, [facts::PROBE, "pacman -Syu --noconfirm"]);
     }
 
     #[test]
@@ -2538,7 +2693,11 @@ mod tests {
             [
                 facts::PROBE,
                 facts::PROBE,
-                "pacman -S --noconfirm --needed git",
+                "{ anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git; do if \
+                 case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null \
+                 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; \
+                 esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ \
+                 -z \"$a\" ] || pacman -S --noconfirm --needed $a; }",
                 "one"
             ]
         );
@@ -2571,6 +2730,7 @@ mod tests {
         assert_eq!(
             report,
             TargetReport::Cancelled {
+                warnings: Vec::new(),
                 target: "a".to_owned(),
                 steps: vec![],
                 ok: false,
@@ -2691,7 +2851,11 @@ mod tests {
     #[test]
     fn a_password_sudo_runs_the_wrapped_script_on_a_tty_with_the_secret() {
         let (report, runs, typed) = apply_sudo(ARCH_SUDO, Some(PASSWORD.as_bytes()), None);
-        let one_liner = "sudo -n pacman -S --noconfirm --needed git";
+        let one_liner = "{ anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git; do if \
+                 case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null \
+                 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; \
+                 esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ \
+                 -z \"$a\" ] || sudo -n pacman -S --noconfirm --needed $a; }";
         assert_eq!(
             runs,
             [
@@ -2801,7 +2965,11 @@ mod tests {
         };
         let (report, runs, _) = apply_sudo(ARCH_SUDO, Some(PASSWORD.as_bytes()), Some(timeout));
         assert_eq!(runs.len(), 2, "the steps do not run: {runs:?}");
-        let one_liner = "sudo -n pacman -S --noconfirm --needed git";
+        let one_liner = "{ anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git; do if \
+                 case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null \
+                 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; \
+                 esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ \
+                 -z \"$a\" ] || sudo -n pacman -S --noconfirm --needed $a; }";
         assert_eq!(
             json(&report),
             serde_json::json!({
@@ -2872,6 +3040,7 @@ mod tests {
             plugin: None,
             timeout,
             file: None,
+            package_manager: None,
             service: None,
         }
     }
@@ -2913,9 +3082,13 @@ mod tests {
             timeout: 900,
             ..packages(&["git"], false)
         };
-        let one_liner = "sudo -n pacman -S --noconfirm --needed git";
+        let one_liner = "{ anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git; do if \
+                 case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null \
+                 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; \
+                 esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ \
+                 -z \"$a\" ] || sudo -n pacman -S --noconfirm --needed $a; }";
         let slow = Duration::from_secs(900);
-        for (pkgs, probe, step) in [
+        for (pkgs, probe, mut step) in [
             (
                 local_sudo(pkgs.clone()),
                 ARCH_SUDO,
@@ -2929,9 +3102,18 @@ mod tests {
             (
                 pkgs.clone(),
                 ARCH_ROOT,
-                planned("pacman -S --noconfirm --needed git", None, slow),
+                planned(
+                    "{ anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git; do if \
+                 case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null \
+                 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; \
+                 esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ \
+                 -z \"$a\" ] || pacman -S --noconfirm --needed $a; }",
+                    None,
+                    slow,
+                ),
             ),
         ] {
+            step.package_manager = Some(packages::Manager::Pacman);
             assert_eq!(
                 resolved(
                     &target("local"),
@@ -2976,6 +3158,7 @@ mod tests {
             plugin: Some(name.to_owned()),
             timeout: RUN_TIMEOUT,
             file: None,
+            package_manager: None,
             service: None,
         }
     }
@@ -3155,6 +3338,7 @@ mod tests {
         assert_eq!(
             report,
             TargetReport::Cancelled {
+                warnings: Vec::new(),
                 target: "box".to_owned(),
                 steps: vec![],
                 ok: false,
@@ -3497,6 +3681,7 @@ mod tests {
     #[test]
     fn a_skipped_file_step_shows_only_its_label() {
         let report = TargetReport::Ran {
+            warnings: Vec::new(),
             target: "pi".to_owned(),
             steps: vec![StepReport::skipped("skipped file /etc/b.conf: no match")],
             ok: true,
@@ -3717,6 +3902,7 @@ mod tests {
         assert_eq!(
             report,
             TargetReport::Cancelled {
+                warnings: Vec::new(),
                 target: "box".to_owned(),
                 steps: vec![step("one", Some(0), "one-out\n", "")],
                 ok: false,
@@ -3745,6 +3931,7 @@ mod tests {
         assert_eq!(
             report,
             TargetReport::Cancelled {
+                warnings: Vec::new(),
                 target: "box".to_owned(),
                 steps: vec![],
                 ok: false,
@@ -4416,6 +4603,7 @@ mod tests {
             let expected: Vec<TargetReport> = [("a", true), ("b", parallel == 2), ("c", false)]
                 .into_iter()
                 .map(|(name, started)| TargetReport::Cancelled {
+                    warnings: Vec::new(),
                     target: name.to_owned(),
                     steps: if started { vec![ran.clone()] } else { vec![] },
                     ok: false,
@@ -4450,6 +4638,7 @@ mod tests {
         assert_eq!(
             report.targets[1],
             TargetReport::Failed {
+                warnings: Vec::new(),
                 target: "b".to_owned(),
                 steps: vec![],
                 error: "internal error: b blew up".to_owned(),

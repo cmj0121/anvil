@@ -133,6 +133,9 @@ pub struct TargetReport {
     /// The resolved package manager; only with `[packages]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manager: Option<String>,
+    /// Read-only repository check: `ok` or a warning; does not affect exit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packages: Option<String>,
     /// Why the package manager cannot be resolved; only with `[packages]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manager_error: Option<String>,
@@ -304,6 +307,12 @@ pub fn check(
                             packages.choice_for(target),
                             packages.sudo_secret_for(target).is_some(),
                         );
+                        if let (Some(manager), Ok(transport)) = (&report.manager, &transport) {
+                            let manager =
+                                packages::Manager::parse(manager).expect("resolved manager");
+                            report.packages =
+                                Some(package_row(manager, packages, transport.as_ref()));
+                        }
                     }
                     if let (Some(doctor), Some(facts), Ok(transport)) =
                         (&doctor, &report.facts, &transport)
@@ -339,6 +348,7 @@ fn cancelled_target(target: &Target) -> TargetReport {
         facts: None,
         error: Some(CANCELLED.to_owned()),
         manager: None,
+        packages: None,
         manager_error: None,
         transport: describe(target),
         plugins: Vec::new(),
@@ -722,10 +732,35 @@ fn check_target(
         facts,
         error,
         manager: None,
+        packages: None,
         manager_error: None,
         transport: describe(target),
         plugins: Vec::new(),
         drift: None,
+    }
+}
+
+/// Check repository names without sudo, refreshes or installation.
+fn package_row(
+    manager: packages::Manager,
+    packages: &packages::Packages,
+    transport: &dyn Transport,
+) -> String {
+    match transport.run(
+        &packages::known_script(manager, packages),
+        packages.timeout(),
+    ) {
+        Ok(output) if output.code == Some(0) => {
+            let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let names = packages::take_unknown(&mut stderr);
+            if names.is_empty() {
+                "ok".to_owned()
+            } else {
+                format!("WARNING: not found by {manager}: {}", names.join(", "))
+            }
+        }
+        Ok(output) => format!("WARNING: package check failed: {}", exit_message(&output)),
+        Err(err) => format!("WARNING: package check failed: {err}"),
     }
 }
 
@@ -851,6 +886,9 @@ fn render(report: &Report) -> String {
         }
         if let Some(manager) = &target.manager {
             let _ = writeln!(out, "  {:<15} {manager}", "manager");
+        }
+        if let Some(packages) = &target.packages {
+            let _ = writeln!(out, "  {:<15} {packages}", "packages");
         }
         if let Some(error) = &target.manager_error {
             let _ = writeln!(out, "  {:<15} error: {error}", "manager");
@@ -1081,6 +1119,73 @@ mod tests {
             Editor::from_command(SH, None),
             check_secrets(&secrets, store),
         )
+    }
+
+    #[test]
+    fn package_checks_use_the_package_timeout_and_cached_dnf_queries() {
+        struct Cached;
+        impl Transport for Cached {
+            fn name(&self) -> &str {
+                "cached"
+            }
+            fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
+                assert_eq!(timeout, Duration::from_secs(77));
+                assert!(script.contains("dnf -C -q repoquery --whatprovides dnf"));
+                assert!(script.contains("dnf -C -q repoquery --whatprovides \"$n\""));
+                assert!(!script.contains("sudo") && !script.contains("update"));
+                Ok(Output {
+                    code: Some(0),
+                    ..Output::default()
+                })
+            }
+            fn run_tty(&self, _: &str, _: &[u8], _: Duration) -> Result<Output, TransportError> {
+                unreachable!("doctor never asks for a password")
+            }
+        }
+        let p = packages::Packages {
+            install: vec!["git".into()],
+            timeout: 77,
+            ..packages::Packages::default()
+        };
+        assert_eq!(package_row(packages::Manager::Dnf, &p, &Cached), "ok");
+    }
+
+    #[test]
+    fn unknown_packages_are_a_warning_row_and_json_field_without_failing() {
+        let packages = packages::Packages {
+            install: vec!["nvim".into(), "watch".into()],
+            ..packages::Packages::default()
+        };
+        let mut target = with_manager(
+            check_target(&host("box"), &fake(Ok(ROOT_FACTS))),
+            Choice::Is(packages::Manager::Pacman),
+        );
+        let row = package_row(
+            packages::Manager::Pacman,
+            &packages,
+            &Exits(
+                Some(0),
+                "anvil-unknown-package nvim\nanvil-unknown-package watch\n",
+            ),
+        );
+        assert_eq!(row, "WARNING: not found by pacman: nvim, watch");
+        target.packages = Some(row.clone());
+        let report = Report::new(healthy_local(&Memory::default(), &[]), vec![target]);
+        assert!(report.ok);
+        assert!(render(&report).contains(&format!("  packages        {row}\n")));
+        assert_eq!(json(&report)["targets"][0]["packages"], row);
+        assert_eq!(
+            package_row(packages::Manager::Pacman, &packages, &Exits(Some(0), "")),
+            "ok"
+        );
+        assert!(
+            package_row(
+                packages::Manager::Pacman,
+                &packages,
+                &Exits(Some(2), "bad db")
+            )
+            .starts_with("WARNING: package check failed:")
+        );
     }
 
     #[test]

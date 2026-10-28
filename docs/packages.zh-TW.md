@@ -26,6 +26,44 @@ install = ["git", "curl"]
 套件 step 最多可執行 `timeout` 秒（預設 300，1..=3600），而 `[[steps]]` 腳本為 30 s。
 取消（TUI 的 `Esc` 或 `q`）會等待執行中的套件 step，最久到 `timeout`。
 
+## 未知的 package 名稱
+
+apply 會先套用 alias、排除與 pin 相同的 install 名稱，再查詢 install 與 pin 名稱是否存在。
+只安裝查詢成功的名稱；全部未知時略過安裝指令。remove 仍只移除已安裝的名稱。
+每個未知名稱會產生內部 marker `anvil-unknown-package NAME`；apply 將它從 step 輸出取出，
+在 target 結尾之前顯示黃色警告，TUI 也顯示相同內容：
+
+```text
+  ⚠ packages: not found by pacman: nvim, watch (add [packages.alias.NAME])
+  ✔ ok · 4 steps
+```
+
+未知名稱不會使 target 失敗，後續 files、services 與 steps 照常執行。
+所有 target 成功時 exit code 為 0，即使有警告；實際安裝、更新或 sudo 失敗仍會使 target 失敗。
+請用 `[packages.alias.NAME]` 指定正確名稱，anvil 不會猜測。
+
+| Manager | 唯讀查詢                                                                              |
+| ------- | ------------------------------------------------------------------------------------- |
+| brew    | `brew info NAME`，包含 formula 與 cask                                                |
+| pacman  | `pacman -Si NAME` 或 `pacman -Sg NAME`，包含 group                                    |
+| apt     | `apt-cache show NAME`，或 `apt-cache showpkg NAME` 的 `Reverse Provides:` 有 provider |
+| dnf     | `dnf -q repoquery --whatprovides NAME`，有輸出才算存在                                |
+| apk     | `apk search -x -q NAME`，有輸出才算存在；apply 先執行 `apk update`                    |
+
+含有 `@`、`:` 或 `/` 的名稱不做查詢，直接交給 manager 處理，避免誤判 group、repository tag、
+virtual provider 或 brew tap 的特殊語法。
+
+每次 check 在名稱迴圈之前只探測一次 db：brew 用 `brew info bash`、pacman 用 `pacman -Si pacman`、
+apt 用 `apt-cache show apt`、dnf 用 `dnf -q repoquery --whatprovides dnf`、
+apk 用 `apk search -x -q apk-tools`。探測失敗或無法可靠查詢時，保留所有名稱交給 manager 決定。
+pacman 設定 `upgrade = true` 時，先執行不帶名稱的 `pacman -Syu --noconfirm`（有 pin 時加上 `--ignore`），
+再查詢並以 `pacman -S --noconfirm --needed` 安裝；未升級時使用目前的 sync db。
+
+有 `[packages]` 時，doctor 對可連線且 manager 解析成功的 target 執行相同唯讀查詢，
+不使用 sudo、不更新 db、不安裝。dnf 使用 `dnf -C -q repoquery --whatprovides`，只讀 cache。
+check 使用 `[packages].timeout`；顯示 `packages  ok` 或
+`packages  WARNING: not found by MANAGER: a, b`，警告不影響 exit code。
+
 ## 選擇哪個套件管理器
 
 target 的選擇是它在 inventory（主機清單）中的 `pkg`，`local` target 則為 `[packages].local`，
@@ -146,13 +184,13 @@ dnf = "fd-find"
 ```
 
 step 會以解析出的管理器的項目取代原名來安裝，該管理器沒有項目時則安裝原名：
-此例中 apt 與 dnf 安裝 `fd-find`，brew、pacman 與 apk 安裝 `fd`。在 Debian 上以 NOPASSWD 使用者執行時：
+此例中 apt 與 dnf 安裝 `fd-find`，brew、pacman 與 apk 安裝 `fd`。在 Debian 上以 NOPASSWD 使用者執行時，查詢成功後的安裝指令為：
 
 ```sh
-sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y fd-find
+sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y fd-find
 ```
 
-`anvil plan` 會以 `would $ ...` 印出同一行，因此在 apply 執行之前就能看到每個 target 會安裝的名稱。
+`anvil plan` 會以 `would $ ...` 印出包含查詢的完整腳本，因此在 apply 執行之前就能看到每個 target 會安裝的名稱。
 沒有 `[packages.alias]` 時，step 與以往相同。
 
 - **鍵。** `brew`、`pacman`、`apt`、`dnf` 與 `apk`；`auto` 不是鍵。
@@ -230,24 +268,27 @@ anvil 從不改為寫入持久的 hold（`brew pin`、`apt-mark hold`、編輯 `
 ## 執行的指令
 
 step 只有一行，各部分以 `&&` 連接：升級、安裝、缺少的鎖定套件，最後是移除（在 dnf 上，缺少的鎖定套件排在安裝之前）。
-沒有事可做的部分會被省略。`S` 代表 `sudo -n` 後接一個空格（以 root 執行時為空），`P` 代表以空格連接、解析後名稱不是鎖定名稱的 `install` 名稱，
+沒有事可做的部分會被省略。`S` 代表 `sudo -n` 後接一個空格（以 root 執行時為空），`P` 代表以空格連接、解析後名稱不是鎖定名稱且查詢成功的 `install` 名稱，
 `K` 代表以空格連接的 `pin` 名稱，有該管理器的[別名](#別名)時以別名取代；`KC` 是以逗號連接的同一組鎖定名稱：
 
-| 管理器 | 部分 | 指令                                                             |
-| ------ | ---- | ---------------------------------------------------------------- |
-| brew   | 升級 | `brew update && brew upgrade --formula`                          |
-| brew   | 安裝 | `brew install P`                                                 |
-| pacman | 升級 | `S pacman -Syu --noconfirm --needed P`（單一指令，也會安裝 `P`） |
-| pacman | 安裝 | `S pacman -S --noconfirm --needed P`                             |
-| apt    | 先行 | `S apt-get update`（有升級或安裝時，一次）                       |
-| apt    | 升級 | `S env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y`        |
-| apt    | 安裝 | `S env DEBIAN_FRONTEND=noninteractive apt-get install -y P`      |
-| dnf    | 升級 | `S dnf -y upgrade`                                               |
-| dnf    | 安裝 | `S dnf -y install P`                                             |
-| apk    | 升級 | `S apk update && S apk upgrade`                                  |
-| apk    | 安裝 | `S apk add --update-cache P`                                     |
+下表省略查詢與篩選群組，只列出查詢後的操作。pin 也會先篩選，再交給下方的缺少檢查群組；
+未知的 pin 名稱仍會列入升級時的排除清單。
 
-有 `pin` 時，pacman 的升級是 `S pacman -Syu --noconfirm --needed --ignore KC P`（`P` 可為空），dnf 的升級是
+| 管理器 | 部分 | 指令                                                        |
+| ------ | ---- | ----------------------------------------------------------- |
+| brew   | 升級 | `brew update && brew upgrade --formula`                     |
+| brew   | 安裝 | `brew install P`                                            |
+| pacman | 升級 | `S pacman -Syu --noconfirm`（接著查詢與安裝）               |
+| pacman | 安裝 | `S pacman -S --noconfirm --needed P`                        |
+| apt    | 先行 | `S apt-get update`（有升級或安裝時，一次）                  |
+| apt    | 升級 | `S env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y`   |
+| apt    | 安裝 | `S env DEBIAN_FRONTEND=noninteractive apt-get install -y P` |
+| dnf    | 升級 | `S dnf -y upgrade`                                          |
+| dnf    | 安裝 | `S dnf -y install P`                                        |
+| apk    | 升級 | `S apk update && S apk upgrade`                             |
+| apk    | 安裝 | `S apk add P`                                               |
+
+有 `pin` 時，pacman 的升級是 `S pacman -Syu --noconfirm --ignore KC`，dnf 的升級是
 `S dnf -y upgrade --exclude=KC`，dnf 的安裝是 `S dnf -y install --exclude=KC P`。缺少的鎖定套件與移除各是一個大括號群組：
 保留 CHECK 回報為缺少（鎖定）或已安裝（移除）的名稱，再對它們執行一次 CMD，沒有則什麼都不做；
 群組的狀態是 CMD 的狀態，因此前面的部分失敗時整行仍會失敗。`R` 是 `remove` 名稱，別名的套用方式與 `P` 相同：
@@ -272,7 +313,7 @@ brew、apt 與 apk 拒絕鎖定（見上文）。
 | dnf    | `rpm -q --whatprovides` | `S dnf -y remove --setopt=clean_requirements_on_remove=False` |
 | apk    | `apk info -e`           | `S apk del`                                                   |
 
-- **索引更新。** apt 在升級或安裝時，先於兩者執行一次 `apt-get update`；apk 以 `--update-cache` 更新；
+- **索引更新。** apt 在升級或安裝時，先於兩者執行一次 `apt-get update`；apk 在有安裝名稱時先執行 `apk update` 再查詢；
   dnf 會自行更新過期的 metadata。pacman 以 `-S` 安裝，不加 `-y`：只用 `-Sy` 而不加 `-u` 是部分升級，Arch 不支援，
   因此過期的資料庫只會由 `upgrade = true`（`-Syu`）更新。
 - **brew 的 PATH。** brew 那一行以 `export PATH=...;` 開頭，
@@ -288,26 +329,55 @@ brew、apt 與 apk 拒絕鎖定（見上文）。
   含有 `/` 的名稱是 brew tap：`owner/repo/formula` 會加入第三方 tap `owner/repo` 並從中安裝。
   config 決定每個 target 安裝什麼、從哪裡安裝，因此只使用你信任的 config。
 
-`install = ["git", "curl"]` 分別在 Debian 上以 NOPASSWD 使用者、在 Arch 上以 root，以及在 Mac 上（Mac 那一行此處以 `\` 換行）：
+`install = ["git", "curl"]` 在 Debian 上以 NOPASSWD 使用者、Arch 上以 root，以及 Mac 上的完整腳本如下。
+此處只用 `\` 換行；產生的腳本仍是一行，各有一次 db probe：
+
+### Debian
 
 ```sh
-sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y git curl
-pacman -S --noconfirm --needed git curl
-export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; \
-  export SUDO_ASKPASS="${SUDO_ASKPASS:-/usr/bin/false}"; brew install git curl
+sudo -n apt-get update && { anvil_db=1; { apt-cache show apt >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in \
+  git curl; do if case "$n" in (*@*|*:*|*/*) true;; (*) [ "$anvil_db" = 0 ] || { apt-cache show "$n" >/dev/null \
+  2>&1 || { v=$(apt-cache showpkg "$n" 2>/dev/null); c=$?; [ "$c" -ne 0 ] || printf '%s\n' "$v" | awk \
+  '/^Reverse Provides:/{p=1;next} p && NF {f=1} END {exit !f}'; } || [ $? -gt 1 ]; };; esac; then printf '%s ' \
+  "$n"; else printf 'anvil-unknown-package %s\n' "$n" >&2; fi; done); [ -z "$a" ] || sudo -n env \
+  DEBIAN_FRONTEND=noninteractive apt-get install -y $a; }
 ```
 
-再加上 `upgrade = true` 時，Mac 那一行的結尾是 `brew update && brew upgrade --formula && brew install git curl`，
-而 Arch 的則是 `pacman -Syu --noconfirm --needed git curl`。
-
-[鎖定與移除](#鎖定與移除)的範例在 Arch 上以 root 執行時是這一行（此處以 `\` 換行）：
+### Arch
 
 ```sh
-pacman -Syu --noconfirm --needed --ignore vim git && \
-  { m=$(for n in vim; do pacman -T "$n" >/dev/null 2>&1 || printf '%s ' "$n"; done); \
-  [ -z "$m" ] || pacman -S --noconfirm $m; } && \
-  { r=$(for n in nano; do pacman -Q "$n" >/dev/null 2>&1 && printf '%s ' "$n"; done); \
-  [ -z "$r" ] || pacman -R --noconfirm $r; }
+{ anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git curl; do if case "$n" \
+  in (*@*|*:*|*/*) true;; (*) [ "$anvil_db" = 0 ] || { pacman -Si "$n" >/dev/null 2>&1; c=$?; [ "$c" -ne 1 ] || \
+  pacman -Sg "$n" >/dev/null 2>&1; c=$?; [ "$c" -ne 1 ]; };; esac; then printf '%s ' "$n"; else printf \
+  'anvil-unknown-package %s\n' "$n" >&2; fi; done); [ -z "$a" ] || pacman -S --noconfirm --needed $a; }
+```
+
+### Mac
+
+```sh
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; export \
+  SUDO_ASKPASS="${SUDO_ASKPASS:-/usr/bin/false}"; { anvil_db=1; { brew info bash >/dev/null 2>&1; } || anvil_db=0; \
+  } && { a=$(for n in git curl; do if case "$n" in (*@*|*:*|*/*) true;; (*) [ "$anvil_db" = 0 ] || { brew info "$n" \
+  >/dev/null 2>&1; [ $? -ne 1 ]; };; esac; then printf '%s ' "$n"; else printf 'anvil-unknown-package %s\n' "$n" \
+  >&2; fi; done); [ -z "$a" ] || brew install $a; }
+```
+
+再加上 `upgrade = true` 時，Mac 在 db probe 之前先執行 `brew update && brew upgrade --formula`，
+Arch 則先執行不帶名稱的 `pacman -Syu --noconfirm`。
+
+[鎖定與移除](#鎖定與移除)的範例在 Arch 上以 root 執行時如下：
+
+```sh
+pacman -Syu --noconfirm --ignore vim && { anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { \
+  a=$(for n in git; do if case "$n" in (*@*|*:*|*/*) true;; (*) [ "$anvil_db" = 0 ] || { pacman -Si "$n" >/dev/null \
+  2>&1; c=$?; [ "$c" -ne 1 ] || pacman -Sg "$n" >/dev/null 2>&1; c=$?; [ "$c" -ne 1 ]; };; esac; then printf '%s ' \
+  "$n"; else printf 'anvil-unknown-package %s\n' "$n" >&2; fi; done); [ -z "$a" ] || pacman -S --noconfirm --needed \
+  $a; } && { a=$(for n in vim; do if case "$n" in (*@*|*:*|*/*) true;; (*) [ "$anvil_db" = 0 ] || { pacman -Si "$n" \
+  >/dev/null 2>&1; c=$?; [ "$c" -ne 1 ] || pacman -Sg "$n" >/dev/null 2>&1; c=$?; [ "$c" -ne 1 ]; };; esac; then \
+  printf '%s ' "$n"; else printf 'anvil-unknown-package %s\n' "$n" >&2; fi; done); [ -z "$a" ] || { m=$(for n in \
+  $a; do pacman -T "$n" >/dev/null 2>&1 || printf '%s ' "$n"; done); [ -z "$m" ] || pacman -S --noconfirm $m; }; } \
+  && { r=$(for n in nano; do pacman -Q "$n" >/dev/null 2>&1 && printf '%s ' "$n"; done); [ -z "$r" ] || pacman -R \
+  --noconfirm $r; }
 ```
 
 ## 失敗

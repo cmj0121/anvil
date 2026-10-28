@@ -1694,6 +1694,7 @@ pub mod tests {
     pub fn ran(target: &str, steps: Vec<apply::StepReport>) -> apply::TargetReport {
         let ok = steps.iter().all(|s| s.code == Some(0));
         apply::TargetReport::Ran {
+            warnings: Vec::new(),
             target: target.to_owned(),
             steps,
             ok,
@@ -1702,6 +1703,7 @@ pub mod tests {
 
     pub fn cancelled(target: &str) -> apply::TargetReport {
         apply::TargetReport::Cancelled {
+            warnings: Vec::new(),
             target: target.to_owned(),
             steps: Vec::new(),
             ok: false,
@@ -1721,6 +1723,7 @@ pub mod tests {
             facts: error.is_none().then_some(facts),
             error: error.map(str::to_owned),
             manager: None,
+            packages: None,
             manager_error: None,
             transport: format!("ssh {target}"),
             plugins: Vec::new(),

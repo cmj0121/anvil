@@ -343,6 +343,7 @@ mod tests {
                     steps,
                     error,
                     ok,
+                    ..
                 },
             ) => {
                 assert_eq!((target.as_str(), *ok), ("down", false));
@@ -352,7 +353,12 @@ mod tests {
             _ => panic!("expected a Failed report for down"),
         }
         match &msgs[5] {
-            Msg::TargetDone(_, apply::TargetReport::Ran { target, steps, ok }) => {
+            Msg::TargetDone(
+                _,
+                apply::TargetReport::Ran {
+                    target, steps, ok, ..
+                },
+            ) => {
                 assert_eq!((target.as_str(), *ok), ("up", true));
                 assert_eq!(steps[0].stdout, "hi\n");
             }
@@ -404,7 +410,12 @@ mod tests {
         assert!(matches!(&msgs[1], Msg::Begin(names) if names[..] == ["local"]));
         assert!(matches!(&msgs[2], Msg::Start(name) if name == "local"));
         match &msgs[3] {
-            Msg::TargetDone(_, apply::TargetReport::Ran { target, steps, ok }) => {
+            Msg::TargetDone(
+                _,
+                apply::TargetReport::Ran {
+                    target, steps, ok, ..
+                },
+            ) => {
                 assert_eq!((target.as_str(), *ok), ("local", true));
                 assert_eq!(steps[0].stdout, "hi\n");
             }
@@ -430,7 +441,12 @@ mod tests {
         assert!(matches!(&msgs[0], Msg::Steps(rows) if rows[..] == [row("printf 'one\\n' …")]));
         assert!(matches!(&msgs[2], Msg::Start(name) if name == "local"));
         match &msgs[3] {
-            Msg::TargetDone(_, apply::TargetReport::Ran { target, steps, ok }) => {
+            Msg::TargetDone(
+                _,
+                apply::TargetReport::Ran {
+                    target, steps, ok, ..
+                },
+            ) => {
                 assert_eq!((target.as_str(), *ok), ("local", true));
                 assert_eq!(
                     (steps[0].run.as_str(), steps[0].stdout.as_str()),

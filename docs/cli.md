@@ -251,7 +251,8 @@ manager cannot be resolved also makes the exit 1; without `[packages]` nothing i
         "os": "Darwin",
         "pkg": "brew"
       },
-      "manager": "brew"
+      "manager": "brew",
+      "packages": "ok"
     },
     {
       "target": "linode1",
@@ -266,6 +267,11 @@ manager cannot be resolved also makes the exit 1; without `[packages]` nothing i
 `editor` is a string or `null`; each secret is `"ok"`, `"missing"`, `"locked"` or `"error"`; `facts` holds every key
 the probe reported (abridged above). `manager` (the resolved manager) or `manager_error` (the reason, without the
 `error:` prefix) appears only with `[packages]` and only on a connectable target.
+
+With `[packages]` and a resolved manager, each target also has a `packages` string: `"ok"` or
+`"WARNING: not found by MANAGER: a, b"`, shown as a `packages` row in human output.
+The check uses no sudo, database refresh or installation. A failed check shows `WARNING: package check failed: REASON`.
+dnf uses `-C` for cache-only queries; the check uses `[packages].timeout`. These warnings do not affect doctor's exit code.
 
 #### Doctor plugins: drift since the last apply
 
@@ -533,6 +539,13 @@ Human output is one block per target, a blank line after each, then a summary:
 A target either ran its steps (`steps` and `ok`; a failed step shows its `code`, and `ok` is false) or failed in the
 transport (`error`, `ok: false`, and `steps` only when some steps completed before the error). `code` is `null` when
 the step was killed by a signal or timed out; a timed-out step is the last `steps` entry, next to `error`.
+
+Unknown names from the package step are removed from captured output and collected in each target's
+`warnings: Vec<String>` (a JSON array of strings, omitted when empty). For example:
+`"warnings": ["packages: not found by pacman: nvim, watch (add [packages.alias.NAME])"]`.
+Human output and the TUI show a yellow `⚠ packages: not found by MANAGER: a, b (add [packages.alias.NAME])`
+before the target's end line. Known names still install and later steps continue. These warnings do not change the
+target's `ok`, summary or exit code: all targets ok still exits 0. Actual install failures still fail the target.
 
 #### Ctrl-C
 

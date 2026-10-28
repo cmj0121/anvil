@@ -246,7 +246,8 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
         "os": "Darwin",
         "pkg": "brew"
       },
-      "manager": "brew"
+      "manager": "brew",
+      "packages": "ok"
     },
     {
       "target": "linode1",
@@ -261,6 +262,11 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
 `editor` 是字串或 `null`；每個 secret 是 `"ok"`、`"missing"`、`"locked"` 或 `"error"`；
 `facts` 含探測回報的每個鍵（上例有刪節）。
 `manager`（解析出的套件管理器）或 `manager_error`（原因，不含 `error:` 前綴）只在有 `[packages]` 且 target 可連線時出現。
+
+有 `[packages]` 且 manager 解析成功時，target 另有 `packages` 字串：`"ok"` 或
+`"WARNING: not found by MANAGER: a, b"`，也會顯示為 `packages` 列。
+查詢不使用 sudo、不更新 db、不安裝；查詢執行失敗時顯示 `WARNING: package check failed: REASON`。
+dnf 使用 `-C`，只讀 cache；check 使用 `[packages].timeout`。這些警告不影響 doctor 的 exit code。
 
 #### Doctor plugins: drift since the last apply
 
@@ -519,6 +525,12 @@ upgrade = true
 target 要嘛執行了它的 step（`steps` 與 `ok`；失敗的 step 會顯示其 `code`，且 `ok` 為 false），
 要嘛在傳輸中失敗（`error`、`ok: false`，只有在錯誤前已完成某些 step 時才有 `steps`）。
 step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 的最後一項，與 `error` 並列。
+
+套件 step 的未知名稱會從輸出取出，放入 target 的 `warnings: Vec<String>`（JSON 為字串陣列，空時省略）。
+例如 `"warnings": ["packages: not found by pacman: nvim, watch (add [packages.alias.NAME])"]`。
+人類可讀輸出與 TUI 在 target 結尾前顯示黃色 `⚠ packages: not found by MANAGER: a, b (add [packages.alias.NAME])`。
+已知名稱仍會安裝，後續 step 照常執行，target 的 `ok`、摘要與 exit code 不因這些警告改變。
+所有 target 成功時仍以 0 結束；實際安裝失敗仍會使 target 失敗。
 
 #### Ctrl-C
 
