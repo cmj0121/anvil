@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicBool;
 
 use crate::cli::{Cli, Failure};
 use crate::config::Config;
+use crate::files::{self, Sources};
 use crate::inventory::{Inventory, Sel, Target, TargetKind};
 use crate::paths;
 use crate::secret::{self, Store};
@@ -138,6 +139,25 @@ impl Options {
     pub fn load_config(&self) -> Result<Config, Failure> {
         let path = paths::locate(self.config.as_deref(), "config")?;
         Ok(Config::load(path.as_ref())?)
+    }
+
+    /// The located config's base dir ([`paths::base_dir`]).
+    pub fn base_dir(&self) -> Result<PathBuf, Failure> {
+        Ok(paths::base_dir(
+            paths::locate(self.config.as_deref(), "config")?.as_ref(),
+        )?)
+    }
+
+    /// `config`'s workspace for this run's `--config`; exit 2 on a resolve error.
+    pub fn workspace(&self, config: &Config) -> Result<PathBuf, Failure> {
+        config.workspace(&self.base_dir()?).map_err(Failure::usage)
+    }
+
+    /// `config`'s `[[files]]` sources; the workspace is resolved only when
+    /// a relative or store src needs it.
+    pub fn sources(&self, config: &Config) -> Result<Sources, Failure> {
+        files::load(config, || self.workspace(config).map_err(|err| err.message))
+            .map_err(Failure::usage)
     }
 
     /// The inventory: `--inventory`, else the discovered file, else only `local`.

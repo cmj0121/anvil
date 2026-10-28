@@ -21,7 +21,8 @@ impl From<StoreError> for Failure {
 /// Runs a local store operation.
 pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failure> {
     crate::commands::warn_target(cli);
-    let root = Root::locate()?;
+    let config = opts.load_config()?;
+    let root = Root::in_workspace(&opts.workspace(&config)?);
     let changed = match action {
         FilesAction::Ls { path, recursive } => {
             let entries = root.list(path.as_deref().unwrap_or(""), *recursive)?;
@@ -80,16 +81,15 @@ pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failur
         FilesAction::Mv { src, dest, force } => {
             let from = filestore::parse(src)?;
             let to = root.rename(src, dest, *force)?;
-            warn_orphans(opts.load_config().ok().as_ref(), &from);
+            warn_orphans(&config, &from);
             vec![shown(&to)]
         }
         FilesAction::Rm { paths, recursive } => {
-            let config = opts.load_config().ok();
             let mut changed = Vec::new();
             for path in paths {
                 let rel = filestore::parse(path)?;
                 root.remove(path, *recursive)?;
-                warn_orphans(config.as_ref(), &rel);
+                warn_orphans(&config, &rel);
                 changed.push(shown(&rel));
             }
             changed
@@ -117,7 +117,6 @@ pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failur
             return Ok(());
         }
         FilesAction::Edit { path } => {
-            let config = opts.load_config()?;
             if edit(&root, path, config.anvil.editor.as_deref())? {
                 vec![shown(&filestore::parse(path)?)]
             } else {
@@ -157,10 +156,7 @@ pub fn edit(root: &Root, path: &str, preference: Option<&str>) -> Result<bool, F
 }
 
 /// Warns when an entry names a removed file or a child of a removed folder.
-fn warn_orphans(config: Option<&Config>, path: &str) {
-    let Some(config) = config else {
-        return;
-    };
+fn warn_orphans(config: &Config, path: &str) {
     for (i, entry) in config.files.iter().enumerate() {
         let src = &entry.src;
         if !filestore::is_store_path(src) {

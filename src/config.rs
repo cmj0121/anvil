@@ -80,6 +80,8 @@ impl Default for Config {
 #[serde(deny_unknown_fields, default)]
 pub struct AnvilPrefs {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
     pub format: Format,
     /// Legacy spelling of `[secrets].names`; moved there by [`Config::migrate`].
@@ -250,7 +252,7 @@ pub struct Step {
     pub args: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
-/// A `[[files]]` entry: `src` beside the config, copied to `dest` on each
+/// A `[[files]]` entry: `src` in the workspace or store, copied to `dest` on each
 /// target whose tags and facts all match.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -405,6 +407,17 @@ impl Config {
 
     /// Checks the schema rules; the error names the field.
     pub fn validate(&self, path: &Path) -> Result<(), DocumentError> {
+        if let Some(value) = &self.anvil.workspace
+            && (value.is_empty() || value.contains('\0'))
+        {
+            return Err(DocumentError::invalid(
+                path,
+                format!(
+                    "anvil.workspace `{}`: must be a non-empty path without NUL",
+                    escape_controls(value)
+                ),
+            ));
+        }
         let (key, names) = self
             .names_key()
             .map_err(|message| DocumentError::invalid(path, message))?;
@@ -431,6 +444,25 @@ impl Config {
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_steps()
             .map_err(|message| DocumentError::invalid(path, message))
+    }
+
+    /// Resolves `[anvil].workspace` against `base`, expanding `~/` using `$HOME`.
+    /// The returned path is never canonicalized.
+    pub fn workspace(&self, base: &Path) -> Result<PathBuf, String> {
+        self.workspace_from(base, std::env::var_os("HOME").as_deref())
+    }
+
+    /// Resolves the workspace with an explicit home directory, without canonicalizing.
+    pub(crate) fn workspace_from(
+        &self,
+        base: &Path,
+        home: Option<&OsStr>,
+    ) -> Result<PathBuf, String> {
+        match self.anvil.workspace.as_deref() {
+            None => Ok(base.to_path_buf()),
+            Some(value) if value.starts_with("~/") => expand("anvil.workspace", value, home),
+            Some(value) => Ok(base.join(value)),
+        }
     }
 
     /// The `[[files]]` syntax rules; src is read only by `apply` and `plan`,
@@ -709,7 +741,7 @@ fn is_plugin_name(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-/// A `[[files]]` src: a store path or a path under the config directory.
+/// A `[[files]]` src: a store path or a path under the workspace.
 fn check_src(src: &str) -> Result<(), &'static str> {
     if crate::filestore::is_store_path(src) {
         let path = crate::filestore::parse(src).map_err(|_| "invalid store path")?;
@@ -983,6 +1015,40 @@ mod tests {
 
     fn home() -> Option<&'static OsStr> {
         Some(OsStr::new("/home/u"))
+    }
+
+    /// Workspace resolution preserves spelling and only expands a leading `~/`.
+    #[test]
+    fn workspaces_resolve_without_canonicalizing() {
+        let mut config = Config::default();
+        let base = Path::new("/site/link");
+        assert_eq!(config.workspace_from(base, None).unwrap(), base);
+        for (value, expected) in [
+            ("work", "/site/link/work"),
+            ("/other", "/other"),
+            ("~/work", "/home/u/work"),
+            ("~", "/site/link/~"),
+            ("../missing", "/site/link/../missing"),
+        ] {
+            config.anvil.workspace = Some(value.into());
+            assert_eq!(
+                config
+                    .workspace_from(base, Some(OsStr::new("/home/u")))
+                    .unwrap(),
+                Path::new(expected)
+            );
+        }
+        config.anvil.workspace = Some("~/work".into());
+        assert_eq!(
+            config.workspace_from(base, None).unwrap_err(),
+            "anvil.workspace `~/work`: $HOME is not set"
+        );
+        assert_eq!(
+            config
+                .workspace_from(base, Some(OsStr::new("relative")))
+                .unwrap_err(),
+            "anvil.workspace `~/work`: $HOME `relative` is not absolute"
+        );
     }
 
     #[test]

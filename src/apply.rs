@@ -396,7 +396,7 @@ pub fn run_targets(
 ) -> Result<Report, Failure> {
     let targets = opts.targets()?;
     let pins = plugin::verify_where(config, Plugin::is_step).map_err(Failure::usage)?;
-    let sources = files::load(config).map_err(Failure::usage)?;
+    let sources = opts.sources(config)?;
     let passwords = load_passwords(&targets, config, || opts.secret_store(config))?;
     let session = match needs_facts(config) {
         true => Some(open_record("apply")?),

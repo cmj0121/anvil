@@ -226,7 +226,7 @@ fn parallel_one_prints_exactly_what_the_default_prints() {
 #[test]
 fn store_src_plans_and_applies_with_a_config_elsewhere() {
     let sandbox = Sandbox::new("pl-store");
-    let store = sandbox.config_dir().join("files/sub");
+    let store = sandbox.root().join("files/sub");
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(store.join("motd"), "from the store\n").unwrap();
     let config = sandbox.root().join("elsewhere.toml");
@@ -283,5 +283,43 @@ fn store_src_refuses_traversal_and_symlink_components() {
                 format!("ERROR anvil: {prefix}files[0].src `{src}`: {why}\n")
             );
         }
+    }
+}
+
+/// Neither command needs to resolve a workspace when there are no file sources.
+#[test]
+fn plan_and_apply_without_files_ignore_an_unresolvable_workspace() {
+    let sandbox = Sandbox::new("workspace-unused");
+    sandbox.write_config("config.toml", "[anvil]\nworkspace = '~/x'\n");
+    for action in ["plan", "apply"] {
+        let out = sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", action])
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{action}: {}",
+            text(&out.stderr)
+        );
+    }
+    // The same unresolved workspace is still an error when a source needs it.
+    sandbox.write_config("config.toml", "[anvil]\nworkspace = '~/x'\n[[files]]\nsrc = '$/motd'\ndest = '/tmp/motd'\nmode = '0644'\n");
+    for action in ["plan", "apply"] {
+        let out = sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", action])
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{action}: {}",
+            text(&out.stderr)
+        );
+        assert!(text(&out.stderr).contains("anvil.workspace `~/x`: $HOME is not set"));
     }
 }

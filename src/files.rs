@@ -1,4 +1,4 @@
-//! `[[files]]`: a text file beside the config or in the store, copied to `dest` on each
+//! `[[files]]`: a text file in the workspace or store, copied to `dest` on each
 //! target whose tags and facts all match.
 //!
 //! [`load`] reads every src once, before any target runs. [`runs`] turns
@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -63,37 +63,43 @@ impl fmt::Debug for Source {
     }
 }
 
-/// Reads every src from the store or config directory; errors name the entry.
-/// [`Sources::default`] when there are none.
-pub fn load(config: &Config) -> Result<Sources, String> {
+/// Reads every src from the store or workspace; source errors name the entry.
+/// Returns [`Sources::default`] without resolving the workspace when there are no files.
+pub fn load(
+    config: &Config,
+    workspace: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<Sources, String> {
     if config.files.is_empty() {
         return Ok(Sources::default());
     }
-    let dir = config
-        .path
-        .as_deref()
-        .and_then(|path| path.parent())
-        .ok_or("files: the config has no directory")?;
+    let workspace = workspace()?;
+    let store = filestore::Root::in_workspace(&workspace);
+    let canonical = std::cell::LazyCell::new(|| {
+        fs::canonicalize(&workspace).map_err(|err| format!("cannot read: {err}"))
+    });
     let sources = config.files.iter().enumerate().map(|(i, entry)| {
-        read_src(dir, &entry.src)
-            .map(|text| Source { text })
+        let text = if filestore::is_store_path(&entry.src) {
+            store
+                .read_text(&entry.src)
+                .map_err(|err| store_reason(&entry.src, &err))
+        } else {
+            canonical
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|dir| read_src(dir, &entry.src))
+        };
+        text.map(|text| Source { text })
             .map_err(|why| format!("files[{i}].src `{}`: {why}", secret::shown_name(&entry.src)))
     });
     Ok(Sources(sources.collect::<Result<_, _>>()?))
 }
 
-/// Reads a store src or a canonical path under `dir` as text.
+/// Reads a relative src as text, confined to the already canonical workspace `dir`.
 fn read_src(dir: &Path, src: &str) -> Result<String, String> {
-    if crate::filestore::is_store_path(src) {
-        return crate::filestore::Root::locate()
-            .map_err(|err| err.to_string())?
-            .read_text(src)
-            .map_err(|err| store_reason(src, &err));
-    }
     const TEXT_ONLY: &str = "[[files]] copies text files only for now";
     let path = fs::canonicalize(dir.join(src)).map_err(|err| format!("cannot read: {err}"))?;
     if !path.starts_with(dir) {
-        return Err("leaves the config directory".to_string());
+        return Err("leaves the workspace".to_string());
     }
     let meta = fs::metadata(&path).map_err(|err| format!("cannot read: {err}"))?;
     if !meta.is_file() {
@@ -1675,11 +1681,41 @@ mod tests {
     }
 
     fn load_err(dir: &Path, src: &str) -> String {
-        load(&config_in(
-            dir,
-            vec![entry("ok.txt", "/etc/ok"), entry(src, "/etc/x")],
-        ))
+        load(
+            &config_in(dir, vec![entry("ok.txt", "/etc/ok"), entry(src, "/etc/x")]),
+            || Ok(dir.to_path_buf()),
+        )
         .unwrap_err()
+    }
+
+    /// Store-only sources retain store errors without canonicalizing a missing workspace.
+    #[test]
+    fn load_store_only_does_not_canonicalize_the_workspace() {
+        let dir = dir("files-store-only");
+        let config = Config {
+            files: vec![entry("$/missing", "/tmp/file")],
+            ..Config::default()
+        };
+        let err = load(&config, || Ok(dir.join("missing"))).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+        assert!(!err.contains("cannot read:"), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A missing workspace reports the source entry rather than needing a config path.
+    #[test]
+    fn missing_workspace_reports_the_relative_source() {
+        let dir = dir("files-missing-workspace");
+        let config = Config {
+            files: vec![entry("relative", "/tmp/file")],
+            ..Config::default()
+        };
+        let err = load(&config, || Ok(dir.join("missing"))).unwrap_err();
+        assert!(
+            err.starts_with("files[0].src `relative`: cannot read: "),
+            "{err}"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1714,7 +1750,7 @@ mod tests {
             &dir,
             vec![entry("sub/a.conf", "/etc/a"), entry("./sub/../b", "/etc/b")],
         );
-        let Sources(loaded) = load(&config).unwrap();
+        let Sources(loaded) = load(&config, || Ok(dir.clone())).unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].text, SECRET_TEXT);
         assert_eq!(loaded[1].text, "");
@@ -1723,12 +1759,15 @@ mod tests {
 
     #[test]
     fn load_without_files_reads_nothing_and_needs_no_path() {
-        let Sources(loaded) = load(&Config::default()).unwrap();
+        let Sources(loaded) = load(&Config::default(), || {
+            panic!("empty files must not resolve the workspace")
+        })
+        .unwrap();
         assert!(loaded.is_empty());
     }
 
     #[test]
-    fn load_refuses_a_src_outside_the_config_directory() {
+    fn load_refuses_a_src_outside_the_workspace() {
         let root = dir("files-escape");
         let dir = root.join("conf");
         fs::create_dir(&dir).unwrap();
@@ -1738,7 +1777,7 @@ mod tests {
         for src in ["../outside", "link"] {
             assert_eq!(
                 load_err(&dir, src),
-                format!("files[1].src `{src}`: leaves the config directory")
+                format!("files[1].src `{src}`: leaves the workspace")
             );
         }
         fs::remove_dir_all(&root).unwrap();
@@ -1769,7 +1808,10 @@ mod tests {
         fs::write(dir.join("fits"), "a".repeat(limit)).unwrap();
         fs::write(dir.join("big"), "a".repeat(limit + 1)).unwrap();
         let config = config_in(&dir, vec![entry("fits", "/etc/fits")]);
-        assert_eq!(load(&config).unwrap().0[0].text.len(), limit);
+        assert_eq!(
+            load(&config, || Ok(dir.clone())).unwrap().0[0].text.len(),
+            limit
+        );
         assert_eq!(
             load_err(&dir, "big"),
             "files[1].src `big`: exceeds the 1 MiB limit"
