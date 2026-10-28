@@ -687,3 +687,41 @@ fn a_second_ctrl_c_kills_the_running_plugin_and_anvil_dies_by_sigint() {
         "the plugin was killed"
     );
 }
+
+#[test]
+fn unknown_packages_are_a_read_only_warning_with_exit_zero() {
+    let (sandbox, path) = common::package_sandbox("dp", &["git", "missing"]);
+    let out = sandbox
+        .command(env!("CARGO_BIN_EXE_anvil"))
+        .args([
+            "--json",
+            "doctor",
+            "--target",
+            "local",
+            "--secret-store",
+            "memory",
+        ])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(value["ok"], true);
+    assert_eq!(
+        value["targets"][0]["packages"],
+        "WARNING: not found by pacman: missing"
+    );
+    let out = sandbox
+        .command(env!("CARGO_BIN_EXE_anvil"))
+        .args(["doctor", "--target", "local", "--secret-store", "memory"])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let shown = text(&out.stdout);
+    assert!(
+        shown.contains("  packages        WARNING: not found by pacman: missing\n"),
+        "{shown}"
+    );
+    assert!(!shown.contains("installed"));
+}

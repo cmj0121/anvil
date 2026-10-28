@@ -923,6 +923,9 @@ fn apply_lines(report: &TargetReport) -> (Vec<Line<'static>>, Vec<usize>) {
                 .map(|l| Line::from(format!("    {}", text(l))).style(Color::Yellow)),
         );
     }
+    for warning in report.warnings() {
+        lines.push(Line::from(format!("  ⚠ {}", text(warning))).style(Color::Yellow));
+    }
     let end = if let TargetReport::Cancelled { .. } = report {
         Line::from("  ⊘ cancelled").style(Color::Red)
     } else {
@@ -1018,6 +1021,14 @@ fn doctor_block(report: &doctor::TargetReport) -> Vec<Line<'static>> {
     }
     if let Some(manager) = &report.manager {
         lines.push(row("manager", manager));
+    }
+    if let Some(packages) = &report.packages {
+        let line = row("packages", packages);
+        lines.push(if packages.starts_with("WARNING:") {
+            line.style(Color::Yellow)
+        } else {
+            line
+        });
     }
     if let Some(error) = &report.manager_error {
         lines.push(row("manager", &format!("error: {error}")).style(Color::Red));
@@ -1404,6 +1415,22 @@ mod tests {
     }
 
     #[test]
+    fn package_warnings_are_yellow_before_the_target_end() {
+        let mut report = ran("box", vec![step("package", Some(0), "", "")]);
+        if let TargetReport::Ran { warnings, .. } = &mut report {
+            warnings.push("packages: not found by pacman: nvim (add [packages.alias.NAME])".into());
+        }
+        let lines = apply_block(&report);
+        let warning = &lines[lines.len() - 3];
+        assert_eq!(
+            warning.to_string(),
+            "  ⚠ packages: not found by pacman: nvim (add [packages.alias.NAME])"
+        );
+        assert_eq!(warning.style.fg, Some(Color::Yellow));
+        assert_eq!(lines[lines.len() - 2].to_string(), "  ✔ ok · 1 step");
+    }
+
+    #[test]
     fn the_frame_is_header_steps_results_and_status_bar() {
         let steps = [
             "packages",
@@ -1465,6 +1492,7 @@ mod tests {
         let mut killed = ran("pi", vec![step("sleep 9", None, "", "")]);
         assert_eq!(marks(Some(&killed), 2), "✘⊘", "no code is a failure");
         killed = TargetReport::Cancelled {
+            warnings: Vec::new(),
             target: "pi".to_owned(),
             steps: vec![ok.clone()],
             ok: false,
@@ -1472,6 +1500,7 @@ mod tests {
         assert_eq!(marks(Some(&killed), 3), "✔⊘⊘");
         assert_eq!(marks(Some(&cancelled("pi")), 2), "⊘⊘");
         let transport = |steps: Vec<apply::StepReport>| TargetReport::Failed {
+            warnings: Vec::new(),
             target: "pi".to_owned(),
             steps,
             error: "ssh: broken pipe".to_owned(),
@@ -2501,6 +2530,7 @@ mod tests {
                                 plugin: None,
                                 timeout: RUN_TIMEOUT,
                                 file: None,
+                                package_manager: None,
                                 service: None,
                             },
                             PlannedRun {
@@ -2510,6 +2540,7 @@ mod tests {
                                 plugin: None,
                                 timeout: RUN_TIMEOUT,
                                 file: None,
+                                package_manager: None,
                                 service: None,
                             },
                         ],
@@ -2563,6 +2594,7 @@ mod tests {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
                 targets: done(vec![crate::apply::TargetReport::Failed {
+                    warnings: Vec::new(),
                     target: "pi".to_owned(),
                     steps: Vec::new(),
                     error: "ssh: connect timed out\x07".to_owned(),
@@ -2594,6 +2626,7 @@ mod tests {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
                 targets: done(vec![crate::apply::TargetReport::Failed {
+                    warnings: Vec::new(),
                     target: "pi".to_owned(),
                     steps: vec![step("sleep 40", None, "start\n", "warn\n")],
                     error: "timed out after 30 s".to_owned(),

@@ -155,6 +155,7 @@ fn service_run(run: String, label: String, sudo_secret: Option<String>, skip: bo
         plugin: None,
         timeout: if skip { RUN_TIMEOUT } else { SERVICE_TIMEOUT },
         file: None,
+        package_manager: None,
         service: Some(ServiceRun { skip }),
     }
 }

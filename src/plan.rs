@@ -465,12 +465,13 @@ mod tests {
         assert_eq!(runs, [facts::PROBE], "no step ran");
         assert_eq!(
             screen(&plan.targets[0]),
-            "▶ local\n  \
-             would $ sudo -n pacman -S --noconfirm --needed git (sudo password from secret LOCAL_SUDO)\n  \
-             would $ file /etc/a.conf (sudo password from secret LOCAL_SUDO)\n  \
-             would $ skipped file /etc/b.conf: no match\n  \
-             would $ one\n  \
-             ✔ 4 steps\n\n"
+            "▶ local\n  would $ { anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { \
+                 a=$(for n in git; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman \
+                 -Si \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \
+                 \"$c\" -ne 1 ]; };; esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \
+                 \"$n\" >&2; fi; done); [ -z \"$a\" ] || sudo -n pacman -S --noconfirm --needed $a; } (sudo password \
+                 from secret LOCAL_SUDO)\n  would $ file /etc/a.conf (sudo password from secret LOCAL_SUDO)\n  would \
+                 $ skipped file /etc/b.conf: no match\n  would $ one\n  ✔ 4 steps\n\n"
         );
         let value = json(&plan);
         assert_eq!(
@@ -536,7 +537,11 @@ mod tests {
         let (plan, runs) = plan(&["local", "b"], None, ARCH_SUDO, &config, false);
         assert_eq!(runs, [facts::PROBE, facts::PROBE], "no step ran");
         assert!(plan.ok);
-        let one_liner = "sudo -n pacman -S --noconfirm --needed git";
+        let one_liner = "{ anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git; do if \
+                 case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null \
+                 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ]; };; \
+                 esac; then printf '%s ' \"$n\"; else printf 'anvil-unknown-package %s\\n' \"$n\" >&2; fi; done); [ \
+                 -z \"$a\" ] || sudo -n pacman -S --noconfirm --needed $a; }";
         let local = PlanReport::Planned {
             target: "local".to_owned(),
             steps: vec![
@@ -547,6 +552,7 @@ mod tests {
                     plugin: None,
                     timeout: git().timeout(),
                     file: None,
+                    package_manager: Some(Manager::Pacman),
                     service: None,
                 },
                 PlannedRun {
@@ -556,6 +562,7 @@ mod tests {
                     plugin: None,
                     timeout: RUN_TIMEOUT,
                     file: None,
+                    package_manager: None,
                     service: None,
                 },
                 PlannedRun {
@@ -565,6 +572,7 @@ mod tests {
                     plugin: None,
                     timeout: RUN_TIMEOUT,
                     file: None,
+                    package_manager: None,
                     service: None,
                 },
             ],

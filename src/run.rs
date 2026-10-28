@@ -43,6 +43,7 @@ pub fn run_targets(
         plugin: None,
         timeout,
         file: None,
+        package_manager: None,
         service: None,
     }];
     let cancel = &opts.cancel;

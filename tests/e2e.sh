@@ -298,12 +298,15 @@ PKG_CONFIG="$TMP/packages.toml"
 # another package would need the network and a fresh sync db.
 cat >"$PKG_CONFIG" <<CONF
 [packages]
-install = ["inetutils"]
+install = ["inetutils", "anvil-e2e-no-such-package"]
 
 [[steps]]
 run = "hostname"
 CONF
-PKG_RUN='sudo -n pacman -S --noconfirm --needed inetutils'
+# The package step's line ends in the install of the names pacman knows;
+# the unknown name is skipped with a warning and the target stays ok.
+PKG_TAIL='sudo -n pacman -S --noconfirm --needed $a; }'
+PKG_WARN='  ⚠ packages: not found by pacman: anvil-e2e-no-such-package (add [packages.alias.NAME])'
 anvil --config "$PKG_CONFIG" doctor --json --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -Eq '"target":"arch","connectable":true,"facts":\{[^}]*\},"manager":"pacman"' "$TMP/out"; then
@@ -313,15 +316,18 @@ else
 fi
 anvil --config "$PKG_CONFIG" apply --target arch
 code=$?
-if [ "$code" -eq 0 ] && grep -qxF "  \$ $PKG_RUN" "$TMP/out" && grep -qxF '  ✔ ok · 2 steps' "$TMP/out"; then
-  pass "apply ran the package step, then hostname"
+if [ "$code" -eq 0 ] && grep -qF '  $ { anvil_db=1;' "$TMP/out" && grep -qF "$PKG_TAIL" "$TMP/out" \
+  && grep -qxF "$PKG_WARN" "$TMP/out" && grep -qxF '  ✔ ok · 2 steps' "$TMP/out"; then
+  pass "apply ran the package step, skipped the unknown name with a warning, then hostname"
 else
   fail "apply with [packages]: exit $code"
 fi
 anvil --config "$PKG_CONFIG" apply --json --target arch
 code=$?
-if [ "$code" -eq 0 ] && grep -qF "\"steps\":[{\"run\":\"$PKG_RUN\",\"code\":0," "$TMP/out"; then
-  pass "apply --json step 1 is the package step"
+if [ "$code" -eq 0 ] && grep -qF "\"steps\":[{\"run\":\"{ anvil_db=1;" "$TMP/out" \
+  && grep -qF "$PKG_TAIL\",\"code\":0," "$TMP/out" \
+  && grep -qF '"warnings":["packages: not found by pacman: anvil-e2e-no-such-package (add [packages.alias.NAME])"]' "$TMP/out"; then
+  pass "apply --json step 1 is the package step, the unknown name is a warning"
 else
   fail "apply --json with [packages]: exit $code"
 fi
@@ -794,7 +800,7 @@ CONF
   fi
   sudo_anvil apply --target archpw
   code=$?
-  if [ "$code" -eq 0 ] && grep -qxF "  \$ $PKG_RUN" "$TMP/out" && grep -qxF '  ✔ ok · 2 steps' "$TMP/out" \
+  if [ "$code" -eq 0 ] && grep -qF "$PKG_TAIL" "$TMP/out" && grep -qxF '  ✔ ok · 2 steps' "$TMP/out" \
     && ! grep -qF -e "$PASSWORD" -e '***' "$TMP/out" "$TMP/err"; then
     pass "apply typed the password at sudo's prompt, the package step and hostname ran"
   else
@@ -802,7 +808,8 @@ CONF
   fi
   sudo_anvil apply --json --target archpw
   code=$?
-  if [ "$code" -eq 0 ] && grep -qF "\"steps\":[{\"run\":\"$PKG_RUN\",\"code\":0," "$TMP/out" \
+  if [ "$code" -eq 0 ] && grep -qF "\"steps\":[{\"run\":\"{ anvil_db=1;" "$TMP/out" \
+    && grep -qF "$PKG_TAIL\",\"code\":0," "$TMP/out" \
     && ! grep -qF -e "$PASSWORD" -e '***' "$TMP/out" "$TMP/err"; then
     pass "apply --json ok, no password in it"
   else

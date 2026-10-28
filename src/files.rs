@@ -410,6 +410,7 @@ fn file_run(
         plugin: None,
         timeout: RUN_TIMEOUT,
         file: Some(file),
+        package_manager: None,
         service: None,
     }
 }

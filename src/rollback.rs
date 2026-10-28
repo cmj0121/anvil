@@ -237,6 +237,7 @@ struct HostCheck {
 /// A selected target the record has no entry for: ok, nothing runs.
 fn nothing_recorded(target: &Target) -> TargetReport {
     TargetReport::Ran {
+        warnings: Vec::new(),
         target: target.name.clone(),
         steps: vec![apply::StepReport::skipped(NOTHING)],
         ok: true,

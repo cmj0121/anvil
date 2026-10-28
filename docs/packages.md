@@ -28,6 +28,44 @@ install = ["git", "curl"]
 The package step may run for `timeout` seconds (default 300, 1..=3600), where a `[[steps]]` script gets 30 s. Cancel
 (TUI `Esc` or `q`) waits for a running package step, up to `timeout`.
 
+## Unknown package names
+
+apply resolves aliases, removes pinned names from install, then checks whether the install and pin names are known.
+Only known names reach installation; when none are known, the install command is skipped.
+Removal still acts only on installed names. Each unknown name emits an internal `anvil-unknown-package NAME` marker;
+apply removes it from step output and shows a yellow warning before the target's end line. The TUI shows the same line:
+
+```text
+  ⚠ packages: not found by pacman: nvim, watch (add [packages.alias.NAME])
+  ✔ ok · 4 steps
+```
+
+Unknown names do not fail the target: its files, services and steps continue. A run with all targets ok exits 0,
+even with warnings. Actual installation, refresh or sudo failures still fail the target.
+Use `[packages.alias.NAME]` to supply the right name; anvil does not guess replacements.
+
+| Manager | Read-only lookup                                                                           |
+| ------- | ------------------------------------------------------------------------------------------ |
+| brew    | `brew info NAME`, for formulae and casks                                                   |
+| pacman  | `pacman -Si NAME` or `pacman -Sg NAME`, including groups                                   |
+| apt     | `apt-cache show NAME`, or a provider under `Reverse Provides:` in `apt-cache showpkg NAME` |
+| dnf     | `dnf -q repoquery --whatprovides NAME`, requiring non-empty output                         |
+| apk     | `apk search -x -q NAME`, requiring non-empty output; apply runs `apk update` first         |
+
+Names containing `@`, `:` or `/` bypass lookups and go directly to the manager, preserving special syntax for
+groups, repository tags, virtual providers and brew taps.
+
+Each check probes database availability once, before the name loop: brew uses `brew info bash`, pacman
+`pacman -Si pacman`, apt `apt-cache show apt`, dnf `dnf -q repoquery --whatprovides dnf`, and apk
+`apk search -x -q apk-tools`. If the probe fails or a query cannot run reliably, all names are retained for the
+manager to decide. With `upgrade = true`, pacman first runs `pacman -Syu --noconfirm` without names (with `--ignore`
+for pins), then checks and installs with `pacman -S --noconfirm --needed`. Otherwise it uses the current sync db.
+
+With `[packages]`, doctor runs the same read-only lookup on connectable targets whose manager resolves, without sudo,
+refreshing databases or installing anything. dnf uses `dnf -C -q repoquery --whatprovides` to read only cached metadata.
+The check uses `[packages].timeout`. Its row is `packages  ok` or
+`packages  WARNING: not found by MANAGER: a, b`; warnings do not change its exit code.
+
 ## Which manager
 
 The choice for a target is its inventory `pkg`, else `[packages].local` for the `local` target, else
@@ -154,13 +192,15 @@ dnf = "fd-find"
 ```
 
 The step installs the resolved manager's entry in place of the plain name, and the plain name when that manager has no
-entry: here apt and dnf install `fd-find`, and brew, pacman and apk install `fd`. On Debian as a NOPASSWD user:
+entry: here apt and dnf install `fd-find`, and brew, pacman and apk install `fd`. On Debian as a NOPASSWD user, the install
+command after a successful lookup is:
 
 ```sh
-sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y fd-find
+sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y fd-find
 ```
 
-`anvil plan` prints that same line as `would $ ...`, so it shows the name each target would install before apply runs.
+`anvil plan` prints the full script, including the lookup, as `would $ ...`, so it shows the name each target would install
+before apply runs.
 Without `[packages.alias]` the step is the same as before.
 
 - **Keys.** `brew`, `pacman`, `apt`, `dnf` and `apk`; `auto` is not a key.
@@ -248,25 +288,28 @@ characters:
 
 The step is one line, its parts joined with `&&`: the upgrade, the install, the missing pins, then the removal (on dnf
 the missing pins come before the install). A part with nothing to do is left out. `S` stands for `sudo -n` followed by
-a space (nothing as root), `P` for the `install` names whose resolved name is not a pin's, joined by spaces, and `K`
+a space (nothing as root), `P` for the known `install` names whose resolved name is not a pin's, joined by spaces, and `K`
 for the `pin` names, each replaced by its [alias](#aliases) for the manager when it has one, joined by spaces; `KC` is
 the same pin names joined by commas:
 
-| Manager | Part    | Command                                                                   |
-| ------- | ------- | ------------------------------------------------------------------------- |
-| brew    | upgrade | `brew update && brew upgrade --formula`                                   |
-| brew    | install | `brew install P`                                                          |
-| pacman  | upgrade | `S pacman -Syu --noconfirm --needed P` (one command, it installs `P` too) |
-| pacman  | install | `S pacman -S --noconfirm --needed P`                                      |
-| apt     | first   | `S apt-get update` (once, with an upgrade or an install)                  |
-| apt     | upgrade | `S env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y`                 |
-| apt     | install | `S env DEBIAN_FRONTEND=noninteractive apt-get install -y P`               |
-| dnf     | upgrade | `S dnf -y upgrade`                                                        |
-| dnf     | install | `S dnf -y install P`                                                      |
-| apk     | upgrade | `S apk update && S apk upgrade`                                           |
-| apk     | install | `S apk add --update-cache P`                                              |
+The table lists actions after the repository lookup, with the filtering groups omitted. Pins are also filtered
+before the missing-pin group below; unknown pins still appear in the upgrade exclusion list.
 
-With a `pin`, pacman's upgrade is `S pacman -Syu --noconfirm --needed --ignore KC P` (`P` may be empty), dnf's is
+| Manager | Part    | Command                                                     |
+| ------- | ------- | ----------------------------------------------------------- |
+| brew    | upgrade | `brew update && brew upgrade --formula`                     |
+| brew    | install | `brew install P`                                            |
+| pacman  | upgrade | `S pacman -Syu --noconfirm` (then check and install)        |
+| pacman  | install | `S pacman -S --noconfirm --needed P`                        |
+| apt     | first   | `S apt-get update` (once, with an upgrade or an install)    |
+| apt     | upgrade | `S env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y`   |
+| apt     | install | `S env DEBIAN_FRONTEND=noninteractive apt-get install -y P` |
+| dnf     | upgrade | `S dnf -y upgrade`                                          |
+| dnf     | install | `S dnf -y install P`                                        |
+| apk     | upgrade | `S apk update && S apk upgrade`                             |
+| apk     | install | `S apk add P`                                               |
+
+With a `pin`, pacman's upgrade is `S pacman -Syu --noconfirm --ignore KC`, dnf's is
 `S dnf -y upgrade --exclude=KC` and dnf's install is `S dnf -y install --exclude=KC P`. The missing pins and the
 removal are each a brace group that keeps the names CHECK reports missing (pin) or installed (remove), then runs CMD
 once on them, or nothing when there are none; the group's status is CMD's, so a failed earlier part still fails the
@@ -293,8 +336,9 @@ brew, apt and apk refuse a pin (above).
 | apk     | `apk info -e`           | `S apk del`                                                   |
 
 - **Index refresh.** apt starts with one `apt-get update` when it upgrades or installs, before both; apk refreshes
-  with `--update-cache`; dnf refreshes expired metadata itself. pacman installs with `-S`, without `-y`: `-Sy` without
-  `-u` is a partial upgrade, which Arch does not support, so a stale database is refreshed only by `upgrade = true`
+  with `apk update` before checking install names; dnf refreshes expired metadata itself. pacman installs with `-S`,
+  without `-y`: `-Sy` without `-u` is a partial upgrade, which Arch does not support, so a stale database is refreshed
+  only by `upgrade = true`
   (`-Syu`).
 - **brew's PATH.** The brew line starts with an `export PATH=...;` that appends `/opt/homebrew/bin`, `/usr/local/bin`
   and `/home/linuxbrew/.linuxbrew/bin` to `$PATH`, since a non-login ssh shell may leave Homebrew off `PATH`. They go
@@ -311,26 +355,55 @@ brew, apt and apk refuse a pin (above).
   out). A name containing `/` is a brew tap: `owner/repo/formula` adds the third-party tap `owner/repo` and installs
   from it. A config decides what every target installs and from where, so only use configs you trust.
 
-`install = ["git", "curl"]` on Debian as a NOPASSWD user, on Arch as root, and on a Mac (wrapped here with `\`):
+These are the full scripts for `install = ["git", "curl"]` on Debian as a NOPASSWD user, Arch as root, and a Mac.
+They are wrapped here with `\`; each generated script is one line and runs one database probe:
+
+### Debian
 
 ```sh
-sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y git curl
-pacman -S --noconfirm --needed git curl
-export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; \
-  export SUDO_ASKPASS="${SUDO_ASKPASS:-/usr/bin/false}"; brew install git curl
+sudo -n apt-get update && { anvil_db=1; { apt-cache show apt >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in \
+  git curl; do if case "$n" in (*@*|*:*|*/*) true;; (*) [ "$anvil_db" = 0 ] || { apt-cache show "$n" >/dev/null \
+  2>&1 || { v=$(apt-cache showpkg "$n" 2>/dev/null); c=$?; [ "$c" -ne 0 ] || printf '%s\n' "$v" | awk \
+  '/^Reverse Provides:/{p=1;next} p && NF {f=1} END {exit !f}'; } || [ $? -gt 1 ]; };; esac; then printf '%s ' \
+  "$n"; else printf 'anvil-unknown-package %s\n' "$n" >&2; fi; done); [ -z "$a" ] || sudo -n env \
+  DEBIAN_FRONTEND=noninteractive apt-get install -y $a; }
 ```
 
-With `upgrade = true` as well, the Mac's line ends `brew update && brew upgrade --formula && brew install git curl`,
-and Arch's is `pacman -Syu --noconfirm --needed git curl`.
-
-The [Pin and remove](#pin-and-remove) example on Arch as root is this one line (wrapped here with `\`):
+### Arch
 
 ```sh
-pacman -Syu --noconfirm --needed --ignore vim git && \
-  { m=$(for n in vim; do pacman -T "$n" >/dev/null 2>&1 || printf '%s ' "$n"; done); \
-  [ -z "$m" ] || pacman -S --noconfirm $m; } && \
-  { r=$(for n in nano; do pacman -Q "$n" >/dev/null 2>&1 && printf '%s ' "$n"; done); \
-  [ -z "$r" ] || pacman -R --noconfirm $r; }
+{ anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git curl; do if case "$n" \
+  in (*@*|*:*|*/*) true;; (*) [ "$anvil_db" = 0 ] || { pacman -Si "$n" >/dev/null 2>&1; c=$?; [ "$c" -ne 1 ] || \
+  pacman -Sg "$n" >/dev/null 2>&1; c=$?; [ "$c" -ne 1 ]; };; esac; then printf '%s ' "$n"; else printf \
+  'anvil-unknown-package %s\n' "$n" >&2; fi; done); [ -z "$a" ] || pacman -S --noconfirm --needed $a; }
+```
+
+### Mac
+
+```sh
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin"; export \
+  SUDO_ASKPASS="${SUDO_ASKPASS:-/usr/bin/false}"; { anvil_db=1; { brew info bash >/dev/null 2>&1; } || anvil_db=0; \
+  } && { a=$(for n in git curl; do if case "$n" in (*@*|*:*|*/*) true;; (*) [ "$anvil_db" = 0 ] || { brew info "$n" \
+  >/dev/null 2>&1; [ $? -ne 1 ]; };; esac; then printf '%s ' "$n"; else printf 'anvil-unknown-package %s\n' "$n" \
+  >&2; fi; done); [ -z "$a" ] || brew install $a; }
+```
+
+With `upgrade = true`, the Mac runs `brew update && brew upgrade --formula` before the database probe;
+Arch first runs `pacman -Syu --noconfirm` without install names.
+
+The [Pin and remove](#pin-and-remove) example on Arch as root is this one line, wrapped here with `\`:
+
+```sh
+pacman -Syu --noconfirm --ignore vim && { anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { \
+  a=$(for n in git; do if case "$n" in (*@*|*:*|*/*) true;; (*) [ "$anvil_db" = 0 ] || { pacman -Si "$n" >/dev/null \
+  2>&1; c=$?; [ "$c" -ne 1 ] || pacman -Sg "$n" >/dev/null 2>&1; c=$?; [ "$c" -ne 1 ]; };; esac; then printf '%s ' \
+  "$n"; else printf 'anvil-unknown-package %s\n' "$n" >&2; fi; done); [ -z "$a" ] || pacman -S --noconfirm --needed \
+  $a; } && { a=$(for n in vim; do if case "$n" in (*@*|*:*|*/*) true;; (*) [ "$anvil_db" = 0 ] || { pacman -Si "$n" \
+  >/dev/null 2>&1; c=$?; [ "$c" -ne 1 ] || pacman -Sg "$n" >/dev/null 2>&1; c=$?; [ "$c" -ne 1 ]; };; esac; then \
+  printf '%s ' "$n"; else printf 'anvil-unknown-package %s\n' "$n" >&2; fi; done); [ -z "$a" ] || { m=$(for n in \
+  $a; do pacman -T "$n" >/dev/null 2>&1 || printf '%s ' "$n"; done); [ -z "$m" ] || pacman -S --noconfirm $m; }; } \
+  && { r=$(for n in nano; do pacman -Q "$n" >/dev/null 2>&1 && printf '%s ' "$n"; done); [ -z "$r" ] || pacman -R \
+  --noconfirm $r; }
 ```
 
 ## Failures

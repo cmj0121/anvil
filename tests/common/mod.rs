@@ -520,3 +520,35 @@ pub fn sudo_sandbox(prefix: &str) -> (Sandbox, &'static str, String) {
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     (sandbox, secrets, path)
 }
+
+/// A root pacman target backed only by stub commands, with a known sync db.
+pub fn package_sandbox(prefix: &str, names: &[&str]) -> (Sandbox, String) {
+    let sandbox = Sandbox::new(prefix);
+    let bin = sandbox.root().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for (name, script) in [
+        ("id", "#!/bin/sh\necho root\n"),
+        (
+            "pacman",
+            "#!/bin/sh\ncase $1 in\n\
+             -Si) [ \"$2\" = git ] || [ \"$2\" = pacman ];;\n\
+             -Sg) exit 1;;\n\
+             -S) echo \"installed $*\"; exit ${INSTALL_EXIT:-0};;\n\
+             *) exit 1;;\nesac\n",
+        ),
+    ] {
+        let path = bin.join(name);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let names = names
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sandbox.write_config("config.toml", &format!(
+        "[packages]\nmanager = \"pacman\"\ninstall = [{names}]\n\n[[steps]]\nrun = \"echo later-step\"\n"
+    ));
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    (sandbox, path)
+}

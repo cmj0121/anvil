@@ -1006,3 +1006,61 @@ fn the_password_path_capture_leaks_no_byte_at_trace_level() {
     assert_eq!(file["previous"]["text"], PREVIOUS);
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), FILE_TEXT);
 }
+
+#[test]
+fn unknown_packages_warn_and_continue_with_exit_zero() {
+    for names in [&["git", "missing"][..], &["missing"][..]] {
+        let (sandbox, path) = common::package_sandbox("ap", names);
+        let out = sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--json", "apply", "--target", "local"])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        let value = json(&out);
+        assert_eq!(value["ok"], true);
+        let target = &value["targets"][0];
+        assert_eq!(
+            target["warnings"],
+            serde_json::json!([
+                "packages: not found by pacman: missing (add [packages.alias.NAME])"
+            ])
+        );
+        assert_eq!(target["steps"][0]["stderr"], "");
+        let installed = target["steps"][0]["stdout"].as_str().unwrap();
+        assert!(!installed.contains("missing"));
+        assert_eq!(installed.contains("installed"), names.contains(&"git"));
+        assert_eq!(target["steps"][1]["stdout"], "later-step\n");
+        let out = sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["apply", "--target", "local"])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        let shown = text(&out.stdout);
+        assert!(
+            shown.contains(
+                "  ⚠ packages: not found by pacman: missing (add [packages.alias.NAME])\n"
+            )
+        );
+        assert!(
+            shown.ends_with("  ✔ ok · 2 steps\n\n1 ok, 0 failed\n"),
+            "{shown}"
+        );
+    }
+    let (sandbox, path) = common::package_sandbox("ap", &["git", "missing"]);
+    let out = sandbox
+        .command(env!("CARGO_BIN_EXE_anvil"))
+        .args(["--json", "apply", "--target", "local"])
+        .env("PATH", path)
+        .env("INSTALL_EXIT", "7")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let value = json(&out);
+    assert_eq!(value["targets"][0]["steps"].as_array().unwrap().len(), 1);
+    assert_eq!(value["targets"][0]["steps"][0]["code"], 7);
+    assert_eq!(value["targets"][0]["warnings"].as_array().unwrap().len(), 1);
+}
