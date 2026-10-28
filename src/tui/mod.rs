@@ -172,7 +172,7 @@ fn edit(app: &App, kind: &EditKind) -> Result<String, Failure> {
     let (opts, format) = (&app.opts, app.edit_format);
     match kind {
         EditKind::Inventory => commands::edit_inventory(opts, format).map(|o| o.to_string()),
-        EditKind::Config => commands::edit_config(opts, format).map(|o| o.to_string()),
+        EditKind::Config => commands::edit_config(opts, format, false).map(|o| o.to_string()),
         EditKind::Secret(name) => {
             let config = opts.load_config()?;
             let store = opts.secret_store(&config)?;

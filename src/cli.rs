@@ -94,6 +94,9 @@ pub enum Command {
     },
     /// Edit the config in the editor; --format picks the edit view, saved as TOML
     Config {
+        /// --full shows every default; saved without them
+        #[arg(long)]
+        full: bool,
         #[arg(long, value_enum, value_name = "FORMAT")]
         format: Option<Format>,
     },
@@ -322,7 +325,7 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
     let opts = Options::from_cli(cli);
     match command {
         Command::Inventory { format } => crate::commands::inventory(cli, &opts, *format),
-        Command::Config { format } => crate::commands::config(cli, &opts, *format),
+        Command::Config { format, full } => crate::commands::config(cli, &opts, *format, *full),
         Command::Files { action } => crate::files_cmd::run(cli, &opts, action),
         Command::Doctor => {
             crate::commands::warn_parallel(cli);
@@ -416,11 +419,22 @@ mod tests {
         ));
         assert!(matches!(
             command(&["config"]),
-            Command::Config { format: None }
+            Command::Config {
+                format: None,
+                full: false
+            }
         ));
         assert!(matches!(
             command(&["config", "--format", "yaml"]),
             Command::Config {
+                full: false,
+                format: Some(Format::Yaml)
+            }
+        ));
+        assert!(matches!(
+            command(&["config", "--full", "--format", "yaml"]),
+            Command::Config {
+                full: true,
                 format: Some(Format::Yaml)
             }
         ));

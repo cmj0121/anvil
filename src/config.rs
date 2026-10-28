@@ -386,7 +386,170 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
+/// Default-valued keys expanded by the full edit view.
+const FULL_DEFAULTS: &str = r#"
+[anvil]
+format = "toml"
+[secrets.keychain]
+service = "anvil"
+[packages]
+manager = "auto"
+install = []
+remove = []
+pin = []
+upgrade = false
+timeout = 300
+[[files]]
+sudo = true
+rollback = true
+[plugins.NAME]
+on = "step"
+"#;
+
+/// Optional sections offered as commented examples in either edit format.
+const FULL_EXAMPLES: &str = r#"
+[secrets]
+backend = "keychain"
+[secrets.age]
+path = "secrets.age"
+identity = "key.txt"
+[secrets.sops]
+path = "secrets.yaml"
+[packages]
+manager = "auto"
+[packages.alias.fd]
+apt = "fd-find"
+[[files]]
+src = "$/motd"
+dest = "/etc/motd"
+mode = "0644"
+[[services]]
+name = "sshd"
+state = "started"
+[plugins.NAME]
+path = "/path/to/plugin"
+sha256 = "REPLACE_WITH_SHA256"
+"#;
+
+/// Parses generated TOML, reporting failures as serialization errors.
+fn full_parse<T: serde::de::DeserializeOwned>(
+    text: &str,
+    format: Format,
+) -> Result<T, DocumentError> {
+    document::from_str(text, format).map_err(|message| DocumentError::Serialize { format, message })
+}
+
+/// Expands or strips listed defaults recursively without removing containers.
+fn full_defaults(value: &mut toml::Value, defaults: &toml::Value, strip: bool) {
+    match (value, defaults) {
+        (toml::Value::Table(table), toml::Value::Table(defaults)) => {
+            for (key, default) in defaults {
+                if key == "NAME" {
+                    for (_, value) in table.iter_mut() {
+                        full_defaults(value, default, strip);
+                    }
+                } else if let Some(value) = table.get_mut(key) {
+                    if strip
+                        && value == default
+                        && !value.is_table()
+                        && (!value.is_array() || default.as_array().is_some_and(Vec::is_empty))
+                    {
+                        table.remove(key);
+                    } else {
+                        full_defaults(value, default, strip);
+                    }
+                } else if !strip
+                    && !default.is_table()
+                    && !default
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(toml::Value::is_table))
+                {
+                    table.insert(key.clone(), default.clone());
+                }
+            }
+        }
+        (toml::Value::Array(values), toml::Value::Array(defaults)) => {
+            if let Some(default) = defaults.first() {
+                for value in values {
+                    full_defaults(value, default, strip);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Config {
+    /// Renders all listed defaults and commented examples for unused sections.
+    pub fn full_view(&self, base: &Path, format: Format) -> Result<String, DocumentError> {
+        let mut value = self.with_defaults(false)?;
+        let workspace = match &self.anvil.workspace {
+            Some(workspace) => workspace.clone(),
+            None => std::path::absolute(base)
+                .map_err(|err| DocumentError::invalid(base, err.to_string()))?
+                .to_str()
+                // Deliberately use "." when the base cannot be represented as UTF-8:
+                // it resolves to the same workspace without replacing path bytes.
+                .unwrap_or(".")
+                .to_owned(),
+        };
+        value["anvil"]
+            .as_table_mut()
+            .expect("serialized preferences")
+            .insert("workspace".into(), toml::Value::String(workspace));
+        let mut rendered = document::to_string(&value, format)?;
+        if self.anvil.editor.is_none() {
+            let (header, example) = match format {
+                Format::Toml => ("[anvil]\n", "# editor = \"nvim\"\n"),
+                Format::Yaml => ("anvil:\n", "  # editor: nvim\n"),
+            };
+            rendered = rendered.replacen(header, &format!("{header}{example}"), 1);
+        }
+        let examples: toml::Table = full_parse(FULL_EXAMPLES, Format::Toml)?;
+        for (key, example) in examples {
+            if value.get(&key).is_none() {
+                let table = toml::Table::from_iter([(key, example)]);
+                rendered.push('\n');
+                for line in document::to_string(&table, format)?.lines() {
+                    rendered.push_str("# ");
+                    rendered.push_str(line);
+                    rendered.push('\n');
+                }
+            }
+        }
+        Ok(rendered)
+    }
+
+    /// Removes default-valued keys while preserving every present section.
+    pub fn stripped(&self, base: &Path) -> Result<toml::Table, DocumentError> {
+        let mut value = self.with_defaults(true)?;
+        let workspace = self
+            .workspace(base)
+            .map_err(|err| DocumentError::invalid(base, err))?;
+        let absolute = |path: &Path| {
+            std::path::absolute(path).map_err(|err| DocumentError::invalid(base, err.to_string()))
+        };
+        if absolute(&workspace)? == absolute(base)? {
+            value["anvil"]
+                .as_table_mut()
+                .expect("serialized preferences")
+                .remove("workspace");
+        }
+        match value {
+            toml::Value::Table(table) => Ok(table),
+            _ => unreachable!("serialized config"),
+        }
+    }
+
+    /// This config as TOML with [`FULL_DEFAULTS`] expanded, or stripped.
+    fn with_defaults(&self, strip: bool) -> Result<toml::Value, DocumentError> {
+        let mut value: toml::Value =
+            full_parse(&document::to_string(self, Format::Toml)?, Format::Toml)?;
+        let defaults = full_parse(FULL_DEFAULTS, Format::Toml)?;
+        full_defaults(&mut value, &defaults, strip);
+        Ok(value)
+    }
+
     /// Loads and validates the config; `None` or a missing file is the defaults.
     pub fn load(doc: Option<&DocPath>) -> Result<Config, DocumentError> {
         let mut config = document::load_or_default(doc, Config::validate)?;
@@ -2418,5 +2581,199 @@ mod tests {
         let err =
             document::from_str::<Config>("[anvil]\nformat = \"ini\"\n", Format::Toml).unwrap_err();
         assert!(err.contains("ini"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod full_tests {
+    use super::*;
+
+    /// Parses a config without filesystem-dependent validation.
+    fn config(text: &str) -> Config {
+        document::from_str(text, Format::Toml).unwrap()
+    }
+
+    /// Normalizes a full view through the same stripped representation as saving.
+    fn round_trip(original: &Config, base: &Path, format: Format) -> Config {
+        let full: Config =
+            document::from_str(&original.full_view(base, format).unwrap(), format).unwrap();
+        document::from_str(
+            &document::to_string(&full.stripped(base).unwrap(), Format::Toml).unwrap(),
+            Format::Toml,
+        )
+        .unwrap()
+    }
+
+    /// Every example, including legacy YAML examples, survives full rendering and stripping.
+    #[test]
+    fn full_examples_round_trip() {
+        for scenario in fs::read_dir("examples").unwrap() {
+            let path = scenario.unwrap().path();
+            for relative in ["config.toml", "yaml/config.yaml"] {
+                let path = path.join(relative);
+                if path.is_file() {
+                    let format = Format::from_extension(&path).unwrap();
+                    let original: Config =
+                        document::from_str(&fs::read_to_string(&path).unwrap(), format).unwrap();
+                    for view in [Format::Toml, Format::Yaml] {
+                        assert_eq!(
+                            round_trip(&original, Path::new("/workspace"), view),
+                            original,
+                            "{} {view}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Full defaults retain the workspace even when its base is relative or not UTF-8.
+    #[test]
+    fn full_default_workspace_preserves_the_base() {
+        use std::os::unix::ffi::OsStrExt;
+
+        for base in [
+            Path::new("site"),
+            Path::new("."),
+            Path::new(OsStr::from_bytes(b"/workspace/non-utf8-\xff")),
+        ] {
+            for format in [Format::Toml, Format::Yaml] {
+                let original = Config::default();
+                assert_eq!(
+                    round_trip(&original, base, format),
+                    original,
+                    "{base:?} {format}"
+                );
+            }
+        }
+    }
+
+    /// Each listed scalar or empty-array default agrees with deserialization.
+    #[test]
+    fn full_defaults_match_schema() {
+        let defaults: toml::Table = document::from_str(FULL_DEFAULTS, Format::Toml).unwrap();
+        for (heading, required, table) in [
+            ("[anvil]", "", defaults["anvil"].as_table().unwrap()),
+            ("[packages]", "", defaults["packages"].as_table().unwrap()),
+            (
+                "[[files]]",
+                "src = '$/a'\ndest = '/a'\nmode = '0644'\n",
+                defaults["files"][0].as_table().unwrap(),
+            ),
+            (
+                "[plugins.NAME]",
+                "path = '/plugin'\nsha256 = 'hash'\n",
+                defaults["plugins"]["NAME"].as_table().unwrap(),
+            ),
+        ] {
+            for (key, value) in table {
+                let plain = config(&format!("{heading}\n{required}"));
+                let explicit = config(&format!("{heading}\n{required}{key} = {value}\n"));
+                assert_eq!(plain, explicit, "{heading} {key}");
+            }
+        }
+        let plain = config("[secrets]\nbackend = 'keychain'\n[secrets.keychain]\n");
+        let explicit =
+            config("[secrets]\nbackend = 'keychain'\n[secrets.keychain]\nservice = 'anvil'\n");
+        assert_eq!(plain.backend(), explicit.backend());
+    }
+
+    /// Empty present tables and explicitly empty secret names retain their meaning.
+    #[test]
+    fn full_preserves_presence_and_names() {
+        let original =
+            config("[packages]\n[secrets]\nbackend = 'keychain'\nnames = []\n[secrets.keychain]\n");
+        assert_eq!(
+            round_trip(&original, Path::new("/workspace"), Format::Toml),
+            original
+        );
+        let table = original.stripped(Path::new("/workspace")).unwrap();
+        assert!(table["packages"].as_table().unwrap().is_empty());
+        assert!(table["secrets"]["keychain"].as_table().unwrap().is_empty());
+        assert_eq!(table["secrets"]["names"].as_array().unwrap().len(), 0);
+    }
+
+    /// Both formats expose active defaults and examples in their native syntax.
+    #[test]
+    fn full_view_expands_present_sections_and_comments_unused_ones() {
+        let original = config(
+            "[packages]\n[[files]]\nsrc = '$/a'\ndest = '/a'\nmode = '0644'\n[plugins.p]\npath = '/p'\nsha256 = 'hash'\n",
+        );
+        let view = original
+            .full_view(Path::new("/workspace"), Format::Toml)
+            .unwrap();
+        for expected in [
+            "format = \"toml\"",
+            "workspace = \"/workspace\"",
+            "manager = \"auto\"",
+            "timeout = 300",
+            "install = []",
+            "remove = []",
+            "pin = []",
+            "upgrade = false",
+            "sudo = true",
+            "rollback = true",
+            "on = \"step\"",
+            "# [secrets]",
+            "# [[services]]",
+            "# editor =",
+        ] {
+            assert!(view.contains(expected), "missing {expected}: {view}");
+        }
+        let yaml = Config::default()
+            .full_view(Path::new("/workspace"), Format::Yaml)
+            .unwrap();
+        for expected in [
+            "# packages:",
+            "# secrets:",
+            "# files:",
+            "# services:",
+            "# plugins:",
+            "  # editor:",
+        ] {
+            assert!(yaml.contains(expected), "missing {expected}: {yaml}");
+        }
+        assert!(!yaml.contains("# [packages]"));
+    }
+
+    /// The editor example can be uncommented in place in either format.
+    #[test]
+    fn full_editor_example_uncomments_in_place() {
+        for original in [Config::default(), config("[packages]\n")] {
+            for format in [Format::Toml, Format::Yaml] {
+                let view = original.full_view(Path::new("/workspace"), format).unwrap();
+                assert!(!view.contains("# [anvil]"), "{view}");
+                assert!(!view.contains("# anvil:"), "{view}");
+                let uncommented = view.replace("# editor", "editor");
+                let parsed: Config = document::from_str(&uncommented, format).unwrap();
+                let mut expected: Config = document::from_str(&view, format).unwrap();
+                expected.anvil.editor = Some("nvim".into());
+                assert_eq!(parsed, expected);
+                let view = parsed.full_view(Path::new("/workspace"), format).unwrap();
+                assert!(!view.contains("# editor"), "{view}");
+            }
+        }
+    }
+
+    /// Workspace equality uses resolution, including dot, absolute and home spellings.
+    #[test]
+    fn full_strips_resolved_default_workspace() {
+        let home = std::env::var_os("HOME").unwrap();
+        let base = Path::new(&home).join("workspace");
+        for workspace in [
+            ".".to_string(),
+            base.to_string_lossy().into_owned(),
+            "~/workspace".to_string(),
+        ] {
+            let mut value = Config::default();
+            value.anvil.workspace = Some(workspace);
+            assert!(
+                !value.stripped(&base).unwrap()["anvil"]
+                    .as_table()
+                    .unwrap()
+                    .contains_key("workspace")
+            );
+        }
     }
 }
