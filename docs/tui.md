@@ -89,7 +89,9 @@ Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
   64 KiB of a text file, `folder` for a folder or `..`, or the error for a file that is not text
   (`$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`) or cannot be read. The status bar shows
   `↑↓ move · Enter open · ⌫ up · e edit · D delete · Esc close`, and a failed edit, delete or listing in red until the
-  next key. When the store cannot be located (no `$HOME`), `F` shows that error as a notice and does not open.
+  next key. When the store cannot be located (the config does not load, its `[anvil].workspace` does not resolve, or
+  there is no `$HOME`), `F` shows that error as a notice and does not open. Every reload (`r`, `o`, and after `i` or
+  `c`) locates it again, so a config edit that moves the workspace takes effect at once.
 - **Delete (`D`).** `delete $/PATH?`, noting that a folder goes with all it holds. Only `y` deletes; `n` or `Esc`
   closes it, and other keys keep the question.
 - **Help (`?`).** One row per group: Run, Targets, Move, History, Edit, Options, App, then the browser's Browser and
@@ -161,8 +163,9 @@ greyed in the help and only shows that notice again, until anvil is restarted.
 
 ### The files browser
 
-`F` opens the [file store](cli.md#anvil-files) at `$/`, the store `[[files]]` src `$/…` reads; `--config` does not
-move it. While it is open these keys apply, and the other keys of the table do nothing:
+`F` opens the [file store](cli.md#anvil-files) at `$/`, the store `[[files]]` src `$/…` reads, in the
+[workspace](configuration.md#the-workspace) of the config `--config` (or `o`) names. While it is open these keys apply,
+and the other keys of the table do nothing:
 
 | Key                     | Action                                                        | CLI equivalent           |
 | ----------------------- | ------------------------------------------------------------- | ------------------------ |

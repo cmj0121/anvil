@@ -8,7 +8,7 @@ For complete scenarios to copy and try, see [examples/](../examples/).
 
 ### `inventory.toml`
 
-`~/.config/anvil/inventory.toml` (or `$XDG_CONFIG_HOME/anvil/`):
+`~/.config/anvil/inventory.toml` (or `$XDG_CONFIG_HOME/anvil/`), in the [workspace](#the-workspace):
 
 ```toml
 [hosts.linode1]
@@ -31,6 +31,7 @@ sudo_secret = "HOST_SUDO" # optional; the secret holding this host's sudo passwo
 [anvil]
 editor = "nvim"            # optional; else $VISUAL, $EDITOR, nvim
 format = "toml"            # the format anvil inventory/config open in: toml | yaml
+workspace = "~/dotfiles"   # optional; where the inventory, $/ and relative src live; default this file's directory
 
 [secrets]
 backend = "keychain"       # keychain (macOS) | age | sops; see secrets.md
@@ -51,7 +52,7 @@ apt = "fd-find"
 dnf = "fd-find"
 
 [[files]]                  # optional; after packages, before [[steps]]; see Files
-src = "files/sshd_config"  # relative to this file's directory
+src = "files/sshd_config"  # relative to the workspace
 dest = "/etc/ssh/sshd_config"
 mode = "0644"              # required, quoted
 tags = ["linode"]          # optional; the target must carry every tag
@@ -77,14 +78,80 @@ An `inventory.yaml` or `config.yml` from an older anvil is still read by every c
 
 ## Files and formats
 
-Directory: `$XDG_CONFIG_HOME/anvil/`, else `~/.config/anvil/`. Two documents, `inventory` and `config`, each stored as
-`NAME.toml`, the only on-disk format. YAML is an editing view: `anvil inventory` and `anvil config` show the document
-in `--format` or `[anvil].format` and save it as TOML; only these two commands accept `--format` (elsewhere it is
-exit 2). A legacy `NAME.yaml` or `NAME.yml` from an older anvil is still read by every command and is replaced by
-`NAME.toml` on the next `anvil inventory` / `anvil config`. More than one file for the same name is ambiguous (exit 2).
-`--inventory` / `--config` take an explicit path, which must end in `.toml` (anything else is exit 2 naming the path).
-A missing file is an empty document: the inventory holds only `local`, the config has the defaults below. Both formats
-map onto the same schema; unknown keys are refused, and any violation is exit 2 naming the file, host and field.
+Directory: `$XDG_CONFIG_HOME/anvil/`, else `~/.config/anvil/`, for the config; the inventory is looked for in the
+[workspace](#the-workspace), which is that same directory unless `--config` or `[anvil].workspace` moves it. Two
+documents, `inventory` and `config`, each stored as `NAME.toml`, the only on-disk format. YAML is an editing view:
+`anvil inventory` and `anvil config` show the document in `--format` or `[anvil].format` and save it as TOML; only
+these two commands accept `--format` (elsewhere it is exit 2). A legacy `NAME.yaml` or `NAME.yml` from an older anvil
+is still read by every command and is replaced by `NAME.toml` on the next `anvil inventory` / `anvil config`. More than
+one file for the same name is ambiguous (exit 2). `--inventory` / `--config` take an explicit path, which must end in
+`.toml` (anything else is exit 2 naming the path). A missing file is an empty document: the inventory holds only
+`local`, the config has the defaults below. Both formats map onto the same schema; unknown keys are refused, and any
+violation is exit 2 naming the file, host and field.
+
+## The workspace
+
+The workspace is the directory that holds the inventory, the [file store](cli.md#anvil-files) and every relative
+`[[files]]` src, so one folder can carry a whole setup:
+
+```sh
+anvil --config ~/site/config.toml apply   # inventory ~/site/inventory.toml, $/motd is ~/site/files/motd
+```
+
+By default it is the directory of the config file anvil located: `~/.config/anvil` (or `$XDG_CONFIG_HOME/anvil`), or
+the directory of `--config PATH` as given (`--config site.toml` means `.`), even when that file does not exist yet.
+With no config file at all, it is the config directory. The path is taken as written, not resolved through symlinks.
+`[anvil].workspace` moves it:
+
+```toml
+[anvil]
+workspace = "~/dotfiles"   # ~/ is $HOME; an absolute path as is; a relative path is relative to the config's directory
+```
+
+Only `~/` expands; a bare `~` is a directory named `~`. An empty value or one holding a NUL byte is exit 2 with
+``anvil.workspace `VALUE`: must be a non-empty path without NUL``; a `~/` value with `$HOME` unset is
+``anvil.workspace `~/dotfiles`: $HOME is not set``, and with a relative `$HOME`
+``anvil.workspace `~/dotfiles`: $HOME `H` is not absolute`` (exit 2).
+
+What follows the workspace:
+
+- **The inventory.** Without `--inventory`, `inventory.toml` (or a legacy `inventory.yaml` / `inventory.yml`) is looked
+  for in the workspace, and `anvil inventory` writes it there; a legacy file there is migrated there. `--inventory PATH`
+  still wins.
+- **The store.** `$/` is `<workspace>/files`.
+- **A relative `src`.** It resolves in the workspace and must stay inside it ([`src`](#files)).
+
+The config itself is never looked for in the workspace, and the state directory, plugin paths and secret backend paths
+do not move with it. A workspace that does not exist is an empty store and an inventory of only `local`;
+`anvil files cp` and `anvil files mkdir` create `<workspace>/files` and its missing parents as 0700.
+
+The workspace is a trust boundary, like the config itself. Whoever can write it controls the inventory, the `$/` files
+and the relative `src` that anvil reads and copies to your targets. A `workspace` such as `~/` or `/` lets a relative
+src name any file under it. The [containment check](#files) guards against mistakes, not against someone who can
+write the workspace. So once per command, when the resolved workspace exists but is group- or world-writable or owned
+by another user, anvil logs a WARN (shown from `-v`) and carries on; it does not refuse:
+
+- ``workspace `PATH`: writable by others (mode 0775); anyone who can write it controls the inventory and files anvil reads``
+- ``workspace `PATH`: owned by uid 501, not you; anyone who can write it controls the inventory and files anvil reads``
+
+A symlinked workspace is checked at its target. A missing workspace, or one others can only read (`0755`), gives no
+warning; one that is not a directory or cannot be checked names that instead (`not a directory`,
+`cannot check directory: REASON`).
+
+When the config does not load (or its workspace does not resolve), the commands that read only the inventory (`run`,
+`doctor`, the TUI's targets) look for it in the config's directory and log a WARN,
+`config failed to load (ERROR); looking for the inventory in DIR`, so an inventory error is still reported on its own.
+`anvil files` needs the workspace and exits 2 with the config's error instead; the TUI's files browser shows that error.
+
+**Moving from an older anvil.** Before, the inventory and `$/` always stayed in the config directory, and a relative
+src resolved beside the config file's real target. Now:
+
+- With `--config PATH` elsewhere, the inventory and `$/` are looked for beside PATH. To keep the old places, set
+  `workspace = "~/.config/anvil"` in that config; `--inventory` overrides only the inventory.
+- When `config.toml` is a symlink to a file elsewhere, a relative src resolves beside the link (the workspace), not
+  beside its target. Set `[anvil].workspace` to the target's directory to keep the old base.
+
+A symlinked config directory (`~/.config/anvil` itself a link) resolves as before.
 
 ## Inventory
 
@@ -124,6 +191,7 @@ with ``host `linode1`: sudo_secret `VALUE`: must match [A-Z][A-Z0-9_]*``; `local
 [anvil]
 editor = "nvim"            # optional; see cli.md (The editor)
 format = "toml"            # "toml" | "yaml": the edit view of inventory and config; default "toml"
+workspace = "~/dotfiles"   # optional: ~/, absolute, or relative to the config's directory; see The workspace
 
 [secrets]
 backend = "keychain"       # keychain | age | sops; required when [secrets] is present
@@ -157,7 +225,7 @@ apt = "fd-find"            # installed in place of fd on apt; a manager with no 
 dnf = "fd-find"
 
 [[files]]                  # optional; one file copied per matching target; see Files
-src = "files/sshd_config"  # relative to the config file's directory
+src = "files/sshd_config"  # relative to the workspace, or $/… in the store
 dest = "/etc/ssh/sshd_config" # absolute path on the target
 mode = "0644"              # required: a quoted string of 3 or 4 octal digits
 tags = ["linode"]          # optional; every tag must be on the target
@@ -237,7 +305,7 @@ below is cut at 64 characters (the cut marked with `…`) and a control characte
 
 ```toml
 [[files]]
-src = "files/sshd_config"        # required: relative to the config file's directory
+src = "files/sshd_config"        # required: relative to the workspace, or $/… in the store
 dest = "/etc/ssh/sshd_config"    # required: absolute path on the target
 mode = "0644"                    # required: quoted, 3 or 4 octal digits
 tags = ["linode"]                # optional; [A-Za-z0-9_-]+; every one must be on the target
@@ -266,20 +334,22 @@ mode. Exit 2:
 - ``files[0].dest `/etc/`: must not end with /``
 - ``files[0].dest `/aaa…`: 4097 bytes exceeds the 4096 byte limit`` (the quoted path is the first 64 characters plus `…`)
 
-**`src`.** Unless it starts with `$/`, a path relative to the directory of the config file, not shell-expanded: `~/a` is
+**`src`.** Unless it starts with `$/`, a path relative to the [workspace](#the-workspace), not shell-expanded: `~/a` is
 a directory whose name is `~`, and `..` is allowed at this check. Absolute, empty, or containing a NUL byte is exit 2
 with ``files[0].src `/etc/motd`: must be relative to the config directory``. `apply` and `plan` (and the TUI's `a` and
-`p`) then resolve `..` and symlinks and read the file, before any target. The resolved path must stay inside the config
-directory: ``files[0].src `../outside`: leaves the config directory``, and the same for a symlink inside the directory
-whose target is outside it. That check guards against a mistake (a stray `..`, a symlink that points the wrong way). It
-is not a security boundary: someone who can edit the config can already put the file in that directory. The path must
-name a regular file. A missing file is ``files[0].src `missing`: cannot read: REASON``, with the operating system's
-REASON; a directory is ``files[0].src `sub`: is not a regular file``. `anvil config`, `anvil doctor`, `anvil inventory`
-and `anvil secret` check the syntax only, so a missing src does not break them, and `anvil run` does not load the config.
+`p`) then resolve `..` and symlinks and read the file, before any target. The resolved path must stay inside the
+workspace, itself resolved through symlinks for this check: ``files[0].src `../outside`: leaves the workspace``, and the
+same for a symlink inside the workspace whose target is outside it. That check guards against a mistake (a stray `..`,
+a symlink that points the wrong way). It is not a security boundary: someone who can edit the config can already put
+the file in the workspace or move it. The path must name a regular file. A missing file, or a workspace that does not
+exist, is ``files[0].src `missing`: cannot read: REASON``, with the operating system's REASON; a directory is
+``files[0].src `sub`: is not a regular file``. `anvil config`, `anvil doctor`, `anvil inventory` and `anvil secret`
+check the syntax only, so a missing src does not break them. `anvil run` loads the config only to locate the inventory
+when `--inventory` is absent; it never reads file sources.
 
 A `src` starting with `$/` instead reads the [file store](cli.md#anvil-files): `$/sub/motd` means
-`<config_dir>/files/sub/motd`, even when `--config` points elsewhere. This replaces the old meaning of a literal
-`$` directory beside the config. Store paths reject absolute paths, NUL, and `.` or `..` components; repeated `/`
+`<workspace>/files/sub/motd`. This replaces the old meaning of a literal
+`$` directory in the workspace. Store paths reject absolute paths, NUL, and `.` or `..` components; repeated `/`
 separators collapse. Every existing component, including the store root, must not be a symlink. Invalid paths and
 symlinks exit 2: ``files[0].src `$/../x`: invalid store path`` and
 ``files[0].src `$/link`: is a symlink``. The root is rejected as

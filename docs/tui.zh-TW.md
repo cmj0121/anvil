@@ -86,7 +86,9 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
   文字檔的前 64 KiB；資料夾或 `..` 顯示 `folder`；不是文字的檔案
   （`$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`）或無法讀取時顯示錯誤。
   狀態列顯示 `↑↓ move · Enter open · ⌫ up · e edit · D delete · Esc close`，失敗的編輯、刪除或列出則以紅色顯示，
-  直到下一個按鍵。找不到儲存區（沒有 `$HOME`）時，`F` 以通知顯示該錯誤且不會開啟。
+  直到下一個按鍵。找不到儲存區（config 無法載入、其 `[anvil].workspace` 無法解析，或沒有 `$HOME`）時，
+  `F` 以通知顯示該錯誤且不會開啟。
+  每次重新載入（`r`、`o`，以及 `i` 或 `c` 之後）都會重新尋找它，因此移動工作區的 config 編輯會立即生效。
 - **刪除（`D`）。** `delete $/PATH?`，並註明資料夾會連同其中所有內容一起刪除。只有 `y` 會刪除；
   `n` 或 `Esc` 關閉它，其他按鍵保留問題。
 - **說明（`?`）。** 每個群組一列：Run、Targets、Move、History、Edit、Options、App，接著是瀏覽器的 Browser 與 Entry。
@@ -156,7 +158,8 @@ curl、tar 與新執行檔的 `--version` 執行時輸出都會被擷取，不�
 
 ### 檔案瀏覽器
 
-`F` 在 `$/` 開啟[檔案儲存區](cli.zh-TW.md#anvil-files)，也就是 `[[files]]` src `$/…` 讀取的儲存區；`--config` 不會移動它。
+`F` 在 `$/` 開啟[檔案儲存區](cli.zh-TW.md#anvil-files)，也就是 `[[files]]` src `$/…` 讀取的儲存區，
+位於 `--config`（或 `o`）指定之 config 的[工作區](configuration.zh-TW.md#工作區)。
 開啟期間適用下列按鍵，表中其他按鍵都不做任何事：
 
 | 按鍵                    | 動作                                       | CLI 對應                 |

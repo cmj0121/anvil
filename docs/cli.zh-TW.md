@@ -13,6 +13,7 @@
 anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [--target SEL]... [--parallel N] [COMMAND]
   inventory [--format toml|yaml] edit the inventory; --format picks the edit view, saved as TOML
   config [--format toml|yaml]    edit the config; --format picks the edit view, saved as TOML
+         [--full]                --full shows every default; saved without them
   files <ACTION>                 manage the file store that [[files]] src $/… reads: ls, cp, mv, rm, mkdir, cat, edit
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
@@ -37,7 +38,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
 | ------------------- | -------------------------------------------------------------------------------------------------- |
 | `-v`, `--verbose`   | stderr 上更多日誌（`tui`：Log pane）；`-v` 警告、`-vv` info、`-vvv` debug（[日誌](#日誌)）         |
 | `--inventory PATH`  | 使用此 inventory 檔案而非自動找到的；須以 `.toml` 結尾（否則以 2 結束；見 [tui](#anvil-tui)）      |
-| `--config PATH`     | 使用此 config 檔案而非自動找到的；PATH 須以 `.toml` 結尾（否則以 2 結束）                          |
+| `--config PATH`     | 使用此 config 檔案而非自動找到的；其目錄即工作區；PATH 須以 `.toml` 結尾（否則以 2 結束）          |
 | `--ssh-config PATH` | 以 `-F PATH` 傳給每個 `ssh`                                                                        |
 | `--json`            | 在 stdout 印出恰好一份 JSON 文件，取代給人看的輸出                                                 |
 | `--target SEL`      | `local`、host 名稱或 tag；可重複以取聯集；未指定表示 `local` 加上所有 host                         |
@@ -95,13 +96,14 @@ anvil run --parallel 4 fix.sh
 ### `anvil inventory [--format toml|yaml]`
 
 在編輯器中開啟 inventory（主機清單），以編輯格式顯示：`--format X` 僅限這次編輯，否則為 `[anvil].format`（預設 TOML）。
-不存在的 inventory 會以空文件開啟。inventory 一律存成 `inventory.toml`；
+沒有 `--inventory` 時，使用的是[工作區](configuration.zh-TW.md#工作區)中的 inventory，因此會先載入 config
+（無法載入的 config 以 2 結束）。不存在的 inventory 會以空文件開啟。inventory 一律存成 `inventory.toml`；
 `--format` 絕不會變更 `[anvil].format`，也絕不會動到 config（設定）。
 
 儲存時，緩衝區會以編輯格式解析並驗證；
 無效的緩衝區會印出錯誤（檔案、host 與欄位），並帶著你的文字重新開啟，最多嘗試三次，之後不寫入任何東西並以 2 結束。
 有效的緩衝區會以 TOML 原子性地寫入（`inventory.toml.tmp`，mode 0600，再 rename 覆蓋 `inventory.toml`）；
-接著移除 config 目錄中舊版的 `inventory.yaml` 或 `inventory.yml`。
+接著移除工作區中舊版的 `inventory.yaml` 或 `inventory.yml`。
 當 inventory 已是 `inventory.toml` 或尚不存在時，未變更的緩衝區不論編輯格式為何都不會寫入任何東西。
 舊版 YAML inventory 即使如此仍會被遷移：寫成 `inventory.toml` 並移除 YAML 檔案。
 
@@ -113,7 +115,7 @@ anvil run --parallel 4 fix.sh
 { "path": "/Users/me/.config/anvil/inventory.toml", "changed": true }
 ```
 
-### `anvil config [--format toml|yaml]`
+### `anvil config [--format toml|yaml] [--full]`
 
 與 `inventory` 相同，但對象是 config，並以 `--config PATH` 取代 `--inventory PATH`：
 它存成 `config.toml`，舊版的 `config.yaml` 或 `config.yml` 會在下一次儲存時遷移。
@@ -121,10 +123,49 @@ anvil run --parallel 4 fix.sh
 當 `[anvil].editor` 指定的程式找不到時，`config` 會改用 `$VISUAL`、`$EDITOR`、`nvim` 並發出警告，
 因此那裡打錯字也不會把你鎖在外面。輸出與 `--json` 同 `inventory`。
 
+`--full` 開啟同一份 config，並把每個預設值都寫出來，方便看出有哪些可以改：
+
+```toml
+[anvil]
+format = "toml"
+# editor = "nvim"
+workspace = "/Users/me/.config/anvil"
+
+[packages]
+install = ["git"]
+manager = "auto"
+pin = []
+remove = []
+timeout = 300
+upgrade = false
+
+[[steps]]
+run = "hostname"
+
+# … one commented example per unused section …
+
+# [[services]]
+# name = "sshd"
+# state = "started"
+```
+
+`[anvil]` 一律完整顯示，包含 `workspace`（未設定時為解析後的預設值）。
+config 已有的每個區段都會補上有預設值的鍵：`[packages]` 的 `manager`、`install`、`remove`、`pin`、`upgrade` 與 `timeout`，
+`[secrets.keychain]` 的 `service`，每個 `[[files]]` 項目的 `sudo` 與 `rollback`，每個 `[plugins.NAME]` 的 `on`。
+config 沒用到的每個選用區段都以註解範例附在後面（`# [secrets]`、`# [packages]`、`# [[files]]`、`# [[services]]`、
+`# [plugins.NAME]`），以編輯格式呈現，所以 `--format yaml --full` 會以 YAML 寫出這些註解。
+`editor` 未設定時，其註解範例會放在 `[anvil]` 內。取消範例的註解即可使用。
+
+儲存時的驗證與重試和不加 `--full` 時相同，接著移除每個值等於預設值的鍵，包括你自己寫上的；
+解析後等於預設的 `workspace`（例如 `"."`）也會移除。即使區段內的鍵全是預設值，區段本身仍會保留，
+所以存在的 `[packages]` 會存成空的 `[packages]`。註解不會保留。
+緩衝區所代表的 config 與原本相同時，不論怎麼編輯都不會寫入任何東西（`PATH: unchanged`）；
+舊版 YAML config 或舊版的 `[anvil].secrets` 仍會和不加 `--full` 時一樣遷移。
+
 ### `anvil files`
 
 把 `[[files]]` 要複製的檔案集中放在一處，也就是檔案儲存區（file store），
-如此 config 不論放在哪裡，都能以 `$/…` 指名它們（[`src`](configuration.zh-TW.md)）：
+如此 config 能以 `$/…` 指名它們（[`src`](configuration.zh-TW.md#files)）：
 
 ```sh
 anvil files cp ~/.tmux.conf '$/dotfiles/'     # copy in; a DEST ending in / keeps the name
@@ -133,8 +174,11 @@ anvil files edit '$/dotfiles/.tmux.conf'      # change it in the editor
 anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
 ```
 
-儲存區是 config 目錄中的 `files` 資料夾：`$XDG_CONFIG_HOME/anvil/files`，否則為 `~/.config/anvil/files`。
-`--config` 與 `--inventory` 絕不會移動它。每個動作都只在這台機器上進行；會忽略 `--target` 與 `--parallel` 並發出警告，從 `-v` 起顯示。
+儲存區是[工作區](configuration.zh-TW.md#工作區)中的 `files` 資料夾：預設為 `$XDG_CONFIG_HOME/anvil/files`，否則為
+`~/.config/anvil/files`；使用 `--config PATH` 時在該 config 旁邊；設定 `[anvil].workspace` 時在其下。
+每個動作都會載入 config 來找到它，因此無法載入的 config 會以 2 結束並顯示其錯誤。
+其他人可寫入、或屬於其他使用者的工作區會得到一則 WARN 而不是拒絕（[工作區](configuration.zh-TW.md#工作區)）：
+能寫入它的人就能控制 `[[files]]` 複製的內容。每個動作都只在這台機器上進行；會忽略 `--target` 與 `--parallel` 並發出警告，從 `-v` 起顯示。
 
 **儲存區路徑。** `$/sub/motd` 指 `files/sub/motd`，`$/` 則是儲存區本身。除了 `cp` 以外，每個動作也接受不帶 `$/` 的路徑
 （`sub/motd`）；`cp` 靠 `$/` 分辨哪一邊是儲存區、哪一邊是這台機器。絕對路徑（`/x`、`$//x`）、含 NUL 位元組，
@@ -172,12 +216,11 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
   把資料夾移到它自己裡面以 2 結束。DEST 缺少的上層資料夾會被建立。
 - **`rm`。** 依序刪除每個 PATH，遇到第一個失敗就停止。沒有 `-r` 的資料夾以 1 結束；`$/` 以 2 結束。
   儲存區中的 symlink 刪除的是它本身，絕不是它指向的東西。
-- **`edit`。** 載入 config（為了 `[anvil].editor`，因此無法載入的 config 會讓它以 2 結束），
-  以檔案的副檔名（沒有時為 `.txt`）開啟 `edit-<random>.<ext>`，只在緩衝區變更時寫回；保持空白的新檔案不會被建立。
+- **`edit`。** 使用 config 的 `[anvil].editor`，以檔案的副檔名（沒有時為 `.txt`）開啟 `edit-<random>.<ext>`，只在緩衝區變更時寫回；保持空白的新檔案不會被建立。
   以非零結束的編輯器不寫入任何東西（以 1 結束）。
 
-`mv` 與 `rm` 接著載入 config，對每個位於被移動或刪除路徑下的 `[[files]]` src 記錄一行 WARN：
-``files[0].src `$/a/motd` names $/a, which is gone``。無法載入的 config 不產生警告，也不算錯誤。
+`mv` 與 `rm` 接著對每個位於被移動或刪除路徑下的 `[[files]]` src 記錄一行 WARN：
+``files[0].src `$/a/motd` names $/a, which is gone``。
 
 給人看的輸出：`ls` 印出名稱，`cat` 印出檔案，其他動作不印任何東西。`--json` 為一份文件：
 
@@ -841,7 +884,7 @@ plan 顯示 `would $ SCRIPT (from plugin NAME)`，其 `--json` 的 step 帶有 `
 
 ### File steps
 
-`[[files]]` 項目把 config 旁的一份文字檔複製到每個 tag 與 fact 都符合的選定 target（[Files](configuration.zh-TW.md#files)）：
+`[[files]]` 項目把工作區或檔案儲存區中的一份文字檔複製到每個 tag 與 fact 都符合的選定 target（[Files](configuration.zh-TW.md#files)）：
 
 ```toml
 [[files]]
@@ -893,7 +936,7 @@ facts = { distro = "arch" }
 step 失敗並顯示 `files: DEST is a symlink; point dest at the real file`。`sudo = false` 以連線使用者身分寫入時會跟隨連結。
 
 `apply` 與 `plan` 在連線任何 target 之前讀取每個 src。
-src 不存在、位於 config 目錄之外、不是一般檔案、超過 1 MiB 或不是文字時以 2 結束，
+src 不存在、位於工作區之外、不是一般檔案、超過 1 MiB 或不是文字時以 2 結束，
 而且只要一個 src 有問題，該指令就對每個 target 停止，包括該項目不符合的 target：
 
 ```text
@@ -1174,7 +1217,8 @@ target 的選法與 apply 相同（`--target`；未指定表示 `local` 加上�
 腳本是每個 target 唯一的 step，經其 stdin 送到 `sh -s`（`local` 則為 `/bin/sh -s`），絕不放在 argv 上。
 它一律是 POSIX sh：shebang 行只是註解。run 不詢問確認。
 
-- **不讀 config。** run 絕不載入 config，因此壞掉的 `[packages]` 或 `[[steps]]` 擋不住它。
+- **config 錯誤不會擋住 run。** 未指定 `--inventory` 時，run 會載入 config 來尋找工作區的 inventory；
+  config 出錯時會記錄警告，並退回 config 所在目錄。指定 `--inventory` 時則略過 config。
   不執行任何探測、絕不開啟 secret store，也不輸入 sudo 密碼。
   需要 root 的工作請在腳本中呼叫 `sudo -n`，或使用 sudo 為 NOPASSWD 的 target。
 - **stdin。** 腳本以 `{ :` … `}` 包住後送出，因此 sh 會先讀完整份再執行其中任何一行：
@@ -1416,7 +1460,7 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
 - **`files`**：成功時為 0。儲存區路徑不存在、已存在而沒有 `-f`、是資料夾（`rm` 沒有 `-r`）或不是資料夾、不是文字檔，
   或讀取、寫入或編輯器失敗時為 1。錯誤的旗標或引數、無效的儲存區路徑、儲存區內的 symlink、
   SRC 與 DEST 都是或都不是 `$/…` 的 `cp`、沒有 `-r` 而複製資料夾、`cat --json`，
-  或（對 `edit`）無法載入的 config 時為 2（[anvil files](#anvil-files)）。
+  或無法載入的 config、無法解析的 `[anvil].workspace` 時為 2（[anvil files](#anvil-files)）。
 - **單獨的 `anvil`**：在終端機上同 `tui`；其他情況在 stderr 印出說明並為 2。
 - **`tui`**：離開時為 0，不論結果為何。
   stdin 或 stdout 不是終端機、使用 `--json`，或未知的 `--target`（只在 inventory 載入成功時檢查）時為 2；

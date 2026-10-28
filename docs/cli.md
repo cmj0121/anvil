@@ -13,6 +13,7 @@ Topic guides: [Getting started](getting-started.md), [Configuration](configurati
 anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [--target SEL]... [--parallel N] [COMMAND]
   inventory [--format toml|yaml] edit the inventory; --format picks the edit view, saved as TOML
   config [--format toml|yaml]    edit the config; --format picks the edit view, saved as TOML
+         [--full]                --full shows every default; saved without them
   files <ACTION>                 manage the file store that [[files]] src $/… reads: ls, cp, mv, rm, mkdir, cat, edit
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
@@ -37,7 +38,7 @@ Every flag is global: it may come before or after the command.
 | ------------------- | ----------------------------------------------------------------------------------------------------- |
 | `-v`, `--verbose`   | more logs on stderr (`tui`: Log pane); `-v` warnings, `-vv` info, `-vvv` debug ([Logging](#logging))  |
 | `--inventory PATH`  | this inventory file, not the discovered one; must end in `.toml` (else exit 2; see [tui](#anvil-tui)) |
-| `--config PATH`     | use this config file instead of the discovered one; PATH must end in `.toml` (else exit 2)            |
+| `--config PATH`     | this config file, not the discovered one; sets the workspace; must end in `.toml` (else exit 2)       |
 | `--ssh-config PATH` | passed to every `ssh` as `-F PATH`                                                                    |
 | `--json`            | print exactly one JSON document on stdout instead of human output                                     |
 | `--target SEL`      | `local`, a host name or a tag; repeat to take the union; none means `local` plus every host           |
@@ -95,13 +96,15 @@ Limitations:
 ### `anvil inventory [--format toml|yaml]`
 
 Opens the inventory in the editor, shown in the edit format: `--format X` for this edit only, else `[anvil].format`
-(default TOML). A missing inventory opens as an empty document. The inventory is always stored as `inventory.toml`;
+(default TOML). Without `--inventory` it is the one in the [workspace](configuration.md#the-workspace), so this loads
+the config first (a config that does not load is exit 2). A missing inventory opens as an empty document. The inventory
+is always stored as `inventory.toml`;
 `--format` never changes `[anvil].format` and never touches the config.
 
 On save the buffer is parsed in the edit format and validated; an invalid buffer prints the error (file, host and
 field) and is re-opened with your text, up to three attempts, after which nothing is written and the exit is 2. A
 valid buffer is written as TOML atomically (`inventory.toml.tmp`, mode 0600, renamed over `inventory.toml`); a legacy
-`inventory.yaml` or `inventory.yml` in the config directory is then removed. A buffer left unchanged writes nothing,
+`inventory.yaml` or `inventory.yml` in the workspace is then removed. A buffer left unchanged writes nothing,
 whatever the edit format, when the inventory already is `inventory.toml` or does not exist yet. A legacy YAML inventory
 is migrated even then: it is written as `inventory.toml` and the YAML file is removed.
 
@@ -114,7 +117,7 @@ Human output: `wrote PATH` or `PATH: unchanged`. `--json`:
 { "path": "/Users/me/.config/anvil/inventory.toml", "changed": true }
 ```
 
-### `anvil config [--format toml|yaml]`
+### `anvil config [--format toml|yaml] [--full]`
 
 Like `inventory`, for the config, with `--config PATH` in place of `--inventory PATH`: it is stored as `config.toml`,
 and a legacy `config.yaml` or `config.yml` is migrated by the next save. `--format X` only picks the edit view; the
@@ -122,10 +125,49 @@ inventory and `[anvil].format` stay as they are (edit `format` like any other ke
 names a program that cannot be found, `config` falls back to `$VISUAL`, `$EDITOR`, `nvim` with a warning, so a typo
 there cannot lock you out. Output and `--json` as for `inventory`.
 
+`--full` opens the same config with every default written out, to see what you can change:
+
+```toml
+[anvil]
+format = "toml"
+# editor = "nvim"
+workspace = "/Users/me/.config/anvil"
+
+[packages]
+install = ["git"]
+manager = "auto"
+pin = []
+remove = []
+timeout = 300
+upgrade = false
+
+[[steps]]
+run = "hostname"
+
+# … one commented example per unused section …
+
+# [[services]]
+# name = "sshd"
+# state = "started"
+```
+
+`[anvil]` is always shown in full, `workspace` included (the resolved default when unset). Every section the config
+already has gets its defaulted keys: `[packages]` `manager`, `install`, `remove`, `pin`, `upgrade` and `timeout`,
+`[secrets.keychain]` `service`, each `[[files]]` entry's `sudo` and `rollback`, each `[plugins.NAME]`'s `on`. Each
+optional section the config does not use is appended as a commented example (`# [secrets]`, `# [packages]`,
+`# [[files]]`, `# [[services]]`, and `# [plugins.NAME]`), in the edit format, so `--format yaml --full` comments
+them as YAML. When `editor` is unset, its commented example appears inside `[anvil]`. Uncomment an example to use it.
+
+Saving validates and retries as without `--full`, then drops every key whose value is its default, also one you wrote
+yourself; a `workspace` that resolves to the default (`"."`, say) is dropped too. Sections stay even when all their keys
+are defaults, so a present `[packages]` is saved as an empty `[packages]`. Comments are not kept. A buffer that means
+the same config as before writes nothing (`PATH: unchanged`), whatever the edit; a legacy YAML config or the legacy
+`[anvil].secrets` is still migrated, as without `--full`.
+
 ### `anvil files`
 
-Keeps the files that `[[files]]` copies in one place, the file store, so a config can name them as `$/…` wherever the
-config itself lives ([`src`](configuration.md)):
+Keeps the files that `[[files]]` copies in one place, the file store, so a config can name them as `$/…`
+([`src`](configuration.md#files)):
 
 ```sh
 anvil files cp ~/.tmux.conf '$/dotfiles/'     # copy in; a DEST ending in / keeps the name
@@ -134,9 +176,12 @@ anvil files edit '$/dotfiles/.tmux.conf'      # change it in the editor
 anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
 ```
 
-The store is the folder `files` in the config directory: `$XDG_CONFIG_HOME/anvil/files`, else
-`~/.config/anvil/files`. `--config` and `--inventory` never move it. Every action works on this machine only; it
-ignores `--target` and `--parallel` with a warning, shown from `-v`.
+The store is the folder `files` in the [workspace](configuration.md#the-workspace): by default
+`$XDG_CONFIG_HOME/anvil/files`, else `~/.config/anvil/files`; beside the config with `--config PATH`; under
+`[anvil].workspace` when set. Every action loads the config to find it, so a config that does not load is exit 2 with
+its error. A workspace that others can write, or that another user owns, gets a WARN, not a refusal
+([The workspace](configuration.md#the-workspace)): whoever can write it controls what `[[files]]` copies. Every
+action works on this machine only; it ignores `--target` and `--parallel` with a warning, shown from `-v`.
 
 **Store paths.** `$/sub/motd` names `files/sub/motd`, and `$/` the store itself. Every action but `cp` also takes the
 path without `$/` (`sub/motd`); `cp` uses `$/` to tell the store side from this machine's. A path that is absolute
@@ -175,12 +220,12 @@ exit 1 with `$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`. Err
   needs `-f`. Moving a folder into itself is exit 2. Missing parents of DEST are created.
 - **`rm`.** Removes each PATH in turn and stops at the first failure. A folder without `-r` is exit 1; `$/` is exit 2.
   A symlink in the store is removed itself, never what it points to.
-- **`edit`.** Loads the config (for `[anvil].editor`, so a config that does not load is its exit 2), opens the file as
-  `edit-<random>.<ext>` with the file's extension (`.txt` when it has none), and writes the buffer back only when it
-  changed; a new file left empty is not created. An editor that exits non-zero writes nothing (exit 1).
+- **`edit`.** Uses the config's `[anvil].editor`, opens the file as `edit-<random>.<ext>` with the file's extension
+  (`.txt` when it has none), and writes the buffer back only when it changed; a new file left empty is not created.
+  An editor that exits non-zero writes nothing (exit 1).
 
-`mv` and `rm` then load the config and log a WARN for every `[[files]]` src under the path they moved or removed:
-``files[0].src `$/a/motd` names $/a, which is gone``. A config that does not load gives no warning and no error.
+`mv` and `rm` then log a WARN for every `[[files]]` src under the path they moved or removed:
+``files[0].src `$/a/motd` names $/a, which is gone``.
 
 Human output: `ls` the names, `cat` the file, the other actions nothing. `--json` is one document:
 
@@ -873,7 +918,7 @@ random number or a remote API) can make plan show a script that apply then does 
 
 ### File steps
 
-A `[[files]]` entry copies one text file from beside the config onto each selected target whose tags and facts match
+A `[[files]]` entry copies one text file from the workspace or file store onto each selected target whose tags and facts match
 ([Files](configuration.md#files)):
 
 ```toml
@@ -929,9 +974,9 @@ symlink and leaves the link and its target alone; the step fails with
 `files: DEST is a symlink; point dest at the real file`. A `sudo = false` write as the connecting user follows the
 link.
 
-`apply` and `plan` read every src before any target is contacted. A src that is missing, outside the config
-directory, not a regular file, over 1 MiB, or not text is exit 2, and one bad src stops the command for every target,
-those the entry does not match included:
+`apply` and `plan` read every src before any target is contacted. A src that is missing, outside the workspace, not
+a regular file, over 1 MiB, or not text is exit 2, and one bad src stops the command for every target, those the entry
+does not match included:
 
 ```text
 ERROR anvil: files[0].src `../nope`: cannot read: No such file or directory (os error 2)
@@ -1233,9 +1278,10 @@ Targets are chosen as for apply (`--target`; none means `local` plus every host)
 The script is each target's one step, sent on its stdin to `sh -s` (`/bin/sh -s` for `local`), never on an argv. It
 is always POSIX sh: a shebang line is only a comment. run asks for no confirmation.
 
-- **No config.** run never loads the config, so a broken `[packages]` or `[[steps]]` cannot block it. Nothing is probed,
-  the secret store is never opened and no sudo password is typed. For root work call `sudo -n` in the script, or use a
-  target whose sudo is NOPASSWD.
+- **Config errors do not block run.** Without `--inventory`, run loads the config to locate the workspace inventory;
+  a config error logs a warning and falls back to the config's directory. With `--inventory`, it skips the config.
+  Nothing is probed, the secret store is never opened and no sudo password is typed. For root work call `sudo -n` in
+  the script, or use a target whose sudo is NOPASSWD.
 - **stdin.** The script is sent wrapped in `{ :` … `}`, so sh reads all of it before running any of it: a command that
   reads stdin (`cat`, `read`, `ssh`) sees EOF and cannot eat the lines after it. A heredoc left open on the last line
   swallows the closing `}`, and the step fails with sh's syntax error.
@@ -1488,7 +1534,8 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 - **`files`**: 0 on success. 1 when a store path is missing, already exists without `-f`, is a folder (`rm` without
   `-r`) or is not a folder, is not a text file, or a read, write or the editor fails. 2 for a bad flag or argument, an
   invalid store path, a symlink inside the store, a `cp` whose SRC and DEST are both or neither `$/…`, a folder copied
-  without `-r`, `cat --json`, or (for `edit`) a config that does not load ([anvil files](#anvil-files)).
+  without `-r`, `cat --json`, or a config that does not load or whose `[anvil].workspace` does not resolve
+  ([anvil files](#anvil-files)).
 - **Bare `anvil`**: as `tui` at a terminal; elsewhere the help on stderr and 2.
 - **`tui`**: 0 on quit, whatever the results. 2 when stdin or stdout is not a terminal, for `--json`, or for an unknown
   `--target` (checked only when the inventory loads); an inventory that does not load (any load error, including an
