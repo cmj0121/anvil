@@ -1,0 +1,6 @@
+# `local` (this machine) is always present and is not an entry here.
+[hosts.linode1]
+host = "203.0.113.10"
+user = "admin"
+tags = ["linode"]
+pkg = "pacman"
