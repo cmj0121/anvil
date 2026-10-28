@@ -97,6 +97,11 @@ pub enum Command {
         #[arg(long, value_enum, value_name = "FORMAT")]
         format: Option<Format>,
     },
+    /// Manage the file store that `[[files]]` src `$/…` reads
+    Files {
+        #[command(subcommand)]
+        action: FilesAction,
+    },
     /// Local checks plus every target's facts and reachability
     Doctor,
     /// Run the config's steps on every target
@@ -159,11 +164,58 @@ pub enum Command {
     },
 }
 
+/// File store operations.
+#[derive(Debug, Subcommand)]
+pub enum FilesAction {
+    /// List a store folder; -r lists the whole tree
+    Ls {
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+        #[arg(short, long)]
+        recursive: bool,
+    },
+    /// Copy between this machine and the store; exactly one side is `$/…`
+    Cp {
+        #[arg(value_name = "SRC")]
+        src: String,
+        #[arg(value_name = "DEST")]
+        dest: String,
+        #[arg(short, long)]
+        recursive: bool,
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Move or rename inside the store
+    Mv {
+        src: String,
+        dest: String,
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Remove a store file; -r removes a folder and its contents
+    Rm {
+        #[arg(required = true)]
+        paths: Vec<String>,
+        #[arg(short, long)]
+        recursive: bool,
+    },
+    /// Create store folders and missing parents
+    Mkdir {
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
+    /// Print a store file to stdout
+    Cat { path: String },
+    /// Edit a store file, created when missing
+    Edit { path: String },
+}
+
 impl Command {
     pub fn name(&self) -> &'static str {
         match self {
             Command::Inventory { .. } => "inventory",
             Command::Config { .. } => "config",
+            Command::Files { .. } => "files",
             Command::Doctor => "doctor",
             Command::Apply => "apply",
             Command::Plan => "plan",
@@ -271,6 +323,7 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
     match command {
         Command::Inventory { format } => crate::commands::inventory(cli, &opts, *format),
         Command::Config { format } => crate::commands::config(cli, &opts, *format),
+        Command::Files { action } => crate::files_cmd::run(cli, &opts, action),
         Command::Doctor => {
             crate::commands::warn_parallel(cli);
             let config = opts.load_config()?;
@@ -312,6 +365,41 @@ mod tests {
 
     fn command(args: &[&str]) -> Command {
         parse(args).command.unwrap()
+    }
+
+    #[test]
+    fn parses_files_actions_and_required_paths() {
+        for args in [
+            vec!["files", "ls"],
+            vec!["files", "ls", "$/sub", "-r"],
+            vec!["files", "cp", "host", "$/", "-rf"],
+            vec!["files", "mv", "a", "b", "--force"],
+            vec!["files", "rm", "a", "b", "-r"],
+            vec!["files", "mkdir", "a", "b"],
+            vec!["files", "cat", "a"],
+            vec!["files", "edit", "a"],
+        ] {
+            assert_eq!(command(&args).name(), "files");
+        }
+        assert!(matches!(
+            command(&["files", "ls"]),
+            Command::Files {
+                action: FilesAction::Ls {
+                    path: None,
+                    recursive: false
+                }
+            }
+        ));
+        for args in [
+            vec!["files"],
+            vec!["files", "rm"],
+            vec!["files", "mkdir"],
+            vec!["files", "cp", "x"],
+            vec!["files", "cat"],
+            vec!["files", "edit"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("anvil").chain(args)).is_err());
+        }
     }
 
     #[test]

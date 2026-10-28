@@ -12,6 +12,7 @@ mod examples;
 mod facts;
 mod fanout;
 mod files;
+mod files_cmd;
 mod filestore;
 mod interrupt;
 mod inventory;

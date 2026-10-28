@@ -1,8 +1,5 @@
 //! Confined text files under `<config_dir>/files`, addressed as `$/…`.
 
-// U2/U3 wire the store into config loading and the CLI.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::fmt;
 use std::fs;
 use std::io;
@@ -60,6 +57,7 @@ pub enum Kind {
 #[derive(Debug)]
 pub enum StoreError {
     BadPath(String),
+    NoBasename(String),
     Symlink(String),
     NotFound(String),
     Exists(String),
@@ -73,7 +71,7 @@ impl StoreError {
     /// Usage errors are 2; failed operations are 1.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::BadPath(_) | Self::Symlink(_) => 2,
+            Self::BadPath(_) | Self::NoBasename(_) | Self::Symlink(_) => 2,
             _ => 1,
         }
     }
@@ -83,6 +81,9 @@ impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (path, why) = match self {
             Self::BadPath(p) => (p, "invalid store path"),
+            Self::NoBasename(p) => {
+                return write!(f, "{p}: has no file name; name the destination");
+            }
             Self::Symlink(p) => (p, "is a symlink"),
             Self::NotFound(p) => (p, "not found"),
             Self::Exists(p) => (p, "exists; pass --force"),
@@ -253,27 +254,32 @@ impl Root {
         }
     }
 
-    /// Moves inside the store, refusing existing files unless forced.
-    pub fn rename(&self, from: &str, to: &str, force: bool) -> Result<(), StoreError> {
+    /// Moves inside the store, returning the normalized destination without `$/`.
+    pub fn rename(&self, from: &str, to: &str, force: bool) -> Result<String, StoreError> {
         let from = non_root(from)?;
         let src = self.resolve(&from)?;
         fs::symlink_metadata(&src).map_err(|e| io_error(&from, e))?;
-        let to = self.destination(to, src.file_name().unwrap().to_str().unwrap())?;
+        let to = self.destination(to, || child_name(&src, &from))?;
         if to == from || to.starts_with(&format!("{from}/")) {
             return Err(StoreError::BadPath(to));
         }
         let dest = self.resolve(&to)?;
         check_destination(&dest, &to, force)?;
         self.parents(&dest, &to)?;
-        fs::rename(src, dest).map_err(|e| io_error(&to, e))
+        fs::rename(src, dest).map_err(|e| io_error(&to, e))?;
+        Ok(to)
     }
 
-    fn destination(&self, rel: &str, name: &str) -> Result<String, StoreError> {
+    fn destination(
+        &self,
+        rel: &str,
+        name: impl FnOnce() -> Result<String, StoreError>,
+    ) -> Result<String, StoreError> {
         let parsed = parse(rel)?;
         let path = self.resolve(&parsed)?;
         Ok(
             if rel.ends_with('/') || path.is_dir() || parsed.is_empty() {
-                joined(&parsed, name)
+                joined(&parsed, &name()?)
             } else {
                 parsed
             },
@@ -288,8 +294,7 @@ impl Root {
         recursive: bool,
         force: bool,
     ) -> Result<Vec<String>, StoreError> {
-        let name = child_name(host, rel)?;
-        let dest = self.destination(rel, &name)?;
+        let dest = self.destination(rel, || copy_name(host, rel))?;
         let mut changed = Vec::new();
         self.import_into(host, &dest, recursive, force, &mut Vec::new(), &mut changed)?;
         Ok(changed)
@@ -351,10 +356,7 @@ impl Root {
         let src = self.resolve(&rel)?;
         fs::symlink_metadata(&src).map_err(|e| io_error(&rel, e))?;
         let dest = if host.is_dir() || host.as_os_str().as_encoded_bytes().ends_with(b"/") {
-            host.join(
-                src.file_name()
-                    .ok_or_else(|| StoreError::BadPath(rel.clone()))?,
-            )
+            host.join(copy_name(&src, &rel)?)
         } else {
             host.to_owned()
         };
@@ -433,6 +435,18 @@ fn joined(parent: &str, name: &str) -> String {
     } else {
         format!("{parent}/{name}")
     }
+}
+
+/// A copy source basename, resolving dot paths only when a basename is needed.
+fn copy_name(path: &Path, rel: &str) -> Result<String, StoreError> {
+    if path.file_name().is_some() {
+        return child_name(path, rel);
+    }
+    let canonical = fs::canonicalize(path).map_err(|e| io_error(rel, e))?;
+    if canonical.file_name().is_none() {
+        return Err(StoreError::NoBasename(path.display().to_string()));
+    }
+    child_name(&canonical, rel)
 }
 
 fn child_name(path: &Path, rel: &str) -> Result<String, StoreError> {
@@ -762,11 +776,17 @@ mod tests {
         ));
         root.rename("a", "b", true).unwrap();
         assert_eq!(root.read_text("b").unwrap(), "a");
-        root.rename("b", "new/parents/file", false).unwrap();
+        assert_eq!(
+            root.rename("b", "new/parents/file", false).unwrap(),
+            "new/parents/file"
+        );
         root.mkdir("folder").unwrap();
-        root.rename("new", "folder", false).unwrap();
+        assert_eq!(root.rename("new", "folder", false).unwrap(), "folder/new");
         assert_eq!(root.read_text("folder/new/parents/file").unwrap(), "a");
-        root.rename("folder/new", "trailing/", false).unwrap();
+        assert_eq!(
+            root.rename("folder/new", "trailing/", false).unwrap(),
+            "trailing/new"
+        );
         assert_eq!(root.read_text("trailing/new/parents/file").unwrap(), "a");
         assert!(matches!(
             root.rename("trailing", "trailing/newer", false),
@@ -776,6 +796,60 @@ mod tests {
             root.rename("$/", "x", false),
             Err(StoreError::BadPath(_))
         ));
+    }
+
+    #[test]
+    fn move_destinations_match_store_folder_rules() {
+        let dir = temp_dir("store-move-dest");
+        let root = Root::at(dir.clone());
+        root.mkdir("existing").unwrap();
+        for (dest, expected) in [
+            ("$/", "name"),
+            ("", "name"),
+            ("existing", "existing/name"),
+            ("missing/", "missing/name"),
+            ("new", "new"),
+            ("$/a//b", "a/b"),
+        ] {
+            root.write("src/name", b"text").unwrap();
+            assert_eq!(root.rename("src/name", dest, true).unwrap(), expected);
+        }
+        assert!(matches!(
+            root.rename("name", "../bad", false),
+            Err(StoreError::BadPath(_))
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copy_basename_resolves_dots_and_rejects_the_filesystem_root() {
+        let dir = temp_dir("store-copy-name");
+        let canonical = fs::canonicalize(&dir).unwrap();
+        assert_eq!(
+            copy_name(&dir.join("."), "dest").unwrap(),
+            canonical.file_name().unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            copy_name(&dir.join(".."), "dest").unwrap(),
+            canonical
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        let err = copy_name(Path::new("/"), "dest").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(matches!(&err, StoreError::NoBasename(path) if path == "/"));
+        assert_eq!(err.to_string(), "/: has no file name; name the destination");
+        let err = Root::at(PathBuf::from("/"))
+            .export("", &dir, true, false)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(matches!(&err, StoreError::NoBasename(path) if path == "/"));
+        assert_eq!(err.to_string(), "/: has no file name; name the destination");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -879,8 +953,8 @@ mod tests {
             root.mkdir("link/new"),
             root.list("link", true).map(drop),
             root.remove("link/keep", true),
-            root.rename("link", "moved", true),
-            root.rename("source", "link/new", true),
+            root.rename("link", "moved", true).map(|_| ()),
+            root.rename("source", "link/new", true).map(|_| ()),
             root.import(&host, "link/new", false, true).map(drop),
             root.export("link/keep", &host, false, true).map(drop),
         ];
