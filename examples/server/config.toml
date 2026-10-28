@@ -1,0 +1,21 @@
+[packages]
+install = ["git", "vim", "htop"]
+pin = ["vim"]       # installed when missing, skipped by the upgrade; pacman and dnf only
+remove = ["nano"]   # removed after the install when it is installed
+upgrade = true      # upgrade every installed package first
+
+# Root-owned file under /etc, written through sudo on hosts tagged linode.
+[[files]]
+src = "files/motd"
+dest = "/etc/motd"
+mode = "0644"
+tags = ["linode"]
+
+[[services]]
+name = "sshd"
+state = "started"
+enabled = true
+tags = ["linode"]
+
+[[steps]]
+run = "uptime"

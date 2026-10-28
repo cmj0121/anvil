@@ -1,0 +1,5 @@
+packages:
+  install:
+    - git
+steps:
+  - run: hostname

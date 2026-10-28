@@ -64,12 +64,12 @@ macOS 上的執行檔沒有程式碼簽署，也沒有經過 notarization。請�
 
 ```sh
 anvil inventory            # add your hosts (opens $EDITOR, default nvim)
-anvil config               # edit the preferences, packages and steps
+anvil config               # edit the preferences, packages, files, services and steps
 anvil inventory --format=yaml   # edit it as YAML this once; it is still saved as TOML
 anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secrets] says otherwise)
 anvil doctor               # local checks + every target's facts and reachability
 anvil plan                 # the steps apply would run on every target, running none
-anvil apply                # install packages and run the steps on every target
+anvil apply                # install packages, copy files, set services, run the steps
 anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
 anvil tui                  # all of the above in one terminal UI
 ```

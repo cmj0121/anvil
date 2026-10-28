@@ -4,210 +4,92 @@ English | [繁體中文](README.zh-TW.md)
 
 > Setup your env, both for human and agent, in one command.
 
-anvil is a secure, single-binary Rust tool that sets up the local machine and remote hosts from one declarative config,
-for both humans and agents. It is agentless: a target needs only POSIX `sh`, and remote hosts are reached through the
-system OpenSSH client.
+anvil is a secure, single-binary Rust tool that sets up the local machine and remote hosts, for humans and agents.
+It is agentless: a target needs only POSIX `sh`, and remote hosts are reached through the system OpenSSH client.
+An inventory says where (the hosts) and a config says what (packages, files, services, steps), both stored as TOML in
+`$XDG_CONFIG_HOME/anvil` or `~/.config/anvil`.
+
+## How it works
+
+- Apply works in a fixed order on each target: packages, then files, then services, then steps.
+- Rollback undoes files only; packages, services and steps cannot be undone.
+- With no files yet, the inventory is only `local` and the config runs `hostname`, so `doctor` and `apply` already pass.
+
+## Install and use
+
+```sh
+make install               # installs `anvil` into ~/.local/bin
+cargo install --path .     # or: installs `anvil` into ~/.cargo/bin
+make build                 # or: builds target/release/anvil
+```
+
+Requires Rust 1.89 or newer and `ssh` on `PATH`. Pre-built binaries and install options:
+[Getting started](docs/getting-started.md#pre-built-binaries).
+
+```sh
+anvil inventory            # edit the hosts (opens $EDITOR)
+anvil config               # edit the packages, files, services and steps
+anvil secret NAME          # store a secret
+anvil doctor               # every target's facts and reachability
+anvil plan                 # the steps apply would run, running none
+anvil apply                # install packages, copy files, set services, run the steps
+anvil run fix.sh           # run one sh script on every target
+anvil rollback             # put back the files the last apply wrote
+anvil tui                  # all of the above in one terminal UI
+anvil update               # replace the binary with the latest signed release
+```
+
+`--json` prints one document on stdout and logs go to stderr ([Common flags](docs/cli.md#common-flags)); `--parallel N`
+works on up to N targets at once ([Running in parallel](docs/cli.md#running-in-parallel)).
 
 ## Highlights
 
-- **`anvil doctor`** reports each target's facts (OS, distro, package manager, sudo) and whether it is reachable.
-- **`anvil apply`** installs the config's packages with each target's package manager (brew, pacman, apt, dnf, apk),
-  then runs the config's steps. It runs directly, with no prompt. `[packages.alias]` names a package per manager, so
-  `fd` installs as `fd-find` on apt and dnf. `remove` removes packages that are installed, and `pin` keeps a package
-  out of the upgrade on pacman and dnf (brew, apt and apk refuse it).
-- **`[[files]]`** copies a text file onto each selected target whose tags and facts match, after the package step and
-  before `[[steps]]`. The write goes through sudo unless the entry sets `sudo = false`, and a rerun with the same bytes
-  prints `unchanged`. The file's bytes are never printed, not in the output and not in `--json`.
-- **`[[services]]`** starts or stops a service, and enables or disables it, on each selected target whose tags and
-  facts match, after the files and before `[[steps]]`. It uses the target's init: systemd, OpenRC on Alpine, or launchd
-  on macOS. It changes only what differs, so a rerun prints `unchanged service NAME`.
-- **`anvil rollback`** puts back the files the last apply wrote: each dest gets its previous text, mode and owner
-  back, and a dest that did not exist before is removed. A dest changed since that apply is refused unless
-  `--force DEST`. A file whose previous text was not kept (binary, over 256 KiB, `rollback = false`, …) shows as
-  `cannot undo: DEST (REASON)`, and the owner comes back only on a root write. Packages, services and steps cannot be
-  undone; rollback lists them as `cannot undo: …`. The record
-  is `last-apply.json` in `$XDG_STATE_HOME/anvil` (mode 0600, plain text), never beside the config
-  ([anvil rollback](docs/cli.md#anvil-rollback)).
-- **`anvil plan`** shows the steps apply would run on each target and runs none of them; `--json` marks the document
-  `"executed": false`.
-- **`anvil run FILE`** (or `-` for stdin) runs one ad-hoc POSIX sh script on every target, with apply's output,
-  `--json` and exit codes. It loads no config, asks for no confirmation and types no sudo password.
-- **Plugin steps**: a step can name a plugin, a program on the controller pinned by its path and sha256, that reads
-  the target's facts as JSON and replies with the sh script to run there. It gets a cleared environment and no secrets.
-- **Drift is a plugin, not a command**: there is no `anvil audit`. Pin a plugin with `on = "doctor"` and `anvil doctor`
-  reports what changed on each target since the last apply: a fact (`kernel was 6.1, now 6.2`) or a file the apply
-  wrote (`/etc/app.conf was written, now changed`). The reference plugin, `anvil-audit`, is built from source with
-  `make audit-plugin`. It sees facts, dests and per-run tags in place of hashes, never a file's bytes or a secret; drift
-  exits 1, as an unreachable target does
+- Packages on brew, pacman, apt, dnf and apk, with per-manager aliases, pin and remove ([Packages](docs/packages.md)).
+- Files, services and steps, each matched per target by tags and facts ([Configuration](docs/configuration.md)).
+- Plugins write a step's script; drift is a doctor plugin, not a command
   ([Doctor plugins](docs/cli.md#doctor-plugins-drift-since-the-last-apply)).
-- **Secrets** live in the macOS keychain, an age file or a sops file, and `anvil secret --migrate` moves them between
-  backends.
-- **`--parallel N`** lets apply, plan, run and rollback work on up to N targets at once (1..=32, default 1). Output and
-  `--json` stay in inventory order, and Ctrl-C lets the running steps finish; a second Ctrl-C stops at once
-  ([Running in parallel](docs/cli.md#running-in-parallel)).
-- **Terminal UI**: `anvil tui` runs every command in one screen and keeps the session's results for browsing.
-- **`anvil update`** replaces the binary with the latest release after checking its `.sha256` and its `.minisig`
-  signature against a public key compiled into anvil, and keeps the previous binary as `anvil.prev`. The keys are
-  compiled in only once the project owner adds them; until then `anvil update` reports `no release key compiled in`.
-- **Built for agents**: `--json` prints one parseable document on stdout; logs go to stderr only.
-- **Secure by default**: host keys are never auto-accepted, sudo passwords never reach argv, the environment or a log,
-  and secrets are written to disk only encrypted, apart from the private editor temp file while you edit one. The
-  apply record keeps the previous text of each file apply replaced, unencrypted at mode 0600; `rollback = false` on a
-  `[[files]]` entry keeps only its hash ([Security notes](docs/security.md)).
+- Secrets in the keychain, age or sops; host keys never auto-accepted; signed updates ([Security notes](docs/security.md)).
 
-## Install
+## Minimal example
 
-Requires Rust 1.89 or newer and the OpenSSH client (`ssh` on `PATH`).
-
-```sh
-make install               # installs `anvil` into ~/.local/bin (PREFIX= to change)
-# or
-cargo install --path .     # installs `anvil` into ~/.cargo/bin
-# or
-make build                 # builds target/release/anvil
-```
-
-Pre-built binaries: see [Getting started](docs/getting-started.md#pre-built-binaries).
-
-## Quick start
-
-```sh
-anvil inventory            # add your hosts (opens $EDITOR, default nvim)
-anvil config               # edit the preferences, packages, files, services and steps
-anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secrets] says otherwise)
-anvil doctor               # local checks + every target's facts and reachability
-anvil plan                 # the steps apply would run on every target, running none
-anvil apply                # install packages, copy files, set services, run the steps
-anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
-anvil rollback --dry-run   # what rollback would put back; `anvil rollback` restores the last apply's files
-anvil --parallel 4 apply   # apply on up to 4 targets at once
-anvil tui                  # all of the above in one terminal UI
-anvil update --check       # is a newer release out? `anvil update` installs it
-```
-
-A config that installs `fd` on every target, as `fd-find` where apt or dnf is the manager
-([Aliases](docs/packages.md#aliases)):
+<!-- example:minimal -->
 
 ```toml
-[packages]
-install = ["fd"]
-
-[packages.alias.fd]
-apt = "fd-find"
-dnf = "fd-find"
+[hosts.web1]
+host = "203.0.113.10"
+user = "deploy"
 ```
-
-A config that keeps `vim` at its version and removes `nano`
-([Pin and remove](docs/packages.md#pin-and-remove)); on brew, apt or apk the pin fails the target with
-`packages: pin is not one-shot on apt: vim`:
 
 ```toml
 [packages]
 install = ["git"]
-pin = ["vim"]
-remove = ["nano"]
-upgrade = true
-```
-
-A file copied onto each selected target that carries the tag `linode` and whose `distro` fact is `arch`
-([Files](docs/configuration.md#files)). `mode` is required and quoted. The bytes are not printed
-([File steps](docs/cli.md#file-steps)):
-
-```toml
-[[files]]
-src = "files/sshd_config"      # beside the config file
-dest = "/etc/ssh/sshd_config"  # absolute path on the target
-mode = "0644"
-tags = ["linode"]              # every listed tag; omit to skip the tag check
-facts = { distro = "arch" }    # each value equals that fact; omit to skip it
-```
-
-A service started and enabled at boot on each selected target that carries the tag `linode`
-([Services](docs/configuration.md#services)). The init comes from the target's `distro` fact; a distro with no known
-init fails a target that some entry matches with ``services: no init known for distro `gentoo` `` ([Service steps](docs/cli.md#service-steps)):
-
-| `distro`                                                                   | Init    |
-| -------------------------------------------------------------------------- | ------- |
-| `macos`                                                                    | launchd |
-| `alpine`                                                                   | OpenRC  |
-| a pacman, apt or dnf distro: `arch`, `debian`, `ubuntu`, `fedora` and more | systemd |
-
-```toml
-[[services]]
-name = "sshd"                  # the systemd unit, OpenRC service or launchd label
-state = "started"              # started | stopped
-enabled = true                 # optional; omit to leave enablement alone
-tags = ["linode"]
-```
-
-A step whose script comes from a plugin ([Plugin steps](docs/cli.md#plugin-steps)). anvil runs only the file the
-config names, and only when it is yours, writable by no one else, in a directory no one else can write, and its bytes
-hash to `sha256` (`shasum -a 256 FILE`, or `sha256sum FILE`); anything else is exit 2 before any target is contacted:
-
-```toml
-[plugins.harden]
-path = "~/.config/anvil/plugins/harden"
-sha256 = "…"                 # 64 lowercase hex digits
 
 [[steps]]
-plugin = "harden"
-args = { profile = "ssh" }
+run = "hostname"
 ```
 
-For each target the plugin runs on the controller, with no arguments, in its own directory, with only `PATH`, `HOME`,
-`TMPDIR`, `LANG` and the `LC_ALL`, `LC_CTYPE`, `LC_COLLATE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC` and `LC_TIME`
-locale variables of the environment. It reads one JSON line on stdin (shown on several lines below) and
-prints one JSON document; the script runs on the target as a step, and `anvil plan` shows it as
-`would $ … (from plugin harden)`:
-
-```json
-{
-  "target": "linode1",
-  "facts": { "distro": "arch", "pkg": "pacman" },
-  "tags": ["linode"],
-  "args": { "profile": "ssh" }
-}
-```
-
-```json
-{ "script": "sshd -t && systemctl reload sshd" }
-```
-
-`anvil plan` runs the plugin too, so a plugin must have no side effects. It is pinned, not sandboxed: it runs as you,
-and the pin covers only the file's bytes ([Security notes](docs/security.md)).
-
-Drift since the last apply comes from a doctor plugin, not a command. Build the reference one, `anvil-audit`, from a
-checkout, pin it with `on = "doctor"`, and `anvil doctor` lists each change under its target, exiting 1 on drift
-([Doctor plugins](docs/cli.md#doctor-plugins-drift-since-the-last-apply)):
+`examples/minimal/inventory.toml` holds one ssh host and `config.toml` installs `git` and runs `hostname`. Try them on
+this machine only (`local` is always present and never an entry; `plan` runs nothing):
 
 ```sh
-make audit-plugin                    # prints target/release/anvil-audit and its sha256
-install -d -m 0700 ~/.config/anvil/plugins
-install -m 0700 target/release/anvil-audit ~/.config/anvil/plugins/audit
+anvil --inventory examples/minimal/inventory.toml --config examples/minimal/config.toml --target local plan
 ```
 
-```toml
-[plugins.audit]
-path = "~/.config/anvil/plugins/audit"
-sha256 = "…"                 # the sha256 make audit-plugin printed
-on = "doctor"
-```
+[examples/](examples/) has more scenarios, each in TOML and YAML.
 
-```text
-  audit           drift: kernel was 6.1, now 6.2
-  audit           drift: /etc/app.conf was written, now changed
-```
-
-The `sudo` fact is neither compared nor shown as drift. A file a rollback put back, and root-only files on a target
-where `sudo -n` was refused or asks for a password, are not compared; doctor counts and shows them instead.
-
-## Documentation
+## Learn more
 
 - [Getting started](docs/getting-started.md): install, first run and sample output
-- [Configuration](docs/configuration.md): the inventory and config files
-- [Packages](docs/packages.md): package managers, root and sudo
-- [Secrets](docs/secrets.md): the keychain, age and sops backends and migration
-- [Terminal UI](docs/tui.md): the screen and its keys
+- [Configuration](docs/configuration.md): every key of the inventory and the config
 - [Command line](docs/cli.md): every command, flag, exit code and the JSON output
-- [Security notes](docs/security.md): what to know about files, terminals and secrets
-- [Development](docs/development.md): tests and the end-to-end suite
+- [All docs](docs/README.md): the learning path through the rest
+
+## License
+
+| Part                                             | License          | What it means                                        |
+| ------------------------------------------------ | ---------------- | ---------------------------------------------------- |
+| The tool you run (`src/`, `tests/`, build files) | GPL-3.0-or-later | Convey it, modified or not, and you offer its source |
+| Examples, reference plugin, docs, these READMEs  | MIT              | Copy freely; keep the MIT notice and copyright       |
+
+Using anvil places no license on your inventory, config, scripts or machines.
+See [LICENSE](LICENSE) for the full split and the license texts.

@@ -1,0 +1,28 @@
+# Licensing
+
+anvil is licensed in two layers. One question decides which applies:
+
+> **Do you run it, or copy or read it?**
+
+| You…                                                  | Covers                                                                                                        | License          |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ---------------- |
+| **run it**: the tool                                  | `src/`, `tests/` (incl. `tests/fixtures/`), `Makefile`, `Cargo.toml`, `Cargo.lock`, `.github/`, root dotfiles | GPL-3.0-or-later |
+| **copy or read it**: examples, reference plugin, docs | `examples/`, `plugins/anvil-audit/`, `docs/`, `README.md`, `README.zh-TW.md`                                  | MIT              |
+
+Full texts are in [`LICENSES/`](LICENSES).
+
+**Your setup is yours.** Using anvil places no license on your inventory, config, scripts or machines.
+
+**Conveying anvil carries GPL's duty.** Whoever conveys anvil, modified or not, must offer anvil's source.
+For an unmodified build, pointing at this repository can satisfy this, while the matching source stays available here.
+
+**Copy the examples freely.** The examples, the reference plugin and the docs are MIT: copy them into your own
+setup or plugin; keep the MIT copyright and permission notice, with no further obligation.
+
+**Contributions** are offered under the layer they land in. There is no separate contributor agreement.
+
+**The name.** These licenses grant rights to the code and the documents; no trademark or name is granted.
+
+---
+
+Copyright (c) 2026 cmj

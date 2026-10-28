@@ -1,0 +1,21 @@
+packages:
+  install:
+    - git
+    - fd
+    - ripgrep
+  # apt and dnf ship fd as fd-find; brew, pacman and apk use the plain name.
+  alias:
+    fd:
+      apt: fd-find
+      dnf: fd-find
+# A dotfile for the user anvil connects as: no sudo, so dest is under that home.
+# Change dest to your own home directory before you apply it.
+files:
+  - src: files/gitignore
+    dest: /home/dev/.config/git/ignore
+    mode: "0644"
+    tags:
+      - local
+    sudo: false
+steps:
+  - run: git --version

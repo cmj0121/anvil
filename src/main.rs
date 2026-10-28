@@ -7,6 +7,8 @@ mod config;
 mod doctor;
 mod document;
 mod editor;
+#[cfg(test)]
+mod examples;
 mod facts;
 mod fanout;
 mod files;

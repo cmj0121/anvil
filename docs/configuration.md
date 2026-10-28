@@ -4,6 +4,8 @@ English | [繁體中文](configuration.zh-TW.md)
 
 ## Quick look
 
+For complete scenarios to copy and try, see [examples/](../examples/).
+
 ### `inventory.toml`
 
 `~/.config/anvil/inventory.toml` (or `$XDG_CONFIG_HOME/anvil/`):

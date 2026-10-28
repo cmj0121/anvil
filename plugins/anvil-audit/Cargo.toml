@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "The reference on = \"doctor\" plugin: drift since anvil's last apply."
+license = "MIT"
 publish = false
 
 [dependencies]
