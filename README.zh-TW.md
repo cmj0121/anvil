@@ -202,3 +202,13 @@ on = "doctor"
 - [命令列](docs/cli.zh-TW.md)：每個指令、旗標、結束碼與 JSON 輸出
 - [安全須知](docs/security.zh-TW.md)：關於檔案、終端機與 secret 的注意事項
 - [開發](docs/development.zh-TW.md)：測試與端對端測試套件
+
+## 授權
+
+| 部分                                     | 授權             | 代表什麼                                 |
+| ---------------------------------------- | ---------------- | ---------------------------------------- |
+| 你執行的工具（`src/`、`tests/`、建置檔） | GPL-3.0-or-later | 散布 anvil（無論是否修改）須提供其原始碼 |
+| 範例、參考 plugin、文件與這兩份 README   | MIT              | 可自由複製；保留 MIT 聲明與版權即可      |
+
+使用 anvil 不會對你的 inventory、config、腳本或機器加上任何授權。
+完整劃分與授權全文見 [LICENSE](LICENSE)。

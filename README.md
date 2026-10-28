@@ -211,3 +211,13 @@ where `sudo -n` was refused or asks for a password, are not compared; doctor cou
 - [Command line](docs/cli.md): every command, flag, exit code and the JSON output
 - [Security notes](docs/security.md): what to know about files, terminals and secrets
 - [Development](docs/development.md): tests and the end-to-end suite
+
+## License
+
+| Part                                             | License          | What it means                                        |
+| ------------------------------------------------ | ---------------- | ---------------------------------------------------- |
+| The tool you run (`src/`, `tests/`, build files) | GPL-3.0-or-later | Convey it, modified or not, and you offer its source |
+| Examples, reference plugin, docs, these READMEs  | MIT              | Copy freely; keep the MIT notice and copyright       |
+
+Using anvil places no license on your inventory, config, scripts or machines.
+See [LICENSE](LICENSE) for the full split and the license texts.
