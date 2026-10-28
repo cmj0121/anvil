@@ -223,6 +223,67 @@ fn b_rolls_back_after_y_and_words_a_conflict_for_the_tui() {
     assert_eq!(fs::read_to_string(&dest).unwrap(), "edited by hand\n");
 }
 
+#[test]
+fn the_files_browser_previews_edits_and_deletes_a_store_file() {
+    if !python() {
+        return;
+    }
+    let sandbox = tui_sandbox("");
+    let store = sandbox.config_dir().join("files");
+    fs::create_dir_all(store.join("etc")).unwrap();
+    fs::write(store.join("etc/motd.txt"), "old-motd\n").unwrap();
+    let content = sandbox.root().join("motd.new");
+    fs::write(&content, "new-motd\n").unwrap();
+
+    let transcript = drive(
+        &sandbox,
+        &[("FAKE_EDITOR_CONTENT", content.to_str().unwrap())],
+        &[
+            "--entries",
+            "2",
+            "--main",
+            &format!("^{MARKER} .*\\.txt$"),
+            "--wait",
+            r"targets: all \(1\)",
+            "--send",
+            "F",
+            "--wait",
+            r"Files \$/",
+            "--send",
+            "\\r",
+            "--wait",
+            r"Files \$/etc",
+            "--send",
+            "j",
+            "--wait",
+            "old-motd",
+            "--send",
+            "e",
+            "--wait",
+            r"wrote \$/etc/motd\.txt",
+            "--wait",
+            "new-motd",
+            "--send",
+            "D",
+            "--wait",
+            r"delete \$/etc/motd\.txt\?",
+            "--send",
+            "y",
+            "--wait",
+            r"removed \$/etc/motd\.txt",
+            "--send",
+            "q",
+            "--wait",
+            r"targets: all \(1\)",
+            "--send",
+            "q",
+        ],
+    );
+    assert!(transcript.contains("rm $/etc/motd.txt"), "{transcript}");
+    assert!(!store.join("etc/motd.txt").exists());
+    assert!(store.join("etc").is_dir());
+}
+
 /// `text` as a Python regex matching it literally.
 fn regex_escape(text: &str) -> String {
     text.chars()

@@ -1,8 +1,9 @@
-//! Draws [`App`]: the header, Steps on the left, Results on the right, an
-//! optional log pane, the status bar and the overlays (help, the secret
-//! NAME prompt, the migrate choice, the options, the targets, the run and
-//! update confirmations). Host and
-//! config text is escaped before it is drawn.
+//! Draws [`App`]: the header, Steps on the left, Results on the right (or
+//! the files browser over both), an optional log pane, the status bar and
+//! the overlays (help, the secret NAME prompt, the migrate choice, the
+//! options, the targets, the run, rollback, update and delete
+//! confirmations). Host, config and file text is escaped before it is
+//! drawn.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -11,9 +12,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use super::app::{
-    self, App, BACKENDS, OPTION_FLAGS, Overlay, Pane, RunKind, RunResult, Running, Slot,
+    self, App, BACKENDS, FilesView, OPTION_FLAGS, Overlay, Pane, RunKind, RunResult, Running, Slot,
 };
 use crate::doctor::{self, RowKind, SecretStatus};
+use crate::filestore::{self, Kind};
 use crate::logger::escape_controls;
 use crate::plan::{self, PlanReport};
 use crate::secret;
@@ -33,6 +35,19 @@ const STATUS_KEYS: &[&str] = &[
     "←→ target",
     "? help",
 ];
+
+/// The status bar's keys while the files browser is open.
+const FILES_STATUS_KEYS: &[&str] = &[
+    "↑↓ move",
+    "Enter open",
+    "⌫ up",
+    "e edit",
+    "D delete",
+    "Esc close",
+];
+
+/// What the store's empty root says.
+const EMPTY_STORE: &str = "(empty — anvil files cp FILE $/ to add)";
 
 /// The `?` overlay: one row per group of `(key, what)` pairs. Every key
 /// [`App::on_key`] handles is listed once.
@@ -66,6 +81,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("c", "config"),
             ("s", "secret"),
             ("m", "migrate"),
+            ("F", "files"),
         ],
     ),
     (
@@ -84,6 +100,22 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
+/// The help overlay's last rows: the keys of the files browser, which
+/// [`App::on_key`] handles only while it is open.
+const FILES_HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Browser",
+        &[
+            ("↑↓/jk", "move"),
+            ("Enter/→/l", "open"),
+            ("⌫/←/h", "up"),
+            ("r", "reload"),
+            ("Esc/F/q", "close"),
+        ],
+    ),
+    ("Entry", &[("e", "edit"), ("D", "delete")]),
+];
+
 pub fn draw(app: &App, f: &mut Frame) {
     let log_rows = if app.show_log { LOG_ROWS } else { 0 };
     let [header, main, log, status] = Layout::vertical([
@@ -96,8 +128,13 @@ pub fn draw(app: &App, f: &mut Frame) {
     let [left, right] =
         Layout::horizontal([Constraint::Length(LEFT_WIDTH), Constraint::Min(0)]).areas(main);
     f.render_widget(Paragraph::new(header_line(app, header.width)), header);
-    draw_steps(app, f, left);
-    draw_results(app, f, right);
+    match &app.files {
+        Some(view) => draw_files(view, f, left, right),
+        None => {
+            draw_steps(app, f, left);
+            draw_results(app, f, right);
+        }
+    }
     if app.show_log {
         draw_log(app, f, log);
     }
@@ -112,6 +149,7 @@ pub fn draw(app: &App, f: &mut Frame) {
         Some(Overlay::Confirm { targets }) => draw_confirm(f, targets),
         Some(Overlay::ConfirmRollback { targets }) => draw_confirm_rollback(f, targets),
         Some(Overlay::ConfirmUpdate { version }) => draw_confirm_update(f, version),
+        Some(Overlay::ConfirmDelete { path }) => draw_confirm_delete(f, path),
     }
 }
 
@@ -198,8 +236,9 @@ fn header_line(app: &App, width: u16) -> Line<'static> {
     spread(spans, right, width)
 }
 
-/// The notice, else the restart notice once `u` updated anvil, else an
-/// update's spinner, else the keys that fit; `-v N · <format>` on the right.
+/// The notice, else the files browser's error, else the restart notice
+/// once `u` updated anvil, else an update's spinner, else the keys that fit
+/// (the browser's while it is open); `-v N · <format>` on the right.
 fn status_line(app: &App, width: u16) -> Line<'static> {
     let format = app
         .edit_format
@@ -209,19 +248,26 @@ fn status_line(app: &App, width: u16) -> Line<'static> {
         secondary(),
     )];
     let update = app.running.as_ref().filter(|r| r.kind == RunKind::Update);
-    let left = match (&app.notice, &app.updated, update) {
+    let files_error = app.files.as_ref().and_then(|view| view.error.as_ref());
+    let left = match (&app.notice, files_error, &app.updated, update) {
         (Some(notice), ..) => Span::styled(format!(" {}", text(notice)), Color::Yellow),
-        (None, Some(version), _) => Span::styled(
+        (None, Some(err), ..) => Span::styled(format!(" {}", text(err)), Color::Red),
+        (None, None, Some(version), _) => Span::styled(
             format!(" {}", text(&app::restart_notice(version))),
             Color::Yellow,
         ),
-        (None, None, Some(running)) => {
+        (None, None, None, Some(running)) => {
             Span::styled(format!(" {}", spinner_text(running)), Color::Cyan)
         }
-        (None, None, None) => {
+        (None, None, None, None) => {
             let room = usize::from(width).saturating_sub(spans_width(&right) + 1);
             let mut keys = String::new();
-            for key in STATUS_KEYS {
+            let shown = if app.files.is_some() {
+                FILES_STATUS_KEYS
+            } else {
+                STATUS_KEYS
+            };
+            for key in shown {
                 let next = format!("{keys} {key}");
                 if cols(&next) > room {
                     break;
@@ -1041,6 +1087,7 @@ fn log_level_style(level: log::Level) -> Style {
 fn draw_help(app: &App, f: &mut Frame) {
     let lines: Vec<Line> = HELP
         .iter()
+        .chain(FILES_HELP)
         .map(|(group, keys)| {
             let mut spans = vec![Span::styled(format!(" {group:<8}"), heading())];
             for (key, what) in *keys {
@@ -1189,6 +1236,70 @@ fn draw_confirm_update(f: &mut Frame, version: &str) {
     popup(f, "Update", fitted_width(f, &lines), lines);
 }
 
+/// `D`'s question, the path escaped; as wide as it is, up to the screen.
+/// Only `y` answers it, so Enter is not offered.
+fn draw_confirm_delete(f: &mut Frame, path: &str) {
+    let lines = vec![
+        Line::from(format!(" delete {}{}?", filestore::PREFIX, text(path))),
+        Line::from(" a folder goes with all it holds").style(secondary()),
+        Line::from(" y delete · n/Esc cancel").style(secondary()),
+    ];
+    popup(f, "Delete", fitted_width(f, &lines), lines);
+}
+
+/// The browser: `Files $/<dir>` on the left, `..` first below the root,
+/// folders suffixed `/`, the cursor row marked `▶`; the cursor file's text
+/// on the right under its name, or what the row is.
+fn draw_files(view: &FilesView, f: &mut Frame, left: Rect, right: Rect) {
+    let title = format!("Files {}{}", filestore::PREFIX, text(&view.dir));
+    let room = usize::from(left.width.saturating_sub(2)).saturating_sub(1);
+    let mut names: Vec<String> = Vec::new();
+    if view.has_parent() {
+        names.push("..".to_owned());
+    }
+    names.extend(view.entries.iter().map(|entry| {
+        let suffix = if entry.kind == Kind::Dir { "/" } else { "" };
+        format!("{}{suffix}", text(app::entry_name(entry)))
+    }));
+    let lines: Vec<Line> = if names.is_empty() && !view.has_parent() {
+        vec![Line::from(EMPTY_STORE).style(secondary())]
+    } else {
+        names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let at = i == view.cursor;
+                let style = if at { cursor_style() } else { Style::default() };
+                Line::from(vec![
+                    Span::styled(if at { "▶" } else { " " }, style),
+                    Span::styled(ellipsize(&name, room), style),
+                ])
+            })
+            .collect()
+    };
+    let skip = (view.cursor + 1).saturating_sub(usize::from(left.height.saturating_sub(2)));
+    let scroll = u16::try_from(skip).unwrap_or(u16::MAX);
+    let list = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0))
+        .block(block(&title, true));
+    f.render_widget(list, left);
+
+    let title = match view.selected() {
+        Some(entry) => text(app::entry_name(entry)),
+        None if view.has_parent() => "..".to_owned(),
+        None => String::new(),
+    };
+    let body = match &view.preview {
+        Ok(contents) => Text::from(text(contents)),
+        Err(why) => Text::from(text(why)).style(secondary()),
+    };
+    let preview = Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .block(block(&title, false));
+    f.render_widget(preview, right);
+}
+
 /// A popup as wide as its widest line and its border, up to the screen.
 fn fitted_width(f: &Frame, lines: &[Line]) -> u16 {
     let widest = lines.iter().map(Line::width).max().unwrap_or(0);
@@ -1235,7 +1346,7 @@ mod tests {
     use crossterm::event::KeyCode;
 
     use crate::tui::app::tests::{
-        app, cancelled, inventory, local_report, opts, probed, ran, row as step_row, step,
+        Store, app, cancelled, inventory, local_report, opts, probed, ran, row as step_row, step,
     };
     use crate::tui::app::{LogLine, Msg, RunKind, RunResult, Running};
 
@@ -2020,22 +2131,24 @@ mod tests {
         app.overlay = Some(Overlay::Help);
         let screen = render(&app, 80, 24);
         assert_eq!(
-            screen[8..17],
+            screen[7..18],
             [
                 "│ ┌Help──────────────────────────────────────────────────────────────────────┐ │",
                 "│ │ Run      a apply  p plan  d doctor  x run script  b rollback  Esc cancel │ │",
                 "│ │ Targets  t pick  Space select                                            │ │",
                 "│ │ Move     ↑↓/jk step/scroll  ←→ target  Enter go to step  Tab focus       │ │",
                 "│ │ History  [ ] run                                                         │ │",
-                "│ │ Edit     i inventory  c config  s secret  m migrate                      │ │",
+                "│ │ Edit     i inventory  c config  s secret  m migrate  F files             │ │",
                 "│ │ Options  f format  o paths  +/- log                                      │ │",
                 "│ │ App      l log  r reload  u update  ? help  q/^C quit                    │ │",
+                "│ │ Browser  ↑↓/jk move  Enter/→/l open  ⌫/←/h up  r reload  Esc/F/q close   │ │",
+                "│ │ Entry    e edit  D delete                                                │ │",
                 "│ └──────────────────────────────────────────────────────────────────────────┘ │",
             ]
         );
         let buf = buffer(&app, 80, 24);
-        assert_eq!(buf[(4, 9)].fg, Color::Cyan, "the group name");
-        assert_eq!(buf[(13, 9)].fg, Color::LightBlue, "a key");
+        assert_eq!(buf[(4, 8)].fg, Color::Cyan, "the group name");
+        assert_eq!(buf[(13, 8)].fg, Color::LightBlue, "a key");
         let (x, y) = find(&buf, 80, 24, "u update");
         assert_eq!(buf[(x, y)].fg, Color::LightBlue);
         assert_eq!(buf[(x + 2, y)].fg, Color::Reset);
@@ -2044,7 +2157,7 @@ mod tests {
         let buf = buffer(&app, 80, 24);
         assert_eq!(buf[(x, y)].fg, Color::DarkGray);
         assert_eq!(buf[(x + 2, y)].fg, Color::DarkGray);
-        assert_eq!(buf[(13, 9)].fg, Color::LightBlue, "the other keys stay");
+        assert_eq!(buf[(13, 8)].fg, Color::LightBlue, "the other keys stay");
     }
 
     #[test]
@@ -3232,6 +3345,140 @@ mod tests {
                     Some(Color::Red)
                 ),
                 ("  record          found".to_owned(), None),
+            ]
+        );
+    }
+
+    /// The browser key that stands for `code`.
+    fn files_help_key(code: KeyCode) -> String {
+        match code {
+            KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k') => "↑↓/jk".to_owned(),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => "Enter/→/l".to_owned(),
+            KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => "⌫/←/h".to_owned(),
+            KeyCode::Esc | KeyCode::Char('F' | 'q') => "Esc/F/q".to_owned(),
+            code => help_key(code),
+        }
+    }
+
+    #[test]
+    fn help_lists_every_key_the_browser_handles_once() {
+        let listed: Vec<&str> = FILES_HELP
+            .iter()
+            .flat_map(|(_, keys)| keys.iter().map(|(key, _)| *key))
+            .chain(["?"])
+            .collect();
+        let mut once = listed.clone();
+        once.sort_unstable();
+        once.dedup();
+        assert_eq!(once.len(), listed.len(), "a key listed twice: {listed:?}");
+        let mut store = Store::new("help", &[("a/b.txt", "")]);
+        let specials = [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Enter,
+            KeyCode::Backspace,
+            KeyCode::Tab,
+            KeyCode::Esc,
+        ];
+        for code in (' '..='~').map(KeyCode::Char).chain(specials) {
+            let app = &mut store.app;
+            (app.files, app.overlay) = (None, None);
+            for open in [KeyCode::Char('F'), KeyCode::Enter, KeyCode::Down] {
+                app.on_key(crossterm::event::KeyEvent::new(
+                    open,
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+            }
+            let handled = !app
+                .on_key(crossterm::event::KeyEvent::new(
+                    code,
+                    crossterm::event::KeyModifiers::NONE,
+                ))
+                .is_empty();
+            assert_eq!(
+                handled,
+                listed.contains(&files_help_key(code).as_str()),
+                "{code} handled: {handled}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_browser_lists_the_folder_and_previews_the_cursor_file() {
+        let mut store = Store::new(
+            "draw",
+            &[("etc/motd.txt", "hello\x1b[2J\nworld\n"), ("etc/sub/", "")],
+        );
+        let app = &mut store.app;
+        press(app, KeyCode::Char('F'));
+        assert_eq!(
+            render(app, 60, 7),
+            [
+                " anvil · targets: all (3)",
+                "┌Files $/──────────────────┐┌etc───────────────────────────┐",
+                "│▶etc/                     ││folder                        │",
+                "│                          ││                              │",
+                "│                          ││                              │",
+                "└──────────────────────────┘└──────────────────────────────┘",
+                " ↑↓ move · Enter open · ⌫ up · e edit        -v 0 · default",
+            ]
+        );
+        press(app, KeyCode::Enter);
+        press(app, KeyCode::Down);
+        press(app, KeyCode::Down);
+        let screen = render(app, 60, 7);
+        assert_eq!(
+            screen[1..6],
+            [
+                "┌Files $/etc───────────────┐┌motd.txt──────────────────────┐",
+                "│ ..                       ││hello\\x1b[2J                  │",
+                "│ sub/                     ││world                         │",
+                "│▶motd.txt                 ││                              │",
+                "└──────────────────────────┘└──────────────────────────────┘",
+            ]
+        );
+        let buf = buffer(app, 60, 7);
+        assert_eq!(buf[(1, 4)].fg, Color::LightBlue, "the cursor row");
+        assert_eq!(buf[(0, 1)].fg, Color::LightBlue, "the list has the focus");
+    }
+
+    #[test]
+    fn an_empty_store_says_how_to_add_a_file() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('F'));
+        assert_eq!(
+            render(&app, 80, 6)[1..5],
+            [
+                "┌Files $/──────────────────┐┌──────────────────────────────────────────────────┐",
+                "│(empty — anvil files cp   ││                                                  │",
+                "│FILE $/ to add)           ││                                                  │",
+                "└──────────────────────────┘└──────────────────────────────────────────────────┘",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_browser_error_is_red_in_the_status_bar_and_the_delete_asks_y_only() {
+        let mut store = Store::new("confirm", &[("k\x1b.txt", "")]);
+        let app = &mut store.app;
+        press(app, KeyCode::Char('F'));
+        app.files.as_mut().unwrap().error = Some("$/k: not found".to_owned());
+        let screen = render(app, 60, 8);
+        assert!(screen[7].starts_with(" $/k: not found "), "{}", screen[7]);
+        let buf = buffer(app, 60, 8);
+        assert_eq!(buf[(1, 7)].fg, Color::Red);
+        press(app, KeyCode::Char('D'));
+        let screen = render(app, 60, 8);
+        assert_eq!(
+            screen[2..7],
+            [
+                "│▶k\\x1b.txt  ┌Delete───────────────────────────┐           │",
+                "│            │ delete $/k\\x1b.txt?             │           │",
+                "│            │ a folder goes with all it holds │           │",
+                "│            │ y delete · n/Esc cancel         │           │",
+                "└────────────└─────────────────────────────────┘───────────┘",
             ]
         );
     }

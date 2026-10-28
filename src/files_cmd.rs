@@ -108,7 +108,8 @@ pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failur
             return Ok(());
         }
         FilesAction::Edit { path } => {
-            if edit(opts, &root, path)? {
+            let config = opts.load_config()?;
+            if edit(&root, path, config.anvil.editor.as_deref())? {
                 vec![shown(&filestore::parse(path)?)]
             } else {
                 Vec::new()
@@ -121,16 +122,16 @@ pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failur
     Ok(())
 }
 
-/// Edits a store file, returning whether its bytes changed.
-pub fn edit(opts: &Options, root: &Root, path: &str) -> Result<bool, Failure> {
+/// Edits a store file in the editor `preference` names (else the
+/// environment's), a missing one as empty; whether its bytes changed.
+pub fn edit(root: &Root, path: &str, preference: Option<&str>) -> Result<bool, Failure> {
     let resolved = root.resolve(path)?;
     let initial = match root.read_text(path) {
         Ok(text) => text,
         Err(StoreError::NotFound(_)) => String::new(),
         Err(err) => return Err(err.into()),
     };
-    let config = opts.load_config()?;
-    let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Lenient)?;
+    let editor = Editor::resolve(preference, Fallback::Lenient)?;
     let ext = resolved
         .extension()
         .and_then(|s| s.to_str())
