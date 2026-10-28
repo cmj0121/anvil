@@ -266,10 +266,10 @@ mode. Exit 2:
 - ``files[0].dest `/etc/`: must not end with /``
 - ``files[0].dest `/aaa…`: 4097 bytes exceeds the 4096 byte limit`` (the quoted path is the first 64 characters plus `…`)
 
-**`src`.** Unless it starts with `$/`, a path relative to the directory of the config file, not shell-expanded:
-`~/a` is a directory whose name is `~`, and `..` is allowed at this check. Absolute, empty, or containing a NUL byte is exit 2 with
-``files[0].src `/etc/motd`: must be relative to the config directory``. `apply` and `plan` (and the TUI's `a` and `p`)
-then resolve `..` and symlinks and read the file, before any target. The resolved path must stay inside the config
+**`src`.** Unless it starts with `$/`, a path relative to the directory of the config file, not shell-expanded: `~/a` is
+a directory whose name is `~`, and `..` is allowed at this check. Absolute, empty, or containing a NUL byte is exit 2
+with ``files[0].src `/etc/motd`: must be relative to the config directory``. `apply` and `plan` (and the TUI's `a` and
+`p`) then resolve `..` and symlinks and read the file, before any target. The resolved path must stay inside the config
 directory: ``files[0].src `../outside`: leaves the config directory``, and the same for a symlink inside the directory
 whose target is outside it. That check guards against a mistake (a stray `..`, a symlink that points the wrong way). It
 is not a security boundary: someone who can edit the config can already put the file in that directory. The path must
@@ -277,7 +277,7 @@ name a regular file. A missing file is ``files[0].src `missing`: cannot read: RE
 REASON; a directory is ``files[0].src `sub`: is not a regular file``. `anvil config`, `anvil doctor`, `anvil inventory`
 and `anvil secret` check the syntax only, so a missing src does not break them, and `anvil run` does not load the config.
 
-A `src` starting with `$/` instead reads the file store: `$/sub/motd` means
+A `src` starting with `$/` instead reads the [file store](cli.md#anvil-files): `$/sub/motd` means
 `<config_dir>/files/sub/motd`, even when `--config` points elsewhere. This replaces the old meaning of a literal
 `$` directory beside the config. Store paths reject absolute paths, NUL, and `.` or `..` components; repeated `/`
 separators collapse. Every existing component, including the store root, must not be a symlink. Invalid paths and

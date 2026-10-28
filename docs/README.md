@@ -11,7 +11,7 @@ Read the first five in order on your first day; the rest you look up. For copy-p
 - [Configuration](configuration.md): every key of the inventory and the config, with files, services and plugins.
 - [Packages](packages.md): which manager a target uses, aliases, pin and remove, and how root and sudo work.
 - [Secrets](secrets.md): the keychain, age and sops backends, and moving secrets between them.
-- [Terminal UI](tui.md): the `anvil tui` screen, its keys and its rules.
+- [Terminal UI](tui.md): the `anvil tui` screen (bare `anvil` at a terminal), its keys, the files browser and its rules.
 
 ## Reference
 

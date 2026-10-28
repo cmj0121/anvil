@@ -10,7 +10,7 @@
 - [設定](configuration.zh-TW.md)：inventory 與 config 的每個鍵，包括檔案、服務與 plugin。
 - [套件](packages.zh-TW.md)：target 使用哪個管理器、別名、pin 與 remove，以及 root 與 sudo 如何運作。
 - [機密](secrets.zh-TW.md)：keychain、age 與 sops backend，以及在它們之間搬移 secret。
-- [終端機介面](tui.zh-TW.md)：`anvil tui` 的畫面、按鍵與規則。
+- [終端機介面](tui.zh-TW.md)：`anvil tui` 的畫面（在終端機上單獨執行 `anvil` 亦同）、按鍵、檔案瀏覽器與規則。
 
 ## 參考
 

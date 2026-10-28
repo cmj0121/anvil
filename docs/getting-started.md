@@ -67,12 +67,13 @@ release keys are compiled in, `anvil update` stops with `no release key compiled
 anvil inventory            # add your hosts (opens $EDITOR, default nvim)
 anvil config               # edit the preferences, packages, files, services and steps
 anvil inventory --format=yaml   # edit it as YAML this once; it is still saved as TOML
+anvil files cp motd '$/'   # keep a file in the store, for [[files]] src = "$/motd"
 anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secrets] says otherwise)
 anvil doctor               # local checks + every target's facts and reachability
 anvil plan                 # the steps apply would run on every target, running none
 anvil apply                # install packages, copy files, set services, run the steps
 anvil run fix.sh           # run one sh script on every target (`-` reads it from stdin)
-anvil tui                  # all of the above in one terminal UI
+anvil                      # all of the above in one terminal UI (also: anvil tui)
 ```
 
 With no files at all, the inventory holds only `local` (this machine) and the config runs `hostname`, so a fresh install

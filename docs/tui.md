@@ -3,11 +3,13 @@
 English | [繁體中文](tui.zh-TW.md)
 
 `anvil tui` runs the same commands in one screen and keeps every result of the session for browsing. It needs a
-terminal and starts only when asked; the global flags (`--target`, `--inventory`, `--config`, `--ssh-config`, `-v`,
-`--parallel`) are its starting state:
+terminal; bare `anvil` opens it too when stdin and stdout are terminals, and prints the help (exit 2) when they are
+not, so a script or an agent never lands in it. The global flags (`--target`, `--inventory`, `--config`,
+`--ssh-config`, `-v`, `--parallel`) are its starting state:
 
 ```sh
-anvil tui                  # or: anvil tui --target linode1
+anvil                      # at a terminal, the same as anvil tui
+anvil tui                  # or: anvil tui --target linode1, or: anvil --target linode1
 anvil tui --parallel 4     # apply, plan and run take up to 4 targets at once
 ```
 
@@ -29,12 +31,13 @@ anvil tui --parallel 4     # apply, plan and run take up to 4 targets at once
 ```
 
 `d` runs doctor, `a` apply and `p` plan on the targets picked with `t` (all of them when none is picked), and `x` a sh
-script you edit, as `anvil run` does; `i`, `c` and `s` open the editor, `m` migrates the secrets. The Steps pane lists
-what apply runs, each step marked for the shown target, and the Results pane shows one tab per target. `↑↓` moves the
-step cursor; on an apply result it also scrolls Results to that step's `$` line. `←` and `→` switch tabs, `[` and `]`
-switch history. `?` lists every key and `q` quits. The editor, ssh's password prompt and the age passphrase prompt (also
-during `m`) get the real terminal while they run. The key table and the rules are [below](#keys). The TUI is the
-default-on cargo feature `tui`; `cargo install --path . --no-default-features` builds anvil without it.
+script you edit, as `anvil run` does; `i`, `c` and `s` open the editor, `m` migrates the secrets, and `F` browses the
+[file store](cli.md#anvil-files). The Steps pane lists what apply runs, each step marked for the shown target, and the
+Results pane shows one tab per target. `↑↓` moves the step cursor; on an apply result it also scrolls Results to that
+step's `$` line. `←` and `→` switch tabs, `[` and `]` switch history. `?` lists every key and `q` quits. The editor,
+ssh's password prompt and the age passphrase prompt (also during `m`) get the real terminal while they run. The key
+table and the rules are [below](#keys). The TUI is the default-on cargo feature `tui`;
+`cargo install --path . --no-default-features` builds anvil without it.
 
 Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
 
@@ -79,7 +82,18 @@ Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
 - **Targets overlay (`t`).** `Hosts`: `[x] name  detail  tags`, `local` first; `Tags`: `[x] tag  N hosts`. `↑↓` moves,
   `Space` selects (the change is live), `Enter`, `Esc` or `t` closes. It opens during a run too, but a run keeps the
   selection it started with. An inventory error shows in it instead of the rows.
-- **Help (`?`).** One row per group: Run, Targets, Move, History, Edit, Options, App. `?` or `Esc` closes it.
+- **Files browser (`F`).** Takes the place of Steps and Results until it closes. On the left, `Files $/DIR`: the
+  folder's entries, folders first, then files, each sorted by name, a folder with a trailing `/`, and `..` first
+  below the store root; the cursor row is marked `▶`. An empty or not yet created store shows
+  `(empty — anvil files cp FILE $/ to add)`. On the right, titled with the cursor entry's name, the preview: the first
+  64 KiB of a text file, `folder` for a folder or `..`, or the error for a file that is not text
+  (`$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`) or cannot be read. The status bar shows
+  `↑↓ move · Enter open · ⌫ up · e edit · D delete · Esc close`, and a failed edit, delete or listing in red until the
+  next key. When the store cannot be located (no `$HOME`), `F` shows that error as a notice and does not open.
+- **Delete (`D`).** `delete $/PATH?`, noting that a folder goes with all it holds. Only `y` deletes; `n` or `Esc`
+  closes it, and other keys keep the question.
+- **Help (`?`).** One row per group: Run, Targets, Move, History, Edit, Options, App, then the browser's Browser and
+  Entry. `?` or `Esc` closes it.
 
 Host and config text is escaped as in the CLI, and a secret value is never drawn.
 
@@ -102,6 +116,7 @@ Host and config text is escaped as in the CLI, and a secret value is never drawn
 | `f`          | cycle the edit format: default, `toml`, `yaml`                | `--format toml\|yaml`                     |
 | `s`          | prompt for NAME, then edit that secret                        | `anvil secret NAME`                       |
 | `m`          | choose keychain, age or sops, then migrate                    | `anvil secret --migrate --to BACKEND`     |
+| `F`          | open the files browser on `$/` ([below](#the-files-browser))  | `anvil files ls`                          |
 | `o`          | edit the paths; empty is the default, `~` is `$HOME`          | `--inventory`, `--config`, `--ssh-config` |
 | `+` / `-`    | log level 0 to 3                                              | `-v`, `-vv`, `-vvv`                       |
 | `l`          | show or hide the Log pane (8 rows)                            | the log on stderr                         |
@@ -144,14 +159,39 @@ output captured, so nothing is drawn over the screen; their errors appear only i
 running TUI is still the old binary: the status bar keeps `updated anvil to VERSION; restart anvil to use it`, `u` is
 greyed in the help and only shows that notice again, until anvil is restarted.
 
+### The files browser
+
+`F` opens the [file store](cli.md#anvil-files) at `$/`, the store `[[files]]` src `$/…` reads; `--config` does not
+move it. While it is open these keys apply, and the other keys of the table do nothing:
+
+| Key                     | Action                                                        | CLI equivalent           |
+| ----------------------- | ------------------------------------------------------------- | ------------------------ |
+| `↑↓` / `jk`             | move the cursor; the preview follows it                       | —                        |
+| `Enter` / `→` / `l`     | open the cursor folder; on `..`, go up                        | `anvil files ls PATH`    |
+| `Backspace` / `←` / `h` | go up to the parent folder, the cursor on the folder you left | —                        |
+| `r`                     | list the folder again                                         | `anvil files ls`         |
+| `e`                     | edit the cursor file                                          | `anvil files edit PATH`  |
+| `D`                     | delete the cursor file or folder, `y` to confirm              | `anvil files rm -r PATH` |
+| `?`                     | help                                                          | `--help`                 |
+| `Esc` / `F` / `q`       | close the browser (`q` does not quit here)                    | —                        |
+| Ctrl-C                  | quit                                                          | —                        |
+
+`e` on a folder or `..` does nothing. It runs `anvil files edit`'s flow: the editor as `x` finds it (a config that does
+not load is skipped), the file's extension on the buffer (`.txt` when it has none), and a write only when the buffer
+changed. The outcome, `wrote $/PATH` or `$/PATH: unchanged`, is the notice and a new edit result `file $/PATH`; the
+folder is listed again. `D` deletes a folder with everything in it, a symlink without following it; the outcome,
+`removed $/PATH` or the error, is the notice (or the red error) and a new result `rm $/PATH`, and the folder is listed
+again. Copying files in or out, moving and creating folders stay with [`anvil files`](cli.md#anvil-files).
+
 ## Rules
 
 - **`--parallel N`** sets how many targets apply, plan, run (`x`) and rollback (`b`) take at once, as in the CLI
   ([Running in parallel](cli.md#running-in-parallel)); no key changes it. doctor runs one target at a time and says
   nothing about the flag.
 - **One run at a time.** While doctor, apply, plan, run, rollback or an update runs, `d`, `a`, `p`, `x`, `b`, `u`, `i`,
-  `c`, `s`, `m` and `o` are refused with `busy: <run> is running (Esc cancels)` on the status bar; for an update,
-  which Esc cannot cancel, it is `busy: <run> is running`. A run keeps the selection and paths it started with.
+  `c`, `s`, `m`, `o` and, in the files browser, `e` and `D` are refused with `busy: <run> is running (Esc cancels)` on
+  the status bar; for an update, which Esc cannot cancel, it is `busy: <run> is running`. A run keeps the selection and
+  paths it started with.
 - **Esc cancels between steps.** apply checks before each target and each step: the running step finishes, and the rest
   of that target and every later target end as `⊘ cancelled`. A rollback (`b`) cancels as apply does. A run (`x`)
   cancels the same way: its script is its one step, so the running script finishes first and every later target ends
@@ -162,9 +202,9 @@ greyed in the help and only shows that notice again, until anvil is restarted.
   Esc never kills a running step, local or remote; only the step's timeout ends it (300 s for `x`). doctor checks
   before each target and each doctor plugin: the running probe, hash run or plugin finishes, and the rest end
   `cancelled`, with the notice `cancelling: the running check finishes first`.
-- **Handoff.** The editor (`i`, `c`, `s`, `x`), the migration (`m`, so its age passphrase prompt works), ssh's interactive
-  retry (a password, passphrase or PIN, see [SSH behaviour](cli.md#ssh-behaviour)) and the
-  [age passphrase prompt](secrets.md#the-passphrase-prompt) get the real terminal: the TUI leaves its screen, the
+- **Handoff.** The editor (`i`, `c`, `s`, `x`, and `e` in the files browser), the migration (`m`, so its age passphrase
+  prompt works), ssh's interactive retry (a password, passphrase or PIN, see [SSH behaviour](cli.md#ssh-behaviour)) and
+  the [age passphrase prompt](secrets.md#the-passphrase-prompt) get the real terminal: the TUI leaves its screen, the
   program runs as it would in the CLI, then the TUI comes back and shows the outcome. ssh's prompt comes from a doctor
   or apply run; while it waits the TUI reads no keys, so `Esc` takes effect only once the TUI is back. Ctrl-C at such a
   prompt goes to ssh or the editor, never to anvil: ssh stops and the target fails with its error, an editor handles
@@ -175,7 +215,7 @@ greyed in the help and only shows that notice again, until anvil is restarted.
   `config: …`); the parse error was on the terminal while the editor had it, and is gone once the TUI redraws.
 - **Session-only history.** Every result stays in memory until you quit, browsable with `[` and `]`; nothing is written
   to disk. Edit results are text only: `wrote PATH`, `PATH: unchanged`, `secret NAME: updated` (or `unchanged`),
-  `migrated N secrets from X to Y`, or the error.
+  `migrated N secrets from X to Y`, `removed $/PATH`, or the error.
 - **A reload keeps the selection.** `r`, `o` and the reload after `i` or `c` keep every selected target and tag by
   name. A selected name no longer in the inventory is unselected, with the notice
   `no longer in the inventory, unselected: NAME, …` on the status bar. The Steps list is rebuilt from the config.

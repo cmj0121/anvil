@@ -277,7 +277,7 @@ setuid 位元（`4000`）與 setgid 位元（`2000`）一律拒絕，不論單�
 `anvil config`、`anvil doctor`、`anvil inventory` 與 `anvil secret` 只檢查語法，因此缺少的 src 不會讓它們失敗；
 `anvil run` 則不載入 config。
 
-以 `$/` 開頭的 `src` 改為讀取檔案儲存區：`$/sub/motd` 代表 `<config_dir>/files/sub/motd`，
+以 `$/` 開頭的 `src` 改為讀取[檔案儲存區](cli.zh-TW.md#anvil-files)：`$/sub/motd` 代表 `<config_dir>/files/sub/motd`，
 即使 `--config` 指向其他目錄也一樣。這會取代原本 config 旁名為 `$` 的目錄的解讀方式。
 儲存區路徑拒絕絕對路徑、NUL、`.` 與 `..` 元件，連續的 `/` 會合併。
 所有已存在的元件（包含儲存區根目錄）都不可是 symlink；無效路徑與 symlink 以 2 結束：
