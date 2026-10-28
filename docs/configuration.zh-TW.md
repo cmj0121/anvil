@@ -266,7 +266,7 @@ setuid 位元（`4000`）與 setgid 位元（`2000`）一律拒絕，不論單�
 - ``files[0].dest `/etc/`: must not end with /``
 - ``files[0].dest `/aaa…`: 4097 bytes exceeds the 4096 byte limit``（引用的路徑是前 64 個字元加上 `…`）
 
-**`src`。** 相對於 config 檔所在目錄的路徑，不做 shell 展開：`~/a` 是名為 `~` 的目錄，`..` 在這項檢查中是允許的。
+**`src`。** 除非以 `$/` 開頭，否則是相對於 config 檔所在目錄的路徑，不做 shell 展開：`~/a` 是名為 `~` 的目錄，`..` 在這項檢查中是允許的。
 絕對路徑、空字串或含 NUL 位元組時以 2 結束並顯示 ``files[0].src `/etc/motd`: must be relative to the config directory``。
 接著 `apply` 與 `plan`（以及 TUI 的 `a` 與 `p`）會在任何 target 之前解析 `..` 與 symlink 並讀取該檔案。
 解析後的路徑必須留在 config 目錄內：否則為 ``files[0].src `../outside`: leaves the config directory``，
@@ -276,6 +276,14 @@ setuid 位元（`4000`）與 setgid 位元（`2000`）一律拒絕，不論單�
 目錄則為 ``files[0].src `sub`: is not a regular file``。
 `anvil config`、`anvil doctor`、`anvil inventory` 與 `anvil secret` 只檢查語法，因此缺少的 src 不會讓它們失敗；
 `anvil run` 則不載入 config。
+
+以 `$/` 開頭的 `src` 改為讀取檔案儲存區：`$/sub/motd` 代表 `<config_dir>/files/sub/motd`，
+即使 `--config` 指向其他目錄也一樣。這會取代原本 config 旁名為 `$` 的目錄的解讀方式。
+儲存區路徑拒絕絕對路徑、NUL、`.` 與 `..` 元件，連續的 `/` 會合併。
+所有已存在的元件（包含儲存區根目錄）都不可是 symlink；無效路徑與 symlink 以 2 結束：
+``files[0].src `$/../x`: invalid store path`` 與 ``files[0].src `$/link`: is a symlink``。
+根目錄會被拒絕：``files[0].src `$/`: must name a file in the store``。
+來源仍須是一般文字檔，且至多 1 MiB。
 
 只接受文字，且至多 1 MiB（1048576 位元組；剛好這個大小可以通過），兩者都是目前的限制。
 以 2 結束，而且第一個這樣的 src 就會讓 `apply` 與 `plan` 對每個 target 停止，在連線任何 target 之前：

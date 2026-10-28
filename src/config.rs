@@ -709,9 +709,16 @@ fn is_plugin_name(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-/// A `[[files]]` src: a path under the config directory, which `apply` and
-/// `plan` check when they read it.
+/// A `[[files]]` src: a store path or a path under the config directory.
 fn check_src(src: &str) -> Result<(), &'static str> {
+    if crate::filestore::is_store_path(src) {
+        let path = crate::filestore::parse(src).map_err(|_| "invalid store path")?;
+        return if path.is_empty() {
+            Err("must name a file in the store")
+        } else {
+            Ok(())
+        };
+    }
     if src.is_empty() || src.contains('\0') || Path::new(src).is_absolute() {
         return Err("must be relative to the config directory");
     }
@@ -976,6 +983,17 @@ mod tests {
 
     fn home() -> Option<&'static OsStr> {
         Some(OsStr::new("/home/u"))
+    }
+
+    #[test]
+    fn store_src_syntax() {
+        for src in ["$/sub/motd", "$ /literal", "$/a//b"] {
+            assert_eq!(check_src(src), Ok(()), "{src}");
+        }
+        assert_eq!(check_src("$/"), Err("must name a file in the store"));
+        for src in ["$/../x", "$/a/./b", "$//absolute", "$/a\0b"] {
+            assert_eq!(check_src(src), Err("invalid store path"), "{src}");
+        }
     }
 
     #[test]

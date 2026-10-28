@@ -77,25 +77,46 @@ impl StoreError {
     }
 }
 
+impl StoreError {
+    /// The path associated with the failure.
+    pub fn path(&self) -> &str {
+        match self {
+            Self::BadPath(path)
+            | Self::NoBasename(path)
+            | Self::Symlink(path)
+            | Self::NotFound(path)
+            | Self::Exists(path)
+            | Self::IsDir(path)
+            | Self::NotDir(path)
+            | Self::NotText(path)
+            | Self::Io(path, _) => path,
+        }
+    }
+
+    /// The message without its path prefix.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::BadPath(_) => "invalid store path",
+            Self::NoBasename(_) => "has no file name; name the destination",
+            Self::Symlink(_) => "is a symlink",
+            Self::NotFound(_) => "not found",
+            Self::Exists(_) => "exists; pass --force",
+            Self::IsDir(_) => "is a folder; pass -r",
+            Self::NotDir(_) => "is not a folder",
+            Self::NotText(_) => "not a regular UTF-8 text file without NUL, at most 1 MiB",
+            Self::Io(_, err) => return err.to_string(),
+        }
+        .to_owned()
+    }
+}
+
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (path, why) = match self {
-            Self::BadPath(p) => (p, "invalid store path"),
-            Self::NoBasename(p) => {
-                return write!(f, "{p}: has no file name; name the destination");
-            }
-            Self::Symlink(p) => (p, "is a symlink"),
-            Self::NotFound(p) => (p, "not found"),
-            Self::Exists(p) => (p, "exists; pass --force"),
-            Self::IsDir(p) => (p, "is a folder; pass -r"),
-            Self::NotDir(p) => (p, "not a folder"),
-            Self::NotText(p) => (
-                p,
-                "not a regular UTF-8 text file without NUL, at most 1 MiB",
-            ),
-            Self::Io(p, err) => return write!(f, "{}: {err}", shown(p)),
-        };
-        write!(f, "{}: {why}", shown(path))
+        let path = self.path();
+        if matches!(self, Self::NoBasename(_)) {
+            return write!(f, "{path}: {}", self.reason());
+        }
+        write!(f, "{}: {}", shown(path), self.reason())
     }
 }
 
@@ -1032,6 +1053,46 @@ mod tests {
             Err(StoreError::NotText(_))
         ));
         assert!(!root.path().join("copy").exists());
+    }
+
+    #[test]
+    fn reasons_omit_the_path() {
+        for (error, reason) in [
+            (StoreError::BadPath("a".into()), "invalid store path"),
+            (
+                StoreError::NoBasename("/".into()),
+                "has no file name; name the destination",
+            ),
+            (StoreError::Symlink("a".into()), "is a symlink"),
+            (StoreError::NotFound("a".into()), "not found"),
+            (StoreError::Exists("a".into()), "exists; pass --force"),
+            (StoreError::IsDir("a".into()), "is a folder; pass -r"),
+            (StoreError::NotDir("a".into()), "is not a folder"),
+            (
+                StoreError::NotText("a".into()),
+                "not a regular UTF-8 text file without NUL, at most 1 MiB",
+            ),
+            (
+                StoreError::Io("a".into(), io::Error::other("failure")),
+                "failure",
+            ),
+        ] {
+            assert_eq!(error.reason(), reason);
+            assert_eq!(
+                error.path(),
+                if matches!(error, StoreError::NoBasename(_)) {
+                    "/"
+                } else {
+                    "a"
+                }
+            );
+            let path = if matches!(error, StoreError::NoBasename(_)) {
+                "/"
+            } else {
+                "$/a"
+            };
+            assert_eq!(error.to_string(), format!("{path}: {reason}"));
+        }
     }
 
     #[test]
