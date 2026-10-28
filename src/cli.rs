@@ -1,5 +1,7 @@
 //! Command line per the CLI contract.
 
+#[cfg(feature = "tui")]
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
@@ -71,8 +73,16 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH", hide = true)]
     pub release_key: Vec<PathBuf>,
 
+    /// None for bare `anvil`; see [`resolve`].
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
+}
+
+impl Cli {
+    /// The command's name; bare `anvil` runs as `tui`.
+    pub fn name(&self) -> &'static str {
+        self.command.as_ref().map_or("tui", Command::name)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -167,6 +177,20 @@ impl Command {
     }
 }
 
+/// What bare `anvil` runs once it opens the TUI.
+#[cfg(feature = "tui")]
+static BARE: Command = Command::Tui;
+
+/// The command to run: the parsed one, else for bare `anvil` `tui` when
+/// stdin and stdout are terminals. None means print the help and exit 2.
+pub fn resolve(cli: &Cli) -> Option<&Command> {
+    #[cfg(feature = "tui")]
+    if cli.command.is_none() && io::stdin().is_terminal() && io::stdout().is_terminal() {
+        return Some(&BARE);
+    }
+    cli.command.as_ref()
+}
+
 /// A fatal error: logged once at `Error`, then the process exits with `code`
 /// (1 when a target or check failed, 2 for usage or config).
 #[derive(Debug)]
@@ -241,10 +265,10 @@ pub fn print_json(value: &impl Serialize, on_err: fn(String) -> Failure) -> Resu
     Ok(())
 }
 
-/// Runs the parsed command.
-pub fn run(cli: &Cli) -> Result<(), Failure> {
+/// Runs `command`, the one [`resolve`] picked for `cli`.
+pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
     let opts = Options::from_cli(cli);
-    match &cli.command {
+    match command {
         Command::Inventory { format } => crate::commands::inventory(cli, &opts, *format),
         Command::Config { format } => crate::commands::config(cli, &opts, *format),
         Command::Doctor => {
@@ -286,32 +310,36 @@ mod tests {
         Cli::try_parse_from(std::iter::once("anvil").chain(args.iter().copied())).unwrap()
     }
 
+    fn command(args: &[&str]) -> Command {
+        parse(args).command.unwrap()
+    }
+
     #[test]
     fn parses_the_five_subcommands() {
         assert!(matches!(
-            parse(&["inventory"]).command,
+            command(&["inventory"]),
             Command::Inventory { format: None }
         ));
         assert!(matches!(
-            parse(&["inventory", "--format", "toml"]).command,
+            command(&["inventory", "--format", "toml"]),
             Command::Inventory {
                 format: Some(Format::Toml)
             }
         ));
         assert!(matches!(
-            parse(&["config"]).command,
+            command(&["config"]),
             Command::Config { format: None }
         ));
         assert!(matches!(
-            parse(&["config", "--format", "yaml"]).command,
+            command(&["config", "--format", "yaml"]),
             Command::Config {
                 format: Some(Format::Yaml)
             }
         ));
-        assert!(matches!(parse(&["doctor"]).command, Command::Doctor));
-        assert!(matches!(parse(&["apply"]).command, Command::Apply));
-        assert!(matches!(parse(&["plan"]).command, Command::Plan));
-        match parse(&["run", "-"]).command {
+        assert!(matches!(command(&["doctor"]), Command::Doctor));
+        assert!(matches!(command(&["apply"]), Command::Apply));
+        assert!(matches!(command(&["plan"]), Command::Plan));
+        match command(&["run", "-"]) {
             Command::Run { script, timeout } => {
                 assert_eq!(script, PathBuf::from("-"));
                 assert_eq!(timeout, 300);
@@ -319,10 +347,10 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(matches!(
-            parse(&["run", "--timeout", "5", "x.sh"]).command,
+            command(&["run", "--timeout", "5", "x.sh"]),
             Command::Run { timeout: 5, .. }
         ));
-        match parse(&["secret", "HOST_SUDO"]).command {
+        match command(&["secret", "HOST_SUDO"]) {
             Command::Secret {
                 name, migrate, to, ..
             } => {
@@ -333,14 +361,14 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(matches!(
-            parse(&["update"]).command,
+            command(&["update"]),
             Command::Update { check: false }
         ));
         assert!(matches!(
-            parse(&["update", "--check", "--json"]).command,
+            command(&["update", "--check", "--json"]),
             Command::Update { check: true }
         ));
-        match parse(&["secret", "--migrate", "--to", "age"]).command {
+        match command(&["secret", "--migrate", "--to", "age"]) {
             Command::Secret { name, migrate, to } => {
                 assert_eq!(name, None);
                 assert!(migrate);
@@ -352,11 +380,9 @@ mod tests {
 
     #[test]
     fn rollback_takes_force_repeated_or_force_all() {
-        match parse(&[
+        match command(&[
             "rollback", "--force", "/etc/a", "--force", "/etc/b", "--json",
-        ])
-        .command
-        {
+        ]) {
             Command::Rollback {
                 force,
                 force_all,
@@ -369,13 +395,12 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(matches!(
-            parse(&[
+            command(&[
                 "rollback",
                 "--force-all",
                 "--allow-host-change",
                 "--dry-run"
-            ])
-            .command,
+            ]),
             Command::Rollback {
                 force_all: true,
                 allow_host_change: true,
@@ -383,7 +408,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(parse(&["rollback"]).command.name(), "rollback");
+        assert_eq!(command(&["rollback"]).name(), "rollback");
         for args in [
             ["rollback", "--force-all", "--force", "/etc/a"].as_slice(),
             ["rollback", "--force"].as_slice(),
@@ -437,8 +462,18 @@ mod tests {
     }
 
     #[test]
+    fn bare_anvil_parses_with_no_command_and_its_global_flags() {
+        assert!(parse(&[]).command.is_none());
+        let cli = parse(&["--config", "cfg.toml", "--target", "local", "-v"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.config, Some(PathBuf::from("cfg.toml")));
+        assert_eq!(cli.target, ["local"]);
+        assert_eq!(cli.name(), "tui");
+        assert_eq!(parse(&["doctor"]).name(), "doctor");
+    }
+
+    #[test]
     fn bad_usage_is_an_error() {
-        assert!(Cli::try_parse_from(["anvil"]).is_err());
         assert!(Cli::try_parse_from(["anvil", "frobnicate"]).is_err());
         assert!(Cli::try_parse_from(["anvil", "secret"]).is_err());
         assert!(Cli::try_parse_from(["anvil", "config", "--format", "ini"]).is_err());

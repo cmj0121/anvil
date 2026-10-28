@@ -62,6 +62,26 @@ fn usage_error_exits_two() {
 }
 
 #[test]
+fn bare_anvil_without_a_terminal_prints_the_help_and_exits_two() {
+    for args in [
+        &[][..],
+        &["--config", "x.toml"],
+        &["-v", "--target", "local", "--parallel", "4"],
+        &["--json"],
+    ] {
+        let out = anvil(args);
+        assert_eq!(out.status.code(), Some(2), "args {args:?}");
+        assert!(out.stdout.is_empty(), "args {args:?}");
+        let stderr = text(&out.stderr);
+        assert!(stderr.contains("\nUsage: anvil "), "{args:?}: {stderr}");
+        for word in ["inventory", "apply", "--config"] {
+            assert!(stderr.contains(word), "{args:?} lacks {word}: {stderr}");
+        }
+        assert!(!stderr.contains("ERROR"), "{args:?}: {stderr}");
+    }
+}
+
+#[test]
 fn parallel_out_of_range_exits_two() {
     for value in ["0", "33", "x"] {
         let out = anvil(&["--parallel", value, "apply"]);

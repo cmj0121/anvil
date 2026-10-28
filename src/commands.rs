@@ -311,7 +311,7 @@ fn migrate_stores(
 
 pub fn warn_target(cli: &Cli) {
     if !cli.target.is_empty() {
-        log::warn!("--target is ignored by `{}`", cli.command.name());
+        log::warn!("--target is ignored by `{}`", cli.name());
     }
     warn_parallel(cli);
 }
@@ -320,7 +320,7 @@ pub fn warn_target(cli: &Cli) {
 /// inventory, config, secret and update.
 pub fn warn_parallel(cli: &Cli) {
     if cli.parallel != 1 {
-        log::warn!("--parallel is ignored by `{}`", cli.command.name());
+        log::warn!("--parallel is ignored by `{}`", cli.name());
     }
 }
 

@@ -54,6 +54,11 @@ fn tui_sandbox(extra: &str) -> Sandbox {
 /// (`--wait REGEX` / `--send KEYS` pairs); asserts the script's checks
 /// passed and returns its transcript (the last screen and the checks).
 fn drive(sandbox: &Sandbox, vars: &[(&str, &str)], steps: &[&str]) -> String {
+    drive_args(sandbox, vars, steps, &["tui"])
+}
+
+/// [`drive`] with `anvil --secret-store memory ARGS`.
+fn drive_args(sandbox: &Sandbox, vars: &[(&str, &str)], steps: &[&str], anvil: &[&str]) -> String {
     let script = fixture("pty_tui.py");
     let mut args = vec![script.to_str().unwrap()];
     args.extend(steps);
@@ -62,8 +67,8 @@ fn drive(sandbox: &Sandbox, vars: &[(&str, &str)], steps: &[&str]) -> String {
         env!("CARGO_BIN_EXE_anvil"),
         "--secret-store",
         "memory",
-        "tui",
     ]);
+    args.extend(anvil);
     let out = sandbox
         .command("python3")
         .args(&args)
@@ -110,6 +115,26 @@ fn an_inventory_edit_hands_the_terminal_to_the_editor_and_back() {
     assert!(transcript.contains(&wrote), "{transcript}");
     let saved = fs::read_to_string(&inventory).unwrap();
     assert!(saved.contains("[hosts.pi]"), "{saved}");
+}
+
+#[test]
+fn bare_anvil_on_a_terminal_opens_the_tui_with_its_global_flags() {
+    if !python() {
+        return;
+    }
+    let sandbox = tui_sandbox("");
+    let quit = ["--wait", r"targets: all \(1\)", "--send", "q"];
+    drive_args(&sandbox, &[], &quit, &[]);
+
+    let other = sandbox.root().join("other.toml");
+    fs::write(&other, "[[steps]]\nrun = \"printf bare-config\"\n").unwrap();
+    let transcript = drive_args(
+        &sandbox,
+        &[],
+        &["--wait", "1 printf bare-config", "--send", "q"],
+        &["--config", other.to_str().unwrap()],
+    );
+    assert!(transcript.contains("1 printf bare-config"), "{transcript}");
 }
 
 #[test]

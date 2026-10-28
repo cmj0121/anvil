@@ -37,7 +37,7 @@ mod update;
 
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use cli::Cli;
 use logger::Logger;
@@ -52,9 +52,14 @@ fn main() -> ExitCode {
             return ExitCode::from(code);
         }
     };
+    // Bare `anvil` off a terminal: clap no longer prints the help itself.
+    let Some(command) = cli::resolve(&cli) else {
+        eprint!("{}", Cli::command().render_help());
+        return ExitCode::from(2);
+    };
     Logger::install(cli.verbose);
-    log::debug!("{:?}", cli.command);
-    match cli::run(&cli) {
+    log::debug!("{command:?}");
+    match cli::run(&cli, command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
             log::error!("{}", failure.message);
