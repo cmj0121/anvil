@@ -191,7 +191,7 @@ fn edit(app: &App, kind: &EditKind) -> Result<String, Failure> {
 /// edit.
 fn edit_store_file(opts: &Options, root: &Root, rel: &str) -> Result<String, Failure> {
     let preference = opts.load_config().ok().and_then(|c| c.anvil.editor);
-    let shown = format!("{}{rel}", filestore::PREFIX);
+    let shown = filestore::shown(rel);
     Ok(if files_cmd::edit(root, rel, preference.as_deref())? {
         format!("wrote {shown}")
     } else {

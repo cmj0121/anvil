@@ -140,6 +140,12 @@ impl FilesView {
     /// Lists `dir` again, keeping the cursor inside the rows; a failed
     /// listing is empty and its error kept.
     fn load(&mut self, root: &Root) {
+        self.list(root);
+        self.preview = self.read_preview(root);
+    }
+
+    /// [`load`](Self::load) without reading the preview.
+    fn list(&mut self, root: &Root) {
         match root.list(&self.dir, false) {
             Ok(mut entries) => {
                 entries.sort_by_key(|entry| entry.kind != Kind::Dir);
@@ -151,7 +157,6 @@ impl FilesView {
             }
         }
         self.cursor = self.cursor.min(self.rows().saturating_sub(1));
-        self.preview = self.read_preview(root);
     }
 
     fn read_preview(&self, root: &Root) -> Result<String, String> {
@@ -174,11 +179,15 @@ impl FilesView {
     }
 
     fn step(&mut self, down: bool, root: &Root) {
-        self.cursor = if down {
+        let cursor = if down {
             (self.cursor + 1).min(self.rows().saturating_sub(1))
         } else {
             self.cursor.saturating_sub(1)
         };
+        if cursor == self.cursor {
+            return;
+        }
+        self.cursor = cursor;
         self.preview = self.read_preview(root);
     }
 
@@ -206,17 +215,12 @@ impl FilesView {
             .map_or("", |(parent, _)| parent)
             .to_owned();
         self.cursor = 0;
-        self.load(root);
+        self.list(root);
         if let Some(at) = self.entries.iter().position(|entry| entry.path == from) {
             self.cursor = at + usize::from(self.has_parent());
-            self.preview = self.read_preview(root);
         }
+        self.preview = self.read_preview(root);
     }
-}
-
-/// An entry's last path component.
-pub fn entry_name(entry: &Entry) -> &str {
-    entry.path.rsplit('/').next().unwrap_or(&entry.path)
 }
 
 pub struct TargetRow {
@@ -324,7 +328,7 @@ impl EditKind {
             EditKind::Config => "config".to_owned(),
             EditKind::Secret(name) => format!("secret {name}"),
             EditKind::Migrate(to) => format!("migrate → {to}"),
-            EditKind::StoreFile(path) => format!("file {}{path}", filestore::PREFIX),
+            EditKind::StoreFile(path) => format!("file {}", filestore::shown(path)),
         }
     }
 }
@@ -786,7 +790,7 @@ impl App {
         let (Ok(root), Some(view)) = (&self.store, &mut self.files) else {
             return;
         };
-        let shown = format!("{}{path}", filestore::PREFIX);
+        let shown = filestore::shown(path);
         let outcome = root
             .remove(path, true)
             .map(|()| format!("removed {shown}"))
@@ -3343,7 +3347,7 @@ pub mod tests {
             .into_iter()
             .chain(view.entries.iter().map(|entry| {
                 let slash = if entry.kind == Kind::Dir { "/" } else { "" };
-                format!("{}{slash}", entry_name(entry))
+                format!("{}{slash}", entry.name())
             }))
             .collect()
     }

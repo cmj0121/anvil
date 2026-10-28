@@ -5,9 +5,9 @@ use rustix::io::Errno;
 use std::fmt;
 use std::fs;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -53,6 +53,13 @@ pub struct Entry {
     pub size: Option<u64>,
 }
 
+impl Entry {
+    /// The last path component.
+    pub fn name(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or(&self.path)
+    }
+}
+
 /// The type of a store entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -87,9 +94,7 @@ impl StoreError {
             _ => 1,
         }
     }
-}
 
-impl StoreError {
     /// The path associated with the failure.
     pub fn path(&self) -> &str {
         match self {
@@ -141,7 +146,8 @@ impl fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-fn shown(rel: &str) -> String {
+/// A store path as shown to the user: `$/…`; host-absolute paths unchanged.
+pub fn shown(rel: &str) -> String {
     if Path::new(rel).is_absolute() {
         return rel.to_owned();
     }
@@ -279,8 +285,7 @@ impl Root {
         let root = self.directory("", true)?;
         let (src_dir, src_name) = parent_at(&root, &from, false)?;
         check_private(&src_dir, from.rsplit_once('/').map_or("", |(p, _)| p))?;
-        let src = open_file(&src_dir, &src_name, &from)?;
-        drop(src);
+        open_file(&src_dir, &src_name, &from)?;
         let to = self.destination(to, || Ok(src_name.clone()))?;
         if to == from || to.starts_with(&format!("{from}/")) {
             return Err(StoreError::BadPath(to));
@@ -345,12 +350,8 @@ impl Root {
         let file = match opened {
             Some(file) => file,
             None => File::from(
-                at::open(
-                    host,
-                    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(|e| host_io_error(host, e.into()))?,
+                at::open(host, file_flags() & !OFlags::NOFOLLOW, Mode::empty())
+                    .map_err(|e| host_io_error(host, e.into()))?,
             ),
         };
         let meta = file.metadata().map_err(|e| host_io_error(host, e))?;
@@ -374,12 +375,7 @@ impl Root {
                 for name in names(&file, rel).map_err(|e| host_error(host, e))? {
                     let child = host.join(&name);
                     let next = joined(rel, &child_name(&child, rel)?);
-                    let opened = match at::openat(
-                        &file,
-                        &name,
-                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    ) {
+                    let opened = match at::openat(&file, &name, file_flags(), Mode::empty()) {
                         Ok(fd) => File::from(fd),
                         Err(Errno::LOOP) => {
                             log::warn!("skipped symlink {}", child.display());
@@ -505,14 +501,18 @@ fn child_name(path: &Path, rel: &str) -> Result<String, StoreError> {
         .ok_or_else(|| StoreError::BadPath(rel.to_owned()))
 }
 
-fn kind(meta: &fs::Metadata) -> Kind {
-    if meta.is_dir() {
-        Kind::Dir
-    } else if meta.is_file() {
-        Kind::File
-    } else {
-        Kind::Other
+impl From<at::FileType> for Kind {
+    fn from(file_type: at::FileType) -> Self {
+        match file_type {
+            at::FileType::Directory => Kind::Dir,
+            at::FileType::RegularFile => Kind::File,
+            _ => Kind::Other,
+        }
     }
+}
+
+fn kind(meta: &fs::Metadata) -> Kind {
+    at::FileType::from_raw_mode(meta.mode() as _).into()
 }
 
 fn text<'a>(bytes: &'a [u8], rel: &str) -> Result<&'a str, StoreError> {
@@ -535,19 +535,7 @@ fn host_directory(path: &Path, create: bool) -> Result<File, StoreError> {
             let name = path
                 .file_name()
                 .ok_or_else(|| host_error(path, StoreError::BadPath(path.display().to_string())))?;
-            let rel = path.display().to_string();
-            match at::mkdirat(&dir, name, Mode::from_raw_mode(0o700)) {
-                Ok(()) | Err(Errno::EXIST) => {}
-                Err(e) => return Err(host_io_error(path, e.into())),
-            }
-            at::openat(&dir, name, dir_flags(), Mode::empty())
-                .map(File::from)
-                .map_err(|e| {
-                    host_error(
-                        path,
-                        component_error(&dir, name.to_str().unwrap_or(""), &rel, e),
-                    )
-                })
+            mkdir_open(&dir, name, &path.display().to_string()).map_err(|e| host_error(path, e))
         }
         Err(e) => Err(host_io_error(path, e.into())),
     }
@@ -583,21 +571,14 @@ fn list_into(
         let next = joined(rel, name);
         let meta =
             at::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| fd_error(&next, e))?;
-        let kind = match at::FileType::from_raw_mode(meta.st_mode) {
-            at::FileType::Directory => Kind::Dir,
-            at::FileType::RegularFile => Kind::File,
-            _ => Kind::Other,
-        };
+        let kind = Kind::from(at::FileType::from_raw_mode(meta.st_mode));
         out.push(Entry {
             path: next.clone(),
             kind,
             size: (kind == Kind::File).then_some(meta.st_size as u64),
         });
         if recursive && kind == Kind::Dir {
-            let child = File::from(
-                at::openat(dir, name, dir_flags(), Mode::empty())
-                    .map_err(|e| component_error(dir, name, &next, e))?,
-            );
+            let child = open_dir(dir, name.as_ref(), &next)?;
             list_into(&child, &next, true, depth + 1, out)?;
         }
     }
@@ -625,18 +606,7 @@ fn export_into(
             if !recursive {
                 return Err(StoreError::IsDir(rel.to_owned()));
             }
-            match at::mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
-                Ok(()) | Err(Errno::EXIST) => {}
-                Err(e) => return Err(host_io_error(host, e.into())),
-            }
-            let dest = File::from(
-                at::openat(parent, name, dir_flags(), Mode::empty()).map_err(|e| {
-                    host_error(
-                        host,
-                        component_error(parent, name.to_str().unwrap_or(""), &host_rel, e),
-                    )
-                })?,
-            );
+            let dest = mkdir_open(parent, name, &host_rel).map_err(|e| host_error(host, e))?;
             changed.push(shown(rel));
             for child in names(&source, rel)? {
                 let name = child
@@ -689,19 +659,13 @@ fn walk_dir(mut dir: File, rel: &str, create: bool) -> Result<File, StoreError> 
     let mut walked = String::new();
     for part in rel.split('/').filter(|p| !p.is_empty()) {
         walked = joined(&walked, part);
-        if create {
-            match at::mkdirat(&dir, part, Mode::from_raw_mode(0o700)) {
-                Ok(()) | Err(Errno::EXIST) => {}
-                Err(e) => return Err(fd_error(&walked, e)),
-            }
-        }
-        dir = File::from(
-            at::openat(&dir, part, dir_flags(), Mode::empty())
-                .map_err(|e| component_error(&dir, part, &walked, e))?,
-        );
-        if create {
+        dir = if create {
+            let dir = mkdir_open(&dir, part.as_ref(), &walked)?;
             check_private(&dir, &walked)?;
-        }
+            dir
+        } else {
+            open_dir(&dir, part.as_ref(), &walked)?
+        };
     }
     Ok(dir)
 }
@@ -723,6 +687,27 @@ fn dir_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
+/// Non-blocking, so opening a FIFO cannot hang.
+fn file_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
+}
+
+/// Opens child folder `name` of `dir` without following a symlink.
+fn open_dir(dir: &File, name: &std::ffi::OsStr, rel: &str) -> Result<File, StoreError> {
+    at::openat(dir, name, dir_flags(), Mode::empty())
+        .map(File::from)
+        .map_err(|e| component_error(dir, name, rel, e))
+}
+
+/// Creates child folder `name` of `dir` as 0700 unless it exists, then opens it.
+fn mkdir_open(dir: &File, name: &std::ffi::OsStr, rel: &str) -> Result<File, StoreError> {
+    match at::mkdirat(dir, name, Mode::from_raw_mode(0o700)) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(e) => return Err(fd_error(rel, e)),
+    }
+    open_dir(dir, name, rel)
+}
+
 fn fd_error(rel: &str, e: Errno) -> StoreError {
     match e {
         Errno::LOOP => StoreError::Symlink(rel.to_owned()),
@@ -731,7 +716,7 @@ fn fd_error(rel: &str, e: Errno) -> StoreError {
     }
 }
 
-fn component_error(dir: &File, name: &str, rel: &str, e: Errno) -> StoreError {
+fn component_error(dir: &File, name: &std::ffi::OsStr, rel: &str, e: Errno) -> StoreError {
     if at::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
         .is_ok_and(|s| at::FileType::from_raw_mode(s.st_mode) == at::FileType::Symlink)
     {
@@ -747,14 +732,9 @@ fn check_private(dir: &File, rel: &str) -> Result<(), StoreError> {
 }
 
 fn open_file(dir: &File, name: &str, rel: &str) -> Result<File, StoreError> {
-    at::openat(
-        dir,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map(File::from)
-    .map_err(|e| fd_error(rel, e))
+    at::openat(dir, name, file_flags(), Mode::empty())
+        .map(File::from)
+        .map_err(|e| fd_error(rel, e))
 }
 
 fn read_file(file: File, rel: &str) -> Result<String, StoreError> {
@@ -767,9 +747,7 @@ fn read_file(file: File, rel: &str) -> Result<String, StoreError> {
         });
     }
     let mut bytes = Vec::new();
-    file.take(document::MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| io_error(rel, e))?;
+    document::read_capped_from(file, &mut bytes).map_err(|e| io_error(rel, e))?;
     text(&bytes, rel).map(str::to_owned)
 }
 

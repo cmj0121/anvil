@@ -1259,7 +1259,7 @@ fn draw_files(view: &FilesView, f: &mut Frame, left: Rect, right: Rect) {
     }
     names.extend(view.entries.iter().map(|entry| {
         let suffix = if entry.kind == Kind::Dir { "/" } else { "" };
-        format!("{}{suffix}", text(app::entry_name(entry)))
+        format!("{}{suffix}", text(entry.name()))
     }));
     let lines: Vec<Line> = if names.is_empty() && !view.has_parent() {
         vec![Line::from(EMPTY_STORE).style(secondary())]
@@ -1286,7 +1286,7 @@ fn draw_files(view: &FilesView, f: &mut Frame, left: Rect, right: Rect) {
     f.render_widget(list, left);
 
     let title = match view.selected() {
-        Some(entry) => text(app::entry_name(entry)),
+        Some(entry) => text(entry.name()),
         None if view.has_parent() => "..".to_owned(),
         None => String::new(),
     };

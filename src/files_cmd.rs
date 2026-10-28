@@ -4,8 +4,9 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::cli::{Cli, Failure, FilesAction, print_json};
+use crate::config::Config;
 use crate::editor::{Buffer, Editor, Fallback};
-use crate::filestore::{self, Kind, Root, StoreError};
+use crate::filestore::{self, Kind, Root, StoreError, shown};
 use crate::options::Options;
 
 impl From<StoreError> for Failure {
@@ -34,7 +35,7 @@ pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failur
                     let name = if *recursive {
                         entry.path.as_str()
                     } else {
-                        entry.path.rsplit('/').next().unwrap()
+                        entry.name()
                     };
                     println!(
                         "{}{}",
@@ -56,15 +57,18 @@ pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failur
                     "anvil files cp: exactly one of SRC and DEST must be a store path ($/…)",
                 ));
             }
-            let source_is_dir = if filestore::is_store_path(src) {
-                root.resolve(src)?.is_dir()
+            let (source_is_dir, result) = if filestore::is_store_path(src) {
+                let is_dir = root.resolve(src)?.is_dir();
+                (
+                    is_dir,
+                    root.export(src, Path::new(dest), *recursive, *force),
+                )
             } else {
-                Path::new(src).is_dir()
-            };
-            let result = if filestore::is_store_path(src) {
-                root.export(src, Path::new(dest), *recursive, *force)
-            } else {
-                root.import(Path::new(src), dest, *recursive, *force)
+                let is_dir = Path::new(src).is_dir();
+                (
+                    is_dir,
+                    root.import(Path::new(src), dest, *recursive, *force),
+                )
             };
             result.map_err(|err| match err {
                 StoreError::IsDir(_) if source_is_dir && !recursive => {
@@ -76,15 +80,16 @@ pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failur
         FilesAction::Mv { src, dest, force } => {
             let from = filestore::parse(src)?;
             let to = root.rename(src, dest, *force)?;
-            warn_orphans(opts, &from);
+            warn_orphans(opts.load_config().ok().as_ref(), &from);
             vec![shown(&to)]
         }
         FilesAction::Rm { paths, recursive } => {
+            let config = opts.load_config().ok();
             let mut changed = Vec::new();
             for path in paths {
                 let rel = filestore::parse(path)?;
                 root.remove(path, *recursive)?;
-                warn_orphans(opts, &rel);
+                warn_orphans(config.as_ref(), &rel);
                 changed.push(shown(&rel));
             }
             changed
@@ -151,13 +156,9 @@ pub fn edit(root: &Root, path: &str, preference: Option<&str>) -> Result<bool, F
     Ok(false)
 }
 
-fn shown(rel: &str) -> String {
-    format!("$/{rel}")
-}
-
 /// Warns when an entry names a removed file or a child of a removed folder.
-fn warn_orphans(opts: &Options, path: &str) {
-    let Ok(config) = opts.load_config() else {
+fn warn_orphans(config: Option<&Config>, path: &str) {
+    let Some(config) = config else {
         return;
     };
     for (i, entry) in config.files.iter().enumerate() {
