@@ -23,8 +23,9 @@ use signal_hook::consts::SIGINT;
 
 use crate::cli::Failure;
 use crate::commands;
-use crate::document::Format;
 use crate::editor::{Buffer, Editor, Fallback};
+use crate::files_cmd;
+use crate::filestore::{self, Root};
 use crate::logger::{self, Sink};
 use crate::options::Options;
 use crate::term;
@@ -147,7 +148,7 @@ fn event_loop(
 /// terminal, records its outcome, and reloads the inventory and the config
 /// after an inventory or config edit.
 fn run_edit(app: &mut App, kind: &EditKind) {
-    let outcome = term::with_terminal(|| edit(&app.opts, app.edit_format, kind));
+    let outcome = term::with_terminal(|| edit(app, kind));
     app.record_edit(kind, outcome.map_err(|failure| failure.message));
     if matches!(kind, EditKind::Inventory | EditKind::Config) {
         app.reload();
@@ -167,7 +168,8 @@ fn edit_script(app: &mut App) {
 }
 
 /// The CLI's editor flow for `kind`, its outcome as the CLI words it.
-fn edit(opts: &Options, format: Option<Format>, kind: &EditKind) -> Result<String, Failure> {
+fn edit(app: &App, kind: &EditKind) -> Result<String, Failure> {
+    let (opts, format) = (&app.opts, app.edit_format);
     match kind {
         EditKind::Inventory => commands::edit_inventory(opts, format).map(|o| o.to_string()),
         EditKind::Config => commands::edit_config(opts, format).map(|o| o.to_string()),
@@ -177,7 +179,24 @@ fn edit(opts: &Options, format: Option<Format>, kind: &EditKind) -> Result<Strin
             commands::edit_secret(&config, name, store.as_ref()).map(|o| o.to_string())
         }
         EditKind::Migrate(to) => commands::migrate_to(opts, *to).map(|o| o.to_string()),
+        EditKind::StoreFile(path) => match &app.store {
+            Ok(root) => edit_store_file(opts, root, path),
+            Err(err) => Err(Failure::failed(err.clone())),
+        },
     }
+}
+
+/// `anvil files edit`'s flow on store file `rel` (without `$/`). The
+/// editor is found as `x` finds it, so a broken config cannot block the
+/// edit.
+fn edit_store_file(opts: &Options, root: &Root, rel: &str) -> Result<String, Failure> {
+    let preference = opts.load_config().ok().and_then(|c| c.anvil.editor);
+    let shown = filestore::shown(rel);
+    Ok(if files_cmd::edit(root, rel, preference.as_deref())? {
+        format!("wrote {shown}")
+    } else {
+        format!("{shown}: unchanged")
+    })
 }
 
 /// The worker running doctor, apply, plan or run, if any. Dropping it (teardown, a
@@ -378,6 +397,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::document::Format;
     use crate::term::testing::{Event, Recorder};
     use crate::test_util::temp_dir;
     use app::RunResult;
@@ -479,6 +499,54 @@ mod tests {
             &edits.app.overlay,
             Some(app::Overlay::Confirm { targets }) if targets[..] == ["local", "pi"]
         ));
+    }
+
+    #[test]
+    fn a_store_file_edit_writes_back_through_the_store_and_reloads_the_browser() {
+        let mut edits = Edits::new(
+            "store",
+            "echo \"$1\" > \"$(dirname \"$0\")/seen\"; printf 'new\\n' > \"$1\"",
+        );
+        let root = edits.dir.join("files");
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::write(root.join("a/n.conf"), "old\n").unwrap();
+        edits.app.store = Ok(Root::at(root.clone()));
+        let mut view = app::tests::browsing(&edits.app, "a");
+        view.cursor = 1;
+        edits.app.files = Some(view);
+        assert_eq!(
+            edits.run(EditKind::StoreFile("a/n.conf".to_owned())),
+            Ok("wrote $/a/n.conf".to_owned())
+        );
+        assert_eq!(fs::read_to_string(root.join("a/n.conf")).unwrap(), "new\n");
+        let seen = fs::read_to_string(edits.dir.join("seen")).unwrap();
+        assert!(seen.trim_end().ends_with(".conf"), "{seen}");
+        let view = edits.app.files.as_ref().unwrap();
+        assert_eq!(view.preview, Ok("new\n".to_owned()), "listed again");
+        assert_eq!(edits.app.notice.as_deref(), Some("wrote $/a/n.conf"));
+        // A missing file opens empty and is created.
+        assert_eq!(
+            edits.run(EditKind::StoreFile("b".to_owned())),
+            Ok("wrote $/b".to_owned())
+        );
+        assert_eq!(fs::read_to_string(root.join("b")).unwrap(), "new\n");
+    }
+
+    #[test]
+    fn an_unchanged_store_file_is_not_written() {
+        let mut edits = Edits::new("store-same", "");
+        let root = edits.dir.join("files");
+        edits.app.store = Ok(Root::at(root.clone()));
+        assert_eq!(
+            edits.run(EditKind::StoreFile("x.txt".to_owned())),
+            Ok("$/x.txt: unchanged".to_owned())
+        );
+        assert!(!root.exists());
+        edits.app.store = Err("no home".to_owned());
+        assert_eq!(
+            edits.run(EditKind::StoreFile("x.txt".to_owned())),
+            Err("no home".to_owned())
+        );
     }
 
     #[test]

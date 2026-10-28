@@ -1,5 +1,6 @@
 //! TUI state and its pure key and message handling: no terminal, and no
-//! I/O beyond [`load_inventory`] and [`load_steps`].
+//! I/O beyond [`load_inventory`], [`load_steps`] and the files browser's
+//! store reads and deletes.
 
 use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
@@ -12,6 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{Config, StepKind};
 use crate::document::{Format, MAX_BYTES};
+use crate::filestore::{self, Entry, Kind, Root};
 use crate::inventory::{Inventory, LOCAL, Sel, Target, UnknownSel};
 use crate::options::Options;
 use crate::secret::{self, BackendKind};
@@ -37,6 +39,9 @@ pub const OPTION_FLAGS: [&str; 3] = ["--inventory", "--config", "--ssh-config"];
 
 /// The target names `x`'s confirmation lists before it cuts the rest to `…`.
 pub const CONFIRM_NAMES: usize = 5;
+
+/// The most of a file the files browser previews.
+pub const PREVIEW_BYTES: usize = 64 * 1024;
 
 pub struct App {
     pub opts: Options,
@@ -82,6 +87,140 @@ pub struct App {
     /// An available version whose check came back under another overlay:
     /// the next `u` asks to install it without checking again.
     pub available: Option<String>,
+    /// The file store `F` browses, or why it has none.
+    pub store: Result<Root, String>,
+    /// `F`'s browser, drawn over Steps and Results while open.
+    pub files: Option<FilesView>,
+}
+
+/// The files browser: one store folder and the row under the cursor.
+pub struct FilesView {
+    /// Store-relative; `""` is the root.
+    pub dir: String,
+    /// Folders first, then files, each by name.
+    pub entries: Vec<Entry>,
+    /// Counts the `..` row first when `dir` is not the root.
+    pub cursor: usize,
+    /// The cursor file's text, cut to [`PREVIEW_BYTES`]; else what the row
+    /// is (`folder`) or why it cannot be shown.
+    pub preview: Result<String, String>,
+    /// The last operation's error, shown in the status bar.
+    pub error: Option<String>,
+}
+
+impl FilesView {
+    /// `dir` of `root`, the cursor on its first row.
+    fn open(root: &Root, dir: String) -> FilesView {
+        let mut view = FilesView {
+            dir,
+            entries: Vec::new(),
+            cursor: 0,
+            preview: Err(String::new()),
+            error: None,
+        };
+        view.load(root);
+        view
+    }
+
+    /// Whether the `..` row is listed.
+    pub fn has_parent(&self) -> bool {
+        !self.dir.is_empty()
+    }
+
+    /// The entry under the cursor; `None` on `..` or with no rows.
+    pub fn selected(&self) -> Option<&Entry> {
+        let index = self.cursor.checked_sub(usize::from(self.has_parent()))?;
+        self.entries.get(index)
+    }
+
+    fn rows(&self) -> usize {
+        self.entries.len() + usize::from(self.has_parent())
+    }
+
+    /// Lists `dir` again, keeping the cursor inside the rows; a failed
+    /// listing is empty and its error kept.
+    fn load(&mut self, root: &Root) {
+        self.list(root);
+        self.preview = self.read_preview(root);
+    }
+
+    /// [`load`](Self::load) without reading the preview.
+    fn list(&mut self, root: &Root) {
+        match root.list(&self.dir, false) {
+            Ok(mut entries) => {
+                entries.sort_by_key(|entry| entry.kind != Kind::Dir);
+                self.entries = entries;
+            }
+            Err(err) => {
+                self.entries.clear();
+                self.error = Some(err.to_string());
+            }
+        }
+        self.cursor = self.cursor.min(self.rows().saturating_sub(1));
+    }
+
+    fn read_preview(&self, root: &Root) -> Result<String, String> {
+        match self.selected() {
+            None if self.rows() > 0 => Err("folder".to_owned()),
+            None => Err(String::new()),
+            Some(entry) if entry.kind == Kind::Dir => Err("folder".to_owned()),
+            Some(entry) => root
+                .read_text(&entry.path)
+                .map(|mut text| {
+                    let mut end = text.len().min(PREVIEW_BYTES);
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                    text
+                })
+                .map_err(|err| err.to_string()),
+        }
+    }
+
+    fn step(&mut self, down: bool, root: &Root) {
+        let cursor = if down {
+            (self.cursor + 1).min(self.rows().saturating_sub(1))
+        } else {
+            self.cursor.saturating_sub(1)
+        };
+        if cursor == self.cursor {
+            return;
+        }
+        self.cursor = cursor;
+        self.preview = self.read_preview(root);
+    }
+
+    /// Enters the folder under the cursor, or the parent on `..`.
+    fn enter(&mut self, root: &Root) {
+        match self.selected() {
+            None if self.has_parent() && self.cursor == 0 => self.up(root),
+            Some(entry) if entry.kind == Kind::Dir => {
+                self.dir = entry.path.clone();
+                self.cursor = 0;
+                self.load(root);
+            }
+            _ => {}
+        }
+    }
+
+    /// Goes to the parent folder, the cursor on the folder it came from.
+    fn up(&mut self, root: &Root) {
+        if !self.has_parent() {
+            return;
+        }
+        let from = std::mem::take(&mut self.dir);
+        self.dir = from
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent)
+            .to_owned();
+        self.cursor = 0;
+        self.list(root);
+        if let Some(at) = self.entries.iter().position(|entry| entry.path == from) {
+            self.cursor = at + usize::from(self.has_parent());
+        }
+        self.preview = self.read_preview(root);
+    }
 }
 
 pub struct TargetRow {
@@ -177,6 +316,8 @@ pub enum EditKind {
     Config,
     Secret(String),
     Migrate(BackendKind),
+    /// A file store path, without `$/`.
+    StoreFile(String),
 }
 
 impl EditKind {
@@ -187,6 +328,7 @@ impl EditKind {
             EditKind::Config => "config".to_owned(),
             EditKind::Secret(name) => format!("secret {name}"),
             EditKind::Migrate(to) => format!("migrate → {to}"),
+            EditKind::StoreFile(path) => format!("file {}", filestore::shown(path)),
         }
     }
 }
@@ -268,7 +410,8 @@ pub enum RunResult {
         error: Option<String>,
     },
     Edit {
-        /// `inventory`, `config`, `secret NAME` or `migrate → age`.
+        /// `inventory`, `config`, `secret NAME`, `migrate → age`, `file
+        /// $/PATH` or `rm $/PATH`.
         what: String,
         outcome: Result<String, String>,
     },
@@ -341,6 +484,11 @@ pub enum Overlay {
     /// `u`'s question before it replaces anvil with release `version`.
     ConfirmUpdate {
         version: String,
+    },
+    /// The files browser's `D` question before it removes store `path`
+    /// (a folder with all it holds); only `y` answers it.
+    ConfirmDelete {
+        path: String,
     },
 }
 
@@ -481,13 +629,15 @@ impl App {
             last_script: String::new(),
             updated: None,
             available: None,
+            store: Root::locate().map_err(|err| err.to_string()),
+            files: None,
         };
         app.set_steps(steps);
         app
     }
 
     /// `q` and Ctrl-C quit; while a run is going they cancel it first, and
-    /// the loop ends once it has.
+    /// the loop ends once it has. In the files browser `q` closes it instead.
     pub fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         let had_notice = self.notice.take().is_some();
         let ctrl_c =
@@ -496,7 +646,7 @@ impl App {
             self.overlay,
             Some(Overlay::Input { .. } | Overlay::Options { .. })
         );
-        if ctrl_c || (key.code == KeyCode::Char('q') && !typing) {
+        if ctrl_c || (key.code == KeyCode::Char('q') && !typing && self.files.is_none()) {
             self.quit = true;
             if let Some(running) = &self.running {
                 running.cancel.store(true, Ordering::Relaxed);
@@ -506,6 +656,9 @@ impl App {
         }
         if let Some(overlay) = self.overlay.take() {
             return self.on_overlay_key(overlay, key);
+        }
+        if self.files.is_some() {
+            return self.on_files_key(key, had_notice);
         }
         match key.code {
             KeyCode::Char('d') => return self.start(Job::Doctor),
@@ -554,6 +707,10 @@ impl App {
                 });
             }
             KeyCode::Char('r') => return vec![Effect::Reload, Effect::Redraw],
+            KeyCode::Char('F') => match &self.store {
+                Ok(root) => self.files = Some(FilesView::open(root, String::new())),
+                Err(err) => self.notice = Some(err.clone()),
+            },
             KeyCode::Char('f') => {
                 self.edit_format = match self.edit_format {
                     None => Some(Format::Toml),
@@ -587,11 +744,77 @@ impl App {
         vec![Effect::Redraw]
     }
 
+    /// A key in the open files browser, with no overlay: it moves, opens a
+    /// folder or goes up, edits or deletes the cursor's entry, reloads, or
+    /// closes the browser. `?` shows help; other keys do nothing. Editing
+    /// and deleting are refused while a run is going.
+    fn on_files_key(&mut self, key: KeyEvent, had_notice: bool) -> Vec<Effect> {
+        let (Ok(root), Some(view)) = (&self.store, &mut self.files) else {
+            return Vec::new();
+        };
+        let had_error = view.error.take().is_some();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('F' | 'q') => self.files = None,
+            KeyCode::Up | KeyCode::Char('k') => view.step(false, root),
+            KeyCode::Down | KeyCode::Char('j') => view.step(true, root),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => view.enter(root),
+            KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => view.up(root),
+            KeyCode::Char('r') => view.load(root),
+            KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
+            KeyCode::Char('e' | 'D') if self.running.is_some() => self.notice = self.busy(),
+            KeyCode::Char('e') => match view.selected() {
+                Some(entry) if entry.kind == Kind::File => {
+                    let kind = EditKind::StoreFile(entry.path.clone());
+                    return vec![Effect::Edit(kind), Effect::Redraw];
+                }
+                _ if had_notice || had_error => {}
+                _ => return Vec::new(),
+            },
+            KeyCode::Char('D') => match view.selected() {
+                Some(entry) => {
+                    let path = entry.path.clone();
+                    self.overlay = Some(Overlay::ConfirmDelete { path });
+                }
+                None if had_notice || had_error => {}
+                None => return Vec::new(),
+            },
+            _ if had_notice || had_error => {}
+            _ => return Vec::new(),
+        }
+        vec![Effect::Redraw]
+    }
+
+    /// `D`'s confirmed delete: removes store `path` (a folder recursively),
+    /// records it as an edit, says how it went and lists the folder again.
+    fn delete(&mut self, path: &str) {
+        let (Ok(root), Some(view)) = (&self.store, &mut self.files) else {
+            return;
+        };
+        let shown = filestore::shown(path);
+        let outcome = root
+            .remove(path, true)
+            .map(|()| format!("removed {shown}"))
+            .map_err(|err| err.to_string());
+        view.load(root);
+        self.files_outcome(&outcome);
+        self.record(format!("rm {shown}"), outcome);
+    }
+
+    /// An edit or delete in the browser: done is the notice, an error the
+    /// browser's error.
+    fn files_outcome(&mut self, outcome: &Result<String, String>) {
+        match (outcome, &mut self.files) {
+            (Ok(done), _) => self.notice = Some(done.clone()),
+            (Err(err), Some(view)) => view.error = Some(err.clone()),
+            (Err(_), None) => {}
+        }
+    }
+
     /// A key under `overlay`, which was taken out of `self.overlay`: it is
     /// put back unless the key closes it. Esc closes any overlay; Enter
     /// confirms the Input, Migrate, Options, Confirm and ConfirmUpdate
     /// overlays, and closes Targets as `t` does: its selection changes as
-    /// Space is pressed. ConfirmRollback takes `y` only.
+    /// Space is pressed. ConfirmRollback and ConfirmDelete take `y` only.
     fn on_overlay_key(&mut self, mut overlay: Overlay, key: KeyEvent) -> Vec<Effect> {
         let mut effects = vec![Effect::Redraw];
         let keep = match (&mut overlay, key.code) {
@@ -600,11 +823,17 @@ impl App {
             | (
                 Overlay::Confirm { .. }
                 | Overlay::ConfirmUpdate { .. }
-                | Overlay::ConfirmRollback { .. },
+                | Overlay::ConfirmRollback { .. }
+                | Overlay::ConfirmDelete { .. },
                 KeyCode::Char('n'),
             ) => false,
             (Overlay::ConfirmRollback { .. }, KeyCode::Char('y')) => {
                 return self.start(Job::Rollback);
+            }
+            (Overlay::ConfirmDelete { path }, KeyCode::Char('y')) => {
+                let path = std::mem::take(path);
+                self.delete(&path);
+                return effects;
             }
             (Overlay::Confirm { .. }, KeyCode::Enter | KeyCode::Char('y')) => {
                 return self.start(Job::Run(self.last_script.clone()));
@@ -616,7 +845,8 @@ impl App {
                 Overlay::Help
                 | Overlay::Confirm { .. }
                 | Overlay::ConfirmUpdate { .. }
-                | Overlay::ConfirmRollback { .. },
+                | Overlay::ConfirmRollback { .. }
+                | Overlay::ConfirmDelete { .. },
                 _,
             ) => {
                 self.overlay = Some(overlay);
@@ -697,12 +927,22 @@ impl App {
         effects
     }
 
-    /// Records an editor flow's outcome as a new, shown result.
+    /// Records an editor flow's outcome as a new, shown result. A store
+    /// file's edit also lists the browser's folder again and says how it
+    /// went, as the browser hides the result.
     pub fn record_edit(&mut self, kind: &EditKind, outcome: Result<String, String>) {
-        self.results.push(RunResult::Edit {
-            what: kind.what(),
-            outcome,
-        });
+        if let EditKind::StoreFile(_) = kind {
+            if let (Ok(root), Some(view)) = (&self.store, &mut self.files) {
+                view.load(root);
+            }
+            self.files_outcome(&outcome);
+        }
+        self.record(kind.what(), outcome);
+    }
+
+    /// `outcome` as a new, shown edit result.
+    fn record(&mut self, what: String, outcome: Result<String, String>) {
+        self.results.push(RunResult::Edit { what, outcome });
         self.show(Some(self.results.len() - 1));
     }
 
@@ -1392,8 +1632,53 @@ pub mod tests {
         }
     }
 
+    /// An app whose file store is a path nothing creates, so `F` never
+    /// reads the real config dir.
     pub fn app() -> App {
-        App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()))
+        let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
+        app.store = Ok(Root::at(PathBuf::from("/nonexistent/anvil-tui/files")));
+        app
+    }
+
+    /// The browser open on `dir` of `app`'s store.
+    pub fn browsing(app: &App, dir: &str) -> FilesView {
+        FilesView::open(app.store.as_ref().unwrap(), dir.to_owned())
+    }
+
+    /// A temp file store holding `files` (`path`, text; a path ending in
+    /// `/` is a folder), removed on drop, and an app browsing it.
+    pub struct Store {
+        pub dir: PathBuf,
+        pub app: App,
+    }
+
+    impl Store {
+        pub fn new(tag: &str, files: &[(&str, &str)]) -> Store {
+            let dir = crate::test_util::temp_dir(&format!("tui-files-{tag}"));
+            let root = dir.join("files");
+            for (path, body) in files {
+                let at = root.join(path);
+                if path.ends_with('/') {
+                    std::fs::create_dir_all(at).unwrap();
+                } else {
+                    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+                    std::fs::write(at, body).unwrap();
+                }
+            }
+            let mut app = app();
+            app.store = Ok(Root::at(root));
+            Store { dir, app }
+        }
+
+        pub fn file(&self, path: &str) -> PathBuf {
+            self.dir.join("files").join(path)
+        }
+    }
+
+    impl Drop for Store {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     pub fn step(run: &str, code: Option<i32>, stdout: &str, stderr: &str) -> apply::StepReport {
@@ -3052,5 +3337,246 @@ pub mod tests {
             app.shown_result(),
             Some(RunResult::Apply { targets, .. }) if targets.len() == 1
         ));
+    }
+
+    /// The browser's rows as drawn: `..`, then names, folders with `/`.
+    fn rows_of(app: &App) -> Vec<String> {
+        let view = app.files.as_ref().expect("the browser is open");
+        let parent = view.has_parent().then(|| "..".to_owned());
+        parent
+            .into_iter()
+            .chain(view.entries.iter().map(|entry| {
+                let slash = if entry.kind == Kind::Dir { "/" } else { "" };
+                format!("{}{slash}", entry.name())
+            }))
+            .collect()
+    }
+
+    fn view(app: &App) -> &FilesView {
+        app.files.as_ref().expect("the browser is open")
+    }
+
+    #[test]
+    fn capital_f_opens_the_browser_on_the_store_root_folders_first() {
+        let mut store = Store::new(
+            "open",
+            &[("b.txt", "bee\n"), ("a/c.txt", "sea\n"), ("z/", "")],
+        );
+        let app = &mut store.app;
+        assert_eq!(app.on_key(key(KeyCode::Char('F'))), [Effect::Redraw]);
+        assert_eq!(view(app).dir, "");
+        assert_eq!(rows_of(app), ["a/", "z/", "b.txt"]);
+        assert_eq!(view(app).preview, Err("folder".to_owned()));
+        press(app, &[KeyCode::Down, KeyCode::Char('j'), KeyCode::Down]);
+        assert_eq!(view(app).cursor, 2, "the cursor stops at the last row");
+        assert_eq!(view(app).preview, Ok("bee\n".to_owned()));
+        press(app, &[KeyCode::Char('k')]);
+        assert_eq!(view(app).cursor, 1);
+        // `f` still cycles the format once the browser is closed.
+        press(app, &[KeyCode::Char('F'), KeyCode::Char('f')]);
+        assert!(app.files.is_none());
+        assert_eq!(app.edit_format, Some(Format::Toml));
+    }
+
+    #[test]
+    fn enter_opens_a_folder_and_backspace_goes_back_to_it() {
+        let mut store = Store::new("nav", &[("a/b/c.txt", "deep\n"), ("x.txt", "")]);
+        let app = &mut store.app;
+        press(app, &[KeyCode::Char('F'), KeyCode::Enter]);
+        assert_eq!(view(app).dir, "a");
+        assert_eq!(rows_of(app), ["..", "b/"]);
+        assert_eq!(view(app).preview, Err("folder".to_owned()));
+        press(app, &[KeyCode::Down, KeyCode::Right]);
+        assert_eq!(view(app).dir, "a/b");
+        press(app, &[KeyCode::Char('j')]);
+        assert_eq!(view(app).preview, Ok("deep\n".to_owned()));
+        press(app, &[KeyCode::Enter]);
+        assert_eq!(view(app).dir, "a/b", "Enter on a file stays");
+        press(app, &[KeyCode::Backspace]);
+        assert_eq!(view(app).dir, "a");
+        assert_eq!(view(app).cursor, 1, "on the folder it came from");
+        press(
+            app,
+            &[KeyCode::Char('l'), KeyCode::Char('h'), KeyCode::Left],
+        );
+        assert_eq!((view(app).dir.as_str(), view(app).cursor), ("", 0));
+        press(app, &[KeyCode::Backspace]);
+        assert_eq!(view(app).dir, "", "the root has no parent");
+        // `..` goes up too.
+        press(app, &[KeyCode::Char('l'), KeyCode::Up, KeyCode::Enter]);
+        assert_eq!(view(app).dir, "");
+    }
+
+    #[test]
+    fn a_missing_store_is_an_empty_root() {
+        let mut app = app();
+        press(
+            &mut app,
+            &[KeyCode::Char('F'), KeyCode::Down, KeyCode::Enter],
+        );
+        let view = view(&app);
+        assert!(view.entries.is_empty() && view.dir.is_empty());
+        assert_eq!((view.cursor, view.error.as_deref()), (0, None));
+        assert_eq!(view.preview, Err(String::new()));
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_located_is_the_notice() {
+        let mut app = app();
+        app.store = Err("no home directory".to_owned());
+        press(&mut app, &[KeyCode::Char('F')]);
+        assert!(app.files.is_none());
+        assert_eq!(app.notice.as_deref(), Some("no home directory"));
+    }
+
+    #[test]
+    fn the_preview_is_cut_at_64_kib_on_a_char_boundary() {
+        let body = format!("{}é tail", "x".repeat(PREVIEW_BYTES - 1));
+        let mut store = Store::new("cut", &[("big.txt", &body)]);
+        press(&mut store.app, &[KeyCode::Char('F')]);
+        let shown = view(&store.app).preview.clone().unwrap();
+        assert_eq!(shown.len(), PREVIEW_BYTES - 1);
+        let mut store = Store::new("bin", &[("bin.dat", "a\0b")]);
+        press(&mut store.app, &[KeyCode::Char('F')]);
+        let err = view(&store.app).preview.clone().unwrap_err();
+        assert!(err.starts_with("$/bin.dat: not a regular UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn e_edits_the_cursor_file_only() {
+        let mut store = Store::new("edit", &[("d/", ""), ("n.txt", "")]);
+        let app = &mut store.app;
+        press(app, &[KeyCode::Char('F')]);
+        assert!(app.on_key(key(KeyCode::Char('e'))).is_empty(), "a folder");
+        press(app, &[KeyCode::Down]);
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('e'))),
+            [
+                Effect::Edit(EditKind::StoreFile("n.txt".to_owned())),
+                Effect::Redraw
+            ]
+        );
+        assert_eq!(
+            EditKind::StoreFile("a/n.txt".to_owned()).what(),
+            "file $/a/n.txt"
+        );
+        app.running = Some(Running {
+            kind: RunKind::Apply,
+            running: Vec::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            tick: 0,
+        });
+        assert_eq!(app.on_key(key(KeyCode::Char('e'))), [Effect::Redraw]);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("busy: apply is running (Esc cancels)")
+        );
+        press(app, &[KeyCode::Char('D')]);
+        assert!(app.overlay.is_none(), "no delete while running");
+    }
+
+    #[test]
+    fn a_store_file_edit_reloads_the_browser_and_is_noticed_and_recorded() {
+        let mut store = Store::new("edited", &[("n.txt", "old\n")]);
+        press(&mut store.app, &[KeyCode::Char('F')]);
+        std::fs::write(store.file("n.txt"), "new\n").unwrap();
+        let kind = EditKind::StoreFile("n.txt".to_owned());
+        store.app.record_edit(&kind, Ok("wrote $/n.txt".to_owned()));
+        let app = &mut store.app;
+        assert_eq!(view(app).preview, Ok("new\n".to_owned()));
+        assert_eq!(app.notice.as_deref(), Some("wrote $/n.txt"));
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Edit { what, outcome: Ok(_) }) if what == "file $/n.txt"
+        ));
+        app.record_edit(&kind, Err("$/n.txt: is a symlink".to_owned()));
+        assert_eq!(view(app).error.as_deref(), Some("$/n.txt: is a symlink"));
+        assert_eq!(app.results.len(), 2);
+        // The next key clears the error.
+        assert_eq!(app.on_key(key(KeyCode::Char('Z'))), [Effect::Redraw]);
+        assert_eq!(view(app).error, None);
+    }
+
+    #[test]
+    fn capital_d_asks_and_only_y_deletes_a_folder_with_all_it_holds() {
+        let mut store = Store::new("delete", &[("d/e/f.txt", "x"), ("k.txt", "")]);
+        let app = &mut store.app;
+        press(app, &[KeyCode::Char('F'), KeyCode::Char('D')]);
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::ConfirmDelete { path }) if path == "d"
+        ));
+        for code in [KeyCode::Enter, KeyCode::Char('q'), KeyCode::Char('j')] {
+            assert!(app.on_key(key(code)).is_empty(), "{code:?}");
+            assert!(matches!(app.overlay, Some(Overlay::ConfirmDelete { .. })));
+        }
+        assert!(!app.quit);
+        press(app, &[KeyCode::Char('n')]);
+        assert!(app.overlay.is_none());
+        press(app, &[KeyCode::Char('D'), KeyCode::Esc]);
+        assert!(app.overlay.is_none() && store.file("d/e/f.txt").exists());
+        let app = &mut store.app;
+        press(app, &[KeyCode::Char('D')]);
+        assert_eq!(app.on_key(key(KeyCode::Char('y'))), [Effect::Redraw]);
+        assert!(app.overlay.is_none());
+        assert!(!store.file("d").exists());
+        let app = &store.app;
+        assert_eq!(rows_of(app), ["k.txt"]);
+        assert_eq!(app.notice.as_deref(), Some("removed $/d"));
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Edit { what, outcome: Ok(done) })
+                if what == "rm $/d" && done == "removed $/d"
+        ));
+    }
+
+    #[test]
+    fn a_failed_delete_is_the_browser_error_and_recorded() {
+        let mut store = Store::new("gone", &[("k.txt", "")]);
+        press(&mut store.app, &[KeyCode::Char('F'), KeyCode::Char('D')]);
+        std::fs::remove_file(store.file("k.txt")).unwrap();
+        press(&mut store.app, &[KeyCode::Char('y')]);
+        let app = &store.app;
+        assert_eq!(view(app).error.as_deref(), Some("$/k.txt: not found"));
+        assert!(view(app).entries.is_empty(), "listed again");
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Edit { what, outcome: Err(_) }) if what == "rm $/k.txt"
+        ));
+    }
+
+    #[test]
+    fn the_browser_closes_on_esc_f_or_q_and_ignores_the_main_keys() {
+        let mut store = Store::new("close", &[("k.txt", "")]);
+        let app = &mut store.app;
+        for close in [KeyCode::Esc, KeyCode::Char('F'), KeyCode::Char('q')] {
+            press(app, &[KeyCode::Char('F')]);
+            for ignored in ['a', 'd', 'i', 't', 'x', 'f', 'c'] {
+                assert!(
+                    app.on_key(key(KeyCode::Char(ignored))).is_empty(),
+                    "{ignored}"
+                );
+            }
+            assert!(app.running.is_none() && app.overlay.is_none());
+            assert_eq!(app.edit_format, None);
+            assert_eq!(app.on_key(key(close)), [Effect::Redraw]);
+            assert!(app.files.is_none() && !app.quit, "{close:?}");
+        }
+        press(app, &[KeyCode::Char('F'), KeyCode::Char('?')]);
+        assert!(matches!(app.overlay, Some(Overlay::Help)));
+        press(app, &[KeyCode::Esc]);
+        assert!(app.overlay.is_none() && app.files.is_some());
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.quit, "Ctrl-C still quits");
+    }
+
+    #[test]
+    fn r_lists_the_folder_again() {
+        let mut store = Store::new("reload", &[("a.txt", "")]);
+        press(&mut store.app, &[KeyCode::Char('F'), KeyCode::Down]);
+        std::fs::write(store.file("b.txt"), "b").unwrap();
+        press(&mut store.app, &[KeyCode::Char('r'), KeyCode::Down]);
+        assert_eq!(rows_of(&store.app), ["a.txt", "b.txt"]);
+        assert_eq!(view(&store.app).preview, Ok("b".to_owned()));
     }
 }

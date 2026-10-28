@@ -10,9 +10,10 @@ Topic guides: [Getting started](getting-started.md), [Configuration](configurati
 [Development](development.md).
 
 ```text
-anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [--target SEL]... [--parallel N] <COMMAND>
+anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [--target SEL]... [--parallel N] [COMMAND]
   inventory [--format toml|yaml] edit the inventory; --format picks the edit view, saved as TOML
   config [--format toml|yaml]    edit the config; --format picks the edit view, saved as TOML
+  files <ACTION>                 manage the file store that [[files]] src $/… reads: ls, cp, mv, rm, mkdir, cat, edit
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
   plan                           show the steps apply would run on every target, running none
@@ -23,6 +24,10 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   tui                            run every command and browse the results in a terminal UI
   update [--check]               replace this binary with the latest release once it verifies
 ```
+
+Bare `anvil`, with no command, opens the [TUI](#anvil-tui) when stdin and stdout are both terminals, with the global
+flags given (`anvil --target pi` is `anvil tui --target pi`). Otherwise, as from a script, a pipe or an agent, it
+prints the help on stderr and exits 2. A binary built without the `tui` feature always prints the help.
 
 ## Common flags
 
@@ -41,9 +46,9 @@ Every flag is global: it may come before or after the command.
 | `-V`, `--version`   | version                                                                                               |
 
 The JSON examples below are pretty-printed; anvil prints each document on one line. An unknown `--target` is a usage
-error (exit 2; for `tui` only when the inventory loads). `inventory`, `config` and `secret` ignore `--target` with a
-warning. `--parallel` outside 1..=32 is exit 2 (`invalid value '0' for '--parallel <N>': 0 is not in 1..=32`);
-`inventory`, `config`, `secret`, `doctor` and `update` ignore it, and with N other than 1 log the warning
+error (exit 2; for `tui` only when the inventory loads). `inventory`, `config`, `files` and `secret` ignore `--target`
+with a warning. `--parallel` outside 1..=32 is exit 2 (`invalid value '0' for '--parallel <N>': 0 is not in 1..=32`);
+`inventory`, `config`, `files`, `secret`, `doctor` and `update` ignore it, and with N other than 1 log the warning
 ``--parallel is ignored by `doctor` `` (with that command's name), shown from `-v`.
 Targets start in order, `local` first, then hosts sorted by name, up to `--parallel N` at a time (one after another by
 default); a failing target does not stop the others.
@@ -116,6 +121,86 @@ and a legacy `config.yaml` or `config.yml` is migrated by the next save. `--form
 inventory and `[anvil].format` stay as they are (edit `format` like any other key). When `[anvil].editor`
 names a program that cannot be found, `config` falls back to `$VISUAL`, `$EDITOR`, `nvim` with a warning, so a typo
 there cannot lock you out. Output and `--json` as for `inventory`.
+
+### `anvil files`
+
+Keeps the files that `[[files]]` copies in one place, the file store, so a config can name them as `$/…` wherever the
+config itself lives ([`src`](configuration.md)):
+
+```sh
+anvil files cp ~/.tmux.conf '$/dotfiles/'     # copy in; a DEST ending in / keeps the name
+anvil files ls -r                             # dotfiles/  dotfiles/.tmux.conf
+anvil files edit '$/dotfiles/.tmux.conf'      # change it in the editor
+anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
+```
+
+The store is the folder `files` in the config directory: `$XDG_CONFIG_HOME/anvil/files`, else
+`~/.config/anvil/files`. `--config` and `--inventory` never move it. Every action works on this machine only; it
+ignores `--target` and `--parallel` with a warning, shown from `-v`.
+
+**Store paths.** `$/sub/motd` names `files/sub/motd`, and `$/` the store itself. Every action but `cp` also takes the
+path without `$/` (`sub/motd`); `cp` uses `$/` to tell the store side from this machine's. A path that is absolute
+(`/x`, `$//x`), holds a NUL byte or has a `.` or `..` component is exit 2 with `$/../x: invalid store path`; repeated
+`/` separators collapse. A path through a symlink inside the store is exit 2 (`$/link: is a symlink`), so nothing reads
+or writes outside it. Missing folders are created as 0700 (the store's own folder too) and files are written as 0600.
+Files are text only: regular UTF-8 files without NUL, at most 1 MiB, the same limits `[[files]]` sets; any other file is
+exit 1 with `$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`. Errors name the store path:
+`$/c: exists; pass --force`, `$/d: is a folder; pass -r`, `$/d/x: is not a folder`, `$/x: not found`.
+
+| Action                  | Effect                                                                        |
+| ----------------------- | ----------------------------------------------------------------------------- |
+| `ls [PATH] [-r]`        | list a folder (default `$/`), a folder marked `/`; `-r` lists the whole tree  |
+| `cp SRC DEST [-r] [-f]` | copy a file, or a folder with `-r`, between this machine and the store        |
+| `mv SRC DEST [-f]`      | move or rename inside the store                                               |
+| `rm PATH... [-r]`       | remove files, or folders and all they hold with `-r`                          |
+| `mkdir PATH...`         | create folders and their missing parents; an existing folder is left as it is |
+| `cat PATH`              | print a file to stdout byte for byte                                          |
+| `edit PATH`             | edit a file in [the editor](#the-editor); a missing one opens empty           |
+
+- **`ls`.** Names one per line, sorted, a folder with a trailing `/`; with `-r` every entry below the folder, as a path
+  from the store root (`a/`, `a/motd`, `a/sub/`). A store that does not exist yet lists as empty; a file is exit 1
+  (`$/x: is not a folder`).
+- **`cp`.** Exactly one of SRC and DEST is a store path, else exit 2 with
+  `anvil files cp: exactly one of SRC and DEST must be a store path ($/…)`. A folder needs `-r` (else exit 2,
+  `is a folder; pass -r`). When DEST ends in `/`, is an existing folder or is `$/`, the copy goes inside it under
+  SRC's name; `.` and `..` take the name of the folder they mean, and `/`, which has none, is exit 2
+  (`/: has no file name; name the destination`). A DEST file that exists is exit 1 (`exists; pass --force`) unless `-f`
+  replaces it with a new inode rather than writing in place. A host SRC symlink given on the command line is followed,
+  like `cp`; symlinks found inside a host folder copied with `-r` are skipped with a warning. A host DEST symlink is
+  refused (exit 1, `PATH: is a symlink`), even with `--force`. Existing host parent directories may be symlinks.
+  Exported files keep the store file's mode masked to `0755`, so `0600` stays `0600` and `0666` becomes `0644`;
+  new folders are `0700`. A folder copied into itself is refused. Recursive operations fail past 64 nested folders
+  (exit 1, `PATH: nested deeper than 64 folders`).
+- **`mv`.** When DEST ends in `/`, is an existing folder or is `$/`, SRC moves inside it. An existing DEST file
+  needs `-f`. Moving a folder into itself is exit 2. Missing parents of DEST are created.
+- **`rm`.** Removes each PATH in turn and stops at the first failure. A folder without `-r` is exit 1; `$/` is exit 2.
+  A symlink in the store is removed itself, never what it points to.
+- **`edit`.** Loads the config (for `[anvil].editor`, so a config that does not load is its exit 2), opens the file as
+  `edit-<random>.<ext>` with the file's extension (`.txt` when it has none), and writes the buffer back only when it
+  changed; a new file left empty is not created. An editor that exits non-zero writes nothing (exit 1).
+
+`mv` and `rm` then load the config and log a WARN for every `[[files]]` src under the path they moved or removed:
+``files[0].src `$/a/motd` names $/a, which is gone``. A config that does not load gives no warning and no error.
+
+Human output: `ls` the names, `cat` the file, the other actions nothing. `--json` is one document:
+
+```json
+{
+  "root": "/Users/me/.config/anvil/files",
+  "entries": [
+    { "path": "a", "kind": "dir" },
+    { "path": "a/motd", "kind": "file", "size": 5 }
+  ]
+}
+```
+
+for `ls` (`kind` is `file`, `dir` or `other`, and only a file has `size`), and `{ "changed": ["$/tree", "$/tree/motd"] }`
+for `cp`, `mv`, `rm`, `mkdir` and `edit`, listing the store paths it wrote, created, moved to or removed (empty when
+nothing changed; `cp` out of the store lists the store paths it read). `cat` refuses `--json` (exit 2,
+`anvil files cat: --json is not available`).
+
+Exit 0 on success; 1 when a path is missing, exists without `-f`, is a folder (`rm`) or not a folder, is not text, or a
+read or write fails; 2 for usage, an invalid store path, a symlink in the store or a SRC without a name.
 
 ### `anvil doctor`
 
@@ -1222,8 +1307,9 @@ Human output: `migrated N secrets from X to Y` (`1 secret` for one). `--json`:
 
 ### `anvil tui`
 
-Runs every command above in one terminal UI and keeps their results for browsing. It starts only when asked: bare
-`anvil` still prints the help, so a script or an agent never lands in a TUI. stdin and stdout must be a terminal (else
+Runs every command above in one terminal UI and keeps their results for browsing, and browses the
+[file store](#anvil-files) with `F`. Bare `anvil` at a terminal opens it too; off a terminal bare `anvil` prints the
+help instead, so a script or an agent never lands in a TUI. stdin and stdout must be a terminal (else
 exit 2, `anvil tui needs a terminal`), and `--json` is refused (exit 2, `anvil tui: --json is not available`), although
 `anvil tui --help` lists it among the global flags. The global flags are the starting state: `--target` preselects
 rows of the `t` overlay, `-v` sets the Log pane level, `--parallel` how many targets its apply, plan and run take at
@@ -1386,6 +1472,11 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 - **`update`**: 0 when up to date, ahead of the latest release, or updated. 1 with `--check` when an update is
   available, and for every failure: the query, a download, a check, a refusal, or `no release key compiled in`; the
   installed binary is then untouched. 2 for a bad flag or argument.
+- **`files`**: 0 on success. 1 when a store path is missing, already exists without `-f`, is a folder (`rm` without
+  `-r`) or is not a folder, is not a text file, or a read, write or the editor fails. 2 for a bad flag or argument, an
+  invalid store path, a symlink inside the store, a `cp` whose SRC and DEST are both or neither `$/…`, a folder copied
+  without `-r`, `cat --json`, or (for `edit`) a config that does not load ([anvil files](#anvil-files)).
+- **Bare `anvil`**: as `tui` at a terminal; elsewhere the help on stderr and 2.
 - **`tui`**: 0 on quit, whatever the results. 2 when stdin or stdout is not a terminal, for `--json`, or for an unknown
   `--target` (checked only when the inventory loads); an inventory that does not load (any load error, including an
   `--inventory` path not ending in `.toml`) is shown in the header, the status bar and the `t` overlay instead. 1 when

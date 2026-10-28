@@ -222,3 +222,66 @@ fn parallel_one_prints_exactly_what_the_default_prints() {
         assert_eq!(text(&one.stdout), text(&default.stdout), "{flag:?}");
     }
 }
+
+#[test]
+fn store_src_plans_and_applies_with_a_config_elsewhere() {
+    let sandbox = Sandbox::new("pl-store");
+    let store = sandbox.config_dir().join("files/sub");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("motd"), "from the store\n").unwrap();
+    let config = sandbox.root().join("elsewhere.toml");
+    let dest = sandbox.root().join("motd");
+    std::fs::write(
+        &config,
+        format!(
+            "[[files]]\nsrc = \"$/sub/motd\"\ndest = \"{}\"\nmode = \"0644\"\nsudo = false\n",
+            dest.display()
+        ),
+    )
+    .unwrap();
+    let out = sandbox.anvil(&["--config", config.to_str().unwrap(), "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains(&format!("file {}", dest.display())));
+    assert!(!dest.exists());
+    let out = sandbox.anvil(&["--config", config.to_str().unwrap(), "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(dest).unwrap(), "from the store\n");
+}
+
+#[test]
+fn store_src_refuses_traversal_and_symlink_components() {
+    let sandbox = Sandbox::new("pl-store-bad");
+    let store = sandbox.config_dir().join("files");
+    std::fs::create_dir_all(store.join("sub")).unwrap();
+    std::fs::write(store.join("sub/motd"), "text").unwrap();
+    std::fs::write(store.join("file"), "text").unwrap();
+    std::os::unix::fs::symlink("sub/motd", store.join("link")).unwrap();
+    std::os::unix::fs::symlink("sub", store.join("linked-dir")).unwrap();
+    for (src, why) in [
+        ("$/", "must name a file in the store"),
+        ("$/../x", "invalid store path"),
+        ("$/link", "is a symlink"),
+        ("$/linked-dir/motd", "$/linked-dir is a symlink"),
+        ("$/file/x", "$/file is not a folder"),
+        ("$/sub//missing", "not found"),
+    ] {
+        sandbox.write_config(
+            "config.toml",
+            &format!("[[files]]\nsrc = \"{src}\"\ndest = \"/etc/motd\"\nmode = \"0644\"\n"),
+        );
+        for command in ["plan", "apply"] {
+            let out = sandbox.anvil(&[command], &[]);
+            assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+            let stderr = text(&out.stderr);
+            let prefix = if matches!(src, "$/" | "$/../x") {
+                format!("{}: ", sandbox.config_dir().join("config.toml").display())
+            } else {
+                String::new()
+            };
+            assert_eq!(
+                stderr,
+                format!("ERROR anvil: {prefix}files[0].src `{src}`: {why}\n")
+            );
+        }
+    }
+}

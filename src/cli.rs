@@ -1,5 +1,7 @@
 //! Command line per the CLI contract.
 
+#[cfg(feature = "tui")]
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
@@ -71,8 +73,16 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH", hide = true)]
     pub release_key: Vec<PathBuf>,
 
+    /// None for bare `anvil`; see [`resolve`].
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
+}
+
+impl Cli {
+    /// The command's name; bare `anvil` runs as `tui`.
+    pub fn name(&self) -> &'static str {
+        self.command.as_ref().map_or("tui", Command::name)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -86,6 +96,11 @@ pub enum Command {
     Config {
         #[arg(long, value_enum, value_name = "FORMAT")]
         format: Option<Format>,
+    },
+    /// Manage the file store that `[[files]]` src `$/…` reads
+    Files {
+        #[command(subcommand)]
+        action: FilesAction,
     },
     /// Local checks plus every target's facts and reachability
     Doctor,
@@ -149,11 +164,58 @@ pub enum Command {
     },
 }
 
+/// File store operations.
+#[derive(Debug, Subcommand)]
+pub enum FilesAction {
+    /// List a store folder; -r lists the whole tree
+    Ls {
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+        #[arg(short, long)]
+        recursive: bool,
+    },
+    /// Copy between this machine and the store; exactly one side is `$/…`
+    Cp {
+        #[arg(value_name = "SRC")]
+        src: String,
+        #[arg(value_name = "DEST")]
+        dest: String,
+        #[arg(short, long)]
+        recursive: bool,
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Move or rename inside the store
+    Mv {
+        src: String,
+        dest: String,
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Remove a store file; -r removes a folder and its contents
+    Rm {
+        #[arg(required = true)]
+        paths: Vec<String>,
+        #[arg(short, long)]
+        recursive: bool,
+    },
+    /// Create store folders and missing parents
+    Mkdir {
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
+    /// Print a store file to stdout
+    Cat { path: String },
+    /// Edit a store file, created when missing
+    Edit { path: String },
+}
+
 impl Command {
     pub fn name(&self) -> &'static str {
         match self {
             Command::Inventory { .. } => "inventory",
             Command::Config { .. } => "config",
+            Command::Files { .. } => "files",
             Command::Doctor => "doctor",
             Command::Apply => "apply",
             Command::Plan => "plan",
@@ -165,6 +227,20 @@ impl Command {
             Command::Update { .. } => "update",
         }
     }
+}
+
+/// What bare `anvil` runs once it opens the TUI.
+#[cfg(feature = "tui")]
+static BARE: Command = Command::Tui;
+
+/// The command to run: the parsed one, else for bare `anvil` `tui` when
+/// stdin and stdout are terminals. None means print the help and exit 2.
+pub fn resolve(cli: &Cli) -> Option<&Command> {
+    #[cfg(feature = "tui")]
+    if cli.command.is_none() && io::stdin().is_terminal() && io::stdout().is_terminal() {
+        return Some(&BARE);
+    }
+    cli.command.as_ref()
 }
 
 /// A fatal error: logged once at `Error`, then the process exits with `code`
@@ -241,12 +317,13 @@ pub fn print_json(value: &impl Serialize, on_err: fn(String) -> Failure) -> Resu
     Ok(())
 }
 
-/// Runs the parsed command.
-pub fn run(cli: &Cli) -> Result<(), Failure> {
+/// Runs `command`, the one [`resolve`] picked for `cli`.
+pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
     let opts = Options::from_cli(cli);
-    match &cli.command {
+    match command {
         Command::Inventory { format } => crate::commands::inventory(cli, &opts, *format),
         Command::Config { format } => crate::commands::config(cli, &opts, *format),
+        Command::Files { action } => crate::files_cmd::run(cli, &opts, action),
         Command::Doctor => {
             crate::commands::warn_parallel(cli);
             let config = opts.load_config()?;
@@ -286,32 +363,71 @@ mod tests {
         Cli::try_parse_from(std::iter::once("anvil").chain(args.iter().copied())).unwrap()
     }
 
+    fn command(args: &[&str]) -> Command {
+        parse(args).command.unwrap()
+    }
+
+    #[test]
+    fn parses_files_actions_and_required_paths() {
+        for args in [
+            vec!["files", "ls"],
+            vec!["files", "ls", "$/sub", "-r"],
+            vec!["files", "cp", "host", "$/", "-rf"],
+            vec!["files", "mv", "a", "b", "--force"],
+            vec!["files", "rm", "a", "b", "-r"],
+            vec!["files", "mkdir", "a", "b"],
+            vec!["files", "cat", "a"],
+            vec!["files", "edit", "a"],
+        ] {
+            assert_eq!(command(&args).name(), "files");
+        }
+        assert!(matches!(
+            command(&["files", "ls"]),
+            Command::Files {
+                action: FilesAction::Ls {
+                    path: None,
+                    recursive: false
+                }
+            }
+        ));
+        for args in [
+            vec!["files"],
+            vec!["files", "rm"],
+            vec!["files", "mkdir"],
+            vec!["files", "cp", "x"],
+            vec!["files", "cat"],
+            vec!["files", "edit"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("anvil").chain(args)).is_err());
+        }
+    }
+
     #[test]
     fn parses_the_five_subcommands() {
         assert!(matches!(
-            parse(&["inventory"]).command,
+            command(&["inventory"]),
             Command::Inventory { format: None }
         ));
         assert!(matches!(
-            parse(&["inventory", "--format", "toml"]).command,
+            command(&["inventory", "--format", "toml"]),
             Command::Inventory {
                 format: Some(Format::Toml)
             }
         ));
         assert!(matches!(
-            parse(&["config"]).command,
+            command(&["config"]),
             Command::Config { format: None }
         ));
         assert!(matches!(
-            parse(&["config", "--format", "yaml"]).command,
+            command(&["config", "--format", "yaml"]),
             Command::Config {
                 format: Some(Format::Yaml)
             }
         ));
-        assert!(matches!(parse(&["doctor"]).command, Command::Doctor));
-        assert!(matches!(parse(&["apply"]).command, Command::Apply));
-        assert!(matches!(parse(&["plan"]).command, Command::Plan));
-        match parse(&["run", "-"]).command {
+        assert!(matches!(command(&["doctor"]), Command::Doctor));
+        assert!(matches!(command(&["apply"]), Command::Apply));
+        assert!(matches!(command(&["plan"]), Command::Plan));
+        match command(&["run", "-"]) {
             Command::Run { script, timeout } => {
                 assert_eq!(script, PathBuf::from("-"));
                 assert_eq!(timeout, 300);
@@ -319,10 +435,10 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(matches!(
-            parse(&["run", "--timeout", "5", "x.sh"]).command,
+            command(&["run", "--timeout", "5", "x.sh"]),
             Command::Run { timeout: 5, .. }
         ));
-        match parse(&["secret", "HOST_SUDO"]).command {
+        match command(&["secret", "HOST_SUDO"]) {
             Command::Secret {
                 name, migrate, to, ..
             } => {
@@ -333,14 +449,14 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(matches!(
-            parse(&["update"]).command,
+            command(&["update"]),
             Command::Update { check: false }
         ));
         assert!(matches!(
-            parse(&["update", "--check", "--json"]).command,
+            command(&["update", "--check", "--json"]),
             Command::Update { check: true }
         ));
-        match parse(&["secret", "--migrate", "--to", "age"]).command {
+        match command(&["secret", "--migrate", "--to", "age"]) {
             Command::Secret { name, migrate, to } => {
                 assert_eq!(name, None);
                 assert!(migrate);
@@ -352,11 +468,9 @@ mod tests {
 
     #[test]
     fn rollback_takes_force_repeated_or_force_all() {
-        match parse(&[
+        match command(&[
             "rollback", "--force", "/etc/a", "--force", "/etc/b", "--json",
-        ])
-        .command
-        {
+        ]) {
             Command::Rollback {
                 force,
                 force_all,
@@ -369,13 +483,12 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(matches!(
-            parse(&[
+            command(&[
                 "rollback",
                 "--force-all",
                 "--allow-host-change",
                 "--dry-run"
-            ])
-            .command,
+            ]),
             Command::Rollback {
                 force_all: true,
                 allow_host_change: true,
@@ -383,7 +496,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(parse(&["rollback"]).command.name(), "rollback");
+        assert_eq!(command(&["rollback"]).name(), "rollback");
         for args in [
             ["rollback", "--force-all", "--force", "/etc/a"].as_slice(),
             ["rollback", "--force"].as_slice(),
@@ -437,8 +550,18 @@ mod tests {
     }
 
     #[test]
+    fn bare_anvil_parses_with_no_command_and_its_global_flags() {
+        assert!(parse(&[]).command.is_none());
+        let cli = parse(&["--config", "cfg.toml", "--target", "local", "-v"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.config, Some(PathBuf::from("cfg.toml")));
+        assert_eq!(cli.target, ["local"]);
+        assert_eq!(cli.name(), "tui");
+        assert_eq!(parse(&["doctor"]).name(), "doctor");
+    }
+
+    #[test]
     fn bad_usage_is_an_error() {
-        assert!(Cli::try_parse_from(["anvil"]).is_err());
         assert!(Cli::try_parse_from(["anvil", "frobnicate"]).is_err());
         assert!(Cli::try_parse_from(["anvil", "secret"]).is_err());
         assert!(Cli::try_parse_from(["anvil", "config", "--format", "ini"]).is_err());

@@ -10,9 +10,10 @@
 [開發](development.zh-TW.md)。
 
 ```text
-anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [--target SEL]... [--parallel N] <COMMAND>
+anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [--target SEL]... [--parallel N] [COMMAND]
   inventory [--format toml|yaml] edit the inventory; --format picks the edit view, saved as TOML
   config [--format toml|yaml]    edit the config; --format picks the edit view, saved as TOML
+  files <ACTION>                 manage the file store that [[files]] src $/… reads: ls, cp, mv, rm, mkdir, cat, edit
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
   plan                           show the steps apply would run on every target, running none
@@ -23,6 +24,10 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   tui                            run every command and browse the results in a terminal UI
   update [--check]               replace this binary with the latest release once it verifies
 ```
+
+不帶指令單獨執行 `anvil` 時，若 stdin 與 stdout 都是終端機，會帶著給定的全域旗標開啟 [TUI](#anvil-tui)
+（`anvil --target pi` 即 `anvil tui --target pi`）。否則（例如來自腳本、管線或 agent）會在 stderr 印出說明並以 2 結束。
+建置時不含 `tui` feature 的執行檔一律印出說明。
 
 ## 通用旗標
 
@@ -42,9 +47,9 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
 
 下方的 JSON 範例經過排版；anvil 會將每份文件印成一行。
 未知的 `--target` 是用法錯誤（以 2 結束；對 `tui` 而言僅在 inventory 載入成功時）。
-`inventory`、`config` 與 `secret` 會忽略 `--target` 並發出警告。
+`inventory`、`config`、`files` 與 `secret` 會忽略 `--target` 並發出警告。
 超出 1..=32 的 `--parallel` 以 2 結束（`invalid value '0' for '--parallel <N>': 0 is not in 1..=32`）；
-`inventory`、`config`、`secret`、`doctor` 與 `update` 會忽略它，N 不為 1 時記錄警告
+`inventory`、`config`、`files`、`secret`、`doctor` 與 `update` 會忽略它，N 不為 1 時記錄警告
 ``--parallel is ignored by `doctor` ``（帶該指令的名稱），從 `-v` 起顯示。
 target（目標）依序啟動，先 `local`，再依名稱排序的 host（主機），同時最多 `--parallel N` 個（預設一個接一個）；
 某個 target 失敗不會中止其他 target。
@@ -115,6 +120,83 @@ anvil run --parallel 4 fix.sh
 `--format X` 只挑選編輯檢視；inventory 與 `[anvil].format` 維持原狀（`format` 像其他鍵一樣直接編輯）。
 當 `[anvil].editor` 指定的程式找不到時，`config` 會改用 `$VISUAL`、`$EDITOR`、`nvim` 並發出警告，
 因此那裡打錯字也不會把你鎖在外面。輸出與 `--json` 同 `inventory`。
+
+### `anvil files`
+
+把 `[[files]]` 要複製的檔案集中放在一處，也就是檔案儲存區（file store），
+如此 config 不論放在哪裡，都能以 `$/…` 指名它們（[`src`](configuration.zh-TW.md)）：
+
+```sh
+anvil files cp ~/.tmux.conf '$/dotfiles/'     # copy in; a DEST ending in / keeps the name
+anvil files ls -r                             # dotfiles/  dotfiles/.tmux.conf
+anvil files edit '$/dotfiles/.tmux.conf'      # change it in the editor
+anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
+```
+
+儲存區是 config 目錄中的 `files` 資料夾：`$XDG_CONFIG_HOME/anvil/files`，否則為 `~/.config/anvil/files`。
+`--config` 與 `--inventory` 絕不會移動它。每個動作都只在這台機器上進行；會忽略 `--target` 與 `--parallel` 並發出警告，從 `-v` 起顯示。
+
+**儲存區路徑。** `$/sub/motd` 指 `files/sub/motd`，`$/` 則是儲存區本身。除了 `cp` 以外，每個動作也接受不帶 `$/` 的路徑
+（`sub/motd`）；`cp` 靠 `$/` 分辨哪一邊是儲存區、哪一邊是這台機器。絕對路徑（`/x`、`$//x`）、含 NUL 位元組，
+或含 `.` 或 `..` 元件的路徑以 2 結束並顯示 `$/../x: invalid store path`；連續的 `/` 會合併。
+經過儲存區內 symlink 的路徑以 2 結束（`$/link: is a symlink`），因此不會讀寫儲存區以外的東西。
+缺少的資料夾以 0700 建立（包括儲存區本身的資料夾），檔案以 0600 寫入。
+只接受文字檔：不含 NUL、至多 1 MiB 的一般 UTF-8 檔案，與 `[[files]]` 的限制相同；
+其他檔案以 1 結束並顯示 `$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`。錯誤會指名儲存區路徑：
+`$/c: exists; pass --force`、`$/d: is a folder; pass -r`、`$/d/x: is not a folder`、`$/x: not found`。
+
+| 動作                    | 效果                                                     |
+| ----------------------- | -------------------------------------------------------- |
+| `ls [PATH] [-r]`        | 列出資料夾（預設 `$/`），資料夾標上 `/`；`-r` 列出整棵樹 |
+| `cp SRC DEST [-r] [-f]` | 在這台機器與儲存區之間複製檔案，或以 `-r` 複製資料夾     |
+| `mv SRC DEST [-f]`      | 在儲存區內移動或重新命名                                 |
+| `rm PATH... [-r]`       | 刪除檔案，或以 `-r` 刪除資料夾及其所有內容               |
+| `mkdir PATH...`         | 建立資料夾及缺少的上層資料夾；已存在的資料夾維持原狀     |
+| `cat PATH`              | 將檔案逐位元組印到 stdout                                |
+| `edit PATH`             | 在[編輯器](#編輯器)中編輯檔案；不存在的檔案以空白開啟    |
+
+- **`ls`。** 每行一個名稱並排序，資料夾結尾帶 `/`；使用 `-r` 時列出資料夾下的每個項目，以從儲存區根目錄起算的路徑表示
+  （`a/`、`a/motd`、`a/sub/`）。尚未存在的儲存區列為空；對檔案使用則以 1 結束（`$/x: is not a folder`）。
+- **`cp`。** SRC 與 DEST 必須恰好一個是儲存區路徑，否則以 2 結束並顯示
+  `anvil files cp: exactly one of SRC and DEST must be a store path ($/…)`。資料夾需要 `-r`（否則以 2 結束，
+  `is a folder; pass -r`）。DEST 以 `/` 結尾、是已存在的資料夾或是 `$/` 時，複製到其中並沿用 SRC 的名稱；
+  `.` 與 `..` 採用它們所指資料夾的名稱，而沒有名稱的 `/` 以 2 結束（`/: has no file name; name the destination`）。
+  已存在的 DEST 檔案以 1 結束（`exists; pass --force`），除非 `-f` 以新的 inode 取代它，而不是原地寫入。
+  命令列指定的 host SRC 若是 symlink，會像 `cp` 一樣跟隨它；以 `-r` 複製 host 資料夾時，
+  其中遇到的 symlink 會略過並顯示 warning。host DEST 若是 symlink，即使使用 `--force` 也會拒絕，
+  以 1 結束（`PATH: is a symlink`）。host DEST 已存在的上層目錄可以是 symlink。
+  匯出的檔案保留儲存區檔案的 mode，但以 `0755` 遮罩限制，因此 `0600` 維持 `0600`，`0666` 變成 `0644`；
+  新資料夾為 `0700`。把資料夾複製到它自己裡面會被拒絕。遞迴操作遇到超過 64 層的巢狀資料夾時，
+  以 1 結束（`PATH: nested deeper than 64 folders`）。
+- **`mv`。** DEST 以 `/` 結尾、是已存在的資料夾或是 `$/` 時，SRC 移到其中。已存在的 DEST 檔案需要 `-f`。
+  把資料夾移到它自己裡面以 2 結束。DEST 缺少的上層資料夾會被建立。
+- **`rm`。** 依序刪除每個 PATH，遇到第一個失敗就停止。沒有 `-r` 的資料夾以 1 結束；`$/` 以 2 結束。
+  儲存區中的 symlink 刪除的是它本身，絕不是它指向的東西。
+- **`edit`。** 載入 config（為了 `[anvil].editor`，因此無法載入的 config 會讓它以 2 結束），
+  以檔案的副檔名（沒有時為 `.txt`）開啟 `edit-<random>.<ext>`，只在緩衝區變更時寫回；保持空白的新檔案不會被建立。
+  以非零結束的編輯器不寫入任何東西（以 1 結束）。
+
+`mv` 與 `rm` 接著載入 config，對每個位於被移動或刪除路徑下的 `[[files]]` src 記錄一行 WARN：
+``files[0].src `$/a/motd` names $/a, which is gone``。無法載入的 config 不產生警告，也不算錯誤。
+
+給人看的輸出：`ls` 印出名稱，`cat` 印出檔案，其他動作不印任何東西。`--json` 為一份文件：
+
+```json
+{
+  "root": "/Users/me/.config/anvil/files",
+  "entries": [
+    { "path": "a", "kind": "dir" },
+    { "path": "a/motd", "kind": "file", "size": 5 }
+  ]
+}
+```
+
+上面是 `ls` 的（`kind` 為 `file`、`dir` 或 `other`，只有檔案有 `size`）；`cp`、`mv`、`rm`、`mkdir` 與 `edit` 則為
+`{ "changed": ["$/tree", "$/tree/motd"] }`，列出寫入、建立、移入或刪除的儲存區路徑（沒有變更時為空；
+從儲存區往外 `cp` 時列出它讀取的儲存區路徑）。`cat` 拒絕 `--json`（以 2 結束，`anvil files cat: --json is not available`）。
+
+成功時以 0 結束；路徑不存在、已存在而沒有 `-f`、是資料夾（`rm`）或不是資料夾、不是文字，或讀寫失敗時為 1；
+用法錯誤、無效的儲存區路徑、儲存區中的 symlink，或沒有名稱的 SRC 時為 2。
 
 ### `anvil doctor`
 
@@ -1164,8 +1246,8 @@ keychain 目標在中途失敗時會列出已寫入的名稱。值絕不會出�
 
 ### `anvil tui`
 
-在一個終端機 UI 中執行上述所有指令，並保留結果供瀏覽。它只在明確要求時啟動：
-單獨執行 `anvil` 仍印出說明，因此腳本或 agent 絕不會掉進 TUI。
+在一個終端機 UI 中執行上述所有指令，並保留結果供瀏覽，也能以 `F` 瀏覽[檔案儲存區](#anvil-files)。
+在終端機上單獨執行 `anvil` 也會開啟它；不在終端機上時，單獨執行 `anvil` 改為印出說明，因此腳本或 agent 絕不會掉進 TUI。
 stdin 與 stdout 必須是終端機（否則以 2 結束，`anvil tui needs a terminal`），
 且 `--json` 會被拒絕（以 2 結束，`anvil tui: --json is not available`），儘管 `anvil tui --help` 將它列在全域旗標中。
 全域旗標是起始狀態：`--target` 預先選取 `t` overlay 中的列，`-v` 設定 Log pane 的層級，
@@ -1319,6 +1401,11 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
 - **`update`**：已是最新、比最新 release 更新或已更新時為 0。
   搭配 `--check` 且有可用的更新時為 1，任何失敗也為 1：查詢、下載、檢查、拒絕情形，或 `no release key compiled in`；
   此時已安裝的執行檔保持不變。錯誤的旗標或引數為 2。
+- **`files`**：成功時為 0。儲存區路徑不存在、已存在而沒有 `-f`、是資料夾（`rm` 沒有 `-r`）或不是資料夾、不是文字檔，
+  或讀取、寫入或編輯器失敗時為 1。錯誤的旗標或引數、無效的儲存區路徑、儲存區內的 symlink、
+  SRC 與 DEST 都是或都不是 `$/…` 的 `cp`、沒有 `-r` 而複製資料夾、`cat --json`，
+  或（對 `edit`）無法載入的 config 時為 2（[anvil files](#anvil-files)）。
+- **單獨的 `anvil`**：在終端機上同 `tui`；其他情況在 stderr 印出說明並為 2。
 - **`tui`**：離開時為 0，不論結果為何。
   stdin 或 stdout 不是終端機、使用 `--json`，或未知的 `--target`（只在 inventory 載入成功時檢查）時為 2；
   無法載入的 inventory（任何載入錯誤，包括不以 `.toml` 結尾的 `--inventory` 路徑）改為顯示在標頭、狀態列與 `t` overlay 中。

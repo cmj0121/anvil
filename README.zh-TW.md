@@ -29,13 +29,14 @@ make build                 # or: builds target/release/anvil
 ```sh
 anvil inventory            # edit the hosts (opens $EDITOR)
 anvil config               # edit the packages, files, services and steps
+anvil files cp motd '$/'   # keep a file in the store, for [[files]] src = "$/motd"
 anvil secret NAME          # store a secret
 anvil doctor               # every target's facts and reachability
 anvil plan                 # the steps apply would run, running none
 anvil apply                # install packages, copy files, set services, run the steps
 anvil run fix.sh           # run one sh script on every target
 anvil rollback             # put back the files the last apply wrote
-anvil tui                  # all of the above in one terminal UI
+anvil                      # all of the above in one terminal UI (also: anvil tui)
 anvil update               # replace the binary with the latest signed release
 ```
 

@@ -1,4 +1,4 @@
-//! `[[files]]`: a text file beside the config, copied to `dest` on each
+//! `[[files]]`: a text file beside the config or in the store, copied to `dest` on each
 //! target whose tags and facts all match.
 //!
 //! [`load`] reads every src once, before any target runs. [`runs`] turns
@@ -26,6 +26,7 @@ use crate::apply::{FileRun, PlannedRun, Upload};
 use crate::config::{Config, ModeValue, is_mode, is_sha256};
 use crate::document;
 use crate::facts::Facts;
+use crate::filestore::{self, StoreError};
 use crate::inventory::{self, Target, TargetKind};
 use crate::record::{FileRecord, Previous, PreviousFile, Write};
 use crate::secret;
@@ -62,9 +63,8 @@ impl fmt::Debug for Source {
     }
 }
 
-/// Reads every `[[files]]` src, resolved in the config's directory, which it
-/// must not leave; [`Sources::default`] when there are none. Errors name the
-/// entry.
+/// Reads every src from the store or config directory; errors name the entry.
+/// [`Sources::default`] when there are none.
 pub fn load(config: &Config) -> Result<Sources, String> {
     if config.files.is_empty() {
         return Ok(Sources::default());
@@ -82,8 +82,14 @@ pub fn load(config: &Config) -> Result<Sources, String> {
     Ok(Sources(sources.collect::<Result<_, _>>()?))
 }
 
-/// `src` under `dir` (canonical), read as text.
+/// Reads a store src or a canonical path under `dir` as text.
 fn read_src(dir: &Path, src: &str) -> Result<String, String> {
+    if crate::filestore::is_store_path(src) {
+        return crate::filestore::Root::locate()
+            .map_err(|err| err.to_string())?
+            .read_text(src)
+            .map_err(|err| store_reason(src, &err));
+    }
     const TEXT_ONLY: &str = "[[files]] copies text files only for now";
     let path = fs::canonicalize(dir.join(src)).map_err(|err| format!("cannot read: {err}"))?;
     if !path.starts_with(dir) {
@@ -102,6 +108,23 @@ fn read_src(dir: &Path, src: &str) -> Result<String, String> {
         return Err(format!("contains a NUL byte; {TEXT_ONLY}"));
     }
     Ok(text)
+}
+
+/// Retains a failing store component when it differs from the source.
+fn store_reason(src: &str, err: &StoreError) -> String {
+    let normalized = |path: &str| {
+        filestore::parse(path).unwrap_or_else(|_| {
+            path.strip_prefix(filestore::PREFIX)
+                .unwrap_or(path)
+                .to_owned()
+        })
+    };
+    let path = normalized(err.path());
+    if path == normalized(src) {
+        err.reason()
+    } else {
+        format!("{}{path} {}", filestore::PREFIX, err.reason())
+    }
 }
 
 /// Whether `target` carries every one of `tags` (`local` carries `local`)
@@ -1656,6 +1679,28 @@ mod tests {
             vec![entry("ok.txt", "/etc/ok"), entry(src, "/etc/x")],
         ))
         .unwrap_err()
+    }
+
+    #[test]
+    fn store_errors_retain_only_different_components() {
+        for error in [
+            StoreError::BadPath("part".into()),
+            StoreError::NoBasename("part".into()),
+            StoreError::Symlink("part".into()),
+            StoreError::NotFound("part".into()),
+            StoreError::Exists("part".into()),
+            StoreError::IsDir("part".into()),
+            StoreError::NotDir("part".into()),
+            StoreError::NotText("part".into()),
+            StoreError::Io("part".into(), std::io::Error::other("failed")),
+        ] {
+            assert_eq!(store_reason("$/part", &error), error.reason());
+            assert_eq!(store_reason("$/part//", &error), error.reason());
+            assert_eq!(
+                store_reason("$/part/file", &error),
+                format!("$/part {}", error.reason())
+            );
+        }
     }
 
     #[test]
