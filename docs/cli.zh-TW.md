@@ -161,8 +161,13 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
   `anvil files cp: exactly one of SRC and DEST must be a store path ($/…)`。資料夾需要 `-r`（否則以 2 結束，
   `is a folder; pass -r`）。DEST 以 `/` 結尾、是已存在的資料夾或是 `$/` 時，複製到其中並沿用 SRC 的名稱；
   `.` 與 `..` 採用它們所指資料夾的名稱，而沒有名稱的 `/` 以 2 結束（`/: has no file name; name the destination`）。
-  已存在的 DEST 檔案以 1 結束（`exists; pass --force`），除非 `-f` 取代它。這台機器上的 symlink 會被跟隨並複製其目標；
-  把資料夾複製到它自己裡面會被拒絕。
+  已存在的 DEST 檔案以 1 結束（`exists; pass --force`），除非 `-f` 以新的 inode 取代它，而不是原地寫入。
+  命令列指定的 host SRC 若是 symlink，會像 `cp` 一樣跟隨它；以 `-r` 複製 host 資料夾時，
+  其中遇到的 symlink 會略過並顯示 warning。host DEST 若是 symlink，即使使用 `--force` 也會拒絕，
+  以 1 結束（`PATH: is a symlink`）。host DEST 已存在的上層目錄可以是 symlink。
+  匯出的檔案保留儲存區檔案的 mode，但以 `0755` 遮罩限制，因此 `0600` 維持 `0600`，`0666` 變成 `0644`；
+  新資料夾為 `0700`。把資料夾複製到它自己裡面會被拒絕。遞迴操作遇到超過 64 層的巢狀資料夾時，
+  以 1 結束（`PATH: nested deeper than 64 folders`）。
 - **`mv`。** DEST 以 `/` 結尾、是已存在的資料夾或是 `$/` 時，SRC 移到其中。已存在的 DEST 檔案需要 `-f`。
   把資料夾移到它自己裡面以 2 結束。DEST 缺少的上層資料夾會被建立。
 - **`rm`。** 依序刪除每個 PATH，遇到第一個失敗就停止。沒有 `-r` 的資料夾以 1 結束；`$/` 以 2 結束。

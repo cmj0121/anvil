@@ -165,7 +165,12 @@ exit 1 with `$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`. Err
   `is a folder; pass -r`). When DEST ends in `/`, is an existing folder or is `$/`, the copy goes inside it under
   SRC's name; `.` and `..` take the name of the folder they mean, and `/`, which has none, is exit 2
   (`/: has no file name; name the destination`). A DEST file that exists is exit 1 (`exists; pass --force`) unless `-f`
-  replaces it. A symlink on this machine is followed and its target copied; a folder copied into itself is refused.
+  replaces it with a new inode rather than writing in place. A host SRC symlink given on the command line is followed,
+  like `cp`; symlinks found inside a host folder copied with `-r` are skipped with a warning. A host DEST symlink is
+  refused (exit 1, `PATH: is a symlink`), even with `--force`. Existing host parent directories may be symlinks.
+  Exported files keep the store file's mode masked to `0755`, so `0600` stays `0600` and `0666` becomes `0644`;
+  new folders are `0700`. A folder copied into itself is refused. Recursive operations fail past 64 nested folders
+  (exit 1, `PATH: nested deeper than 64 folders`).
 - **`mv`.** When DEST ends in `/`, is an existing folder or is `$/`, SRC moves inside it. An existing DEST file
   needs `-f`. Moving a folder into itself is exit 2. Missing parents of DEST are created.
 - **`rm`.** Removes each PATH in turn and stops at the first failure. A folder without `-r` is exit 1; `$/` is exit 2.

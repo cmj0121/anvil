@@ -347,3 +347,50 @@ fn removal_succeeds_without_an_orphan_warning_when_config_is_invalid() {
     assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
     assert!(!s.config_dir().join("files/a").exists());
 }
+
+#[test]
+fn human_names_escape_terminal_controls_but_json_preserves_names() {
+    let s = Sandbox::new("files-controls");
+    run(&s, &["files", "mkdir", "dir"], 0);
+    let name = "evil\x1b[2J\r";
+    fs::write(s.config_dir().join("files/dir").join(name), "text").unwrap();
+    assert_eq!(
+        text(&run(&s, &["files", "ls", "dir"], 0).stdout),
+        "evil\\x1b[2J\\x0d\n"
+    );
+    assert_eq!(
+        text(&run(&s, &["files", "ls", "-r"], 0).stdout),
+        "dir/\ndir/evil\\x1b[2J\\x0d\n"
+    );
+    assert_eq!(
+        json(&run(&s, &["files", "ls", "dir", "--json"], 0))["entries"][0]["path"],
+        format!("dir/{name}")
+    );
+}
+
+#[test]
+fn relative_host_failures_keep_host_paths() {
+    let s = Sandbox::new("files-host-errors");
+    run(&s, &["files", "mkdir", "dir"], 0);
+    fs::write(s.config_dir().join("files/a"), "text").unwrap();
+    for (args, expected) in [
+        (
+            ["files", "cp", "$/a", "missing/out"],
+            "ERROR anvil: missing: not found\n",
+        ),
+        (
+            ["files", "cp", "missing", "$/a"],
+            "ERROR anvil: missing: not found\n",
+        ),
+    ] {
+        let out = s
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .current_dir(s.root())
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(text(&out.stderr), expected);
+        assert!(out.stdout.is_empty());
+    }
+}

@@ -36,7 +36,11 @@ pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failur
                     } else {
                         entry.path.rsplit('/').next().unwrap()
                     };
-                    println!("{name}{}", if entry.kind == Kind::Dir { "/" } else { "" });
+                    println!(
+                        "{}{}",
+                        crate::logger::escape_controls(name),
+                        if entry.kind == Kind::Dir { "/" } else { "" }
+                    );
                 }
             }
             return Ok(());

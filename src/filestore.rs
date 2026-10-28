@@ -1,8 +1,13 @@
 //! Confined text files under `<config_dir>/files`, addressed as `$/…`.
 
+use rustix::fs::{self as at, AtFlags, Mode, OFlags};
+use rustix::io::Errno;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -10,9 +15,13 @@ use serde::Serialize;
 use crate::document;
 use crate::paths::{self, PathsError};
 use crate::private;
+use crate::secret::check_owner;
 
 /// Store path prefix.
 pub const PREFIX: &str = "$/";
+
+/// Maximum folder depth in a recursive traversal.
+const MAX_DEPTH: usize = 64;
 
 /// Whether `s` explicitly names the store.
 pub fn is_store_path(s: &str) -> bool {
@@ -59,11 +68,14 @@ pub enum StoreError {
     BadPath(String),
     NoBasename(String),
     Symlink(String),
+    HostSymlink(String),
+    Host(String, io::Error),
     NotFound(String),
     Exists(String),
     IsDir(String),
     NotDir(String),
     NotText(String),
+    TooDeep(String),
     Io(String, io::Error),
 }
 
@@ -84,12 +96,15 @@ impl StoreError {
             Self::BadPath(path)
             | Self::NoBasename(path)
             | Self::Symlink(path)
+            | Self::HostSymlink(path)
             | Self::NotFound(path)
             | Self::Exists(path)
             | Self::IsDir(path)
             | Self::NotDir(path)
+            | Self::TooDeep(path)
             | Self::NotText(path)
-            | Self::Io(path, _) => path,
+            | Self::Io(path, _)
+            | Self::Host(path, _) => path,
         }
     }
 
@@ -98,13 +113,14 @@ impl StoreError {
         match self {
             Self::BadPath(_) => "invalid store path",
             Self::NoBasename(_) => "has no file name; name the destination",
-            Self::Symlink(_) => "is a symlink",
+            Self::Symlink(_) | Self::HostSymlink(_) => "is a symlink",
             Self::NotFound(_) => "not found",
             Self::Exists(_) => "exists; pass --force",
             Self::IsDir(_) => "is a folder; pass -r",
             Self::NotDir(_) => "is not a folder",
+            Self::TooDeep(_) => return format!("nested deeper than {MAX_DEPTH} folders"),
             Self::NotText(_) => "not a regular UTF-8 text file without NUL, at most 1 MiB",
-            Self::Io(_, err) => return err.to_string(),
+            Self::Io(_, err) | Self::Host(_, err) => return err.to_string(),
         }
         .to_owned()
     }
@@ -113,7 +129,10 @@ impl StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let path = self.path();
-        if matches!(self, Self::NoBasename(_)) {
+        if matches!(
+            self,
+            Self::NoBasename(_) | Self::HostSymlink(_) | Self::Host(_, _)
+        ) {
             return write!(f, "{path}: {}", self.reason());
         }
         write!(f, "{}: {}", shown(path), self.reason())
@@ -123,6 +142,9 @@ impl fmt::Display for StoreError {
 impl std::error::Error for StoreError {}
 
 fn shown(rel: &str) -> String {
+    if Path::new(rel).is_absolute() {
+        return rel.to_owned();
+    }
     format!("{PREFIX}{}", rel.strip_prefix(PREFIX).unwrap_or(rel))
 }
 
@@ -181,113 +203,91 @@ impl Root {
     /// Lists a folder, sorted by store-relative path; a missing root is empty.
     pub fn list(&self, rel: &str, recursive: bool) -> Result<Vec<Entry>, StoreError> {
         let rel = parse(rel)?;
-        let path = self.resolve(&rel)?;
-        if rel.is_empty() && !path.exists() {
-            return Ok(Vec::new());
-        }
-        if !fs::metadata(&path).map_err(|e| io_error(&rel, e))?.is_dir() {
-            return Err(StoreError::NotDir(rel));
-        }
+        let dir = match self.directory(&rel, false) {
+            Ok(dir) => dir,
+            Err(StoreError::NotFound(_)) if rel.is_empty() => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
         let mut entries = Vec::new();
-        self.list_into(&rel, recursive, &mut entries)?;
+        list_into(&dir, &rel, recursive, 0, &mut entries)?;
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
     }
 
-    fn list_into(
-        &self,
-        rel: &str,
-        recursive: bool,
-        out: &mut Vec<Entry>,
-    ) -> Result<(), StoreError> {
-        for child in children(&self.resolve(rel)?, rel)? {
-            let name = child_name(&child, rel)?;
-            let next = joined(rel, &name);
-            let meta = fs::symlink_metadata(&child).map_err(|e| io_error(&next, e))?;
-            let kind = kind(&meta);
-            out.push(Entry {
-                path: next.clone(),
-                kind,
-                size: (kind == Kind::File).then_some(meta.len()),
-            });
-            if recursive && kind == Kind::Dir {
-                self.list_into(&next, true, out)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Reads one regular UTF-8 text file, without NUL, at most 1 MiB.
     pub fn read_text(&self, rel: &str) -> Result<String, StoreError> {
-        read_text(&self.resolve(rel)?, rel)
+        let rel = parse(rel)?;
+        let (dir, name) = self.parent(&rel, false)?;
+        let file = open_file(&dir, &name, &rel)?;
+        read_file(file, &rel)
     }
 
     /// Writes atomically as 0600, creating missing parents as 0700.
     pub fn write(&self, rel: &str, bytes: &[u8]) -> Result<(), StoreError> {
-        let rel = parse(rel)?;
-        text(bytes, &rel)?;
-        let path = self.resolve(&rel)?;
-        if path.is_dir() || rel.is_empty() {
-            return Err(StoreError::IsDir(rel));
-        }
-        self.parents(&path, &rel)?;
-        private::write_atomic(&path, bytes).map_err(|e| io_error(&rel, e))
+        self.write_into(rel, bytes, true)
     }
 
-    fn parents(&self, path: &Path, rel: &str) -> Result<(), StoreError> {
-        private::ensure_dir(&self.0).map_err(|e| io_error("", e))?;
-        if let Some(parent) = path.parent() {
-            private::create_dir(parent).map_err(|e| io_error(rel, e))?;
+    fn write_into(&self, rel: &str, bytes: &[u8], force: bool) -> Result<(), StoreError> {
+        let rel = parse(rel)?;
+        text(bytes, &rel)?;
+        if rel.is_empty() {
+            return Err(StoreError::IsDir(rel));
         }
-        Ok(())
+        let (dir, name) = self.parent(&rel, true)?;
+        check_at(&dir, &name, &rel, force)?;
+        atomic_at(&dir, &name, bytes, 0o600).map_err(|e| io_error(&rel, e))
+    }
+
+    fn directory(&self, rel: &str, create: bool) -> Result<File, StoreError> {
+        if fs::symlink_metadata(&self.0).is_ok_and(|m| m.is_symlink()) {
+            return Err(StoreError::Symlink(String::new()));
+        }
+        if create && !self.0.exists() {
+            private::create_dir(&self.0).map_err(|e| io_error("", e))?;
+        }
+        let dir =
+            File::from(at::open(&self.0, dir_flags(), Mode::empty()).map_err(|e| fd_error("", e))?);
+        if create {
+            check_private(&dir, "")?;
+        }
+        walk_dir(dir, rel, create)
+    }
+
+    fn parent(&self, rel: &str, create: bool) -> Result<(File, String), StoreError> {
+        let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+        Ok((
+            self.directory(parent, create)?,
+            if name.is_empty() { "." } else { name }.to_owned(),
+        ))
     }
 
     /// Creates a folder and missing parents as 0700.
     pub fn mkdir(&self, rel: &str) -> Result<(), StoreError> {
-        let path = self.resolve(rel)?;
-        if path.exists() && !path.is_dir() {
-            return Err(StoreError::NotDir(parse(rel)?));
-        }
-        private::ensure_dir(&self.0).map_err(|e| io_error("", e))?;
-        private::create_dir(&path).map_err(|e| io_error(rel, e))
+        self.directory(&parse(rel)?, true).map(drop)
     }
 
     /// Removes a file or tree, unlinking symlinks without following them.
     pub fn remove(&self, rel: &str, recursive: bool) -> Result<(), StoreError> {
         let rel = non_root(rel)?;
-        let (parent, name) = rel.rsplit_once('/').unwrap_or(("", &rel));
-        let parent_path = self.resolve(parent)?;
-        if !fs::symlink_metadata(&parent_path)
-            .map_err(|e| io_error(parent, e))?
-            .is_dir()
-        {
-            return Err(StoreError::NotDir(parent.to_owned()));
-        }
-        let path = parent_path.join(name);
-        let meta = fs::symlink_metadata(&path).map_err(|e| io_error(&rel, e))?;
-        if meta.is_dir() {
-            if !recursive {
-                return Err(StoreError::IsDir(rel));
-            }
-            remove_tree(&path, &rel)
-        } else {
-            fs::remove_file(path).map_err(|e| io_error(&rel, e))
-        }
+        let (dir, name) = self.parent(&rel, false)?;
+        remove_at(&dir, &name, &rel, recursive, 1)
     }
 
     /// Moves inside the store, returning the normalized destination without `$/`.
     pub fn rename(&self, from: &str, to: &str, force: bool) -> Result<String, StoreError> {
         let from = non_root(from)?;
-        let src = self.resolve(&from)?;
-        fs::symlink_metadata(&src).map_err(|e| io_error(&from, e))?;
-        let to = self.destination(to, || child_name(&src, &from))?;
+        let root = self.directory("", true)?;
+        let (src_dir, src_name) = parent_at(&root, &from, false)?;
+        check_private(&src_dir, from.rsplit_once('/').map_or("", |(p, _)| p))?;
+        let src = open_file(&src_dir, &src_name, &from)?;
+        drop(src);
+        let to = self.destination(to, || Ok(src_name.clone()))?;
         if to == from || to.starts_with(&format!("{from}/")) {
             return Err(StoreError::BadPath(to));
         }
-        let dest = self.resolve(&to)?;
-        check_destination(&dest, &to, force)?;
-        self.parents(&dest, &to)?;
-        fs::rename(src, dest).map_err(|e| io_error(&to, e))?;
+        let (dest_dir, dest_name) = parent_at(&root, &to, true)?;
+        check_at(&dest_dir, &dest_name, &to, force)?;
+        at::renameat(&src_dir, &src_name, &dest_dir, &dest_name).map_err(|e| fd_error(&to, e))?;
         Ok(to)
     }
 
@@ -317,22 +317,46 @@ impl Root {
     ) -> Result<Vec<String>, StoreError> {
         let dest = self.destination(rel, || copy_name(host, rel))?;
         let mut changed = Vec::new();
-        self.import_into(host, &dest, recursive, force, &mut Vec::new(), &mut changed)?;
+        self.import_into(
+            host,
+            None,
+            &dest,
+            recursive,
+            force,
+            &mut Vec::new(),
+            1,
+            &mut changed,
+        )?;
         Ok(changed)
     }
 
+    #[expect(clippy::too_many_arguments, reason = "recursive copy state")]
     fn import_into(
         &self,
         host: &Path,
+        opened: Option<File>,
         rel: &str,
         recursive: bool,
         force: bool,
         ancestors: &mut Vec<PathBuf>,
+        depth: usize,
         changed: &mut Vec<String>,
     ) -> Result<(), StoreError> {
-        let meta = fs::metadata(host).map_err(|e| io_error(rel, e))?;
+        let file = match opened {
+            Some(file) => file,
+            None => File::from(
+                at::open(
+                    host,
+                    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|e| host_io_error(host, e.into()))?,
+            ),
+        };
+        let meta = file.metadata().map_err(|e| host_io_error(host, e))?;
         match kind(&meta) {
             Kind::Dir => {
+                check_depth(rel, depth)?;
                 if !recursive {
                     return Err(StoreError::IsDir(rel.to_owned()));
                 }
@@ -347,20 +371,41 @@ impl Root {
                 self.mkdir(rel)?;
                 changed.push(shown(rel));
                 ancestors.push(host.to_owned());
-                for child in children(host, rel)? {
+                for name in names(&file, rel).map_err(|e| host_error(host, e))? {
+                    let child = host.join(&name);
                     let next = joined(rel, &child_name(&child, rel)?);
-                    self.import_into(&child, &next, true, force, ancestors, changed)?;
+                    let opened = match at::openat(
+                        &file,
+                        &name,
+                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        Ok(fd) => File::from(fd),
+                        Err(Errno::LOOP) => {
+                            log::warn!("skipped symlink {}", child.display());
+                            continue;
+                        }
+                        Err(e) => return Err(host_io_error(&child, e.into())),
+                    };
+                    self.import_into(
+                        &child,
+                        Some(opened),
+                        &next,
+                        true,
+                        force,
+                        ancestors,
+                        depth + 1,
+                        changed,
+                    )?;
                 }
                 ancestors.pop();
             }
             Kind::File => {
-                let dest = self.resolve(rel)?;
-                check_destination(&dest, rel, force)?;
-                let content = read_text(host, rel)?;
-                self.write(rel, content.as_bytes())?;
+                let content = read_file(file, rel).map_err(|e| host_error(host, e))?;
+                self.write_into(rel, content.as_bytes(), force)?;
                 changed.push(shown(rel));
             }
-            Kind::Other => return Err(StoreError::NotText(rel.to_owned())),
+            Kind::Other => return Err(host_error(host, StoreError::NotText(rel.to_owned()))),
         }
         Ok(())
     }
@@ -374,6 +419,7 @@ impl Root {
         force: bool,
     ) -> Result<Vec<String>, StoreError> {
         let rel = parse(rel)?;
+        refuse_host_link(host)?;
         let src = self.resolve(&rel)?;
         fs::symlink_metadata(&src).map_err(|e| io_error(&rel, e))?;
         let dest = if host.is_dir() || host.as_os_str().as_encoded_bytes().ends_with(b"/") {
@@ -381,49 +427,31 @@ impl Root {
         } else {
             host.to_owned()
         };
-        let mut changed = Vec::new();
-        self.export_into(&rel, &dest, recursive, force, &mut changed)?;
-        Ok(changed)
-    }
-
-    fn export_into(
-        &self,
-        rel: &str,
-        host: &Path,
-        recursive: bool,
-        force: bool,
-        changed: &mut Vec<String>,
-    ) -> Result<(), StoreError> {
-        let src = self.resolve(rel)?;
-        let meta = fs::symlink_metadata(&src).map_err(|e| io_error(rel, e))?;
-        match kind(&meta) {
-            Kind::Dir => {
-                if !recursive {
-                    return Err(StoreError::IsDir(rel.to_owned()));
-                }
-                // A host destination inside the source would grow while traversing it.
-                if host_contains(&src, host) {
-                    return Err(StoreError::BadPath(rel.to_owned()));
-                }
-                fs::create_dir_all(host).map_err(|e| io_error(rel, e))?;
-                changed.push(shown(rel));
-                for child in children(&src, rel)? {
-                    let name = child_name(&child, rel)?;
-                    self.export_into(&joined(rel, &name), &host.join(name), true, force, changed)?;
-                }
-            }
-            Kind::File => {
-                if paths::same_file(&src, host) {
-                    return Err(StoreError::BadPath(rel.to_owned()));
-                }
-                check_destination(host, rel, force)?;
-                let content = self.read_text(rel)?;
-                fs::write(host, content).map_err(|e| io_error(rel, e))?;
-                changed.push(shown(rel));
-            }
-            Kind::Other => return Err(StoreError::NotText(rel.to_owned())),
+        if src.is_dir() && host_contains(&src, &dest) {
+            return Err(StoreError::BadPath(rel));
         }
-        Ok(())
+        let (parent, name) = self.parent(&rel, false)?;
+        let source = open_file(&parent, &name, &rel)?;
+        let host_parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let host_dir = host_directory(host_parent, recursive)?;
+        let mut changed = Vec::new();
+        export_into(
+            source,
+            &src,
+            &rel,
+            &host_dir,
+            dest.file_name()
+                .ok_or_else(|| StoreError::BadPath(rel.clone()))?,
+            &dest,
+            recursive,
+            force,
+            1,
+            &mut changed,
+        )?;
+        Ok(changed)
     }
 }
 
@@ -463,7 +491,7 @@ fn copy_name(path: &Path, rel: &str) -> Result<String, StoreError> {
     if path.file_name().is_some() {
         return child_name(path, rel);
     }
-    let canonical = fs::canonicalize(path).map_err(|e| io_error(rel, e))?;
+    let canonical = fs::canonicalize(path).map_err(|e| host_io_error(path, e))?;
     if canonical.file_name().is_none() {
         return Err(StoreError::NoBasename(path.display().to_string()));
     }
@@ -477,16 +505,6 @@ fn child_name(path: &Path, rel: &str) -> Result<String, StoreError> {
         .ok_or_else(|| StoreError::BadPath(rel.to_owned()))
 }
 
-fn children(path: &Path, rel: &str) -> Result<Vec<PathBuf>, StoreError> {
-    let mut paths = fs::read_dir(path)
-        .map_err(|e| io_error(rel, e))?
-        .map(|entry| entry.map(|e| e.path()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| io_error(rel, e))?;
-    paths.sort();
-    Ok(paths)
-}
-
 fn kind(meta: &fs::Metadata) -> Kind {
     if meta.is_dir() {
         Kind::Dir
@@ -497,17 +515,6 @@ fn kind(meta: &fs::Metadata) -> Kind {
     }
 }
 
-fn check_destination(path: &Path, rel: &str, force: bool) -> Result<(), StoreError> {
-    match fs::metadata(path) {
-        Ok(meta) if meta.is_dir() => Err(StoreError::IsDir(rel.to_owned())),
-        Ok(meta) if !meta.is_file() => Err(StoreError::NotText(rel.to_owned())),
-        Ok(_) if !force => Err(StoreError::Exists(rel.to_owned())),
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(io_error(rel, e)),
-    }
-}
-
 fn text<'a>(bytes: &'a [u8], rel: &str) -> Result<&'a str, StoreError> {
     if bytes.len() as u64 > document::MAX_BYTES || bytes.contains(&0) {
         return Err(StoreError::NotText(rel.to_owned()));
@@ -515,8 +522,243 @@ fn text<'a>(bytes: &'a [u8], rel: &str) -> Result<&'a str, StoreError> {
     std::str::from_utf8(bytes).map_err(|_| StoreError::NotText(rel.to_owned()))
 }
 
-fn read_text(path: &Path, rel: &str) -> Result<String, StoreError> {
-    let meta = fs::metadata(path).map_err(|e| io_error(rel, e))?;
+/// Opens existing host parents like cp, creating missing parents privately.
+fn host_directory(path: &Path, create: bool) -> Result<File, StoreError> {
+    match at::open(path, dir_flags() & !OFlags::NOFOLLOW, Mode::empty()) {
+        Ok(fd) => Ok(File::from(fd)),
+        Err(Errno::NOENT) if create => {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let dir = host_directory(parent, true)?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| host_error(path, StoreError::BadPath(path.display().to_string())))?;
+            let rel = path.display().to_string();
+            match at::mkdirat(&dir, name, Mode::from_raw_mode(0o700)) {
+                Ok(()) | Err(Errno::EXIST) => {}
+                Err(e) => return Err(host_io_error(path, e.into())),
+            }
+            at::openat(&dir, name, dir_flags(), Mode::empty())
+                .map(File::from)
+                .map_err(|e| {
+                    host_error(
+                        path,
+                        component_error(&dir, name.to_str().unwrap_or(""), &rel, e),
+                    )
+                })
+        }
+        Err(e) => Err(host_io_error(path, e.into())),
+    }
+}
+
+/// Names read from a held directory, excluding dot entries.
+fn names(dir: &File, rel: &str) -> Result<Vec<std::ffi::OsString>, StoreError> {
+    let entries = at::Dir::read_from(dir).map_err(|e| fd_error(rel, e))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| fd_error(rel, e))?;
+        let name = entry.file_name();
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(std::ffi::OsStr::from_bytes(name.to_bytes()).to_owned());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn list_into(
+    dir: &File,
+    rel: &str,
+    recursive: bool,
+    depth: usize,
+    out: &mut Vec<Entry>,
+) -> Result<(), StoreError> {
+    check_depth(rel, depth)?;
+    for name in names(dir, rel)? {
+        let name = name
+            .to_str()
+            .ok_or_else(|| StoreError::BadPath(rel.to_owned()))?;
+        let next = joined(rel, name);
+        let meta =
+            at::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| fd_error(&next, e))?;
+        let kind = match at::FileType::from_raw_mode(meta.st_mode) {
+            at::FileType::Directory => Kind::Dir,
+            at::FileType::RegularFile => Kind::File,
+            _ => Kind::Other,
+        };
+        out.push(Entry {
+            path: next.clone(),
+            kind,
+            size: (kind == Kind::File).then_some(meta.st_size as u64),
+        });
+        if recursive && kind == Kind::Dir {
+            let child = File::from(
+                at::openat(dir, name, dir_flags(), Mode::empty())
+                    .map_err(|e| component_error(dir, name, &next, e))?,
+            );
+            list_into(&child, &next, true, depth + 1, out)?;
+        }
+    }
+    Ok(())
+}
+
+#[expect(clippy::too_many_arguments, reason = "recursive copy state")]
+fn export_into(
+    source: File,
+    source_path: &Path,
+    rel: &str,
+    parent: &File,
+    name: &std::ffi::OsStr,
+    host: &Path,
+    recursive: bool,
+    force: bool,
+    depth: usize,
+    changed: &mut Vec<String>,
+) -> Result<(), StoreError> {
+    let meta = source.metadata().map_err(|e| io_error(rel, e))?;
+    let host_rel = host.display().to_string();
+    match kind(&meta) {
+        Kind::Dir => {
+            check_depth(rel, depth)?;
+            if !recursive {
+                return Err(StoreError::IsDir(rel.to_owned()));
+            }
+            match at::mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
+                Ok(()) | Err(Errno::EXIST) => {}
+                Err(e) => return Err(host_io_error(host, e.into())),
+            }
+            let dest = File::from(
+                at::openat(parent, name, dir_flags(), Mode::empty()).map_err(|e| {
+                    host_error(
+                        host,
+                        component_error(parent, name.to_str().unwrap_or(""), &host_rel, e),
+                    )
+                })?,
+            );
+            changed.push(shown(rel));
+            for child in names(&source, rel)? {
+                let name = child
+                    .to_str()
+                    .ok_or_else(|| StoreError::BadPath(rel.to_owned()))?;
+                let next = joined(rel, name);
+                let file = open_file(&source, name, &next)?;
+                export_into(
+                    file,
+                    &source_path.join(&child),
+                    &next,
+                    &dest,
+                    &child,
+                    &host.join(&child),
+                    true,
+                    force,
+                    depth + 1,
+                    changed,
+                )?;
+            }
+        }
+        Kind::File => {
+            if paths::same_file(source_path, host) {
+                return Err(StoreError::BadPath(rel.to_owned()));
+            }
+            check_at(
+                parent,
+                name.to_str()
+                    .ok_or_else(|| host_error(host, StoreError::BadPath(host_rel.clone())))?,
+                &host_rel,
+                force,
+            )
+            .map_err(|e| host_error(host, e))?;
+            let content = read_file(source, rel)?;
+            atomic_at(
+                parent,
+                name,
+                content.as_bytes(),
+                meta.permissions().mode() & 0o755,
+            )
+            .map_err(|e| host_io_error(host, e))?;
+            changed.push(shown(rel));
+        }
+        Kind::Other => return Err(StoreError::NotText(rel.to_owned())),
+    }
+    Ok(())
+}
+
+fn walk_dir(mut dir: File, rel: &str, create: bool) -> Result<File, StoreError> {
+    let mut walked = String::new();
+    for part in rel.split('/').filter(|p| !p.is_empty()) {
+        walked = joined(&walked, part);
+        if create {
+            match at::mkdirat(&dir, part, Mode::from_raw_mode(0o700)) {
+                Ok(()) | Err(Errno::EXIST) => {}
+                Err(e) => return Err(fd_error(&walked, e)),
+            }
+        }
+        dir = File::from(
+            at::openat(&dir, part, dir_flags(), Mode::empty())
+                .map_err(|e| component_error(&dir, part, &walked, e))?,
+        );
+        if create {
+            check_private(&dir, &walked)?;
+        }
+    }
+    Ok(dir)
+}
+
+fn parent_at(root: &File, rel: &str, create: bool) -> Result<(File, String), StoreError> {
+    let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+    let dir = root.try_clone().map_err(|e| io_error(parent, e))?;
+    Ok((walk_dir(dir, parent, create)?, name.to_owned()))
+}
+
+fn check_depth(rel: &str, depth: usize) -> Result<(), StoreError> {
+    if depth > MAX_DEPTH {
+        return Err(StoreError::TooDeep(rel.to_owned()));
+    }
+    Ok(())
+}
+
+fn dir_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+fn fd_error(rel: &str, e: Errno) -> StoreError {
+    match e {
+        Errno::LOOP => StoreError::Symlink(rel.to_owned()),
+        Errno::NOTDIR => StoreError::NotDir(rel.to_owned()),
+        _ => io_error(rel, e.into()),
+    }
+}
+
+fn component_error(dir: &File, name: &str, rel: &str, e: Errno) -> StoreError {
+    if at::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+        .is_ok_and(|s| at::FileType::from_raw_mode(s.st_mode) == at::FileType::Symlink)
+    {
+        StoreError::Symlink(rel.to_owned())
+    } else {
+        fd_error(rel, e)
+    }
+}
+
+fn check_private(dir: &File, rel: &str) -> Result<(), StoreError> {
+    let meta = dir.metadata().map_err(|e| io_error(rel, e))?;
+    check_owner(&meta, 0o022).map_err(|why| io_error(rel, io::Error::other(why)))
+}
+
+fn open_file(dir: &File, name: &str, rel: &str) -> Result<File, StoreError> {
+    at::openat(
+        dir,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|e| fd_error(rel, e))
+}
+
+fn read_file(file: File, rel: &str) -> Result<String, StoreError> {
+    let meta = file.metadata().map_err(|e| io_error(rel, e))?;
     if !meta.is_file() {
         return Err(if meta.is_dir() {
             StoreError::IsDir(rel.to_owned())
@@ -524,19 +766,113 @@ fn read_text(path: &Path, rel: &str) -> Result<String, StoreError> {
             StoreError::NotText(rel.to_owned())
         });
     }
-    let bytes = document::read_capped(path).map_err(|e| io_error(rel, e))?;
+    let mut bytes = Vec::new();
+    file.take(document::MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io_error(rel, e))?;
     text(&bytes, rel).map(str::to_owned)
 }
 
-fn remove_tree(path: &Path, rel: &str) -> Result<(), StoreError> {
-    let meta = fs::symlink_metadata(path).map_err(|e| io_error(rel, e))?;
-    if meta.is_dir() {
-        for child in children(path, rel)? {
-            remove_tree(&child, &joined(rel, &child_name(&child, rel)?))?;
+fn check_at(dir: &File, name: &str, rel: &str, force: bool) -> Result<(), StoreError> {
+    match at::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(s) => match at::FileType::from_raw_mode(s.st_mode) {
+            at::FileType::Symlink => Err(StoreError::Symlink(rel.to_owned())),
+            at::FileType::Directory => Err(StoreError::IsDir(rel.to_owned())),
+            at::FileType::RegularFile if force => Ok(()),
+            at::FileType::RegularFile => Err(StoreError::Exists(rel.to_owned())),
+            _ => Err(StoreError::NotText(rel.to_owned())),
+        },
+        Err(Errno::NOENT) => Ok(()),
+        Err(e) => Err(fd_error(rel, e)),
+    }
+}
+
+fn atomic_at(
+    dir: &File,
+    name: impl AsRef<std::ffi::OsStr>,
+    bytes: &[u8],
+    mode: u32,
+) -> io::Result<()> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (tmp, mut file) = loop {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = format!(".anvil-{}-{n}", std::process::id());
+        if name.as_ref() == std::ffi::OsStr::new(&tmp) {
+            continue;
         }
-        fs::remove_dir(path).map_err(|e| io_error(rel, e))
-    } else {
-        fs::remove_file(path).map_err(|e| io_error(rel, e))
+        match at::openat(
+            dir,
+            &tmp,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(mode as _),
+        ) {
+            Ok(fd) => break (tmp, File::from(fd)),
+            Err(Errno::EXIST) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let result = (|| {
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        at::renameat(dir, &tmp, dir, name.as_ref()).map_err(io::Error::from)
+    })();
+    if result.is_err() {
+        let _ = at::unlinkat(dir, &tmp, AtFlags::empty());
+    }
+    result
+}
+
+fn host_error(path: &Path, err: StoreError) -> StoreError {
+    match err {
+        StoreError::Symlink(_) => StoreError::HostSymlink(path.display().to_string()),
+        StoreError::Host(_, _) | StoreError::HostSymlink(_) => err,
+        StoreError::Io(_, err) => StoreError::Host(path.display().to_string(), err),
+        _ => StoreError::Host(path.display().to_string(), io::Error::other(err.reason())),
+    }
+}
+
+fn host_io_error(path: &Path, err: io::Error) -> StoreError {
+    host_error(path, io_error("", err))
+}
+
+fn refuse_host_link(path: &Path) -> Result<(), StoreError> {
+    if fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()) {
+        return Err(StoreError::HostSymlink(path.display().to_string()));
+    }
+    Ok(())
+}
+
+fn remove_at(
+    parent: &File,
+    name: impl AsRef<std::ffi::OsStr>,
+    rel: &str,
+    recursive: bool,
+    depth: usize,
+) -> Result<(), StoreError> {
+    let name = name.as_ref();
+    match at::openat(parent, name, dir_flags(), Mode::empty()) {
+        Ok(fd) => {
+            check_depth(rel, depth)?;
+            if !recursive {
+                return Err(StoreError::IsDir(rel.to_owned()));
+            }
+            let dir = File::from(fd);
+            for child in names(&dir, rel)? {
+                remove_at(
+                    &dir,
+                    &child,
+                    &joined(rel, &child.to_string_lossy()),
+                    true,
+                    depth + 1,
+                )?;
+            }
+            at::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(|e| fd_error(rel, e))
+        }
+        Err(Errno::NOTDIR | Errno::LOOP) => {
+            at::unlinkat(parent, name, AtFlags::empty()).map_err(|e| fd_error(rel, e))
+        }
+        Err(e) => Err(fd_error(rel, e)),
     }
 }
 
@@ -561,6 +897,245 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn exports_follow_existing_host_parent_symlinks() {
+        let store = Store::new();
+        store.1.write("file", b"text").unwrap();
+        store.1.write("tree/child", b"nested").unwrap();
+        let real = store.0.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = store.0.join("linkdir");
+        symlink(&real, &link).unwrap();
+        store
+            .1
+            .export("file", &link.join("out"), false, false)
+            .unwrap();
+        assert_eq!(fs::read_to_string(real.join("out")).unwrap(), "text");
+        store
+            .1
+            .export("tree", &link.join("new/out"), true, false)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(real.join("new/out/child")).unwrap(),
+            "nested"
+        );
+    }
+
+    #[test]
+    fn exports_refuse_live_and_dangling_links_even_with_force() {
+        let store = Store::new();
+        let root = &store.1;
+        root.write("tree/file", b"secret").unwrap();
+        let target = store.0.join("target");
+        for live in [false, true] {
+            if live {
+                fs::write(&target, "safe").unwrap();
+            }
+            for force in [false, true] {
+                let out = store.0.join("out");
+                symlink(&target, &out).unwrap();
+                let err = root.export("tree/file", &out, false, force).unwrap_err();
+                assert!(matches!(err, StoreError::HostSymlink(_)));
+                assert_eq!(err.exit_code(), 1);
+                assert_eq!(err.to_string(), format!("{}: is a symlink", out.display()));
+                fs::remove_file(&out).unwrap();
+                let tree = store.0.join("export");
+                fs::create_dir_all(tree.join("tree")).unwrap();
+                symlink(&target, tree.join("tree/file")).unwrap();
+                assert!(root.export("tree", &tree, true, force).is_err());
+                fs::remove_file(tree.join("tree/file")).unwrap();
+                if live {
+                    assert_eq!(fs::read_to_string(&target).unwrap(), "safe");
+                } else {
+                    assert!(!target.exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exports_preserve_file_modes_and_make_private_directories() {
+        let store = Store::new();
+        store.1.write("tree/sub/file", b"secret").unwrap();
+        fs::set_permissions(
+            store.1.path().join("tree/sub/file"),
+            fs::Permissions::from_mode(0o4640),
+        )
+        .unwrap();
+        let out = store.0.join("new/parents/out");
+        store.1.export("tree", &out, true, false).unwrap();
+        for (path, mode) in [
+            (out.clone(), 0o700),
+            (out.join("sub"), 0o700),
+            (out.join("sub/file"), 0o640),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn imports_skip_file_directory_and_dangling_symlink_children() {
+        let store = Store::new();
+        let host = store.0.join("host");
+        fs::create_dir(&host).unwrap();
+        fs::write(host.join("file"), "text").unwrap();
+        for (name, target) in [
+            ("file-link", host.join("file")),
+            ("dir-link", host.clone()),
+            ("dangling", host.join("missing")),
+        ] {
+            symlink(target, host.join(name)).unwrap();
+        }
+        assert_eq!(
+            store.1.import(&host, "copy", true, false).unwrap(),
+            ["$/copy", "$/copy/file"]
+        );
+        let alias = store.0.join("alias");
+        symlink(&host, &alias).unwrap();
+        assert!(store.1.import(&alias, "alias-copy", true, false).is_ok());
+    }
+
+    #[test]
+    fn writes_and_mkdir_refuse_writable_existing_parents() {
+        let store = Store::new();
+        store.1.mkdir("parent").unwrap();
+        fs::set_permissions(
+            store.1.path().join("parent"),
+            fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        for result in [
+            store.1.write("parent/file", b"secret"),
+            store.1.mkdir("parent/child"),
+        ] {
+            let err = result.unwrap_err();
+            assert_eq!(err.exit_code(), 1);
+            assert_eq!(
+                err.to_string(),
+                "$/parent: mode 777 lets others write to it; run chmod go-w on it"
+            );
+        }
+        assert!(!store.1.path().join("parent/file").exists());
+        assert!(!store.1.path().join("parent/child").exists());
+    }
+
+    #[test]
+    fn held_parents_survive_replacement_with_symlinks() {
+        let store = Store::new();
+        store.1.write("parent/file", b"inside").unwrap();
+        let outside = store.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file"), "safe").unwrap();
+        let (dir, name) = store.1.parent("parent/file", true).unwrap();
+        fs::rename(store.1.path().join("parent"), store.1.path().join("moved")).unwrap();
+        symlink(&outside, store.1.path().join("parent")).unwrap();
+        assert_eq!(
+            read_file(
+                open_file(&dir, &name, "parent/file").unwrap(),
+                "parent/file"
+            )
+            .unwrap(),
+            "inside"
+        );
+        atomic_at(&dir, &name, b"updated", 0o600).unwrap();
+        at::mkdirat(&dir, "sub", Mode::from_raw_mode(0o700)).unwrap();
+        at::renameat(&dir, &name, &dir, "renamed").unwrap();
+        remove_at(&dir, "renamed", "parent/renamed", false, 1).unwrap();
+        assert!(store.1.path().join("moved/sub").is_dir());
+        assert!(!outside.join("sub").exists());
+        assert_eq!(fs::read_to_string(outside.join("file")).unwrap(), "safe");
+        assert!(!store.1.path().join("moved/file").exists());
+    }
+
+    #[test]
+    fn recursive_remove_does_not_follow_replaced_directory() {
+        let store = Store::new();
+        store.1.write("tree/sub/file", b"inside").unwrap();
+        let outside = store.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), "safe").unwrap();
+        let dir = store.1.directory("tree", false).unwrap();
+        fs::rename(store.1.path().join("tree"), store.1.path().join("moved")).unwrap();
+        symlink(&outside, store.1.path().join("tree")).unwrap();
+        remove_at(&dir, "sub", "tree/sub", true, 1).unwrap();
+        assert_eq!(fs::read_to_string(outside.join("keep")).unwrap(), "safe");
+        assert!(!store.1.path().join("moved/sub").exists());
+    }
+
+    #[test]
+    fn operations_refuse_a_symlinked_store_root() {
+        let store = Store::new();
+        store.1.write("file", b"safe").unwrap();
+        let alias = Root::at(store.0.join("alias"));
+        symlink(store.1.path(), alias.path()).unwrap();
+        for result in [
+            alias.read_text("file").map(drop),
+            alias.write("file", b"bad"),
+            alias.mkdir("sub"),
+            alias.rename("file", "new", true).map(drop),
+            alias.remove("file", true),
+        ] {
+            assert!(matches!(result, Err(StoreError::Symlink(_))));
+        }
+        assert_eq!(store.1.read_text("file").unwrap(), "safe");
+    }
+
+    #[test]
+    fn host_errors_preserve_relative_paths() {
+        let err = host_error(Path::new("out"), StoreError::Symlink("out".into()));
+        assert_eq!(err.exit_code(), 1);
+        assert_eq!(err.to_string(), "out: is a symlink");
+    }
+
+    #[test]
+    fn exports_strip_group_and_other_write_permissions() {
+        let store = Store::new();
+        store.1.write("file", b"text").unwrap();
+        fs::set_permissions(
+            store.1.path().join("file"),
+            fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        let out = store.0.join("out");
+        store.1.export("file", &out, false, false).unwrap();
+        assert_eq!(
+            fs::metadata(out).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn recursive_operations_refuse_more_than_64_folders() {
+        let store = Store::new();
+        let allowed = vec!["d"; MAX_DEPTH].join("/");
+        store.1.mkdir(&allowed).unwrap();
+        assert_eq!(store.1.list("", true).unwrap().len(), MAX_DEPTH);
+        let deep = joined(&allowed, "d");
+        store.1.mkdir(&deep).unwrap();
+        let out = store.0.join("out");
+        let imported = Root::at(store.0.join("imported"));
+        for result in [
+            store.1.list("", true).map(drop),
+            store.1.remove("d", true),
+            store.1.export("d", &out, true, false).map(drop),
+            imported
+                .import(&store.1.path().join("d"), "d", true, false)
+                .map(drop),
+        ] {
+            let err = result.unwrap_err();
+            assert!(matches!(err, StoreError::TooDeep(_)), "{err:?}");
+            assert_eq!(err.exit_code(), 1);
+            assert_eq!(
+                err.to_string(),
+                format!("$/{deep}: nested deeper than 64 folders")
+            );
+        }
+        assert!(store.1.path().join(deep).is_dir());
     }
 
     #[test]
@@ -898,7 +1473,7 @@ mod tests {
         );
         assert!(matches!(
             root.export("host.txt", &out, false, false),
-            Err(StoreError::Exists(_))
+            Err(StoreError::Host(_, _))
         ));
         root.export("host.txt", &out, false, true).unwrap();
         let new = store.0.join("new.txt");
@@ -907,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn copies_folders_and_follows_only_host_links() {
+    fn copies_folders_and_skips_host_children_links() {
         let store = Store::new();
         let root = &store.1;
         let host = store.0.join("host");
@@ -919,7 +1494,10 @@ mod tests {
             Err(StoreError::IsDir(_))
         ));
         root.import(&host, "copy", true, false).unwrap();
-        assert_eq!(root.read_text("copy/link").unwrap(), "text");
+        assert!(matches!(
+            root.read_text("copy/link"),
+            Err(StoreError::NotFound(_))
+        ));
         let out = store.0.join("out");
         assert!(matches!(
             root.export("copy", &out, false, false),
@@ -954,7 +1532,7 @@ mod tests {
         let host = store.0.join("host");
         fs::create_dir(&host).unwrap();
         symlink(&host, host.join("cycle")).unwrap();
-        assert!(root.import(&host, "cycle-copy", true, false).is_err());
+        assert!(root.import(&host, "cycle-copy", true, false).is_ok());
     }
 
     #[test]
@@ -1039,18 +1617,18 @@ mod tests {
         ));
         assert!(matches!(
             root.import(&fifo, "copy", false, false),
-            Err(StoreError::NotText(_))
+            Err(StoreError::Host(_, _))
         ));
         root.write("text", b"text").unwrap();
         assert!(matches!(
             root.export("text", &fifo, false, true),
-            Err(StoreError::NotText(_))
+            Err(StoreError::Host(_, _))
         ));
         let host = store.0.join("binary");
         fs::write(&host, [0xff]).unwrap();
         assert!(matches!(
             root.import(&host, "copy", false, false),
-            Err(StoreError::NotText(_))
+            Err(StoreError::Host(_, _))
         ));
         assert!(!root.path().join("copy").exists());
     }
