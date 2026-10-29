@@ -1,11 +1,12 @@
 //! What every command runs with: the global flags, without the output mode
 //! or the command, so a front end other than the CLI can build one.
 
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::num::NonZeroU8;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use crate::cli::{Cli, Failure};
 use crate::config::Config;
@@ -36,6 +37,8 @@ pub struct Options {
     /// ssh may run its interactive retry. CLI: stdin && stderr are terminals.
     /// TUI: true only while a term::Handoff is installed.
     pub can_prompt: bool,
+    /// Workspaces already checked for this run, shared with cloned options.
+    pub checked_workspaces: Arc<Mutex<HashSet<PathBuf>>>,
     #[cfg(debug_assertions)]
     pub secret_store: Option<SecretStoreKind>,
     #[cfg(debug_assertions)]
@@ -61,6 +64,7 @@ impl Options {
     /// are both terminals.
     pub fn from_cli(cli: &Cli) -> Options {
         Options {
+            checked_workspaces: Arc::default(),
             verbose: cli.verbose,
             inventory: cli.inventory.clone(),
             config: cli.config.clone(),
@@ -154,7 +158,42 @@ impl Options {
 
     /// `config`'s workspace for this run's `--config`; exit 2 on a resolve error.
     pub fn workspace(&self, config: &Config) -> Result<PathBuf, Failure> {
-        config.workspace(&self.base_dir()?).map_err(Failure::usage)
+        let workspace = config
+            .workspace(&self.base_dir()?)
+            .map_err(Failure::usage)?;
+        self.warn_workspace(&workspace);
+        Ok(workspace)
+    }
+
+    /// Warns once per workspace when another user can control its inventory or files.
+    /// Missing workspaces count as empty; directory links are checked at their target.
+    fn warn_workspace(&self, workspace: &std::path::Path) {
+        let canonical = std::fs::canonicalize(workspace);
+        let key = canonical.as_deref().unwrap_or(workspace).to_path_buf();
+        if !self.checked_workspaces.lock().unwrap().insert(key) {
+            return;
+        }
+        let checked = match canonical {
+            Ok(path) => paths::check_private_dir(&path, rustix::process::getuid().as_raw()),
+            Err(err) => Err(paths::PrivateDirError::Io(err)),
+        };
+        let reason = match checked {
+            Ok(()) => return,
+            Err(paths::PrivateDirError::Mode(mode)) if mode & 0o022 == 0 => return,
+            Err(paths::PrivateDirError::Mode(mode)) => {
+                format!("writable by others (mode {mode:04o})")
+            }
+            Err(paths::PrivateDirError::Owner(uid)) => format!("owned by uid {uid}, not you"),
+            Err(paths::PrivateDirError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                return;
+            }
+            Err(paths::PrivateDirError::Io(err)) => format!("cannot check directory: {err}"),
+            Err(paths::PrivateDirError::NotDir) => "not a directory".to_owned(),
+        };
+        log::warn!(
+            "workspace `{}`: {reason}; anyone who can write it controls the inventory and files anvil reads",
+            workspace.display()
+        );
     }
 
     /// The inventory: `--inventory`, else discovered in `config`'s workspace.
@@ -202,6 +241,7 @@ impl Options {
             "config failed to load ({err}); looking for the inventory in {}",
             base.display()
         );
+        self.warn_workspace(&base);
         Ok(base)
     }
 
@@ -258,11 +298,66 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+    use crate::test_util::logged;
 
     fn parse(args: &[&str]) -> Options {
         let cli =
             Cli::try_parse_from(std::iter::once("anvil").chain(args.iter().copied())).unwrap();
         Options::from_cli(&cli)
+    }
+
+    /// Unsafe workspaces warn once even when inventory and sources both resolve them.
+    #[test]
+    fn workspace_permissions_warn_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_util::temp_dir("workspace-permissions");
+        let path = dir.join("site.toml");
+        for (name, mode) in [
+            ("unsafe", Some(0o777)),
+            ("private", Some(0o700)),
+            ("readable", Some(0o755)),
+            ("group-writable", Some(0o770)),
+            ("missing", None),
+        ] {
+            let workspace = dir.join(name);
+            if let Some(mode) = mode {
+                std::fs::create_dir(&workspace).unwrap();
+                std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(mode))
+                    .unwrap();
+            }
+            let opts = parse(&["--config", path.to_str().unwrap(), "plan"]);
+            let mut config = Config::default();
+            config.anvil.workspace = Some(name.to_owned());
+            let ((), lines) = logged(|| {
+                opts.inventory_for(&config).unwrap();
+                assert_eq!(opts.clone().workspace(&config).unwrap(), workspace);
+                config.anvil.workspace = Some(format!("{name}/../{name}"));
+                opts.workspace(&config).unwrap();
+                if mode.is_some() {
+                    let link = dir.join(format!("{name}-link"));
+                    std::os::unix::fs::symlink(&workspace, &link).unwrap();
+                    config.anvil.workspace = Some(link.to_string_lossy().into_owned());
+                    opts.workspace(&config).unwrap();
+                }
+            });
+            let warnings: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains(&format!("workspace `{}/", dir.display())))
+                .collect();
+            if mode.is_some_and(|mode| mode & 0o022 != 0) {
+                assert_eq!(warnings.len(), 1, "{lines:?}");
+                assert!(warnings[0].starts_with("WARN "));
+                assert!(
+                    warnings[0]
+                        .contains(&format!("writable by others (mode {:04o})", mode.unwrap()))
+                );
+                assert!(warnings[0].contains("controls the inventory and files anvil reads"));
+            } else {
+                assert!(warnings.is_empty(), "{lines:?}");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Callers with a config use that value without loading the on-disk config again.

@@ -1604,6 +1604,7 @@ pub mod tests {
 
     pub fn opts() -> Options {
         Options {
+            checked_workspaces: std::sync::Arc::default(),
             verbose: 0,
             inventory: None,
             config: None,

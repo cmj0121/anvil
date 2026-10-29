@@ -1622,7 +1622,7 @@ mod tests {
     use super::*;
     use crate::config::FileEntry;
     use crate::packages::Packages;
-    use crate::test_util::temp_dir;
+    use crate::test_util::{logged, temp_dir};
     use crate::transport::{Local, Transport};
 
     const SECRET_TEXT: &str = "token = hunter2-file-content\n";
@@ -3058,33 +3058,6 @@ mod tests {
             (sha256, bytes, reason),
             ("a".repeat(64), None, Some("over 256 KiB"))
         );
-    }
-
-    /// Collects every log line while `f` runs, with the logger at its most
-    /// verbose (it stops at debug: nothing in anvil logs at trace).
-    fn logged<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Default)]
-        struct Lines(Mutex<Vec<String>>);
-        impl crate::logger::Sink for Lines {
-            fn line(&self, level: log::Level, target: &str, message: &str) {
-                let line = format!("{level} {target}: {message}");
-                self.0.lock().unwrap().push(line);
-            }
-        }
-        let _lock = crate::logger::test_lock();
-        let before = log::max_level();
-        crate::logger::Logger::install(u8::MAX);
-        crate::logger::set_verbosity(u8::MAX);
-        log::set_max_level(log::LevelFilter::Trace);
-        let lines = Arc::new(Lines::default());
-        crate::logger::set_sink(Some(lines.clone()));
-        let out = f();
-        crate::logger::set_sink(None);
-        log::set_max_level(before);
-        let lines = std::mem::take(&mut *lines.0.lock().unwrap());
-        (out, lines)
     }
 
     /// Builds, and so logs, the `ssh` command that would run `script`: on
