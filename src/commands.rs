@@ -78,13 +78,15 @@ pub fn inventory(cli: &Cli, opts: &Options, format: Option<Format>) -> Result<()
 pub fn edit_inventory(opts: &Options, format: Option<Format>) -> Result<Outcome, Failure> {
     let config = opts.load_config()?;
     let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict)?;
-    let current = paths::locate(opts.inventory.as_deref(), "inventory")?;
+    let workspace = || opts.workspace(&config);
+    let current = opts.locate_inventory(workspace)?;
+    let inventory = Inventory::load(current.as_ref())?;
     let dest = destination(
         opts.inventory.as_deref(),
+        workspace,
         "inventory",
         format.unwrap_or(config.anvil.format),
     )?;
-    let inventory = Inventory::load(current.as_ref())?;
     edit_document(
         &editor,
         "inventory",
@@ -109,6 +111,7 @@ pub fn edit_config(opts: &Options, format: Option<Format>) -> Result<Outcome, Fa
     let config = Config::load(current.as_ref())?;
     let dest = destination(
         opts.config.as_deref(),
+        config_dir,
         "config",
         format.unwrap_or(config.anvil.format),
     )?;
@@ -262,7 +265,7 @@ pub fn migrate_to(opts: &Options, to: BackendKind) -> Result<Migrated, Failure> 
     secret::migrate::check_apart(&source, &backend).map_err(usage)?;
     let from = secret::from_config(&source)?;
     let target = secret::from_config(&backend)?;
-    let dest = destination(opts.config.as_deref(), "config", Format::Toml)?;
+    let dest = destination(opts.config.as_deref(), config_dir, "config", Format::Toml)?;
     migrate_stores(
         config,
         current.as_ref(),
@@ -325,18 +328,24 @@ pub fn warn_parallel(cli: &Cli) {
 }
 
 /// Where document `name` is written: the explicit `.toml` path (already
-/// checked by [`paths::locate`]), else `NAME.toml` in the config directory.
-/// `format` is only how it is shown.
+/// checked by [`paths::explicit`]), else `NAME.toml` in `dir`, resolved only
+/// then. `format` is only how it is shown.
 fn destination(
     explicit: Option<&Path>,
+    dir: impl FnOnce() -> Result<PathBuf, Failure>,
     name: &str,
     format: Format,
 ) -> Result<Destination, Failure> {
     let path = match explicit {
         Some(path) => path.to_path_buf(),
-        None => paths::config_dir()?.join(format!("{name}.{}", Format::Toml.extension())),
+        None => dir()?.join(format!("{name}.{}", Format::Toml.extension())),
     };
     Ok(Destination { path, format })
+}
+
+/// [`paths::config_dir`] as a [`destination`] directory.
+fn config_dir() -> Result<PathBuf, Failure> {
+    Ok(paths::config_dir()?)
 }
 
 /// Shows `value` in the editor until it parses and validates (or `ATTEMPTS`

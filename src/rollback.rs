@@ -107,7 +107,7 @@ pub fn run_targets(
     wording: Wording,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
-    let targets = opts.targets()?;
+    let targets = opts.targets_for(config)?;
     let path = record::path().map_err(|err| Failure::failed(format!("rollback: {err}")))?;
     // This read, before the lock, only refuses a missing record or an
     // unknown --force dest; the session reads the record again under it.
@@ -471,7 +471,7 @@ fn dry_target(config: &Config, target: &Target, entry: Option<&TargetRecord>) ->
 /// connection, no lock), then `N targets, [M failed, ]nothing executed`. A
 /// target the real run would refuse fails here too, exit 1.
 fn print_dry_run(cli: &Cli, opts: &Options, config: &Config, force: &Force) -> Result<(), Failure> {
-    let targets = opts.targets()?;
+    let targets = opts.targets_for(config)?;
     let path = record::path().map_err(|err| Failure::failed(format!("rollback: {err}")))?;
     let record = recorded(&path)?;
     check_force(&record, &targets, force)?;

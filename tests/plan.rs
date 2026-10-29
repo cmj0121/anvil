@@ -286,15 +286,26 @@ fn store_src_refuses_traversal_and_symlink_components() {
     }
 }
 
-/// Neither command needs to resolve a workspace when there are no file sources.
+/// Inventory discovery needs the workspace; an explicit inventory avoids resolving
+/// it when there are no file sources.
 #[test]
-fn plan_and_apply_without_files_ignore_an_unresolvable_workspace() {
+fn plan_and_apply_resolve_workspace_only_when_inventory_or_files_need_it() {
     let sandbox = Sandbox::new("workspace-unused");
     sandbox.write_config("config.toml", "[anvil]\nworkspace = '~/x'\n");
+    let inventory = sandbox.root().join("explicit.toml");
     for action in ["plan", "apply"] {
-        let out = sandbox
+        let discovered = sandbox
             .command(env!("CARGO_BIN_EXE_anvil"))
             .args(["--secret-store", "memory", action])
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        assert_eq!(discovered.status.code(), Some(2));
+        assert!(text(&discovered.stderr).contains("anvil.workspace `~/x`: $HOME is not set"));
+        let out = sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", action, "--inventory"])
+            .arg(&inventory)
             .env_remove("HOME")
             .output()
             .unwrap();
@@ -310,7 +321,8 @@ fn plan_and_apply_without_files_ignore_an_unresolvable_workspace() {
     for action in ["plan", "apply"] {
         let out = sandbox
             .command(env!("CARGO_BIN_EXE_anvil"))
-            .args(["--secret-store", "memory", action])
+            .args(["--secret-store", "memory", action, "--inventory"])
+            .arg(&inventory)
             .env_remove("HOME")
             .output()
             .unwrap();

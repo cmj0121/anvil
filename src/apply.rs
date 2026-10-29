@@ -394,7 +394,7 @@ pub fn run_targets(
     config: &Config,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
-    let targets = opts.targets()?;
+    let targets = opts.targets_for(config)?;
     let pins = plugin::verify_where(config, Plugin::is_step).map_err(Failure::usage)?;
     let sources = opts.sources(config)?;
     let passwords = load_passwords(&targets, config, || opts.secret_store(config))?;

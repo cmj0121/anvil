@@ -281,6 +281,7 @@ pub fn check(
     cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
+    // Lenient on purpose: an unresolvable workspace falls back with a warning.
     let targets = opts.targets();
     let names = required_names(config, targets.as_deref().unwrap_or_default());
     let secrets = check_secrets(&names, store);
@@ -2032,6 +2033,42 @@ mod tests {
             report.plugins = vec![passing.clone(), failing];
             assert!(!report.ok(), "{:?}", report.plugins);
         }
+    }
+
+    /// Inventory checking falls back beside a broken config and keeps its own error.
+    #[test]
+    fn inventory_and_config_failures_are_separate() {
+        let dir = crate::test_util::temp_dir("doctor-inventory-fallback");
+        let config = dir.join("site.toml");
+        let inventory = dir.join("inventory.toml");
+        std::fs::write(&config, "broken config").unwrap();
+        std::fs::write(&inventory, "[hosts.bad]\nhost = \"-bad\"\n").unwrap();
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "anvil",
+            "--config",
+            config.to_str().unwrap(),
+            "doctor",
+        ])
+        .unwrap();
+        let opts = Options::from_cli(&cli);
+        let config_error = opts.load_config().unwrap_err();
+        assert!(config_error.message.contains(config.to_str().unwrap()));
+        let inventory_error = check(
+            &opts,
+            &Config::default(),
+            &Memory::default(),
+            &AtomicBool::new(false),
+            &mut |_| panic!("invalid inventory must fail before probing"),
+        )
+        .unwrap_err();
+        assert_eq!(inventory_error.code, 2);
+        assert!(
+            inventory_error
+                .message
+                .contains(inventory.to_str().unwrap())
+        );
+        assert!(!inventory_error.message.contains(config.to_str().unwrap()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(debug_assertions)]

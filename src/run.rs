@@ -1,7 +1,7 @@
 //! `anvil run FILE|-`: one ad-hoc POSIX sh script on every selected target,
 //! up to `--parallel` at a time, through apply's step runner.
 //!
-//! The config is never loaded, so a broken one cannot block a run; nothing
+//! Config errors fall back to inventory discovery beside the config; nothing
 //! is probed, the secret store is never opened and no sudo password is
 //! typed. The script travels on the transport's stdin, never on an argv,
 //! wrapped in `{ : }` so sh parses all of it before a command in it can read

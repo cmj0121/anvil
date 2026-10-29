@@ -307,14 +307,14 @@ CONF
 # the unknown name is skipped with a warning and the target stays ok.
 PKG_TAIL='sudo -n pacman -S --noconfirm --needed $a; }'
 PKG_WARN='  ⚠ packages: not found by pacman: anvil-e2e-no-such-package (add [packages.alias.NAME])'
-anvil --config "$PKG_CONFIG" doctor --json --target arch
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$PKG_CONFIG" doctor --json --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -Eq '"target":"arch","connectable":true,"facts":\{[^}]*\},"manager":"pacman"' "$TMP/out"; then
   pass "doctor reports pacman"
 else
   fail "doctor with [packages]: exit $code"
 fi
-anvil --config "$PKG_CONFIG" apply --target arch
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$PKG_CONFIG" apply --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qF '  $ { anvil_db=1;' "$TMP/out" && grep -qF "$PKG_TAIL" "$TMP/out" \
   && grep -qxF "$PKG_WARN" "$TMP/out" && grep -qxF '  ✔ ok · 2 steps' "$TMP/out"; then
@@ -322,7 +322,7 @@ if [ "$code" -eq 0 ] && grep -qF '  $ { anvil_db=1;' "$TMP/out" && grep -qF "$PK
 else
   fail "apply with [packages]: exit $code"
 fi
-anvil --config "$PKG_CONFIG" apply --json --target arch
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$PKG_CONFIG" apply --json --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qF "\"steps\":[{\"run\":\"{ anvil_db=1;" "$TMP/out" \
   && grep -qF "$PKG_TAIL\",\"code\":0," "$TMP/out" \
@@ -374,7 +374,7 @@ CONF
 docker exec "$NAME" sh -c 'printf old >/etc/anvil-e2e-real && chmod 600 /etc/anvil-e2e-real \
   && ln -s anvil-e2e-real /etc/anvil-e2e-link'
 docker exec -u key "$NAME" sh -c 'printf old >/home/key/anvil-e2e-real && ln -s anvil-e2e-real /home/key/anvil-e2e-link'
-anvil --config "$FILES_DIR/config.toml" apply --target arch
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/config.toml" apply --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  $ file /etc/anvil-e2e-plain' "$TMP/out" \
   && grep -qxF '  wrote /etc/anvil-e2e-plain' "$TMP/out" \
@@ -390,7 +390,7 @@ if [ "$code" -eq 0 ] && grep -qxF '  $ file /etc/anvil-e2e-plain' "$TMP/out" \
 else
   fail "apply with [[files]]: exit $code"
 fi
-anvil --config "$FILES_DIR/config.toml" apply --target arch
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/config.toml" apply --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-plain' "$TMP/out" \
   && grep -qxF '  unchanged /home/key/anvil-e2e-link' "$TMP/out"; then
@@ -398,7 +398,7 @@ if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-plain' "$TMP/out" 
 else
   fail "rerun with [[files]]: exit $code"
 fi
-anvil --config "$FILES_DIR/link.toml" apply --target arch
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/link.toml" apply --target arch
 code=$?
 if [ "$code" -eq 1 ] && grep -qxF '  $ file /etc/anvil-e2e-link' "$TMP/out" \
   && grep -qF 'files: /etc/anvil-e2e-link is a symlink; point dest at the real file' "$TMP/err" \
@@ -409,7 +409,7 @@ if [ "$code" -eq 1 ] && grep -qxF '  $ file /etc/anvil-e2e-link' "$TMP/out" \
 else
   fail "apply to a symlinked dest: exit $code"
 fi
-anvil --config "$FILES_DIR/home.toml" apply --target arch
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/home.toml" apply --target arch
 code=$?
 if [ "$code" -eq 1 ] && grep -qxF '  $ file /home/key/anvil-e2e-root' "$TMP/out" \
   && grep -qF 'files: /home/key is not root-only; root will not write under it' "$TMP/err" \
@@ -427,7 +427,7 @@ dest = "/etc/anvil-e2e-big"
 mode = "0644"
 CONF
 step "(l) a 1 MiB file on arch within 10 s"
-anvil --config "$FILES_DIR/big.toml" apply --target arch
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/big.toml" apply --target arch
 code=$?
 elapsed=$(($(date +%s) - started))
 if [ "$code" -eq 0 ] && [ "$elapsed" -le 10 ] && grep -qxF '  wrote /etc/anvil-e2e-big' "$TMP/out" \
@@ -458,7 +458,7 @@ dest = "/etc/anvil-e2e-rb-new"
 mode = "0644"
 CONF
 rb_anvil() {
-  run_env XDG_STATE_HOME="$RB_STATE" "$ANVIL" --ssh-config "$CFG" --config "$RB_DIR/config.toml" "$@" \
+  run_env XDG_STATE_HOME="$RB_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$RB_DIR/config.toml" "$@" \
     </dev/null >"$TMP/out" 2>"$TMP/err"
 }
 # Neither the previous nor the written bytes ever reach the output, logs included.
@@ -592,7 +592,7 @@ dest = "/etc/anvil-e2e-drift"
 mode = "0644"
 CONF
 dr_anvil() {
-  run_env XDG_STATE_HOME="$DR_STATE" "$ANVIL" --ssh-config "$CFG" --config "$DR_DIR/config.toml" "$@" \
+  run_env XDG_STATE_HOME="$DR_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$DR_DIR/config.toml" "$@" \
     </dev/null >"$TMP/out" 2>"$TMP/err"
 }
 # No byte of the file, and no hash or tag, reaches the output or the -vv log.
@@ -1044,7 +1044,7 @@ CONF
     docker exec "$SD_NAME" sh -c 'journalctl --sync; journalctl -q --no-pager _COMM=sudo' | grep -cF "COMMAND=/usr/bin/systemctl --no-ask-password $1 -- anvil-e2e"
   }
 
-  anvil --config "$SVC_DIR/start.toml" apply --target sd
+  anvil --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/start.toml" apply --target sd
   code=$?
   expected=$(svc_out 'enabled service anvil-e2e' 'started service anvil-e2e')
   if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ] && svc_unit active enabled \
@@ -1056,7 +1056,7 @@ CONF
     docker exec "$SD_NAME" systemctl is-active anvil-e2e
     docker exec "$SD_NAME" systemctl is-enabled anvil-e2e
   fi
-  anvil --config "$SVC_DIR/start.toml" apply --target sd
+  anvil --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/start.toml" apply --target sd
   code=$?
   expected=$(svc_out 'unchanged service anvil-e2e')
   if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ] && svc_unit active enabled \
@@ -1066,7 +1066,7 @@ CONF
     fail "rerun started + enabled: exit $code, expected:"
     printf '%s\n' "$expected"
   fi
-  anvil --config "$SVC_DIR/stop.toml" apply --target sd
+  anvil --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/stop.toml" apply --target sd
   code=$?
   expected=$(svc_out 'disabled service anvil-e2e' 'stopped service anvil-e2e')
   if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ] && svc_unit inactive disabled \
@@ -1076,7 +1076,7 @@ CONF
     fail "apply stopped + disabled: exit $code, expected:"
     printf '%s\n' "$expected"
   fi
-  anvil --config "$SVC_DIR/stop.toml" apply --target sd
+  anvil --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/stop.toml" apply --target sd
   code=$?
   expected=$(svc_out 'unchanged service anvil-e2e')
   if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ] && svc_unit inactive disabled \
@@ -1086,7 +1086,7 @@ CONF
     fail "rerun stopped + disabled: exit $code, expected:"
     printf '%s\n' "$expected"
   fi
-  anvil --config "$SVC_DIR/missing.toml" apply --target archsd --target arch
+  anvil --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/missing.toml" apply --target archsd --target arch
   code=$?
   if [ "$code" -ne 0 ] && grep -qF 'services: anvil-e2e-missing: not found by systemd' "$TMP/out" "$TMP/err" \
     && grep -qxF '  $ skipped service anvil-e2e-missing: no match' "$TMP/out" \

@@ -11,7 +11,7 @@ use crate::cli::{Cli, Failure};
 use crate::config::Config;
 use crate::files::{self, Sources};
 use crate::inventory::{Inventory, Sel, Target, TargetKind};
-use crate::paths;
+use crate::paths::{self, DocPath};
 use crate::secret::{self, Store};
 use crate::ssh::{self, Ssh, SshSettings};
 use crate::transport::{Local, Transport, TransportError};
@@ -144,13 +144,35 @@ impl Options {
     /// The located config's base dir ([`paths::base_dir`]).
     pub fn base_dir(&self) -> Result<PathBuf, Failure> {
         Ok(paths::base_dir(
-            paths::locate(self.config.as_deref(), "config")?.as_ref(),
+            self.config
+                .as_deref()
+                .map(paths::explicit)
+                .transpose()?
+                .as_ref(),
         )?)
     }
 
     /// `config`'s workspace for this run's `--config`; exit 2 on a resolve error.
     pub fn workspace(&self, config: &Config) -> Result<PathBuf, Failure> {
         config.workspace(&self.base_dir()?).map_err(Failure::usage)
+    }
+
+    /// The inventory: `--inventory`, else discovered in `config`'s workspace.
+    pub fn inventory_for(&self, config: &Config) -> Result<Inventory, Failure> {
+        let path = self.locate_inventory(|| self.workspace(config))?;
+        Ok(Inventory::load(path.as_ref())?)
+    }
+
+    /// `--inventory`, else the inventory discovered in `dir`, resolved only
+    /// when no explicit path is given.
+    pub fn locate_inventory(
+        &self,
+        dir: impl FnOnce() -> Result<PathBuf, Failure>,
+    ) -> Result<Option<DocPath>, Failure> {
+        Ok(match self.inventory.as_deref() {
+            Some(explicit) => Some(paths::explicit(explicit)?),
+            None => paths::discover(&dir()?, "inventory")?,
+        })
     }
 
     /// `config`'s `[[files]]` sources; the workspace is resolved only when
@@ -160,15 +182,50 @@ impl Options {
             .map_err(Failure::usage)
     }
 
-    /// The inventory: `--inventory`, else the discovered file, else only `local`.
+    /// The targets `--target` selects from `config`'s inventory (all when none).
+    pub fn targets_for(&self, config: &Config) -> Result<Vec<Target>, Failure> {
+        self.select_targets(self.inventory_for(config)?)
+    }
+
+    /// The workspace of `config`, as loaded; on a config or workspace error,
+    /// warn and look beside the config so inventory errors can be reported separately.
+    fn inventory_dir(&self, config: Result<&Config, &Failure>) -> Result<PathBuf, Failure> {
+        let err = match config {
+            Ok(config) => match self.workspace(config) {
+                Ok(workspace) => return Ok(workspace),
+                Err(err) => err.message,
+            },
+            Err(err) => err.message.clone(),
+        };
+        let base = self.base_dir()?;
+        log::warn!(
+            "config failed to load ({err}); looking for the inventory in {}",
+            base.display()
+        );
+        Ok(base)
+    }
+
+    /// The inventory, falling back beside an unloadable config; an explicit
+    /// `--inventory` always wins. A missing inventory contains only `local`.
     pub fn inventory(&self) -> Result<Inventory, Failure> {
-        let path = paths::locate(self.inventory.as_deref(), "inventory")?;
+        let path = self.locate_inventory(|| self.inventory_dir(self.load_config().as_ref()))?;
         Ok(Inventory::load(path.as_ref())?)
     }
 
-    /// The targets `--target` selects from the inventory (all when none).
+    /// [`Options::inventory`] for a config load already attempted.
+    #[cfg_attr(not(feature = "tui"), expect(dead_code, reason = "used by the TUI"))]
+    pub fn inventory_with(&self, config: Result<&Config, &Failure>) -> Result<Inventory, Failure> {
+        let path = self.locate_inventory(|| self.inventory_dir(config))?;
+        Ok(Inventory::load(path.as_ref())?)
+    }
+
+    /// The targets `--target` selects from the lenient inventory (all when none).
     pub fn targets(&self) -> Result<Vec<Target>, Failure> {
-        let inventory = self.inventory()?;
+        self.select_targets(self.inventory()?)
+    }
+
+    /// Selects this run's targets from an already loaded inventory.
+    fn select_targets(&self, inventory: Inventory) -> Result<Vec<Target>, Failure> {
         let sels: Vec<Sel> = self.target.iter().map(|sel| Sel::parse(sel)).collect();
         Ok(inventory.select(&sels)?)
     }
@@ -206,6 +263,30 @@ mod tests {
         let cli =
             Cli::try_parse_from(std::iter::once("anvil").chain(args.iter().copied())).unwrap();
         Options::from_cli(&cli)
+    }
+
+    /// Callers with a config use that value without loading the on-disk config again.
+    #[test]
+    fn inventory_for_reuses_the_loaded_config_and_missing_workspace_is_local() {
+        let dir = crate::test_util::temp_dir("inventory-for");
+        let config_path = dir.join("site.toml");
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&config_path, "broken config").unwrap();
+        std::fs::write(
+            workspace.join("inventory.toml"),
+            "[hosts.box]\nhost = \"example.org\"\n",
+        )
+        .unwrap();
+        let opts = parse(&["--config", config_path.to_str().unwrap(), "plan"]);
+        let mut config = Config::default();
+        config.anvil.workspace = Some("workspace".to_owned());
+        assert_eq!(opts.targets_for(&config).unwrap().len(), 2);
+        config.anvil.workspace = Some("missing".to_owned());
+        let targets = opts.targets_for(&config).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "local");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

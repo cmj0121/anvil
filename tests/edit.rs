@@ -764,3 +764,96 @@ fn a_yaml_edit_whose_toml_form_is_past_the_size_limit_writes_nothing() {
     assert_eq!(sb.calls(), 1);
     assert!(sb.files().is_empty());
 }
+
+/// Inventory edits discover and migrate legacy documents inside the workspace.
+#[test]
+fn inventory_edits_follow_the_workspace_including_legacy_yaml() {
+    for extension in ["toml", "yaml", "yml"] {
+        let sb = sandbox();
+        let workspace = sb.root().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        sb.write_config("config.toml", "[anvil]\nworkspace = \"../../workspace\"\n");
+        let original = workspace.join(format!("inventory.{extension}"));
+        fs::copy(fixture(&format!("inventory.{extension}")), &original).unwrap();
+        let out = sb.edit(&["inventory", "--json"], None, None);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert_eq!(
+            common::json(&out)["path"],
+            sb.config_dir()
+                .join("../../workspace/inventory.toml")
+                .to_str()
+                .unwrap()
+        );
+        assert!(workspace.join("inventory.toml").exists());
+        assert_eq!(original.exists(), extension == "toml");
+        assert!(!sb.config_dir().join("inventory.toml").exists());
+        assert!(sb.seen(1).contains("[hosts.pi]"));
+    }
+}
+
+/// A missing inventory is created beside an explicit config or in its workspace.
+#[test]
+fn new_inventory_uses_the_config_base_or_workspace_and_explicit_path_wins() {
+    for setting in [None, Some("workspace"), Some("~/workspace")] {
+        let sb = sandbox();
+        let config = sb.root().join("site.toml");
+        let body = setting
+            .map(|value| format!("[anvil]\nworkspace = {value:?}\n"))
+            .unwrap_or_default();
+        fs::write(&config, body).unwrap();
+        let workspace = match setting {
+            None => sb.root().to_path_buf(),
+            Some("~/workspace") => sb.root().join("h/workspace"),
+            Some(_) => sb.root().join("workspace"),
+        };
+        let out = sb.edit(
+            &["--config", config.to_str().unwrap(), "inventory"],
+            Some(&fixture("inventory.toml")),
+            None,
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert!(workspace.join("inventory.toml").exists());
+
+        let explicit = sb.root().join("chosen.toml");
+        let out = sb.edit(
+            &[
+                "--config",
+                config.to_str().unwrap(),
+                "--inventory",
+                explicit.to_str().unwrap(),
+                "inventory",
+            ],
+            Some(&fixture("inventory.toml")),
+            None,
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert!(explicit.exists());
+    }
+}
+
+/// An explicit inventory bypasses workspace resolution even without `$HOME`.
+#[test]
+fn explicit_inventory_edits_without_a_resolvable_workspace() {
+    let sb = sandbox();
+    sb.write_config("config.toml", "[anvil]\nworkspace = '~/x'\n");
+    let inventory = sb.root().join("chosen.toml");
+    fs::copy(fixture("inventory.toml"), &inventory).unwrap();
+    let original = fs::read(&inventory).unwrap();
+    let out = sb
+        .command(env!("CARGO_BIN_EXE_anvil"))
+        .args([
+            "--inventory",
+            inventory.to_str().unwrap(),
+            "inventory",
+            "--json",
+        ])
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(common::json(&out)["path"], inventory.to_str().unwrap());
+    assert_eq!(common::json(&out)["changed"], false);
+    assert_eq!(fs::read(&inventory).unwrap(), original);
+    assert!(sb.seen(1).contains("[hosts.pi]"));
+    assert!(!sb.config_dir().join("inventory.toml").exists());
+}

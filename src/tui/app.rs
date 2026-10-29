@@ -1009,10 +1009,17 @@ impl App {
     /// Loads the inventory `opts` names again ([`App::set_inventory`]), and
     /// the config's steps.
     pub fn reload(&mut self) {
-        self.store = load_store(&self.opts);
-        let inventory = load_inventory(&self.opts);
+        let config = self.opts.load_config();
+        self.store = store_for(&self.opts, config.as_ref());
+        let inventory = self
+            .opts
+            .inventory_with(config.as_ref())
+            .map_err(|failure| failure.message);
         self.set_inventory(inventory);
-        let steps = load_steps(&self.opts);
+        let steps = config
+            .as_ref()
+            .map(step_rows)
+            .map_err(|failure| failure.message.clone());
         self.set_steps(steps);
     }
 
