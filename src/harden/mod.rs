@@ -3,11 +3,7 @@
 //! [`suggest`] reads the config, the inventory and the `[[files]]` srcs it
 //! names, and returns the edited config document and src files; it never
 //! writes, contacts a target or prints.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "config --harden calls the engine from U4 on")
-)]
-
+pub mod diff;
 pub mod rules;
 
 use std::cell::OnceCell;
@@ -15,6 +11,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use serde::Serialize;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::config::Config;
@@ -60,8 +57,24 @@ pub enum Action {
     Remove,
 }
 
+impl Action {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Action::Add => "add",
+            Action::Change => "change",
+            Action::Remove => "remove",
+        }
+    }
+}
+
+impl Serialize for Action {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 /// One edit, with every rule it serves (several for a shared entry).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Suggestion {
     pub rules: Vec<&'static str>,
     pub action: Action,
@@ -69,7 +82,7 @@ pub struct Suggestion {
 }
 
 /// A rule left out because applying it could lock the named hosts out.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Held {
     pub rule: &'static str,
     pub reason: &'static str,
@@ -123,7 +136,7 @@ pub fn suggest(input: &Input) -> Result<Outcome, Failure> {
         } else {
             held.push(Held {
                 rule: ROOT_LOGIN,
-                reason: "connects as root or names no user",
+                reason: "connect as root or name no user",
                 hosts,
             });
         }
@@ -837,7 +850,7 @@ net.ipv4.conf.all.log_martians = 1
                 out.held,
                 [Held {
                     rule: ROOT_LOGIN,
-                    reason: "connects as root or names no user",
+                    reason: "connect as root or name no user",
                     hosts: vec!["db2".into(), "web1".into()],
                 }]
             );
