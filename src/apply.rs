@@ -56,6 +56,7 @@ use crate::plugin::{self, Plugins, Request};
 use crate::record::{self, FileRecord, Session, TargetRecord};
 use crate::secret::Store;
 use crate::services;
+use crate::status;
 use crate::transport::{
     Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
 };
@@ -1497,16 +1498,16 @@ impl Style {
     }
 }
 
-/// Writes each line to its stream, flushing so a terminal shows them in order.
-/// Each write locks only its own stream, so a stdout blocked on a full pipe
-/// never holds stderr.
+/// Writes each line to its stream through [`status`], flushing so a terminal
+/// shows them in order. A stdout pipe never takes the status line's lock, so
+/// a stdout blocked on a full pipe never holds stderr.
 pub(crate) fn print_lines(lines: &[Line], style: Style) {
     for line in lines {
         let text = line.show(style);
         let _ = if line.stderr {
-            write_flushed(&mut std::io::stderr().lock(), &text)
+            status::write_stderr(&text)
         } else {
-            write_flushed(&mut std::io::stdout().lock(), &text)
+            status::write_stdout(&text)
         };
     }
 }

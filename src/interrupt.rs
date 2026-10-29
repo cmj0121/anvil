@@ -23,6 +23,7 @@ use signal_hook::iterator::{Handle, Signals};
 
 use crate::cli::Failure;
 use crate::logger::format_line;
+use crate::status;
 use crate::transport::Groups;
 
 /// What the first SIGINT says on stderr, whatever `-v`.
@@ -41,8 +42,14 @@ const SAY_WAIT: Duration = Duration::from_millis(100);
 /// Writes `text` to stderr from a detached thread, so a full stderr pipe
 /// never blocks the handler; the returned receiver hears once it is written.
 /// A thread that cannot start loses the line, never the handler: its
-/// receiver is then disconnected at once.
+/// receiver is then disconnected at once. A drawn status line is cleared
+/// first, without its lock.
 fn say(text: String) -> Receiver<()> {
+    let text = if status::drawn() {
+        format!("{}{text}", status::CLEAR)
+    } else {
+        text
+    };
     let (done, written) = mpsc::channel();
     let _ = thread::Builder::new().spawn(move || {
         write_stderr(&text);
