@@ -14,6 +14,7 @@ mod fanout;
 mod files;
 mod files_cmd;
 mod filestore;
+mod harden;
 mod interrupt;
 mod inventory;
 mod logger;
