@@ -14,6 +14,8 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   inventory [--format toml|yaml] edit the inventory; --format picks the edit view, saved as TOML
   config [--format toml|yaml]    edit the config; --format picks the edit view, saved as TOML
          [--full]                --full shows every default; saved without them
+         [--harden]              --harden shows the Linux hardening the config lacks as a diff
+         [--strict] [--write]    with --harden: also the high-risk rules; write the suggestions
   files <ACTION>                 manage the file store that [[files]] src $/… reads: ls, cp, mv, rm, mkdir, cat, edit
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
@@ -157,7 +159,8 @@ run = "hostname"
 
 `[anvil]` is always shown in full, `workspace` included (the resolved default when unset). Every section the config
 already has gets its defaulted keys: `[packages]` `manager`, `install`, `remove`, `pin`, `upgrade` and `timeout`,
-`[secrets.keychain]` `service`, each `[[files]]` entry's `sudo` and `rollback`, each `[plugins.NAME]`'s `on`. Each
+`[secrets.keychain]` `service`, each `[[files]]` entry's `sudo` and `rollback`, each `[plugins.NAME]`'s `on`.
+`[harden]` is always shown, as `skip = []` when unset ([`--harden`](#anvil-config---harden)). Each
 optional section the config does not use is appended as a commented example (`# [secrets]`, `# [packages]`,
 `# [[files]]`, `# [[services]]`, and `# [plugins.NAME]`), in the edit format, so `--format yaml --full` comments
 them as YAML. When `editor` is unset, its commented example appears inside `[anvil]`. Uncomment an example to use it.
@@ -167,6 +170,105 @@ yourself; a `workspace` that resolves to the default (`"."`, say) is dropped too
 are defaults, so a present `[packages]` is saved as an empty `[packages]`. Comments are not kept. A buffer that means
 the same config as before writes nothing (`PATH: unchanged`), whatever the edit; a legacy YAML config or the legacy
 `[anvil].secrets` is still migrated, as without `--full`.
+
+#### `anvil config --harden`
+
+Shows the Linux hardening the config lacks, as a diff of the config and the files it would add; `--write` saves it:
+
+```sh
+anvil config --harden              # preview: exit 1 while any suggestion remains
+anvil config --harden --strict     # also the high-risk rules (ssh.password-auth)
+anvil config --harden --write      # write the suggestions, then: anvil plan
+```
+
+It reads the config, the inventory and the srcs of the `[[files]]` entries it checks, and nothing else: it never
+contacts a target and runs offline. The rules, what each one writes and `[harden] skip` are in
+[Harden](configuration.md#harden). `--strict` and `--write` require `--harden`; `--harden` with `--full` or
+`--format` is exit 2. `--target` and `--parallel` are ignored with a warning, as for `config`.
+
+stdout is only a unified diff (three lines of context), one section per changed file: the config headed by its path
+(`--- /dev/null` when it does not exist yet), each store file as `--- a/$/harden/sshd.conf` / `+++ b/$/harden/sshd.conf`
+(`--- /dev/null` when new), and a workspace src by its path relative to the workspace. stderr carries, always shown:
+
+- one line per suggestion, before the diff: `harden: add|change|remove RULE: WHAT`, such as
+  `harden: add ssh.root-login: files[0] /etc/ssh/sshd_config.d/00-anvil-harden.conf`,
+  `harden: add updates.auto: steps[2] # anvil-harden: updates` or
+  `harden: remove packages.insecure: telnet: packages.install -> packages.remove`;
+- a held rule:
+  `harden: held ssh.root-login: hosts db2, web1 connect as root or name no user; set user, or skip the rule`;
+- with `--strict`:
+  `harden: warning ssh.password-auth: hosts that log in by password lose access; check every host has a key first`;
+- with nothing to suggest, and nothing printed on stdout:
+  `config carries every harden rule; anvil plan / apply bring the hosts to it`;
+- for a legacy YAML config: `harden: config.yaml is shown as the TOML anvil config would migrate it to`, and the diff
+  is against that TOML.
+
+Exit 0 means the config carries every rule that is not skipped or held, not that the hosts are hardened: `anvil plan`
+shows what is still to do on each target, and `anvil apply` does it. A held rule does not count as a suggestion.
+
+`--json` prints one document instead (the suggestion lines and the closing line are left out; held and warning lines
+still go to stderr). `suggestions` holds each edit with every rule it serves, `held` each rule left out and the hosts
+behind it, `diff` the same text the preview prints, and `written` whether `--write` saved it:
+
+```json
+{
+  "config": "/home/me/.config/anvil/config.toml",
+  "strict": false,
+  "suggestions": [
+    {
+      "rules": ["sysctl.net"],
+      "action": "add",
+      "what": "files[0] /etc/sysctl.d/99-anvil-harden.conf"
+    },
+    {
+      "rules": ["sysctl.net"],
+      "action": "add",
+      "what": "$/harden/sysctl.conf"
+    },
+    {
+      "rules": ["sysctl.net"],
+      "action": "add",
+      "what": "steps[0] # anvil-harden: sysctl"
+    },
+    {
+      "rules": ["updates.auto"],
+      "action": "add",
+      "what": "steps[1] # anvil-harden: updates"
+    }
+  ],
+  "held": [
+    {
+      "rule": "ssh.root-login",
+      "reason": "connect as root or name no user",
+      "hosts": ["db2", "web1"]
+    }
+  ],
+  "warnings": [],
+  "diff": "--- /home/me/.config/anvil/config.toml\n+++ /home/me/.config/anvil/config.toml\n@@ -0,0 +1,38 @@\n…",
+  "written": false
+}
+```
+
+`action` is `add`, `change` or `remove`; `warnings` holds the `--strict` text without the `harden: warning` prefix.
+
+`--write` writes what the preview shows, and nothing when there is nothing to suggest. The edited config is validated
+first; then every store file and workspace src is written, then the config last, each atomically. Comments, key order
+and layout are kept, and each generated entry gets a `# added by anvil config --harden (RULE)` comment. An existing
+file keeps its permission bits (a new config is 0600), but not its owner. It refuses, with exit 2 and nothing written:
+
+- a legacy YAML config: `config.yaml: run anvil config once to migrate it to config.toml` (migrate it with
+  `anvil config` first);
+- a config or src that is a symlink: `PATH: is a symlink; --write does not replace it, nothing written`;
+- a src that is absolute, has `..` or resolves outside the workspace: `SRC: leaves the workspace; nothing written`;
+- an edited config that does not validate.
+
+After writing, stderr adds `harden: wrote PATH` for the config and each file, then `next: anvil plan`. A config with no
+`[[steps]]` ran the default `hostname` step; once `--harden` adds steps, that default is gone, so add a
+`run = "hostname"` step back if you want it.
+
+Exit codes: the preview is 1 when any suggestion remains (`config --harden: 3 suggestions`), else 0, held rules and
+warnings alone included. `--write` is 0 after writing or when there was nothing to write, 2 for a refusal above or a
+config that does not load, and 1 when a write fails. A config, inventory or src that cannot be read is exit 2.
 
 ### `anvil files`
 
@@ -1558,6 +1660,9 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 - **`update`**: 0 when up to date, ahead of the latest release, or updated. 1 with `--check` when an update is
   available, and for every failure: the query, a download, a check, a refusal, or `no release key compiled in`; the
   installed binary is then untouched. 2 for a bad flag or argument.
+- **`config --harden`**: 1 while any suggestion remains, else 0; held rules and warnings alone are 0. With `--write`,
+  0 after writing (or with nothing to write), 2 for a refusal or a config that does not validate, 1 when a write fails
+  ([`--harden`](#anvil-config---harden)).
 - **`files`**: 0 on success. 1 when a store path is missing, already exists without `-f`, is a folder (`rm` without
   `-r`) or is not a folder, is not a text file, or a read, write or the editor fails. 2 for a bad flag or argument, an
   invalid store path, a symlink inside the store, a `cp` whose SRC and DEST are both or neither `$/…`, a folder copied

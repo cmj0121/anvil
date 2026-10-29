@@ -29,6 +29,7 @@ Requires Rust 1.89 or newer and `ssh` on `PATH`. Pre-built binaries and install 
 ```sh
 anvil inventory            # edit the hosts (opens $EDITOR)
 anvil config               # edit the packages, files, services and steps
+anvil config --harden      # the Linux hardening the config lacks, as a diff; --write adds it
 anvil files cp motd '$/'   # keep a file in the store, for [[files]] src = "$/motd"
 anvil secret NAME          # store a secret
 anvil doctor               # every target's facts and reachability
@@ -49,6 +50,8 @@ works on up to N targets at once ([Running in parallel](docs/cli.md#running-in-p
 - Files, services and steps, each matched per target by tags and facts ([Configuration](docs/configuration.md)).
 - Plugins write a step's script; drift is a doctor plugin, not a command
   ([Doctor plugins](docs/cli.md#doctor-plugins-drift-since-the-last-apply)).
+- Linux hardening suggested as config entries, with lockout guards: `anvil config --harden` previews, `--write` adds
+  ([Harden](docs/configuration.md#harden)).
 - Secrets in the keychain, age or sops; host keys never auto-accepted; signed updates ([Security notes](docs/security.md)).
 
 ## Minimal example

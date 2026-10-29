@@ -29,6 +29,7 @@ make build                 # or: builds target/release/anvil
 ```sh
 anvil inventory            # edit the hosts (opens $EDITOR)
 anvil config               # edit the packages, files, services and steps
+anvil config --harden      # the Linux hardening the config lacks, as a diff; --write adds it
 anvil files cp motd '$/'   # keep a file in the store, for [[files]] src = "$/motd"
 anvil secret NAME          # store a secret
 anvil doctor               # every target's facts and reachability
@@ -49,6 +50,8 @@ anvil update               # replace the binary with the latest signed release
 - 檔案、服務與步驟，各自依 tags 與 facts 比對每個 target（[設定](docs/configuration.zh-TW.md)）。
 - plugin 產生步驟的腳本；drift 是 doctor plugin，而非指令
   （[Doctor plugins](docs/cli.zh-TW.md#doctor-plugins-drift-since-the-last-apply)）。
+- 以 config 項目建議 Linux 強化設定，並防止把自己鎖在外面：`anvil config --harden` 預覽，`--write` 加入
+  （[Harden](docs/configuration.zh-TW.md#harden)）。
 - secret 存於 keychain、age 或 sops；host key 絕不自動接受；更新經過簽章驗證（[安全須知](docs/security.zh-TW.md)）。
 
 ## 最小範例
