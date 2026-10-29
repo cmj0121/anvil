@@ -107,6 +107,9 @@ pub enum Command {
         /// With --harden: also suggest high-risk rules (ssh.password-auth)
         #[arg(long, requires = "harden")]
         strict: bool,
+        /// With --harden: write the suggestions into the config and the file store
+        #[arg(long, requires = "harden")]
+        write: bool,
         #[arg(long, value_enum, value_name = "FORMAT")]
         format: Option<Format>,
     },
@@ -338,8 +341,9 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
         Command::Config {
             harden: true,
             strict,
+            write,
             ..
-        } => crate::commands::harden(cli, &opts, *strict),
+        } => crate::commands::harden(cli, &opts, *strict, *write),
         Command::Config { format, full, .. } => crate::commands::config(cli, &opts, *format, *full),
         Command::Files { action } => crate::files_cmd::run(cli, &opts, action),
         Command::Doctor => {
@@ -438,7 +442,8 @@ mod tests {
                 format: None,
                 full: false,
                 harden: false,
-                strict: false
+                strict: false,
+                write: false
             }
         ));
         assert!(matches!(
@@ -455,7 +460,8 @@ mod tests {
                 full: true,
                 format: Some(Format::Yaml),
                 harden: false,
-                strict: false
+                strict: false,
+                write: false
             }
         ));
         assert!(matches!(
@@ -463,6 +469,7 @@ mod tests {
             Command::Config {
                 harden: true,
                 strict: false,
+                write: false,
                 full: false,
                 format: None
             }
@@ -475,8 +482,18 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            command(&["config", "--harden", "--strict", "--write"]),
+            Command::Config {
+                harden: true,
+                strict: true,
+                write: true,
+                ..
+            }
+        ));
         for args in [
             vec!["config", "--strict"],
+            vec!["config", "--write"],
             vec!["config", "--harden", "--full"],
             vec!["config", "--harden", "--format", "toml"],
         ] {

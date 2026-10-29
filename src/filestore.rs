@@ -451,6 +451,43 @@ impl Root {
     }
 }
 
+/// Writes `rel` under the host folder `dir` atomically without following a
+/// symlink below `dir`: each parent is opened, or created, with `O_NOFOLLOW`
+/// and the file itself is refused when it is a symlink. An existing file
+/// keeps its mode; a new one is 0600.
+pub fn write_beneath(dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), StoreError> {
+    let parts: Vec<&str> = rel
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    let Some((name, parents)) = parts.split_last().filter(|_| !parts.contains(&"..")) else {
+        return Err(StoreError::BadPath(rel.to_owned()));
+    };
+    let mut at_dir = host_directory(dir, false)?;
+    let mut walked = String::new();
+    for part in parents {
+        walked = joined(&walked, part);
+        match at::mkdirat(&at_dir, *part, Mode::from_raw_mode(0o777)) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(e) => return Err(fd_error(&walked, e)),
+        }
+        at_dir = open_dir(&at_dir, part.as_ref(), &walked)?;
+    }
+    let mode = match at::statat(&at_dir, *name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(s) => match at::FileType::from_raw_mode(s.st_mode) {
+            // st_mode is u16 on macOS and u32 on Linux.
+            #[allow(clippy::useless_conversion)]
+            at::FileType::RegularFile => u32::from(s.st_mode) & 0o7777,
+            at::FileType::Symlink => return Err(StoreError::Symlink(rel.to_owned())),
+            at::FileType::Directory => return Err(StoreError::IsDir(rel.to_owned())),
+            _ => return Err(StoreError::NotText(rel.to_owned())),
+        },
+        Err(Errno::NOENT) => 0o600,
+        Err(e) => return Err(fd_error(rel, e)),
+    };
+    atomic_at(&at_dir, name, bytes, mode).map_err(|e| io_error(rel, e))
+}
+
 /// Whether a host destination lies in a source directory, including host aliases.
 fn host_contains(dir: &Path, dest: &Path) -> bool {
     let absolute = if dest.is_absolute() {
@@ -875,6 +912,30 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn write_beneath_keeps_the_mode_and_never_follows_a_symlink() {
+        let store = Store::new();
+        let (ws, outside) = (store.0.join("ws"), store.0.join("outside"));
+        fs::create_dir_all(ws.join("real")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(ws.join("real/f"), "old").unwrap();
+        fs::set_permissions(ws.join("real/f"), fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&outside, ws.join("out")).unwrap();
+        symlink(outside.join("t"), ws.join("link")).unwrap();
+
+        write_beneath(&ws, "real/f", b"new").unwrap();
+        assert_eq!(fs::read_to_string(ws.join("real/f")).unwrap(), "new");
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&ws.join("real/f")), 0o640);
+        write_beneath(&ws, "new/dir/g", b"g").unwrap();
+        assert_eq!(mode(&ws.join("new/dir/g")), 0o600);
+
+        for rel in ["out/f", "out/new/f", "link", "../outside/f"] {
+            assert!(write_beneath(&ws, rel, b"x").is_err(), "{rel}");
+        }
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -33,6 +33,7 @@ use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
 use crate::document::{self, DocumentError, Format, MAX_BYTES};
 use crate::editor::{Buffer, Editor, Fallback};
+use crate::filestore;
 use crate::harden;
 use crate::inventory::Inventory;
 use crate::logger::escape_controls;
@@ -128,17 +129,26 @@ struct HardenReport<'a> {
 
 /// `anvil config --harden`: the hardening the config lacks, as a diff of the
 /// config and the src files it names; exit 1 while any suggestion remains.
-pub fn harden(cli: &Cli, opts: &Options, strict: bool) -> Result<(), Failure> {
+/// With `write`, the edited config is validated, the src files are written
+/// (store files first), then the config is saved; exit 0.
+pub fn harden(cli: &Cli, opts: &Options, strict: bool, write: bool) -> Result<(), Failure> {
     warn_target(cli);
     let current = paths::locate(opts.config.as_deref(), "config")?;
+    let yaml_name = current
+        .as_ref()
+        .filter(|doc| doc.format != Format::Toml)
+        .map(|doc| doc.path.file_name().unwrap_or_default().to_string_lossy());
+    if write && let Some(name) = &yaml_name {
+        return Err(Failure::usage(format!(
+            "{name}: run anvil config once to migrate it to config.toml"
+        )));
+    }
     let mut config = Config::load(current.as_ref())?;
     let dest = destination(opts.config.as_deref(), config_dir, "config", Format::Toml)?;
     let shown = dest.path.display().to_string();
-    let yaml = current.as_ref().filter(|doc| doc.format != Format::Toml);
     let mut notes = Vec::new();
-    let (original, text) = match yaml {
-        Some(doc) => {
-            let name = doc.path.file_name().unwrap_or_default().to_string_lossy();
+    let (original, text) = match yaml_name {
+        Some(name) => {
             notes.push(format!(
                 "harden: {name} is shown as the TOML anvil config would migrate it to"
             ));
@@ -162,7 +172,15 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool) -> Result<(), Failure> {
     })
     .map_err(|err| Failure::usage(err.to_string()))?;
 
-    let mut diff = harden::diff::unified(&shown, original.as_deref(), &outcome.doc.to_string());
+    let edited = outcome.doc.to_string();
+    let count = outcome.suggestions.len();
+    let written = write && count > 0;
+    if written {
+        parse::<Config>(edited.as_bytes(), &dest, Config::validate)?;
+        write_harden(&workspace, &outcome.files, &dest.path, &edited)?;
+    }
+
+    let mut diff = harden::diff::unified(&shown, original.as_deref(), &edited);
     for file in &outcome.files {
         diff.push_str(&harden::diff::unified(
             &file.shown,
@@ -170,7 +188,6 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool) -> Result<(), Failure> {
             &file.new,
         ));
     }
-    let count = outcome.suggestions.len();
     if !cli.json {
         for s in &outcome.suggestions {
             notes.push(format!(
@@ -197,6 +214,13 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool) -> Result<(), Failure> {
             "config carries every harden rule; anvil plan / apply bring the hosts to it".to_owned(),
         );
     }
+    if written {
+        notes.push(format!("harden: wrote {shown}"));
+        for file in &outcome.files {
+            notes.push(format!("harden: wrote {}", file.shown));
+        }
+        notes.push("next: anvil plan".to_owned());
+    }
     for note in &notes {
         let _ = status::write_stderr(&format!("{}\n", escape_controls(note)));
     }
@@ -209,7 +233,7 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool) -> Result<(), Failure> {
                 held: &outcome.held,
                 warnings: &outcome.warnings,
                 diff: &diff,
-                written: false,
+                written,
             },
             Failure::usage,
         )?;
@@ -218,9 +242,84 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool) -> Result<(), Failure> {
     }
     match count {
         0 => Ok(()),
+        _ if write => Ok(()),
         1 => Err(Failure::failed("config --harden: 1 suggestion")),
         n => Err(Failure::failed(format!("config --harden: {n} suggestions"))),
     }
+}
+
+/// Checks every harden src file and `config` before writing any, then writes
+/// the src files (store files through the file store, workspace srcs
+/// without following a symlink) and saves `config` last. A symlinked config
+/// or src is refused rather than replaced.
+fn write_harden(
+    workspace: &Path,
+    files: &[harden::FileChange],
+    config: &Path,
+    text: &str,
+) -> Result<(), Failure> {
+    refuse_symlink(config, &config.display().to_string())?;
+    let store = filestore::Root::in_workspace(workspace);
+    for file in files {
+        if filestore::is_store_path(&file.shown) {
+            store.resolve(&file.shown)?;
+        } else {
+            confined_src(workspace, &file.shown)?;
+        }
+    }
+    for file in files {
+        if filestore::is_store_path(&file.shown) {
+            store.write(&file.shown, file.new.as_bytes())?;
+        } else {
+            filestore::write_beneath(workspace, &file.shown, file.new.as_bytes()).map_err(
+                |err| Failure {
+                    code: err.exit_code(),
+                    message: format!("{}: {}", file.shown, err.reason()),
+                },
+            )?;
+        }
+    }
+    write_keeping_mode(config, text.as_bytes())
+}
+
+/// Refuses (exit 2) the relative `src` when it is absolute, has a `..`, is
+/// a symlink, or resolves outside the workspace.
+fn confined_src(workspace: &Path, src: &str) -> Result<(), Failure> {
+    let leaves = || Failure::usage(format!("{src}: leaves the workspace; nothing written"));
+    let rel = Path::new(src);
+    if rel.is_absolute() || rel.components().any(|c| c == Component::ParentDir) {
+        return Err(leaves());
+    }
+    let path = workspace.join(rel);
+    refuse_symlink(&path, src)?;
+    let canonical = |dir: &Path| {
+        fs::canonicalize(dir).map_err(|err| Failure::failed(format!("{}: {err}", dir.display())))
+    };
+    let existing = path
+        .ancestors()
+        .find(|ancestor| fs::symlink_metadata(ancestor).is_ok())
+        .unwrap_or(workspace);
+    if !canonical(existing)?.starts_with(canonical(workspace)?) {
+        return Err(leaves());
+    }
+    Ok(())
+}
+
+fn refuse_symlink(path: &Path, shown: &str) -> Result<(), Failure> {
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) {
+        return Err(Failure::usage(format!(
+            "{shown}: is a symlink; --write does not replace it, nothing written"
+        )));
+    }
+    Ok(())
+}
+
+/// [`write_atomic`] with an existing file's permission bits kept.
+fn write_keeping_mode(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
+    let permissions = fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| meta.permissions());
+    write_atomic_as(path, bytes, permissions)
 }
 
 /// The config's editor flow; `format` is the edit view.
@@ -720,6 +819,15 @@ fn parse<T: DeserializeOwned>(
 /// Writes a fresh `<path>.tmp` 0600 and renames it over `path`. A stale
 /// `.tmp` (or a symlink planted there) is removed first, never reused.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
+    write_atomic_as(path, bytes, None)
+}
+
+/// [`write_atomic`], giving the temp file `permissions` before the rename.
+fn write_atomic_as(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<fs::Permissions>,
+) -> Result<(), Failure> {
     let io = |source: std::io::Error| Failure::failed(format!("{}: {source}", path.display()));
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(io)?;
@@ -742,6 +850,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
         .open(&tmp)
         .and_then(|mut file| {
             file.write_all(bytes)?;
+            if let Some(permissions) = permissions {
+                file.set_permissions(permissions)?;
+            }
             file.sync_all()
         })
         .and_then(|()| fs::rename(&tmp, path));
@@ -768,6 +879,38 @@ mod tests {
     use super::*;
     use crate::secret::{Memory, SecretError, Vault};
     use crate::test_util::{Unopenable, temp_dir, write_private};
+
+    #[test]
+    fn harden_srcs_stay_inside_the_workspace_and_off_symlinks() {
+        let root = temp_dir("harden-src");
+        let ws = root.join("ws");
+        let outside = root.join("outside");
+        fs::create_dir_all(ws.join("real")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(ws.join("real/sshd_config"), "x").unwrap();
+        std::os::unix::fs::symlink("real/sshd_config", ws.join("link")).unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("out")).unwrap();
+
+        confined_src(&ws, "real/sshd_config").unwrap();
+        confined_src(&ws, "new/dir/f").unwrap();
+        for (src, why) in [
+            ("/etc/passwd", "leaves the workspace"),
+            ("../outside/f", "leaves the workspace"),
+            ("real/../../outside/f", "leaves the workspace"),
+            ("out/f", "leaves the workspace"),
+            ("out/new/f", "leaves the workspace"),
+            ("link", "is a symlink"),
+        ] {
+            let err = confined_src(&ws, src).unwrap_err();
+            assert_eq!(err.code, 2, "{src}");
+            assert!(
+                err.message.starts_with(&format!("{src}: {why}")),
+                "{}",
+                err.message
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     /// A config naming a scripted editor: `script` runs with the temp file as
     /// `$1` and must write it itself (an empty script leaves it unchanged).
