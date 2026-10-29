@@ -54,6 +54,13 @@ fn a_file_runs_on_local_and_the_fake_host() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(
         text(&out.stdout),
+        "▶ local\n  ✔ ok · 1 step\n\n▶ fake\n  ✔ ok · 1 step\n\n2 ok, 0 failed\n",
+        "a quiet step shows nothing below -vv"
+    );
+    let out = sandbox.anvil(&["-vv", "run", path.to_str().unwrap()], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
         "▶ local\n  $ echo hello\n  hello\n  ✔ ok · 1 step\n\n\
          ▶ fake\n  $ echo hello\n  hello\n  ✔ ok · 1 step\n\n\
          2 ok, 0 failed\n"
@@ -88,7 +95,7 @@ fn the_script_is_never_on_an_ssh_argv_and_nothing_is_probed() {
     let marker = "anvil-run-marker-7f3a";
     let out = anvil_stdin(
         &sandbox,
-        &["run", "--target", "fake", "-"],
+        &["-vv", "run", "--target", "fake", "-"],
         &[("FAKE_SSH_LOG", log.to_str().unwrap())],
         format!("echo {marker}\n").as_bytes(),
     );
@@ -143,7 +150,7 @@ fn an_unclosed_heredoc_on_the_last_line_is_a_failed_step() {
 #[test]
 fn a_script_of_only_comments_runs() {
     let sandbox = Sandbox::new("ru");
-    let out = anvil_stdin(&sandbox, &["run", "-"], &[], b"# nothing\n# to do\n");
+    let out = anvil_stdin(&sandbox, &["-vv", "run", "-"], &[], b"# nothing\n# to do\n");
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(text(&out.stdout).contains("  $ # nothing …\n  ✔ ok · 1 step\n"));
 }
@@ -152,7 +159,7 @@ fn a_script_of_only_comments_runs() {
 fn a_broken_config_does_not_block_a_run() {
     let sandbox = Sandbox::new("ru");
     sandbox.write_config("config.toml", "[packages\n");
-    let out = anvil_stdin(&sandbox, &["run", "-"], &[], b"echo fine\n");
+    let out = anvil_stdin(&sandbox, &["-vv", "run", "-"], &[], b"echo fine\n");
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(text(&out.stdout).contains("  fine\n"));
 }
@@ -272,10 +279,7 @@ fn the_secret_store_is_never_opened() {
     let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     assert!(!stderr.contains("missing-key.txt"), "{stderr}");
-    assert_eq!(
-        stdout,
-        "▶ local\n  $ echo fine\n  fine\n  ✔ ok · 1 step\n\n1 ok, 0 failed\n"
-    );
+    assert_eq!(stdout, "▶ local\n  ✔ ok · 1 step\n\n1 ok, 0 failed\n");
 }
 
 #[test]
@@ -336,7 +340,7 @@ fn parallel_two_runs_the_script_on_two_hosts_at_once_in_inventory_order() {
         "--target",
         "alpha",
     ];
-    let out = sandbox.anvil(&args, &[]);
+    let out = sandbox.anvil(&[&["-vv"][..], &args].concat(), &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let block = |name: &str| format!("▶ {name}\n  $ {step}\n  met\n  ✔ ok · 1 step\n\n");
     assert_eq!(
@@ -365,7 +369,7 @@ fn parallel_one_prints_exactly_what_the_default_prints() {
         assert_eq!(one.status.code(), Some(0), "{}", text(&one.stderr));
         assert_eq!(one.stdout, default.stdout, "{flag:?}");
     }
-    let out = sandbox.anvil(&["--parallel", "1", "run", path], &[]);
+    let out = sandbox.anvil(&["-vv", "--parallel", "1", "run", path], &[]);
     assert_eq!(
         text(&out.stdout),
         "▶ local\n  $ echo hello\n  hello\n  ✔ ok · 1 step\n\n\

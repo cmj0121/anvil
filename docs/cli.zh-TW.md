@@ -46,6 +46,8 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
 | `-h`, `--help`      | 說明                                                                                               |
 | `-V`, `--version`   | 版本                                                                                               |
 
+`-v` 也決定 `apply`、`run` 與 `rollback` 的 step 輸出：每個 step 的 stdout 從 `-vv` 起顯示（[apply](#anvil-apply)）。
+
 下方的 JSON 範例經過排版；anvil 會將每份文件印成一行。
 未知的 `--target` 是用法錯誤（以 2 結束；對 `tui` 而言僅在 inventory 載入成功時）。
 `inventory`、`config`、`files` 與 `secret` 會忽略 `--target` 並發出警告。
@@ -513,7 +515,7 @@ remove = ["nano"]
 upgrade = true
 ```
 
-給人看的輸出是每個 target 一個區塊，每個區塊後有一個空行，最後是摘要：
+給人看的輸出是每個 target 一個區塊，每個區塊後有一個空行，最後是摘要。使用 `-vv` 時（略去 anvil 自己的 info 日誌）：
 
 ```text
 ▶ local
@@ -533,7 +535,27 @@ upgrade = true
 1 ok, 1 failed
 ```
 
+預設（低於 `-vv`）只顯示需要注意的 step：
+
+```text
+▶ local
+  $ uname -sr; echo warn >&2
+  local: warn
+  ✔ ok · 2 steps
+
+▶ linode1
+  $ false
+  ✘ step 2 exited 1
+
+1 ok, 1 failed
+```
+
 - `▶ TARGET` 是區塊開頭；每個 step 顯示 `$ RUN`（多行的 `run` 顯示第一行與 `…`），接著是縮排兩個空格的輸出行。
+- **輸出跟隨 `-v`。** step 的 stdout 屬 info 層級：從 `-vv` 起顯示，失敗的 step（非零結束、被終止或逾時）則一律顯示。
+  它的 stderr 屬 error 層級：一律顯示。低於 `-vv` 時，step 的 `$ RUN` 行只在該 step 寫了 stderr 或失敗時顯示。
+  `▶` 標頭、`⚠` 警告、`✔`／`✘` 結尾行與摘要一律顯示。`--json` 在任何層級都帶有完整的 stdout 與 stderr，TUI 也全部顯示。
+- **預設輸出已變更。** 以前每個 step 的 `$` 行與 stdout 在任何層級都會顯示。解析 `apply`、`run` 或 `rollback`
+  給人看的 stdout 的腳本應改用 `--json`，或加上 `-vv`。
 - step 的 stderr 行送到 stderr，以相同方式縮排，讓它們在終端機上就地交錯；
   當 stderr 不是終端機時，每行前面加上 `TARGET:`（上例的 `local: warn`）。
 - 區塊以 `✔ ok · N steps` 結尾，失敗的 step 則為 `✘ step K exited C`，傳輸錯誤則為 `✘ ERROR`（排在錯誤發生前已完成的 step 之後）。
@@ -897,7 +919,7 @@ facts = { distro = "arch" }
 每個項目在每個 target 上都是一個 step，依 config 順序排在套件 step 之後、`[[steps]]` 之前。
 在符合的 target 上，該 step 顯示為 `$ file DEST` 並印出 `wrote DEST`；dest 已是相同位元組時印出 `unchanged DEST`（此時只套用 `mode`）。
 在不符合的 target 上，它是沒有輸出的 `$ skipped file DEST: no match`：它不執行任何東西，計入 `✔ ok · N steps`，
-該 target 的其他 step 仍會執行。寫入失敗的 step 會像任何 step 一樣結束該 target：
+該 target 的其他 step 仍會執行。寫入失敗的 step 會像任何 step 一樣結束該 target。使用 `-vv` 時：
 
 ```text
 ▶ linode1
@@ -969,6 +991,7 @@ tags = ["web"]
 `disabled service NAME`、`started service NAME`、`stopped service NAME`。沒有要變更的東西時印出
 `unchanged service NAME`，因此再次執行不會有任何動作。在不符合的 target 上，它是沒有輸出的
 `$ skipped service NAME: no match`：它不執行任何東西，計入 `✔ ok · N steps`，該 target 的其他 step 仍會執行。
+使用 `-vv` 時：
 
 ```text
 ▶ linode1
@@ -1114,7 +1137,8 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 | `--allow-host-change` | 即使 target 的 machine-id 或 hostname 與紀錄不同也執行 rollback |
 | `--dry-run`           | 列出會還原的內容，不連線到任何地方                              |
 
-`--target`、`--parallel` 與 `--json` 的作用與 apply 相同。同時使用 `--force` 與 `--force-all` 是用法錯誤。
+`--target`、`--parallel`、`--json` 與給人看的輸出的 `-v` 層級，作用都與 apply 相同。同時使用 `--force` 與
+`--force-all` 是用法錯誤。使用 `-vv` 時：
 
 ```text
 ▶ web1
@@ -1237,10 +1261,10 @@ target 的選法與 apply 相同（`--target`；未指定表示 `local` 加上�
   | 不是 UTF-8                    | `run: the script is not UTF-8`                      |
   | 無法讀取的 `FILE`（或 stdin） | `run: cannot read FILE: REASON`（`-` 時為 `stdin`） |
 
-給人看的輸出、`--json` 與結束碼都與 apply 相同：每個 target 一個區塊，腳本是其唯一的 `$` 行
+給人看的輸出（含其 `-v` 層級）、`--json` 與結束碼都與 apply 相同：每個 target 一個區塊，腳本是其唯一的 `$` 行
 （有多行時顯示第一行與 `…`），接著是摘要。`--json` 中 step 的 `run` 是原本給的腳本，不含外層包裝。
 腳本在每個 target 上都以 0 結束時以 0 結束，任一 target 失敗時為 1，用法錯誤為 2。
-在 Mac 上執行 `printf 'hostname\nuname -s\n' | anvil run --target local -`：
+在 Mac 上執行 `printf 'hostname\nuname -s\n' | anvil -vv run --target local -`，stdout 印出：
 
 ```text
 ▶ local
@@ -1501,7 +1525,8 @@ anvil 以 argv 陣列執行系統的 `ssh`，絕不使用 shell 字串，因此 
 
 日誌以 `LEVEL target: message` 的形式寫到 stderr（在 `anvil tui` 中則改寫到其 [Log 窗格](tui.zh-TW.md)）；
 stdout 上的 `--json` 輸出維持單一文件。預設只顯示錯誤；`-v` 加上警告、`-vv` info、`-vvv` debug，
-其中包含每次 `ssh` 與編輯器啟動的 argv。使用 `--parallel` 時，同時執行的 target 的日誌行會交錯，
+其中包含每次 `ssh` 與編輯器啟動的 argv。同一層級也決定 `apply`、`run` 與 `rollback` 的 step 輸出：
+step 的 stdout 屬 info、stderr 屬 error（[apply](#anvil-apply)）；沒有另外的旗標。使用 `--parallel` 時，同時執行的 target 的日誌行會交錯，
 每行完整且標出它的 target（[平行執行](#平行執行)）。致命錯誤是非零結束前的最後一行。
 訊息中的控制字元（ssh 或 host 的文字）顯示為 `\x1b` 式跳脫；`doctor` 給人看的輸出也會跳脫它們。
 secret 值、探測輸出與檔案內容在任何層級都絕不記錄。沒有日誌檔案，也沒有 `RUST_LOG`。

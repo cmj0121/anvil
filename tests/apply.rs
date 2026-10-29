@@ -28,7 +28,19 @@ fn hostname_runs_on_local_and_the_fake_host() {
     sandbox.with_fake_host();
     let out = sandbox.anvil(&["apply"], &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "▶ local\n  ✔ ok · 1 step\n\n▶ fake\n  ✔ ok · 1 step\n\n2 ok, 0 failed\n",
+        "a quiet step shows nothing below -vv"
+    );
+    assert!(
+        !text(&out.stdout).contains('\x1b'),
+        "no colour off a terminal"
+    );
+
     // The fake runs the client script on this machine.
+    let out = sandbox.anvil(&["-vv", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let name = local_hostname();
     let name = name.trim_end();
     assert_eq!(
@@ -38,10 +50,6 @@ fn hostname_runs_on_local_and_the_fake_host() {
              ▶ fake\n  $ hostname\n  {name}\n  ✔ ok · 1 step\n\n\
              2 ok, 0 failed\n"
         )
-    );
-    assert!(
-        !text(&out.stdout).contains('\x1b'),
-        "no colour off a terminal"
     );
 }
 
@@ -54,12 +62,10 @@ fn human_output_ends_a_failed_target_with_its_error_and_counts_both() {
         &CONNECT_REFUSED,
     );
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
-    let name = local_hostname();
-    let name = name.trim_end();
     assert_eq!(
         text(&out.stdout),
         format!(
-            "▶ local\n  $ hostname\n  {name}\n  ✔ ok · 1 step\n\n\
+            "▶ local\n  ✔ ok · 1 step\n\n\
              ▶ fake\n  ✘ {CONNECT_REFUSED_MESSAGE}\n\n\
              1 ok, 1 failed\n"
         )
@@ -227,7 +233,7 @@ fn files_go_to_each_matching_target_between_packages_and_the_steps() {
 
     let sandbox = Sandbox::new("aa");
     let (web, local) = with_files(&sandbox);
-    let out = sandbox.anvil(&["apply"], &[]);
+    let out = sandbox.anvil(&["-vv", "apply"], &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(
         text(&out.stdout),
@@ -239,7 +245,6 @@ fn files_go_to_each_matching_target_between_packages_and_the_steps() {
              2 ok, 0 failed\n"
         )
     );
-    assert_eq!(text(&out.stderr), "", "nothing on raw stderr");
     for dest in [&web, &local] {
         assert_eq!(std::fs::read_to_string(dest).unwrap(), FILE_TEXT);
         let mode = std::fs::metadata(dest).unwrap().permissions().mode();
@@ -247,6 +252,14 @@ fn files_go_to_each_matching_target_between_packages_and_the_steps() {
     }
 
     let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "▶ fake\n  ✔ ok · 3 steps\n\n1 ok, 0 failed\n"
+    );
+    assert_eq!(text(&out.stderr), "", "nothing on raw stderr");
+
+    let out = sandbox.anvil(&["-vv", "apply", "--target", "fake"], &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(
         text(&out.stdout).contains(&format!("  $ file {web}\n  unchanged {web}\n")),
@@ -438,7 +451,7 @@ fn parallel_two_runs_two_hosts_at_once_and_keeps_inventory_order() {
         "--target",
         "alpha",
     ];
-    let out = sandbox.anvil(&args, &[]);
+    let out = sandbox.anvil(&[&["-vv"][..], &args].concat(), &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let block = |name: &str| format!("▶ {name}\n  $ {step}\n  met\n  ✔ ok · 1 step\n\n");
     assert_eq!(
@@ -471,7 +484,7 @@ fn parallel_one_prints_exactly_what_the_default_prints() {
     }
     let name = local_hostname();
     let name = name.trim_end();
-    let out = sandbox.anvil(&["--parallel", "1", "apply"], &[]);
+    let out = sandbox.anvil(&["-vv", "--parallel", "1", "apply"], &[]);
     assert_eq!(
         text(&out.stdout),
         format!(

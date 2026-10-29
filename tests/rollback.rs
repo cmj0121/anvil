@@ -81,7 +81,7 @@ fn without_a_record_rollback_exits_one_and_runs_nothing() {
 fn rollback_restores_and_removes_what_apply_wrote_and_twice_is_the_same() {
     let sandbox = Sandbox::new("rb");
     let (web, local) = applied(&sandbox);
-    let out = sandbox.anvil(&["rollback"], &[]);
+    let out = sandbox.anvil(&["-vv", "rollback"], &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(
         text(&out.stdout),
@@ -352,7 +352,7 @@ fn a_dry_run_lists_what_would_be_restored_and_connects_to_nothing() {
     assert_eq!(std::fs::read_to_string(&local).unwrap(), FILE_TEXT);
     assert!(Path::new(&web).exists());
 
-    let out = sandbox.anvil(&["rollback"], &vars);
+    let out = sandbox.anvil(&["-vv", "rollback"], &vars);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(
         text(&out.stdout).contains("▶ fake\n  $ nothing recorded\n  ✔ ok · 1 step\n"),
@@ -457,7 +457,7 @@ fn a_failed_restore_stops_the_target_and_records_only_the_earlier_ones() {
     let (a, b, c) = (&dests[0], &dests[1], &dests[2]);
     // Rollback goes last written first: c is removed, b refuses, a waits.
     std::fs::write(b, "edited by hand\n").unwrap();
-    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    let out = sandbox.anvil(&["-vv", "rollback", "--target", "local"], &[]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
     assert!(

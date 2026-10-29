@@ -223,8 +223,8 @@ else
   fail "exit $code, $accepted auths"
 fi
 
-step "(c) apply prints each target's hostname"
-anvil apply --target local --target arch
+step "(c) apply -vv prints each target's hostname"
+anvil -vv apply --target local --target arch
 code=$?
 expected=$(printf '▶ local\n  $ hostname\n  %s\n  ✔ ok · 1 step\n\n▶ arch\n  $ hostname\n  %s\n  ✔ ok · 1 step\n\n2 ok, 0 failed' \
   "$LOCAL_HOSTNAME" "$REMOTE_HOSTNAME")
@@ -232,6 +232,15 @@ if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ]; then
   pass "local $LOCAL_HOSTNAME, arch $REMOTE_HOSTNAME"
 else
   fail "exit $code, expected:"
+  printf '%s\n' "$expected"
+fi
+anvil apply --target local --target arch
+code=$?
+expected=$(printf '▶ local\n  ✔ ok · 1 step\n\n▶ arch\n  ✔ ok · 1 step\n\n2 ok, 0 failed')
+if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ]; then
+  pass "below -vv a quiet step prints no \$ line and no stdout"
+else
+  fail "default level: exit $code, expected:"
   printf '%s\n' "$expected"
 fi
 anvil apply --json --target local --target arch
@@ -314,7 +323,7 @@ if [ "$code" -eq 0 ] && grep -Eq '"target":"arch","connectable":true,"facts":\{[
 else
   fail "doctor with [packages]: exit $code"
 fi
-anvil --inventory "$XDG/anvil/inventory.toml" --config "$PKG_CONFIG" apply --target arch
+anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$PKG_CONFIG" apply --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qF '  $ { anvil_db=1;' "$TMP/out" && grep -qF "$PKG_TAIL" "$TMP/out" \
   && grep -qxF "$PKG_WARN" "$TMP/out" && grep -qxF '  ✔ ok · 2 steps' "$TMP/out"; then
@@ -374,7 +383,7 @@ CONF
 docker exec "$NAME" sh -c 'printf old >/etc/anvil-e2e-real && chmod 600 /etc/anvil-e2e-real \
   && ln -s anvil-e2e-real /etc/anvil-e2e-link'
 docker exec -u key "$NAME" sh -c 'printf old >/home/key/anvil-e2e-real && ln -s anvil-e2e-real /home/key/anvil-e2e-link'
-anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/config.toml" apply --target arch
+anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/config.toml" apply --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  $ file /etc/anvil-e2e-plain' "$TMP/out" \
   && grep -qxF '  wrote /etc/anvil-e2e-plain' "$TMP/out" \
@@ -390,7 +399,7 @@ if [ "$code" -eq 0 ] && grep -qxF '  $ file /etc/anvil-e2e-plain' "$TMP/out" \
 else
   fail "apply with [[files]]: exit $code"
 fi
-anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/config.toml" apply --target arch
+anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/config.toml" apply --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-plain' "$TMP/out" \
   && grep -qxF '  unchanged /home/key/anvil-e2e-link' "$TMP/out"; then
@@ -427,7 +436,7 @@ dest = "/etc/anvil-e2e-big"
 mode = "0644"
 CONF
 step "(l) a 1 MiB file on arch within 10 s"
-anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/big.toml" apply --target arch
+anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/big.toml" apply --target arch
 code=$?
 elapsed=$(($(date +%s) - started))
 if [ "$code" -eq 0 ] && [ "$elapsed" -le 10 ] && grep -qxF '  wrote /etc/anvil-e2e-big' "$TMP/out" \
@@ -484,7 +493,7 @@ if [ "$(local_mode "$RB_STATE/anvil")" = 700 ] && [ "$(local_mode "$RB_RECORD")"
 else
   fail "the record: dir $(local_mode "$RB_STATE/anvil"), file $(local_mode "$RB_RECORD")"
 fi
-rb_anvil apply --target arch
+rb_anvil -vv apply --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-rb' "$TMP/out" && grep -qF "$RB_OLD" "$RB_RECORD"; then
   pass "a rerun apply is unchanged and keeps the previous text"
@@ -515,7 +524,7 @@ else
   fail "rollback: exit $code"
   docker exec "$NAME" stat -c '%a %U:%G %n' /etc/anvil-e2e-rb
 fi
-rb_anvil rollback --target arch
+rb_anvil -vv rollback --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-rb' "$TMP/out" \
   && grep -qxF '  unchanged /etc/anvil-e2e-rb-new' "$TMP/out" \
@@ -538,7 +547,7 @@ if [ "$code" -eq 0 ] && [ "$code2" -eq 1 ] \
 else
   fail "rollback over a hand edit: apply exit $code, rollback exit $code2"
 fi
-rb_anvil rollback --force /etc/anvil-e2e-rb --target arch
+rb_anvil -vv rollback --force /etc/anvil-e2e-rb --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  restored /etc/anvil-e2e-rb' "$TMP/out" \
   && grep -qxF '  unchanged /etc/anvil-e2e-rb-new' "$TMP/out" \
@@ -567,7 +576,7 @@ if [ "$code" -eq 1 ] \
 else
   fail "apply with a tee that fails midway: exit $code"
 fi
-rb_anvil rollback --target arch
+rb_anvil -vv rollback --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  restored /etc/anvil-e2e-rb' "$TMP/out" \
   && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" = "$RB_OLD" ] \
@@ -707,7 +716,7 @@ if command -v python3 >/dev/null 2>&1; then
     fail "doctor over the pty: exit $code"
   fi
   run_env PTY_PASSWORD="$PASSWORD" python3 tests/e2e/pty_login.py --prompts 0 --expect "^  $REMOTE_HOSTNAME\$" \
-    -- "$ANVIL" --ssh-config "$CFG" apply --target archpw >"$TMP/out" 2>"$TMP/err"
+    -- "$ANVIL" --ssh-config "$CFG" -vv apply --target archpw >"$TMP/out" 2>"$TMP/err"
   code=$?
   if [ "$code" -eq 0 ]; then
     pass "apply reused the master, no prompt"
@@ -798,7 +807,7 @@ CONF
   else
     fail "doctor over the pty: exit $code"
   fi
-  sudo_anvil apply --target archpw
+  sudo_anvil -vv apply --target archpw
   code=$?
   if [ "$code" -eq 0 ] && grep -qF "$PKG_TAIL" "$TMP/out" && grep -qxF '  ✔ ok · 2 steps' "$TMP/out" \
     && ! grep -qF -e "$PASSWORD" -e '***' "$TMP/out" "$TMP/err"; then
@@ -835,7 +844,7 @@ mode = "0640"
 facts = { distro = "$REMOTE_DISTRO" }
 CONF
   SUDO_CONFIG_USED="$SUDO_FILES_DIR/config.toml"
-  sudo_anvil apply --target archpw
+  sudo_anvil -vv apply --target archpw
   code=$?
   if [ "$code" -eq 0 ] && grep -qxF '  $ file /etc/anvil-e2e.conf' "$TMP/out" \
     && grep -qxF '  wrote /etc/anvil-e2e.conf' "$TMP/out" \
@@ -996,7 +1005,7 @@ tags = ["sd"]
 INV
   SD_HOSTNAME=$(docker inspect -f '{{.Config.Hostname}}' "$SD_NAME")
   printf 'hostname\n' >"$TMP/hostname.sh"
-  anvil run --target sd "$TMP/hostname.sh"
+  anvil -vv run --target sd "$TMP/hostname.sh"
   code=$?
   if [ "$code" -eq 0 ] && grep -qxF "  $SD_HOSTNAME" "$TMP/out" && grep -qxF '1 ok, 0 failed' "$TMP/out" \
     && [ "$(docker exec "$SD_NAME" cat /proc/1/comm)" = systemd ]; then
@@ -1044,7 +1053,7 @@ CONF
     docker exec "$SD_NAME" sh -c 'journalctl --sync; journalctl -q --no-pager _COMM=sudo' | grep -cF "COMMAND=/usr/bin/systemctl --no-ask-password $1 -- anvil-e2e"
   }
 
-  anvil --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/start.toml" apply --target sd
+  anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/start.toml" apply --target sd
   code=$?
   expected=$(svc_out 'enabled service anvil-e2e' 'started service anvil-e2e')
   if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ] && svc_unit active enabled \
@@ -1056,7 +1065,7 @@ CONF
     docker exec "$SD_NAME" systemctl is-active anvil-e2e
     docker exec "$SD_NAME" systemctl is-enabled anvil-e2e
   fi
-  anvil --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/start.toml" apply --target sd
+  anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/start.toml" apply --target sd
   code=$?
   expected=$(svc_out 'unchanged service anvil-e2e')
   if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ] && svc_unit active enabled \
@@ -1066,7 +1075,7 @@ CONF
     fail "rerun started + enabled: exit $code, expected:"
     printf '%s\n' "$expected"
   fi
-  anvil --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/stop.toml" apply --target sd
+  anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/stop.toml" apply --target sd
   code=$?
   expected=$(svc_out 'disabled service anvil-e2e' 'stopped service anvil-e2e')
   if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ] && svc_unit inactive disabled \
@@ -1076,7 +1085,7 @@ CONF
     fail "apply stopped + disabled: exit $code, expected:"
     printf '%s\n' "$expected"
   fi
-  anvil --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/stop.toml" apply --target sd
+  anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/stop.toml" apply --target sd
   code=$?
   expected=$(svc_out 'unchanged service anvil-e2e')
   if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ] && svc_unit inactive disabled \
@@ -1086,7 +1095,7 @@ CONF
     fail "rerun stopped + disabled: exit $code, expected:"
     printf '%s\n' "$expected"
   fi
-  anvil --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/missing.toml" apply --target archsd --target arch
+  anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/missing.toml" apply --target archsd --target arch
   code=$?
   if [ "$code" -ne 0 ] && grep -qF 'services: anvil-e2e-missing: not found by systemd' "$TMP/out" "$TMP/err" \
     && grep -qxF '  $ skipped service anvil-e2e-missing: no match' "$TMP/out" \

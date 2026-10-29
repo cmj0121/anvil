@@ -46,6 +46,9 @@ Every flag is global: it may come before or after the command.
 | `-h`, `--help`      | help                                                                                                  |
 | `-V`, `--version`   | version                                                                                               |
 
+`-v` also sets the step output of `apply`, `run` and `rollback`: every step's stdout shows from `-vv`
+([apply](#anvil-apply)).
+
 The JSON examples below are pretty-printed; anvil prints each document on one line. An unknown `--target` is a usage
 error (exit 2; for `tui` only when the inventory loads). `inventory`, `config`, `files` and `secret` ignore `--target`
 with a warning. `--parallel` outside 1..=32 is exit 2 (`invalid value '0' for '--parallel <N>': 0 is not in 1..=32`);
@@ -526,7 +529,8 @@ remove = ["nano"]
 upgrade = true
 ```
 
-Human output is one block per target, a blank line after each, then a summary:
+Human output is one block per target, a blank line after each, then a summary. With `-vv` (anvil's own info logs left
+out):
 
 ```text
 ▶ local
@@ -546,8 +550,29 @@ Human output is one block per target, a blank line after each, then a summary:
 1 ok, 1 failed
 ```
 
+The default, below `-vv`, shows only the steps that need a look:
+
+```text
+▶ local
+  $ uname -sr; echo warn >&2
+  local: warn
+  ✔ ok · 2 steps
+
+▶ linode1
+  $ false
+  ✘ step 2 exited 1
+
+1 ok, 1 failed
+```
+
 - `▶ TARGET` heads the block; each step shows `$ RUN` (a multi-line `run` shows its first line and `…`), then its
   output lines indented two spaces.
+- **Output follows `-v`.** A step's stdout is info level: shown from `-vv`, and always for a failed step (non-zero
+  exit, killed or timed out). Its stderr is error level: always shown. Below `-vv` a step's `$ RUN` line shows only
+  when the step wrote stderr or failed. The `▶` header, `⚠` warnings, the `✔`/`✘` end line and the summary always
+  show. `--json` always carries the full stdout and stderr, and the TUI shows everything, at any level.
+- **Changed default.** Before, every step's `$` line and stdout showed at every level. A script that reads the human
+  stdout of `apply`, `run` or `rollback` should switch to `--json`, or add `-vv`.
 - A step's stderr lines go to stderr, indented the same way so they interleave in place on a terminal; when stderr is
   not a terminal each one is prefixed with `TARGET:` (`local: warn` above).
 - The block ends with `✔ ok · N steps`, or `✘ step K exited C` for a failing step, or `✘ ERROR` for a transport error
@@ -933,7 +958,7 @@ Every entry is one step on every target, in config order, after the package step
 target that matches, the step shows as `$ file DEST` and prints `wrote DEST`, or `unchanged DEST` when dest already
 holds the same bytes (only `mode` is applied then). On a target that does not match, it is
 `$ skipped file DEST: no match` with no output: it runs nothing, counts in `✔ ok · N steps`, and the target's other
-steps still run. A step whose write fails ends the target like any step:
+steps still run. A step whose write fails ends the target like any step. With `-vv`:
 
 ```text
 ▶ linode1
@@ -1009,7 +1034,7 @@ the init first, changes only what differs and prints one line per change, in the
 `disabled service NAME`, `started service NAME`, `stopped service NAME`. With nothing to change it prints
 `unchanged service NAME`, so a rerun is a no-op. On a target that does not match, it is
 `$ skipped service NAME: no match` with no output: it runs nothing, counts in `✔ ok · N steps`, and the target's
-other steps still run.
+other steps still run. With `-vv`:
 
 ```text
 ▶ linode1
@@ -1164,7 +1189,8 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 | `--allow-host-change` | roll back even if the target's machine-id or hostname differs from the record |
 | `--dry-run`           | list what would be restored, connecting to nothing                            |
 
-`--target`, `--parallel` and `--json` work as for apply. `--force` and `--force-all` together are a usage error.
+`--target`, `--parallel`, `--json` and the `-v` level of the human output work as for apply. `--force` and
+`--force-all` together are a usage error. With `-vv`:
 
 ```text
 ▶ web1
@@ -1298,10 +1324,10 @@ is always POSIX sh: a shebang line is only a comment. run asks for no confirmati
   | not UTF-8                    | `run: the script is not UTF-8`                     |
   | `FILE` (or stdin) unreadable | `run: cannot read FILE: REASON` (`stdin` for `-`)  |
 
-Human output, `--json` and the exit codes are apply's: one block per target with the script as its one `$` line (the
-first line and `…` when it has more), then the summary. In `--json` the step's `run` is the script as given, without the
-wrapper. Exit 0 when the script exited 0 on every target, 1 when any target failed, 2 for usage.
-`printf 'hostname\nuname -s\n' | anvil run --target local -` on a Mac:
+Human output (with its `-v` level), `--json` and the exit codes are apply's: one block per target with the script as
+its one `$` line (the first line and `…` when it has more), then the summary. In `--json` the step's `run` is the
+script as given, without the wrapper. Exit 0 when the script exited 0 on every target, 1 when any target failed, 2 for usage.
+`printf 'hostname\nuname -s\n' | anvil -vv run --target local -` on a Mac prints on stdout:
 
 ```text
 ▶ local
@@ -1581,8 +1607,10 @@ from `--ssh-config`; `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE` and `DISPLAY` are remo
 
 Logs go to stderr as `LEVEL target: message` (in `anvil tui`, to its [Log pane](tui.md) instead); `--json` output
 on stdout stays a single document. The default shows errors only; `-v` adds warnings, `-vv` info, `-vvv` debug, which
-includes the argv of every `ssh` and editor spawn. With `--parallel`, the lines of targets that run at once interleave,
-each line whole and naming its target ([Running in parallel](#running-in-parallel)). A fatal error is the last line
-before a non-zero exit. Control characters in a message (ssh's or a host's text) are shown as `\x1b`-style escapes;
-`doctor`'s human output escapes them too. Secret values, probe output and file contents are never logged at any level.
-There are no log files and no `RUST_LOG`.
+includes the argv of every `ssh` and editor spawn. The same level drives the step output of `apply`, `run` and
+`rollback`: a step's stdout is info, its stderr error ([apply](#anvil-apply)); there is no separate flag. With
+`--parallel`, the lines of targets that run at once interleave, each line whole and naming its target
+([Running in parallel](#running-in-parallel)). A fatal error is the last line before a non-zero exit. Control
+characters in a message (ssh's or a host's text) are shown as `\x1b`-style escapes; `doctor`'s human output escapes
+them too. Secret values, probe output and file contents are never logged at any level. There are no log files and no
+`RUST_LOG`.
