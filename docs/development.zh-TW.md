@@ -6,7 +6,13 @@
 make test          # builds anvil-audit, then fmt --check, clippy -D warnings and cargo test over the workspace
 make e2e           # doctor, apply and the ssh auth paths against an Arch sshd container; prints `skip` without docker
 make audit-plugin  # builds the reference doctor plugin in release and prints its path and sha256
+make audit         # cargo audit: Cargo.lock against the RustSec advisory database (needs cargo-audit)
 ```
+
+`make audit` 需要 `cargo-audit`（`cargo install --locked cargo-audit`），只要有未在
+[`.cargo/audit.toml`](../.cargo/audit.toml) 中忽略的 advisory 就會失敗；套件不再維護（unmaintained）的警告不會讓它失敗。
+那裡的每一筆忽略都寫明原因與何時移除：RUSTSEC-2026-0387（`crypto-bigint` 0.5.5）經由 `age` 0.12.1 引入，
+會保留到 `age` 改用 `p256` 0.14 為止。
 
 這個儲存庫是一個 cargo workspace：根目錄的 anvil，以及參考 [doctor plugin](cli.zh-TW.md#doctor-plugins-drift-since-the-last-apply)
 `plugins/anvil-audit`。預設成員只有 anvil，因此 `cargo build`、`cargo run`、`cargo install --path .` 與發行建置只動到 anvil，
@@ -39,6 +45,7 @@ GitHub Actions（[`.github/workflows/ci.yml`](../.github/workflows/ci.yml)）會
 | `pre-commit` | Ubuntu               | `pre-commit run --all-files`（YAML、空白字元、gitleaks、markdownlint、prettier） |
 | `make test`  | Ubuntu 與 macOS      | 搭配 sops 與 python3 3.12 執行 `make test`，再以 `--no-default-features` 建置    |
 | `MSRV`       | Ubuntu、Rust 1.89    | 以 Cargo.toml 的 `rust-version` 執行 `cargo check --workspace --all-targets`     |
+| `make audit` | Ubuntu               | 以固定版本的 `cargo-audit` 執行 `make audit`                                     |
 | `make e2e`   | Ubuntu，在測試通過後 | 對 amd64 的 Arch 映像檔執行 `make e2e`；出現 `skip`（沒有 docker）時該 job 失敗  |
 | `build`      | Ubuntu 與 macOS      | 在測試通過後，為三個 target 建置 release 執行檔，並保留為 artifact（見下文）     |
 
@@ -48,7 +55,7 @@ GitHub Actions（[`.github/workflows/ci.yml`](../.github/workflows/ci.yml)）會
 它的 smoke test 以 `--version` 執行每個執行檔，也以 `--release-key x update --check` 執行，且必須以 2 結束：
 測試用旗標 `--release-url` 與 `--release-key` 只存在於 debug 建置中。
 
-各個 action 都以 commit SHA 固定版本，sops 則是固定版本的 release，並比對其 SHA-256（`.github/install-sops.sh`）；
+各個 action 都以 commit SHA 固定版本，cargo-audit 以版本號固定，sops 則是固定版本的 release，並比對其 SHA-256（`.github/install-sops.sh`）；
 release job 中的 minisign 也是如此（`.github/install-minisign.sh`）。
 會寫入登入 keychain 的測試維持 `#[ignore]`，不在 CI 中執行。
 
