@@ -50,6 +50,10 @@ pub struct Cli {
     )]
     pub parallel: u8,
 
+    /// No live progress line on stderr
+    #[arg(long, global = true)]
+    pub no_progress: bool,
+
     /// Test aid, debug builds only: `memory` keeps secrets in this process
     /// instead of the keychain.
     #[cfg(debug_assertions)]

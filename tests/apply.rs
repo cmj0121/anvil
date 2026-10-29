@@ -1077,3 +1077,76 @@ fn unknown_packages_warn_and_continue_with_exit_zero() {
     assert_eq!(value["targets"][0]["steps"][0]["code"], 7);
     assert_eq!(value["targets"][0]["warnings"].as_array().unwrap().len(), 1);
 }
+
+/// `anvil apply ARGS` with stdout and stderr on a pseudo-terminal, through
+/// `pty_capture.py`: the raw bytes it wrote; `None` without a python3 that
+/// has `os.login_tty`.
+fn apply_on_a_terminal(sandbox: &Sandbox, args: &[&str]) -> Option<String> {
+    let python = Command::new("python3")
+        .args(["-c", "import os; os.login_tty"])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !python {
+        eprintln!("skip: no python3 with os.login_tty");
+        return None;
+    }
+    let out = sandbox
+        .command("python3")
+        .arg(common::fixture("pty_capture.py"))
+        .args([
+            "--",
+            env!("CARGO_BIN_EXE_anvil"),
+            "--secret-store",
+            "memory",
+            "apply",
+        ])
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let transcript = text(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{transcript:?}\n{}",
+        text(&out.stderr)
+    );
+    Some(transcript)
+}
+
+#[test]
+fn a_terminal_shows_the_progress_line_and_clears_it_before_each_block() {
+    let sandbox = Sandbox::new("ap");
+    sandbox.write_config("config.toml", "[[steps]]\nrun = \"sleep 1\"\n");
+    let Some(out) = apply_on_a_terminal(&sandbox, &[]) else {
+        return;
+    };
+    let frame = out
+        .find("\r\x1b[K")
+        .filter(|&at| out[at..].contains(" apply · local step 1/1 0:0"))
+        .unwrap_or_else(|| panic!("no frame in {out:?}"));
+    let block = out.find("▶ local").unwrap();
+    let summary = out.find("1 ok, 0 failed").unwrap();
+    assert!(frame < block, "{out:?}");
+    let clear = out[..block].rfind("\r\x1b[K").unwrap();
+    assert!(
+        clear > frame,
+        "the frame is cleared before the block: {out:?}"
+    );
+    assert!(
+        !out[block..summary].contains("apply · local"),
+        "no frame after the last target ended: {out:?}"
+    );
+    assert!(!out.contains("\x1b[?25l"), "the cursor is never hidden");
+}
+
+#[test]
+fn no_progress_draws_no_line_on_a_terminal() {
+    let sandbox = Sandbox::new("ap");
+    sandbox.write_config("config.toml", "[[steps]]\nrun = \"sleep 1\"\n");
+    let Some(out) = apply_on_a_terminal(&sandbox, &["--no-progress"]) else {
+        return;
+    };
+    assert!(out.contains("▶ local"), "{out:?}");
+    assert!(!out.contains("\r\x1b[K"), "{out:?}");
+}

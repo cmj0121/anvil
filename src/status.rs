@@ -7,6 +7,7 @@
 //! output never mixes with it. Inactive, they write plainly, as without a
 //! status. Lock order is always the status mutex, then a stream's lock.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::panic::{self, PanicHookInfo};
@@ -16,6 +17,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::fanout::Event;
+use crate::inventory::Target;
 use crate::logger::{self, escape_controls};
 use crate::term::{self, Handoff, HandoffGuard};
 
@@ -25,14 +28,11 @@ pub const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', 
 /// Moves to the start of the line and erases it.
 pub(crate) const CLEAR: &str = "\r\x1b[K";
 /// How long after the first target starts the line is first drawn.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in by the commands"))]
 const DELAY: Duration = Duration::from_millis(300);
 /// How often the line is drawn again.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in by the commands"))]
 const TICK: Duration = Duration::from_millis(100);
 
 /// What a running target is doing.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in by the commands"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Probe,
@@ -65,7 +65,8 @@ struct Running {
 struct Inner {
     command: String,
     total: usize,
-    done: usize,
+    /// The targets that ended; their count is shown as done.
+    ended: HashSet<String>,
     /// In start order.
     running: Vec<Running>,
     first_start: Option<Instant>,
@@ -113,7 +114,14 @@ impl Inner {
             .collect();
         let glyph = SPINNER[usize::from(self.tick) % SPINNER.len()];
         let width = self.width.unwrap_or_else(terminal_width);
-        let line = frame(&self.command, &running, self.done, self.total, glyph, width);
+        let line = frame(
+            &self.command,
+            &running,
+            self.ended.len(),
+            self.total,
+            glyph,
+            width,
+        );
         self.out.write_all(format!("{CLEAR}{line}").as_bytes())?;
         DRAWN.store(true, Ordering::Relaxed);
         Ok(())
@@ -140,16 +148,35 @@ impl Inner {
         }
         self.out.flush()
     }
+
+    /// Running target `name`, recorded from now if it is new; `None` once it ended.
+    fn running(&mut self, name: &str) -> Option<&mut Running> {
+        if self.ended.contains(name) {
+            return None;
+        }
+        let at = match self.running.iter().position(|r| r.name == name) {
+            Some(at) => at,
+            None => {
+                let now = Instant::now();
+                self.first_start.get_or_insert(now);
+                self.running.push(Running {
+                    name: name.to_owned(),
+                    started: now,
+                    phase: None,
+                });
+                self.running.len() - 1
+            }
+        };
+        Some(&mut self.running[at])
+    }
 }
 
 /// Whether a CLI command should draw: stderr is a TTY and not `--no-progress`, and no logger Sink (TUI) is set.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in by the commands"))]
 pub fn enabled(no_progress: bool) -> bool {
     !no_progress && io::stderr().is_terminal() && !logger::has_sink()
 }
 
 /// Starts the line for `command` over `total` targets; inactive (all calls no-op, writes plain) when !enabled.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in by the commands"))]
 pub fn start(command: &str, total: usize, enabled: bool) -> Guard {
     if !enabled {
         return Guard { active: None };
@@ -193,7 +220,7 @@ fn activate(
     *status() = Some(Inner {
         command: command.to_owned(),
         total,
-        done: 0,
+        ended: HashSet::new(),
         running: Vec::new(),
         first_start: None,
         paused: false,
@@ -303,36 +330,62 @@ impl Handoff for Pause {
     }
 }
 
-/// Records `name` as running from now; phase none yet.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in by the commands"))]
+/// Records `name` as running from now, unless it already is (a worker's
+/// [`phase`] can arrive first) or it ended.
 pub fn target_started(name: &str) {
     if let Some(inner) = status().as_mut() {
-        let now = Instant::now();
-        inner.first_start.get_or_insert(now);
-        inner.running.push(Running {
-            name: name.to_owned(),
-            started: now,
-            phase: None,
-        });
+        inner.running(name);
     }
 }
 
-/// Sets the phase of running target `name`; an unknown name is ignored.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in by the commands"))]
+/// Sets the phase of target `name`, recording it as running if it is new;
+/// a target that ended is not shown again.
 pub fn phase(name: &str, phase: Phase) {
-    if let Some(inner) = status().as_mut()
-        && let Some(running) = inner.running.iter_mut().find(|r| r.name == name)
-    {
+    if let Some(running) = status().as_mut().and_then(|inner| inner.running(name)) {
         running.phase = Some(phase);
     }
 }
 
-/// Removes `name` from the running targets and counts one more done.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in by the commands"))]
+/// Removes `name` from the running targets and counts it done.
 pub fn target_done(name: &str) {
     if let Some(inner) = status().as_mut() {
         inner.running.retain(|r| r.name != name);
-        inner.done += 1;
+        inner.ended.insert(name.to_owned());
+    }
+}
+
+/// Drives the line from a fan-out's events: it starts at `Begin` and stops
+/// when this drops.
+pub struct Follow {
+    command: &'static str,
+    enabled: bool,
+    names: Vec<String>,
+    guard: Option<Guard>,
+}
+
+impl Follow {
+    pub fn new(command: &'static str, enabled: bool) -> Follow {
+        Follow {
+            command,
+            enabled,
+            names: Vec::new(),
+            guard: None,
+        }
+    }
+
+    /// Starts the line over `targets`.
+    pub fn begin(&mut self, targets: &[Target]) {
+        self.names = targets.iter().map(|t| t.name.clone()).collect();
+        self.guard = Some(start(self.command, targets.len(), self.enabled));
+    }
+
+    pub fn event<R>(&mut self, event: &Event<'_, R>) {
+        match event {
+            Event::Begin(targets) => self.begin(targets),
+            Event::Start(target) => target_started(&target.name),
+            Event::Done(index, _) => target_done(&self.names[*index]),
+            Event::Ordered(_) => {}
+        }
     }
 }
 
@@ -622,6 +675,63 @@ mod tests {
         target_done("web");
         write_stderr("a\n").unwrap();
         assert!(buf.text().ends_with("apply · db 0:00 · 1/2 done"));
+    }
+
+    #[test]
+    fn follow_tracks_each_target_by_its_index() {
+        use crate::inventory::{Target, TargetKind};
+
+        let _lock = test_lock();
+        let buf = Buf::default();
+        let _guard = start_with("apply", 3, Box::new(buf.clone()), 80, Duration::ZERO, LONG);
+        let targets: Vec<Target> = ["web", "db", "cache"]
+            .iter()
+            .map(|name| Target {
+                name: (*name).to_owned(),
+                kind: TargetKind::Local,
+                pkg: None,
+                sudo_secret: None,
+                tags: Vec::new(),
+            })
+            .collect();
+        // Disabled, so Begin leaves the status started above in place.
+        let mut follow = Follow::new("apply", false);
+        follow.event(&Event::<()>::Begin(&targets));
+        follow.event(&Event::<()>::Start(&targets[0]));
+        follow.event(&Event::<()>::Start(&targets[1]));
+        // A skipped target ends without its own work.
+        follow.event(&Event::<()>::Start(&targets[2]));
+        follow.event(&Event::Done(2, &()));
+        follow.event(&Event::Done(0, &()));
+        write_stderr("a\n").unwrap();
+        assert!(
+            buf.text().ends_with("apply · db 0:00 · 2/3 done"),
+            "{}",
+            buf.text()
+        );
+    }
+
+    #[test]
+    fn a_phase_before_the_start_is_kept_and_one_after_the_end_is_dropped() {
+        let _lock = test_lock();
+        let (buf, _guard) = active();
+        phase("web", Phase::Probe);
+        target_started("web");
+        write_stderr("a\n").unwrap();
+        assert!(
+            buf.text().ends_with("apply · web probe 0:00 · 0/2 done"),
+            "{}",
+            buf.text()
+        );
+        target_done("web");
+        phase("web", Phase::Probe);
+        target_started("db");
+        write_stderr("b\n").unwrap();
+        assert!(
+            buf.text().ends_with("apply · db 0:00 · 1/2 done"),
+            "{}",
+            buf.text()
+        );
     }
 
     #[test]
