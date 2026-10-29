@@ -2,7 +2,7 @@ SUBDIR :=
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
-.PHONY: all clean test e2e run build audit-plugin install uninstall upgrade help $(SUBDIR)
+.PHONY: all clean test e2e audit run build audit-plugin install uninstall upgrade help $(SUBDIR)
 
 all: $(SUBDIR) 		# default action
 	@[ -f .git/hooks/pre-commit ] || pre-commit install --install-hooks
@@ -17,6 +17,11 @@ test:				# run test (the workspace: anvil and anvil-audit)
 
 e2e:				# run the end-to-end suite (archlinux sshd container; skip without docker)
 	@if [ -f tests/e2e.sh ]; then sh tests/e2e.sh; else echo skip; fi
+
+audit:				# audit Cargo.lock against the RustSec advisory database
+	@cargo audit --version >/dev/null 2>&1 || \
+		{ echo "cargo-audit not found; run: cargo install --locked cargo-audit" >&2; exit 1; }
+	cargo audit
 
 run:				# run in the local environment
 	cargo run -- $(ARGS)

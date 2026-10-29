@@ -6,7 +6,13 @@ English | [繁體中文](development.zh-TW.md)
 make test          # builds anvil-audit, then fmt --check, clippy -D warnings and cargo test over the workspace
 make e2e           # doctor, apply and the ssh auth paths against an Arch sshd container; prints `skip` without docker
 make audit-plugin  # builds the reference doctor plugin in release and prints its path and sha256
+make audit         # cargo audit: Cargo.lock against the RustSec advisory database (needs cargo-audit)
 ```
+
+`make audit` needs `cargo-audit` (`cargo install --locked cargo-audit`) and fails on any advisory not ignored in
+[`.cargo/audit.toml`](../.cargo/audit.toml); an unmaintained-crate warning does not fail it. Every ignore there carries
+its reason and when to drop it: RUSTSEC-2026-0387 (`crypto-bigint` 0.5.5) comes in through `age` 0.12.1 and stays until
+`age` moves to `p256` 0.14.
 
 The repository is a cargo workspace: anvil at the root and `plugins/anvil-audit`, the reference
 [doctor plugin](cli.md#doctor-plugins-drift-since-the-last-apply). Its default member is anvil only, so `cargo build`,
@@ -39,6 +45,7 @@ GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs 
 | `pre-commit` | Ubuntu                 | `pre-commit run --all-files` (YAML, whitespace, gitleaks, markdownlint, prettier) |
 | `make test`  | Ubuntu and macOS       | `make test` with sops and python3 3.12, then a `--no-default-features` build      |
 | `MSRV`       | Ubuntu, Rust 1.89      | `cargo check --workspace --all-targets` on the `rust-version` in Cargo.toml       |
+| `make audit` | Ubuntu                 | `make audit` with a pinned `cargo-audit`                                          |
 | `make e2e`   | Ubuntu, after the test | `make e2e` against the amd64 Arch image; a `skip` (no docker) fails the job       |
 | `build`      | Ubuntu and macOS       | After the test, release binaries for three targets, kept as artifacts (below)     |
 
@@ -48,7 +55,7 @@ GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs 
 runs each binary with `--version`, and with `--release-key x update --check`, which must exit 2: the test flags
 `--release-url` and `--release-key` exist only in debug builds.
 
-Actions are pinned by commit SHA, and sops is a pinned release checked against its SHA-256 (`.github/install-sops.sh`);
+Actions are pinned by commit SHA, cargo-audit by version, and sops is a pinned release checked against its SHA-256 (`.github/install-sops.sh`);
 so is minisign in the release job (`.github/install-minisign.sh`).
 The keychain tests that write to the login keychain stay `#[ignore]` and do not run in CI.
 

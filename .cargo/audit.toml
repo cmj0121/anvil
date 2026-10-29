@@ -1,0 +1,10 @@
+# cargo audit configuration (`make audit` and the CI audit job).
+[advisories]
+# Each ignore needs a reason and a condition to drop it.
+ignore = [
+    # crypto-bigint 0.5.5, timing variability in constant-time operations. Pulled in by
+    # age 0.12.1 -> p256 0.13 (the latest age); the fix (>= 0.7.6) needs a newer age.
+    # anvil reaches it only when encrypting to an age1tag (P-256) recipient on the
+    # controller. Drop this once age moves to p256 0.14.
+    "RUSTSEC-2026-0387",
+]
