@@ -14,6 +14,8 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   inventory [--format toml|yaml] edit the inventory; --format picks the edit view, saved as TOML
   config [--format toml|yaml]    edit the config; --format picks the edit view, saved as TOML
          [--full]                --full shows every default; saved without them
+         [--harden]              --harden shows the Linux hardening the config lacks as a diff
+         [--strict] [--write]    with --harden: also the high-risk rules; write the suggestions
   files <ACTION>                 manage the file store that [[files]] src $/… reads: ls, cp, mv, rm, mkdir, cat, edit
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
@@ -155,6 +157,7 @@ run = "hostname"
 `[anvil]` 一律完整顯示，包含 `workspace`（未設定時為解析後的預設值）。
 config 已有的每個區段都會補上有預設值的鍵：`[packages]` 的 `manager`、`install`、`remove`、`pin`、`upgrade` 與 `timeout`，
 `[secrets.keychain]` 的 `service`，每個 `[[files]]` 項目的 `sudo` 與 `rollback`，每個 `[plugins.NAME]` 的 `on`。
+`[harden]` 一律顯示，未設定時為 `skip = []`（[`--harden`](#anvil-config---harden)）。
 config 沒用到的每個選用區段都以註解範例附在後面（`# [secrets]`、`# [packages]`、`# [[files]]`、`# [[services]]`、
 `# [plugins.NAME]`），以編輯格式呈現，所以 `--format yaml --full` 會以 YAML 寫出這些註解。
 `editor` 未設定時，其註解範例會放在 `[anvil]` 內。取消範例的註解即可使用。
@@ -164,6 +167,103 @@ config 沒用到的每個選用區段都以註解範例附在後面（`# [secret
 所以存在的 `[packages]` 會存成空的 `[packages]`。註解不會保留。
 緩衝區所代表的 config 與原本相同時，不論怎麼編輯都不會寫入任何東西（`PATH: unchanged`）；
 舊版 YAML config 或舊版的 `[anvil].secrets` 仍會和不加 `--full` 時一樣遷移。
+
+#### `anvil config --harden`
+
+以 config 與它將新增之檔案的 diff，顯示 config 尚缺的 Linux 強化設定；`--write` 則把它存下：
+
+```sh
+anvil config --harden              # preview: exit 1 while any suggestion remains
+anvil config --harden --strict     # also the high-risk rules (ssh.password-auth)
+anvil config --harden --write      # write the suggestions, then: anvil plan
+```
+
+它只讀取 config、inventory，以及它檢查的 `[[files]]` 項目的 src，不讀其他東西：它從不連線任何 target，完全離線執行。
+規則、各規則寫入的內容與 `[harden] skip` 請見 [Harden](configuration.zh-TW.md#harden)。
+`--strict` 與 `--write` 需要 `--harden`；`--harden` 搭配 `--full` 或 `--format` 以 2 結束。
+`--target` 與 `--parallel` 會被忽略並發出警告，和 `config` 相同。
+
+stdout 只有一份 unified diff（三行上下文），每個變更的檔案一段：config 以其路徑為標頭（尚不存在時為 `--- /dev/null`），
+每個儲存區檔案為 `--- a/$/harden/sshd.conf` / `+++ b/$/harden/sshd.conf`（新檔案時為 `--- /dev/null`），
+工作區的 src 則以相對於工作區的路徑表示。stderr 一律顯示以下內容：
+
+- 每個建議一行，位於 diff 之前：`harden: add|change|remove RULE: WHAT`，例如
+  `harden: add ssh.root-login: files[0] /etc/ssh/sshd_config.d/00-anvil-harden.conf`、
+  `harden: add updates.auto: steps[2] # anvil-harden: updates` 或
+  `harden: remove packages.insecure: telnet: packages.install -> packages.remove`；
+- 被擱置的規則：
+  `harden: held ssh.root-login: hosts db2, web1 connect as root or name no user; set user, or skip the rule`；
+- 使用 `--strict` 時：
+  `harden: warning ssh.password-auth: hosts that log in by password lose access; check every host has a key first`；
+- 沒有任何建議時（stdout 不印任何東西）：
+  `config carries every harden rule; anvil plan / apply bring the hosts to it`；
+- 舊版 YAML config：`harden: config.yaml is shown as the TOML anvil config would migrate it to`，diff 以該 TOML 為準。
+
+以 0 結束代表 config 已包含每條未被略過或擱置的規則，而不是 host 已經強化：`anvil plan` 顯示每個 target 還要做什麼，
+`anvil apply` 則實際去做。被擱置的規則不算建議。
+
+`--json` 改為印出一份文件（不印建議行與結尾那一行；擱置與警告行仍寫到 stderr）。
+`suggestions` 列出每項編輯及其服務的每條規則，`held` 列出每條被擱置的規則與造成擱置的 host，
+`diff` 是預覽印出的同一段文字，`written` 表示 `--write` 是否已存檔：
+
+```json
+{
+  "config": "/home/me/.config/anvil/config.toml",
+  "strict": false,
+  "suggestions": [
+    {
+      "rules": ["sysctl.net"],
+      "action": "add",
+      "what": "files[0] /etc/sysctl.d/99-anvil-harden.conf"
+    },
+    {
+      "rules": ["sysctl.net"],
+      "action": "add",
+      "what": "$/harden/sysctl.conf"
+    },
+    {
+      "rules": ["sysctl.net"],
+      "action": "add",
+      "what": "steps[0] # anvil-harden: sysctl"
+    },
+    {
+      "rules": ["updates.auto"],
+      "action": "add",
+      "what": "steps[1] # anvil-harden: updates"
+    }
+  ],
+  "held": [
+    {
+      "rule": "ssh.root-login",
+      "reason": "connect as root or name no user",
+      "hosts": ["db2", "web1"]
+    }
+  ],
+  "warnings": [],
+  "diff": "--- /home/me/.config/anvil/config.toml\n+++ /home/me/.config/anvil/config.toml\n@@ -0,0 +1,38 @@\n…",
+  "written": false
+}
+```
+
+`action` 為 `add`、`change` 或 `remove`；`warnings` 存放 `--strict` 的文字，不含 `harden: warning` 前綴。
+
+`--write` 寫入預覽所顯示的內容；沒有任何建議時什麼也不寫。它先驗證編輯後的 config，
+接著寫入每個儲存區檔案與工作區 src，最後才寫 config，每個都以原子方式寫入。
+註解、鍵的順序與排版都會保留，每個產生的項目會加上 `# added by anvil config --harden (RULE)` 註解。
+既有檔案保留其權限位元（新的 config 為 0600），但不保留擁有者。以下情況會拒絕，以 2 結束且不寫入任何東西：
+
+- 舊版 YAML config：`config.yaml: run anvil config once to migrate it to config.toml`（先用 `anvil config` 遷移它）；
+- 是 symlink 的 config 或 src：`PATH: is a symlink; --write does not replace it, nothing written`；
+- 是絕對路徑、含 `..` 或解析後位於工作區外的 src：`SRC: leaves the workspace; nothing written`；
+- 編輯後無法通過驗證的 config。
+
+寫入後，stderr 會為 config 與每個檔案加上 `harden: wrote PATH`，再印出 `next: anvil plan`。
+沒有 `[[steps]]` 的 config 會執行預設的 `hostname` step；`--harden` 加入 step 後，這個預設就不再存在，
+若仍需要，請自行加回一個 `run = "hostname"` 的 step。
+
+結束碼：預覽時有任何建議為 1（`config --harden: 3 suggestions`），否則為 0，只有擱置的規則或警告時也是 0。
+`--write` 寫入後或無須寫入時為 0，遇到上述拒絕情形或無法載入的 config 時為 2，寫入失敗時為 1。
+無法讀取的 config、inventory 或 src 為 2。
 
 ### `anvil files`
 
@@ -1482,6 +1582,9 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
 - **`update`**：已是最新、比最新 release 更新或已更新時為 0。
   搭配 `--check` 且有可用的更新時為 1，任何失敗也為 1：查詢、下載、檢查、拒絕情形，或 `no release key compiled in`；
   此時已安裝的執行檔保持不變。錯誤的旗標或引數為 2。
+- **`config --harden`**：仍有任何建議時為 1，否則為 0；只有擱置的規則或警告時為 0。
+  搭配 `--write` 時，寫入後（或無須寫入）為 0，遇到拒絕情形或無法通過驗證的 config 為 2，寫入失敗為 1
+  （[`--harden`](#anvil-config---harden)）。
 - **`files`**：成功時為 0。儲存區路徑不存在、已存在而沒有 `-f`、是資料夾（`rm` 沒有 `-r`）或不是資料夾、不是文字檔，
   或讀取、寫入或編輯器失敗時為 1。錯誤的旗標或引數、無效的儲存區路徑、儲存區內的 symlink、
   SRC 與 DEST 都是或都不是 `$/…` 的 `cp`、沒有 `-r` 而複製資料夾、`cat --json`，

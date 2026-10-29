@@ -101,6 +101,15 @@ pub enum Command {
         /// --full shows every default; saved without them
         #[arg(long)]
         full: bool,
+        /// Show the Linux hardening the config lacks as a diff; exit 1 while any remains
+        #[arg(long, conflicts_with_all = ["full", "format"])]
+        harden: bool,
+        /// With --harden: also suggest high-risk rules (ssh.password-auth)
+        #[arg(long, requires = "harden")]
+        strict: bool,
+        /// With --harden: write the suggestions into the config and the file store
+        #[arg(long, requires = "harden")]
+        write: bool,
         #[arg(long, value_enum, value_name = "FORMAT")]
         format: Option<Format>,
     },
@@ -329,7 +338,13 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
     let opts = Options::from_cli(cli);
     match command {
         Command::Inventory { format } => crate::commands::inventory(cli, &opts, *format),
-        Command::Config { format, full } => crate::commands::config(cli, &opts, *format, *full),
+        Command::Config {
+            harden: true,
+            strict,
+            write,
+            ..
+        } => crate::commands::harden(cli, &opts, *strict, *write),
+        Command::Config { format, full, .. } => crate::commands::config(cli, &opts, *format, *full),
         Command::Files { action } => crate::files_cmd::run(cli, &opts, action),
         Command::Doctor => {
             crate::commands::warn_parallel(cli);
@@ -425,23 +440,65 @@ mod tests {
             command(&["config"]),
             Command::Config {
                 format: None,
-                full: false
+                full: false,
+                harden: false,
+                strict: false,
+                write: false
             }
         ));
         assert!(matches!(
             command(&["config", "--format", "yaml"]),
             Command::Config {
                 full: false,
-                format: Some(Format::Yaml)
+                format: Some(Format::Yaml),
+                ..
             }
         ));
         assert!(matches!(
             command(&["config", "--full", "--format", "yaml"]),
             Command::Config {
                 full: true,
-                format: Some(Format::Yaml)
+                format: Some(Format::Yaml),
+                harden: false,
+                strict: false,
+                write: false
             }
         ));
+        assert!(matches!(
+            command(&["config", "--harden"]),
+            Command::Config {
+                harden: true,
+                strict: false,
+                write: false,
+                full: false,
+                format: None
+            }
+        ));
+        assert!(matches!(
+            command(&["config", "--harden", "--strict"]),
+            Command::Config {
+                harden: true,
+                strict: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            command(&["config", "--harden", "--strict", "--write"]),
+            Command::Config {
+                harden: true,
+                strict: true,
+                write: true,
+                ..
+            }
+        ));
+        for args in [
+            vec!["config", "--strict"],
+            vec!["config", "--write"],
+            vec!["config", "--harden", "--full"],
+            vec!["config", "--harden", "--format", "toml"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("anvil").chain(args)).is_err());
+        }
         assert!(matches!(command(&["doctor"]), Command::Doctor));
         assert!(matches!(command(&["apply"]), Command::Apply));
         assert!(matches!(command(&["plan"]), Command::Plan));

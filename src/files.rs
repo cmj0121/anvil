@@ -95,7 +95,7 @@ pub fn load(
 }
 
 /// Reads a relative src as text, confined to the already canonical workspace `dir`.
-fn read_src(dir: &Path, src: &str) -> Result<String, String> {
+pub(crate) fn read_src(dir: &Path, src: &str) -> Result<String, String> {
     const TEXT_ONLY: &str = "[[files]] copies text files only for now";
     let path = fs::canonicalize(dir.join(src)).map_err(|err| format!("cannot read: {err}"))?;
     if !path.starts_with(dir) {

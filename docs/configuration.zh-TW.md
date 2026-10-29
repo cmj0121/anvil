@@ -66,6 +66,9 @@ tags = ["linode"]          # optional; matched like [[files]]
 
 [[steps]]
 run = "hostname"           # placeholder: a POSIX sh script run on every target
+
+[harden]                   # optional; the rules anvil config --harden leaves out; see Harden
+skip = ["updates.auto"]    # default []
 ```
 
 兩個檔案都只以 TOML 儲存。YAML 只是編輯檢視：`anvil inventory` 與 `anvil config` 以 `[anvil].format`（預設 `toml`）
@@ -245,9 +248,12 @@ sha256 = "…"               # the sha256 of the file's bytes
 [[steps]]
 plugin = "harden"          # instead of run: the [plugins] entry whose reply is the script
 args = { profile = "ssh" } # optional, plugin steps only
+[harden]                   # optional; see Harden below
+skip = ["updates.auto"]    # rule ids anvil config --harden leaves out; default []
 ```
 
-沒有任何 `[[steps]]` 時，config 會執行一個 step（步驟）：`hostname`。每個 step 有 `run` 或 `plugin`，不能兩者都有；
+沒有任何 `[[steps]]` 時，config 會執行一個 step（步驟）：`hostname`；一旦你或 `anvil config --harden` 加入 step，
+這個預設就不再存在。每個 step 有 `run` 或 `plugin`，不能兩者都有；
 兩者都有時以 2 結束並顯示 `steps[I]: has both run and plugin; keep one`，兩者都沒有時為 `steps[I]: needs run or plugin`。
 
 沒有 `[secrets]` 時，backend（後端）在 macOS 上是 keychain（其他平台不支援）。
@@ -619,6 +625,68 @@ on = "doctor"
 每次重新建置位元組都會改變，所以之後要重新釘選：doctor 會在
 `plugin audit    error: plugins.audit.sha256: does not match …` 這一列顯示新的雜湊。
 config 中有 doctor plugin 時，apply 會探測每個 target，因此即使沒有 `[[files]]`，它的 facts 也會被記錄。
+
+## Harden
+
+`anvil config --harden` 以一般的 `[[files]]`、`[[steps]]` 與 `[packages]` 項目建議 Linux 強化設定，
+`--write` 則把它們加進 config（[`anvil config --harden`](cli.zh-TW.md#anvil-config---harden)）。
+`[harden]` 列出它要略過的規則：
+
+```toml
+[harden]
+skip = ["updates.auto"]          # rule ids config --harden never suggests; default []
+```
+
+每個 `skip` 項目都必須是下表的規則 id；重複無妨。其他值都以 2 結束並顯示
+``harden.skip `nope`: unknown rule; known: ssh.root-login, ssh.password-auth, sysctl.net, updates.auto, packages.insecure``，
+`[harden]` 中未知的鍵則以 2 結束並顯示解析器的訊息。之後才略過某條規則，並不會移除它先前加入的項目。
+
+| Rule                | Strict | Store file             | `dest`                                        | Step      |
+| ------------------- | ------ | ---------------------- | --------------------------------------------- | --------- |
+| `ssh.root-login`    | no     | `$/harden/sshd.conf`   | `/etc/ssh/sshd_config.d/00-anvil-harden.conf` | `ssh`     |
+| `ssh.password-auth` | yes    | `$/harden/sshd.conf`   | `/etc/ssh/sshd_config.d/00-anvil-harden.conf` | `ssh`     |
+| `sysctl.net`        | no     | `$/harden/sysctl.conf` | `/etc/sysctl.d/99-anvil-harden.conf`          | `sysctl`  |
+| `updates.auto`      | no     | —                      | —                                             | `updates` |
+| `packages.insecure` | no     | —                      | —                                             | —         |
+
+標示為 strict 的規則只在使用 `--strict` 時才建議。各規則設定的內容：
+
+- `ssh.root-login`：`PermitRootLogin no`。
+- `ssh.password-auth`：`PasswordAuthentication no` 與 `KbdInteractiveAuthentication no`。
+- `sysctl.net`：`rp_filter` 設為 2（寬鬆模式）；`accept_redirects`、`send_redirects` 與 `accept_source_route` 設為 0；
+  `icmp_echo_ignore_broadcasts`、`tcp_syncookies` 與 `log_martians` 設為 1。step 以 `sysctl -e -p` 載入該檔案。
+- `updates.auto`：一個 step，在 apt 上安裝 `unattended-upgrades`，在 dnf 上安裝並設定 `dnf-automatic` 套用安全性更新，
+  其他情況印出 `anvil-harden: no automatic security updates for this package manager; skipped`。
+- `packages.insecure`：把 `packages.install` 中每個不安全的名稱移到 `packages.remove`（清單見下方）。
+
+兩條 ssh 規則共用同一個 drop-in、`[[files]]` 項目與 step。新的儲存區檔案以 `# managed by anvil config --harden` 開頭。
+每個產生的 `[[files]]` 項目都帶有 `mode = "0644"` 與 `facts = { os = "Linux" }`，
+每個產生的 step 都是第一行為其標記的 `run` 腳本：`# anvil-harden: ssh`、`sysctl` 或 `updates`。
+`packages.insecure` 只移動已在 `install` 中的名稱：`ftp`、`inetutils-telnet`、`inetutils-telnetd`、`nis`、
+`rsh`、`rsh-client`、`rsh-redone-client`、`rsh-server`、`talk`、`talkd`、`telnet`、`telnet-server`、`telnetd`、`tftp`、
+`tftp-hpa`、`tftp-server`、`tftpd`、`tftpd-hpa`、`ypbind`。`[packages]` 沒有 tags 或 facts，
+因此被移動的名稱會從每個已安裝它的 target 上移除。
+
+當 config 已包含規則所寫入的內容時，該規則即已滿足，不會有任何建議：有一個帶有該 `dest` 的 `[[files]]` 項目，
+其 src（在儲存區或工作區中）含有每條指令，並且有一個第一行為其標記的 step。只會建議缺少的部分。
+你已有的 src 會就地修改：缺少的行會附加上去（`change`），把同一個鍵設成其他值的行則會被改寫，
+`/etc/ssh/sshd_config`、`/etc/ssh/sshd_config.d/…`、`/etc/sysctl.conf` 或 `/etc/sysctl.d/…` 的其他 `[[files]]` src 也一樣。
+帶標記的 step 絕不會被改寫，因此你可以自行編輯它。
+
+防止把自己鎖在外面的機制：
+
+- **root 登入會被擱置。** 只要有任何 inventory host（`local` 除外）以 root 連線或沒有指定 `user`，
+  就不會建議 `ssh.root-login`；輸出會列出這些 host。請為它們設定 `user`，或略過這條規則。`--strict` 不會推翻這一點。
+- **密碼登入只在 `--strict` 時建議，** 並附上這則警告：
+  `ssh.password-auth: hosts that log in by password lose access; check every host has a key first`。
+- **sshd step 先檢查再重新載入。** 當 `/etc/ssh/sshd_config` 沒有針對 `sshd_config.d` 的 `Include`，
+  或 `sshd -t` 失敗時，它會移除 drop-in 並失敗，讓 sshd 維持原狀。接著它重新載入 sshd
+  （`systemctl reload ssh`，否則 `sshd`，或 OpenRC 的 `rc-service sshd reload`），
+  並檢查 `sshd -T` 是否顯示 drop-in 的每一行，否則該 step 失敗。沒有安裝 `sshd` 時會略過。
+  sshd 會在每個新連線時讀取設定，因此 drop-in 一寫入就對新的登入生效，早於 step 執行 `sshd -t`、並在失敗時移除它。
+  套用期間請保持一個已開啟的連線。
+- **非 Linux 的 target 會被略過。** 產生的 `[[files]]` 項目只比對 `facts = { os = "Linux" }`，
+  每個產生的 step 都以 `[ "$(uname -s)" = Linux ] || exit 0` 開頭。這些 step 除非以 root 執行，否則使用 `sudo -n`。
 
 ## 限制與拒絕
 

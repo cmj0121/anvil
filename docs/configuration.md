@@ -66,6 +66,9 @@ tags = ["linode"]          # optional; matched like [[files]]
 
 [[steps]]
 run = "hostname"           # placeholder: a POSIX sh script run on every target
+
+[harden]                   # optional; the rules anvil config --harden leaves out; see Harden
+skip = ["updates.auto"]    # default []
 ```
 
 Both files are stored as TOML only. YAML is an editing view: `anvil inventory` and `anvil config` open the document
@@ -249,10 +252,14 @@ sha256 = "…"               # the sha256 of the file's bytes
 [[steps]]
 plugin = "harden"          # instead of run: the [plugins] entry whose reply is the script
 args = { profile = "ssh" } # optional, plugin steps only
+
+[harden]                   # optional; see Harden below
+skip = ["updates.auto"]    # rule ids anvil config --harden leaves out; default []
 ```
 
-Without any `[[steps]]` the config runs one step, `hostname`. Each step has `run` or `plugin`, never both; a step with
-both is exit 2 with `steps[I]: has both run and plugin; keep one`, one with neither with `steps[I]: needs run or plugin`.
+Without any `[[steps]]` the config runs one step, `hostname`; once you or `anvil config --harden` add a step, that
+default is gone. Each step has `run` or `plugin`, never both; a step with both is exit 2 with
+`steps[I]: has both run and plugin; keep one`, one with neither with `steps[I]: needs run or plugin`.
 
 Without `[secrets]` the backend is the keychain on macOS (and unsupported elsewhere). Only the selected backend's section
 is required and checked: a missing section, an unknown backend or `keychain` off macOS is a config error (exit 2). A
@@ -644,6 +651,71 @@ on = "doctor"
 Every rebuild changes the bytes, so pin again after it: doctor shows the new hash in its
 `plugin audit    error: plugins.audit.sha256: does not match …` row. A config with a doctor plugin makes apply probe
 each target, so its facts are recorded even without `[[files]]`.
+
+## Harden
+
+`anvil config --harden` suggests Linux hardening as ordinary `[[files]]`, `[[steps]]` and `[packages]` entries, and
+`--write` adds them to the config ([`anvil config --harden`](cli.md#anvil-config---harden)). `[harden]` names the rules
+it leaves out:
+
+```toml
+[harden]
+skip = ["updates.auto"]          # rule ids config --harden never suggests; default []
+```
+
+Each `skip` entry must be a rule id below; repeats are harmless. Anything else is exit 2 with
+``harden.skip `nope`: unknown rule; known: ssh.root-login, ssh.password-auth, sysctl.net, updates.auto, packages.insecure``,
+and an unknown key in `[harden]` is exit 2 with the parser's message. Skipping a rule later does not remove the entries
+it added.
+
+| Rule                | Strict | Store file             | `dest`                                        | Step      |
+| ------------------- | ------ | ---------------------- | --------------------------------------------- | --------- |
+| `ssh.root-login`    | no     | `$/harden/sshd.conf`   | `/etc/ssh/sshd_config.d/00-anvil-harden.conf` | `ssh`     |
+| `ssh.password-auth` | yes    | `$/harden/sshd.conf`   | `/etc/ssh/sshd_config.d/00-anvil-harden.conf` | `ssh`     |
+| `sysctl.net`        | no     | `$/harden/sysctl.conf` | `/etc/sysctl.d/99-anvil-harden.conf`          | `sysctl`  |
+| `updates.auto`      | no     | —                      | —                                             | `updates` |
+| `packages.insecure` | no     | —                      | —                                             | —         |
+
+A strict rule is suggested only with `--strict`. What each rule sets:
+
+- `ssh.root-login`: `PermitRootLogin no`.
+- `ssh.password-auth`: `PasswordAuthentication no` and `KbdInteractiveAuthentication no`.
+- `sysctl.net`: `rp_filter` 2 (loose); `accept_redirects`, `send_redirects` and `accept_source_route` 0;
+  `icmp_echo_ignore_broadcasts`, `tcp_syncookies` and `log_martians` 1. The step loads the file with `sysctl -e -p`.
+- `updates.auto`: a step that installs `unattended-upgrades` on apt, or `dnf-automatic` set to apply security updates on
+  dnf, and otherwise prints `anvil-harden: no automatic security updates for this package manager; skipped`.
+- `packages.insecure`: moves each insecure name in `packages.install` to `packages.remove` (listed below).
+
+The two ssh rules share one drop-in, `[[files]]` entry and step. A new store file starts with
+`# managed by anvil config --harden`. Each generated `[[files]]` entry has `mode = "0644"` and `facts = { os = "Linux" }`,
+and each generated step is a `run` script whose first line is its marker, `# anvil-harden: ssh`, `sysctl` or `updates`.
+`packages.insecure` moves only names already in `install`: `ftp`, `inetutils-telnet`, `inetutils-telnetd`, `nis`,
+`rsh`, `rsh-client`, `rsh-redone-client`, `rsh-server`, `talk`, `talkd`, `telnet`, `telnet-server`, `telnetd`, `tftp`,
+`tftp-hpa`, `tftp-server`, `tftpd`, `tftpd-hpa`, `ypbind`. `[packages]` has no tags or facts, so a moved name is
+removed from every target that has it installed.
+
+A rule is satisfied, and suggests nothing, when the config already carries what it writes: a `[[files]]` entry with its
+`dest` whose src (in the store or the workspace) has each directive, and a step whose first line is its marker. Only the
+missing pieces are suggested. A src you already have is changed in place: a missing line is appended (`change`), and a
+line that sets the same key to another value is rewritten, also in any other `[[files]]` src for
+`/etc/ssh/sshd_config`, `/etc/ssh/sshd_config.d/…`, `/etc/sysctl.conf` or `/etc/sysctl.d/…`. A marked step is never
+rewritten, so you may edit it.
+
+What keeps you from locking yourself out:
+
+- **Root login is held.** When any inventory host (not `local`) connects as root or names no `user`, `ssh.root-login`
+  is not suggested; the output names those hosts. Set `user` on them, or skip the rule. `--strict` does not override
+  this.
+- **Password login is `--strict` only,** and comes with this warning:
+  `ssh.password-auth: hosts that log in by password lose access; check every host has a key first`.
+- **The sshd step checks before it reloads.** When `/etc/ssh/sshd_config` has no `Include` for `sshd_config.d`, or
+  `sshd -t` fails, it removes the drop-in and fails, leaving sshd as it was. Then it reloads
+  sshd (`systemctl reload ssh`, else `sshd`, or OpenRC's `rc-service sshd reload`) and checks that `sshd -T` shows each
+  line of the drop-in, failing the step otherwise. Without `sshd` installed it skips.
+  sshd reads its config for each new connection, so the drop-in is in effect for new logins as soon as the file is
+  written, before the step's `sshd -t` runs and removes it on failure. Keep a session open while you apply it.
+- **Non-Linux targets are skipped.** The generated `[[files]]` entries match `facts = { os = "Linux" }` only, and every
+  generated step starts with `[ "$(uname -s)" = Linux ] || exit 0`. The steps use `sudo -n` unless they run as root.
 
 ## Limits and refusals
 

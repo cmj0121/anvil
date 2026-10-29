@@ -1,7 +1,7 @@
 //! The config document: `[anvil]` preferences, the `[secrets]` backend, the
 //! `[packages]` to install, the pinned `[plugins]`, the `[[files]]` to copy,
-//! the `[[services]]` to bring to a state and the `[[steps]]` that
-//! `anvil apply` runs.
+//! the `[[services]]` to bring to a state, the `[[steps]]` that
+//! `anvil apply` runs and the `[harden]` rules `config --harden` skips.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::{self, DocumentError, Format};
 use crate::facts;
+use crate::harden::rules;
 use crate::inventory;
 use crate::logger::escape_controls;
 use crate::packages::Packages;
@@ -55,6 +56,8 @@ pub struct Config {
     pub files: Vec<FileEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<ServiceEntry>,
+    #[serde(skip_serializing_if = "Harden::is_empty")]
+    pub harden: Harden,
     /// The loaded file, canonicalized by [`Config::load`]; `None` for defaults.
     #[serde(skip)]
     pub path: Option<PathBuf>,
@@ -70,6 +73,7 @@ impl Default for Config {
             plugins: BTreeMap::new(),
             files: Vec::new(),
             services: Vec::new(),
+            harden: Harden::default(),
             path: None,
             steps: vec![Step::script("hostname")],
         }
@@ -87,6 +91,19 @@ pub struct AnvilPrefs {
     /// Legacy spelling of `[secrets].names`; moved there by [`Config::migrate`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secrets: Option<Vec<String>>,
+}
+
+/// `[harden]`: the rule ids `config --harden` leaves out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Harden {
+    pub skip: Vec<String>,
+}
+
+impl Harden {
+    fn is_empty(&self) -> bool {
+        self.skip.is_empty()
+    }
 }
 
 /// `[secrets]`: the backend and the names `doctor` requires. Only the
@@ -404,6 +421,8 @@ sudo = true
 rollback = true
 [plugins.NAME]
 on = "step"
+[harden]
+skip = []
 "#;
 
 /// Optional sections offered as commented examples in either edit format.
@@ -483,6 +502,13 @@ impl Config {
     /// Renders all listed defaults and commented examples for unused sections.
     pub fn full_view(&self, base: &Path, format: Format) -> Result<String, DocumentError> {
         let mut value = self.with_defaults(false)?;
+        value
+            .as_table_mut()
+            .expect("serialized config")
+            .entry("harden")
+            .or_insert_with(|| {
+                toml::Table::from_iter([("skip".into(), toml::Value::Array(Vec::new()))]).into()
+            });
         let workspace = match &self.anvil.workspace {
             Some(workspace) => workspace.clone(),
             None => std::path::absolute(base)
@@ -605,6 +631,8 @@ impl Config {
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_services()
             .map_err(|message| DocumentError::invalid(path, message))?;
+        self.check_harden()
+            .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_steps()
             .map_err(|message| DocumentError::invalid(path, message))
     }
@@ -694,6 +722,22 @@ impl Config {
             seen.push(key);
         }
         Ok(())
+    }
+
+    /// Every `[harden].skip` entry names a known rule; repeats are harmless.
+    fn check_harden(&self) -> Result<(), String> {
+        match self.harden.skip.iter().find(|id| rules::find(id).is_none()) {
+            Some(id) => Err(format!(
+                "harden.skip `{}`: unknown rule; known: {}",
+                secret::shown_name(id),
+                rules::RULES
+                    .iter()
+                    .map(|rule| rule.id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            None => Ok(()),
+        }
     }
 
     /// The `[plugins]` schema rules; the files are checked by
@@ -2582,6 +2626,49 @@ mod tests {
             document::from_str::<Config>("[anvil]\nformat = \"ini\"\n", Format::Toml).unwrap_err();
         assert!(err.contains("ini"), "{err}");
     }
+
+    #[test]
+    fn harden_skip_accepts_known_rules_in_either_format() {
+        let path = Path::new("config.toml");
+        let config = parse("[harden]\nskip = [\"ssh.root-login\", \"ssh.root-login\"]\n");
+        assert_eq!(config.harden.skip, ["ssh.root-login", "ssh.root-login"]);
+        assert!(config.validate(path).is_ok());
+        let yaml: Config = document::from_str(
+            "harden:\n  skip: [ssh.root-login, ssh.root-login]\n",
+            Format::Yaml,
+        )
+        .unwrap();
+        assert_eq!(yaml, config);
+        assert_eq!(parse("[harden]\n"), Config::default());
+    }
+
+    #[test]
+    fn harden_skip_refuses_unknown_rules_and_keys() {
+        let err = parse("[harden]\nskip = [\"sysctl.net\", \"no\\u001bpe\"]\n")
+            .validate(Path::new("config.toml"))
+            .unwrap_err();
+        assert!(matches!(err, DocumentError::Invalid { .. }), "{err}");
+        assert!(
+            err.to_string().contains(
+                "harden.skip `no\\x1bpe`: unknown rule; known: ssh.root-login, \
+                 ssh.password-auth, sysctl.net, updates.auto, packages.insecure"
+            ),
+            "{err}"
+        );
+        let err = document::from_str::<Config>("[harden]\nrules = []\n", Format::Toml).unwrap_err();
+        assert!(err.contains("rules"), "{err}");
+    }
+
+    #[test]
+    fn empty_harden_is_not_serialized() {
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&parse("[harden]\nskip = []\n"), format).unwrap();
+            assert!(!text.contains("harden"), "{text}");
+            let text = document::to_string(&parse("[harden]\nskip = [\"updates.auto\"]\n"), format)
+                .unwrap();
+            assert!(text.contains("updates.auto"), "{text}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2666,6 +2753,7 @@ mod full_tests {
                 "path = '/plugin'\nsha256 = 'hash'\n",
                 defaults["plugins"]["NAME"].as_table().unwrap(),
             ),
+            ("[harden]", "", defaults["harden"].as_table().unwrap()),
         ] {
             for (key, value) in table {
                 let plain = config(&format!("{heading}\n{required}"));
@@ -2715,6 +2803,7 @@ mod full_tests {
             "sudo = true",
             "rollback = true",
             "on = \"step\"",
+            "[harden]\nskip = []",
             "# [secrets]",
             "# [[services]]",
             "# editor =",
@@ -2731,10 +2820,37 @@ mod full_tests {
             "# services:",
             "# plugins:",
             "  # editor:",
+            "harden:\n  skip: []",
         ] {
             assert!(yaml.contains(expected), "missing {expected}: {yaml}");
         }
         assert!(!yaml.contains("# [packages]"));
+        let skipped = config("[harden]\nskip = ['sysctl.net']\n")
+            .full_view(Path::new("/workspace"), Format::Toml)
+            .unwrap();
+        assert!(
+            skipped.contains("[harden]\nskip = [\"sysctl.net\"]"),
+            "{skipped}"
+        );
+    }
+
+    /// The `[harden]` the full view adds is gone again once stripped.
+    #[test]
+    fn full_harden_round_trips() {
+        for original in [
+            Config::default(),
+            config("[harden]\nskip = ['sysctl.net']\n"),
+        ] {
+            for format in [Format::Toml, Format::Yaml] {
+                assert_eq!(
+                    round_trip(&original, Path::new("/workspace"), format),
+                    original,
+                    "{format}"
+                );
+            }
+        }
+        let table = Config::default().stripped(Path::new("/workspace")).unwrap();
+        assert!(!table.contains_key("harden"), "{table:?}");
     }
 
     /// The editor example can be uncommented in place in either format.
