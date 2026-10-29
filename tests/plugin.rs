@@ -63,7 +63,7 @@ fn logged(sandbox: &Sandbox, args: &[&str]) -> (std::process::Output, String) {
 #[test]
 fn apply_runs_the_returned_script_on_the_target() {
     let (sandbox, _) = pinned(None);
-    let (out, log) = logged(&sandbox, &["apply", "--target", "fake"]);
+    let (out, log) = logged(&sandbox, &["-vv", "apply", "--target", "fake"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(
         text(&out.stdout),

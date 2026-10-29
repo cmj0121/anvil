@@ -707,7 +707,8 @@ pub(crate) fn print_report(
     targets: impl FnOnce(&mut dyn FnMut(Progress<'_>)) -> Result<Report, Failure>,
 ) -> Result<(), Failure> {
     let style = Style::detect();
-    let mut print = fanout::in_order(|report| print_lines(&render(report, style), style));
+    let verbose = log::max_level() >= log::LevelFilter::Info;
+    let mut print = fanout::in_order(|report| print_lines(&render(report, style, verbose), style));
     let report = targets(&mut |progress| {
         if !cli.json {
             print(progress);
@@ -1529,11 +1530,13 @@ pub fn command(run: &str) -> String {
 
 /// One target's block: a `▶ target` header, each step's `$ command` and its
 /// indented output, then `✔ ok · N steps` or `✘ reason`, then a blank line.
-/// Stdout lines go to stdout; stderr lines go to stderr, prefixed with the
-/// target when stderr is not a terminal. Control characters from the host are
-/// escaped on stderr and in failures always, and on stdout only when it is
-/// a terminal.
-fn render(report: &TargetReport, style: Style) -> Vec<Line> {
+/// Unless `verbose` (`-vv`), a step's stdout shows only when the step failed,
+/// and its `$` line only when it failed or wrote to stderr; stderr always
+/// shows. Stdout lines go to stdout; stderr lines go to stderr, prefixed with
+/// the target when stderr is not a terminal. Control characters from the host
+/// are escaped on stderr and in failures always, and on stdout only when it
+/// is a terminal.
+fn render(report: &TargetReport, style: Style, verbose: bool) -> Vec<Line> {
     let (target, steps) = (report.target(), report.steps());
     let mut lines = vec![Line::header(target)];
     let prefix = if style.err.tty {
@@ -1542,12 +1545,16 @@ fn render(report: &TargetReport, style: Style) -> Vec<Line> {
         format!("{target}: ")
     };
     for step in steps {
-        lines.push(Line::out(
-            format!("$ {}", command(&step.run)),
-            Escape::Always,
-            Some(DIM),
-        ));
-        for line in step.stdout.lines() {
+        let show_stdout = verbose || step.code != Some(0);
+        if show_stdout || !step.stderr.is_empty() {
+            lines.push(Line::out(
+                format!("$ {}", command(&step.run)),
+                Escape::Always,
+                Some(DIM),
+            ));
+        }
+        let stdout = if show_stdout { &step.stdout[..] } else { "" };
+        for line in stdout.lines() {
             lines.push(Line {
                 lead: if line.is_empty() { "" } else { "  " },
                 ..Line::out(line.to_owned(), Escape::OnTerminal, None)
@@ -1873,7 +1880,15 @@ mod tests {
 
     /// Stdout and stderr as written, interleaved, like a terminal shows them.
     fn screen(report: &TargetReport, style: Style) -> String {
-        render(report, style)
+        render(report, style, true)
+            .iter()
+            .map(|line| line.show(style))
+            .collect()
+    }
+
+    /// As `screen`, below `-vv`.
+    fn brief(report: &TargetReport, style: Style) -> String {
+        render(report, style, false)
             .iter()
             .map(|line| line.show(style))
             .collect()
@@ -1882,7 +1897,7 @@ mod tests {
     /// Stdout and stderr apart.
     fn streams(report: &TargetReport, style: Style) -> (String, String) {
         let (mut out, mut err) = (String::new(), String::new());
-        for line in render(report, style) {
+        for line in render(report, style, true) {
             let shown = line.show(style);
             if line.stderr {
                 err.push_str(&shown);
@@ -2079,6 +2094,44 @@ mod tests {
         assert_eq!(
             screen(&report, terminal()),
             "\x1b[1;36m▶ local\x1b[0m\n  \x1b[2m$ hostname\x1b[0m\n  mac.local\n  \x1b[2m$ uname -sr; echo warn >&2\x1b[0m\n  Darwin 25.6.0\n  \x1b[33mwarn\x1b[0m\n  \x1b[32m✔ ok · 2 steps\x1b[0m\n\n"
+        );
+    }
+
+    #[test]
+    fn below_vv_only_failed_steps_show_stdout_and_quiet_steps_no_command() {
+        let report = TargetReport::Ran {
+            warnings: vec!["careful".to_owned()],
+            target: "box".to_owned(),
+            steps: vec![
+                step("hostname", Some(0), "mac.local\n", ""),
+                step("uname", Some(0), "Darwin\n", "warn\n"),
+                step("fail", Some(3), "partial\n", "boom\n"),
+            ],
+            ok: false,
+        };
+        assert_eq!(
+            brief(&report, piped()),
+            "▶ box\n  $ uname\n  box: warn\n  $ fail\n  partial\n  box: boom\n  ⚠ careful\n  ✘ step 3 exited 3\n\n"
+        );
+        assert_eq!(
+            screen(&report, piped()),
+            "▶ box\n  $ hostname\n  mac.local\n  $ uname\n  Darwin\n  box: warn\n  $ fail\n  partial\n  box: boom\n  ⚠ careful\n  ✘ step 3 exited 3\n\n",
+            "-vv shows everything"
+        );
+
+        let report = TargetReport::Ran {
+            warnings: Vec::new(),
+            target: "box".to_owned(),
+            steps: vec![
+                step("one", Some(0), "one-out\n", ""),
+                step("two", Some(0), "two-out\n", ""),
+            ],
+            ok: true,
+        };
+        assert_eq!(
+            brief(&report, piped()),
+            "▶ box\n  ✔ ok · 2 steps\n\n",
+            "every step counts"
         );
     }
 
