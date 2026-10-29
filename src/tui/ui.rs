@@ -19,12 +19,12 @@ use crate::filestore::{self, Kind};
 use crate::logger::escape_controls;
 use crate::plan::{self, PlanReport};
 use crate::secret;
+use crate::status::SPINNER;
 use crate::{apply, apply::TargetReport};
 
 const LEFT_WIDTH: u16 = 28;
 const LOG_ROWS: u16 = 8;
 const ELLIPSIS: &str = "…";
-const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// The status bar's keys, kept from the left while they fit.
 const STATUS_KEYS: &[&str] = &[

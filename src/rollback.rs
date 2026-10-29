@@ -35,6 +35,7 @@ use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED};
 use crate::options::Options;
 use crate::record::{self, Previous, Record, RolledBack, Session, TargetRecord};
+use crate::status;
 use crate::transport::{Transport, TransportError};
 
 /// What a selected target with no entry in the record shows.
@@ -274,6 +275,7 @@ fn roll_back(
     if cancel.load(Ordering::Relaxed) {
         return RolledTarget::report(apply::cancelled("rollback", target, Vec::new()));
     }
+    status::phase(&target.name, status::Phase::Probe);
     let facts = match apply::probe(transport.as_ref(), &Config::default()) {
         Ok(facts) => facts,
         Err(Unresolved::Failed(error)) => return failed(error),
@@ -510,7 +512,7 @@ fn print_dry_run(cli: &Cli, opts: &Options, config: &Config, force: &Force) -> R
             print_lines(&lines, style);
         }
         let summary = crate::plan::render_summary(dry.len(), failed, style);
-        let _ = apply::write_flushed(&mut std::io::stdout().lock(), &summary);
+        let _ = status::write_stdout(&summary);
     }
     match failed {
         0 => Ok(()),

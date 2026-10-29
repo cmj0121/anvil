@@ -111,10 +111,13 @@ fn run_doctor(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(
     let config = opts.load_config()?;
     let store = opts.secret_store(&config)?;
     let report = doctor::check(opts, &config, store.as_ref(), cancel, &mut |progress| {
-        let _ = tx.send(match progress {
+        let msg = match progress {
+            // The doctor tab lists each target as it starts.
+            doctor::Progress::Begin(_) => return,
             doctor::Progress::Start(target) => Msg::Start(target.name.clone()),
             doctor::Progress::Done(report) => Msg::DoctorTarget(report.clone()),
-        });
+        };
+        let _ = tx.send(msg);
     })?;
     let _ = tx.send(Msg::DoctorDone(report));
     Ok(())

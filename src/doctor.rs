@@ -44,6 +44,7 @@ use crate::paths;
 use crate::plugin::{self, CurrentFile, DoctorRequest, Finding, Pin, Severity};
 use crate::record::{self, Record, TargetRecord};
 use crate::secret::{self, SecretError, Store};
+use crate::status::{self, Phase};
 use crate::transport::{Output, RUN_TIMEOUT, Transport, TransportError};
 
 const SH: &str = "/bin/sh";
@@ -259,13 +260,10 @@ impl Report {
     }
 }
 
-/// What [`check`] reports as it goes: a target about to be probed, and its
-/// report once probed.
-#[cfg_attr(
-    not(any(test, feature = "tui")),
-    expect(dead_code, reason = "read by the TUI")
-)]
+/// What [`check`] reports as it goes: the targets once, then a target about
+/// to be probed, and its report once probed.
 pub enum Progress<'a> {
+    Begin(&'a [Target]),
     Start(&'a Target),
     Done(&'a TargetReport),
 }
@@ -293,6 +291,7 @@ pub fn check(
     );
     let doctor = DoctorRun::prepare(config, &mut local);
     let mut cancelled = false;
+    on(Progress::Begin(&targets));
     let targets = targets
         .iter()
         .map(|target| {
@@ -309,6 +308,7 @@ pub fn check(
                             packages.sudo_secret_for(target).is_some(),
                         );
                         if let (Some(manager), Ok(transport)) = (&report.manager, &transport) {
+                            status::phase(&target.name, Phase::Check("packages"));
                             let manager =
                                 packages::Manager::parse(manager).expect("resolved manager");
                             report.packages =
@@ -439,6 +439,7 @@ impl DoctorRun {
         let mut drift = None;
         let current = match entry {
             Some(entry) if !entry.files.is_empty() && entry.files.len() <= MAX_FILES => {
+                status::phase(name, Phase::Check("drift"));
                 log::info!(
                     "doctor {name}: hashing {} recorded files",
                     entry.files.len()
@@ -458,6 +459,7 @@ impl DoctorRun {
             _ => Ok(Vec::new()),
         };
         let args = Map::new();
+        status::phase(name, Phase::Check("plugins"));
         let reports = self
             .pins
             .iter()
@@ -611,11 +613,23 @@ fn summary(
 /// kills the running probe, hash run or plugin ([`Interrupt`]).
 pub fn run(cli: &Cli, opts: &Options, config: &Config, store: &dyn Store) -> Result<(), Failure> {
     let _interrupt = Interrupt::install(&opts.cancel)?;
-    let report = check(opts, config, store, &opts.cancel, &mut |_| {})?;
+    let mut follow = status::Follow::new("doctor", status::enabled(cli.no_progress));
+    let report = check(
+        opts,
+        config,
+        store,
+        &opts.cancel,
+        &mut |progress| match progress {
+            Progress::Begin(targets) => follow.begin(targets),
+            Progress::Start(target) => status::target_started(&target.name),
+            Progress::Done(report) => status::target_done(&report.target),
+        },
+    )?;
+    drop(follow);
     if cli.json {
         print_json(&report, Failure::failed)?;
     } else {
-        print!("{}", render(&report));
+        let _ = status::write_stdout(&render(&report));
     }
     match () {
         _ if report.ok => Ok(()),
@@ -705,6 +719,7 @@ fn check_target(
     transport: &Result<Box<dyn Transport>, TransportError>,
 ) -> TargetReport {
     log::info!("doctor {}: start", target.name);
+    status::phase(&target.name, Phase::Probe);
     let result = match transport {
         Ok(transport) => {
             log::info!("doctor {}: probing over {}", target.name, transport.name());
@@ -1380,7 +1395,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn check_reports_progress_start_then_done_per_target() {
+    fn check_reports_begin_then_start_and_done_per_target() {
         let inventory = crate::test_util::fixture("inventory.toml");
         let cli = <Cli as clap::Parser>::try_parse_from([
             "anvil",
@@ -1411,6 +1426,7 @@ mod tests {
             &AtomicBool::new(false),
             &mut |progress| {
                 events.push(match progress {
+                    Progress::Begin(targets) => format!("begin {}", targets.len()),
                     Progress::Start(target) => format!("start {}", target.name),
                     Progress::Done(report) => format!("done {}", report.target),
                 })
@@ -1419,10 +1435,10 @@ mod tests {
         .unwrap();
         let names: Vec<&str> = report.targets.iter().map(|t| t.target.as_str()).collect();
         assert_eq!(names.len(), 2);
-        let expected: Vec<String> = names
+        let ends = names
             .iter()
-            .flat_map(|name| [format!("start {name}"), format!("done {name}")])
-            .collect();
+            .flat_map(|name| [format!("start {name}"), format!("done {name}")]);
+        let expected: Vec<String> = std::iter::once("begin 2".to_owned()).chain(ends).collect();
         assert_eq!(events, expected);
         let pi = report.targets.iter().find(|t| t.target == "pi").unwrap();
         assert!(!pi.connectable);

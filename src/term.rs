@@ -1,8 +1,9 @@
 //! Lending the real terminal to a child or a prompt while a front end owns it.
 //!
-//! The CLI installs no handoff, so [`with_terminal`] just runs its closure. A
-//! front end that keeps the terminal in raw mode on the alternate screen (the
-//! TUI) installs one; [`with_terminal`] then gives the terminal back for the
+//! The CLI installs one while its status line runs (`status`), to clear and
+//! pause it; without one, [`with_terminal`] just runs its closure. A front
+//! end that keeps the terminal in raw mode on the alternate screen (the TUI)
+//! installs one; [`with_terminal`] then gives the terminal back for the
 //! duration of the closure. Calls nest and overlap across threads through one
 //! depth counter: only the first suspends and only the last out resumes.
 
@@ -49,6 +50,16 @@ fn state() -> MutexGuard<'static, State> {
 pub fn install(h: Arc<dyn Handoff>) -> HandoffGuard {
     state().installed = Some(h);
     HandoffGuard
+}
+
+/// Installs `h` like [`install`], unless a handoff is installed already.
+pub fn install_if_none(h: Arc<dyn Handoff>) -> Option<HandoffGuard> {
+    let mut state = state();
+    if state.installed.is_some() {
+        return None;
+    }
+    state.installed = Some(h);
+    Some(HandoffGuard)
 }
 
 /// Uninstalls the handoff on drop.

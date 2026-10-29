@@ -10,7 +10,6 @@
 //! src is read before any target, as apply reads it; its bytes are never
 //! shown. A `[[services]]` step shows as `service NAME`, never its script.
 
-use std::io::Write;
 use std::num::NonZeroU8;
 use std::sync::atomic::AtomicBool;
 
@@ -26,6 +25,7 @@ use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, YELLOW, paint};
 use crate::options::Options;
 use crate::plugin::{self, Plugins};
+use crate::status;
 use crate::transport::{Transport, TransportError};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -159,6 +159,7 @@ fn plan_target(
     cancel: &AtomicBool,
 ) -> PlanReport {
     log::info!("plan {}: start", target.name);
+    status::phase(&target.name, status::Phase::Probe);
     let runs = transport
         .map_err(|err| Unresolved::Failed(err.to_string()))
         .and_then(|transport| apply::probe(transport.as_ref(), config))
@@ -187,19 +188,19 @@ pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
     let config = opts.load_config()?;
     let _interrupt = Interrupt::install(&opts.cancel)?;
     let mut print = fanout::in_order(|report| print_lines(&render(report), style));
+    let mut follow = status::Follow::new("plan", status::enabled(cli.no_progress));
     let plan = run_targets(opts, &config, &mut |progress| {
+        follow.event(&progress);
         if !cli.json {
             print(progress);
         }
     })?;
+    drop(follow);
     let failed = plan.targets.iter().filter(|t| !t.ok()).count();
     if cli.json {
         print_json(&plan, Failure::failed)?;
     } else {
-        let summary = render_summary(plan.targets.len(), failed, style);
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(summary.as_bytes());
-        let _ = out.flush();
+        let _ = status::write_stdout(&render_summary(plan.targets.len(), failed, style));
     }
     if failed == 0 {
         Ok(())

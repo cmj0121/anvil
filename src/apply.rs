@@ -35,7 +35,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -56,6 +56,7 @@ use crate::plugin::{self, Plugins, Request};
 use crate::record::{self, FileRecord, Session, TargetRecord};
 use crate::secret::Store;
 use crate::services;
+use crate::status;
 use crate::transport::{
     Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
 };
@@ -700,31 +701,31 @@ pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
 
 /// Prints each target's block once it and every earlier target have ended
 /// (or one JSON document), then the summary; any failed target fails
-/// `command`.
+/// `command`. The progress line runs until the summary.
 pub(crate) fn print_report(
     cli: &Cli,
-    command: &str,
+    command: &'static str,
     targets: impl FnOnce(&mut dyn FnMut(Progress<'_>)) -> Result<Report, Failure>,
 ) -> Result<(), Failure> {
     let style = Style::detect();
     let verbose = log::max_level() >= log::LevelFilter::Info;
     let mut print = fanout::in_order(|report| print_lines(&render(report, style, verbose), style));
+    let mut follow = status::Follow::new(command, status::enabled(cli.no_progress));
     let report = targets(&mut |progress| {
+        follow.event(&progress);
         if !cli.json {
             print(progress);
         }
     })?;
+    drop(follow);
     for warning in &report.warnings {
-        eprintln!("{warning}");
+        let _ = status::write_stderr(&format!("{warning}\n"));
     }
     let (ok, failed) = report.counts();
     if cli.json {
         print_json(&report, Failure::failed)?;
     } else {
-        let summary = render_summary(ok, failed, style);
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(summary.as_bytes());
-        let _ = out.flush();
+        let _ = status::write_stdout(&render_summary(ok, failed, style));
     }
     if failed == 0 {
         Ok(())
@@ -783,6 +784,7 @@ fn apply_target(
         if cancel.load(Ordering::Relaxed) {
             return Applied::unrecorded(cancelled("apply", target, Vec::new()));
         }
+        status::phase(&target.name, status::Phase::Probe);
         match probe(transport.as_ref(), config) {
             Ok(facts) => Some(facts),
             Err(Unresolved::Failed(error)) => {
@@ -930,10 +932,22 @@ fn execute_inner(
 ) -> TargetReport {
     let mut reports = Vec::with_capacity(runs.len());
     let mut ok = true;
-    for planned in runs {
+    let of = runs.len();
+    for (n, planned) in runs.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return cancelled(command, target, reports);
         }
+        let prefix = match (&planned.file, &planned.service) {
+            (Some(_), _) => "files",
+            (_, Some(_)) => "services",
+            _ => "packages",
+        };
+        // A sudo error on a plain step reads "packages", as before.
+        let kind = match planned.package_manager {
+            None if prefix == "packages" => "step",
+            _ => prefix,
+        };
+        status::phase(&target.name, status::Phase::Run { kind, n: n + 1, of });
         let label = planned.shown();
         if planned.file.as_ref().is_some_and(|file| file.skip)
             || planned.service.as_ref().is_some_and(|service| service.skip)
@@ -941,11 +955,6 @@ fn execute_inner(
             reports.push(StepReport::skipped(label));
             continue;
         }
-        let prefix = match (&planned.file, &planned.service) {
-            (Some(_), _) => "files",
-            (_, Some(_)) => "services",
-            _ => "packages",
-        };
         let password = match planned.sudo_secret.as_deref() {
             None => None,
             Some(name) => match sudo_password(passwords, name, prefix) {
@@ -1497,23 +1506,20 @@ impl Style {
     }
 }
 
-/// Writes each line to its stream, flushing so a terminal shows them in order.
-/// Each write locks only its own stream, so a stdout blocked on a full pipe
-/// never holds stderr.
+/// Writes each line to its stream through [`status`], flushing so a terminal
+/// shows them in order. A stdout pipe never takes the status line's lock, so
+/// a stdout blocked on a full pipe never holds stderr.
 pub(crate) fn print_lines(lines: &[Line], style: Style) {
-    for line in lines {
-        let text = line.show(style);
-        let _ = if line.stderr {
-            write_flushed(&mut std::io::stderr().lock(), &text)
+    // One write per run of lines to the same stream, so the status line is
+    // cleared and redrawn once per run, not once per line.
+    for run in lines.chunk_by(|a, b| a.stderr == b.stderr) {
+        let text: String = run.iter().map(|line| line.show(style)).collect();
+        let _ = if run[0].stderr {
+            status::write_stderr(&text)
         } else {
-            write_flushed(&mut std::io::stdout().lock(), &text)
+            status::write_stdout(&text)
         };
     }
-}
-
-pub(crate) fn write_flushed(stream: &mut dyn Write, text: &str) -> std::io::Result<()> {
-    stream.write_all(text.as_bytes())?;
-    stream.flush()
 }
 
 /// The step's command as shown in its `$` line: a multi-line script shows its

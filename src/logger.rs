@@ -15,6 +15,8 @@ use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
+use crate::status;
+
 pub struct Logger {
     verbosity: AtomicU8,
     colour: bool,
@@ -35,6 +37,13 @@ static SINK: RwLock<Option<Arc<dyn Sink>>> = RwLock::new(None);
 )]
 pub fn set_sink(sink: Option<Arc<dyn Sink>>) {
     *SINK.write().unwrap_or_else(PoisonError::into_inner) = sink;
+}
+
+/// Whether a [`Sink`] is installed, so a front end owns the terminal.
+pub fn has_sink() -> bool {
+    SINK.read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_some()
 }
 
 /// Sets the level from a `-v` count, as [`level_for`] maps it.
@@ -80,10 +89,9 @@ impl Logger {
         level_for(self.verbosity.load(Ordering::Relaxed))
     }
 
-    fn write_record(&self, out: &mut dyn Write, record: &Record) -> std::io::Result<()> {
+    fn render(&self, record: &Record) -> String {
         let message = record.args().to_string();
-        let line = format_line(self.colour, record.level(), record.target(), &message);
-        out.write_all(line.as_bytes())
+        format_line(self.colour, record.level(), record.target(), &message)
     }
 }
 
@@ -175,9 +183,7 @@ impl Log for Logger {
             sink.line(record.level(), record.target(), &escape_controls(&message));
             return;
         }
-        let stderr = std::io::stderr();
-        let mut out = stderr.lock();
-        let _ = self.write_record(&mut out, record);
+        let _ = status::write_stderr(&self.render(record));
     }
 
     fn flush(&self) {
@@ -212,9 +218,7 @@ mod tests {
             .metadata(metadata(level))
             .args(args)
             .build();
-        let mut buf = Vec::new();
-        logger.write_record(&mut buf, &record).unwrap();
-        String::from_utf8(buf).unwrap()
+        logger.render(&record)
     }
 
     #[derive(Default)]
