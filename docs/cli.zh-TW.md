@@ -43,6 +43,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
 | `--json`            | 在 stdout 印出恰好一份 JSON 文件，取代給人看的輸出                                                 |
 | `--target SEL`      | `local`、host 名稱或 tag；可重複以取聯集；未指定表示 `local` 加上所有 host                         |
 | `--parallel N`      | `apply`、`plan`、`run` 與 `rollback` 同時處理的 target 數，1..=32，預設 1（[平行執行](#平行執行)） |
+| `--no-progress`     | stderr 上不顯示即時進度行（[進度行](#進度行)）                                                     |
 | `-h`, `--help`      | 說明                                                                                               |
 | `-V`, `--version`   | 版本                                                                                               |
 
@@ -1530,3 +1531,18 @@ step 的 stdout 屬 info、stderr 屬 error（[apply](#anvil-apply)）；沒有�
 每行完整且標出它的 target（[平行執行](#平行執行)）。致命錯誤是非零結束前的最後一行。
 訊息中的控制字元（ssh 或 host 的文字）顯示為 `\x1b` 式跳脫；`doctor` 給人看的輸出也會跳脫它們。
 secret 值、探測輸出與檔案內容在任何層級都絕不記錄。沒有日誌檔案，也沒有 `RUST_LOG`。
+
+### 進度行
+
+`apply`、`run`、`rollback`、`plan` 或 `doctor` 執行期間，且僅在 stderr 是終端機時，stderr 上會有一行狀態，
+顯示 spinner、指令、每個執行中的 target 及其階段與已耗時間，以及 `k/n done`：
+
+```text
+⠹ apply · web1 packages 2/7 0:42, db1 step 5/7 0:07 · 2/5 done
+```
+
+階段為 `probe`、`packages n/m`、`files n/m`、`services n/m` 與 `step n/m`；`plan` 顯示 `probe`；
+`doctor` 顯示 `probe`、`packages`、`plugins` 與 `drift`。此行在 300 ms 後出現，在任何 target 區塊、日誌行或摘要之前清除、
+之後重繪，並在 ssh 密碼或 age passphrase 提示期間暫停。stderr 不是終端機時絕不寫出，因此管線與 CI 日誌不變。
+`--json` 保留它（它只在 stderr 上）。`--no-progress` 關閉它——stdout 接到分頁器（`anvil apply | less`）
+而 stderr 仍是終端機時，這也是解法。`anvil tui` 不變。

@@ -43,6 +43,7 @@ Every flag is global: it may come before or after the command.
 | `--json`            | print exactly one JSON document on stdout instead of human output                                     |
 | `--target SEL`      | `local`, a host name or a tag; repeat to take the union; none means `local` plus every host           |
 | `--parallel N`      | targets at once (apply, plan, run, rollback): 1..=32, default 1 ([parallel](#running-in-parallel))    |
+| `--no-progress`     | no live progress line on stderr ([Progress line](#progress-line))                                     |
 | `-h`, `--help`      | help                                                                                                  |
 | `-V`, `--version`   | version                                                                                               |
 
@@ -1614,3 +1615,19 @@ includes the argv of every `ssh` and editor spawn. The same level drives the ste
 characters in a message (ssh's or a host's text) are shown as `\x1b`-style escapes; `doctor`'s human output escapes
 them too. Secret values, probe output and file contents are never logged at any level. There are no log files and no
 `RUST_LOG`.
+
+### Progress line
+
+While `apply`, `run`, `rollback`, `plan` or `doctor` works, and only when stderr is a terminal, one status line on
+stderr shows a spinner, the command, each running target with its phase and elapsed time, and `k/n done`:
+
+```text
+⠹ apply · web1 packages 2/7 0:42, db1 step 5/7 0:07 · 2/5 done
+```
+
+The phases are `probe`, `packages n/m`, `files n/m`, `services n/m` and `step n/m`; `plan` shows `probe`; `doctor`
+shows `probe`, `packages`, `plugins` and `drift`. The line appears after 300 ms, is cleared before any target block,
+log line or the summary and redrawn after, and pauses during an ssh password or age passphrase prompt. When stderr is
+not a terminal it is never written, so pipes and CI logs are unchanged. `--json` keeps it (it is on stderr only).
+`--no-progress` turns it off — also the way out when stdout is piped to a pager (`anvil apply | less`) while stderr is
+still the terminal. `anvil tui` is unchanged.
