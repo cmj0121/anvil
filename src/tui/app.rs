@@ -11,6 +11,7 @@ use std::sync::mpsc::Sender;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::cli::Failure;
 use crate::config::{Config, StepKind};
 use crate::document::{Format, MAX_BYTES};
 use crate::filestore::{self, Entry, Kind, Root};
@@ -533,6 +534,18 @@ pub enum Effect {
     Redraw,
 }
 
+/// Loads the config and resolves its workspace's store, retaining load errors.
+pub fn load_store(opts: &Options) -> Result<Root, String> {
+    store_for(opts, opts.load_config().as_ref())
+}
+
+/// The store in the workspace of `config`, as loaded, or why it is unknown.
+fn store_for(opts: &Options, config: Result<&Config, &Failure>) -> Result<Root, String> {
+    let config = config.map_err(|err| err.message.clone())?;
+    let workspace = opts.workspace(config).map_err(|err| err.message)?;
+    Ok(Root::in_workspace(&workspace))
+}
+
 /// The inventory `opts` names, or why it did not load.
 pub fn load_inventory(opts: &Options) -> Result<Inventory, String> {
     opts.inventory().map_err(|failure| failure.message)
@@ -604,6 +617,7 @@ impl App {
             Err(err) => (Vec::new(), Vec::new(), None, Some(err)),
         };
         let notice = inventory_error.clone();
+        let store = load_store(&opts);
         let mut app = App {
             opts,
             targets,
@@ -629,7 +643,7 @@ impl App {
             last_script: String::new(),
             updated: None,
             available: None,
-            store: Root::locate().map_err(|err| err.to_string()),
+            store,
             files: None,
         };
         app.set_steps(steps);
@@ -995,9 +1009,17 @@ impl App {
     /// Loads the inventory `opts` names again ([`App::set_inventory`]), and
     /// the config's steps.
     pub fn reload(&mut self) {
-        let inventory = load_inventory(&self.opts);
+        let config = self.opts.load_config();
+        self.store = store_for(&self.opts, config.as_ref());
+        let inventory = self
+            .opts
+            .inventory_with(config.as_ref())
+            .map_err(|failure| failure.message);
         self.set_inventory(inventory);
-        let steps = load_steps(&self.opts);
+        let steps = config
+            .as_ref()
+            .map(step_rows)
+            .map_err(|failure| failure.message.clone());
         self.set_steps(steps);
     }
 
@@ -1582,6 +1604,7 @@ pub mod tests {
 
     pub fn opts() -> Options {
         Options {
+            checked_workspaces: std::sync::Arc::default(),
             verbose: 0,
             inventory: None,
             config: None,
@@ -1765,6 +1788,27 @@ pub mod tests {
         for code in codes {
             app.on_key(key(*code));
         }
+    }
+
+    /// Reload follows config edits and option changes, and retains strict load errors.
+    #[test]
+    fn store_reloads_the_workspace_and_config_errors() {
+        let dir = crate::test_util::temp_dir("tui-workspace");
+        let path = dir.join("site.toml");
+        let mut options = opts();
+        options.config = Some(path.clone());
+        let mut app = App::with_inventory(options, Ok(inventory()), Ok(Vec::new()));
+        assert_eq!(app.store.as_ref().unwrap().path(), dir.join("files"));
+        std::fs::write(&path, "[anvil]\nworkspace = 'work'\n").unwrap();
+        app.reload();
+        assert_eq!(app.store.as_ref().unwrap().path(), dir.join("work/files"));
+        std::fs::write(&path, "invalid = [").unwrap();
+        app.reload();
+        assert!(app.store.as_ref().unwrap_err().contains("site.toml"));
+        app.opts.config = Some(dir.join("other/missing.toml"));
+        app.reload();
+        assert_eq!(app.store.as_ref().unwrap().path(), dir.join("other/files"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

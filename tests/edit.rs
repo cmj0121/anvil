@@ -764,3 +764,282 @@ fn a_yaml_edit_whose_toml_form_is_past_the_size_limit_writes_nothing() {
     assert_eq!(sb.calls(), 1);
     assert!(sb.files().is_empty());
 }
+
+/// Inventory edits discover and migrate legacy documents inside the workspace.
+#[test]
+fn inventory_edits_follow_the_workspace_including_legacy_yaml() {
+    for extension in ["toml", "yaml", "yml"] {
+        let sb = sandbox();
+        let workspace = sb.root().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        sb.write_config("config.toml", "[anvil]\nworkspace = \"../../workspace\"\n");
+        let original = workspace.join(format!("inventory.{extension}"));
+        fs::copy(fixture(&format!("inventory.{extension}")), &original).unwrap();
+        let out = sb.edit(&["inventory", "--json"], None, None);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert_eq!(
+            common::json(&out)["path"],
+            sb.config_dir()
+                .join("../../workspace/inventory.toml")
+                .to_str()
+                .unwrap()
+        );
+        assert!(workspace.join("inventory.toml").exists());
+        assert_eq!(original.exists(), extension == "toml");
+        assert!(!sb.config_dir().join("inventory.toml").exists());
+        assert!(sb.seen(1).contains("[hosts.pi]"));
+    }
+}
+
+/// A missing inventory is created beside an explicit config or in its workspace.
+#[test]
+fn new_inventory_uses_the_config_base_or_workspace_and_explicit_path_wins() {
+    for setting in [None, Some("workspace"), Some("~/workspace")] {
+        let sb = sandbox();
+        let config = sb.root().join("site.toml");
+        let body = setting
+            .map(|value| format!("[anvil]\nworkspace = {value:?}\n"))
+            .unwrap_or_default();
+        fs::write(&config, body).unwrap();
+        let workspace = match setting {
+            None => sb.root().to_path_buf(),
+            Some("~/workspace") => sb.root().join("h/workspace"),
+            Some(_) => sb.root().join("workspace"),
+        };
+        let out = sb.edit(
+            &["--config", config.to_str().unwrap(), "inventory"],
+            Some(&fixture("inventory.toml")),
+            None,
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert!(workspace.join("inventory.toml").exists());
+
+        let explicit = sb.root().join("chosen.toml");
+        let out = sb.edit(
+            &[
+                "--config",
+                config.to_str().unwrap(),
+                "--inventory",
+                explicit.to_str().unwrap(),
+                "inventory",
+            ],
+            Some(&fixture("inventory.toml")),
+            None,
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert!(explicit.exists());
+    }
+}
+
+/// An explicit inventory bypasses workspace resolution even without `$HOME`.
+#[test]
+fn explicit_inventory_edits_without_a_resolvable_workspace() {
+    let sb = sandbox();
+    sb.write_config("config.toml", "[anvil]\nworkspace = '~/x'\n");
+    let inventory = sb.root().join("chosen.toml");
+    fs::copy(fixture("inventory.toml"), &inventory).unwrap();
+    let original = fs::read(&inventory).unwrap();
+    let out = sb
+        .command(env!("CARGO_BIN_EXE_anvil"))
+        .args([
+            "--inventory",
+            inventory.to_str().unwrap(),
+            "inventory",
+            "--json",
+        ])
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(common::json(&out)["path"], inventory.to_str().unwrap());
+    assert_eq!(common::json(&out)["changed"], false);
+    assert_eq!(fs::read(&inventory).unwrap(), original);
+    assert!(sb.seen(1).contains("[hosts.pi]"));
+    assert!(!sb.config_dir().join("inventory.toml").exists());
+}
+
+/// A full view left unchanged, or changed only in presentation/defaults, never writes.
+#[test]
+fn config_full_unchanged_writes_nothing() {
+    let sb = sandbox();
+    let original = "# keep this comment\n[packages]\nmanager = 'auto'\n";
+    let path = sb.put("config.toml", original);
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    let out = sb.edit(&["config", "--full", "--json"], None, None);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(common::json(&out)["changed"], false);
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+    let content = sb.root().join("content.toml");
+    fs::write(&content, format!("{}\n# edited comment\n", sb.seen(1))).unwrap();
+    let out = sb.edit(&["config", "--full"], Some(&content), None);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("unchanged"));
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
+}
+
+/// A real edit saves only non-default keys and retains an all-default packages table.
+#[test]
+fn config_full_one_edit_strips_defaults() {
+    let sb = sandbox();
+    let path = sb.put("config.toml", "[packages]\n");
+    let out = sb.edit(&["config", "--full"], None, None);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let content = sb.root().join("content.toml");
+    fs::write(
+        &content,
+        sb.seen(1).replace("run = \"hostname\"", "run = \"uptime\""),
+    )
+    .unwrap();
+    let out = sb.edit(&["config", "--full"], Some(&content), None);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let saved = fs::read_to_string(path).unwrap();
+    assert!(saved.contains("[packages]"));
+    assert!(saved.contains("run = \"uptime\""));
+    for default in ["manager", "timeout", "workspace", "format", "upgrade", "#"] {
+        assert!(!saved.contains(default), "{saved}");
+    }
+}
+
+/// Full YAML views use YAML comments, and legacy YAML still migrates unchanged.
+#[test]
+fn config_full_yaml_migrates_and_renders_yaml_examples() {
+    let sb = sandbox();
+    sb.put("config.yaml", "anvil:\n  format: yaml\n");
+    let out = sb.edit(&["config", "--full", "--format", "yaml"], None, None);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(sb.files(), ["config.toml"]);
+    assert!(sb.seen(1).contains("# packages:"));
+    assert!(!sb.seen(1).contains("# [packages]"));
+}
+
+/// Full editing retains the same three validation attempts and preserves invalid buffers.
+#[test]
+fn config_full_invalid_buffers_retry() {
+    let sb = sandbox();
+    let original = "[packages]\n";
+    let path = sb.put("config.toml", original);
+    let invalid = fixture("invalid/config-bad-timeout.toml");
+    let out = sb.edit(&["config", "--full"], Some(&invalid), None);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(sb.calls(), 3);
+    assert_eq!(sb.seen(2), fs::read_to_string(invalid).unwrap());
+    assert_eq!(sb.seen(2), sb.seen(3));
+    assert!(text(&out.stderr).contains("config: still invalid after 3 attempts"));
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
+}
+
+/// Legacy secret names migrate even when the full editor leaves the buffer unchanged
+/// (on macOS only, where the migration adds the keychain backend).
+#[cfg(target_os = "macos")]
+#[test]
+fn config_full_migrates_legacy_names() {
+    let sb = sandbox();
+    let path = sb.put("config.toml", "[anvil]\nsecrets = []\n");
+    let out = sb.edit(&["config", "--full"], None, None);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let saved = fs::read_to_string(path).unwrap();
+    assert!(saved.contains("[secrets]"));
+    assert!(saved.contains("names = []"));
+    assert!(!saved.contains("secrets = []"));
+}
+
+/// Full views derive workspace from the located config rather than its canonical path.
+#[test]
+fn config_full_uses_explicit_config_base() {
+    let sb = sandbox();
+    let dir = sb.root().join("site");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("custom.toml");
+    fs::write(&path, "[anvil]\n").unwrap();
+    let out = sb.edit(
+        &["--config", path.to_str().unwrap(), "config", "--full"],
+        None,
+        None,
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        sb.seen(1)
+            .contains(&format!("workspace = \"{}\"", dir.display()))
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), "[anvil]\n");
+}
+
+/// Relative and home-relative workspace text survives an unchanged full edit byte for byte.
+#[test]
+fn config_full_preserves_workspace_spelling_when_unchanged() {
+    for workspace in ["work", "~/x"] {
+        let sb = sandbox();
+        let original = format!("# preserve spelling\n[anvil]\nworkspace = \"{workspace}\"\n");
+        let path = sb.put("config.toml", &original);
+        let out = sb.edit(&["config", "--full", "--json"], None, None);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(common::json(&out)["changed"], false);
+        assert!(sb.seen(1).contains(&format!("workspace = \"{workspace}\"")));
+        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+    }
+}
+
+/// Equivalent resolved workspace spellings do not count as a config edit.
+#[test]
+fn config_full_equivalent_workspace_spelling_writes_nothing() {
+    for workspace in ["work", "~/x"] {
+        let sb = sandbox();
+        let original = format!("# preserve spelling\n[anvil]\nworkspace = \"{workspace}\"\n");
+        let path = sb.put("config.toml", &original);
+        let resolved = if workspace == "work" {
+            sb.config_dir().join("work")
+        } else {
+            sb.root().join("h/x")
+        };
+        let content = sb.root().join("content.toml");
+        fs::write(
+            &content,
+            format!("[anvil]\nworkspace = \"{}\"\n", resolved.display()),
+        )
+        .unwrap();
+        let out = sb.edit(&["config", "--full", "--json"], Some(&content), None);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(common::json(&out)["changed"], false);
+        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+    }
+}
+
+/// Relative config paths must not apply the base directory twice in the full view.
+#[test]
+fn config_full_relative_config_keeps_the_workspace() {
+    for config in ["site/config.toml", "config.toml"] {
+        let sb = sandbox();
+        let path = sb.root().join(config);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# keep this comment\n[packages]\n";
+        fs::write(&path, original).unwrap();
+        let out = sb
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .current_dir(sb.root())
+            .args(["--config", config, "config", "--full", "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(common::json(&out)["changed"], false);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let content = sb.root().join("content.toml");
+        fs::write(
+            &content,
+            sb.seen(1).replace("run = \"hostname\"", "run = \"uptime\""),
+        )
+        .unwrap();
+        let out = sb
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .current_dir(sb.root())
+            .args(["--config", config, "config", "--full", "--json"])
+            .env("FAKE_EDITOR_CONTENT", &content)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(common::json(&out)["changed"], true);
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("uptime"), "{saved}");
+        assert!(!saved.contains("workspace"), "{saved}");
+    }
+}

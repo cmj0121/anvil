@@ -335,17 +335,15 @@ fn copy_and_move_create_private_missing_parents() {
 }
 
 #[test]
-fn removal_succeeds_without_an_orphan_warning_when_config_is_invalid() {
+fn files_refuses_an_invalid_config_before_mutating_the_store() {
     let s = Sandbox::new("files-bad-config");
-    s.write_config(
-        "config.toml",
-        "[[files]]\nsrc = '$/a'\ndest = '/tmp/a'\nmode = '0644'\ninvalid = [",
-    );
     run(&s, &["files", "mkdir", "a"], 0);
-    let out = run(&s, &["-v", "files", "rm", "a", "-r", "--json"], 0);
-    assert_eq!(json(&out)["changed"], json!(["$/a"]));
-    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
-    assert!(!s.config_dir().join("files/a").exists());
+    s.write_config("config.toml", "invalid = [");
+    for args in [vec!["files", "ls"], vec!["files", "rm", "a", "-r"]] {
+        let out = run(&s, &args, 2);
+        assert!(text(&out.stderr).contains("config.toml"));
+    }
+    assert!(s.config_dir().join("files/a").exists());
 }
 
 #[test]
@@ -392,5 +390,135 @@ fn relative_host_failures_keep_host_paths() {
         assert_eq!(out.status.code(), Some(1));
         assert_eq!(text(&out.stderr), expected);
         assert!(out.stdout.is_empty());
+    }
+}
+
+/// Both source forms resolve in the workspace, including through directory links.
+#[test]
+fn workspace_sources_and_store_keep_the_located_config_directory() {
+    for case in [
+        "default",
+        "explicit",
+        "relative",
+        "absolute",
+        "home",
+        "default-link",
+        "explicit-link",
+        "file-link",
+    ] {
+        let s = Sandbox::new(case);
+        let site = s.root().join("site");
+        fs::create_dir(&site).unwrap();
+        let workspace = match case {
+            "relative" | "absolute" => site.join("work"),
+            "home" => s.root().join("h/work"),
+            "default" | "default-link" => s.config_dir(),
+            _ => site.clone(),
+        };
+        fs::create_dir_all(&workspace).unwrap();
+        if case == "default-link" {
+            fs::remove_dir(&workspace).unwrap();
+            symlink(&site, &workspace).unwrap();
+        }
+        fs::write(workspace.join("relative"), "relative text").unwrap();
+        let pref = match case {
+            "relative" => "[anvil]\nworkspace = 'work'\n".to_owned(),
+            "absolute" => format!("[anvil]\nworkspace = '{}'\n", workspace.display()),
+            "home" => "[anvil]\nworkspace = '~/work'\n".to_owned(),
+            _ => String::new(),
+        };
+        let config = format!(
+            "{pref}[[files]]\nsrc = 'relative'\ndest = '/tmp/workspace-relative'\nmode = '0644'\n[[files]]\nsrc = '$/motd'\ndest = '/tmp/workspace-store'\nmode = '0644'\n"
+        );
+        let path = if case.starts_with("default") {
+            s.config_dir().join("config.toml")
+        } else {
+            site.join("site.toml")
+        };
+        if case == "file-link" {
+            let target = s.root().join("target.toml");
+            fs::write(&target, &config).unwrap();
+            // Relative src belongs beside the link, even though Config.path names its target.
+            symlink(target, &path).unwrap();
+        } else {
+            fs::write(&path, &config).unwrap();
+        }
+        let path = if case == "explicit-link" {
+            let link = s.root().join("link");
+            symlink(&site, &link).unwrap();
+            link.join("site.toml")
+        } else {
+            path
+        };
+        let mut args = Vec::new();
+        if !case.starts_with("default") {
+            args.extend(["--config", path.to_str().unwrap()]);
+        }
+        let mut mkdir = args.clone();
+        mkdir.extend(["files", "mkdir", "sub"]);
+        run(&s, &mkdir, 0);
+        fs::write(workspace.join("files/motd"), "store text").unwrap();
+        let mut ls = args.clone();
+        ls.extend(["files", "ls", "--json"]);
+        let expected = if case == "explicit-link" {
+            path.parent().unwrap()
+        } else {
+            &workspace
+        };
+        assert_eq!(
+            json(&run(&s, &ls, 0))["root"],
+            json!(expected.join("files"))
+        );
+        args.extend(["plan", "--target", "local", "--json"]);
+        run(&s, &args, 0);
+    }
+}
+
+/// Invalid values are rejected before a store operation starts.
+#[test]
+fn invalid_workspace_values_are_usage_errors() {
+    let s = Sandbox::new("workspace-invalid");
+    for value in ["", "\\u0000"] {
+        s.write_config(
+            "config.toml",
+            &format!("[anvil]\nworkspace = \"{value}\"\n"),
+        );
+        let out = run(&s, &["files", "ls"], 2);
+        let err = text(&out.stderr);
+        assert!(err.contains("anvil.workspace"), "{err}");
+        assert!(
+            err.contains("must be a non-empty path without NUL"),
+            "{err}"
+        );
+    }
+}
+
+/// Missing explicit configs retain their base; missing workspaces are created privately.
+#[test]
+fn missing_config_and_workspace_keep_their_resolved_base() {
+    let s = Sandbox::new("workspace-missing");
+    let path = s.root().join("site.toml");
+    let config = path.to_str().unwrap();
+    let out = run(&s, &["--config", config, "files", "ls", "--json"], 0);
+    assert_eq!(json(&out)["root"], json!(s.root().join("files")));
+    fs::write(&path, "[anvil]\nworkspace = 'missing/nested'\n").unwrap();
+    let workspace = s.root().join("missing/nested");
+    let out = run(&s, &["--config", config, "files", "ls", "--json"], 0);
+    assert_eq!(
+        json(&out),
+        json!({"root": workspace.join("files"), "entries": []})
+    );
+    assert!(!workspace.exists());
+    run(&s, &["--config", config, "files", "mkdir", "sub"], 0);
+    for dir in [
+        s.root().join("missing"),
+        workspace.clone(),
+        workspace.join("files"),
+        workspace.join("files/sub"),
+    ] {
+        assert_eq!(
+            fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 }

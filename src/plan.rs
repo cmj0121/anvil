@@ -20,7 +20,7 @@ use crate::apply::{self, Escape, Line, PlannedRun, Style, Unresolved, print_line
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::{Config, Plugin};
 use crate::fanout::{self, Event};
-use crate::files::{self, Sources};
+use crate::files::Sources;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, YELLOW, paint};
@@ -83,9 +83,9 @@ pub fn run_targets(
     config: &Config,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Plan, Failure> {
-    let targets = opts.targets()?;
+    let targets = opts.targets_for(config)?;
     let pins = plugin::verify_where(config, Plugin::is_step).map_err(Failure::usage)?;
-    let sources = files::load(config).map_err(Failure::usage)?;
+    let sources = opts.sources(config)?;
     Ok(plan_targets(
         &targets,
         opts.parallel,

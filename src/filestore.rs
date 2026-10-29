@@ -1,4 +1,4 @@
-//! Confined text files under `<config_dir>/files`, addressed as `$/…`.
+//! Confined text files under `<workspace>/files`, addressed as `$/…`.
 
 use rustix::fs::{self as at, AtFlags, Mode, OFlags};
 use rustix::io::Errno;
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::document;
-use crate::paths::{self, PathsError};
+use crate::paths;
 use crate::private;
 use crate::secret::check_owner;
 
@@ -162,14 +162,14 @@ fn io_error(rel: &str, err: io::Error) -> StoreError {
     }
 }
 
-/// The store root: `<config_dir>/files`.
+/// The store root: `<workspace>/files`.
 #[derive(Debug)]
 pub struct Root(PathBuf);
 
 impl Root {
-    /// Finds the store in the config directory.
-    pub fn locate() -> Result<Root, PathsError> {
-        Ok(Self::at(paths::config_dir()?.join("files")))
+    /// Uses the `files` store in the workspace, without canonicalizing.
+    pub fn in_workspace(workspace: &Path) -> Root {
+        Root::at(workspace.join("files"))
     }
 
     /// Uses a known store directory.
@@ -1139,8 +1139,8 @@ mod tests {
     #[test]
     fn locates_and_resolves_missing_destinations() {
         assert_eq!(
-            Root::locate().unwrap().path(),
-            paths::config_dir().unwrap().join("files")
+            Root::in_workspace(Path::new("/workspace")).path(),
+            Path::new("/workspace/files")
         );
         let Store(_, root) = &Store::new();
         assert_eq!(root.resolve("$/a/b").unwrap(), root.path().join("a/b"));

@@ -78,50 +78,175 @@ pub fn inventory(cli: &Cli, opts: &Options, format: Option<Format>) -> Result<()
 pub fn edit_inventory(opts: &Options, format: Option<Format>) -> Result<Outcome, Failure> {
     let config = opts.load_config()?;
     let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict)?;
-    let current = paths::locate(opts.inventory.as_deref(), "inventory")?;
+    let workspace = || opts.workspace(&config);
+    let current = opts.locate_inventory(workspace)?;
+    let inventory = Inventory::load(current.as_ref())?;
     let dest = destination(
         opts.inventory.as_deref(),
+        workspace,
         "inventory",
         format.unwrap_or(config.anvil.format),
     )?;
-    let inventory = Inventory::load(current.as_ref())?;
     edit_document(
         &editor,
         "inventory",
         inventory,
         current.as_ref(),
         &dest,
+        &mut Plain,
         |_: &mut Inventory| false,
         Inventory::validate,
     )
 }
 
 /// `anvil config`: [`edit_config`], then its outcome.
-pub fn config(cli: &Cli, opts: &Options, format: Option<Format>) -> Result<(), Failure> {
+pub fn config(
+    cli: &Cli,
+    opts: &Options,
+    format: Option<Format>,
+    full: bool,
+) -> Result<(), Failure> {
     warn_target(cli);
-    let outcome = edit_config(opts, format)?;
+    let outcome = edit_config(opts, format, full)?;
     report(cli, &outcome)
 }
 
 /// The config's editor flow; `format` is the edit view.
-pub fn edit_config(opts: &Options, format: Option<Format>) -> Result<Outcome, Failure> {
+pub fn edit_config(opts: &Options, format: Option<Format>, full: bool) -> Result<Outcome, Failure> {
     let current = paths::locate(opts.config.as_deref(), "config")?;
     let config = Config::load(current.as_ref())?;
     let dest = destination(
         opts.config.as_deref(),
+        config_dir,
         "config",
         format.unwrap_or(config.anvil.format),
     )?;
     let editor = Editor::resolve(config.anvil.editor.as_deref(), Fallback::Lenient)?;
+    let mut view: Box<dyn View<Config>> = if full {
+        Box::new(FullView {
+            base: opts.base_dir()?,
+            original: None,
+        })
+    } else {
+        Box::new(Plain)
+    };
     edit_document(
         &editor,
         "config",
         config,
         current.as_ref(),
         &dest,
+        view.as_mut(),
         Config::migrate,
         Config::validate,
     )
+}
+
+/// How [`edit_document`] shows a document, decides it changed, and saves it.
+trait View<T> {
+    /// Records the loaded (already migrated) value before the first edit.
+    fn prepare(&mut self, _loaded: &T) -> Result<(), Failure> {
+        Ok(())
+    }
+    /// The buffer handed to the editor.
+    fn render(&self, value: &T, format: Format) -> Result<String, Failure>;
+    /// Whether a first buffer returned unchanged in place is the file as loaded.
+    fn is_file(&self) -> bool;
+    /// Whether `parsed` differs from the loaded value; `edited` is whether the
+    /// editor returned a new buffer.
+    fn changed(&self, parsed: &T, edited: bool) -> Result<bool, Failure>;
+    /// The TOML written for `parsed`, typed as `buffer` in `format`.
+    fn saved(
+        &self,
+        parsed: &T,
+        buffer: Vec<u8>,
+        format: Format,
+        migrated: bool,
+        path: &Path,
+    ) -> Result<Vec<u8>, Failure>;
+}
+
+/// The document as stored: changed when edited, saved as typed when TOML.
+struct Plain;
+
+impl<T: Serialize> View<T> for Plain {
+    fn render(&self, value: &T, format: Format) -> Result<String, Failure> {
+        Ok(document::to_string(value, format)?)
+    }
+
+    fn is_file(&self) -> bool {
+        true
+    }
+
+    fn changed(&self, _parsed: &T, edited: bool) -> Result<bool, Failure> {
+        Ok(edited)
+    }
+
+    fn saved(
+        &self,
+        parsed: &T,
+        buffer: Vec<u8>,
+        format: Format,
+        migrated: bool,
+        path: &Path,
+    ) -> Result<Vec<u8>, Failure> {
+        match format {
+            Format::Toml if !migrated => Ok(buffer),
+            _ => to_toml(parsed, path),
+        }
+    }
+}
+
+/// `config --full`: every default shown, compared normalized, saved without them.
+struct FullView {
+    base: PathBuf,
+    original: Option<(Config, PathBuf)>,
+}
+
+impl FullView {
+    /// `value` without defaults or its workspace, and its absolute workspace.
+    fn normalize(&self, value: &Config) -> Result<(Config, PathBuf), Failure> {
+        let base = &self.base;
+        let workspace = std::path::absolute(value.workspace(base).map_err(Failure::usage)?)
+            .map_err(|err| Failure::usage(err.to_string()))?;
+        // Same deserializer as the saved TOML text: `path` is skipped and no
+        // field has a custom TOML-only deserializer.
+        let mut normalized: Config = toml::Value::Table(value.stripped(base)?)
+            .try_into()
+            .map_err(|err: toml::de::Error| Failure::usage(err.to_string()))?;
+        normalized.anvil.workspace = None;
+        Ok((normalized, workspace))
+    }
+}
+
+impl View<Config> for FullView {
+    fn prepare(&mut self, loaded: &Config) -> Result<(), Failure> {
+        self.original = Some(self.normalize(loaded)?);
+        Ok(())
+    }
+
+    fn render(&self, value: &Config, format: Format) -> Result<String, Failure> {
+        Ok(value.full_view(&self.base, format)?)
+    }
+
+    fn is_file(&self) -> bool {
+        false
+    }
+
+    fn changed(&self, parsed: &Config, _edited: bool) -> Result<bool, Failure> {
+        Ok(Some(self.normalize(parsed)?) != self.original)
+    }
+
+    fn saved(
+        &self,
+        parsed: &Config,
+        _buffer: Vec<u8>,
+        _format: Format,
+        _migrated: bool,
+        path: &Path,
+    ) -> Result<Vec<u8>, Failure> {
+        to_toml(&parsed.stripped(&self.base)?, path)
+    }
 }
 
 /// What `--json` prints for `secret`: the name and whether the store changed.
@@ -262,7 +387,7 @@ pub fn migrate_to(opts: &Options, to: BackendKind) -> Result<Migrated, Failure> 
     secret::migrate::check_apart(&source, &backend).map_err(usage)?;
     let from = secret::from_config(&source)?;
     let target = secret::from_config(&backend)?;
-    let dest = destination(opts.config.as_deref(), "config", Format::Toml)?;
+    let dest = destination(opts.config.as_deref(), config_dir, "config", Format::Toml)?;
     migrate_stores(
         config,
         current.as_ref(),
@@ -325,18 +450,24 @@ pub fn warn_parallel(cli: &Cli) {
 }
 
 /// Where document `name` is written: the explicit `.toml` path (already
-/// checked by [`paths::locate`]), else `NAME.toml` in the config directory.
-/// `format` is only how it is shown.
+/// checked by [`paths::explicit`]), else `NAME.toml` in `dir`, resolved only
+/// then. `format` is only how it is shown.
 fn destination(
     explicit: Option<&Path>,
+    dir: impl FnOnce() -> Result<PathBuf, Failure>,
     name: &str,
     format: Format,
 ) -> Result<Destination, Failure> {
     let path = match explicit {
         Some(path) => path.to_path_buf(),
-        None => paths::config_dir()?.join(format!("{name}.{}", Format::Toml.extension())),
+        None => dir()?.join(format!("{name}.{}", Format::Toml.extension())),
     };
     Ok(Destination { path, format })
+}
+
+/// [`paths::config_dir`] as a [`destination`] directory.
+fn config_dir() -> Result<PathBuf, Failure> {
+    Ok(paths::config_dir()?)
 }
 
 /// Shows `value` in the editor until it parses and validates (or `ATTEMPTS`
@@ -347,13 +478,19 @@ fn destination(
 /// the saved one: a loaded document it changed is written even when
 /// unchanged, and a saved one it changed is written from the parsed value
 /// rather than as typed. A legacy YAML source is written as well, and removed
-/// once `dest` is written.
+/// once `dest` is written. `view` decides what is shown, what counts as a
+/// change and what is saved.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one flow, configured per document"
+)]
 fn edit_document<T>(
     editor: &Editor,
     name: &str,
     mut value: T,
     current: Option<&DocPath>,
     dest: &Destination,
+    view: &mut dyn View<T>,
     migrate: impl Fn(&mut T) -> bool,
     validate: impl Fn(&T, &Path) -> Result<(), DocumentError>,
 ) -> Result<Outcome, Failure>
@@ -361,12 +498,13 @@ where
     T: Serialize + DeserializeOwned,
 {
     let migrated_on_load = migrate(&mut value);
+    view.prepare(&value)?;
     let mut migrated = false;
-    let mut buffer = document::to_string(&value, dest.format)?.into_bytes();
+    let mut buffer = view.render(&value, dest.format)?.into_bytes();
     if buffer.len() as u64 > MAX_BYTES {
         return Err(oversize_view(&value, dest)?);
     }
-    let in_place = current.is_some_and(|current| current.path == dest.path);
+    let in_place = view.is_file() && current.is_some_and(|current| current.path == dest.path);
     let legacy = current.filter(|current| current.path != dest.path);
     let mut edited = false;
     let mut parsed = value;
@@ -398,12 +536,10 @@ where
         }
     }
 
-    let changed = edited || legacy.is_some() || migrated_on_load || migrated;
+    let changed =
+        view.changed(&parsed, edited)? || legacy.is_some() || migrated_on_load || migrated;
     if changed {
-        let toml = match dest.format {
-            Format::Toml if !migrated => buffer,
-            _ => to_toml(&parsed, &dest.path)?,
-        };
+        let toml = view.saved(&parsed, buffer, dest.format, migrated, &dest.path)?;
         save(&dest.path, &toml, legacy)?;
     }
     Ok(Outcome {

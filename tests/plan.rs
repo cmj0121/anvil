@@ -226,7 +226,7 @@ fn parallel_one_prints_exactly_what_the_default_prints() {
 #[test]
 fn store_src_plans_and_applies_with_a_config_elsewhere() {
     let sandbox = Sandbox::new("pl-store");
-    let store = sandbox.config_dir().join("files/sub");
+    let store = sandbox.root().join("files/sub");
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(store.join("motd"), "from the store\n").unwrap();
     let config = sandbox.root().join("elsewhere.toml");
@@ -283,5 +283,55 @@ fn store_src_refuses_traversal_and_symlink_components() {
                 format!("ERROR anvil: {prefix}files[0].src `{src}`: {why}\n")
             );
         }
+    }
+}
+
+/// Inventory discovery needs the workspace; an explicit inventory avoids resolving
+/// it when there are no file sources.
+#[test]
+fn plan_and_apply_resolve_workspace_only_when_inventory_or_files_need_it() {
+    let sandbox = Sandbox::new("workspace-unused");
+    sandbox.write_config("config.toml", "[anvil]\nworkspace = '~/x'\n");
+    let inventory = sandbox.root().join("explicit.toml");
+    for action in ["plan", "apply"] {
+        let discovered = sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", action])
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        assert_eq!(discovered.status.code(), Some(2));
+        assert!(text(&discovered.stderr).contains("anvil.workspace `~/x`: $HOME is not set"));
+        let out = sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", action, "--inventory"])
+            .arg(&inventory)
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{action}: {}",
+            text(&out.stderr)
+        );
+    }
+    // The same unresolved workspace is still an error when a source needs it.
+    sandbox.write_config("config.toml", "[anvil]\nworkspace = '~/x'\n[[files]]\nsrc = '$/motd'\ndest = '/tmp/motd'\nmode = '0644'\n");
+    for action in ["plan", "apply"] {
+        let out = sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", action, "--inventory"])
+            .arg(&inventory)
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{action}: {}",
+            text(&out.stderr)
+        );
+        assert!(text(&out.stderr).contains("anvil.workspace `~/x`: $HOME is not set"));
     }
 }

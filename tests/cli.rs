@@ -184,3 +184,164 @@ fn config_with_a_bad_files_entry_exits_two_naming_the_entry() {
         "{stderr}"
     );
 }
+
+/// Inventory-only commands log config failures and discover beside that config.
+#[test]
+fn broken_config_warns_and_inventory_errors_stay_separate() {
+    let sb = Sandbox::new("ac");
+    let config = sb.root().join("site.toml");
+    let inventory = sb.root().join("inventory.toml");
+    let script = sb.root().join("script.sh");
+    std::fs::write(&script, "true\n").unwrap();
+    std::fs::write(&config, "not valid toml").unwrap();
+    std::fs::write(&inventory, "[hosts.bad]\nhost = \"-bad\"\n").unwrap();
+    let out = sb.anvil(
+        &[
+            "-v",
+            "--config",
+            config.to_str().unwrap(),
+            "run",
+            script.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("WARN anvil::options: config failed to load ("),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "looking for the inventory in {}",
+            sb.root().display()
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("ERROR anvil: {}", inventory.display())),
+        "{stderr}"
+    );
+
+    let out = sb.anvil(&["--config", config.to_str().unwrap(), "doctor"], &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(text(&out.stderr).contains(&config.display().to_string()));
+    std::fs::write(&config, "").unwrap();
+    let out = sb.anvil(&["--config", config.to_str().unwrap(), "doctor"], &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(text(&out.stderr).contains(&inventory.display().to_string()));
+}
+
+/// Loaded-config and inventory-only callers all select workspace targets.
+#[test]
+fn workspace_inventory_is_used_by_plan_apply_run_and_doctor() {
+    for command in ["plan", "apply", "run", "doctor"] {
+        let sb = Sandbox::new("ac");
+        let workspace = sb.root().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        sb.write_config(
+            "config.toml",
+            &format!("[anvil]\nworkspace = {:?}\n", workspace),
+        );
+        std::fs::write(
+            workspace.join("inventory.toml"),
+            "[hosts.workspace]\nhost = \"example.org\"\n",
+        )
+        .unwrap();
+        let script = sb.root().join("script.sh");
+        std::fs::write(&script, "true\n").unwrap();
+        let mut args = vec!["--target", "workspace", command];
+        if command == "run" {
+            args.push(script.to_str().unwrap());
+        }
+        let out = sb.anvil(&args, &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{command}: {}",
+            text(&out.stderr)
+        );
+        sb.write_config(
+            "inventory.toml",
+            "[hosts.explicit]\nhost = \"other.example\"\n",
+        );
+        let explicit = sb.config_dir().join("inventory.toml");
+        let mut args = vec![
+            "--inventory",
+            explicit.to_str().unwrap(),
+            "--target",
+            "explicit",
+            command,
+        ];
+        if command == "run" {
+            args.push(script.to_str().unwrap());
+        }
+        let out = sb.anvil(&args, &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{command}: {}",
+            text(&out.stderr)
+        );
+    }
+}
+
+/// Workspace resolution errors use the same warning and fallback as load errors.
+#[test]
+fn unresolved_workspace_warns_and_explicit_inventory_bypasses_config() {
+    let sb = Sandbox::new("ac");
+    sb.write_config("config.toml", "[anvil]\nworkspace = \"~/workspace\"\n");
+    sb.write_config("inventory.toml", "[hosts.box]\nhost = \"example.org\"\n");
+    let script = sb.root().join("script.sh");
+    std::fs::write(&script, "true\n").unwrap();
+    let out = sb.anvil(
+        &["-v", "--target", "local", "run", script.to_str().unwrap()],
+        &[("HOME", "relative")],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("WARN anvil::options: config failed to load (anvil.workspace"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("looking for the inventory in"), "{stderr}");
+
+    sb.write_config("config.toml", "broken config");
+    let inventory = sb.config_dir().join("inventory.toml");
+    let out = sb.anvil(
+        &[
+            "-v",
+            "--inventory",
+            inventory.to_str().unwrap(),
+            "--target",
+            "box",
+            "run",
+            script.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(!text(&out.stderr).contains("config failed to load"));
+}
+
+/// Ambiguous config discovery still permits inventory-only commands to fall back.
+#[test]
+fn ambiguous_config_warns_and_inventory_discovery_falls_back() {
+    let sb = Sandbox::new("ambiguous-workspace");
+    sb.write_config("config.toml", "");
+    sb.write_config("config.yaml", "{}");
+    sb.write_config("inventory.toml", "[hosts.box]\nhost = 'example.org'\n");
+    let script = sb.root().join("script.sh");
+    std::fs::write(&script, "true\n").unwrap();
+    let out = sb.anvil(
+        &["-v", "--target", "box", "run", script.to_str().unwrap()],
+        &[],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("config failed to load (ambiguous config:"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("looking for the inventory in"), "{stderr}");
+}

@@ -8,7 +8,7 @@
 
 ### `inventory.toml`
 
-`~/.config/anvil/inventory.toml`（或 `$XDG_CONFIG_HOME/anvil/`）：
+`~/.config/anvil/inventory.toml`（或 `$XDG_CONFIG_HOME/anvil/`），位於[工作區](#工作區)：
 
 ```toml
 [hosts.linode1]
@@ -31,6 +31,7 @@ sudo_secret = "HOST_SUDO" # optional; the secret holding this host's sudo passwo
 [anvil]
 editor = "nvim"            # optional; else $VISUAL, $EDITOR, nvim
 format = "toml"            # the format anvil inventory/config open in: toml | yaml
+workspace = "~/dotfiles"   # optional; where the inventory, $/ and relative src live; default this file's directory
 
 [secrets]
 backend = "keychain"       # keychain (macOS) | age | sops; see secrets.md
@@ -51,7 +52,7 @@ apt = "fd-find"
 dnf = "fd-find"
 
 [[files]]                  # optional; after packages, before [[steps]]; see Files
-src = "files/sshd_config"  # relative to this file's directory
+src = "files/sshd_config"  # relative to the workspace
 dest = "/etc/ssh/sshd_config"
 mode = "0644"              # required, quoted
 tags = ["linode"]          # optional; the target must carry every tag
@@ -77,7 +78,8 @@ run = "hostname"           # placeholder: a POSIX sh script run on every target
 
 ## 檔案與格式
 
-目錄：`$XDG_CONFIG_HOME/anvil/`，否則為 `~/.config/anvil/`。
+config 的目錄：`$XDG_CONFIG_HOME/anvil/`，否則為 `~/.config/anvil/`。
+inventory 則在[工作區](#工作區)中尋找；除非 `--config` 或 `[anvil].workspace` 改變它，工作區就是同一個目錄。
 兩份文件 `inventory` 與 `config`，各自存成 `NAME.toml`，這是唯一的磁碟格式。
 YAML 只是編輯檢視：`anvil inventory` 與 `anvil config` 以 `--format` 或 `[anvil].format` 顯示文件並存成 TOML；
 只有這兩個指令接受 `--format`（其他指令使用它會以 2 結束）。
@@ -86,6 +88,66 @@ YAML 只是編輯檢視：`anvil inventory` 與 `anvil config` 以 `--format` �
 `--inventory` / `--config` 接受明確的路徑，必須以 `.toml` 結尾（否則以 2 結束並指出該路徑）。
 不存在的檔案視為空文件：inventory（主機清單）只含 `local`，config（設定）採用下列預設值。
 兩種格式對應到同一份 schema；未知的鍵一律拒絕，任何違規都以 2 結束並指出檔案、host 與欄位。
+
+## 工作區
+
+工作區是存放 inventory、[檔案儲存區](cli.zh-TW.md#anvil-files)與每個相對 `[[files]]` src 的目錄，
+因此一個資料夾就能裝下整套設定：
+
+```sh
+anvil --config ~/site/config.toml apply   # inventory ~/site/inventory.toml, $/motd is ~/site/files/motd
+```
+
+預設是 anvil 找到的 config 檔所在的目錄：`~/.config/anvil`（或 `$XDG_CONFIG_HOME/anvil`），
+或 `--config PATH` 照原樣取的目錄（`--config site.toml` 代表 `.`），即使該檔案還不存在也一樣。
+完全沒有 config 檔時，就是 config 目錄。這個路徑照寫法使用，不會經由 symlink 解析。
+`[anvil].workspace` 可以移動它：
+
+```toml
+[anvil]
+workspace = "~/dotfiles"   # ~/ is $HOME; an absolute path as is; a relative path is relative to the config's directory
+```
+
+只有 `~/` 會展開；單獨的 `~` 是名為 `~` 的目錄。
+空值或含 NUL 位元組的值以 2 結束並顯示 ``anvil.workspace `VALUE`: must be a non-empty path without NUL``；
+`$HOME` 未設定時，`~/` 開頭的值為 ``anvil.workspace `~/dotfiles`: $HOME is not set``，
+`$HOME` 是相對路徑時為 ``anvil.workspace `~/dotfiles`: $HOME `H` is not absolute``（以 2 結束）。
+
+跟著工作區走的有：
+
+- **inventory。** 沒有 `--inventory` 時，會在工作區尋找 `inventory.toml`（或舊版的 `inventory.yaml` / `inventory.yml`），
+  `anvil inventory` 也寫到那裡；那裡的舊版檔案就地遷移。`--inventory PATH` 仍然優先。
+- **儲存區。** `$/` 是 `<workspace>/files`。
+- **相對的 `src`。** 在工作區內解析，且必須留在其中（[`src`](#files)）。
+
+config 本身永遠不會在工作區中尋找，狀態目錄、plugin 路徑與機密 backend 路徑也不會跟著移動。
+不存在的工作區視為空的儲存區，inventory 只含 `local`；
+`anvil files cp` 與 `anvil files mkdir` 會以 0700 建立 `<workspace>/files` 與缺少的上層目錄。
+
+工作區和 config 本身一樣是信任邊界。能寫入它的人，就能控制 anvil 讀取並複製到 target 的 inventory、`$/` 檔案與相對 `src`。
+像 `~/` 或 `/` 這樣的 `workspace` 會讓相對 src 能指向其下的任何檔案。
+[留在工作區內的檢查](#files)防的是失誤，而不是能寫入工作區的人。
+因此當解析後的工作區存在、但群組或其他人可寫入，或屬於其他使用者時，anvil 每個指令會記錄一次 WARN（從 `-v` 起顯示）並繼續執行；它不會拒絕：
+
+- ``workspace `PATH`: writable by others (mode 0775); anyone who can write it controls the inventory and files anvil reads``
+- ``workspace `PATH`: owned by uid 501, not you; anyone who can write it controls the inventory and files anvil reads``
+
+symlink 的工作區會檢查其目標。不存在的工作區，或其他人只能讀取的工作區（`0755`），不會產生警告；
+不是目錄或無法檢查時，訊息會改為指出這點（`not a directory`、`cannot check directory: REASON`）。
+
+config 無法載入（或其工作區無法解析）時，只讀取 inventory 的指令（`run`、`doctor`、TUI 的 targets）
+會改在 config 所在的目錄尋找，並記錄一則 WARN：`config failed to load (ERROR); looking for the inventory in DIR`，
+讓 inventory 的錯誤仍然單獨回報。
+`anvil files` 需要工作區，因此改以 config 的錯誤結束（以 2 結束）；TUI 的檔案瀏覽器會顯示該錯誤。
+
+**從舊版 anvil 移轉。** 以前 inventory 與 `$/` 一律留在 config 目錄，相對 src 則在 config 檔實際目標的旁邊解析。現在：
+
+- `--config PATH` 指向其他位置時，inventory 與 `$/` 會在 PATH 旁邊尋找。
+  要保留原本的位置，請在該 config 中設定 `workspace = "~/.config/anvil"`；`--inventory` 只會覆寫 inventory 的位置。
+- `config.toml` 是指向其他位置檔案的 symlink 時，相對 src 會在連結旁邊（工作區）解析，而不是在其目標旁邊。
+  要保留原本的基準，請把 `[anvil].workspace` 設為目標所在的目錄。
+
+symlink 的 config 目錄（`~/.config/anvil` 本身是連結）解析方式與以前相同。
 
 ## Inventory
 
@@ -125,6 +187,7 @@ Host 名稱須符合 `[A-Za-z0-9_-]+`。`local` 是保留名稱：它永遠存�
 [anvil]
 editor = "nvim"            # optional; see cli.md (The editor)
 format = "toml"            # "toml" | "yaml": the edit view of inventory and config; default "toml"
+workspace = "~/dotfiles"   # optional: ~/, absolute, or relative to the config's directory; see The workspace
 
 [secrets]
 backend = "keychain"       # keychain | age | sops; required when [secrets] is present
@@ -158,7 +221,7 @@ apt = "fd-find"            # installed in place of fd on apt; a manager with no 
 dnf = "fd-find"
 
 [[files]]                  # optional; one file copied per matching target; see Files
-src = "files/sshd_config"  # relative to the config file's directory
+src = "files/sshd_config"  # relative to the workspace, or $/… in the store
 dest = "/etc/ssh/sshd_config" # absolute path on the target
 mode = "0644"              # required: a quoted string of 3 or 4 octal digits
 tags = ["linode"]          # optional; every tag must be on the target
@@ -237,7 +300,7 @@ names = ["HOST_SUDO"]
 
 ```toml
 [[files]]
-src = "files/sshd_config"        # required: relative to the config file's directory
+src = "files/sshd_config"        # required: relative to the workspace, or $/… in the store
 dest = "/etc/ssh/sshd_config"    # required: absolute path on the target
 mode = "0644"                    # required: quoted, 3 or 4 octal digits
 tags = ["linode"]                # optional; [A-Za-z0-9_-]+; every one must be on the target
@@ -266,19 +329,19 @@ setuid 位元（`4000`）與 setgid 位元（`2000`）一律拒絕，不論單�
 - ``files[0].dest `/etc/`: must not end with /``
 - ``files[0].dest `/aaa…`: 4097 bytes exceeds the 4096 byte limit``（引用的路徑是前 64 個字元加上 `…`）
 
-**`src`。** 除非以 `$/` 開頭，否則是相對於 config 檔所在目錄的路徑，不做 shell 展開：`~/a` 是名為 `~` 的目錄，`..` 在這項檢查中是允許的。
+**`src`。** 除非以 `$/` 開頭，否則是相對於[工作區](#工作區)的路徑，不做 shell 展開：`~/a` 是名為 `~` 的目錄，`..` 在這項檢查中是允許的。
 絕對路徑、空字串或含 NUL 位元組時以 2 結束並顯示 ``files[0].src `/etc/motd`: must be relative to the config directory``。
 接著 `apply` 與 `plan`（以及 TUI 的 `a` 與 `p`）會在任何 target 之前解析 `..` 與 symlink 並讀取該檔案。
-解析後的路徑必須留在 config 目錄內：否則為 ``files[0].src `../outside`: leaves the config directory``，
-目錄內指向目錄外的 symlink 也一樣。這項檢查是用來防止失誤（多出來的 `..`、指錯方向的 symlink），
-不是安全邊界：能編輯 config 的人本來就能把檔案放進那個目錄。
-該路徑必須指向一般檔案。檔案不存在時為 ``files[0].src `missing`: cannot read: REASON``，REASON 是作業系統給的原因；
+解析後的路徑必須留在工作區內（這項檢查會先經由 symlink 解析工作區）：否則為
+``files[0].src `../outside`: leaves the workspace``，工作區內指向工作區外的 symlink 也一樣。這項檢查是用來防止失誤（多出來的 `..`、指錯方向的 symlink），
+不是安全邊界：能編輯 config 的人本來就能把檔案放進工作區，或移動工作區。
+該路徑必須指向一般檔案。檔案不存在、或工作區不存在時為 ``files[0].src `missing`: cannot read: REASON``，REASON 是作業系統給的原因；
 目錄則為 ``files[0].src `sub`: is not a regular file``。
 `anvil config`、`anvil doctor`、`anvil inventory` 與 `anvil secret` 只檢查語法，因此缺少的 src 不會讓它們失敗；
-`anvil run` 則不載入 config。
+`anvil run` 僅在未指定 `--inventory` 時載入 config 來尋找 inventory；它絕不讀取來源檔案。
 
-以 `$/` 開頭的 `src` 改為讀取[檔案儲存區](cli.zh-TW.md#anvil-files)：`$/sub/motd` 代表 `<config_dir>/files/sub/motd`，
-即使 `--config` 指向其他目錄也一樣。這會取代原本 config 旁名為 `$` 的目錄的解讀方式。
+以 `$/` 開頭的 `src` 改為讀取[檔案儲存區](cli.zh-TW.md#anvil-files)：`$/sub/motd` 代表 `<workspace>/files/sub/motd`。
+這會取代原本工作區中名為 `$` 的目錄的解讀方式。
 儲存區路徑拒絕絕對路徑、NUL、`.` 與 `..` 元件，連續的 `/` 會合併。
 所有已存在的元件（包含儲存區根目錄）都不可是 symlink；無效路徑與 symlink 以 2 結束：
 ``files[0].src `$/../x`: invalid store path`` 與 ``files[0].src `$/link`: is a symlink``。

@@ -5,7 +5,7 @@ use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -258,4 +258,29 @@ impl Store for Unopenable {
         self.opened.set(self.opened.get() + 1);
         Err((self.error)())
     }
+}
+
+/// Collects every log line while `f` runs, with the logger at its most
+/// verbose (it stops at debug: nothing in anvil logs at trace).
+pub fn logged<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    #[derive(Default)]
+    struct Lines(Mutex<Vec<String>>);
+    impl crate::logger::Sink for Lines {
+        fn line(&self, level: log::Level, target: &str, message: &str) {
+            let line = format!("{level} {target}: {message}");
+            self.0.lock().unwrap().push(line);
+        }
+    }
+    let _lock = crate::logger::test_lock();
+    let before = log::max_level();
+    crate::logger::Logger::install(u8::MAX);
+    crate::logger::set_verbosity(u8::MAX);
+    log::set_max_level(log::LevelFilter::Trace);
+    let lines = Arc::new(Lines::default());
+    crate::logger::set_sink(Some(lines.clone()));
+    let out = f();
+    crate::logger::set_sink(None);
+    log::set_max_level(before);
+    let lines = std::mem::take(&mut *lines.0.lock().unwrap());
+    (out, lines)
 }

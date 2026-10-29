@@ -174,6 +174,20 @@ pub fn locate(explicit_path: Option<&Path>, name: &str) -> Result<Option<DocPath
     }
 }
 
+/// The default workspace for the config at `located`: its parent as given (`.` for a bare
+/// file name), else [`config_dir`] when nothing was located. Not canonicalized.
+pub fn base_dir(located: Option<&DocPath>) -> Result<PathBuf, PathsError> {
+    match located {
+        Some(doc) => Ok(doc
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf()),
+        None => config_dir(),
+    }
+}
+
 /// Why [`check_private_dir`] refused a directory.
 #[derive(Debug)]
 pub enum PrivateDirError {
@@ -237,6 +251,20 @@ pub fn find_program(program: &Path, path: Option<&OsStr>) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::test_util::temp_dir;
+
+    /// A missing explicit document still supplies its parent, including a bare name.
+    #[test]
+    fn base_dir_uses_the_located_spelling() {
+        for (path, base) in [
+            ("site.toml", "."),
+            ("/linked/site.toml", "/linked"),
+            ("relative/site.toml", "relative"),
+        ] {
+            let doc = explicit(Path::new(path)).unwrap();
+            assert_eq!(base_dir(Some(&doc)).unwrap(), Path::new(base));
+        }
+        assert_eq!(base_dir(None).unwrap(), config_dir().unwrap());
+    }
 
     #[test]
     fn xdg_wins_over_home() {
