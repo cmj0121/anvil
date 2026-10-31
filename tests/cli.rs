@@ -232,6 +232,33 @@ fn broken_config_warns_and_inventory_errors_stay_separate() {
     assert!(text(&out.stderr).contains(&inventory.display().to_string()));
 }
 
+/// Refused `[[tasks]]` configs exit 2 before any target, naming what is wrong.
+#[test]
+fn a_refused_tasks_config_exits_two() {
+    let sb = Sandbox::new("ac");
+    let config = sb.root().join("tasks.toml");
+    for (body, named) in [
+        (
+            "[[tasks]]\nrun = \"a\"\n[[steps]]\nrun = \"hostname\"\n",
+            "[[steps]]",
+        ),
+        ("[[tasks]]\nrun = \"a\"\ninclude = \"$/b\"\n", "tasks[0]"),
+        (
+            "[[tasks]]\n[[tasks.tasks]]\nname = \"c\"\n",
+            "tasks[0].tasks[0]",
+        ),
+        (
+            "[[tasks]]\ninclude = \"roles/web.toml\"\n",
+            "tasks[0].include",
+        ),
+    ] {
+        std::fs::write(&config, body).unwrap();
+        let out = sb.anvil(&["--config", config.to_str().unwrap(), "plan"], &[]);
+        assert_eq!(out.status.code(), Some(2), "{body}");
+        assert!(text(&out.stderr).contains(named), "{body}");
+    }
+}
+
 /// Loaded-config and inventory-only callers all select workspace targets.
 #[test]
 fn workspace_inventory_is_used_by_plan_apply_run_and_doctor() {

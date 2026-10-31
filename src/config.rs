@@ -1,7 +1,8 @@
 //! The config document: `[anvil]` preferences, the `[secrets]` backend, the
 //! `[packages]` to install, the pinned `[plugins]`, the `[[files]]` to copy,
 //! the `[[services]]` to bring to a state, the `[[steps]]` that
-//! `anvil apply` runs and the `[harden]` rules `config --harden` skips.
+//! `anvil apply` runs, the `[harden]` rules `config --harden` skips and the
+//! ordered `[[tasks]]` that replace the fixed sections.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -43,7 +44,7 @@ const MAX_SERVICE_NAME_BYTES: usize = 255;
 const MACOS: bool = cfg!(target_os = "macos");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(try_from = "RawConfig", into = "RawConfig")]
 pub struct Config {
     pub anvil: AnvilPrefs,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -59,9 +60,108 @@ pub struct Config {
     #[serde(skip_serializing_if = "Harden::is_empty")]
     pub harden: Harden,
     /// The loaded file, canonicalized by [`Config::load`]; `None` for defaults.
-    #[serde(skip)]
     pub path: Option<PathBuf>,
     pub steps: Vec<Step>,
+    pub tasks: Vec<Task>,
+}
+
+/// [`Config`] as written, so parsing can tell an absent `steps` from a written
+/// one. Named `Config` so serde's own messages read as they do for the struct.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename = "Config", deny_unknown_fields, default)]
+struct RawConfig {
+    anvil: AnvilPrefs,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secrets: Option<Secrets>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packages: Option<Packages>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    plugins: BTreeMap<String, Plugin>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    files: Vec<FileEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    services: Vec<ServiceEntry>,
+    #[serde(skip_serializing_if = "Harden::is_empty")]
+    harden: Harden,
+    #[serde(
+        deserialize_with = "written_steps",
+        skip_serializing_if = "Option::is_none"
+    )]
+    steps: Option<Vec<Step>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tasks: Vec<Task>,
+}
+
+/// A written `steps`, where a YAML null is the empty list a plain `Vec` reads
+/// it as; only an absent key stays `None`.
+fn written_steps<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<Step>>, D::Error> {
+    Vec::deserialize(d).map(Some)
+}
+
+impl TryFrom<RawConfig> for Config {
+    type Error = String;
+
+    fn try_from(raw: RawConfig) -> Result<Self, String> {
+        if !raw.tasks.is_empty() {
+            let packages = raw.packages.as_ref();
+            let mixed = [
+                (raw.steps.is_some(), "[[steps]]"),
+                (!raw.files.is_empty(), "[[files]]"),
+                (!raw.services.is_empty(), "[[services]]"),
+                (
+                    packages.is_some_and(|p| !p.install.is_empty()),
+                    "[packages] install",
+                ),
+                (
+                    packages.is_some_and(|p| !p.pin.is_empty()),
+                    "[packages] pin",
+                ),
+                (
+                    packages.is_some_and(|p| !p.remove.is_empty()),
+                    "[packages] remove",
+                ),
+                (packages.is_some_and(|p| p.upgrade), "[packages] upgrade"),
+            ];
+            if let Some((_, section)) = mixed.iter().find(|(written, _)| *written) {
+                return Err(format!(
+                    "[[tasks]] cannot be mixed with {section}; move it into a task"
+                ));
+            }
+        }
+        let steps = match raw.steps {
+            Some(steps) => steps,
+            None if raw.tasks.is_empty() => Config::default().steps,
+            None => Vec::new(),
+        };
+        Ok(Config {
+            anvil: raw.anvil,
+            secrets: raw.secrets,
+            packages: raw.packages,
+            plugins: raw.plugins,
+            files: raw.files,
+            services: raw.services,
+            harden: raw.harden,
+            path: None,
+            steps,
+            tasks: raw.tasks,
+        })
+    }
+}
+
+impl From<Config> for RawConfig {
+    fn from(config: Config) -> Self {
+        RawConfig {
+            anvil: config.anvil,
+            secrets: config.secrets,
+            packages: config.packages,
+            plugins: config.plugins,
+            files: config.files,
+            services: config.services,
+            harden: config.harden,
+            steps: config.tasks.is_empty().then_some(config.steps),
+            tasks: config.tasks,
+        }
+    }
 }
 
 impl Default for Config {
@@ -76,6 +176,7 @@ impl Default for Config {
             harden: Harden::default(),
             path: None,
             steps: vec![Step::script("hostname")],
+            tasks: Vec::new(),
         }
     }
 }
@@ -267,6 +368,50 @@ pub struct Step {
     pub plugin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// A `[[tasks]]` entry: exactly one kind (`run`, `plugin`, `packages`, `file`,
+/// `service`, `include` or `tasks`) on the targets its `tags` and `facts` match.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Task {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facts: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packages: Option<TaskPackages>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<FileEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<ServiceEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<Vec<Task>>,
+}
+
+/// A `packages` task: the lists only, since manager, sudo, timeout and alias
+/// stay global in `[packages]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskPackages {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub install: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pin: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upgrade: bool,
 }
 
 /// A `[[files]]` entry: `src` in the workspace or store, copied to `dest` on each
@@ -533,7 +678,8 @@ impl Config {
         }
         let examples: toml::Table = full_parse(FULL_EXAMPLES, Format::Toml)?;
         for (key, example) in examples {
-            if value.get(&key).is_none() {
+            let refused = !self.tasks.is_empty() && matches!(key.as_str(), "files" | "services");
+            if value.get(&key).is_none() && !refused {
                 let table = toml::Table::from_iter([(key, example)]);
                 rendered.push('\n');
                 for line in document::to_string(&table, format)?.lines() {
@@ -571,8 +717,15 @@ impl Config {
     fn with_defaults(&self, strip: bool) -> Result<toml::Value, DocumentError> {
         let mut value: toml::Value =
             full_parse(&document::to_string(self, Format::Toml)?, Format::Toml)?;
-        let defaults = full_parse(FULL_DEFAULTS, Format::Toml)?;
-        full_defaults(&mut value, &defaults, strip);
+        let mut defaults: toml::Table = full_parse(FULL_DEFAULTS, Format::Toml)?;
+        if !self.tasks.is_empty()
+            && let Some(packages) = defaults["packages"].as_table_mut()
+        {
+            for key in ["install", "pin", "remove", "upgrade"] {
+                packages.remove(key);
+            }
+        }
+        full_defaults(&mut value, &defaults.into(), strip);
         Ok(value)
     }
 
@@ -634,7 +787,8 @@ impl Config {
         self.check_harden()
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_steps()
-            .map_err(|message| DocumentError::invalid(path, message))
+            .map_err(|message| DocumentError::invalid(path, message))?;
+        check_tasks(&self.tasks, "tasks").map_err(|message| DocumentError::invalid(path, message))
     }
 
     /// Resolves `[anvil].workspace` against `base`, expanding `~/` using `$HOME`.
@@ -1209,6 +1363,63 @@ fn expand(key: &str, value: &str, home: Option<&OsStr>) -> Result<PathBuf, Strin
             "{key} `{shown}`: must be an absolute path or start with ~/"
         ))
     }
+}
+
+/// The rules on one document's tasks, each named by its path under `prefix`;
+/// what a task refers to is checked when it is expanded.
+fn check_tasks(tasks: &[Task], prefix: &str) -> Result<(), String> {
+    for (i, task) in tasks.iter().enumerate() {
+        let path = format!("{prefix}[{i}]");
+        if task.args.is_some() && task.plugin.is_none() {
+            return Err(format!("{path}.args: needs plugin"));
+        }
+        let kinds = [
+            ("run", task.run.is_some()),
+            ("plugin", task.plugin.is_some()),
+            ("packages", task.packages.is_some()),
+            ("file", task.file.is_some()),
+            ("service", task.service.is_some()),
+            ("include", task.include.is_some()),
+            ("tasks", task.tasks.is_some()),
+        ]
+        .map(|(kind, set)| set.then_some(kind));
+        let kinds: Vec<&str> = kinds.into_iter().flatten().collect();
+        match kinds.as_slice() {
+            [_] => {}
+            [] => {
+                return Err(format!(
+                    "{path}: needs one of run, plugin, packages, file, service, include, tasks"
+                ));
+            }
+            many => return Err(format!("{path}: has {}; keep one", many.join(" and "))),
+        }
+        if let Some(file) = &task.file
+            && (!file.tags.is_empty() || !file.facts.is_empty())
+        {
+            return Err(format!(
+                "{path}.file: tags and facts belong on the task, not the file"
+            ));
+        }
+        if let Some(service) = &task.service
+            && (!service.tags.is_empty() || !service.facts.is_empty())
+        {
+            return Err(format!(
+                "{path}.service: tags and facts belong on the task, not the service"
+            ));
+        }
+        if let Some(include) = &task.include
+            && !crate::filestore::is_store_path(include)
+        {
+            return Err(format!(
+                "{path}.include `{}`: must be a $/ store path",
+                secret::shown_name(include)
+            ));
+        }
+        if let Some(children) = &task.tasks {
+            check_tasks(children, &format!("{path}.tasks"))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2659,6 +2870,331 @@ mod tests {
         assert!(err.contains("rules"), "{err}");
     }
 
+    const TASKS: &str = r#"
+[packages]
+manager = "apt"
+[packages.alias.nginx]
+brew = "nginx"
+
+[[tasks]]
+name = "repo"
+facts = { pkg = "apt" }
+file = { src = "$/app.list", dest = "/etc/app.list", mode = "0644" }
+
+[[tasks]]
+run = "sudo apt-get update"
+
+[[tasks]]
+packages = { install = ["git"], pin = ["curl"], remove = ["vim"], upgrade = true }
+
+[[tasks]]
+tags = ["web"]
+include = "$/roles/web.toml"
+
+[[tasks]]
+plugin = "tool"
+args = { a = 1 }
+
+[[tasks]]
+name = "group"
+facts = { os = "Linux" }
+
+  [[tasks.tasks]]
+  service = { name = "nginx", state = "started", enabled = true }
+"#;
+
+    fn validated(text: &str) -> Result<Config, String> {
+        let config: Config = document::from_str(text, Format::Toml)?;
+        check_tasks(&config.tasks, "tasks")?;
+        Ok(config)
+    }
+
+    #[test]
+    fn a_tasks_config_parses_with_no_default_step() {
+        let config = parse(TASKS);
+        assert_eq!(config.steps, []);
+        assert_eq!(config.tasks.len(), 6);
+        assert_eq!(config.tasks[0].name.as_deref(), Some("repo"));
+        assert_eq!(config.tasks[0].facts["pkg"], "apt");
+        assert_eq!(
+            config.tasks[2].packages,
+            Some(TaskPackages {
+                install: vec!["git".into()],
+                pin: vec!["curl".into()],
+                remove: vec!["vim".into()],
+                upgrade: true,
+            })
+        );
+        assert!(config.tasks[0].file.as_ref().unwrap().sudo);
+        let children = config.tasks[5].tasks.as_ref().unwrap();
+        assert_eq!(children[0].service.as_ref().unwrap().name, "nginx");
+        config.validate(Path::new("config.toml")).unwrap();
+        check_tasks(&config.tasks, "tasks").unwrap();
+    }
+
+    #[test]
+    fn a_tasks_config_round_trips_with_no_steps_key() {
+        let config = parse(TASKS);
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&config, format).unwrap();
+            assert!(!text.contains("steps"), "{text}");
+            let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(back, config, "{format}");
+        }
+    }
+
+    #[test]
+    fn a_task_with_other_than_one_kind_is_refused() {
+        for (task, expected) in [
+            (
+                "run = \"a\"\ninclude = \"$/b\"",
+                "tasks[0]: has run and include; keep one",
+            ),
+            (
+                "name = \"only\"\ntags = [\"web\"]",
+                "tasks[0]: needs one of run, plugin",
+            ),
+            (
+                "tasks = []\nrun = \"a\"",
+                "tasks[0]: has run and tasks; keep one",
+            ),
+            (
+                "plugin = \"a\"\nrun = \"b\"",
+                "tasks[0]: has run and plugin; keep one",
+            ),
+            (
+                "packages = { install = [\"a\"] }\nservice = { name = \"b\", state = \"started\" }",
+                "tasks[0]: has packages and service; keep one",
+            ),
+            (
+                "file = { src = \"a\", dest = \"/b\", mode = \"0644\" }\nrun = \"c\"",
+                "tasks[0]: has run and file; keep one",
+            ),
+        ] {
+            let err = validated(&format!("[[tasks]]\n{task}\n")).unwrap_err();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_refused_task_is_named_by_its_path() {
+        let text = "[[tasks]]\nrun = \"a\"\n[[tasks]]\nrun = \"b\"\n[[tasks]]\n\
+                    [[tasks.tasks]]\nname = \"empty\"\n";
+        let err = validated(text).unwrap_err();
+        assert!(err.starts_with("tasks[2].tasks[0]: needs one of"), "{err}");
+        let err = parse(text).validate(Path::new("config.toml")).unwrap_err();
+        assert!(matches!(err, DocumentError::Invalid { .. }), "{err}");
+        assert!(err.to_string().contains("tasks[2].tasks[0]"), "{err}");
+    }
+
+    #[test]
+    fn task_args_need_a_plugin() {
+        for task in ["run = \"a\"\nargs = { b = 1 }", "args = { b = 1 }"] {
+            let err = validated(&format!("[[tasks]]\n{task}\n")).unwrap_err();
+            assert_eq!(err, "tasks[0].args: needs plugin");
+        }
+    }
+
+    #[test]
+    fn a_file_or_service_with_its_own_selector_is_refused() {
+        for (kind, inner) in [
+            (
+                "file",
+                "src = \"a\", dest = \"/b\", mode = \"0644\", tags = [\"web\"]",
+            ),
+            (
+                "file",
+                "src = \"a\", dest = \"/b\", mode = \"0644\", facts = { os = \"Linux\" }",
+            ),
+            (
+                "service",
+                "name = \"a\", state = \"started\", tags = [\"web\"]",
+            ),
+            (
+                "service",
+                "name = \"a\", state = \"started\", facts = { os = \"Linux\" }",
+            ),
+        ] {
+            let err = validated(&format!("[[tasks]]\n{kind} = {{ {inner} }}\n")).unwrap_err();
+            assert!(
+                err.starts_with(&format!("tasks[0].{kind}: tags and facts")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_include_outside_the_store_is_refused() {
+        for include in ["roles/web.toml", "/etc/web.toml", "$web.toml", ""] {
+            let err = validated(&format!("[[tasks]]\ninclude = \"{include}\"\n")).unwrap_err();
+            assert!(err.starts_with("tasks[0].include"), "{err}");
+        }
+        validated("[[tasks]]\ninclude = \"$/roles/web.toml\"\n").unwrap();
+    }
+
+    #[test]
+    fn unknown_task_keys_are_refused_naming_the_key_and_line() {
+        for (text, key, line) in [
+            ("[[tasks]]\nrun = \"a\"\nwhen = \"b\"\n", "when", "line 3"),
+            (
+                "[[tasks]]\n[tasks.packages]\nmanager = \"apt\"\n",
+                "manager",
+                "line 3",
+            ),
+            (
+                "[[tasks]]\n[[tasks.tasks]]\nrun = \"a\"\nowner = \"b\"\n",
+                "owner",
+                "line 4",
+            ),
+        ] {
+            let err = document::from_str::<Config>(text, Format::Toml).unwrap_err();
+            assert!(err.contains(key) && err.contains(line), "{err}");
+        }
+    }
+
+    #[test]
+    fn tasks_mixed_with_a_legacy_section_are_refused() {
+        const TASK: &str = "[[tasks]]\nrun = \"a\"\n";
+        const FILE: &str = "[[files]]\nsrc = \"a\"\ndest = \"/b\"\nmode = \"0644\"\n";
+        const SERVICE: &str = "[[services]]\nname = \"a\"\nstate = \"started\"\n";
+        let err =
+            document::from_str::<Config>(&format!("steps = []\n{TASK}"), Format::Toml).unwrap_err();
+        assert!(err.contains("cannot be mixed with [[steps]]"), "{err}");
+        for (section, named) in [
+            ("[[steps]]\nrun = \"hostname\"\n", "[[steps]]"),
+            (FILE, "[[files]]"),
+            (SERVICE, "[[services]]"),
+            ("[packages]\ninstall = [\"a\"]\n", "[packages] install"),
+            ("[packages]\npin = [\"a\"]\n", "[packages] pin"),
+            ("[packages]\nremove = [\"a\"]\n", "[packages] remove"),
+            ("[packages]\nupgrade = true\n", "[packages] upgrade"),
+        ] {
+            for text in [format!("{section}{TASK}"), format!("{TASK}{section}")] {
+                let err = document::from_str::<Config>(&text, Format::Toml).unwrap_err();
+                assert!(
+                    err.contains(&format!("cannot be mixed with {named}")),
+                    "{err}"
+                );
+            }
+        }
+        let err = document::from_str::<Config>(
+            "tasks:\n  - run: a\nsteps:\n  - run: hostname\n",
+            Format::Yaml,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot be mixed with [[steps]]"), "{err}");
+    }
+
+    /// A written null is a written key, as with a plain `Vec`.
+    #[test]
+    fn a_yaml_null_steps_is_written_and_empty() {
+        for text in ["steps:\n", "steps: null\n"] {
+            let config: Config = document::from_str(text, Format::Yaml).unwrap();
+            assert_eq!(config.steps, [], "{text}");
+            let out = document::to_string(&config, Format::Toml).unwrap();
+            assert!(out.contains("steps = []"), "{out}");
+            assert!(!out.contains("hostname"), "{out}");
+
+            let err =
+                document::from_str::<Config>(&format!("tasks:\n  - run: a\n{text}"), Format::Yaml)
+                    .unwrap_err();
+            assert!(err.contains("cannot be mixed with [[steps]]"), "{err}");
+        }
+    }
+
+    /// A null `tasks` is no tasks, so `steps` keeps its legacy meaning.
+    #[test]
+    fn a_yaml_null_tasks_is_no_tasks() {
+        let config: Config = document::from_str("tasks:\n", Format::Yaml).unwrap();
+        assert_eq!(config, Config::default());
+        let config: Config =
+            document::from_str("tasks:\nsteps:\n  - run: a\n", Format::Yaml).unwrap();
+        assert_eq!(config.steps, [Step::script("a")]);
+    }
+
+    /// A null nested `tasks` is not a kind, so the task has none.
+    #[test]
+    fn a_yaml_null_nested_tasks_is_no_kind() {
+        let err = document::from_str::<Config>("tasks:\n  - tasks:\n", Format::Yaml)
+            .and_then(|config| check_tasks(&config.tasks, "tasks"))
+            .unwrap_err();
+        assert!(err.starts_with("tasks[0]: needs one of"), "{err}");
+    }
+
+    #[test]
+    fn empty_legacy_values_stay_allowed_with_tasks() {
+        const TASK: &str = "[[tasks]]\nrun = \"a\"\n";
+        for section in [
+            "[packages]\ninstall = []\n",
+            "[packages]\nupgrade = false\n",
+            "files = []\n",
+            "services = []\n",
+        ] {
+            let config = validated(&format!("{section}{TASK}")).unwrap();
+            assert_eq!(config.tasks.len(), 1, "{section}");
+            assert_eq!(config.steps, [], "{section}");
+        }
+    }
+
+    #[test]
+    fn an_empty_nested_tasks_is_one_kind() {
+        let config = validated("[[tasks]]\ntasks = []\n").unwrap();
+        assert_eq!(config.tasks[0].tasks, Some(vec![]));
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&config, format).unwrap();
+            assert_eq!(document::from_str::<Config>(&text, format).unwrap(), config);
+        }
+    }
+
+    #[test]
+    fn global_package_settings_stay_allowed_with_tasks() {
+        let config = parse(
+            "[packages]\nmanager = \"apt\"\ntimeout = 60\n\
+             [packages.alias.fd]\napt = \"fd-find\"\n[[tasks]]\nrun = \"a\"\n",
+        );
+        let packages = config.packages.as_ref().unwrap();
+        assert_eq!(packages.timeout, 60);
+        assert_eq!(packages.alias["fd"]["apt"], "fd-find");
+    }
+
+    #[test]
+    fn steps_round_trip_as_written_without_tasks() {
+        for (text, steps) in [
+            ("steps = []\n", vec![]),
+            ("", vec![Step::script("hostname")]),
+            ("tasks = []\n", vec![Step::script("hostname")]),
+            ("[[steps]]\nrun = \"a\"\n", vec![Step::script("a")]),
+        ] {
+            let config = parse(text);
+            assert_eq!(config.steps, steps, "{text}");
+            for format in [Format::Toml, Format::Yaml] {
+                let out = document::to_string(&config, format).unwrap();
+                assert!(out.contains("steps"), "{out}");
+                assert!(!out.contains("tasks"), "{out}");
+                assert_eq!(document::from_str::<Config>(&out, format).unwrap(), config);
+            }
+        }
+        assert_eq!(
+            document::to_string(&parse("steps = []\n"), Format::Toml).unwrap(),
+            "steps = []\n\n[anvil]\nformat = \"toml\"\n"
+        );
+        assert_eq!(
+            document::to_string(&parse(""), Format::Toml).unwrap(),
+            "[anvil]\nformat = \"toml\"\n\n[[steps]]\nrun = \"hostname\"\n"
+        );
+    }
+
+    /// `try_from` must not leak `RawConfig` into what serde reports.
+    #[test]
+    fn parser_messages_read_as_for_the_struct() {
+        for (text, format) in [("3", Format::Yaml), ("nope", Format::Yaml)] {
+            let err = document::from_str::<Config>(text, format).unwrap_err();
+            assert!(!err.contains("RawConfig"), "{err}");
+        }
+        let err = document::from_str::<Config>("nope = 1\n", Format::Toml).unwrap_err();
+        assert!(err.contains("nope") && err.contains("line 1"), "{err}");
+    }
+
     #[test]
     fn empty_harden_is_not_serialized() {
         for format in [Format::Toml, Format::Yaml] {
@@ -2713,6 +3249,30 @@ mod full_tests {
                 }
             }
         }
+    }
+
+    /// A tasks config offers nothing that mixing would refuse, and survives
+    /// the full view, with no `steps`, in both formats.
+    #[test]
+    fn a_tasks_config_survives_the_full_view() {
+        let original = config(
+            "[packages]\nmanager = \"apt\"\n[packages.alias.fd]\napt = \"fd-find\"\n\
+             [[tasks]]\nrun = \"a\"\n\
+             [[tasks]]\nfile = { src = \"$/a\", dest = \"/a\", mode = \"0644\" }\n",
+        );
+        let base = Path::new("/workspace");
+        for format in [Format::Toml, Format::Yaml] {
+            let view = original.full_view(base, format).unwrap();
+            for absent in [
+                "steps", "install", "pin", "remove", "upgrade", "files", "services",
+            ] {
+                assert!(!view.contains(absent), "{absent} in {view}");
+            }
+            assert_eq!(round_trip(&original, base, format), original, "{format}");
+        }
+        let stripped = original.stripped(base).unwrap();
+        assert!(!stripped.contains_key("steps"));
+        assert_eq!(stripped["tasks"].as_array().unwrap().len(), 2);
     }
 
     /// Full defaults retain the workspace even when its base is relative or not UTF-8.
