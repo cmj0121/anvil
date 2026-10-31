@@ -1,8 +1,10 @@
 //! `anvil config --harden`: Linux hardening suggestions written into the config.
 //!
-//! [`suggest`] reads the config, the inventory and the `[[files]]` srcs it
-//! names, and returns the edited config document and src files; it never
-//! writes, contacts a target or prints.
+//! [`suggest`] reads the config, its expanded list, the inventory and the srcs
+//! it names, and returns the edited config document and src files; it never
+//! writes, contacts a target or prints. On a `[[tasks]]` config it adds and
+//! edits only the main file's top-level tasks: what lives in an include or a
+//! nested task counts as present, and a change it needs is a warning.
 pub mod diff;
 pub mod rules;
 
@@ -12,19 +14,23 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
-use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use crate::config::Config;
 use crate::files;
 use crate::filestore::{self, StoreError};
 use crate::inventory::{self, Inventory};
+use crate::logger::escape_invisible;
 use crate::secret;
+use crate::tasks::{self, Expanded, ItemKind};
 
 /// What [`suggest`] reads.
 pub struct Input<'a> {
     /// The config text `config` was parsed from; edits keep its layout.
     pub text: &'a str,
     pub config: &'a Config,
+    /// `config`'s ordered list: what is already present, wherever it lives.
+    pub expanded: &'a Expanded,
     pub inventory: &'a Inventory,
     /// The workspace: relative srcs resolve here, `$/` srcs in its store.
     pub workspace: &'a Path,
@@ -39,6 +45,9 @@ pub struct Outcome {
     pub suggestions: Vec<Suggestion>,
     pub held: Vec<Held>,
     pub warnings: Vec<String>,
+    /// A warning names an include's or nested task's entry that still needs
+    /// changing, so the config does not yet carry every rule.
+    pub unresolved: bool,
 }
 
 /// A `[[files]]` src to create (`old` is `None`) or change.
@@ -120,13 +129,15 @@ pub fn suggest(input: &Input) -> Result<Outcome, Failure> {
         sources: Sources::new(input.workspace),
         files: Vec::new(),
         suggestions: Vec::new(),
+        added: Vec::new(),
+        warnings: Vec::new(),
+        unresolved: false,
     };
     let active = |id: &str| {
         !input.config.harden.skip.iter().any(|skip| skip == id)
             && rules::find(id).is_some_and(|rule| input.strict || !rule.strict)
     };
     let mut held = Vec::new();
-    let mut warnings = Vec::new();
 
     let mut ssh: Vec<(&'static str, Directives)> = Vec::new();
     if active(ROOT_LOGIN) {
@@ -143,7 +154,7 @@ pub fn suggest(input: &Input) -> Result<Outcome, Failure> {
     }
     if active(PASSWORD_AUTH) {
         ssh.push((PASSWORD_AUTH, rules::PASSWORD_AUTH));
-        warnings.push(PASSWORD_WARNING.to_string());
+        run.warnings.push(PASSWORD_WARNING.to_string());
     }
     run.drop_in(&DropIn {
         rules: ssh,
@@ -169,12 +180,14 @@ pub fn suggest(input: &Input) -> Result<Outcome, Failure> {
     if active(PACKAGES_INSECURE) {
         run.packages()?;
     }
+    run.add_tasks()?;
     Ok(Outcome {
         doc: run.doc,
         files: run.files,
         suggestions: run.suggestions,
         held,
-        warnings,
+        warnings: run.warnings,
+        unresolved: run.unresolved,
     })
 }
 
@@ -342,6 +355,20 @@ impl<'a> Sources<'a> {
     }
 }
 
+/// A task [`Run::add_tasks`] appends once the whole list is known.
+struct Added {
+    is_step: bool,
+    /// The top-level task to go before, when it holds what this task feeds.
+    before: Option<usize>,
+    table: Table,
+    ids: Vec<&'static str>,
+    /// Its entry in `suggestions`, completed with the index.
+    suggestion: usize,
+}
+
+/// A file entry of the expanded list: its item and ordinal.
+type FileItem<'a> = (&'a tasks::Item, usize);
+
 /// One [`suggest`] pass: the document and src files edited so far.
 struct Run<'a> {
     input: &'a Input<'a>,
@@ -349,9 +376,12 @@ struct Run<'a> {
     sources: Sources<'a>,
     files: Vec<FileChange>,
     suggestions: Vec<Suggestion>,
+    added: Vec<Added>,
+    warnings: Vec<String>,
+    unresolved: bool,
 }
 
-impl Run<'_> {
+impl<'a> Run<'a> {
     fn suggest(&mut self, rules: &[&'static str], action: Action, what: String) {
         self.suggestions.push(Suggestion {
             rules: rules.to_vec(),
@@ -382,32 +412,33 @@ impl Run<'_> {
             return Ok(());
         }
         let ids: Vec<&'static str> = drop_in.rules.iter().map(|(id, _)| *id).collect();
-        let config = self.input.config;
-        let entry = config.files.iter().position(|f| f.dest == drop_in.dest);
-        let src = match entry {
-            Some(i) => config.files[i].src.clone(),
+        let expanded = self.input.expanded;
+        let found = expanded
+            .files()
+            .find(|(_, file, _)| expanded.same_dest(&file.dest, drop_in.dest));
+        let entry = found.map(|(item, _, i)| (item, i));
+        let src = match found {
+            Some((_, file, _)) => file.src.clone(),
             None => {
-                let mut facts = InlineTable::new();
-                facts.insert("os", "Linux".into());
-                let mut table = Table::new();
-                table.insert("src", toml_edit::value(drop_in.store));
-                table.insert("dest", toml_edit::value(drop_in.dest));
-                table.insert("mode", toml_edit::value("0644"));
-                table.insert("facts", toml_edit::value(facts));
-                let i = self.append("files", table, &ids)?;
-                self.suggest(&ids, Action::Add, format!("files[{i}] {}", drop_in.dest));
+                self.add_file(drop_in, &ids)?;
                 drop_in.store.to_owned()
             }
         };
         let fail = |why: String| {
             Failure(match entry {
-                Some(i) => format!("files[{i}].src `{}`: {why}", secret::shown_name(&src)),
+                Some((item, i)) => item.shown_message(format!(
+                    "{}.src `{}`: {why}",
+                    item.label("files", i),
+                    secret::shown_name(&src)
+                )),
                 None => format!("{}: {why}", self.sources.shown(&src)),
             })
         };
         let shown = self.sources.shown(&src);
+        let is_locked = entry.is_some_and(|(item, _)| locked(item));
         match self.text(&src).map_err(fail)? {
-            Some(old) => self.ensure_src(drop_in, &src, old, true),
+            Some(old) => self.ensure_entry(drop_in, entry, &src, old, true),
+            None if is_locked => self.ensure_entry(drop_in, entry, &src, String::new(), true),
             None => {
                 let mut text = rules::MANAGED.to_owned();
                 for (_, directives) in &drop_in.rules {
@@ -420,39 +451,92 @@ impl Run<'_> {
                 self.suggest(&ids, Action::Add, shown);
             }
         }
-        self.contradictions(drop_in, entry)?;
+        self.contradictions(drop_in, entry.map(|(_, i)| i));
         self.step(&ids, drop_in.marker, drop_in.script)
+    }
+
+    /// Adds the store drop-in's entry: a `[[files]]` entry, or a file task.
+    fn add_file(&mut self, drop_in: &DropIn, ids: &[&'static str]) -> Result<(), Failure> {
+        let mut table = Table::new();
+        if self.input.expanded.from_tasks {
+            let mut file = InlineTable::new();
+            file.insert("src", drop_in.store.into());
+            file.insert("dest", drop_in.dest.into());
+            file.insert("mode", "0644".into());
+            table.insert("file", toml_edit::value(file));
+            table.insert("facts", toml_edit::value(linux()));
+            let before = self
+                .marker_step(&rules::marker(drop_in.marker))
+                .and_then(|item| item.path.as_deref())
+                .and_then(top_task);
+            self.add_task(false, before, table, ids, drop_in.dest);
+            return Ok(());
+        }
+        table.insert("src", toml_edit::value(drop_in.store));
+        table.insert("dest", toml_edit::value(drop_in.dest));
+        table.insert("mode", toml_edit::value("0644"));
+        table.insert("facts", toml_edit::value(linux()));
+        let i = self.append("files", table, ids)?;
+        self.suggest(ids, Action::Add, format!("files[{i}] {}", drop_in.dest));
+        Ok(())
     }
 
     /// Rewrites lines in the other srcs of the same daemon that set an active
     /// directive to another value; unreadable or missing srcs are skipped.
-    fn contradictions(&mut self, drop_in: &DropIn, entry: Option<usize>) -> Result<(), Failure> {
-        let config = self.input.config;
-        for (i, file) in config.files.iter().enumerate() {
-            if Some(i) == entry || !drop_in.syntax.shares(&file.dest) {
+    fn contradictions(&mut self, drop_in: &DropIn, entry: Option<usize>) {
+        let expanded = self.input.expanded;
+        for (item, file, i) in expanded.files() {
+            if Some(i) == entry || !drop_in.syntax.shares(&expanded.spelled_dest(&file.dest)) {
                 continue;
             }
             if let Ok(Some(old)) = self.text(&file.src) {
-                self.ensure_src(drop_in, &file.src, old, false);
+                self.ensure_entry(drop_in, Some((item, i)), &file.src, old, false);
             }
         }
-        Ok(())
+    }
+
+    /// [`Self::ensure_src`], or a warning when the entry naming `src` lives
+    /// where harden does not write.
+    fn ensure_entry(
+        &mut self,
+        drop_in: &DropIn,
+        entry: Option<FileItem<'a>>,
+        src: &str,
+        old: String,
+        append: bool,
+    ) {
+        match entry.filter(|(item, _)| locked(item)) {
+            Some((item, i)) => {
+                let (changes, _) = changes(drop_in, &old, append);
+                if !changes.is_empty() {
+                    let lines: Vec<&str> = changes.iter().map(|(_, l)| l.as_str()).collect();
+                    let shown = self.sources.shown(src);
+                    self.unresolved(item.shown_message(format!(
+                        "{}: src {} must set {}",
+                        item.label("files", i),
+                        secret::shown_name(&shown),
+                        lines.join("; ")
+                    )));
+                }
+            }
+            None => self.ensure_src(drop_in, src, old, append),
+        }
+    }
+
+    fn unresolved(&mut self, what: String) {
+        self.unresolved = true;
+        self.warnings.push(format!(
+            "{what}; change it by hand, harden writes only the main file's top-level tasks"
+        ));
     }
 
     /// Sets every directive of `drop_in` in `src`'s text `old` (appending
     /// missing ones when `append`), one suggestion per changed directive.
     fn ensure_src(&mut self, drop_in: &DropIn, src: &str, old: String, append: bool) {
         let shown = self.sources.shown(src);
-        let mut text: Option<String> = None;
-        for (id, directives) in &drop_in.rules {
-            for (key, value) in *directives {
-                let current = text.as_deref().unwrap_or(&old);
-                if let Some(new) = drop_in.syntax.ensure(current, key, value, append) {
-                    text = Some(new);
-                    let line = drop_in.syntax.line(key, value);
-                    self.suggest(&[*id], Action::Change, format!("{shown} {line}"));
-                }
-            }
+        let (changes, text) = changes(drop_in, &old, append);
+        for (id, line) in changes {
+            self.suggest(&[id], Action::Change, format!("{shown} {line}"));
         }
         if let Some(text) = text {
             self.set_text(src, Some(old), text);
@@ -462,19 +546,86 @@ impl Run<'_> {
     /// Appends the `marker` step unless a step already starts with it.
     fn step(&mut self, ids: &[&'static str], marker: &str, script: &str) -> Result<(), Failure> {
         let marker = rules::marker(marker);
-        let exists = self.input.config.steps.iter().any(|step| {
-            step.run
-                .as_deref()
-                .is_some_and(|run| run.lines().next() == Some(marker.as_str()))
-        });
+        let exists = self.marker_step(&marker).is_some();
         if exists {
             return Ok(());
         }
         let mut table = Table::new();
         table.insert("run", toml_edit::value(script));
+        if self.input.expanded.from_tasks {
+            table.insert("facts", toml_edit::value(linux()));
+            self.add_task(true, None, table, ids, &marker);
+            return Ok(());
+        }
         let i = self.append("steps", table, ids)?;
         self.suggest(ids, Action::Add, format!("steps[{i}] {marker}"));
         Ok(())
+    }
+
+    /// The first step starting with `marker`.
+    fn marker_step(&self, marker: &str) -> Option<&'a tasks::Item> {
+        let expanded: &'a Expanded = self.input.expanded;
+        expanded.items.iter().find(|item| {
+            matches!(&item.kind, ItemKind::Step(step) if step
+                    .run
+                    .as_deref()
+                    .is_some_and(|run| run.lines().next() == Some(marker)))
+        })
+    }
+
+    /// Queues a task and its suggestion, which [`Self::add_tasks`] completes.
+    fn add_task(
+        &mut self,
+        is_step: bool,
+        before: Option<usize>,
+        table: Table,
+        ids: &[&'static str],
+        what: &str,
+    ) {
+        self.suggest(ids, Action::Add, what.to_owned());
+        self.added.push(Added {
+            is_step,
+            before,
+            table,
+            ids: ids.to_vec(),
+            suggestion: self.suggestions.len() - 1,
+        });
+    }
+
+    /// Adds the queued tasks: a file ahead of the existing step that reads it,
+    /// the rest appended files before steps as the legacy order runs them.
+    /// Inserting in ascending order keeps each index already named correct.
+    fn add_tasks(&mut self) -> Result<(), Failure> {
+        let mut added = std::mem::take(&mut self.added);
+        added.sort_by_key(|task| (task.before.unwrap_or(usize::MAX), task.is_step));
+        let mut inserted = 0;
+        for task in added {
+            let i = match task.before {
+                Some(before) => {
+                    inserted += 1;
+                    self.insert_task(before + inserted - 1, task.table, &task.ids)?
+                }
+                None => self.append("tasks", task.table, &task.ids)?,
+            };
+            let what = &mut self.suggestions[task.suggestion].what;
+            *what = format!("tasks[{i}] {what}");
+        }
+        Ok(())
+    }
+
+    /// Inserts `table` at top-level index `i` with the generated-by comment.
+    fn insert_task(&mut self, i: usize, mut table: Table, ids: &[&str]) -> Result<usize, Failure> {
+        table.decor_mut().set_prefix(added_comment("\n", ids));
+        match self.doc.get_mut("tasks") {
+            Some(Item::ArrayOfTables(tables)) => {
+                // Same position as the next task: rendering keeps array order on a tie.
+                table.set_position(tables.get(i).and_then(Table::position));
+                tables.insert(i, table);
+            }
+            Some(Item::Value(Value::Array(array))) => array.insert(i, table.into_inline_table()),
+            _ => return Err(Failure("tasks: is not an array of tables".to_string())),
+        }
+        Ok(i)
     }
 
     /// Appends `table` to the `key` array with the generated-by comment;
@@ -485,10 +636,7 @@ impl Run<'_> {
         } else {
             "\n"
         };
-        table.decor_mut().set_prefix(format!(
-            "{blank}# added by anvil config --harden ({})\n",
-            ids.join(", ")
-        ));
+        table.decor_mut().set_prefix(added_comment(blank, ids));
         match self.doc.get_mut(key) {
             None => {
                 let mut tables = ArrayOfTables::new();
@@ -508,54 +656,144 @@ impl Run<'_> {
         }
     }
 
-    /// Moves insecure names from `packages.install` to `packages.remove`.
+    /// Moves insecure names from `install` to `remove`, in `[packages]` or
+    /// the main file's top-level `packages` task; warns about any other task.
     fn packages(&mut self) -> Result<(), Failure> {
-        let Some(packages) = &self.input.config.packages else {
-            return Ok(());
-        };
-        let mut names: Vec<&str> = Vec::new();
-        for name in &packages.install {
-            if rules::INSECURE.contains(&name.as_str()) && !names.contains(&name.as_str()) {
-                names.push(name);
+        for item in &self.input.expanded.items {
+            let ItemKind::Packages(packages) = &item.kind else {
+                continue;
+            };
+            let mut names: Vec<&str> = Vec::new();
+            for name in &packages.install {
+                if rules::INSECURE.contains(&name.as_str()) && !names.contains(&name.as_str()) {
+                    names.push(name);
+                }
             }
-        }
-        if names.is_empty() {
-            return Ok(());
-        }
-        let not_array = |key: &str| Failure(format!("packages.{key}: is not an array"));
-        let table = self
-            .doc
-            .get_mut("packages")
-            .and_then(Item::as_table_like_mut)
-            .ok_or_else(|| Failure("packages: is not a table".to_string()))?;
-        let install = table
-            .get_mut("install")
-            .and_then(Item::as_array_mut)
-            .ok_or_else(|| not_array("install"))?;
-        for name in &names {
-            drop_name(install, name);
-        }
-        if table.get("remove").is_none() {
-            table.insert("remove", toml_edit::value(Array::new()));
-        }
-        let remove = table
-            .get_mut("remove")
-            .and_then(Item::as_array_mut)
-            .ok_or_else(|| not_array("remove"))?;
-        for name in &names {
-            if !remove.iter().any(|v| v.as_str() == Some(name)) {
-                remove.push(*name);
+            if names.is_empty() {
+                continue;
             }
-        }
-        for name in names {
-            self.suggest(
-                &[PACKAGES_INSECURE],
-                Action::Remove,
-                format!("{name}: packages.install -> packages.remove"),
-            );
+            let prefix = match item.path.as_deref() {
+                Some(path) => format!("{}.packages", escape_invisible(path)),
+                None => "packages".to_owned(),
+            };
+            if locked(item) {
+                self.unresolved(format!(
+                    "{prefix}: {} should move from install to remove",
+                    names.join(", ")
+                ));
+                continue;
+            }
+            let table = match item.path.as_deref().and_then(main_task) {
+                Some(i) => self
+                    .task_table(i)
+                    .and_then(|task| task.get_mut("packages"))
+                    .and_then(Item::as_table_like_mut),
+                None => self
+                    .doc
+                    .get_mut("packages")
+                    .and_then(Item::as_table_like_mut),
+            }
+            .ok_or_else(|| Failure(format!("{prefix}: is not a table")))?;
+            move_to_remove(table, &prefix, &names)?;
+            for name in names {
+                self.suggest(
+                    &[PACKAGES_INSECURE],
+                    Action::Remove,
+                    format!("{name}: {prefix}.install -> {prefix}.remove"),
+                );
+            }
         }
         Ok(())
     }
+
+    /// The main file's top-level task `i`.
+    fn task_table(&mut self, i: usize) -> Option<&mut dyn TableLike> {
+        match self.doc.get_mut("tasks")? {
+            Item::ArrayOfTables(tables) => {
+                tables.get_mut(i).map(|table| table as &mut dyn TableLike)
+            }
+            Item::Value(Value::Array(array)) => array
+                .get_mut(i)?
+                .as_inline_table_mut()
+                .map(|table| table as &mut dyn TableLike),
+            _ => None,
+        }
+    }
+}
+
+/// The directives `old` lacks, as (rule, line), and the text setting them.
+fn changes(
+    drop_in: &DropIn,
+    old: &str,
+    append: bool,
+) -> (Vec<(&'static str, String)>, Option<String>) {
+    let mut changes = Vec::new();
+    let mut text: Option<String> = None;
+    for (id, directives) in &drop_in.rules {
+        for (key, value) in *directives {
+            let current = text.as_deref().unwrap_or(old);
+            if let Some(new) = drop_in.syntax.ensure(current, key, value, append) {
+                text = Some(new);
+                changes.push((*id, drop_in.syntax.line(key, value)));
+            }
+        }
+    }
+    (changes, text)
+}
+
+fn added_comment(blank: &str, ids: &[&str]) -> String {
+    format!(
+        "{blank}# added by anvil config --harden ({})\n",
+        ids.join(", ")
+    )
+}
+
+fn linux() -> InlineTable {
+    let mut facts = InlineTable::new();
+    facts.insert("os", "Linux".into());
+    facts
+}
+
+/// The index of a task path naming a top-level task of the main file.
+fn main_task(path: &str) -> Option<usize> {
+    path.strip_prefix("tasks[")?.strip_suffix(']')?.parse().ok()
+}
+
+/// The top-level task of the main file that a task path lies under.
+fn top_task(path: &str) -> Option<usize> {
+    path.strip_prefix("tasks[")?.split(']').next()?.parse().ok()
+}
+
+/// Whether `item` lives in an include or a nested task, where harden does not write.
+fn locked(item: &tasks::Item) -> bool {
+    item.path
+        .as_deref()
+        .is_some_and(|path| main_task(path).is_none())
+}
+
+/// Moves `names` from `table`'s `install` to its `remove`, once each.
+fn move_to_remove(table: &mut dyn TableLike, prefix: &str, names: &[&str]) -> Result<(), Failure> {
+    let not_array = |key: &str| Failure(format!("{prefix}.{key}: is not an array"));
+    let install = table
+        .get_mut("install")
+        .and_then(Item::as_array_mut)
+        .ok_or_else(|| not_array("install"))?;
+    for name in names {
+        drop_name(install, name);
+    }
+    if table.get("remove").is_none() {
+        table.insert("remove", toml_edit::value(Array::new()));
+    }
+    let remove = table
+        .get_mut("remove")
+        .and_then(Item::as_array_mut)
+        .ok_or_else(|| not_array("remove"))?;
+    for name in names {
+        if !remove.iter().any(|v| v.as_str() == Some(name)) {
+            remove.push(*name);
+        }
+    }
+    Ok(())
 }
 
 /// Removes every `name` from `array`, keeping the opening layout when the
@@ -606,6 +844,7 @@ mod tests {
             suggest(&Input {
                 text,
                 config: &config,
+                expanded: &tasks::expand(&config, || Ok(self.0.clone())).unwrap(),
                 inventory: &inventory,
                 workspace: &self.0,
                 strict,
@@ -1017,6 +1256,43 @@ install = [\"telnet\", \"git\"] # trailing
     }
 
     #[test]
+    fn an_unreadable_tasks_src_shows_bidi_as_an_escape_and_a_legacy_one_as_it_is() {
+        let ws = Workspace::new();
+        let src = "a\u{202e}b.conf";
+        fs::create_dir_all(ws.0.join(src)).unwrap();
+        let inventory = Inventory::default();
+        let fails = |text: &str, config: &Config, expanded: &Expanded| {
+            suggest(&Input {
+                text,
+                config,
+                expanded,
+                inventory: &inventory,
+                workspace: &ws.0,
+                strict: false,
+            })
+            .unwrap_err()
+            .to_string()
+        };
+        let dest = rules::SSHD_DEST;
+        let text = format!(
+            "[[tasks]]\nfile = {{ src = \"{src}\", dest = \"{dest}\", mode = \"0600\" }}\n"
+        );
+        let config: Config = toml::from_str(&text).unwrap();
+        let expanded = tasks::expand(&config, || Ok(ws.0.clone())).unwrap();
+        assert_eq!(
+            fails(&text, &config, &expanded),
+            "tasks[0].file.src `a\\u{202e}b.conf`: is not a regular file"
+        );
+
+        let text = format!("[[files]]\nsrc = \"{src}\"\ndest = \"{dest}\"\n");
+        let config: Config = toml::from_str(&text).unwrap();
+        assert_eq!(
+            fails(&text, &config, &tasks::legacy(&config)),
+            format!("files[0].src `{src}`: is not a regular file")
+        );
+    }
+
+    #[test]
     fn an_unparsable_config_or_unreadable_src_fails() {
         let ws = Workspace::new();
         let config = Config::default();
@@ -1024,6 +1300,7 @@ install = [\"telnet\", \"git\"] # trailing
         let input = Input {
             text: "[[files]",
             config: &config,
+            expanded: &tasks::legacy(&config),
             inventory: &inventory,
             workspace: &ws.0,
             strict: false,
@@ -1039,6 +1316,7 @@ install = [\"telnet\", \"git\"] # trailing
         let err = suggest(&Input {
             text: &text,
             config: &config,
+            expanded: &tasks::legacy(&config),
             inventory: &inventory,
             workspace: &ws.0,
             strict: false,
@@ -1062,6 +1340,7 @@ install = [\"telnet\", \"git\"] # trailing
             let err = suggest(&Input {
                 text: &text,
                 config: &config,
+                expanded: &tasks::legacy(&config),
                 inventory: &inventory,
                 workspace: &ws.0,
                 strict: false,
@@ -1083,6 +1362,7 @@ install = [\"telnet\", \"git\"] # trailing
         let err = suggest(&Input {
             text: &text,
             config: &config,
+            expanded: &tasks::legacy(&config),
             inventory: &inventory,
             workspace: &ws.0,
             strict: false,

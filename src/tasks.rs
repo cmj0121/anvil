@@ -1,6 +1,7 @@
 //! The ordered list a run follows: legacy sections in their fixed order, or
 //! `[[tasks]]` with nesting and `$/` includes flattened, inheriting selectors.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -86,12 +87,28 @@ impl Expanded {
         }
     }
 
+    /// `dest` as [`Self::same_dest`] reads it for a prefix test: on a tasks
+    /// config with repeated slashes collapsed, on a legacy one as spelled.
+    pub fn spelled_dest<'a>(&self, dest: &'a str) -> Cow<'a, str> {
+        if !self.from_tasks || !dest.contains("//") {
+            return Cow::Borrowed(dest);
+        }
+        let mut collapsed = String::with_capacity(dest.len());
+        for c in dest.chars() {
+            if c != '/' || !collapsed.ends_with('/') {
+                collapsed.push(c);
+            }
+        }
+        Cow::Owned(collapsed)
+    }
+
     /// The file entry with this ordinal.
     pub fn file(&self, ordinal: usize) -> Option<&FileEntry> {
         self.files()
             .find(|(_, _, found)| *found == ordinal)
             .map(|(_, entry, _)| entry)
     }
+
     /// The sudo secrets a step may type on a target its tags reach: for a
     /// package item, a `sudo = true` file item or a service item.
     pub fn sudo_secrets<'a>(

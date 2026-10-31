@@ -1043,3 +1043,77 @@ fn config_full_relative_config_keeps_the_workspace() {
         assert!(!saved.contains("workspace"), "{saved}");
     }
 }
+
+const TASKS_BROKEN: &str = "[[tasks]]\ninclude = \"$/gone.toml\"\n";
+
+#[test]
+fn config_opens_with_a_broken_include_and_an_unchanged_buffer_writes_nothing() {
+    let sb = sandbox();
+    let path = sb.put("config.toml", TASKS_BROKEN);
+    let out = sb.edit(&["config"], None, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(sb.calls(), 1);
+    assert!(sb.seen(1).contains(TASKS_BROKEN), "{}", sb.seen(1));
+    assert!(text(&out.stdout).ends_with("unchanged\n"));
+    assert_eq!(fs::read_to_string(path).unwrap(), TASKS_BROKEN);
+}
+
+#[test]
+fn config_save_refuses_a_missing_include_through_the_invalid_flow() {
+    let sb = sandbox();
+    let original = "[[tasks]]\nrun = \"echo hi\"\n";
+    let path = sb.put("config.toml", original);
+    let content = sb.put("content.toml", TASKS_BROKEN);
+    let out = sb.edit(&["config"], Some(&content), None);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert_eq!(sb.calls(), 3);
+    assert_eq!(sb.seen(3), TASKS_BROKEN);
+    assert!(
+        stderr.contains("tasks[0].include `$/gone.toml`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("config: still invalid after 3 attempts"));
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
+}
+
+#[test]
+fn config_save_writes_as_typed_and_leaves_the_include_alone() {
+    let sb = sandbox();
+    let include = "# role\n[[tasks]]\nrun = \"echo inner\"\n";
+    let included = sb.config_dir().join("files/base.toml");
+    fs::create_dir_all(included.parent().unwrap()).unwrap();
+    fs::write(&included, include).unwrap();
+    fs::set_permissions(&included, fs::Permissions::from_mode(0o644)).unwrap();
+    let path = sb.put("config.toml", "");
+    let typed = "# mine\n[[tasks]]\ninclude = \"$/base.toml\"\n";
+    let content = sb.put("content.toml", typed);
+
+    let out = sb.edit(&["config"], Some(&content), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(fs::read_to_string(&path).unwrap(), typed);
+    assert_eq!(fs::read_to_string(&included).unwrap(), include);
+
+    let yaml = sb.put("content.yaml", "tasks:\n  - include: $/base.toml\n");
+    let out = sb.edit(&["config", "--format", "yaml"], Some(&yaml), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let saved = fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("include = \"$/base.toml\""), "{saved}");
+    assert!(
+        !saved.contains("echo inner") && !saved.contains("steps"),
+        "{saved}"
+    );
+    assert_eq!(fs::read_to_string(&included).unwrap(), include);
+}
+
+#[test]
+fn config_full_save_refuses_a_missing_include_too() {
+    let sb = sandbox();
+    let original = "[[tasks]]\nrun = \"echo hi\"\n";
+    let path = sb.put("config.toml", original);
+    let content = sb.put("content.toml", TASKS_BROKEN);
+    let out = sb.edit(&["config", "--full"], Some(&content), None);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(sb.calls(), 3);
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
+}
