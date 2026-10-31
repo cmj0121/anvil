@@ -247,8 +247,7 @@ pub fn would_text(step: &PlannedRun) -> String {
         .map(|name| format!(" (sudo password from secret {name})"))
         .unwrap_or_default();
     let from = step
-        .plugin
-        .as_ref()
+        .plugin()
         .map(|name| format!(" (from plugin {name})"))
         .unwrap_or_default();
     format!("would $ {}{secret}{from}", apply::command(step.shown()))
@@ -270,6 +269,7 @@ pub(crate) fn render_summary(targets: usize, failed: usize, style: Style) -> Str
 
 #[cfg(test)]
 mod tests {
+    use crate::apply::RunKind;
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -550,31 +550,30 @@ mod tests {
                     run: one_liner.to_owned().into(),
                     label: None,
                     sudo_secret: Some("LOCAL_SUDO".to_owned()),
-                    plugin: None,
                     timeout: git().timeout(),
-                    file: None,
-                    package_manager: Some(Manager::Pacman),
-                    service: None,
+                    kind: RunKind::Packages {
+                        manager: Manager::Pacman,
+                    },
                 },
                 PlannedRun {
                     run: "one".to_owned().into(),
                     label: None,
                     sudo_secret: None,
-                    plugin: None,
                     timeout: RUN_TIMEOUT,
-                    file: None,
-                    package_manager: None,
-                    service: None,
+                    kind: RunKind::Step {
+                        number: 1,
+                        plugin: None,
+                    },
                 },
                 PlannedRun {
                     run: "two".to_owned().into(),
                     label: None,
                     sudo_secret: None,
-                    plugin: None,
                     timeout: RUN_TIMEOUT,
-                    file: None,
-                    package_manager: None,
-                    service: None,
+                    kind: RunKind::Step {
+                        number: 2,
+                        plugin: None,
+                    },
                 },
             ],
             ok: true,

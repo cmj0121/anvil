@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use crate::apply::{self, PlannedRun, Report, TargetReport};
+use crate::apply::{self, PlannedRun, Report, RunKind, TargetReport};
 use crate::cli::{Cli, Failure};
 use crate::document::{MAX_BYTES, read_capped_from};
 use crate::interrupt::Interrupt;
@@ -40,11 +40,8 @@ pub fn run_targets(
         run: wrap(&script).into(),
         label: Some(script),
         sudo_secret: None,
-        plugin: None,
         timeout,
-        file: None,
-        package_manager: None,
-        service: None,
+        kind: RunKind::Script,
     }];
     let cancel = &opts.cancel;
     Ok(apply::for_each_target(

@@ -14,7 +14,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::apply::{PlannedRun, ServiceRun};
+use crate::apply::{PlannedRun, RunKind, ServiceRun};
 use crate::config::{Config, ServiceState, check_service_name};
 use crate::facts::Facts;
 use crate::files::{self, quote};
@@ -79,6 +79,7 @@ pub fn runs(
         if !files::matches(&entry.tags, &entry.facts, target, facts) {
             log::info!("{}: services[{i}] {name}: no match", target.name);
             runs.push(service_run(
+                name,
                 String::new(),
                 format!("skipped service {name}: no match"),
                 None,
@@ -105,6 +106,7 @@ pub fn runs(
             None => log::info!("{}: services[{i}] {name} with {init}", target.name),
         }
         runs.push(service_run(
+            name,
             script(init, name, state, entry.enabled, sudo, LAUNCH_DAEMONS),
             format!("service {name}"),
             secret.map(str::to_owned),
@@ -147,16 +149,22 @@ fn root_access<'a>(
     }
 }
 
-fn service_run(run: String, label: String, sudo_secret: Option<String>, skip: bool) -> PlannedRun {
+fn service_run(
+    name: &str,
+    run: String,
+    label: String,
+    sudo_secret: Option<String>,
+    skip: bool,
+) -> PlannedRun {
     PlannedRun {
         run: run.into(),
         label: Some(label),
         sudo_secret,
-        plugin: None,
         timeout: if skip { RUN_TIMEOUT } else { SERVICE_TIMEOUT },
-        file: None,
-        package_manager: None,
-        service: Some(ServiceRun { skip }),
+        kind: RunKind::Service {
+            name: name.to_owned(),
+            run: ServiceRun { skip },
+        },
     }
 }
 

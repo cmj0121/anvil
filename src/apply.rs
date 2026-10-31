@@ -82,42 +82,79 @@ fn sudo_password<'a>(
 }
 
 /// A step apply would run: its one-line script, the secret whose password
-/// is typed when it runs through sudo with a password, the plugin that
-/// returned it, and its time limit. It serializes as the user sees it:
-/// `run` is the label when there is one.
+/// is typed when it runs through sudo with a password, its time limit, and
+/// what kind of step it is. It serializes as the user sees it: `run` is the
+/// label when there is one.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PlannedRun {
-    /// Set only for the package step, for marker extraction.
-    pub package_manager: Option<packages::Manager>,
     /// Zeroed when dropped: a `[[files]]` step's carries the file's bytes.
     pub run: Zeroizing<String>,
     /// What the step's report shows instead of `run`, when what is sent
     /// differs from what the user wrote.
     pub label: Option<String>,
     pub sudo_secret: Option<String>,
-    pub plugin: Option<String>,
     pub timeout: Duration,
-    /// Set for a `[[files]]` step, whose `run` carries the file's bytes.
-    pub file: Option<FileRun>,
-    /// Set for a `[[services]]` step.
-    pub service: Option<ServiceRun>,
+    pub kind: RunKind,
+}
+
+/// What a run does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunKind {
+    /// The package step; `manager` is for marker extraction.
+    Packages { manager: packages::Manager },
+    /// A `[[files]]` step, whose `run` carries the file's bytes; also a
+    /// rollback restore, and a rollback note, which is always a skip and has
+    /// `dest` `""`.
+    File { dest: String, run: FileRun },
+    /// A `[[services]]` step.
+    Service { name: String, run: ServiceRun },
+    /// A `[[steps]]` entry, 1-based among them, and the plugin that returned it.
+    Step {
+        number: usize,
+        plugin: Option<String>,
+    },
+    /// `anvil run`: no config entry.
+    Script,
+}
+
+impl RunKind {
+    pub fn entry(&self) -> Entry {
+        match self {
+            RunKind::Packages { .. } => Entry::Packages,
+            RunKind::File { dest, .. } => Entry::File { dest: dest.clone() },
+            RunKind::Service { name, .. } => Entry::Service { name: name.clone() },
+            RunKind::Step { number, .. } => Entry::Step { number: *number },
+            RunKind::Script => Entry::Script,
+        }
+    }
+}
+
+/// Which config entry a report belongs to. Never serialized. Rollback
+/// restores and notes are `File` too; a note's `dest` is `""`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Entry {
+    Packages,
+    File { dest: String },
+    Service { name: String },
+    Step { number: usize },
+    Script,
 }
 
 /// By hand: a `[[files]]` step's `run` is shown only by its length.
 impl std::fmt::Debug for PlannedRun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = f.debug_struct("PlannedRun");
-        match self.file {
+        match self.file() {
             Some(_) => debug.field("run", &Redacted(self.run.len())),
             None => debug.field("run", &*self.run),
         };
         debug
             .field("label", &self.label)
             .field("sudo_secret", &self.sudo_secret)
-            .field("plugin", &self.plugin)
+            .field("plugin", &self.plugin())
             .field("timeout", &self.timeout)
-            .field("file", &self.file)
-            .field("service", &self.service)
+            .field("file", &self.file())
+            .field("service", &self.service())
             .finish()
     }
 }
@@ -172,6 +209,28 @@ impl PlannedRun {
     pub fn shown(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.run)
     }
+
+    /// The plugin that returned this step, if one did.
+    pub fn plugin(&self) -> Option<&str> {
+        match &self.kind {
+            RunKind::Step { plugin, .. } => plugin.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn file(&self) -> Option<&FileRun> {
+        match &self.kind {
+            RunKind::File { run, .. } => Some(run),
+            _ => None,
+        }
+    }
+
+    fn service(&self) -> Option<&ServiceRun> {
+        match &self.kind {
+            RunKind::Service { run, .. } => Some(run),
+            _ => None,
+        }
+    }
 }
 
 impl Serialize for PlannedRun {
@@ -187,7 +246,7 @@ impl Serialize for PlannedRun {
         Shown {
             run: self.shown(),
             sudo_secret: self.sudo_secret.as_deref(),
-            plugin: self.plugin.as_deref(),
+            plugin: self.plugin(),
         }
         .serialize(serializer)
     }
@@ -204,27 +263,31 @@ pub struct StepReport {
     /// nothing ran.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skipped: bool,
+    #[serde(skip)]
+    pub entry: Entry,
 }
 
 impl StepReport {
-    fn from_output(run: &str, output: Output) -> StepReport {
+    fn from_output(run: &str, output: Output, entry: Entry) -> StepReport {
         StepReport {
             run: run.to_owned(),
             code: output.code,
             stdout: into_string(output.stdout),
             stderr: into_string(output.stderr),
             skipped: false,
+            entry,
         }
     }
 
     /// A step that ran nothing and passed.
-    pub(crate) fn skipped(run: &str) -> StepReport {
+    pub(crate) fn skipped(run: &str, entry: Entry) -> StepReport {
         StepReport {
             run: run.to_owned(),
             code: Some(0),
             stdout: String::new(),
             stderr: String::new(),
             skipped: true,
+            entry,
         }
     }
 }
@@ -285,7 +348,7 @@ impl TargetReport {
             } => (steps, warnings),
         };
         for (step, run) in steps.iter_mut().zip(runs) {
-            if let Some(manager) = run.package_manager {
+            if let RunKind::Packages { manager } = run.kind {
                 let mut names = packages::take_unknown(&mut step.stdout);
                 for name in packages::take_unknown(&mut step.stderr) {
                     if !names.contains(&name) {
@@ -798,24 +861,21 @@ fn apply_target(
         None
     };
     let mut recorder = Recorder::new(config, sources);
-    let (report, runs) = match resolve(target, facts.as_ref(), config, sources, plugins, cancel) {
-        Ok(runs) => {
-            let report = execute(
-                "apply",
-                target,
-                transport.as_ref(),
-                &runs,
-                passwords,
-                cancel,
-                Some(&mut recorder),
-            );
-            (report, runs)
-        }
-        Err(Unresolved::Failed(error)) => (failed("apply", target, Vec::new(), error), Vec::new()),
-        Err(Unresolved::Cancelled) => (cancelled("apply", target, Vec::new()), Vec::new()),
+    let report = match resolve(target, facts.as_ref(), config, sources, plugins, cancel) {
+        Ok(runs) => execute(
+            "apply",
+            target,
+            transport.as_ref(),
+            &runs,
+            passwords,
+            cancel,
+            Some(&mut recorder),
+        ),
+        Err(Unresolved::Failed(error)) => failed("apply", target, Vec::new(), error),
+        Err(Unresolved::Cancelled) => cancelled("apply", target, Vec::new()),
     };
     let reached = facts.map(|facts| {
-        let cannot_undo = cannot_undo(config, &runs, report.steps());
+        let cannot_undo = cannot_undo(report.steps());
         recorder.finish(facts, report.ok(), cannot_undo)
     });
     Applied { report, reached }
@@ -857,25 +917,17 @@ impl<'a> Recorder<'a> {
     }
 }
 
-/// The steps among `runs` that ran (one report each, in order) and that a
-/// rollback cannot undo: `packages`, `service NAME` and `step N` (1-based
-/// among `[[steps]]`), never a skip. `runs` is [`resolve`]'s list: the
-/// package step, if any, then one step per `[[files]]`, `[[services]]` and
-/// `[[steps]]` entry.
-fn cannot_undo(config: &Config, runs: &[PlannedRun], steps: &[StepReport]) -> Vec<String> {
-    let entries = config.files.len() + config.services.len() + config.steps.len();
-    let packages = runs.len().saturating_sub(entries);
-    let services = packages + config.files.len();
-    let entries = services + config.services.len();
+/// The steps that ran and that a rollback cannot undo: `packages`,
+/// `service NAME` and `step N` (1-based among `[[steps]]`), never a skip.
+fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
     steps
         .iter()
-        .enumerate()
-        .filter(|(_, step)| !step.skipped)
-        .filter_map(|(i, _)| match i {
-            _ if i < packages => Some("packages".to_owned()),
-            _ if i < services => None,
-            _ if i < entries => Some(format!("service {}", config.services[i - services].name)),
-            _ => Some(format!("step {}", i - entries + 1)),
+        .filter(|step| !step.skipped)
+        .filter_map(|step| match &step.entry {
+            Entry::Packages => Some("packages".to_owned()),
+            Entry::Service { name } => Some(format!("service {name}")),
+            Entry::Step { number } => Some(format!("step {number}")),
+            Entry::File { .. } | Entry::Script => None,
         })
         .collect()
 }
@@ -937,22 +989,20 @@ fn execute_inner(
         if cancel.load(Ordering::Relaxed) {
             return cancelled(command, target, reports);
         }
-        let prefix = match (&planned.file, &planned.service) {
-            (Some(_), _) => "files",
-            (_, Some(_)) => "services",
-            _ => "packages",
-        };
         // A sudo error on a plain step reads "packages", as before.
-        let kind = match planned.package_manager {
-            None if prefix == "packages" => "step",
-            _ => prefix,
+        let (prefix, kind) = match &planned.kind {
+            RunKind::File { .. } => ("files", "files"),
+            RunKind::Service { .. } => ("services", "services"),
+            RunKind::Packages { .. } => ("packages", "packages"),
+            RunKind::Step { .. } | RunKind::Script => ("packages", "step"),
         };
         status::phase(&target.name, status::Phase::Run { kind, n: n + 1, of });
         let label = planned.shown();
-        if planned.file.as_ref().is_some_and(|file| file.skip)
-            || planned.service.as_ref().is_some_and(|service| service.skip)
+        let entry = planned.kind.entry();
+        if planned.file().is_some_and(|file| file.skip)
+            || planned.service().is_some_and(|service| service.skip)
         {
-            reports.push(StepReport::skipped(label));
+            reports.push(StepReport::skipped(label, entry));
             continue;
         }
         let password = match planned.sudo_secret.as_deref() {
@@ -963,8 +1013,8 @@ fn execute_inner(
             },
         };
         let (mut run, timeout) = (planned.run.as_str(), planned.timeout);
-        let mut upload = planned.file.as_ref().and_then(|file| file.upload.as_ref());
-        let write = planned.file.as_ref().and_then(|file| file.write.as_ref());
+        let mut upload = planned.file().and_then(|file| file.upload.as_ref());
+        let write = planned.file().and_then(|file| file.write.as_ref());
         let rebuilt;
         let mut captured = None;
         if let (Some(recorder), Some(write)) = (recorder.as_deref_mut(), write) {
@@ -973,6 +1023,7 @@ fn execute_inner(
                 Err(Uncaptured::Step(step)) => {
                     reports.push(StepReport {
                         run: label.to_owned(),
+                        entry,
                         ..step
                     });
                     ok = false;
@@ -1061,7 +1112,7 @@ fn execute_inner(
                     ..
                 } = err
                 {
-                    reports.push(StepReport::from_output(label, *output));
+                    reports.push(StepReport::from_output(label, *output, entry));
                 }
                 return failed(command, target, reports, error);
             }
@@ -1070,7 +1121,7 @@ fn execute_inner(
         if succeeded && output.truncated {
             log::warn!("{command} {}: step output cut at 1 MiB", target.name);
         }
-        reports.push(StepReport::from_output(label, output));
+        reports.push(StepReport::from_output(label, output, entry));
         if !succeeded {
             ok = false;
             break;
@@ -1138,6 +1189,9 @@ fn capture(
             stdout: String::new(),
             stderr,
             skipped: false,
+            entry: Entry::File {
+                dest: write.dest.clone(),
+            },
         })
     };
     if output.code != Some(0) {
@@ -1340,18 +1394,16 @@ pub fn resolve(
                 run: run.into(),
                 label: None,
                 sudo_secret: sudo_secret.map(str::to_owned),
-                plugin: None,
                 timeout: packages.timeout(),
-                file: None,
-                package_manager: Some(manager),
-                service: None,
+                kind: RunKind::Packages { manager },
             });
         }
     }
     runs.extend(files::runs(config, sources, target, facts)?);
     runs.extend(services::runs(config, target, facts)?);
     let no_args = serde_json::Map::new();
-    for step in &config.steps {
+    for (i, step) in config.steps.iter().enumerate() {
+        let number = i + 1;
         match step.kind() {
             StepKind::Plugin(name) => {
                 if cancel.load(Ordering::Relaxed) {
@@ -1370,22 +1422,22 @@ pub fn resolve(
                     run: crate::run::wrap(&script).into(),
                     label: Some(script),
                     sudo_secret: None,
-                    plugin: Some(name.to_owned()),
                     timeout: RUN_TIMEOUT,
-                    file: None,
-                    package_manager: None,
-                    service: None,
+                    kind: RunKind::Step {
+                        number,
+                        plugin: Some(name.to_owned()),
+                    },
                 });
             }
             StepKind::Run(run) => runs.push(PlannedRun {
                 run: run.to_owned().into(),
                 label: None,
                 sudo_secret: None,
-                plugin: None,
                 timeout: RUN_TIMEOUT,
-                file: None,
-                package_manager: None,
-                service: None,
+                kind: RunKind::Step {
+                    number,
+                    plugin: None,
+                },
             }),
         }
     }
@@ -1914,6 +1966,16 @@ mod tests {
         (out, err)
     }
 
+    /// The report of the `[[files]]` step that writes `/etc/b.conf`.
+    fn file_step(code: Option<i32>, stdout: &str, stderr: &str) -> StepReport {
+        StepReport {
+            entry: Entry::File {
+                dest: "/etc/b.conf".to_owned(),
+            },
+            ..step("file /etc/b.conf", code, stdout, stderr)
+        }
+    }
+
     fn step(run: &str, code: Option<i32>, stdout: &str, stderr: &str) -> StepReport {
         StepReport {
             run: run.to_owned(),
@@ -1921,6 +1983,7 @@ mod tests {
             stdout: stdout.to_owned(),
             stderr: stderr.to_owned(),
             skipped: false,
+            entry: Entry::Script,
         }
     }
 
@@ -2539,7 +2602,9 @@ mod tests {
             }
         }
         let mut package = planned("package", None, RUN_TIMEOUT);
-        package.package_manager = Some(packages::Manager::Pacman);
+        package.kind = RunKind::Packages {
+            manager: packages::Manager::Pacman,
+        };
         let runs = [package, planned("user", None, RUN_TIMEOUT)];
         let warning = "packages: not found by pacman: nvim, watch (add [packages.alias.NAME])";
         for (code, timeout) in [(0, false), (7, false), (0, true)] {
@@ -2927,7 +2992,10 @@ mod tests {
         assert!(report.ok());
         assert_eq!(
             report.steps()[0],
-            step(one_liner, Some(0), "tty-out\n", "ssh-err\n"),
+            StepReport {
+                entry: Entry::Packages,
+                ..step(one_liner, Some(0), "tty-out\n", "ssh-err\n")
+            },
             "the $ line is the one-liner, not the wrapper"
         );
         let shown = screen(&report, piped());
@@ -3091,16 +3159,24 @@ mod tests {
         Facts::parse(probe.as_bytes()).unwrap()
     }
 
+    /// What [`resolve`] builds for the `number`th `[[steps]]` entry `run`.
+    fn config_step(number: usize, run: &str) -> PlannedRun {
+        PlannedRun {
+            kind: RunKind::Step {
+                number,
+                plugin: None,
+            },
+            ..planned(run, None, RUN_TIMEOUT)
+        }
+    }
+
     fn planned(run: &str, sudo_secret: Option<&str>, timeout: Duration) -> PlannedRun {
         PlannedRun {
             run: run.to_owned().into(),
             label: None,
             sudo_secret: sudo_secret.map(str::to_owned),
-            plugin: None,
             timeout,
-            file: None,
-            package_manager: None,
-            service: None,
+            kind: RunKind::Script,
         }
     }
 
@@ -3130,10 +3206,7 @@ mod tests {
         let none = config(None, &["one", "two"]);
         assert_eq!(
             resolved(&target("box"), None, &none).unwrap(),
-            [
-                planned("one", None, RUN_TIMEOUT),
-                planned("two", None, RUN_TIMEOUT)
-            ],
+            [config_step(1, "one"), config_step(2, "two")],
             "without package work no facts are needed"
         );
 
@@ -3172,7 +3245,9 @@ mod tests {
                 ),
             ),
         ] {
-            step.package_manager = Some(packages::Manager::Pacman);
+            step.kind = RunKind::Packages {
+                manager: packages::Manager::Pacman,
+            };
             assert_eq!(
                 resolved(
                     &target("local"),
@@ -3180,7 +3255,7 @@ mod tests {
                     &config(Some(&pkgs), &["one"])
                 )
                 .unwrap(),
-                [step, planned("one", None, RUN_TIMEOUT)],
+                [step, config_step(1, "one")],
                 "{probe}"
             );
         }
@@ -3209,16 +3284,16 @@ mod tests {
         config
     }
 
-    fn from_plugin(name: &str, script: &str) -> PlannedRun {
+    fn from_plugin(number: usize, name: &str, script: &str) -> PlannedRun {
         PlannedRun {
             run: crate::run::wrap(script).into(),
             label: Some(script.to_owned()),
             sudo_secret: None,
-            plugin: Some(name.to_owned()),
             timeout: RUN_TIMEOUT,
-            file: None,
-            package_manager: None,
-            service: None,
+            kind: RunKind::Step {
+                number,
+                plugin: Some(name.to_owned()),
+            },
         }
     }
 
@@ -3244,10 +3319,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             runs,
-            [
-                planned("one", None, RUN_TIMEOUT),
-                from_plugin("harden", "hostname")
-            ]
+            [config_step(1, "one"), from_plugin(2, "harden", "hostname")]
         );
         assert_eq!(*runs[1].run, crate::run::wrap("hostname"));
         assert_eq!(
@@ -3725,6 +3797,9 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
                 skipped: true,
+                entry: Entry::File {
+                    dest: "/etc/b.conf".to_owned(),
+                },
             }
         );
         let value = json(&report);
@@ -3742,7 +3817,12 @@ mod tests {
         let report = TargetReport::Ran {
             warnings: Vec::new(),
             target: "pi".to_owned(),
-            steps: vec![StepReport::skipped("skipped file /etc/b.conf: no match")],
+            steps: vec![StepReport::skipped(
+                "skipped file /etc/b.conf: no match",
+                Entry::File {
+                    dest: "/etc/b.conf".to_owned(),
+                },
+            )],
             ok: true,
         };
         assert_eq!(
@@ -3851,7 +3931,7 @@ mod tests {
         assert_eq!(typed, [PASSWORD.as_bytes()]);
         assert_eq!(
             report.steps()[0],
-            step("file /etc/b.conf", Some(0), "tty-out\n", "ssh-err\n")
+            file_step(Some(0), "tty-out\n", "ssh-err\n")
         );
         let shown = json(&report).to_string();
         assert!(
@@ -3871,12 +3951,7 @@ mod tests {
         assert_eq!(report.failure().unwrap(), "step 1 exited 1");
         assert_eq!(
             report.steps(),
-            [step(
-                "file /etc/b.conf",
-                Some(1),
-                "",
-                "files: could not stage the file\n"
-            )],
+            [file_step(Some(1), "", "files: could not stage the file\n")],
             "not what the shell printed, which names the temp file"
         );
         assert_eq!(runs.len(), 3, "probe, stage, cleanup: {runs:?}");
@@ -4044,7 +4119,7 @@ mod tests {
         temp_of(&runs[3]);
         assert_eq!(
             report.steps(),
-            [step("file /etc/b.conf", Some(0), "tty-out\n", "ssh-err\n")]
+            [file_step(Some(0), "tty-out\n", "ssh-err\n")]
         );
         assert_eq!(
             report.failure().unwrap(),
@@ -4658,7 +4733,10 @@ mod tests {
                 },
                 &mut |_| {},
             );
-            let ran = step("meet", Some(0), "meet-out\n", "");
+            let ran = StepReport {
+                entry: Entry::Step { number: 1 },
+                ..step("meet", Some(0), "meet-out\n", "")
+            };
             let expected: Vec<TargetReport> = [("a", true), ("b", parallel == 2), ("c", false)]
                 .into_iter()
                 .map(|(name, started)| TargetReport::Cancelled {
@@ -4671,6 +4749,67 @@ mod tests {
             assert_eq!(report.targets, expected, "--parallel {parallel}");
             assert_eq!(built, parties, "no transport after cancel");
         }
+    }
+
+    #[test]
+    fn reports_name_their_entries_whatever_the_order_of_the_runs() {
+        let kinded = |run: &str, kind: RunKind| PlannedRun {
+            kind,
+            ..planned(run, None, RUN_TIMEOUT)
+        };
+        let step_kind = |number| RunKind::Step {
+            number,
+            plugin: None,
+        };
+        let service = |name: &str, skip| RunKind::Service {
+            name: name.to_owned(),
+            run: ServiceRun { skip },
+        };
+        let runs = [
+            kinded("two", step_kind(2)),
+            kinded("up", service("sshd", false)),
+            kinded(
+                "write",
+                RunKind::File {
+                    dest: "/etc/a".to_owned(),
+                    run: FileRun {
+                        upload: None,
+                        skip: false,
+                        write: None,
+                    },
+                },
+            ),
+            kinded("", service("cron", true)),
+            kinded(
+                "install",
+                RunKind::Packages {
+                    manager: packages::Manager::Pacman,
+                },
+            ),
+            kinded("one", step_kind(1)),
+            kinded("script", RunKind::Script),
+        ];
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let report = execute(
+            "apply",
+            &target("box"),
+            &Fake::new(&log),
+            &runs,
+            &Passwords::new(),
+            &AtomicBool::new(false),
+            None,
+        );
+        let entries: Vec<_> = report.steps().iter().map(|s| s.entry.clone()).collect();
+        let expected: Vec<_> = runs.iter().map(|run| run.kind.entry()).collect();
+        assert_eq!(entries, expected);
+        assert_eq!(
+            cannot_undo(report.steps()),
+            ["step 2", "service sshd", "packages", "step 1"]
+        );
+        assert!(
+            !json(&report).to_string().contains("entry"),
+            "never serialized"
+        );
     }
 
     #[test]
@@ -5195,6 +5334,9 @@ mod tests {
                     stdout: String::new(),
                     stderr: stderr.to_owned(),
                     skipped: false,
+                    entry: Entry::File {
+                        dest: "/etc/a.conf".to_owned(),
+                    },
                 }]
             );
             let reached = applied.reached.unwrap();

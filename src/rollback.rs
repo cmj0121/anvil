@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use crate::apply::{
-    self, Escape, Line, Passwords, PlannedRun, Progress, Report, Style, TargetReport, Unresolved,
-    print_lines,
+    self, Entry, Escape, Line, Passwords, PlannedRun, Progress, Report, StepReport, Style,
+    TargetReport, Unresolved, print_lines,
 };
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
@@ -240,7 +240,7 @@ fn nothing_recorded(target: &Target) -> TargetReport {
     TargetReport::Ran {
         warnings: Vec::new(),
         target: target.name.clone(),
-        steps: vec![apply::StepReport::skipped(NOTHING)],
+        steps: vec![apply::StepReport::skipped(NOTHING, Entry::Script)],
         ok: true,
     }
 }
@@ -296,7 +296,6 @@ fn roll_back(
             Ok(runs) => runs,
             Err(error) => return failed(error),
         };
-    let restores = runs.len();
     runs.extend(entry.cannot_undo.iter().map(|what| cannot_undo(what)));
     let report = apply::execute(
         "rollback",
@@ -307,15 +306,7 @@ fn roll_back(
         cancel,
         None,
     );
-    // restore_runs lists the files last written first.
-    let dests: Vec<String> = report
-        .steps()
-        .iter()
-        .take(restores)
-        .zip(entry.files.iter().rev())
-        .filter(|(step, _)| !step.skipped && step.code == Some(0))
-        .map(|(_, file)| file.dest.clone())
-        .collect();
+    let dests = restored(report.steps());
     let rolled_back = (!dests.is_empty()).then(|| RolledBack {
         at: record::now(),
         dests,
@@ -324,6 +315,19 @@ fn roll_back(
         report,
         rolled_back,
     }
+}
+
+/// The dests of the file steps that passed. A note's `dest` is `""` and it is
+/// always a skip, so the `!step.skipped` filter is what keeps it out.
+fn restored(steps: &[StepReport]) -> Vec<String> {
+    steps
+        .iter()
+        .filter(|step| !step.skipped && step.code == Some(0))
+        .filter_map(|step| match &step.entry {
+            Entry::File { dest } => Some(dest.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Refuses `entry` unless each of its files is the dest of a `[[files]]`
@@ -375,7 +379,7 @@ fn check_files(
 
 /// A step that only shows `cannot undo: WHAT`.
 fn cannot_undo(what: &str) -> PlannedRun {
-    files::skip_run(format!("cannot undo: {what}"))
+    files::skip_run("", format!("cannot undo: {what}"))
 }
 
 /// The refusal when `live` is not the host `recorded` is from: the
@@ -566,6 +570,29 @@ mod tests {
                 .unwrap()
                 .contains("now host unknown, the record is from unknown")
         );
+    }
+
+    #[test]
+    fn restored_reads_the_dest_of_each_passed_file_step_in_any_order() {
+        let step = |dest: Option<&str>, code, skipped| StepReport {
+            run: String::new(),
+            code,
+            stdout: String::new(),
+            stderr: String::new(),
+            skipped,
+            entry: dest.map_or(Entry::Script, |dest| Entry::File {
+                dest: dest.to_owned(),
+            }),
+        };
+        let steps = [
+            step(None, Some(0), false),
+            step(Some("/etc/c"), Some(0), false),
+            step(Some("/etc/kept-out"), Some(0), true),
+            step(Some("/etc/a"), Some(0), false),
+            step(Some("/etc/failed"), Some(1), false),
+            step(Some("/etc/killed"), None, false),
+        ];
+        assert_eq!(restored(&steps), ["/etc/c", "/etc/a"]);
     }
 
     fn file(dest: &str, previous: Previous) -> FileRecord {

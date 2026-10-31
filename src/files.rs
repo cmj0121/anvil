@@ -22,7 +22,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::apply::{FileRun, PlannedRun, Upload};
+use crate::apply::{FileRun, PlannedRun, RunKind, Upload};
 use crate::config::{Config, ModeValue, is_mode, is_sha256};
 use crate::document;
 use crate::facts::Facts;
@@ -185,7 +185,7 @@ pub fn runs(
         let dest = &entry.dest;
         if !matches(&entry.tags, &entry.facts, target, facts) {
             log::info!("{}: files[{i}] {dest}: no match", target.name);
-            runs.push(skip_run(format!("skipped file {dest}: no match")));
+            runs.push(skip_run(dest, format!("skipped file {dest}: no match")));
             continue;
         }
         let Some(ModeValue::Text(mode)) = &entry.mode else {
@@ -234,6 +234,7 @@ pub fn runs(
         };
         let (script, upload) = write_script(&write, sources, &Expected::Unchecked)?;
         runs.push(file_run(
+            dest,
             script,
             format!("file {dest}"),
             secret.map(str::to_owned),
@@ -404,6 +405,7 @@ fn guard(sudo: &str, dest: &str, expected: &Expected) -> String {
 }
 
 fn file_run(
+    dest: &str,
     run: Zeroizing<String>,
     label: String,
     sudo_secret: Option<String>,
@@ -413,22 +415,23 @@ fn file_run(
         run,
         label: Some(label),
         sudo_secret,
-        plugin: None,
         timeout: RUN_TIMEOUT,
-        file: Some(file),
-        package_manager: None,
-        service: None,
+        kind: RunKind::File {
+            dest: dest.to_owned(),
+            run: file,
+        },
     }
 }
 
-/// A file step that runs nothing and only shows `label`.
-pub(crate) fn skip_run(label: String) -> PlannedRun {
+/// A file step that runs nothing and only shows `label`; `dest` is empty for
+/// a note about no file.
+pub(crate) fn skip_run(dest: &str, label: String) -> PlannedRun {
     let skip = FileRun {
         upload: None,
         skip: true,
         write: None,
     };
-    file_run(Zeroizing::default(), label, None, skip)
+    file_run(dest, Zeroizing::default(), label, None, skip)
 }
 
 /// A text as a quoted heredoc: `head -c N <<'D'`, then the body, which ends
@@ -1367,7 +1370,7 @@ pub(crate) fn restore_runs(
     let mut runs = Vec::with_capacity(files.len());
     for file in files.iter().rev() {
         let dest = file.dest.as_str();
-        let skip = |reason: &str| skip_run(format!("cannot undo: {dest} ({reason})"));
+        let skip = |reason: &str| skip_run(dest, format!("cannot undo: {dest} ({reason})"));
         let previous = match &file.previous {
             Previous::File(previous) => match previous.text.as_deref() {
                 Some(text) if previous.kept => Some((previous, text)),
@@ -1432,6 +1435,7 @@ pub(crate) fn restore_runs(
         };
         log::info!("{}: {label}", target.name);
         runs.push(file_run(
+            dest,
             run,
             label,
             secret.map(str::to_owned),
@@ -1933,7 +1937,7 @@ mod tests {
                 "file /etc/b.conf"
             ]
         );
-        let files: Vec<_> = runs.iter().map(|run| run.file.clone().unwrap()).collect();
+        let files: Vec<_> = runs.iter().map(|run| run.file().unwrap().clone()).collect();
         assert_eq!(
             files[1],
             FileRun {
@@ -1946,7 +1950,7 @@ mod tests {
         assert!(!files[0].skip && !files[2].skip);
         for run in &runs {
             assert_eq!(run.timeout, RUN_TIMEOUT);
-            assert_eq!((&run.sudo_secret, &run.plugin), (&None, &None));
+            assert_eq!((&run.sudo_secret, run.plugin()), (&None, None));
         }
     }
 
@@ -2000,7 +2004,7 @@ mod tests {
         for (sudo, secret, facts, prefix) in cases {
             let run = only_run(sudo, secret, facts);
             let case = format!("sudo={sudo} {secret:?} {facts:?}");
-            assert_eq!(run.file.as_ref().unwrap().upload, None, "{case}");
+            assert_eq!(run.file().unwrap().upload, None, "{case}");
             assert_eq!(run.sudo_secret, None, "{case}");
             assert!(
                 run.run.contains(&format!("| {prefix}tee '/etc/a'")),
@@ -2012,7 +2016,7 @@ mod tests {
         let run = only_run(true, Some("WEB"), &user_facts("binary"));
         assert_eq!(run.shown(), "file /etc/a");
         assert_eq!(run.sudo_secret.as_deref(), Some("WEB"));
-        let upload = run.file.as_ref().unwrap().upload.as_ref().unwrap();
+        let upload = run.file().unwrap().upload.as_ref().unwrap();
         let temp = upload
             .cleanup
             .strip_prefix("rm -f '")
@@ -2035,7 +2039,10 @@ mod tests {
                 .contains(&format!("sudo install -m 0644 '{temp}' '/etc/a'"))
         );
         let other = only_run(true, Some("WEB"), &user_facts("binary"));
-        assert_ne!(other.file.unwrap().upload.unwrap().cleanup, upload.cleanup);
+        assert_ne!(
+            other.file().unwrap().upload.as_ref().unwrap().cleanup,
+            upload.cleanup
+        );
     }
 
     #[test]
@@ -3324,7 +3331,7 @@ mod tests {
             let run = runs(&config, &sources, &host(&[], secret), Some(&facts))
                 .unwrap()
                 .remove(0);
-            let write = run.file.as_ref().unwrap().write.clone().unwrap();
+            let write = run.file().unwrap().write.clone().unwrap();
             assert_eq!(write.password, secret.is_some());
             let (script, upload) = write_script(&write, &sources, &Expected::Unchecked).unwrap();
             assert_eq!(upload.is_some(), secret.is_some());
@@ -3360,8 +3367,7 @@ mod tests {
                 Some(&user_facts("nopasswd")),
             )
             .unwrap()[0]
-                .file
-                .as_ref()
+                .file()
                 .unwrap()
                 .write
                 .clone()
@@ -3796,7 +3802,7 @@ mod tests {
         let run = &runs[0];
         assert_eq!(run.shown(), format!("restore {}", dest.display()));
         assert_eq!(run.sudo_secret.as_deref(), Some("WEB"));
-        let upload = run.file.as_ref().unwrap().upload.as_ref().unwrap();
+        let upload = run.file().unwrap().upload.as_ref().unwrap();
         let temp = upload
             .cleanup
             .strip_prefix("rm -f '")
@@ -3895,7 +3901,7 @@ mod tests {
         );
         assert!(
             runs.iter()
-                .all(|run| run.file.as_ref().unwrap().skip && run.run.is_empty())
+                .all(|run| run.file().unwrap().skip && run.run.is_empty())
         );
     }
 
@@ -3937,7 +3943,7 @@ mod tests {
                 .unwrap();
                 let (restore, remove) = (&runs[0], &runs[1]);
                 assert!(!remove.run.contains("hunter2"));
-                match &restore.file.as_ref().unwrap().upload {
+                match &restore.file().unwrap().upload {
                     Some(upload) => {
                         assert!(!restore.run.contains("hunter2"));
                         assert_eq!(upload.stage.matches("hunter2").count(), 1);
@@ -3986,7 +3992,7 @@ mod tests {
             format!("{:?}", Sources::of(&[SECRET_TEXT])),
             format!("{tee:?}"),
             format!("{upload:?}"),
-            format!("{:?}", upload.file.as_ref().unwrap().upload),
+            format!("{:?}", upload.file().unwrap().upload),
             format!("{:?}", entry("a", "/etc/a")),
         ];
         for shown in &shown {
@@ -4000,7 +4006,10 @@ mod tests {
             shown[2]
         );
         assert!(shown[4].contains("dest: \"/etc/a\"") && shown[4].contains("sudo: true"));
-        let plain = PlannedRun { file: None, ..tee };
+        let plain = PlannedRun {
+            kind: RunKind::Script,
+            ..tee
+        };
         assert!(
             format!("{plain:?}").contains("hunter2"),
             "other runs are shown unchanged"
