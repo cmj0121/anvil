@@ -569,3 +569,19 @@ fn warns_for_srcs_and_includes_reached_through_tasks() {
         text(&out.stderr)
     );
 }
+
+#[test]
+fn the_dangling_warning_escapes_a_bidi_character_in_a_task_reference() {
+    let s = Sandbox::new("files-tasks");
+    s.write_config(
+        "config.toml",
+        "[[tasks]]\nfile = { src = '$/evil\u{202e}', dest = '/tmp/n', mode = '0644' }\n",
+    );
+    let store = s.config_dir().join("files");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("evil\u{202e}"), "hi").unwrap();
+    let out = run(&s, &["-v", "files", "rm", "evil\u{202e}"], 0);
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("`$/evil\\u{202e}`"), "{stderr}");
+    assert!(!stderr.contains('\u{202e}'), "{stderr}");
+}

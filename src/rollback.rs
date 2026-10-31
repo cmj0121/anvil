@@ -32,7 +32,7 @@ use crate::fanout::{self, Event};
 use crate::files::{self, Force, Wording};
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
-use crate::logger::{DIM, GREEN, RED};
+use crate::logger::{DIM, GREEN, RED, escape_invisible};
 use crate::options::Options;
 use crate::record::{self, Previous, Record, RolledBack, Session, TargetRecord};
 use crate::status;
@@ -551,7 +551,9 @@ fn print_dry_run(
             let end = match (&target.steps, &target.error) {
                 (Some(steps), _) => {
                     for step in steps {
-                        lines.push(Line::out(step.run.clone(), Escape::Always, Some(DIM)));
+                        // A recorded task path may hold invisible characters.
+                        let run = escape_invisible(&step.run);
+                        lines.push(Line::out(run, Escape::Always, Some(DIM)));
                     }
                     let end = format!("✔ {}", apply::steps_text(steps.len()));
                     Line::out(end, Escape::Never, Some(GREEN))
@@ -643,6 +645,8 @@ mod tests {
             entry: dest.map_or(Entry::Script, |dest| Entry::File {
                 dest: dest.to_owned(),
             }),
+            task: None,
+            name: None,
         };
         let steps = [
             step(None, Some(0), false),

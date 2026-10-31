@@ -37,7 +37,7 @@ use crate::facts::{self, Facts, PROBE};
 use crate::files::{self, FileState, HashDest};
 use crate::interrupt::Interrupt;
 use crate::inventory::{Target, TargetKind};
-use crate::logger::{escape_controls, is_invisible};
+use crate::logger::{escape_controls, escape_invisible};
 use crate::options::Options;
 use crate::packages::{self, Choice};
 use crate::paths;
@@ -863,13 +863,7 @@ fn exit_text(code: Option<i32>, stderr: &str) -> String {
 /// invisible character in it is escaped too.
 fn hash_exit_message(output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let shown: String = secret::shown_name(stderr.trim())
-        .chars()
-        .map(|c| match is_invisible(c) {
-            true => format!("\\u{{{:04x}}}", u32::from(c)),
-            false => c.to_string(),
-        })
-        .collect();
+    let shown = escape_invisible(&secret::shown_name(stderr.trim()));
     exit_text(output.code, &shown)
 }
 

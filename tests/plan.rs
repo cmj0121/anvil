@@ -366,8 +366,126 @@ fn tasks_are_planned_in_the_order_apply_runs_them() {
             "first",
             "file /tmp/motd",
             "included",
-            "skipped step 3: no match",
+            "skipped run: no match",
             "nested"
         ]
     );
+}
+
+/// A store include named `role\u{202e}.toml`, 0644.
+#[cfg(unix)]
+fn hostile_include(sandbox: &Sandbox) {
+    use std::os::unix::fs::PermissionsExt;
+    let store = sandbox.config_dir().join("files");
+    std::fs::create_dir_all(&store).unwrap();
+    let include = store.join("role\u{202e}.toml");
+    std::fs::write(
+        &include,
+        "[[tasks]]\nname = \"a\\u001b]0;pwn\\u0007\\n  ✔ ok\\u2066b\\u200b\"\nrun = \"true\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&include, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+#[test]
+fn tasks_show_their_path_and_name_before_what_they_would_run() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.write_config(
+        "config.toml",
+        "[[tasks]]\nname = \"First\"\nrun = \"true\"\n\n\
+         [[tasks]]\nrun = \"false\"\n\n\
+         [[tasks]]\nname = \"Elsewhere\"\ntags = [\"other\"]\nrun = \"true\"\n",
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "▶ local\n  tasks[0]  First\n  would $ true\n  tasks[1]\n  would $ false\n  \
+         tasks[2]  Elsewhere\n  would $ skipped run: no match\n  ✔ 3 steps\n\n\
+         1 target, nothing executed\n"
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(
+        json(&out)["targets"][0]["steps"],
+        serde_json::json!([
+            {"run": "true", "task": "tasks[0]", "name": "First"},
+            {"run": "false", "task": "tasks[1]"},
+            {"run": "skipped run: no match", "task": "tasks[2]", "name": "Elsewhere"},
+        ])
+    );
+}
+
+#[test]
+fn a_legacy_config_has_no_task_or_name_in_json() {
+    let sandbox = Sandbox::new("pl");
+    let run = touching(&sandbox, "");
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert!(
+        text(&out.stdout).contains(&format!(r#""steps":[{{"run":"{run}"}}],"ok":true"#)),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_hostile_name_or_include_path_is_escaped_for_people_and_real_in_json() {
+    let sandbox = Sandbox::new("pl");
+    hostile_include(&sandbox);
+    sandbox.write_config(
+        "config.toml",
+        "[[tasks]]\ninclude = \"$/role\u{202e}.toml\"\n",
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "▶ local\n  tasks[0]/role\\u{202e}.toml:tasks[0]  \
+         a\\x1b]0;pwn\\x07\\n  ✔ ok\\u{2066}b\\u{200b}\n  would $ true\n  ✔ 1 step\n\n\
+         1 target, nothing executed\n"
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][0],
+        serde_json::json!({
+            "run": "true",
+            "task": "tasks[0]/role\u{202e}.toml:tasks[0]",
+            "name": "a\u{1b}]0;pwn\u{7}\n  ✔ ok\u{2066}b\u{200b}",
+        })
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_refusal_naming_a_hostile_include_path_escapes_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = Sandbox::new("pl");
+    let store = sandbox.config_dir().join("files");
+    std::fs::create_dir_all(&store).unwrap();
+    let include = store.join("role\u{202e}.toml");
+    std::fs::write(&include, "[[tasks]]\nname = \"empty\"\n").unwrap();
+    std::fs::set_permissions(&include, std::fs::Permissions::from_mode(0o644)).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        "[[tasks]]\ninclude = \"$/role\u{202e}.toml\"\n",
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("role\\u{202e}.toml"), "{stderr}");
+    assert!(!stderr.contains('\u{202e}'), "{stderr}");
+}
+
+#[test]
+fn a_refused_include_outside_the_store_escapes_a_bidi_character() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.write_config(
+        "config.toml",
+        "[[tasks]]\ninclude = \"\u{202e}evil.toml\"\n",
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("`\\u{202e}evil.toml`"), "{stderr}");
+    assert!(!stderr.contains('\u{202e}'), "{stderr}");
 }

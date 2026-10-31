@@ -172,7 +172,13 @@ fn warn_orphans(config: &Config, root: &Root, path: &str) {
             && (rel == path || rel.starts_with(&format!("{path}/")))
         {
             let path = shown(path);
-            log::warn!("{field} `{src}` names {path}, which is gone");
+            let warning = format!("{field} `{src}` names {path}, which is gone");
+            if config.tasks.is_empty() {
+                log::warn!("{warning}");
+            } else {
+                // A task's field and include may hold invisible characters.
+                log::warn!("{}", crate::logger::escape_invisible(&warning));
+            }
         }
     }
 }

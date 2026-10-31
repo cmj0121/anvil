@@ -54,7 +54,10 @@ use crate::fanout::{self, Event};
 use crate::files::{self, Sources};
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
-use crate::logger::{BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, is_escaped, paint};
+use crate::logger::{
+    BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, escape_invisible, escape_line, is_escaped,
+    paint,
+};
 use crate::options::Options;
 use crate::packages::{self, Packages};
 use crate::plugin::{self, Plugins, Request};
@@ -103,6 +106,8 @@ pub struct PlannedRun {
     pub kind: RunKind,
     /// The path of the task this step comes from; `None` for a legacy entry.
     pub task: Option<String>,
+    /// That task's `name`, if it has one.
+    pub name: Option<String>,
 }
 
 /// What a run does.
@@ -145,19 +150,9 @@ impl RunKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
     Packages,
-    File {
-        dest: String,
-    },
-    Service {
-        name: String,
-    },
-    Step {
-        number: usize,
-    },
-    /// A `packages`, `service`, `run` or `plugin` task, by its path.
-    Task {
-        path: String,
-    },
+    File { dest: String },
+    Service { name: String },
+    Step { number: usize },
     Script,
 }
 
@@ -231,12 +226,9 @@ impl PlannedRun {
         self.label.as_deref().unwrap_or(&self.run)
     }
 
-    /// The config entry this step's report belongs to.
-    fn entry(&self) -> Entry {
-        match (&self.kind, &self.task) {
-            (RunKind::File { .. }, _) | (_, None) => self.kind.entry(),
-            (_, Some(path)) => Entry::Task { path: path.clone() },
-        }
+    /// This step's task line in human output; `None` for a legacy entry.
+    pub fn title(&self) -> Option<String> {
+        task_title(self.task.as_deref(), self.name.as_deref())
     }
 
     /// The plugin that returned this step, if one did.
@@ -271,11 +263,17 @@ impl Serialize for PlannedRun {
             sudo_secret: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             plugin: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            task: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            name: Option<&'a str>,
         }
         Shown {
             run: self.shown(),
             sudo_secret: self.sudo_secret.as_deref(),
             plugin: self.plugin(),
+            task: self.task.as_deref(),
+            name: self.name.as_deref(),
         }
         .serialize(serializer)
     }
@@ -294,9 +292,41 @@ pub struct StepReport {
     pub skipped: bool,
     #[serde(skip)]
     pub entry: Entry,
+    /// The path of the task this step comes from; `None` for a legacy entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// That task's `name`, if it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl StepReport {
+    /// This report as the report of `planned`'s task.
+    fn of(self, planned: &PlannedRun) -> StepReport {
+        StepReport {
+            task: planned.task.clone(),
+            name: planned.name.clone(),
+            ..self
+        }
+    }
+
+    /// This step's task line in human output; `None` for a legacy entry.
+    pub fn title(&self) -> Option<String> {
+        task_title(self.task.as_deref(), self.name.as_deref())
+    }
+
+    /// The step's `$` line text, unescaped but for a rollback note, which names
+    /// a recorded task path that may hold invisible characters, and a task's,
+    /// whose `run` is config text under review.
+    pub fn command_text(&self) -> String {
+        let command = command(&self.run);
+        let note = matches!(&self.entry, Entry::File { dest } if dest.is_empty());
+        match note || self.task.is_some() {
+            true => escape_invisible(&command),
+            false => command,
+        }
+    }
+
     fn from_output(run: &str, output: Output, entry: Entry) -> StepReport {
         StepReport {
             run: run.to_owned(),
@@ -305,6 +335,8 @@ impl StepReport {
             stderr: into_string(output.stderr),
             skipped: false,
             entry,
+            task: None,
+            name: None,
         }
     }
 
@@ -317,8 +349,27 @@ impl StepReport {
             stderr: String::new(),
             skipped: true,
             entry,
+            task: None,
+            name: None,
         }
     }
+}
+
+/// A task's line in human output, `PATH  NAME` or `PATH`; `None` without a path.
+/// See [`shown_text`]: neither is trusted.
+pub fn task_title(path: Option<&str>, name: Option<&str>) -> Option<String> {
+    let path = shown_text(path?);
+    Some(match name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("{path}  {}", shown_text(name)),
+        None => path,
+    })
+}
+
+/// Config text on one line, with every control, bidi and invisible character
+/// shown as a visible escape, so it can neither drive the terminal nor pass
+/// for other output.
+pub fn shown_text(text: &str) -> String {
+    escape_invisible(&escape_line(text))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -333,7 +384,8 @@ pub enum TargetReport {
     },
     /// A transport error ended the target; `steps` holds the ones that ran
     /// before it, then a step that timed out with what it printed (omitted
-    /// when none did).
+    /// when none did). `task` and `name` are those of the task whose step it
+    /// ended, if any.
     Failed {
         target: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -342,19 +394,53 @@ pub enum TargetReport {
         steps: Vec<StepReport>,
         error: String,
         ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     /// The cancel flag ended the target; `steps` holds the ones that ran
-    /// before it. `ok` is always false.
+    /// before it. `ok` is always false. `task` and `name` are those of the task
+    /// whose step was under way, if any.
     Cancelled {
         target: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<String>,
         steps: Vec<StepReport>,
         ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
 }
 
 impl TargetReport {
+    /// This report as ended during `planned`'s step.
+    fn at(mut self, planned: &PlannedRun) -> TargetReport {
+        if let TargetReport::Failed { task, name, .. }
+        | TargetReport::Cancelled { task, name, .. } = &mut self
+        {
+            task.clone_from(&planned.task);
+            name.clone_from(&planned.name);
+        }
+        self
+    }
+
+    /// The task line of the step that ended this report, unless a kept step
+    /// (one that timed out) has shown it already.
+    pub fn ended_title(&self) -> Option<String> {
+        let (TargetReport::Failed { task, name, .. } | TargetReport::Cancelled { task, name, .. }) =
+            self
+        else {
+            return None;
+        };
+        if task.is_some() && self.steps().last().is_some_and(|step| step.task == *task) {
+            return None;
+        }
+        task_title(task.as_deref(), name.as_deref())
+    }
+
     pub fn warnings(&self) -> &[String] {
         match self {
             Self::Ran { warnings, .. }
@@ -828,6 +914,8 @@ pub(crate) fn cancelled(command: &str, target: &Target, steps: Vec<StepReport>) 
         target: target.name.clone(),
         steps,
         ok: false,
+        task: None,
+        name: None,
     }
 }
 
@@ -992,12 +1080,12 @@ fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
     steps
         .iter()
         .filter(|step| !step.skipped)
-        .filter_map(|step| match &step.entry {
-            Entry::Packages => Some("packages".to_owned()),
-            Entry::Service { name } => Some(format!("service {name}")),
-            Entry::Step { number } => Some(format!("step {number}")),
-            Entry::Task { path } => Some(path.clone()),
-            Entry::File { .. } | Entry::Script => None,
+        .filter_map(|step| match (&step.entry, &step.task) {
+            (Entry::File { .. } | Entry::Script, _) => None,
+            (_, Some(path)) => Some(path.clone()),
+            (Entry::Packages, None) => Some("packages".to_owned()),
+            (Entry::Service { name }, None) => Some(format!("service {name}")),
+            (Entry::Step { number }, None) => Some(format!("step {number}")),
         })
         .collect()
 }
@@ -1017,6 +1105,8 @@ pub(crate) fn failed(
         steps,
         error,
         ok: false,
+        task: None,
+        name: None,
     }
 }
 
@@ -1068,19 +1158,19 @@ fn execute_inner(
         };
         status::phase(&target.name, status::Phase::Run { kind, n: n + 1, of });
         let label = planned.shown();
-        let entry = planned.entry();
+        let entry = planned.kind.entry();
         if planned.file().is_some_and(|file| file.skip)
             || planned.service().is_some_and(|service| service.skip)
             || matches!(planned.kind, RunKind::Skip)
         {
-            reports.push(StepReport::skipped(label, entry));
+            reports.push(StepReport::skipped(label, entry).of(planned));
             continue;
         }
         let password = match planned.sudo_secret.as_deref() {
             None => None,
             Some(name) => match sudo_password(passwords, name, prefix) {
                 Ok(password) => Some((name, password)),
-                Err(error) => return failed(command, target, reports, error),
+                Err(error) => return failed(command, target, reports, error).at(planned),
             },
         };
         let (mut run, timeout) = (planned.run.as_str(), planned.timeout);
@@ -1091,29 +1181,37 @@ fn execute_inner(
         if let (Some(recorder), Some(write)) = (recorder.as_deref_mut(), write) {
             let found = match capture(target, transport, write, password.map(|(_, p)| p)) {
                 Ok(found) => found,
-                Err(Uncaptured::Step(step)) => {
-                    reports.push(StepReport {
-                        run: label.to_owned(),
-                        entry,
-                        ..step
-                    });
+                Err(Uncaptured::Step { code, stderr }) => {
+                    reports.push(
+                        StepReport {
+                            run: label.to_owned(),
+                            code,
+                            stdout: String::new(),
+                            stderr,
+                            skipped: false,
+                            entry,
+                            task: None,
+                            name: None,
+                        }
+                        .of(planned),
+                    );
                     ok = false;
                     break;
                 }
                 Err(Uncaptured::Transport(TransportError::Cancelled)) => {
-                    return cancelled(command, target, reports);
+                    return cancelled(command, target, reports).at(planned);
                 }
                 Err(Uncaptured::Transport(err)) => {
                     let error = step_error(&err, password.map(|(name, _)| name), prefix);
-                    return failed(command, target, reports, error);
+                    return failed(command, target, reports, error).at(planned);
                 }
             };
             if cancel.load(Ordering::Relaxed) {
-                return cancelled(command, target, reports);
+                return cancelled(command, target, reports).at(planned);
             }
             rebuilt = match files::write_script(write, recorder.sources, &found.expected()) {
                 Ok(rebuilt) => rebuilt,
-                Err(error) => return failed(command, target, reports, error),
+                Err(error) => return failed(command, target, reports, error).at(planned),
             };
             (run, upload) = (rebuilt.0.as_str(), rebuilt.1.as_ref());
             recorder.wrote = true;
@@ -1124,7 +1222,7 @@ fn execute_inner(
             (None, None) => transport.run(run, timeout),
             (None, Some(_)) => {
                 let error = format!("files: internal error: {label} has no sudo secret");
-                return failed(command, target, reports, error);
+                return failed(command, target, reports, error).at(planned);
             }
             (Some((_, password)), None) => {
                 transport.run_tty(&packages::with_password(run), password, timeout)
@@ -1138,7 +1236,7 @@ fn execute_inner(
                         staged = false;
                         output
                     }
-                    Sent::Cancelled => return cancelled(command, target, reports),
+                    Sent::Cancelled => return cancelled(command, target, reports).at(planned),
                 }
             }
         };
@@ -1176,7 +1274,9 @@ fn execute_inner(
         let output = match output {
             Ok(output) => output,
             // ssh would have had to open a master after cancel.
-            Err(TransportError::Cancelled) => return cancelled(command, target, reports),
+            Err(TransportError::Cancelled) => {
+                return cancelled(command, target, reports).at(planned);
+            }
             Err(err) => {
                 let error = step_error(&err, password.map(|(name, _)| name), prefix);
                 // A step killed at the limit still shows what it printed.
@@ -1185,16 +1285,16 @@ fn execute_inner(
                     ..
                 } = err
                 {
-                    reports.push(StepReport::from_output(label, *output, entry));
+                    reports.push(StepReport::from_output(label, *output, entry).of(planned));
                 }
-                return failed(command, target, reports, error);
+                return failed(command, target, reports, error).at(planned);
             }
         };
         let succeeded = output.code == Some(0);
         if succeeded && output.truncated {
             log::warn!("{command} {}: step output cut at 1 MiB", target.name);
         }
-        reports.push(StepReport::from_output(label, output, entry));
+        reports.push(StepReport::from_output(label, output, entry).of(planned));
         if !succeeded {
             ok = false;
             break;
@@ -1213,10 +1313,10 @@ fn execute_inner(
     }
 }
 
-/// Why [`capture`] found nothing: the step that failed, without what the
+/// Why [`capture`] found nothing: how the step failed, without what the
 /// capture printed on stdout, or the transport's error.
 enum Uncaptured {
-    Step(StepReport),
+    Step { code: Option<i32>, stderr: String },
     Transport(TransportError),
 }
 
@@ -1255,18 +1355,6 @@ fn capture(
     })?;
     // The buffer itself, moved rather than copied, so it is zeroed on drop.
     let stdout = Zeroizing::new(output.stdout);
-    let failure = |code, stderr: String| {
-        Uncaptured::Step(StepReport {
-            run: String::new(),
-            code,
-            stdout: String::new(),
-            stderr,
-            skipped: false,
-            entry: Entry::File {
-                dest: write.dest.clone(),
-            },
-        })
-    };
     if output.code != Some(0) {
         let stderr = match password {
             None => into_string(output.stderr),
@@ -1279,10 +1367,15 @@ fn capture(
                 .map(|line| format!("{}\n", String::from_utf8_lossy(line)))
                 .collect(),
         };
-        return Err(failure(output.code, stderr));
+        return Err(Uncaptured::Step {
+            code: output.code,
+            stderr,
+        });
     }
-    let found = files::parse_capture(&write.dest, &stdout)
-        .map_err(|error| failure(Some(1), format!("{error}\n")))?;
+    let found = files::parse_capture(&write.dest, &stdout).map_err(|error| Uncaptured::Step {
+        code: Some(1),
+        stderr: format!("{error}\n"),
+    })?;
     log::info!(
         "apply {}: capture {}: {}",
         target.name,
@@ -1473,6 +1566,7 @@ pub fn resolve(
         };
         runs.extend(run.map(|run| PlannedRun {
             task: item.path.clone(),
+            name: item.name.clone(),
             ..run
         }));
     }
@@ -1498,6 +1592,7 @@ fn skip_run(label: String) -> PlannedRun {
         timeout: RUN_TIMEOUT,
         kind: RunKind::Skip,
         task: None,
+        name: None,
     }
 }
 
@@ -1536,6 +1631,7 @@ fn package_run(
         timeout: packages.timeout(),
         kind: RunKind::Packages { manager },
         task: None,
+        name: None,
     }))
 }
 
@@ -1553,10 +1649,19 @@ fn step_run(
         log::info!("{}: step {number}: no match", target.name);
         let label = match step.kind() {
             StepKind::Plugin(name) => format!("skipped plugin {name}: no match"),
-            StepKind::Run(_) => format!("skipped step {number}: no match"),
+            StepKind::Run(_) => "skipped run: no match".to_owned(),
         };
         return Ok(skip_run(label));
     }
+    let planned = |run: String, label, plugin| PlannedRun {
+        run: run.into(),
+        label,
+        sudo_secret: None,
+        timeout: RUN_TIMEOUT,
+        kind: RunKind::Step { number, plugin },
+        task: None,
+        name: None,
+    };
     Ok(match step.kind() {
         StepKind::Plugin(name) => {
             if cancel.load(Ordering::Relaxed) {
@@ -1572,29 +1677,13 @@ fn step_run(
             };
             let script = plugins.script(name, &request)?;
             log::info!("{}: step from plugin {name}", target.name);
-            PlannedRun {
-                run: crate::run::wrap(&script).into(),
-                label: Some(script),
-                sudo_secret: None,
-                timeout: RUN_TIMEOUT,
-                kind: RunKind::Step {
-                    number,
-                    plugin: Some(name.to_owned()),
-                },
-                task: None,
-            }
+            planned(
+                crate::run::wrap(&script),
+                Some(script),
+                Some(name.to_owned()),
+            )
         }
-        StepKind::Run(run) => PlannedRun {
-            run: run.to_owned().into(),
-            label: None,
-            sudo_secret: None,
-            timeout: RUN_TIMEOUT,
-            kind: RunKind::Step {
-                number,
-                plugin: None,
-            },
-            task: None,
-        },
+        StepKind::Run(run) => planned(run.to_owned(), None, None),
     })
 }
 
@@ -1740,11 +1829,11 @@ pub fn command(run: &str) -> String {
     }
 }
 
-/// One target's block: a `▶ target` header, each step's `$ command` and its
-/// indented output, then `✔ ok · N steps` or `✘ reason`, then a blank line.
+/// One target's block: a `▶ target` header, each task's `PATH  NAME` line, each
+/// step's `$ command` and its indented output, then `✔ ok · N steps` or `✘ reason`, then a blank line.
 /// Unless `verbose` (`-vv`), a step's stdout shows only when the step failed,
-/// and its `$` line only when it failed or wrote to stderr; stderr always
-/// shows. Stdout lines go to stdout; stderr lines go to stderr, prefixed with
+/// and its `$` line only when it failed, wrote to stderr or is a skipped task;
+/// stderr always shows. Stdout lines go to stdout; stderr lines go to stderr, prefixed with
 /// the target when stderr is not a terminal. Control characters from the host
 /// are escaped on stderr and in failures always, and on stdout only when it
 /// is a terminal.
@@ -1758,9 +1847,12 @@ fn render(report: &TargetReport, style: Style, verbose: bool) -> Vec<Line> {
     };
     for step in steps {
         let show_stdout = verbose || step.code != Some(0);
-        if show_stdout || !step.stderr.is_empty() {
+        let title = step.title();
+        let skipped_task = step.skipped && title.is_some();
+        lines.extend(title.map(|title| Line::out(title, Escape::Always, None)));
+        if show_stdout || skipped_task || !step.stderr.is_empty() {
             lines.push(Line::out(
-                format!("$ {}", command(&step.run)),
+                format!("$ {}", step.command_text()),
                 Escape::Always,
                 Some(DIM),
             ));
@@ -1786,6 +1878,11 @@ fn render(report: &TargetReport, style: Style, verbose: bool) -> Vec<Line> {
             Some(YELLOW),
         ));
     }
+    lines.extend(
+        report
+            .ended_title()
+            .map(|title| Line::out(title, Escape::Always, None)),
+    );
     let end = match report.failure() {
         Some(reason) => Line::out(format!("✘ {reason}"), Escape::Always, Some(RED)),
         None => Line::out(
@@ -2140,6 +2237,99 @@ mod tests {
         (report, runs)
     }
 
+    /// `execute` of one step of task `tasks[0]`, named `Boom`, on a transport
+    /// failing with `err`.
+    fn execute_task(err: TransportError) -> TargetReport {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let fake = Fake {
+            fail_with: Some(err),
+            ..Fake::new(&log)
+        };
+        let run = PlannedRun {
+            task: Some("tasks[0]".to_owned()),
+            name: Some("Boom".to_owned()),
+            ..config_step(1, "boom")
+        };
+        execute(
+            "apply",
+            &target("pi"),
+            &fake,
+            &[run],
+            &Passwords::new(),
+            &AtomicBool::new(false),
+            None,
+        )
+    }
+
+    #[test]
+    fn a_step_cancelled_under_way_names_its_task() {
+        let report = execute_task(TransportError::Cancelled);
+        assert_eq!(
+            brief(&report, piped()),
+            "▶ pi\n  tasks[0]  Boom\n  ✘ cancelled\n\n"
+        );
+        assert_eq!(json(&report)["task"], "tasks[0]");
+        assert_eq!(json(&report)["name"], "Boom");
+    }
+
+    #[test]
+    fn a_cancel_before_a_step_starts_names_no_task() {
+        let run = PlannedRun {
+            task: Some("tasks[0]".to_owned()),
+            ..config_step(1, "boom")
+        };
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let report = execute(
+            "apply",
+            &target("pi"),
+            &Fake::new(&log),
+            &[run],
+            &Passwords::new(),
+            &AtomicBool::new(true),
+            None,
+        );
+        assert_eq!(brief(&report, piped()), "▶ pi\n  ✘ cancelled\n\n");
+        assert_eq!(keys(&json(&report)), ["ok", "steps", "target"]);
+    }
+
+    #[test]
+    fn a_timed_out_task_shows_its_line_once_and_json_keeps_it_on_the_target() {
+        let report = execute_task(TransportError::Timeout {
+            after: Duration::from_secs(1),
+            output: Some(Box::new(Output {
+                stdout: b"partial\n".to_vec(),
+                ..Output::default()
+            })),
+        });
+        let shown = brief(&report, piped());
+        assert_eq!(shown.matches("tasks[0]  Boom").count(), 1, "{shown}");
+        assert_eq!(json(&report)["task"], "tasks[0]");
+    }
+
+    #[test]
+    fn a_legacy_transport_error_or_cancel_names_no_task() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        for (err, want) in [
+            (TransportError::Cancelled, vec!["ok", "steps", "target"]),
+            (TransportError::HostKey, vec!["error", "ok", "target"]),
+        ] {
+            let fake = Fake {
+                fail_with: Some(err),
+                ..Fake::new(&log)
+            };
+            let report = execute(
+                "apply",
+                &target("pi"),
+                &fake,
+                &[config_step(1, "boom")],
+                &Passwords::new(),
+                &AtomicBool::new(false),
+                None,
+            );
+            assert_eq!(keys(&json(&report)), want);
+        }
+    }
+
     #[test]
     fn the_runner_inputs_are_shareable_across_threads() {
         fn assert_sync<T: Sync + ?Sized>() {}
@@ -2214,6 +2404,8 @@ mod tests {
             stderr: stderr.to_owned(),
             skipped: false,
             entry: Entry::Script,
+            task: None,
+            name: None,
         }
     }
 
@@ -2467,6 +2659,8 @@ mod tests {
             steps: vec![step("one", Some(0), "one-out\n", "")],
             error: "timed out after 30 s".to_owned(),
             ok: false,
+            task: None,
+            name: None,
         };
         assert_eq!(
             screen(&report, terminal()),
@@ -2567,6 +2761,8 @@ mod tests {
             }
             .to_string(),
             ok: false,
+            task: None,
+            name: None,
         };
         let (out, err) = streams(&report, piped());
         assert_eq!(
@@ -2714,6 +2910,8 @@ mod tests {
                 target: "b".to_owned(),
                 steps: vec![],
                 ok: false,
+                task: None,
+                name: None,
             }
         );
         assert_eq!(
@@ -3088,6 +3286,8 @@ mod tests {
                 target: "a".to_owned(),
                 steps: vec![],
                 ok: false,
+                task: None,
+                name: None,
             }
         );
     }
@@ -3408,6 +3608,7 @@ mod tests {
             timeout,
             kind: RunKind::Script,
             task: None,
+            name: None,
         }
     }
 
@@ -3526,6 +3727,7 @@ mod tests {
                 plugin: Some(name.to_owned()),
             },
             task: None,
+            name: None,
         }
     }
 
@@ -3705,6 +3907,8 @@ mod tests {
                 target: "box".to_owned(),
                 steps: vec![],
                 ok: false,
+                task: None,
+                name: None,
             }
         );
 
@@ -4032,6 +4236,8 @@ mod tests {
                 entry: Entry::File {
                     dest: "/etc/b.conf".to_owned(),
                 },
+                task: None,
+                name: None,
             }
         );
         let value = json(&report);
@@ -4272,6 +4478,8 @@ mod tests {
                 target: "box".to_owned(),
                 steps: vec![step("one", Some(0), "one-out\n", "")],
                 ok: false,
+                task: None,
+                name: None,
             }
         );
         assert_eq!(report.failure().unwrap(), "cancelled");
@@ -4301,6 +4509,8 @@ mod tests {
                 target: "box".to_owned(),
                 steps: vec![],
                 ok: false,
+                task: None,
+                name: None,
             }
         );
         assert!(log.lock().unwrap().is_empty());
@@ -4976,6 +5186,8 @@ mod tests {
                     target: name.to_owned(),
                     steps: if started { vec![ran.clone()] } else { vec![] },
                     ok: false,
+                    task: None,
+                    name: None,
                 })
                 .collect();
             assert_eq!(report.targets, expected, "--parallel {parallel}");
@@ -5073,6 +5285,8 @@ mod tests {
                 steps: vec![],
                 error: "internal error: b blew up".to_owned(),
                 ok: false,
+                task: None,
+                name: None,
             }
         );
         assert!(report.targets[2].ok(), "{:?}", report.targets[2]);
@@ -5569,6 +5783,8 @@ mod tests {
                     entry: Entry::File {
                         dest: "/etc/a.conf".to_owned(),
                     },
+                    task: None,
+                    name: None,
                 }]
             );
             let reached = applied.reached.unwrap();
@@ -6353,6 +6569,25 @@ mod tests {
             assert_eq!(previous.text.as_deref().map(String::as_str), Some("v0\n"));
             assert_eq!(previous.reason, None);
         }
+    }
+
+    #[test]
+    fn a_tasks_command_line_shows_bidi_as_an_escape_and_json_keeps_it() {
+        let run = "true \u{202e}x";
+        let task = StepReport {
+            task: Some("tasks[0]".to_owned()),
+            ..step(run, Some(1), "", "")
+        };
+        assert_eq!(task.command_text(), "true \\u{202e}x");
+        assert_eq!(json(&task)["run"], run);
+        let report = TargetReport::Ran {
+            warnings: Vec::new(),
+            target: "box".to_owned(),
+            steps: vec![task],
+            ok: false,
+        };
+        assert!(streams(&report, piped()).0.contains("$ true \\u{202e}x\n"));
+        assert_eq!(step(run, Some(1), "", "").command_text(), run, "legacy");
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::document::{self, DocumentError, Format};
 use crate::facts;
 use crate::harden::rules;
 use crate::inventory;
-use crate::logger::escape_controls;
+use crate::logger::{escape_controls, escape_invisible};
 use crate::packages::Packages;
 use crate::paths::{self, DocPath};
 use crate::secret::{self, BackendKind, SERVICE};
@@ -1419,7 +1419,7 @@ pub(crate) fn check_tasks(tasks: &[Task], prefix: &str) -> Result<(), String> {
         {
             return Err(format!(
                 "{path}.include `{}`: must be a $/ store path",
-                secret::shown_name(include)
+                escape_invisible(&secret::shown_name(include))
             ));
         }
         if let Some(children) = &task.tasks {

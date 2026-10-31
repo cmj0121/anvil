@@ -700,3 +700,30 @@ fn a_hash_only_write_drops_the_text_even_when_it_found_no_file() {
     assert!(previous["text"].is_null(), "{previous}");
     assert_eq!(previous["reason"], "rollback = false");
 }
+
+#[test]
+fn a_cannot_undo_note_escapes_a_hostile_include_path_for_people() {
+    let sandbox = Sandbox::new("rb");
+    let store = sandbox.config_dir().join("files");
+    std::fs::create_dir_all(&store).unwrap();
+    let include = store.join("role\u{202e}.toml");
+    let dest = task_dest(&sandbox, "dest");
+    std::fs::write(
+        &include,
+        format!("[[tasks]]\nrun = \"true\"\n\n{}", file_task("a.txt", &dest)),
+    )
+    .unwrap();
+    std::fs::set_permissions(&include, std::fs::Permissions::from_mode(0o644)).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        "[[tasks]]\ninclude = \"$/role\u{202e}.toml\"\n",
+    );
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let shown = "cannot undo: tasks[0]/role\\u{202e}.toml:tasks[0]\n";
+    let out = sandbox.anvil(&["rollback", "--dry-run"], &[]);
+    assert!(text(&out.stdout).contains(shown), "{}", text(&out.stdout));
+    let out = sandbox.anvil(&["-vv", "rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains(shown), "{}", text(&out.stdout));
+}

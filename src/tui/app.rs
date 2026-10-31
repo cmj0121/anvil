@@ -562,21 +562,35 @@ pub fn load_steps(opts: &Options) -> Result<Vec<StepRow>, String> {
 /// The steps apply runs for `expanded`, in its order: `packages`, `file <dest>`,
 /// `service <name>` (each a step on every target, skipped where it does not
 /// match), each step's command as its `$` line shows it, or `plugin <name>` for
-/// a plugin step, whose script is known only once it has run.
+/// a plugin step, whose script is known only once it has run. A task's row is
+/// `NAME  PATH`, or `<that label>  PATH` without a name: the pane is narrow and a
+/// row is cut at its end, and an include's path alone can fill it.
 pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
     expanded
         .items
         .iter()
-        .map(|item| match &item.kind {
-            ItemKind::Packages(_) => "packages".to_owned(),
-            ItemKind::File { entry, .. } => format!("file {}", entry.dest),
-            ItemKind::Service(entry) => format!("service {}", entry.name),
-            ItemKind::Step(step) => match step.kind() {
-                StepKind::Plugin(name) => format!("plugin {name}"),
-                StepKind::Run(run) => apply::command(run),
-            },
+        .map(|item| {
+            let label = match &item.kind {
+                ItemKind::Packages(_) => "packages".to_owned(),
+                ItemKind::File { entry, .. } => format!("file {}", entry.dest),
+                ItemKind::Service(entry) => format!("service {}", entry.name),
+                ItemKind::Step(step) => match step.kind() {
+                    StepKind::Plugin(name) => format!("plugin {name}"),
+                    StepKind::Run(run) => apply::command(run),
+                },
+            };
+            let Some(path) = &item.path else {
+                return StepRow { label };
+            };
+            let name = item.name.as_deref().filter(|name| !name.trim().is_empty());
+            StepRow {
+                label: format!(
+                    "{}  {}",
+                    apply::shown_text(name.unwrap_or(&label).trim()),
+                    apply::shown_text(path)
+                ),
+            }
         })
-        .map(|label| StepRow { label })
         .collect()
 }
 
@@ -1708,6 +1722,8 @@ pub mod tests {
             stderr: stderr.to_owned(),
             skipped: false,
             entry: apply::Entry::Script,
+            task: None,
+            name: None,
         }
     }
 
@@ -1727,6 +1743,8 @@ pub mod tests {
             target: target.to_owned(),
             steps: Vec::new(),
             ok: false,
+            task: None,
+            name: None,
         }
     }
 
@@ -1882,6 +1900,18 @@ pub mod tests {
             [row("packages"), row("hostname"), row("mkdir -p ~/.local …")]
         );
         assert_eq!(app.config_error, None);
+    }
+
+    #[test]
+    fn a_task_row_is_its_name_or_label_then_its_path() {
+        let toml = "[[tasks]]\nname = \"Web\u{202e}\"\nrun = \"a\"\n\n[[tasks]]\nrun = \"b\"\n";
+        let opts = config_opts("tui-task-rows", toml);
+        let rows: Vec<String> = load_steps(&opts)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.label)
+            .collect();
+        assert_eq!(rows, ["Web\\u{202e}  tasks[0]", "b  tasks[1]"]);
     }
 
     #[test]

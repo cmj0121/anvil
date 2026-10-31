@@ -179,6 +179,7 @@ fn service_run(
             run: ServiceRun { skip },
         },
         task: None,
+        name: None,
     }
 }
 

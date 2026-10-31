@@ -90,11 +90,11 @@ pub fn load(
                 .and_then(|dir| read_src(dir, &entry.src))
         };
         text.map(|text| Source { text }).map_err(|why| {
-            format!(
+            item.shown_message(format!(
                 "{}.src `{}`: {why}",
                 item.label("files", i),
                 secret::shown_name(&entry.src)
-            )
+            ))
         })
     });
     Ok(Sources(sources.collect::<Result<_, _>>()?))
@@ -428,6 +428,7 @@ fn file_run(
             run: file,
         },
         task: None,
+        name: None,
     }
 }
 
@@ -1734,6 +1735,31 @@ mod tests {
         let err = load(&config, || Ok(dir.join("missing"))).unwrap_err();
         assert!(err.contains("not found"), "{err}");
         assert!(!err.contains("cannot read:"), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_tasks_src_error_shows_bidi_as_an_escape_and_a_legacy_one_as_it_is() {
+        let dir = dir("files-src-bidi");
+        let src = "a\u{202e}b";
+        let text = format!(
+            "[[tasks]]\nfile = {{ src = \"{src}\", dest = \"/tmp/file\", mode = \"0644\" }}\n"
+        );
+        let tasks: Config = toml::from_str(&text).unwrap();
+        let expanded = crate::tasks::expand(&tasks, || Ok(dir.clone())).unwrap();
+        let err = super::load(&expanded, || Ok(dir.clone())).unwrap_err();
+        assert!(
+            err.starts_with("tasks[0].file.src `a\\u{202e}b`: "),
+            "{err}"
+        );
+        assert!(!err.contains('\u{202e}'), "{err}");
+
+        let legacy = Config {
+            files: vec![entry(src, "/tmp/file")],
+            ..Config::default()
+        };
+        let err = load(&legacy, || Ok(dir.clone())).unwrap_err();
+        assert!(err.starts_with(&format!("files[0].src `{src}`: ")), "{err}");
         fs::remove_dir_all(dir).unwrap();
     }
 

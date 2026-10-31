@@ -15,7 +15,7 @@ use crate::facts::Facts;
 use crate::files;
 use crate::filestore::{self, Root};
 use crate::inventory::Target;
-use crate::logger::escape_controls;
+use crate::logger::{escape_invisible, escape_line};
 use crate::packages::Packages;
 use crate::secret;
 
@@ -125,8 +125,21 @@ impl Item {
     /// `tasks[0].file`, else `section[i]` as a legacy section's entry.
     pub fn label(&self, section: &str, i: usize) -> String {
         match &self.path {
-            Some(path) => format!("{path}.{}", section.trim_end_matches('s')),
+            Some(path) => format!(
+                "{}.{}",
+                escape_invisible(path),
+                section.trim_end_matches('s')
+            ),
             None => format!("{section}[{i}]"),
+        }
+    }
+
+    /// `message` about this item as shown: a task's with its invisible
+    /// characters escaped, a legacy entry's as it is.
+    pub fn shown_message(&self, message: String) -> String {
+        match self.path {
+            Some(_) => escape_invisible(&message),
+            None => message,
         }
     }
 
@@ -134,6 +147,7 @@ impl Item {
     pub fn matches(&self, target: &Target, facts: &Facts) -> bool {
         files::matches_list(&self.tags, &self.facts, target, facts)
     }
+
     /// [`Self::matches`] once facts are known; before the probe, only tags.
     pub fn may_match(&self, target: &Target, facts: Option<&Facts>) -> bool {
         match facts {
@@ -203,7 +217,9 @@ pub fn expand(
         files: 0,
         services: 0,
     };
-    walk.tasks(&config.tasks, "tasks", 1, &Selector::default())?;
+    // A refusal can name an include's path, which may hold anything.
+    walk.tasks(&config.tasks, "tasks", 1, &Selector::default())
+        .map_err(|why| escape_invisible(&why))?;
     Ok(Expanded {
         items: walk.items,
         from_tasks: true,
@@ -458,9 +474,7 @@ impl Walk<'_> {
 /// A store path as a task path holds it: never cut, so paths stay distinct, and
 /// with every control character escaped, since output shows it.
 fn segment(rel: &str) -> String {
-    escape_controls(rel)
-        .replace('\n', "\\n")
-        .replace('\t', "\\t")
+    escape_line(rel)
 }
 
 #[cfg(test)]

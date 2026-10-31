@@ -22,7 +22,7 @@ use crate::fanout::{self, Event};
 use crate::files::Sources;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
-use crate::logger::{DIM, GREEN, RED, YELLOW, paint};
+use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
 use crate::options::Options;
 use crate::plugin::{self, Plugins};
 use crate::status;
@@ -237,13 +237,17 @@ pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
     }
 }
 
-/// One target's block: a `▶ target` header, a `would $ command` line per
-/// step, then `✔ N steps`, `✘ reason` or `⊘ cancelled`, then a blank line.
+/// One target's block: a `▶ target` header, a `PATH  NAME` line per task and a
+/// `would $ command` line per step, then `✔ N steps`, `✘ reason` or `⊘ cancelled`, then a blank line.
 pub fn render(report: &PlanReport) -> Vec<Line> {
     let mut lines = vec![Line::header(report.target())];
     let end = match report {
         PlanReport::Planned { steps, .. } => {
             for step in steps {
+                lines.extend(
+                    step.title()
+                        .map(|title| Line::out(title, Escape::Always, None)),
+                );
                 lines.push(Line::out(would_text(step), Escape::Always, Some(DIM)));
             }
             Line::out(
@@ -264,7 +268,8 @@ pub fn render(report: &PlanReport) -> Vec<Line> {
 }
 
 /// `would $ command`, then the secret whose password it would type and the
-/// plugin that returned it, if any; unescaped.
+/// plugin that returned it, if any; unescaped but for a task's invisible
+/// characters, since its `run` is config text under review.
 pub fn would_text(step: &PlannedRun) -> String {
     let secret = step
         .sudo_secret
@@ -275,7 +280,11 @@ pub fn would_text(step: &PlannedRun) -> String {
         .plugin()
         .map(|name| format!(" (from plugin {name})"))
         .unwrap_or_default();
-    format!("would $ {}{secret}{from}", apply::command(step.shown()))
+    let text = format!("would $ {}{secret}{from}", apply::command(step.shown()));
+    match step.task {
+        Some(_) => escape_invisible(&text),
+        None => text,
+    }
 }
 
 /// The last line of the human output: `N targets, [M failed, ]nothing executed`.
@@ -305,6 +314,24 @@ mod tests {
     use crate::packages::{Manager, Packages};
     use crate::test_util::{FakePlugins, Meet, json, keys};
     use crate::transport::{Output, RUN_TIMEOUT};
+
+    #[test]
+    fn a_tasks_would_line_shows_bidi_as_an_escape_and_json_keeps_it() {
+        let run = "true \u{202e}x";
+        let step = |task: Option<&str>| PlannedRun {
+            run: run.to_owned().into(),
+            label: None,
+            sudo_secret: None,
+            timeout: RUN_TIMEOUT,
+            kind: RunKind::Script,
+            task: task.map(str::to_owned),
+            name: None,
+        };
+        let task = step(Some("tasks[0]"));
+        assert_eq!(would_text(&task), "would $ true \\u{202e}x");
+        assert!(serde_json::to_string(&task).unwrap().contains(run));
+        assert_eq!(would_text(&step(None)), format!("would $ {run}"), "legacy");
+    }
 
     /// [`super::run_targets`] on a legacy config's list.
     fn run_targets(
@@ -616,6 +643,7 @@ mod tests {
                         manager: Manager::Pacman,
                     },
                     task: None,
+                    name: None,
                 },
                 PlannedRun {
                     run: "one".to_owned().into(),
@@ -627,6 +655,7 @@ mod tests {
                         plugin: None,
                     },
                     task: None,
+                    name: None,
                 },
                 PlannedRun {
                     run: "two".to_owned().into(),
@@ -638,6 +667,7 @@ mod tests {
                         plugin: None,
                     },
                     task: None,
+                    name: None,
                 },
             ],
             ok: true,

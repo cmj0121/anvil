@@ -43,6 +43,7 @@ pub fn run_targets(
         timeout,
         kind: RunKind::Script,
         task: None,
+        name: None,
     }];
     let cancel = &opts.cancel;
     Ok(apply::for_each_target(
