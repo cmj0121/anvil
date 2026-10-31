@@ -348,9 +348,9 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
         Command::Files { action } => crate::files_cmd::run(cli, &opts, action),
         Command::Doctor => {
             crate::commands::warn_parallel(cli);
-            let config = opts.load_config()?;
+            let (config, expanded) = opts.load_expanded()?;
             let store = opts.secret_store(&config)?;
-            crate::doctor::run(cli, &opts, &config, store.as_ref())
+            crate::doctor::run(cli, &opts, &config, &expanded, store.as_ref())
         }
         Command::Apply => crate::apply::run(cli, &opts),
         Command::Plan => crate::plan::run(cli, &opts),

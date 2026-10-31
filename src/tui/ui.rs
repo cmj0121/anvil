@@ -1548,7 +1548,7 @@ mod tests {
             steps: vec![Step::script("hostname"), Step::script("false")],
             ..Config::default()
         };
-        let rows = crate::tui::app::step_rows(&config);
+        let rows = crate::tui::app::step_rows(&crate::tasks::legacy(&config));
         assert_eq!(
             rows,
             [
@@ -1616,7 +1616,7 @@ mod tests {
             steps: vec![Step::script("hostname")],
             ..Config::default()
         };
-        let rows = crate::tui::app::step_rows(&config);
+        let rows = crate::tui::app::step_rows(&crate::tasks::legacy(&config));
         assert_eq!(
             rows,
             [
@@ -2529,6 +2529,7 @@ mod tests {
                                 sudo_secret: Some("LOCAL_SUDO".to_owned()),
                                 timeout: RUN_TIMEOUT,
                                 kind: crate::apply::RunKind::Script,
+                                task: None,
                             },
                             PlannedRun {
                                 run: "hostname".to_owned().into(),
@@ -2536,6 +2537,7 @@ mod tests {
                                 sudo_secret: None,
                                 timeout: RUN_TIMEOUT,
                                 kind: crate::apply::RunKind::Script,
+                                task: None,
                             },
                         ],
                         ok: true,

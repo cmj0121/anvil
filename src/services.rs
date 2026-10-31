@@ -1,7 +1,7 @@
 //! `[[services]]`: a service brought to a state, and to an enablement when
 //! one is set, by the init each target runs.
 //!
-//! [`runs`] turns each entry into one step per target: a skip when the
+//! [`Builder::run`] turns each entry into one step per target: a skip when the
 //! entry does not match, else the script, run as root or through
 //! `sudo -n`, with the password typed when sudo asks for one.
 //!
@@ -15,12 +15,13 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::apply::{PlannedRun, RunKind, ServiceRun};
-use crate::config::{Config, ServiceState, check_service_name};
+use crate::config::{Config, ServiceEntry, ServiceState, check_service_name};
 use crate::facts::Facts;
 use crate::files::{self, quote};
 use crate::inventory::Target;
 use crate::packages::Manager;
 use crate::secret;
+use crate::tasks::Item;
 use crate::transport::RUN_TIMEOUT;
 
 /// The time limit of a service step: systemd's default 90 s start timeout
@@ -59,61 +60,73 @@ pub fn init_for(distro: &str) -> Option<Init> {
     }
 }
 
-/// One step per `[[services]]` entry for `target`, in config order: a skip
-/// when it does not match, else its script under the target's init. The
-/// init and the way to root are looked up once, and only when an entry
-/// matches; either failing fails the whole target.
-pub fn runs(
-    config: &Config,
-    target: &Target,
-    facts: Option<&Facts>,
-) -> Result<Vec<PlannedRun>, String> {
-    if config.services.is_empty() {
-        return Ok(Vec::new());
+/// Builds the steps of one target's service items, in list order: a skip when
+/// the item does not match, else its script under the target's init. The init
+/// and the way to root are looked up once, and only when an item matches;
+/// either failing fails the whole target.
+pub struct Builder<'a> {
+    config: &'a Config,
+    target: &'a Target,
+    facts: Option<&'a Facts>,
+    found: Option<(Init, &'static str, Option<&'a str>)>,
+    seen: usize,
+}
+
+impl<'a> Builder<'a> {
+    pub fn new(config: &'a Config, target: &'a Target, facts: Option<&'a Facts>) -> Builder<'a> {
+        Builder {
+            config,
+            target,
+            facts,
+            found: None,
+            seen: 0,
+        }
     }
-    let facts = facts.ok_or("services: the probe has not run")?;
-    let mut found: Option<(Init, &str, Option<&str>)> = None;
-    let mut runs = Vec::with_capacity(config.services.len());
-    for (i, entry) in config.services.iter().enumerate() {
+
+    /// The step of service `item`, holding `entry`.
+    pub fn run(&mut self, item: &Item, entry: &ServiceEntry) -> Result<PlannedRun, String> {
+        let target = self.target;
+        let facts = self.facts.ok_or("services: the probe has not run")?;
+        let i = self.seen;
+        self.seen += 1;
+        let label = item.label("services", i);
         let name = &entry.name;
-        if !files::matches(&entry.tags, &entry.facts, target, facts) {
-            log::info!("{}: services[{i}] {name}: no match", target.name);
-            runs.push(service_run(
+        if !item.matches(target, facts) {
+            log::info!("{}: {label} {name}: no match", target.name);
+            return Ok(service_run(
                 name,
                 String::new(),
                 format!("skipped service {name}: no match"),
                 None,
                 true,
             ));
-            continue;
         }
-        let (init, sudo, secret) = match found {
+        let (init, sudo, secret) = match self.found {
             Some(found) => found,
             None => {
                 let init = init_of(facts)?;
-                let (sudo, secret) = root_access(config, target, facts)?;
-                *found.insert((init, sudo, secret))
+                let (sudo, secret) = root_access(self.config, target, facts)?;
+                *self.found.insert((init, sudo, secret))
             }
         };
         let state = entry
             .state()
-            .ok_or_else(|| format!("services: internal error: services[{i}] has no valid state"))?;
+            .ok_or_else(|| format!("services: internal error: {label} has no valid state"))?;
         match secret {
             Some(secret) => log::info!(
-                "{}: services[{i}] {name} with {init}, sudo password from secret {secret}",
+                "{}: {label} {name} with {init}, sudo password from secret {secret}",
                 target.name
             ),
-            None => log::info!("{}: services[{i}] {name} with {init}", target.name),
+            None => log::info!("{}: {label} {name} with {init}", target.name),
         }
-        runs.push(service_run(
+        Ok(service_run(
             name,
             script(init, name, state, entry.enabled, sudo, LAUNCH_DAEMONS),
             format!("service {name}"),
             secret.map(str::to_owned),
             false,
-        ));
+        ))
     }
-    Ok(runs)
 }
 
 /// The init the target's `distro` fact names.
@@ -165,6 +178,7 @@ fn service_run(
             name: name.to_owned(),
             run: ServiceRun { skip },
         },
+        task: None,
     }
 }
 

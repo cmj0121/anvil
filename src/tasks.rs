@@ -1,7 +1,7 @@
 //! The ordered list a run follows: legacy sections in their fixed order, or
 //! `[[tasks]]` with nesting and `$/` includes flattened, inheriting selectors.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -11,7 +11,10 @@ use crate::config::{
     check_selector, check_service, check_tasks,
 };
 use crate::document::{self, Format};
+use crate::facts::Facts;
+use crate::files;
 use crate::filestore::{self, Root};
+use crate::inventory::Target;
 use crate::logger::escape_controls;
 use crate::packages::Packages;
 use crate::secret;
@@ -27,16 +30,15 @@ const MAX_TASKS: usize = 256;
 const MAX_VISITED: usize = 4096;
 
 /// What a run does, in order. Never serialized.
-// U5 removes this allow when apply reads the list.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Expanded {
     pub items: Vec<Item>,
+    /// From `[[tasks]]`, not legacy sections: decided by the config, since a
+    /// task list may expand to no items.
+    pub from_tasks: bool,
 }
 
 /// One thing to run.
-// U5 removes this allow when apply reads the list.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     /// The task's stable path; `None` for legacy entries, so output is unchanged.
@@ -50,8 +52,6 @@ pub struct Item {
 }
 
 /// What an [`Item`] does.
-// U5 removes this allow when apply reads the list.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemKind {
     /// The global `[packages]` with this task's lists.
@@ -65,6 +65,84 @@ pub enum ItemKind {
     Step(Step),
 }
 
+impl Expanded {
+    /// The file items in order, each with its entry and ordinal.
+    pub fn files(&self) -> impl Iterator<Item = (&Item, &FileEntry, usize)> {
+        self.items.iter().filter_map(|item| match &item.kind {
+            ItemKind::File { entry, ordinal } => Some((item, entry, *ordinal)),
+            _ => None,
+        })
+    }
+
+    /// Whether two dests name one path: on a tasks config repeated slashes do
+    /// not count, on a legacy one only the same spelling does.
+    pub fn same_dest(&self, a: &str, b: &str) -> bool {
+        fn parts(dest: &str) -> impl Iterator<Item = &str> {
+            dest.split('/').filter(|part| !part.is_empty())
+        }
+        match self.from_tasks {
+            true => parts(a).eq(parts(b)),
+            false => a == b,
+        }
+    }
+
+    /// The file entry with this ordinal.
+    pub fn file(&self, ordinal: usize) -> Option<&FileEntry> {
+        self.files()
+            .find(|(_, _, found)| *found == ordinal)
+            .map(|(_, entry, _)| entry)
+    }
+    /// The sudo secrets a step may type on a target its tags reach: for a
+    /// package item, a `sudo = true` file item or a service item.
+    pub fn sudo_secrets<'a>(
+        &'a self,
+        config: &'a Config,
+        targets: &'a [Target],
+    ) -> BTreeSet<&'a str> {
+        let mut names = BTreeSet::new();
+        for item in &self.items {
+            let tagged = targets
+                .iter()
+                .filter(|target| files::has_tags(&item.tags, target));
+            match &item.kind {
+                ItemKind::Packages(packages) => {
+                    names.extend(tagged.filter_map(|target| packages.sudo_secret_for(target)));
+                }
+                ItemKind::File { entry, .. } if !entry.sudo => {}
+                ItemKind::File { .. } | ItemKind::Service(_) => {
+                    names
+                        .extend(tagged.filter_map(|target| files::sudo_secret_for(config, target)));
+                }
+                ItemKind::Step(_) => {}
+            }
+        }
+        names
+    }
+}
+
+impl Item {
+    /// What messages call this item: its path and kind field, as
+    /// `tasks[0].file`, else `section[i]` as a legacy section's entry.
+    pub fn label(&self, section: &str, i: usize) -> String {
+        match &self.path {
+            Some(path) => format!("{path}.{}", section.trim_end_matches('s')),
+            None => format!("{section}[{i}]"),
+        }
+    }
+
+    /// Whether `target` matches this item's tags and facts.
+    pub fn matches(&self, target: &Target, facts: &Facts) -> bool {
+        files::matches_list(&self.tags, &self.facts, target, facts)
+    }
+    /// [`Self::matches`] once facts are known; before the probe, only tags.
+    pub fn may_match(&self, target: &Target, facts: Option<&Facts>) -> bool {
+        match facts {
+            Some(facts) => self.matches(target, facts),
+            None => files::has_tags(&self.tags, target),
+        }
+    }
+}
+
 /// An include file: only `tasks`, so it cannot change global settings.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,8 +152,6 @@ struct IncludeFile {
 }
 
 /// Legacy sections in today's fixed order. Touches no filesystem.
-// U5 removes this allow when apply reads the list.
-#[allow(dead_code)]
 pub fn legacy(config: &Config) -> Expanded {
     fn item(tags: &[String], facts: &BTreeMap<String, String>, kind: ItemKind) -> Item {
         Item {
@@ -104,13 +180,12 @@ pub fn legacy(config: &Config) -> Expanded {
     let steps = (config.steps.iter()).map(|step| item(&[], &none, ItemKind::Step(step.clone())));
     Expanded {
         items: packages.chain(files).chain(services).chain(steps).collect(),
+        from_tasks: false,
     }
 }
 
 /// [`legacy`] when there are no tasks, without calling `workspace`; else the
 /// tasks flattened and validated. Every include is read whatever its selector.
-// U5 removes this allow when apply reads the list.
-#[allow(dead_code)]
 pub fn expand(
     config: &Config,
     workspace: impl FnOnce() -> Result<PathBuf, String>,
@@ -129,7 +204,75 @@ pub fn expand(
         services: 0,
     };
     walk.tasks(&config.tasks, "tasks", 1, &Selector::default())?;
-    Ok(Expanded { items: walk.items })
+    Ok(Expanded {
+        items: walk.items,
+        from_tasks: true,
+    })
+}
+
+/// Every `$/` path `config`'s tasks name, as (the field naming it, the path),
+/// following each include that can still be read. Unlike [`expand`] it never
+/// fails: it answers what a removed store file leaves dangling, and a removed
+/// include is exactly what expansion refuses.
+pub fn references(config: &Config, root: &Root) -> Vec<(String, String)> {
+    let mut found = Found {
+        root,
+        chain: Vec::new(),
+        visited: 0,
+        references: Vec::new(),
+    };
+    found.tasks(&config.tasks, "tasks");
+    found.references
+}
+
+struct Found<'a> {
+    root: &'a Root,
+    chain: Vec<String>,
+    visited: usize,
+    references: Vec<(String, String)>,
+}
+
+impl Found<'_> {
+    fn tasks(&mut self, tasks: &[Task], prefix: &str) {
+        for (i, task) in tasks.iter().enumerate() {
+            self.visited += 1;
+            if self.visited > MAX_VISITED {
+                return;
+            }
+            let path = format!("{prefix}[{i}]");
+            if let Some(entry) = &task.file {
+                self.references
+                    .push((format!("{path}.file.src"), entry.src.clone()));
+            }
+            if let Some(children) = &task.tasks {
+                self.tasks(children, &format!("{path}.tasks"));
+            }
+            if let Some(include) = &task.include {
+                self.references
+                    .push((format!("{path}.include"), include.clone()));
+                self.include(include, &path);
+            }
+        }
+    }
+
+    fn include(&mut self, include: &str, path: &str) {
+        let Ok(rel) = filestore::parse(include) else {
+            return;
+        };
+        if self.chain.contains(&rel) {
+            return;
+        }
+        let Ok(text) = self.root.read_trusted(include) else {
+            return;
+        };
+        let Ok(file) = document::from_str::<IncludeFile>(&text, Format::Toml) else {
+            return;
+        };
+        let prefix = format!("{path}/{}:tasks", segment(&rel));
+        self.chain.push(rel);
+        self.tasks(&file.tasks, &prefix);
+        self.chain.pop();
+    }
 }
 
 /// The selector a task inherits.
@@ -223,7 +366,7 @@ impl Walk<'_> {
                 None => return Ok(()),
             }
         } else if let Some(entry) = &task.file {
-            check_file(&path, entry)?;
+            check_file(&format!("{path}.file"), entry)?;
             self.files += 1;
             if self.files > MAX_FILES {
                 return Err(format!(
@@ -235,7 +378,7 @@ impl Walk<'_> {
                 ordinal: self.files - 1,
             }
         } else if let Some(entry) = &task.service {
-            check_service(&path, entry)?;
+            check_service(&format!("{path}.service"), entry)?;
             self.services += 1;
             if self.services > MAX_SERVICES {
                 return Err(format!(
@@ -887,36 +1030,39 @@ mod tests {
     const BROKEN: &[(&str, &str)] = &[
         (
             r#"file = { src = "", dest = "/d", mode = "0644" }"#,
-            ".src ``: must be relative",
+            ".file.src ``: must be relative",
         ),
         (
             r#"file = { src = "/abs", dest = "/d", mode = "0644" }"#,
-            ".src `/abs`: must be relative",
+            ".file.src `/abs`: must be relative",
         ),
         (
             r#"file = { src = "$/", dest = "/d", mode = "0644" }"#,
-            ".src `$/`: must name a file",
+            ".file.src `$/`: must name a file",
         ),
         (
             r#"file = { src = "s", dest = "rel", mode = "0644" }"#,
-            ".dest `rel`: must be an absolute path",
+            ".file.dest `rel`: must be an absolute path",
         ),
         (
             r#"file = { src = "s", dest = "/a/../b", mode = "0644" }"#,
-            ".dest `/a/../b`: must not contain",
+            ".file.dest `/a/../b`: must not contain",
         ),
-        (r#"file = { src = "s", dest = "/d" }"#, ".mode: required"),
+        (
+            r#"file = { src = "s", dest = "/d" }"#,
+            ".file.mode: required",
+        ),
         (
             r#"file = { src = "s", dest = "/d", mode = 644 }"#,
-            ".mode: write it as a quoted string",
+            ".file.mode: write it as a quoted string",
         ),
         (
             r#"file = { src = "s", dest = "/d", mode = "9" }"#,
-            ".mode `9`: must be 3 or 4 octal digits",
+            ".file.mode `9`: must be 3 or 4 octal digits",
         ),
         (
             r#"file = { src = "s", dest = "/d", mode = "4755" }"#,
-            ".mode `4755`: setuid and setgid are refused",
+            ".file.mode `4755`: setuid and setgid are refused",
         ),
         (
             r#"file = { src = "s", dest = "/d", mode = "0644", tags = ["web"] }"#,
@@ -924,16 +1070,16 @@ mod tests {
         ),
         (
             r#"service = { name = "-x", state = "started" }"#,
-            ".name `-x`: must not start with",
+            ".service.name `-x`: must not start with",
         ),
         (
             r#"service = { name = "a.target", state = "started" }"#,
-            ".name `a.target`: must name a service",
+            ".service.name `a.target`: must name a service",
         ),
-        (r#"service = { name = "a" }"#, ".state: required"),
+        (r#"service = { name = "a" }"#, ".service.state: required"),
         (
             r#"service = { name = "a", state = "gone" }"#,
-            ".state `gone`: must be started or stopped",
+            ".service.state `gone`: must be started or stopped",
         ),
         (
             r#"service = { name = "a", state = "started", facts = { os = "Linux" } }"#,

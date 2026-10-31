@@ -15,6 +15,11 @@
 //! any plugin step needs) and becomes the script it replies with, wrapped
 //! as `anvil run` wraps a script.
 //!
+//! A `[[tasks]]` config runs its expanded list ([`crate::tasks`]) in order
+//! instead of the fixed order below, an item that does not match being a skip
+//! of any kind. Facts come from one probe before the run, so a step cannot
+//! change which manager or facts a later task sees.
+//!
 //! Each `[[files]]` entry is one step after the package step, before
 //! `[[steps]]`: it copies its src when the target matches, else it is
 //! reported as skipped without running anything. When sudo asks that
@@ -43,7 +48,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::cli::{Cli, Failure, print_json};
-use crate::config::{Config, Plugin, StepKind};
+use crate::config::{Config, Plugin, Step, StepKind};
 use crate::facts::{self, Facts};
 use crate::fanout::{self, Event};
 use crate::files::{self, Sources};
@@ -57,6 +62,7 @@ use crate::record::{self, FileRecord, Session, TargetRecord};
 use crate::secret::Store;
 use crate::services;
 use crate::status;
+use crate::tasks::{Expanded, Item, ItemKind};
 use crate::transport::{
     Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
 };
@@ -95,6 +101,8 @@ pub struct PlannedRun {
     pub sudo_secret: Option<String>,
     pub timeout: Duration,
     pub kind: RunKind,
+    /// The path of the task this step comes from; `None` for a legacy entry.
+    pub task: Option<String>,
 }
 
 /// What a run does.
@@ -113,6 +121,9 @@ pub enum RunKind {
         number: usize,
         plugin: Option<String>,
     },
+    /// A `run`, `plugin` or `packages` task the target does not match:
+    /// nothing runs, and no manager was resolved for it.
+    Skip,
     /// `anvil run`: no config entry.
     Script,
 }
@@ -124,7 +135,7 @@ impl RunKind {
             RunKind::File { dest, .. } => Entry::File { dest: dest.clone() },
             RunKind::Service { name, .. } => Entry::Service { name: name.clone() },
             RunKind::Step { number, .. } => Entry::Step { number: *number },
-            RunKind::Script => Entry::Script,
+            RunKind::Skip | RunKind::Script => Entry::Script,
         }
     }
 }
@@ -134,9 +145,19 @@ impl RunKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
     Packages,
-    File { dest: String },
-    Service { name: String },
-    Step { number: usize },
+    File {
+        dest: String,
+    },
+    Service {
+        name: String,
+    },
+    Step {
+        number: usize,
+    },
+    /// A `packages`, `service`, `run` or `plugin` task, by its path.
+    Task {
+        path: String,
+    },
     Script,
 }
 
@@ -208,6 +229,14 @@ impl PlannedRun {
     /// What the step's report shows: `label`, or else `run`.
     pub fn shown(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.run)
+    }
+
+    /// The config entry this step's report belongs to.
+    fn entry(&self) -> Entry {
+        match (&self.kind, &self.task) {
+            (RunKind::File { .. }, _) | (_, None) => self.kind.entry(),
+            (_, Some(path)) => Entry::Task { path: path.clone() },
+        }
     }
 
     /// The plugin that returned this step, if one did.
@@ -456,13 +485,14 @@ pub type Progress<'a> = Event<'a, TargetReport>;
 pub fn run_targets(
     opts: &Options,
     config: &Config,
+    expanded: &Expanded,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
     let targets = opts.targets_for(config)?;
     let pins = plugin::verify_where(config, Plugin::is_step).map_err(Failure::usage)?;
-    let sources = opts.sources(config)?;
-    let passwords = load_passwords(&targets, config, || opts.secret_store(config))?;
-    let session = match needs_facts(config) {
+    let sources = opts.sources(config, expanded)?;
+    let passwords = load_passwords(&targets, config, expanded, || opts.secret_store(config))?;
+    let session = match needs_facts(config, expanded) {
         true => Some(open_record("apply")?),
         false => None,
     };
@@ -471,6 +501,7 @@ pub fn run_targets(
         opts.parallel,
         |target| opts.transport(target),
         config,
+        expanded,
         &sources,
         &pins,
         &passwords,
@@ -490,32 +521,19 @@ pub(crate) fn open_record(command: &str) -> Result<Session, Failure> {
 }
 
 /// The sudo password of each of `targets` with a sudo secret that a step may
-/// type, read from the store `store` builds, opened once: the package step's
-/// when `[packages]` has work, and a target's when a `sudo = true`
-/// `[[files]]` entry or a `[[services]]` entry carries only tags it has (its
-/// facts are not known yet).
+/// type, read from the store `store` builds, opened once: a target's when a
+/// package item, a `sudo = true` file item or a service item carries only tags
+/// it has (its facts are not known yet).
 /// Nothing is built or opened when no step may type one. One trailing
 /// newline is trimmed. A store error fails the command. Core dumps are
 /// turned off first.
 fn load_passwords(
     targets: &[Target],
     config: &Config,
+    expanded: &Expanded,
     store: impl FnOnce() -> Result<Box<dyn Store>, Failure>,
 ) -> Result<Passwords, Failure> {
-    let mut names: BTreeSet<&str> = package_work(config)
-        .map(|packages| packages.sudo_secrets(targets).collect())
-        .unwrap_or_default();
-    names.extend(
-        targets
-            .iter()
-            .filter(|target| {
-                (config.files.iter())
-                    .any(|entry| entry.sudo && files::has_tags(&entry.tags, target))
-                    || (config.services.iter()).any(|entry| files::has_tags(&entry.tags, target))
-            })
-            .filter_map(|target| files::sudo_secret_for(config, target)),
-    );
-    read_passwords(names, store)
+    read_passwords(expanded.sudo_secrets(config, targets), store)
 }
 
 /// The sudo password of each secret in `names`, read from the store
@@ -582,6 +600,7 @@ fn apply_targets(
     parallel: NonZeroU8,
     transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError> + Sync,
     config: &Config,
+    expanded: &Expanded,
     sources: &Sources,
     plugins: &dyn Plugins,
     passwords: &Passwords,
@@ -612,6 +631,7 @@ fn apply_targets(
                 target,
                 transport(target),
                 config,
+                expanded,
                 sources,
                 plugins,
                 passwords,
@@ -757,9 +777,9 @@ pub(crate) fn for_each_target(
 /// `anvil apply`: prints each target's block in order (or one JSON
 /// document), then the summary.
 pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
-    let config = opts.load_config()?;
+    let (config, expanded) = opts.load_expanded()?;
     let _interrupt = Interrupt::install(&opts.cancel)?;
-    print_report(cli, "apply", |on| run_targets(opts, &config, on))
+    print_report(cli, "apply", |on| run_targets(opts, &config, &expanded, on))
 }
 
 /// Prints each target's block once it and every earlier target have ended
@@ -811,25 +831,33 @@ pub(crate) fn cancelled(command: &str, target: &Target, steps: Vec<StepReport>) 
     }
 }
 
-/// Whether apply probes each target: `[packages]` has work, a step is a
-/// plugin, a doctor plugin is configured (its drift needs the facts), or
-/// there are `[[files]]` or `[[services]]`.
-fn needs_facts(config: &Config) -> bool {
-    package_work(config).is_some()
-        || config.steps.iter().any(|s| s.plugin.is_some())
-        || config.plugins.values().any(Plugin::is_doctor)
-        || !config.files.is_empty()
-        || !config.services.is_empty()
+/// Whether apply probes each target: the list has package, file or service
+/// items, a plugin step, or an item selecting on facts, or a doctor plugin is
+/// configured (its drift needs the facts).
+fn needs_facts(config: &Config, expanded: &Expanded) -> bool {
+    config.plugins.values().any(Plugin::is_doctor)
+        || expanded.items.iter().any(|item| {
+            !item.facts.is_empty()
+                || match &item.kind {
+                    ItemKind::Step(step) => step.plugin.is_some(),
+                    _ => true,
+                }
+        })
 }
 
 /// Probes `target` when [`needs_facts`], then runs the steps [`resolve`]
 /// lists; `passwords` holds the sudo passwords to type. A target the probe
 /// reached comes back with its record: its facts, each file written with
 /// what DEST held before, and the steps that ran but cannot be undone.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one input of the target's apply, passed through"
+)]
 fn apply_target(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
     config: &Config,
+    expanded: &Expanded,
     sources: &Sources,
     plugins: &dyn Plugins,
     passwords: &Passwords,
@@ -843,12 +871,12 @@ fn apply_target(
         }
     };
     log::info!("apply {}: over {}", target.name, transport.name());
-    let facts = if needs_facts(config) {
+    let facts = if needs_facts(config, expanded) {
         if cancel.load(Ordering::Relaxed) {
             return Applied::unrecorded(cancelled("apply", target, Vec::new()));
         }
         status::phase(&target.name, status::Phase::Probe);
-        match probe(transport.as_ref(), config) {
+        match probe(transport.as_ref(), expanded) {
             Ok(facts) => Some(facts),
             Err(Unresolved::Failed(error)) => {
                 return Applied::unrecorded(failed("apply", target, Vec::new(), error));
@@ -860,8 +888,17 @@ fn apply_target(
     } else {
         None
     };
-    let mut recorder = Recorder::new(config, sources);
-    let report = match resolve(target, facts.as_ref(), config, sources, plugins, cancel) {
+    let mut recorder = Recorder::new(expanded, sources, target, facts.as_ref());
+    let resolved = resolve(
+        target,
+        facts.as_ref(),
+        config,
+        expanded,
+        sources,
+        plugins,
+        cancel,
+    );
+    let report = match resolved {
         Ok(runs) => execute(
             "apply",
             target,
@@ -883,20 +920,51 @@ fn apply_target(
 
 /// What a target's `[[files]]` steps wrote, for the record.
 pub(crate) struct Recorder<'a> {
-    config: &'a Config,
+    expanded: &'a Expanded,
     sources: &'a Sources,
     files: Vec<FileRecord>,
+    /// On a tasks config, the dests with a `rollback = false` file item that
+    /// applies to this target. Known before any write, since one kept text
+    /// could already be that item's bytes from the last apply, and the item
+    /// may never run to drop it.
+    hash_only: Vec<&'a str>,
     /// Whether a write started: its capture ran, then the write did.
     wrote: bool,
 }
 
 impl<'a> Recorder<'a> {
-    fn new(config: &'a Config, sources: &'a Sources) -> Recorder<'a> {
+    fn new(
+        expanded: &'a Expanded,
+        sources: &'a Sources,
+        target: &Target,
+        facts: Option<&Facts>,
+    ) -> Recorder<'a> {
+        let hash_only = match facts.filter(|_| expanded.from_tasks) {
+            Some(facts) => expanded
+                .files()
+                .filter(|(item, entry, _)| !entry.rollback && item.matches(target, facts))
+                .map(|(_, entry, _)| entry.dest.as_str())
+                .collect(),
+            None => Vec::new(),
+        };
         Recorder {
-            config,
+            expanded,
             sources,
             files: Vec::new(),
+            hash_only,
             wrote: false,
+        }
+    }
+
+    /// Keeps a tasks config to one record per dest
+    /// ([`FileRecord::written_again`]); a legacy config has one per write.
+    fn keep(&mut self, file: FileRecord) {
+        let again = self.files.iter_mut().find(|kept| {
+            self.expanded.from_tasks && self.expanded.same_dest(&kept.dest, &file.dest)
+        });
+        match again {
+            Some(kept) => kept.written_again(file),
+            None => self.files.push(file),
         }
     }
 
@@ -918,7 +986,8 @@ impl<'a> Recorder<'a> {
 }
 
 /// The steps that ran and that a rollback cannot undo: `packages`,
-/// `service NAME` and `step N` (1-based among `[[steps]]`), never a skip.
+/// `service NAME` and `step N` (1-based among `[[steps]]`), or a task's path;
+/// never a skip.
 fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
     steps
         .iter()
@@ -927,6 +996,7 @@ fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
             Entry::Packages => Some("packages".to_owned()),
             Entry::Service { name } => Some(format!("service {name}")),
             Entry::Step { number } => Some(format!("step {number}")),
+            Entry::Task { path } => Some(path.clone()),
             Entry::File { .. } | Entry::Script => None,
         })
         .collect()
@@ -994,13 +1064,14 @@ fn execute_inner(
             RunKind::File { .. } => ("files", "files"),
             RunKind::Service { .. } => ("services", "services"),
             RunKind::Packages { .. } => ("packages", "packages"),
-            RunKind::Step { .. } | RunKind::Script => ("packages", "step"),
+            RunKind::Step { .. } | RunKind::Skip | RunKind::Script => ("packages", "step"),
         };
         status::phase(&target.name, status::Phase::Run { kind, n: n + 1, of });
         let label = planned.shown();
-        let entry = planned.kind.entry();
+        let entry = planned.entry();
         if planned.file().is_some_and(|file| file.skip)
             || planned.service().is_some_and(|service| service.skip)
+            || matches!(planned.kind, RunKind::Skip)
         {
             reports.push(StepReport::skipped(label, entry));
             continue;
@@ -1097,8 +1168,10 @@ fn execute_inner(
                 // the running ssh (Wait) may have cut it.
                 _ => record::Write::FailedMidway,
             };
-            let file = write.record(recorder.config, recorder.sources, found, ended);
-            recorder.files.push(file);
+            let hash_only = (recorder.hash_only.iter())
+                .any(|dest| recorder.expanded.same_dest(dest, &write.dest));
+            let file = write.record(recorder.expanded, recorder.sources, found, ended, hash_only);
+            recorder.keep(file);
         }
         let output = match output {
             Ok(output) => output,
@@ -1305,18 +1378,21 @@ fn step_error(err: &TransportError, secret: Option<&str>, prefix: &str) -> Strin
     }
 }
 
-/// `[packages]`, when it has work to do.
-fn package_work(config: &Config) -> Option<&Packages> {
-    config.packages.as_ref().filter(|p| p.has_work())
+/// Whether the list has a package item; one exists only when it has work.
+fn package_work(expanded: &Expanded) -> bool {
+    expanded
+        .items
+        .iter()
+        .any(|item| matches!(item.kind, ItemKind::Packages(_)))
 }
 
 /// Runs the probe over `transport`. The error is the target's failure: a
 /// transport error as is, anything else as `packages: <reason>` when
-/// `config`'s `[packages]` has work, else as `probe: <reason>`; or
-/// Cancelled when the transport was.
-pub fn probe(transport: &dyn Transport, config: &Config) -> Result<Facts, Unresolved> {
+/// `expanded` has a package item, else as `probe: <reason>`; or Cancelled
+/// when the transport was.
+pub fn probe(transport: &dyn Transport, expanded: &Expanded) -> Result<Facts, Unresolved> {
     let output = transport.run(facts::PROBE, RUN_TIMEOUT)?;
-    let (prefix, probe) = if package_work(config).is_some() {
+    let (prefix, probe) = if package_work(expanded) {
         ("packages", "probe ")
     } else {
         ("probe", "")
@@ -1353,95 +1429,173 @@ impl From<TransportError> for Unresolved {
     }
 }
 
-/// The steps apply runs on `target`, in order: the step that installs and
-/// upgrades `[packages]` with the target's package manager (when it has
-/// work), then one step per `[[files]]` entry, copying its src from
-/// `sources` or skipped, then one step per `[[services]]` entry, bringing it
-/// to its state or skipped, then each `[[steps]]` entry, a plugin step as the
-/// script its plugin returns. Runs nothing on the target, but each plugin on
-/// the controller, in step order, `cancel` checked before each. `facts`, from
-/// [`probe`], is required when `[packages]` has work, a step is a plugin or
-/// there are `[[files]]` or `[[services]]`. A failure is
+/// The steps apply runs on `target`, one per item of `expanded` in order: a
+/// package item as the step that installs and upgrades with the target's
+/// package manager (none when its script is empty), a file item copying its
+/// src from `sources`, a service item bringing it to its state, a step item as
+/// its command or the script its plugin returns. An item the target does not
+/// match is a skip and resolves nothing. Runs nothing on the target, but each
+/// plugin on the controller, in order, `cancel` checked before each. `facts`,
+/// from [`probe`], is required when [`needs_facts`] says so; being one probe,
+/// no step can change what a later item sees. A failure is
 /// `packages: <reason>`, `files…`, `services: <reason>` or
 /// `plugin <name>: <reason>`; the first one ends the list.
 pub fn resolve(
     target: &Target,
     facts: Option<&Facts>,
     config: &Config,
+    expanded: &Expanded,
     sources: &Sources,
     plugins: &dyn Plugins,
     cancel: &AtomicBool,
 ) -> Result<Vec<PlannedRun>, Unresolved> {
-    let mut runs =
-        Vec::with_capacity(config.steps.len() + config.files.len() + config.services.len() + 1);
-    if let Some(packages) = package_work(config) {
-        let facts = facts.ok_or_else(|| "packages: the probe has not run".to_owned())?;
-        let reason = |why: String| format!("packages: {why}");
-        let sudo = packages.sudo_secret_for(target);
-        let manager = packages::resolve(packages.choice_for(target), facts, sudo.is_some())
-            .map_err(reason)?;
-        packages::check_pin(manager, packages).map_err(reason)?;
-        if let Some(run) = packages::script(manager, packages, facts.is_root()) {
-            let sudo_secret = sudo.filter(|_| packages::uses_password(manager, facts));
-            match sudo_secret {
-                Some(name) => log::info!(
-                    "{}: packages with {manager}, sudo password from secret {name}",
-                    target.name
-                ),
-                None => log::info!("{}: packages with {manager}", target.name),
+    let mut runs = Vec::with_capacity(expanded.items.len());
+    let mut services = services::Builder::new(config, target, facts);
+    let mut number = 0;
+    for item in &expanded.items {
+        let run = match &item.kind {
+            ItemKind::Packages(packages) => package_run(target, facts, item, packages)?,
+            ItemKind::File { entry, ordinal } => Some(files::run(
+                config,
+                item,
+                (entry, *ordinal),
+                sources,
+                target,
+                facts,
+            )?),
+            ItemKind::Service(entry) => Some(services.run(item, entry)?),
+            ItemKind::Step(step) => {
+                number += 1;
+                Some(step_run(
+                    target, facts, item, step, number, plugins, cancel,
+                )?)
             }
-            runs.push(PlannedRun {
-                run: run.into(),
-                label: None,
-                sudo_secret: sudo_secret.map(str::to_owned),
-                timeout: packages.timeout(),
-                kind: RunKind::Packages { manager },
-            });
-        }
+        };
+        runs.extend(run.map(|run| PlannedRun {
+            task: item.path.clone(),
+            ..run
+        }));
     }
-    runs.extend(files::runs(config, sources, target, facts)?);
-    runs.extend(services::runs(config, target, facts)?);
-    let no_args = serde_json::Map::new();
-    for (i, step) in config.steps.iter().enumerate() {
-        let number = i + 1;
-        match step.kind() {
-            StepKind::Plugin(name) => {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(Unresolved::Cancelled);
-                }
-                let facts = facts.ok_or_else(|| format!("plugin {name}: the probe has not run"))?;
-                let request = Request {
-                    target: &target.name,
-                    facts,
-                    tags: &target.tags,
-                    args: step.args.as_ref().unwrap_or(&no_args),
-                };
-                let script = plugins.script(name, &request)?;
-                log::info!("{}: step from plugin {name}", target.name);
-                runs.push(PlannedRun {
-                    run: crate::run::wrap(&script).into(),
-                    label: Some(script),
-                    sudo_secret: None,
-                    timeout: RUN_TIMEOUT,
-                    kind: RunKind::Step {
-                        number,
-                        plugin: Some(name.to_owned()),
-                    },
-                });
+    Ok(runs)
+}
+
+/// Whether `target` matches `item`, whose selector needs `facts` only when it
+/// has facts.
+fn selected(item: &Item, target: &Target, facts: Option<&Facts>) -> Result<bool, String> {
+    match facts {
+        Some(facts) => Ok(item.matches(target, facts)),
+        None if item.facts.is_empty() => Ok(files::has_tags(&item.tags, target)),
+        None => Err("tasks: the probe has not run".to_owned()),
+    }
+}
+
+/// A step that runs nothing and only shows `label`.
+fn skip_run(label: String) -> PlannedRun {
+    PlannedRun {
+        run: Zeroizing::default(),
+        label: Some(label),
+        sudo_secret: None,
+        timeout: RUN_TIMEOUT,
+        kind: RunKind::Skip,
+        task: None,
+    }
+}
+
+/// The step of package `item`; `None` when its script has nothing to do.
+fn package_run(
+    target: &Target,
+    facts: Option<&Facts>,
+    item: &Item,
+    packages: &Packages,
+) -> Result<Option<PlannedRun>, String> {
+    if !selected(item, target, facts)? {
+        log::info!("{}: packages: no match", target.name);
+        return Ok(Some(skip_run("skipped packages: no match".to_owned())));
+    }
+    let facts = facts.ok_or("packages: the probe has not run")?;
+    let reason = |why: String| format!("packages: {why}");
+    let sudo = packages.sudo_secret_for(target);
+    let manager =
+        packages::resolve(packages.choice_for(target), facts, sudo.is_some()).map_err(reason)?;
+    packages::check_pin(manager, packages).map_err(reason)?;
+    let Some(run) = packages::script(manager, packages, facts.is_root()) else {
+        return Ok(None);
+    };
+    let sudo_secret = sudo.filter(|_| packages::uses_password(manager, facts));
+    match sudo_secret {
+        Some(name) => log::info!(
+            "{}: packages with {manager}, sudo password from secret {name}",
+            target.name
+        ),
+        None => log::info!("{}: packages with {manager}", target.name),
+    }
+    Ok(Some(PlannedRun {
+        run: run.into(),
+        label: None,
+        sudo_secret: sudo_secret.map(str::to_owned),
+        timeout: packages.timeout(),
+        kind: RunKind::Packages { manager },
+        task: None,
+    }))
+}
+
+/// The step of `item`, the `number`th step, its plugin run on the controller.
+fn step_run(
+    target: &Target,
+    facts: Option<&Facts>,
+    item: &Item,
+    step: &Step,
+    number: usize,
+    plugins: &dyn Plugins,
+    cancel: &AtomicBool,
+) -> Result<PlannedRun, Unresolved> {
+    if !selected(item, target, facts)? {
+        log::info!("{}: step {number}: no match", target.name);
+        let label = match step.kind() {
+            StepKind::Plugin(name) => format!("skipped plugin {name}: no match"),
+            StepKind::Run(_) => format!("skipped step {number}: no match"),
+        };
+        return Ok(skip_run(label));
+    }
+    Ok(match step.kind() {
+        StepKind::Plugin(name) => {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Unresolved::Cancelled);
             }
-            StepKind::Run(run) => runs.push(PlannedRun {
-                run: run.to_owned().into(),
-                label: None,
+            let facts = facts.ok_or_else(|| format!("plugin {name}: the probe has not run"))?;
+            let no_args = serde_json::Map::new();
+            let request = Request {
+                target: &target.name,
+                facts,
+                tags: &target.tags,
+                args: step.args.as_ref().unwrap_or(&no_args),
+            };
+            let script = plugins.script(name, &request)?;
+            log::info!("{}: step from plugin {name}", target.name);
+            PlannedRun {
+                run: crate::run::wrap(&script).into(),
+                label: Some(script),
                 sudo_secret: None,
                 timeout: RUN_TIMEOUT,
                 kind: RunKind::Step {
                     number,
-                    plugin: None,
+                    plugin: Some(name.to_owned()),
                 },
-            }),
+                task: None,
+            }
         }
-    }
-    Ok(runs)
+        StepKind::Run(run) => PlannedRun {
+            run: run.to_owned().into(),
+            label: None,
+            sudo_secret: None,
+            timeout: RUN_TIMEOUT,
+            kind: RunKind::Step {
+                number,
+                plugin: None,
+            },
+            task: None,
+        },
+    })
 }
 
 /// When a line's text has its control characters escaped.
@@ -1655,10 +1809,86 @@ fn render_summary(ok: usize, failed: usize, style: Style) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::tasks::legacy;
     use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::config::{FileEntry, ModeValue, ServiceEntry, Step};
+
+    /// [`super::apply_target`] on a legacy config's list.
+    fn apply_target(
+        target: &Target,
+        transport: Result<Box<dyn Transport>, TransportError>,
+        config: &Config,
+        sources: &Sources,
+        plugins: &dyn Plugins,
+        passwords: &Passwords,
+        cancel: &AtomicBool,
+    ) -> Applied {
+        let expanded = legacy(config);
+        super::apply_target(
+            target, transport, config, &expanded, sources, plugins, passwords, cancel,
+        )
+    }
+
+    /// [`super::apply_targets`] on a legacy config's list.
+    #[expect(clippy::too_many_arguments, reason = "the function under test's")]
+    fn apply_targets(
+        targets: &[Target],
+        parallel: NonZeroU8,
+        transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError> + Sync,
+        config: &Config,
+        sources: &Sources,
+        plugins: &dyn Plugins,
+        passwords: &Passwords,
+        cancel: &AtomicBool,
+        session: Option<Session>,
+        on: &mut dyn FnMut(Progress<'_>),
+    ) -> Result<Report, String> {
+        let expanded = legacy(config);
+        super::apply_targets(
+            targets, parallel, transport, config, &expanded, sources, plugins, passwords, cancel,
+            session, on,
+        )
+    }
+
+    /// [`super::resolve`] on a legacy config's list.
+    fn resolve(
+        target: &Target,
+        facts: Option<&Facts>,
+        config: &Config,
+        sources: &Sources,
+        plugins: &dyn Plugins,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<PlannedRun>, Unresolved> {
+        super::resolve(
+            target,
+            facts,
+            config,
+            &legacy(config),
+            sources,
+            plugins,
+            cancel,
+        )
+    }
+
+    /// [`super::run_targets`] on a legacy config's list.
+    fn run_targets(
+        opts: &Options,
+        config: &Config,
+        on: &mut dyn FnMut(Progress<'_>),
+    ) -> Result<Report, Failure> {
+        super::run_targets(opts, config, &legacy(config), on)
+    }
+
+    /// [`super::load_passwords`] on a legacy config's list.
+    fn load_passwords(
+        targets: &[Target],
+        config: &Config,
+        store: impl FnOnce() -> Result<Box<dyn Store>, Failure>,
+    ) -> Result<Passwords, Failure> {
+        super::load_passwords(targets, config, &legacy(config), store)
+    }
 
     const ONE: NonZeroU8 = NonZeroU8::MIN;
     use crate::inventory::TargetKind;
@@ -3177,6 +3407,7 @@ mod tests {
             sudo_secret: sudo_secret.map(str::to_owned),
             timeout,
             kind: RunKind::Script,
+            task: None,
         }
     }
 
@@ -3294,6 +3525,7 @@ mod tests {
                 number,
                 plugin: Some(name.to_owned()),
             },
+            task: None,
         }
     }
 
@@ -5654,5 +5886,493 @@ mod tests {
             "b never started once a could not be saved"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `text` expanded; it has no includes, so the workspace is never read.
+    fn tasks_of(text: &str) -> (Config, Expanded) {
+        let config: Config = toml::from_str(text).unwrap();
+        let expanded = crate::tasks::expand(&config, || Ok(std::path::PathBuf::from("/nowhere")));
+        (config, expanded.unwrap())
+    }
+
+    fn resolve_tasks(
+        target: &Target,
+        probe: &str,
+        text: &str,
+    ) -> Result<Vec<PlannedRun>, Unresolved> {
+        let (config, expanded) = tasks_of(text);
+        let sources: Vec<&str> = expanded.files().map(|_| "text").collect();
+        super::resolve(
+            target,
+            Some(&facts(probe)),
+            &config,
+            &expanded,
+            &Sources::of(&sources),
+            &FakePlugins::none(),
+            &AtomicBool::new(false),
+        )
+    }
+
+    /// Applies `text` over a [`Fake`] answering the probe with `probe`.
+    fn apply_tasks(
+        probe: &'static str,
+        text: &str,
+        log: &Arc<Mutex<Vec<String>>>,
+        exits: &'static [(&'static str, i32)],
+    ) -> Applied {
+        let (config, expanded) = tasks_of(text);
+        let sources: Vec<&str> = expanded.files().map(|_| "text").collect();
+        super::apply_target(
+            &target("box"),
+            Ok(Box::new(Fake {
+                probe,
+                exits,
+                ..Fake::new(log)
+            })),
+            &config,
+            &expanded,
+            &Sources::of(&sources),
+            &FakePlugins::new(|_, _| panic!("no plugin matches")),
+            &Passwords::new(),
+            &AtomicBool::new(false),
+        )
+    }
+
+    const EVERY_KIND: &str = r#"
+        [[tasks]]
+        run = "first"
+        [[tasks]]
+        file = { src = "a", dest = "/etc/a", mode = "0644", sudo = false }
+        [[tasks]]
+        run = "second"
+        [[tasks]]
+        packages = { install = ["git"] }
+        [[tasks]]
+        tasks = [
+          { service = { name = "nginx", state = "started" } },
+          { run = "third" },
+        ]
+    "#;
+
+    #[test]
+    fn interleaved_kinds_resolve_in_list_order() {
+        let runs = resolve_tasks(&target("box"), ARCH_ROOT, EVERY_KIND).unwrap();
+        let shown: Vec<&str> = runs
+            .iter()
+            .map(|run| match &run.kind {
+                RunKind::Packages { .. } => "packages",
+                _ => run.shown(),
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "first",
+                "file /etc/a",
+                "second",
+                "packages",
+                "service nginx",
+                "third"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_non_matching_item_of_any_kind_is_a_skip_that_resolves_nothing() {
+        // No manager and no init is known for this target, and the plugin
+        // panics when run: only the skip can get past each.
+        const UNKNOWN: &str = "distro=nope\nuser=root\nsudo=none\npkg=\nanvil-probe-end=1\n";
+        for selector in ["tags = [\"other\"]", "facts = { distro = \"arch\" }"] {
+            let text = format!(
+                r#"
+                [plugins.audit]
+                path = "/bin/true"
+                sha256 = "{sha}"
+                [[tasks]]
+                {selector}
+                tasks = [
+                  {{ run = "a-run" }},
+                  {{ plugin = "audit" }},
+                  {{ packages = {{ install = ["git"] }} }},
+                  {{ file = {{ src = "a", dest = "/etc/a", mode = "0644", sudo = false }} }},
+                  {{ service = {{ name = "nginx", state = "started" }} }},
+                ]
+                "#,
+                sha = "0".repeat(64),
+            );
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let applied = apply_tasks(UNKNOWN, &text, &log, &[]);
+            assert!(applied.report.ok(), "{:?}", applied.report);
+            let steps = applied.report.steps();
+            assert_eq!(steps.len(), 5);
+            assert!(steps.iter().all(|step| step.skipped), "{steps:?}");
+            assert_eq!(*log.lock().unwrap(), [facts::PROBE]);
+            let record = applied.reached.unwrap().record;
+            assert!(record.files.is_empty() && record.cannot_undo.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_task_selecting_on_tags_alone_needs_no_probe_and_on_facts_does() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let tagged = "[[tasks]]\nrun = \"a\"\ntags = [\"other\"]\n";
+        let report = apply_tasks(ARCH_ROOT, tagged, &log, &[]).report;
+        assert!(report.steps()[0].skipped);
+        assert!(log.lock().unwrap().is_empty());
+        let (config, expanded) = tasks_of("[[tasks]]\nrun = \"a\"\nfacts = { os = \"x\" }\n");
+        assert!(super::needs_facts(&config, &expanded));
+    }
+
+    #[test]
+    fn pkg_is_checked_by_membership_at_every_level() {
+        const BOTH: &str = "distro=arch\nuser=root\nsudo=none\npkg=pacman apt\nanvil-probe-end=1\n";
+        let text = r#"
+            [[tasks]]
+            facts = { pkg = "pacman" }
+            tasks = [{ run = "a", facts = { pkg = "apt" } }]
+        "#;
+        let skipped = |probe| {
+            matches!(
+                resolve_tasks(&target("box"), probe, text).unwrap()[0].kind,
+                RunKind::Skip
+            )
+        };
+        assert!(!skipped(BOTH));
+        assert!(skipped(ARCH_ROOT));
+    }
+
+    #[test]
+    fn two_package_tasks_keep_their_own_pins() {
+        let runs = resolve_tasks(
+            &target("box"),
+            ARCH_ROOT,
+            r#"
+            [[tasks]]
+            packages = { pin = ["vim"], upgrade = true }
+            [[tasks]]
+            run = "between"
+            [[tasks]]
+            packages = { pin = ["fd"], upgrade = true }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(runs.len(), 3);
+        assert!(runs[0].run.contains("vim") && !runs[0].run.contains(" fd"));
+        assert!(runs[2].run.contains(" fd") && !runs[2].run.contains("vim"));
+        assert_eq!(
+            runs[2].kind,
+            RunKind::Packages {
+                manager: packages::Manager::Pacman
+            }
+        );
+    }
+
+    #[test]
+    fn a_failed_task_stops_the_target_and_only_what_ran_cannot_be_undone() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let applied = apply_tasks(
+            ARCH_ROOT,
+            r#"
+            [[tasks]]
+            run = "first"
+            facts = { distro = "arch" }
+            [[tasks]]
+            tasks = [{ run = "boom" }, { run = "never" }]
+            [[tasks]]
+            run = "never"
+            "#,
+            &log,
+            &[("boom", 3)],
+        );
+        assert!(!applied.report.ok());
+        assert_eq!(applied.report.steps().len(), 2);
+        assert_eq!(*log.lock().unwrap(), [facts::PROBE, "first", "boom"]);
+        assert_eq!(
+            applied.reached.unwrap().record.cannot_undo,
+            ["tasks[0]", "tasks[1].tasks[0]"]
+        );
+    }
+
+    #[test]
+    fn stop_migrate_start_repeats_a_service() {
+        let runs = resolve_tasks(
+            &target("box"),
+            ARCH_ROOT,
+            r#"
+            [[tasks]]
+            service = { name = "db", state = "stopped" }
+            [[tasks]]
+            run = "migrate"
+            [[tasks]]
+            service = { name = "db", state = "started" }
+            "#,
+        )
+        .unwrap();
+        let shown: Vec<&str> = runs.iter().map(PlannedRun::shown).collect();
+        assert_eq!(shown, ["service db", "migrate", "service db"]);
+        assert_ne!(runs[0].run, runs[2].run);
+    }
+
+    /// The limit D9 documents: one probe before the run, so a step that
+    /// installs a manager or changes a fact cannot serve a later task.
+    #[test]
+    fn a_step_cannot_change_later_manager_resolution_or_facts() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let applied = apply_tasks(
+            GENTOO_ROOT,
+            r#"
+            [[tasks]]
+            run = "install-a-manager"
+            [[tasks]]
+            packages = { install = ["git"] }
+            "#,
+            &log,
+            &[],
+        );
+        assert!(!applied.report.ok());
+        assert!(
+            applied.report.failure().unwrap().starts_with("packages: "),
+            "{:?}",
+            applied.report
+        );
+        assert_eq!(*log.lock().unwrap(), [facts::PROBE], "nothing ran");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let report = apply_tasks(
+            GENTOO_ROOT,
+            r#"
+            [[tasks]]
+            run = "become-arch"
+            [[tasks]]
+            run = "arch-only"
+            facts = { distro = "arch" }
+            "#,
+            &log,
+            &[],
+        )
+        .report;
+        assert!(report.steps()[1].skipped);
+        let probes = log.lock().unwrap();
+        assert_eq!(*probes, [facts::PROBE, "become-arch"]);
+    }
+
+    #[test]
+    fn a_sudo_task_at_any_depth_gets_its_password_before_the_run() {
+        use crate::test_util::Unopenable;
+        let mut web = target("web");
+        web.tags = vec!["web".to_owned()];
+        web.sudo_secret = Some("WEB".to_owned());
+        let needs = |task: &str| {
+            let (config, expanded) =
+                tasks_of(&format!("[[tasks]]\ntasks = [{{ tasks = [{task}] }}]\n"));
+            let built = std::cell::Cell::new(false);
+            let _ = super::load_passwords(std::slice::from_ref(&web), &config, &expanded, || {
+                built.set(true);
+                Ok(Box::new(Unopenable::new(|| {
+                    crate::secret::SecretError::Locked
+                })))
+            });
+            built.get()
+        };
+        let file = r#"file = { src = "a", dest = "/a", mode = "0644""#;
+        for wanted in [
+            format!("{{ {file} }} }}"),
+            r#"{ service = { name = "db", state = "started" } }"#.to_owned(),
+            r#"{ packages = { install = ["git"] } }"#.to_owned(),
+            format!("{{ tags = [\"web\"], {file} }} }}"),
+        ] {
+            assert!(needs(&wanted), "{wanted}");
+        }
+        for not_wanted in [
+            format!("{{ {file}, sudo = false }} }}"),
+            r#"{ run = "x" }"#.to_owned(),
+            format!("{{ tags = [\"db\"], {file} }} }}"),
+            r#"{ tags = ["db"], packages = { install = ["git"] } }"#.to_owned(),
+        ] {
+            assert!(!needs(&not_wanted), "{not_wanted}");
+        }
+    }
+
+    /// `file A` (keeps its text by default), `run`, then `selector`'s `file B`
+    /// of the same dest with `rollback = false`, over a dest that already holds
+    /// text; the run stops or cancels as `fake` says.
+    fn apply_a_then_hash_only_b(selector: &str, fake: impl FnOnce(Fake) -> Fake) -> Applied {
+        apply_a_then_hash_only_at("/etc/a.conf", selector, fake)
+    }
+
+    /// [`apply_a_then_hash_only_b`] with file B's dest spelled `dest`.
+    fn apply_a_then_hash_only_at(
+        dest: &str,
+        selector: &str,
+        fake: impl FnOnce(Fake) -> Fake,
+    ) -> Applied {
+        let text = format!(
+            r#"
+            [[tasks]]
+            file = {{ src = "a", dest = "/etc/a.conf", mode = "0644", sudo = false }}
+            [[tasks]]
+            run = "between"
+            [[tasks]]
+            file = {{ src = "b", dest = "{dest}", mode = "0600", sudo = false, rollback = false }}
+            {selector}
+            "#
+        );
+        let (config, expanded) = tasks_of(&text);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let fake = fake(Fake {
+            probe: ARCH_ROOT,
+            capture: CAPTURED_V0,
+            cancel_on: Some(("cancel-here", Arc::clone(&cancel))),
+            ..Fake::new(&log)
+        });
+        super::apply_target(
+            &target("box"),
+            Ok(Box::new(fake)),
+            &config,
+            &expanded,
+            &Sources::of(&["a", "b"]),
+            &FakePlugins::none(),
+            &Passwords::new(),
+            &cancel,
+        )
+    }
+
+    fn the_previous(applied: Applied) -> record::PreviousFile {
+        let files = applied.reached.unwrap().record.files;
+        assert_eq!(files.len(), 1);
+        let record::Previous::File(previous) = files[0].previous.clone() else {
+            panic!("{:?}", files[0].previous);
+        };
+        previous
+    }
+
+    fn assert_hash_only(applied: Applied) {
+        let previous = the_previous(applied);
+        assert!(!previous.kept);
+        assert_eq!(previous.text, None);
+        assert_eq!(previous.reason.as_deref(), Some(record::NO_ROLLBACK));
+    }
+
+    #[test]
+    fn a_later_hash_only_write_keeps_the_text_out_when_a_run_fails_before_it() {
+        let applied = apply_a_then_hash_only_b("", |fake| Fake {
+            exits: &[("between", 1)],
+            ..fake
+        });
+        assert!(!applied.report.ok());
+        assert_hash_only(applied);
+    }
+
+    #[test]
+    fn a_later_hash_only_write_keeps_the_text_out_when_the_run_is_cancelled_before_it() {
+        let applied = apply_a_then_hash_only_b("", |fake| {
+            let cancel = fake.cancel_on.clone().unwrap().1;
+            Fake {
+                cancel_on: Some(("between", cancel)),
+                ..fake
+            }
+        });
+        assert!(matches!(applied.report, TargetReport::Cancelled { .. }));
+        assert_hash_only(applied);
+    }
+
+    #[test]
+    fn a_later_hash_only_write_keeps_the_text_out_when_every_step_passes() {
+        let applied = apply_a_then_hash_only_b(r#"facts = { distro = "arch" }"#, |fake| fake);
+        assert!(applied.report.ok());
+        assert_hash_only(applied);
+    }
+
+    #[test]
+    fn a_hash_only_write_spelled_with_repeated_slashes_keeps_the_text_out() {
+        let applied = apply_a_then_hash_only_at("/etc//a.conf", "", |fake| Fake {
+            exits: &[("between", 1)],
+            ..fake
+        });
+        assert_hash_only(applied);
+        let applied = apply_a_then_hash_only_at("//etc///a.conf", "", |fake| fake);
+        assert!(applied.report.ok());
+        assert_hash_only(applied);
+    }
+
+    #[test]
+    fn both_spellings_of_a_dest_keep_one_record_and_each_writes_as_spelled() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let applied = apply_tasks(
+            ARCH_ROOT,
+            r#"
+            [[tasks]]
+            file = { src = "a", dest = "/etc/a", mode = "0644", sudo = false }
+            [[tasks]]
+            file = { src = "b", dest = "/etc//a", mode = "0600", sudo = false }
+            "#,
+            &log,
+            &[],
+        );
+        assert!(applied.report.ok(), "{:?}", applied.report);
+        let files = applied.reached.unwrap().record.files;
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(
+            (files[0].dest.as_str(), files[0].mode.as_str()),
+            ("/etc/a", "0600")
+        );
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|run| run.contains("/etc//a"))
+        );
+    }
+
+    #[test]
+    fn a_legacy_config_keeps_one_record_per_spelling() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let config = with_files(
+            None,
+            vec![
+                file_entry("/etc/a", &[], true),
+                file_entry("/etc//a", &[], true),
+            ],
+            &[],
+        );
+        let fake = Fake {
+            probe: ARCH_NOPASSWD,
+            ..Fake::new(&log)
+        };
+        let (applied, _, _) = apply_recorded(&target("local"), &config, fake, &Passwords::new());
+        assert_eq!(applied.reached.unwrap().record.files.len(), 2);
+    }
+
+    #[test]
+    fn a_hash_only_write_for_another_target_does_not_force_hash_only() {
+        for selector in [r#"facts = { distro = "debian" }"#, r#"tags = ["absent"]"#] {
+            let applied = apply_a_then_hash_only_b(selector, |fake| fake);
+            assert!(applied.report.ok(), "{selector}");
+            let previous = the_previous(applied);
+            assert!(previous.kept, "{selector}");
+            assert_eq!(previous.text.as_deref().map(String::as_str), Some("v0\n"));
+            assert_eq!(previous.reason, None);
+        }
+    }
+
+    #[test]
+    fn the_same_dest_twice_in_one_apply_records_one_entry() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let applied = apply_tasks(
+            ARCH_ROOT,
+            r#"
+            [[tasks]]
+            file = { src = "a", dest = "/etc/a", mode = "0644", sudo = false }
+            [[tasks]]
+            file = { src = "b", dest = "/etc/a", mode = "0600", sudo = false }
+            "#,
+            &log,
+            &[],
+        );
+        assert!(applied.report.ok(), "{:?}", applied.report);
+        let reached = applied.reached.unwrap();
+        assert!(reached.wrote);
+        assert_eq!(reached.record.files.len(), 1);
+        assert_eq!(reached.record.files[0].mode, "0600");
     }
 }

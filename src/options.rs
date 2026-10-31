@@ -15,6 +15,7 @@ use crate::inventory::{Inventory, Sel, Target, TargetKind};
 use crate::paths::{self, DocPath};
 use crate::secret::{self, Store};
 use crate::ssh::{self, Ssh, SshSettings};
+use crate::tasks::{self, Expanded};
 use crate::transport::{Local, Transport, TransportError};
 use crate::update::Source;
 use crate::update::keys::TrustedKeys;
@@ -145,6 +146,20 @@ impl Options {
         Ok(Config::load(path.as_ref())?)
     }
 
+    /// The config and what a run follows ([`tasks::expand`]); exit 2 when a
+    /// task or include is refused.
+    pub fn load_expanded(&self) -> Result<(Config, Expanded), Failure> {
+        let config = self.load_config()?;
+        let expanded = self.expand(&config)?;
+        Ok((config, expanded))
+    }
+
+    /// `config`'s ordered list; exit 2 when a task or include is refused.
+    pub fn expand(&self, config: &Config) -> Result<Expanded, Failure> {
+        tasks::expand(config, || self.workspace(config).map_err(|err| err.message))
+            .map_err(Failure::usage)
+    }
+
     /// The located config's base dir ([`paths::base_dir`]).
     pub fn base_dir(&self) -> Result<PathBuf, Failure> {
         Ok(paths::base_dir(
@@ -216,9 +231,11 @@ impl Options {
 
     /// `config`'s `[[files]]` sources; the workspace is resolved only when
     /// a relative or store src needs it.
-    pub fn sources(&self, config: &Config) -> Result<Sources, Failure> {
-        files::load(config, || self.workspace(config).map_err(|err| err.message))
-            .map_err(Failure::usage)
+    pub fn sources(&self, config: &Config, expanded: &Expanded) -> Result<Sources, Failure> {
+        files::load(expanded, || {
+            self.workspace(config).map_err(|err| err.message)
+        })
+        .map_err(Failure::usage)
     }
 
     /// The targets `--target` selects from `config`'s inventory (all when none).

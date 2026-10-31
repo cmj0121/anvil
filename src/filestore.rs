@@ -234,8 +234,6 @@ impl Root {
     /// [`Root::read_text`] for a file that decides what runs: owned by the
     /// current user and not group- or other-writable, checked on the fd it
     /// reads.
-    // U5 removes this allow when apply expands tasks.
-    #[allow(dead_code)]
     pub fn read_trusted(&self, rel: &str) -> Result<String, StoreError> {
         let rel = parse(rel)?;
         let (dir, name) = self.parent(&rel, false)?;

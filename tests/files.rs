@@ -522,3 +522,50 @@ fn missing_config_and_workspace_keep_their_resolved_base() {
         );
     }
 }
+
+#[test]
+fn warns_for_srcs_and_includes_reached_through_tasks() {
+    let s = Sandbox::new("files-tasks");
+    s.write_config(
+        "config.toml",
+        "[[tasks]]\ninclude = '$/role.toml'\n\n\
+         [[tasks]]\ntasks = [{ file = { src = '$/nested', dest = '/tmp/n', mode = '0644' } }]\n",
+    );
+    let store = s.config_dir().join("files");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(
+        store.join("role.toml"),
+        "[[tasks]]\nfile = { src = '$/inner', dest = '/tmp/i', mode = '0644' }\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        store.join("role.toml"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+    for name in ["inner", "nested"] {
+        fs::write(store.join(name), "hi").unwrap();
+    }
+    let out = run(&s, &["-v", "files", "rm", "inner"], 0);
+    assert!(
+        text(&out.stderr).contains(
+            "tasks[0]/role.toml:tasks[0].file.src `$/inner` names $/inner, which is gone"
+        ),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = run(&s, &["-v", "files", "rm", "nested"], 0);
+    assert!(
+        text(&out.stderr)
+            .contains("tasks[1].tasks[0].file.src `$/nested` names $/nested, which is gone"),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = run(&s, &["-v", "files", "rm", "role.toml"], 0);
+    assert!(
+        text(&out.stderr)
+            .contains("tasks[0].include `$/role.toml` names $/role.toml, which is gone"),
+        "{}",
+        text(&out.stderr)
+    );
+}

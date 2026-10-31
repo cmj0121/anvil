@@ -108,9 +108,9 @@ fn spawn_task(tx: Sender<Msg>, task: impl FnOnce(&Sender<Msg>) -> Msg + Send + '
 /// age passphrase prompt goes through the terminal handoff. `cancel` stops
 /// doctor between targets and plugins.
 fn run_doctor(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(), Failure> {
-    let config = opts.load_config()?;
+    let (config, expanded) = opts.load_expanded()?;
     let store = opts.secret_store(&config)?;
-    let report = doctor::check(opts, &config, store.as_ref(), cancel, &mut |progress| {
+    let on = &mut |progress: doctor::Progress<'_>| {
         let msg = match progress {
             // The doctor tab lists each target as it starts.
             doctor::Progress::Begin(_) => return,
@@ -118,7 +118,8 @@ fn run_doctor(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(
             doctor::Progress::Done(report) => Msg::DoctorTarget(report.clone()),
         };
         let _ = tx.send(msg);
-    })?;
+    };
+    let report = doctor::check(opts, &config, &expanded, store.as_ref(), cancel, on)?;
     let _ = tx.send(Msg::DoctorDone(report));
     Ok(())
 }
@@ -127,9 +128,9 @@ fn run_doctor(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(
 /// sudo password (in [`apply::run_targets`]), are opened here, on the worker.
 /// The steps sent are this config's, which may be newer than the app's.
 fn run_apply(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
-    let config = opts.load_config()?;
-    let _ = tx.send(Msg::Steps(app::step_rows(&config)));
-    let report = apply::run_targets(opts, &config, &mut send_progress(tx))?;
+    let (config, expanded) = opts.load_expanded()?;
+    let _ = tx.send(Msg::Steps(app::step_rows(&expanded)));
+    let report = apply::run_targets(opts, &config, &expanded, &mut send_progress(tx))?;
     send_warnings(tx, report.warnings);
     Ok(())
 }
@@ -138,10 +139,11 @@ fn run_apply(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
 /// conflicts worded for the TUI; the secret store, when a recorded file
 /// went through sudo, is opened here, on the worker.
 fn run_rollback(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
-    let config = opts.load_config()?;
+    let (config, expanded) = rollback::load(opts)?;
     let report = rollback::run_targets(
         opts,
         &config,
+        &expanded,
         &Force::None,
         false,
         Wording::Tui,
@@ -187,8 +189,8 @@ fn run_script(opts: &Options, script: String, tx: &Sender<Msg>) -> Result<(), Fa
 
 /// Plan opens no secret store; the steps pane keeps the app's list.
 fn run_plan(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
-    let config = opts.load_config()?;
-    plan::run_targets(opts, &config, &mut |progress| {
+    let (config, expanded) = opts.load_expanded()?;
+    plan::run_targets(opts, &config, &expanded, &mut |progress| {
         let msg = match progress {
             plan::Progress::Begin(targets) => Msg::Begin(names(targets)),
             plan::Progress::Start(target) => Msg::Start(target.name.clone()),

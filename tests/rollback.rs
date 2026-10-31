@@ -531,3 +531,172 @@ fn rollback_is_refused_while_an_apply_holds_the_record() {
     assert_eq!(status.code(), Some(0), "the apply went on");
     assert_eq!(std::fs::read_to_string(&local).unwrap(), FILE_TEXT);
 }
+
+/// A file task copying store-less `src` to `dest`.
+fn file_task(src: &str, dest: &str) -> String {
+    format!(
+        "[[tasks]]\nfile = {{ src = \"{src}\", dest = \"{dest}\", mode = \"0640\", sudo = false }}\n\n"
+    )
+}
+
+/// `<root>/out/name`, holding [`PREVIOUS`], and a config dir with `a.txt`
+/// and `b.txt`.
+fn task_dest(sandbox: &Sandbox, name: &str) -> String {
+    let out = sandbox.root().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(sandbox.config_dir().join("a.txt"), "bytes-a\n").unwrap();
+    std::fs::write(sandbox.config_dir().join("b.txt"), "bytes-b\n").unwrap();
+    let dest = out.join(name);
+    std::fs::write(&dest, PREVIOUS).unwrap();
+    dest.display().to_string()
+}
+
+#[test]
+fn interleaved_tasks_restore_the_right_files_and_name_what_cannot_be_undone() {
+    let sandbox = Sandbox::new("rb");
+    let (one, two) = (task_dest(&sandbox, "one"), task_dest(&sandbox, "two"));
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[tasks]]\nrun = \"true\"\n\n{}[[tasks]]\nrun = \"true\"\n\n[[tasks]]\ntasks = [{{ run = \"true\" }}]\n\n{}",
+            file_task("a.txt", &one),
+            file_task("b.txt", &two),
+        ),
+    );
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&two).unwrap(), "bytes-b\n");
+    let out = sandbox.anvil(&["--json", "rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&one).unwrap(), PREVIOUS);
+    assert_eq!(std::fs::read_to_string(&two).unwrap(), PREVIOUS);
+    let stdout = text(&out.stdout);
+    for what in ["tasks[0]", "tasks[2]", "tasks[3].tasks[0]"] {
+        assert!(stdout.contains(&format!("cannot undo: {what}")), "{stdout}");
+    }
+}
+
+#[test]
+fn the_same_dest_twice_applied_twice_rolls_back_to_before_the_first_apply() {
+    let sandbox = Sandbox::new("rb");
+    let dest = task_dest(&sandbox, "dest");
+    sandbox.write_config(
+        "config.toml",
+        &format!("{}{}", file_task("a.txt", &dest), file_task("b.txt", &dest)),
+    );
+    for _ in 0..2 {
+        let out = sandbox.anvil(&["apply"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "bytes-b\n");
+        let record = sandbox.last_apply().unwrap();
+        let files = record["targets"]["local"]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{files:?}");
+    }
+    let out = sandbox.anvil(&["rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), PREVIOUS);
+}
+
+#[test]
+fn a_missing_include_refuses_rollback_and_says_how_to_recover() {
+    let sandbox = Sandbox::new("rb");
+    let dest = task_dest(&sandbox, "dest");
+    let store = sandbox.config_dir().join("files");
+    std::fs::create_dir_all(&store).unwrap();
+    let include = store.join("role.toml");
+    std::fs::write(&include, file_task("a.txt", &dest)).unwrap();
+    std::fs::set_permissions(&include, std::fs::Permissions::from_mode(0o644)).unwrap();
+    sandbox.write_config("config.toml", "[[tasks]]\ninclude = \"$/role.toml\"\n");
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    std::fs::remove_file(&include).unwrap();
+    for args in [&["rollback"][..], &["rollback", "--dry-run"][..]] {
+        let out = sandbox.anvil(args, &[]);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let stderr = text(&out.stderr);
+        assert!(
+            stderr.contains("$/role.toml") && stderr.contains("fix or restore what it names"),
+            "{stderr}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "bytes-a\n");
+    std::fs::write(&include, file_task("a.txt", &dest)).unwrap();
+    std::fs::set_permissions(&include, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = sandbox.anvil(&["rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), PREVIOUS);
+}
+
+#[test]
+fn a_recorded_dest_no_task_names_is_refused() {
+    let sandbox = Sandbox::new("rb");
+    let dest = task_dest(&sandbox, "dest");
+    sandbox.write_config("config.toml", &file_task("a.txt", &dest));
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    sandbox.write_config("config.toml", "[[tasks]]\nrun = \"true\"\n");
+    let out = sandbox.anvil(&["rollback"], &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "bytes-a\n");
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("is not in the config"), "{stdout}");
+    assert!(!stdout.contains("[[files]]"), "{stdout}");
+}
+
+/// A legacy config writing one dest twice keeps one record per write, each
+/// rollback undoing the last apply only.
+#[test]
+fn a_legacy_duplicate_dest_keeps_one_entry_per_write() {
+    let sandbox = Sandbox::new("rb");
+    let out = sandbox.root().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(sandbox.config_dir().join("a.txt"), "bytes-a\n").unwrap();
+    std::fs::write(sandbox.config_dir().join("b.txt"), "bytes-b\n").unwrap();
+    let dest = out.join("dest");
+    std::fs::write(&dest, PREVIOUS).unwrap();
+    let dest = dest.display().to_string();
+    let entry = |src: &str| {
+        format!("[[files]]\nsrc = \"{src}\"\ndest = \"{dest}\"\nmode = \"0640\"\nsudo = false\n\n")
+    };
+    sandbox.write_config(
+        "config.toml",
+        &format!("{}{}", entry("a.txt"), entry("b.txt")),
+    );
+    let apply = || {
+        let out = sandbox.anvil(&["apply"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        let record = sandbox.last_apply().unwrap();
+        let files = record["targets"]["local"]["files"].as_array().unwrap();
+        files
+            .iter()
+            .map(|file| file["previous"]["text"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(apply(), [PREVIOUS, "bytes-a\n"]);
+    assert_eq!(apply(), ["bytes-b\n", "bytes-a\n"]);
+    let out = sandbox.anvil(&["rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "bytes-b\n");
+}
+
+/// A `run` between the writes deletes dest, so the hash-only write captures
+/// no file: the first write's text must still leave the record.
+#[test]
+fn a_hash_only_write_drops_the_text_even_when_it_found_no_file() {
+    let sandbox = Sandbox::new("rb");
+    let dest = task_dest(&sandbox, "dest");
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}[[tasks]]\nrun = \"rm {dest}\"\n\n[[tasks]]\nfile = {{ src = \"b.txt\", dest = \"{dest}\", mode = \"0640\", sudo = false, rollback = false }}\n",
+            file_task("a.txt", &dest),
+        ),
+    );
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let record = sandbox.last_apply().unwrap();
+    let previous = &record["targets"]["local"]["files"][0]["previous"];
+    assert_eq!(previous["kept"], false, "{previous}");
+    assert!(previous["text"].is_null(), "{previous}");
+    assert_eq!(previous["reason"], "rollback = false");
+}

@@ -335,3 +335,39 @@ fn plan_and_apply_resolve_workspace_only_when_inventory_or_files_need_it() {
         assert!(text(&out.stderr).contains("anvil.workspace `~/x`: $HOME is not set"));
     }
 }
+
+#[test]
+fn tasks_are_planned_in_the_order_apply_runs_them() {
+    let sandbox = Sandbox::new("pl");
+    let store = sandbox.config_dir().join("files");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("role.toml"), "[[tasks]]\nrun = \"included\"\n").unwrap();
+    std::fs::write(sandbox.config_dir().join("motd.txt"), "text\n").unwrap();
+    sandbox.write_config(
+        "config.toml",
+        "[[tasks]]\nrun = \"first\"\n\n\
+         [[tasks]]\nfile = { src = \"motd.txt\", dest = \"/tmp/motd\", mode = \"0644\", sudo = false }\n\n\
+         [[tasks]]\ninclude = \"$/role.toml\"\n\n\
+         [[tasks]]\nrun = \"skipped\"\ntags = [\"other\"]\n\n\
+         [[tasks]]\ntasks = [{ run = \"nested\" }]\n",
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let steps: Vec<&str> = value["targets"][0]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["run"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            "first",
+            "file /tmp/motd",
+            "included",
+            "skipped step 3: no match",
+            "nested"
+        ]
+    );
+}

@@ -1150,3 +1150,90 @@ fn no_progress_draws_no_line_on_a_terminal() {
     assert!(out.contains("▶ local"), "{out:?}");
     assert!(!out.contains("\r\x1b[K"), "{out:?}");
 }
+
+/// Writes `rel` into the workspace's store, as a user's editor leaves it.
+fn store_file(sandbox: &Sandbox, rel: &str, body: &str) {
+    let path = sandbox.config_dir().join("files").join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+}
+
+#[test]
+fn tasks_run_in_order_through_nesting_and_an_include_used_twice() {
+    let sandbox = Sandbox::new("aa");
+    std::fs::write(sandbox.config_dir().join("motd.txt"), "from-the-file\n").unwrap();
+    let log = sandbox.root().join("order.log");
+    let log = log.display();
+    let dest = sandbox.root().join("motd");
+    let dest = dest.display();
+    store_file(
+        &sandbox,
+        "roles/log.toml",
+        &format!("[[tasks]]\nrun = \"echo included >> {log}\"\n"),
+    );
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[tasks]]\nrun = \"echo first >> {log}\"\n\n\
+             [[tasks]]\ninclude = \"$/roles/log.toml\"\n\n\
+             [[tasks]]\nfile = {{ src = \"motd.txt\", dest = \"{dest}\", mode = \"0640\", sudo = false }}\n\n\
+             [[tasks]]\n  [[tasks.tasks]]\n  run = \"cat {dest} >> {log}\"\n\n\
+             [[tasks]]\ninclude = \"$/roles/log.toml\"\n"
+        ),
+    );
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        std::fs::read_to_string(sandbox.root().join("order.log")).unwrap(),
+        "first\nincluded\nfrom-the-file\nincluded\n"
+    );
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["cannot_undo"],
+        serde_json::json!([
+            "tasks[0]",
+            "tasks[1]/roles/log.toml:tasks[0]",
+            "tasks[3].tasks[0]",
+            "tasks[4]/roles/log.toml:tasks[0]",
+        ])
+    );
+}
+
+#[test]
+fn a_missing_include_is_exit_two_before_any_target() {
+    let sandbox = Sandbox::new("aa");
+    let ran = sandbox.root().join("ran");
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[tasks]]\nrun = \"touch {}\"\n\n[[tasks]]\ntags = [\"other\"]\ninclude = \"$/gone.toml\"\n",
+            ran.display()
+        ),
+    );
+    for command in ["apply", "plan", "doctor"] {
+        let out = sandbox.anvil(&[command], &[]);
+        assert_eq!(out.status.code(), Some(2), "{command}");
+        assert!(text(&out.stderr).contains("tasks[1].include"), "{command}");
+    }
+    assert!(!ran.exists());
+}
+
+#[test]
+fn a_missing_src_or_bad_mode_of_a_task_names_its_file_field() {
+    let sandbox = Sandbox::new("aa");
+    sandbox.write_config(
+        "config.toml",
+        "[[tasks]]\nfile = { src = \"gone.txt\", dest = \"/tmp/x\", mode = \"0644\", sudo = false }\n",
+    );
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr).contains("tasks[0].file.src `gone.txt`"),
+        "{}",
+        text(&out.stderr)
+    );
+}

@@ -42,6 +42,7 @@ pub fn run_targets(
         sudo_secret: None,
         timeout,
         kind: RunKind::Script,
+        task: None,
     }];
     let cancel = &opts.cancel;
     Ok(apply::for_each_target(

@@ -18,6 +18,7 @@ use crate::filestore::{self, Entry, Kind, Root};
 use crate::inventory::{Inventory, LOCAL, Sel, Target, UnknownSel};
 use crate::options::Options;
 use crate::secret::{self, BackendKind};
+use crate::tasks::{Expanded, ItemKind};
 use crate::update::{Check, Status};
 use crate::{apply, doctor, plan};
 
@@ -551,40 +552,30 @@ pub fn load_inventory(opts: &Options) -> Result<Inventory, String> {
     opts.inventory().map_err(|failure| failure.message)
 }
 
-/// The steps of the config `opts` names, or why it did not load.
+/// The steps of the config `opts` names, or why it or an include did not load.
 pub fn load_steps(opts: &Options) -> Result<Vec<StepRow>, String> {
-    opts.load_config()
-        .map(|config| step_rows(&config))
+    opts.load_expanded()
+        .map(|(_, expanded)| step_rows(&expanded))
         .map_err(|failure| failure.message)
 }
 
-/// The steps apply runs for `config`: `packages` first when it has work,
-/// then `file <dest>` for each `[[files]]` entry and `service <name>` for
-/// each `[[services]]` entry (each a step on every target, skipped where it
-/// does not match), then each step's command as its `$`
-/// line shows it, or `plugin <name>` for a plugin step, whose script is
-/// known only once it has run.
-pub fn step_rows(config: &Config) -> Vec<StepRow> {
-    let packages = config.packages.as_ref().is_some_and(|p| p.has_work());
-    packages
-        .then(|| "packages".to_owned())
-        .into_iter()
-        .chain(
-            config
-                .files
-                .iter()
-                .map(|entry| format!("file {}", entry.dest)),
-        )
-        .chain(
-            config
-                .services
-                .iter()
-                .map(|entry| format!("service {}", entry.name)),
-        )
-        .chain(config.steps.iter().map(|step| match step.kind() {
-            StepKind::Plugin(name) => format!("plugin {name}"),
-            StepKind::Run(run) => apply::command(run),
-        }))
+/// The steps apply runs for `expanded`, in its order: `packages`, `file <dest>`,
+/// `service <name>` (each a step on every target, skipped where it does not
+/// match), each step's command as its `$` line shows it, or `plugin <name>` for
+/// a plugin step, whose script is known only once it has run.
+pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
+    expanded
+        .items
+        .iter()
+        .map(|item| match &item.kind {
+            ItemKind::Packages(_) => "packages".to_owned(),
+            ItemKind::File { entry, .. } => format!("file {}", entry.dest),
+            ItemKind::Service(entry) => format!("service {}", entry.name),
+            ItemKind::Step(step) => match step.kind() {
+                StepKind::Plugin(name) => format!("plugin {name}"),
+                StepKind::Run(run) => apply::command(run),
+            },
+        })
         .map(|label| StepRow { label })
         .collect()
 }
@@ -1018,8 +1009,13 @@ impl App {
         self.set_inventory(inventory);
         let steps = config
             .as_ref()
-            .map(step_rows)
-            .map_err(|failure| failure.message.clone());
+            .map_err(|failure| failure.message.clone())
+            .and_then(|config| {
+                self.opts
+                    .expand(config)
+                    .map(|expanded| step_rows(&expanded))
+                    .map_err(|failure| failure.message)
+            });
         self.set_steps(steps);
     }
 
@@ -1900,7 +1896,10 @@ pub mod tests {
             ],
             ..Config::default()
         };
-        assert_eq!(step_rows(&config), [row("ls"), row("plugin harden")]);
+        assert_eq!(
+            step_rows(&crate::tasks::legacy(&config)),
+            [row("ls"), row("plugin harden")]
+        );
     }
 
     #[test]
@@ -1927,7 +1926,10 @@ pub mod tests {
     fn packages_without_work_and_no_steps_is_the_default_step() {
         let opts = config_opts("tui-steps-default", "[packages]\ninstall = []\n");
         assert_eq!(load_steps(&opts), Ok(vec![row("hostname")]));
-        assert_eq!(step_rows(&Config::default()), [row("hostname")]);
+        assert_eq!(
+            step_rows(&crate::tasks::legacy(&Config::default())),
+            [row("hostname")]
+        );
     }
 
     #[test]

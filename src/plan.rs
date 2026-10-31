@@ -26,6 +26,7 @@ use crate::logger::{DIM, GREEN, RED, YELLOW, paint};
 use crate::options::Options;
 use crate::plugin::{self, Plugins};
 use crate::status;
+use crate::tasks::Expanded;
 use crate::transport::{Transport, TransportError};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -81,16 +82,18 @@ pub type Progress<'a> = Event<'a, PlanReport>;
 pub fn run_targets(
     opts: &Options,
     config: &Config,
+    expanded: &Expanded,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Plan, Failure> {
     let targets = opts.targets_for(config)?;
     let pins = plugin::verify_where(config, Plugin::is_step).map_err(Failure::usage)?;
-    let sources = opts.sources(config)?;
+    let sources = opts.sources(config, expanded)?;
     Ok(plan_targets(
         &targets,
         opts.parallel,
         |target| opts.transport(target),
         config,
+        expanded,
         &sources,
         &pins,
         &opts.cancel,
@@ -110,6 +113,7 @@ pub fn plan_targets(
     parallel: NonZeroU8,
     transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError> + Sync,
     config: &Config,
+    expanded: &Expanded,
     sources: &Sources,
     plugins: &dyn Plugins,
     cancel: &AtomicBool,
@@ -120,7 +124,17 @@ pub fn plan_targets(
         parallel,
         cancel,
         on,
-        |target| plan_target(target, transport(target), config, sources, plugins, cancel),
+        |target| {
+            plan_target(
+                target,
+                transport(target),
+                config,
+                expanded,
+                sources,
+                plugins,
+                cancel,
+            )
+        },
         cancelled,
         |target, message| failed(target, format!("internal error: {message}")),
     );
@@ -154,6 +168,7 @@ fn plan_target(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
     config: &Config,
+    expanded: &Expanded,
     sources: &Sources,
     plugins: &dyn Plugins,
     cancel: &AtomicBool,
@@ -162,8 +177,18 @@ fn plan_target(
     status::phase(&target.name, status::Phase::Probe);
     let runs = transport
         .map_err(|err| Unresolved::Failed(err.to_string()))
-        .and_then(|transport| apply::probe(transport.as_ref(), config))
-        .and_then(|facts| apply::resolve(target, Some(&facts), config, sources, plugins, cancel));
+        .and_then(|transport| apply::probe(transport.as_ref(), expanded))
+        .and_then(|facts| {
+            apply::resolve(
+                target,
+                Some(&facts),
+                config,
+                expanded,
+                sources,
+                plugins,
+                cancel,
+            )
+        });
     match runs {
         Ok(steps) => {
             log::info!("plan {}: {} steps", target.name, steps.len());
@@ -185,11 +210,11 @@ fn plan_target(
 /// target have ended (or one JSON document), then the summary.
 pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
     let style = Style::detect();
-    let config = opts.load_config()?;
+    let (config, expanded) = opts.load_expanded()?;
     let _interrupt = Interrupt::install(&opts.cancel)?;
     let mut print = fanout::in_order(|report| print_lines(&render(report), style));
     let mut follow = status::Follow::new("plan", status::enabled(cli.no_progress));
-    let plan = run_targets(opts, &config, &mut |progress| {
+    let plan = run_targets(opts, &config, &expanded, &mut |progress| {
         follow.event(&progress);
         if !cli.json {
             print(progress);
@@ -270,6 +295,7 @@ pub(crate) fn render_summary(targets: usize, failed: usize, style: Style) -> Str
 #[cfg(test)]
 mod tests {
     use crate::apply::RunKind;
+    use crate::tasks::legacy;
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -279,6 +305,40 @@ mod tests {
     use crate::packages::{Manager, Packages};
     use crate::test_util::{FakePlugins, Meet, json, keys};
     use crate::transport::{Output, RUN_TIMEOUT};
+
+    /// [`super::run_targets`] on a legacy config's list.
+    fn run_targets(
+        opts: &Options,
+        config: &Config,
+        on: &mut dyn FnMut(Progress<'_>),
+    ) -> Result<Plan, Failure> {
+        super::run_targets(opts, config, &legacy(config), on)
+    }
+
+    /// [`super::plan_targets`] on a legacy config's list.
+    #[expect(clippy::too_many_arguments, reason = "the function under test's")]
+    fn plan_targets(
+        targets: &[Target],
+        parallel: NonZeroU8,
+        transport: impl Fn(&Target) -> Result<Box<dyn Transport>, TransportError> + Sync,
+        config: &Config,
+        sources: &Sources,
+        plugins: &dyn Plugins,
+        cancel: &AtomicBool,
+        on: &mut dyn FnMut(Progress<'_>),
+    ) -> Plan {
+        super::plan_targets(
+            targets,
+            parallel,
+            transport,
+            config,
+            &legacy(config),
+            sources,
+            plugins,
+            cancel,
+            on,
+        )
+    }
 
     const ARCH_SUDO: &str = "distro=arch\nuser=cmj\nsudo=binary\npkg=pacman\nanvil-probe-end=1\n";
     const MAC: &str = "distro=macos\nuser=cmj\nsudo=binary\npkg=brew\nanvil-probe-end=1\n";
@@ -373,6 +433,7 @@ mod tests {
             &target("local"),
             Some(facts),
             config,
+            &legacy(config),
             &Sources::default(),
             &FakePlugins::none(),
             &cancel,
@@ -554,6 +615,7 @@ mod tests {
                     kind: RunKind::Packages {
                         manager: Manager::Pacman,
                     },
+                    task: None,
                 },
                 PlannedRun {
                     run: "one".to_owned().into(),
@@ -564,6 +626,7 @@ mod tests {
                         number: 1,
                         plugin: None,
                     },
+                    task: None,
                 },
                 PlannedRun {
                     run: "two".to_owned().into(),
@@ -574,6 +637,7 @@ mod tests {
                         number: 2,
                         plugin: None,
                     },
+                    task: None,
                 },
             ],
             ok: true,
