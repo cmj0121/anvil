@@ -820,17 +820,7 @@ impl Config {
             ));
         }
         for (i, entry) in self.files.iter().enumerate() {
-            check_src(&entry.src).map_err(|why| {
-                format!("files[{i}].src `{}`: {why}", secret::shown_name(&entry.src))
-            })?;
-            check_dest(&entry.dest).map_err(|why| {
-                format!(
-                    "files[{i}].dest `{}`: {why}",
-                    secret::shown_name(&entry.dest)
-                )
-            })?;
-            check_mode(entry.mode.as_ref()).map_err(|why| format!("files[{i}].mode{why}"))?;
-            check_selector(&format!("files[{i}]"), &entry.tags, &entry.facts)?;
+            check_file(&format!("files[{i}]"), entry)?;
         }
         Ok(())
     }
@@ -846,23 +836,7 @@ impl Config {
         }
         let mut seen: Vec<(&str, BTreeSet<&String>, &BTreeMap<String, String>)> = Vec::new();
         for (i, entry) in self.services.iter().enumerate() {
-            check_service_name(&entry.name).map_err(|why| {
-                format!(
-                    "services[{i}].name `{}`: {why}",
-                    secret::shown_name(&entry.name)
-                )
-            })?;
-            match (&entry.state, entry.state()) {
-                (None, _) => return Err(format!("services[{i}].state: required")),
-                (Some(state), None) => {
-                    return Err(format!(
-                        "services[{i}].state `{}`: must be started or stopped",
-                        secret::shown_name(state)
-                    ));
-                }
-                (Some(_), Some(_)) => {}
-            }
-            check_selector(&format!("services[{i}]"), &entry.tags, &entry.facts)?;
+            check_service(&format!("services[{i}]"), entry)?;
             let key = (
                 entry.name.as_str(),
                 entry.tags.iter().collect(),
@@ -924,51 +898,57 @@ impl Config {
     /// The `[[steps]]` rules: `run` or `plugin`, and the limits on each.
     fn check_steps(&self) -> Result<(), String> {
         for (i, step) in self.steps.iter().enumerate() {
-            match (&step.run, &step.plugin) {
-                (Some(_), Some(_)) => {
-                    return Err(format!("steps[{i}]: has both run and plugin; keep one"));
-                }
-                (None, None) => return Err(format!("steps[{i}]: needs run or plugin")),
-                _ => {}
+            self.check_step(&format!("steps[{i}]"), step)?;
+        }
+        Ok(())
+    }
+
+    /// One step's rules; `prefix` names it, as `steps[0]`.
+    pub(crate) fn check_step(&self, prefix: &str, step: &Step) -> Result<(), String> {
+        match (&step.run, &step.plugin) {
+            (Some(_), Some(_)) => {
+                return Err(format!("{prefix}: has both run and plugin; keep one"));
             }
-            if let Some(args) = &step.args {
-                if step.plugin.is_none() {
-                    return Err(format!("steps[{i}].args: needs plugin"));
-                }
-                let len = serde_json::to_vec(args).map_or(usize::MAX, |json| json.len());
-                if len > ARGS_LIMIT {
+            (None, None) => return Err(format!("{prefix}: needs run or plugin")),
+            _ => {}
+        }
+        if let Some(args) = &step.args {
+            if step.plugin.is_none() {
+                return Err(format!("{prefix}.args: needs plugin"));
+            }
+            let len = serde_json::to_vec(args).map_or(usize::MAX, |json| json.len());
+            if len > ARGS_LIMIT {
+                return Err(format!(
+                    "{prefix}.args: {len} bytes as JSON exceeds the {ARGS_LIMIT} byte limit"
+                ));
+            }
+        }
+        if let Some(name) = &step.plugin {
+            match self.plugins.get(name) {
+                None => {
                     return Err(format!(
-                        "steps[{i}].args: {len} bytes as JSON exceeds the {ARGS_LIMIT} byte limit"
+                        "{prefix}.plugin `{}`: must name a [plugins] entry",
+                        secret::shown_name(name)
                     ));
                 }
-            }
-            if let Some(name) = &step.plugin {
-                match self.plugins.get(name) {
-                    None => {
-                        return Err(format!(
-                            "steps[{i}].plugin `{}`: must name a [plugins] entry",
-                            secret::shown_name(name)
-                        ));
-                    }
-                    Some(plugin) if plugin.is_doctor() => {
-                        return Err(format!(
-                            "steps[{i}].plugin `{name}`: names an on = \"doctor\" plugin; \
-                             only doctor runs it"
-                        ));
-                    }
-                    Some(_) => {}
-                }
-            }
-            if let Some(run) = &step.run {
-                if run.trim().is_empty() {
-                    return Err(format!("steps[{i}].run: is empty or blank"));
-                }
-                if run.len() > MAX_RUN_BYTES {
+                Some(plugin) if plugin.is_doctor() => {
                     return Err(format!(
-                        "steps[{i}].run: {} bytes exceeds the {MAX_RUN_BYTES} byte limit",
-                        run.len()
+                        "{prefix}.plugin `{name}`: names an on = \"doctor\" plugin; \
+                         only doctor runs it"
                     ));
                 }
+                Some(_) => {}
+            }
+        }
+        if let Some(run) = &step.run {
+            if run.trim().is_empty() {
+                return Err(format!("{prefix}.run: is empty or blank"));
+            }
+            if run.len() > MAX_RUN_BYTES {
+                return Err(format!(
+                    "{prefix}.run: {} bytes exceeds the {MAX_RUN_BYTES} byte limit",
+                    run.len()
+                ));
             }
         }
         Ok(())
@@ -1102,6 +1082,33 @@ fn is_plugin_name(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
+/// One file entry's rules; `prefix` names it, as `files[0]`.
+pub(crate) fn check_file(prefix: &str, entry: &FileEntry) -> Result<(), String> {
+    check_src(&entry.src)
+        .map_err(|why| format!("{prefix}.src `{}`: {why}", secret::shown_name(&entry.src)))?;
+    check_dest(&entry.dest)
+        .map_err(|why| format!("{prefix}.dest `{}`: {why}", secret::shown_name(&entry.dest)))?;
+    check_mode(entry.mode.as_ref()).map_err(|why| format!("{prefix}.mode{why}"))?;
+    check_selector(prefix, &entry.tags, &entry.facts)
+}
+
+/// One service entry's rules; `prefix` names it, as `services[0]`.
+pub(crate) fn check_service(prefix: &str, entry: &ServiceEntry) -> Result<(), String> {
+    check_service_name(&entry.name)
+        .map_err(|why| format!("{prefix}.name `{}`: {why}", secret::shown_name(&entry.name)))?;
+    match (&entry.state, entry.state()) {
+        (None, _) => return Err(format!("{prefix}.state: required")),
+        (Some(state), None) => {
+            return Err(format!(
+                "{prefix}.state `{}`: must be started or stopped",
+                secret::shown_name(state)
+            ));
+        }
+        (Some(_), Some(_)) => {}
+    }
+    check_selector(prefix, &entry.tags, &entry.facts)
+}
+
 /// A `[[files]]` src: a store path or a path under the workspace.
 fn check_src(src: &str) -> Result<(), &'static str> {
     if crate::filestore::is_store_path(src) {
@@ -1206,8 +1213,8 @@ pub(crate) fn check_service_name(name: &str) -> Result<(), String> {
 }
 
 /// The tags and facts that select the targets of a `[[files]]` or
-/// `[[services]]` entry; `prefix` names the entry, as `files[0]`.
-fn check_selector(
+/// `[[services]]` entry or a task; `prefix` names it, as `files[0]`.
+pub(crate) fn check_selector(
     prefix: &str,
     tags: &[String],
     facts: &BTreeMap<String, String>,
@@ -1367,7 +1374,7 @@ fn expand(key: &str, value: &str, home: Option<&OsStr>) -> Result<PathBuf, Strin
 
 /// The rules on one document's tasks, each named by its path under `prefix`;
 /// what a task refers to is checked when it is expanded.
-fn check_tasks(tasks: &[Task], prefix: &str) -> Result<(), String> {
+pub(crate) fn check_tasks(tasks: &[Task], prefix: &str) -> Result<(), String> {
     for (i, task) in tasks.iter().enumerate() {
         let path = format!("{prefix}[{i}]");
         if task.args.is_some() && task.plugin.is_none() {
