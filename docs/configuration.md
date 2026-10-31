@@ -261,6 +261,9 @@ Without any `[[steps]]` the config runs one step, `hostname`; once you or `anvil
 default is gone. Each step has `run` or `plugin`, never both; a step with both is exit 2 with
 `steps[I]: has both run and plugin; keep one`, one with neither with `steps[I]: needs run or plugin`.
 
+The sections above run in a fixed order: packages, files, services, steps. To choose the order, use [`[[tasks]]`](#tasks)
+instead of `[[files]]`, `[[services]]`, `[[steps]]` and the lists in `[packages]`.
+
 Without `[secrets]` the backend is the keychain on macOS (and unsupported elsewhere). Only the selected backend's section
 is required and checked: a missing section, an unknown backend or `keychain` off macOS is a config error (exit 2). A
 path may start with `~/`, which is `$HOME`; after that it must be absolute. Each backend's setup is in
@@ -304,7 +307,8 @@ names = ["HOST_SUDO"]
 
 A `[[files]]` entry copies one text file onto each selected target whose tags and facts all match. No `tags` and no
 `facts` means every selected target. Matching entries run in config order, after the package step and before
-`[[steps]]`; an entry that does not match is still a step, reported as skipped, and the target's other steps still run
+`[[steps]]` (a `file` [task](#tasks) runs where it stands instead); an entry that does not match is still a step, reported as
+skipped, and the target's other steps still run
 ([File steps](cli.md#file-steps)). At most 64 entries: one more is exit 2 with `files: N entries exceeds the 64 entry limit`
 (`files: 65 entries exceeds the 64 entry limit` for 65). An unknown key, or a `sudo` or `rollback` that is not a
 boolean, is exit 2 with the parser's message, which names the key and the line. A path or value quoted in a message
@@ -476,7 +480,8 @@ with a regular file; the symlink refusal above runs first.
 A `[[services]]` entry brings one service to a state, and to an enablement when `enabled` is set, on each selected
 target whose tags and facts all match. It asks the target's init first and changes only what differs, so a rerun on a
 service already there prints `unchanged service NAME`. Matching entries run in config order, after the `[[files]]`
-steps and before `[[steps]]`; an entry that does not match is still a step, reported as
+steps and before `[[steps]]` (a `service` [task](#tasks) runs where it stands instead); an entry that does not match is still
+a step, reported as
 `skipped service NAME: no match`, and the target's other steps still run ([Service steps](cli.md#service-steps)).
 
 ```toml
@@ -579,6 +584,129 @@ fail with launchctl's own error. The launchd changes are tested against stand-in
 `print-disabled` format was checked, read-only, on macOS 26.
 
 What each init runs, and the messages of a service it cannot find, are in [Service steps](cli.md#service-steps).
+
+## Tasks
+
+A `[[tasks]]` list runs top to bottom on each target, in the order you write. It replaces the legacy sections' fixed
+order (packages, files, services, steps) when a setup needs another one: a directory before the file that goes in it,
+a migration between a file and the service that reads it. Tasks can nest, and can include task files from the
+[file store](cli.md#anvil-files). A config without `[[tasks]]` behaves exactly as before.
+
+`config.toml`:
+
+```toml
+[packages.alias.nginx]             # stays global
+brew = "nginx"
+
+[[tasks]]
+name = "Create conf dir"
+run = "sudo mkdir -p /etc/nginx/conf.d"
+
+[[tasks]]
+name = "Base packages"
+packages = { install = ["git", "curl"] }
+
+[[tasks]]
+name = "Web role"
+tags = ["web"]                     # inherited by every child
+include = "$/roles/web.toml"
+```
+
+`$/roles/web.toml`, which is `files/roles/web.toml` in the workspace:
+
+```toml
+[[tasks]]
+name = "Install nginx"
+packages = { install = ["nginx"] }
+
+[[tasks]]
+name = "Configure and start"
+facts = { os = "Linux" }           # ANDed with the parent's tags
+
+  [[tasks.tasks]]
+  name = "Write config"
+  file = { src = "$/roles/web/nginx.conf", dest = "/etc/nginx/nginx.conf", mode = "0644" }
+
+  [[tasks.tasks]]
+  name = "Start nginx"
+  service = { name = "nginx", state = "started", enabled = true }
+```
+
+**Kinds.** A task has exactly one of these, and may also set `name`, `tags` and `facts`. An unknown key is exit 2 with
+the parser's message. Two kinds are exit 2 with `tasks[0]: has run and include; keep one`, none with
+`tasks[0]: needs one of run, plugin, packages, file, service, include, tasks`.
+
+| Kind       | What it does                                                                         |
+| ---------- | ------------------------------------------------------------------------------------ |
+| `run`      | a POSIX sh script, at most 4 KiB, as in `[[steps]]`                                  |
+| `plugin`   | a `[plugins]` entry, with optional `args`, as in [Plugin steps](cli.md#plugin-steps) |
+| `packages` | only `install`, `pin`, `remove` and `upgrade`, as in `[packages]`                    |
+| `file`     | `src`, `dest`, `mode`, `sudo` and `rollback`, as in [`[[files]]`](#files)            |
+| `service`  | `name`, `state` and `enabled`, as in [`[[services]]`](#services)                     |
+| `include`  | a `$/…` task file, expanded in place                                                 |
+| `tasks`    | child tasks, written as `[[tasks.tasks]]` or an inline array                         |
+
+`tags` and `facts` go on the task, not inside `file` or `service`: that is exit 2 with
+`tasks[0].file: tags and facts belong on the task, not the file`. A task whose selector does not match is still a step,
+reported as skipped (`skipped run: no match`, `skipped packages: no match`), and the target's other steps still run. A
+failed task ends that target; the other targets go on. A `packages` task that asks for nothing, an empty `tasks` and an
+include with no tasks add no step. Every file and service task is its own step, and repeats are allowed: the
+[`[[services]]` duplicate rule](#services) does not apply, because stop, migrate, start is how a migration is written.
+A config with `[[tasks]]` has no default `hostname` step.
+
+**Nesting.** Children inherit `tags` and `facts`, and every level must match: a target must carry every tag along the chain,
+facts are ANDed. The same
+fact key with two different values along one chain can never match, so it is exit 2 with
+``tasks[0].tasks[0].facts.os `Darwin`: conflicts with `Linux` inherited from a parent``. `pkg` is the exception: it
+matches by membership, so each level is checked on its own.
+
+**Include.** `include` takes only a `$/…` store path. Anything else is exit 2 with
+``tasks[0].include `roles/web.toml`: must be a $/ store path``. The file is TOML only, whatever `[anvil].format` says, and
+`tasks` is its only allowed key, so an include cannot change a global setting: `[packages.alias]`, `[plugins]` or any
+other key is exit 2 with the parser's message (``unknown field `packages`, expected `tasks` ``). `anvil config` edits only
+the main file. An include has the store's limits (a regular UTF-8 text file without NUL, at most 1 MiB, no symlink) and
+must be owned by you and not group- or other-writable ([Security notes](security.md)):
+``tasks[0].include `$/roles/web.toml`: mode 664 lets others write to it; set mode 644``.
+
+**Reference checks.** All of these are exit 2 before any target starts, and every include is read whatever its `tags` or
+`facts`, so a typo does not wait for a matching host:
+
+- a cycle: ``tasks[0]/c1.toml:tasks[0]/c2.toml:tasks[0].include `$/c1.toml`: cycle: $/c1.toml -> $/c2.toml -> $/c1.toml``;
+- a missing include: ``tasks[1].include `$/r.toml`: not found``;
+- a missing `file.src` at any depth: ``tasks[0].file.src `$/gone`: not found``;
+- any check the main file has, from any depth, naming the task: `tasks[0].run: 4097 bytes exceeds the 4096 byte limit`.
+
+Including one file from two places, with no cycle, is allowed.
+
+**Limits.** All of them count after expansion, and each is exit 2 naming the task that went over:
+
+| Limit                                         | Message                                               |
+| --------------------------------------------- | ----------------------------------------------------- |
+| 8 levels, counting the top level and includes | `PATH: nested deeper than 8 levels`                   |
+| 256 tasks                                     | `PATH: more than 256 tasks after expansion`           |
+| 64 file tasks                                 | `PATH: more than 64 file tasks after expansion`       |
+| 64 service tasks                              | `PATH: more than 64 service tasks after expansion`    |
+| 4096 tasks visited, groups and includes too   | `PATH: more than 4096 tasks visited during expansion` |
+
+**Mixing.** `[[tasks]]` with `[[files]]`, `[[services]]`, `[[steps]]`, or `[packages]` `install`, `pin`, `remove` or
+`upgrade` is exit 2 with `[[tasks]] cannot be mixed with [[steps]]; move it into a task`. There is no automatic
+migration. `[packages.alias]` and the other `[packages]` settings (`manager`, `local`, `local_sudo_secret`, `timeout`)
+stay global and work with `[[tasks]]`, as do `[plugins]`, `[secrets]`, `[harden]` and `[anvil]`.
+
+**`packages` tasks.** Each one is its own step, under the global `[packages]` settings, and does not merge its lists
+with another task's: two tasks can each `pin` a different name. A `manager` or `alias` inside the task is exit 2 with the
+parser's message. See [Packages](packages.md).
+
+**Which commands expand.** `apply`, `plan`, `rollback`, `doctor`, `config --harden`, saving `anvil config` and the
+dangling-src warning of `anvil files mv` and `rm` read the expanded list, once per run. Opening the editor, inventory
+lookup and secrets use the main file as it is, so a broken include can still be fixed with `anvil config`. The dangling-src
+warning follows the includes it can read and never fails.
+
+**One probe.** Facts come from one probe before the run, and every step is built from them up front. A step that installs
+a package manager therefore cannot serve a later `packages` task on the same run, and a step that changes a fact does not
+change what later tasks match. Apply again to use the new state.
+
+Output, the record and rollback are in [Tasks in a run](cli.md#tasks-in-a-run).
 
 ## Plugins
 
@@ -701,6 +829,10 @@ line that sets the same key to another value is rewritten, also in any other `[[
 `/etc/ssh/sshd_config`, `/etc/ssh/sshd_config.d/…`, `/etc/sysctl.conf` or `/etc/sysctl.d/…`. A marked step is never
 rewritten, so you may edit it.
 
+On a [`[[tasks]]`](#tasks) config the rules suggest tasks instead of sections, and only the main file's top-level tasks are
+written. An entry already in an include or a nested task counts as present; one there that needs changing is left to
+you ([On a tasks config](cli.md#on-a-tasks-config)).
+
 What keeps you from locking yourself out:
 
 - **Root login is held.** When any inventory host (not `local`) connects as root or names no `user`, `ssh.root-login`
@@ -720,7 +852,8 @@ What keeps you from locking yourself out:
 ## Limits and refusals
 
 Every config or inventory file is capped at 1 MiB, checked before parsing. A `[[files]]` src has its own 1 MiB cap,
-checked when `apply` or `plan` reads it ([Files](#files)). YAML refuses anchors and aliases, merge keys (`<<`), duplicate
+checked when `apply` or `plan` reads it ([Files](#files)), and so does an [include](#tasks). YAML refuses anchors and aliases,
+merge keys (`<<`), duplicate
 keys, unsupported tags and more than one document, in a legacy file and in the YAML edit view alike. `anvil inventory`
 and `anvil config` open the parsed document, not the file's text, so comments are not preserved once you save. The
 1 MiB cap also holds for the edit view and the stored TOML: when the document rendered in the edit format is over

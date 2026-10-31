@@ -28,6 +28,12 @@ install = ["git", "curl"]
 The package step may run for `timeout` seconds (default 300, 1..=3600), where a `[[steps]]` script gets 30 s. Cancel
 (TUI `Esc` or `q`) waits for a running package step, up to `timeout`.
 
+That step runs first only in a legacy config. A [`[[tasks]]`](configuration.md#tasks) config has `packages` tasks instead,
+each its own step where it stands, holding only `install`, `pin`, `remove` and `upgrade`, and not merging with another
+task's lists. `manager`, `local`, `local_sudo_secret`, `timeout` and `[packages.alias]` stay global in `[packages]`, and
+writing a list there as well is exit 2. The manager comes from the one probe before the run, so a step that installs a
+manager cannot serve a later `packages` task on that run.
+
 ## Unknown package names
 
 apply resolves aliases, removes pinned names from install, then checks whether the install and pin names are known.
@@ -414,5 +420,6 @@ before the step fails the target with no steps and `packages: REASON`: `packages
 (`packages: brew refuses to run as root`), a [pin](#pin-and-remove) on brew, apt or apk
 (`packages: pin is not one-shot on brew: vim`), or a sudo password failure from
 [Typing the sudo password](#typing-the-sudo-password) (`packages: secret NAME is not set`). The step itself failing
-reads like any step, `✘ step 1 exited C`, and the `[[steps]]` do not run. `anvil doctor` shows the same resolution as
+reads like any step, `✘ step 1 exited C` (on a tasks config, the task's place in the run), and the later steps do not run.
+`anvil doctor` shows the same resolution as
 its `manager` row, so it reports a target apply would refuse before apply runs.

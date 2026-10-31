@@ -171,6 +171,12 @@ are defaults, so a present `[packages]` is saved as an empty `[packages]`. Comme
 the same config as before writes nothing (`PATH: unchanged`), whatever the edit; a legacy YAML config or the legacy
 `[anvil].secrets` is still migrated, as without `--full`.
 
+Saving a `[[tasks]]` config, with or without `--full`, also runs its
+[reference checks](configuration.md#tasks): a missing include goes through the same retry as any invalid edit, ending in
+`config: still invalid after 3 attempts`, exit 2, with nothing written. Opening the editor does not expand, so a broken
+include can still be fixed here. Only the main file is edited, and the saved file holds what you typed, never the
+expanded tasks.
+
 #### `anvil config --harden`
 
 Shows the Linux hardening the config lacks, as a diff of the config and the files it would add; `--write` saves it:
@@ -181,7 +187,8 @@ anvil config --harden --strict     # also the high-risk rules (ssh.password-auth
 anvil config --harden --write      # write the suggestions, then: anvil plan
 ```
 
-It reads the config, the inventory and the srcs of the `[[files]]` entries it checks, and nothing else: it never
+It reads the config, the inventory and the srcs of the `[[files]]` entries it checks (on a tasks config, its includes and
+the file tasks' srcs), and nothing else: it never
 contacts a target and runs offline. The rules, what each one writes and `[harden] skip` are in
 [Harden](configuration.md#harden). `--strict` and `--write` require `--harden`; `--harden` with `--full` or
 `--format` is exit 2. `--target` and `--parallel` are ignored with a warning, as for `config`.
@@ -266,9 +273,31 @@ After writing, stderr adds `harden: wrote PATH` for the config and each file, th
 `[[steps]]` ran the default `hostname` step; once `--harden` adds steps, that default is gone, so add a
 `run = "hostname"` step back if you want it.
 
-Exit codes: the preview is 1 when any suggestion remains (`config --harden: 3 suggestions`), else 0, held rules and
-warnings alone included. `--write` is 0 after writing or when there was nothing to write, 2 for a refusal above or a
+Exit codes: the preview is 1 when any suggestion remains (`config --harden: 3 suggestions`) or a
+[task entry is unresolved](#on-a-tasks-config), else 0, held rules and other warnings alone included. `--write` is 0 after
+writing or when there was nothing to write, 2 for a refusal above or a
 config that does not load, and 1 when a write fails. A config, inventory or src that cannot be read is exit 2.
+
+##### On a tasks config
+
+On a [`[[tasks]]`](configuration.md#tasks) config `--harden` adds tasks to the main file, top level only, and never
+writes an include or a nested task:
+
+```text
+harden: add ssh.root-login: tasks[3] /etc/ssh/sshd_config.d/00-anvil-harden.conf
+harden: add ssh.root-login: tasks[5] # anvil-harden: ssh
+harden: remove packages.insecure: telnet: tasks[1].packages.install -> tasks[1].packages.remove
+harden: warning tasks[0]/base.toml:tasks[0].packages: ftp should move from install to remove; change it by hand, …
+```
+
+- A new file task goes just ahead of an existing marked step that reads it. The rest are appended, files before steps.
+- An entry already in an include or a nested task counts as present. One there that needs changing gets that warning,
+  or `harden: warning PATH.file: src SRC must set LINE; change it by hand, …`, and no write. The warning ends with
+  `harden writes only the main file's top-level tasks`.
+- The preview is exit 1 while such an entry is unresolved, even with no suggestion left:
+  `config --harden: entries in includes or nested tasks need changing by hand`. `--write` writes the rest and is exit 0.
+- `--json` adds `"unresolved": true` then, and leaves the key out otherwise; the warnings are in `warnings`.
+- A second `--write` is a no-op, and the main file never gains the expanded tasks.
 
 ### `anvil files`
 
@@ -331,7 +360,8 @@ exit 1 with `$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`. Err
   An editor that exits non-zero writes nothing (exit 1).
 
 `mv` and `rm` then log a WARN for every `[[files]]` src under the path they moved or removed:
-``files[0].src `$/a/motd` names $/a, which is gone``.
+``files[0].src `$/a/motd` names $/a, which is gone``. On a `[[tasks]]` config it does the same for each `file.src` and
+`include` it can reach: ``tasks[0]/role.toml:tasks[0].file.src `$/inner` names $/inner, which is gone``.
 
 Human output: `ls` the names, `cat` the file, the other actions nothing. `--json` is one document:
 
@@ -586,6 +616,9 @@ Runs the config's `[[steps]]` in order on every selected target: each step's `ru
 every step on every target exited 0, else 1. apply runs directly: it prints no plan and asks for no confirmation; run
 [`anvil plan`](#anvil-plan) first to see what it would run.
 
+The rest of this section describes the legacy sections, whose order is fixed: packages, files, services, steps. A
+`[[tasks]]` config runs in the order you write ([Tasks in a run](#tasks-in-a-run)).
+
 With `[packages]` that has work to do (a non-empty `install`, `pin` or `remove`, or `upgrade = true`), each target
 first runs the facts probe over the same transport, resolves its package manager and runs the generated script as step 1,
 before the `[[steps]]`. That step is an ordinary step: it shows as `$ SCRIPT` with its output, counts in
@@ -598,10 +631,12 @@ terminal and anvil types the password at sudo's prompt ([Typing the sudo passwor
 probe runs and apply runs only the `[[steps]]`, unless a step names a plugin ([Plugin steps](#plugin-steps)) or the
 config has `[[files]]` or `[[services]]`.
 
-Each `[[files]]` entry is one step on every target, after the package step and before the `[[steps]]`: it copies the
+In a legacy config, each `[[files]]` entry is one step on every target, after the package step and before the `[[steps]]`:
+it copies the
 file when the target's tags and facts match and shows as skipped when they do not ([File steps](#file-steps)).
 
-Each `[[services]]` entry is one step on every target, after the file steps and before the `[[steps]]`: it brings the
+In a legacy config, each `[[services]]` entry is one step on every target, after the file steps and before the
+`[[steps]]`: it brings the
 service to its state under the target's init when the target's tags and facts match, and shows as skipped when they
 do not ([Service steps](#service-steps)).
 
@@ -720,6 +755,94 @@ Human output and the TUI show a yellow `⚠ packages: not found by MANAGER: a, b
 before the target's end line. Known names still install and later steps continue. These warnings do not change the
 target's `ok`, summary or exit code: all targets ok still exits 0. Actual install failures still fail the target.
 
+#### Tasks in a run
+
+A [`[[tasks]]`](configuration.md#tasks) config runs in the order written, not the fixed order above: a `packages`, `file`,
+`service`, `run` or `plugin` task behaves as that kind of step does, wherever it stands. `plan` and `apply` run the same
+order. With this config, `anvil plan` on `local` prints:
+
+```toml
+[[tasks]]
+name = "Create conf dir"
+run = "mkdir -p /tmp/app"
+
+[[tasks]]
+name = "App"
+
+  [[tasks.tasks]]
+  name = "Write config"
+  file = { src = "$/app.conf", dest = "/tmp/app/app.conf", mode = "0644", sudo = false }
+
+[[tasks]]
+name = "Web role"
+include = "$/roles/web.toml"   # Validate config, then Start nginx with tags = ["web"]
+```
+
+```text
+▶ local
+  tasks[0]  Create conf dir
+  would $ mkdir -p /tmp/app
+  tasks[1].tasks[0]  Write config
+  would $ file /tmp/app/app.conf
+  tasks[2]/roles/web.toml:tasks[0]  Validate config
+  would $ cat /tmp/app/app.conf
+  tasks[2]/roles/web.toml:tasks[1]  Start nginx
+  would $ skipped run: no match
+  ✔ 4 steps
+
+1 target, nothing executed
+```
+
+- **`PATH  NAME`.** Each task has a line with its stable path and, when set, its `name`; apply and plan print it at every
+  `-v` level, just above the step's `$` or `would $` line. An include shows in the path as `/roles/web.toml:`, a child as
+  `.tasks[0]`. Control characters and invisible characters in both are escaped. A legacy config prints no such line.
+- **`--json`.** Each step in `apply --json` and `plan --json` adds `task`, and `name` when set. A legacy config's JSON is
+  unchanged:
+
+```json
+{
+  "run": "skipped run: no match",
+  "code": 0,
+  "stdout": "",
+  "stderr": "",
+  "skipped": true,
+  "task": "tasks[2]/roles/web.toml:tasks[1]",
+  "name": "Start nginx"
+}
+```
+
+- **Failure.** `✘ step N exited C` counts the target's steps in run order, skipped ones included, so `N` is the place in
+  the expanded list. A failure stops that target's remaining tasks.
+- **Probe.** apply probes a target when the list has a `packages`, `file`, `service` or `plugin` task, or a task with
+  `facts`, or the config has a doctor plugin. The probe runs once, before the first task
+  ([One probe](configuration.md#tasks)). A sudo password any task needs is read before the run starts.
+- **Rollback.** `cannot undo` names a `run`, `plugin`, `packages` or `service` task by its path, on `--dry-run` as well:
+
+```text
+▶ local
+  would remove /tmp/app/app.conf
+  cannot undo: tasks[0]
+  cannot undo: tasks[2]/roles/web.toml:tasks[0]
+  ✔ 3 steps
+
+1 target, nothing executed
+```
+
+rollback needs the config to decide which files it may restore, so an include that is missing or refused stops it, exit 2:
+
+```text
+rollback: tasks[1].include `$/r.toml`: not found; the config decides which files may be restored: fix or restore
+what it names, then run rollback again
+```
+
+A recorded dest no file task names now fails the target with
+`rollback: DEST is not in the config; refusing to restore it`.
+
+- **doctor.** doctor expands the list (a refused include is exit 2), checks the `packages` tasks whose selectors match
+  each target, checks the sudo secrets those tasks need, and compares the dests file tasks wrote.
+- **TUI.** The Steps pane lists the expanded tasks; apply and plan sections show the same `PATH  NAME` lines
+  ([Terminal UI](tui.md)).
+
 #### Ctrl-C
 
 `apply`, `plan`, `run` and `rollback` handle Ctrl-C the same way, with any `--parallel`; `doctor` does too, between its
@@ -743,7 +866,8 @@ targets and its doctor plugins ([Doctor plugins](#doctor-plugins-drift-since-the
 
 #### The apply record
 
-An apply that probes its targets (`[packages]` with work, a plugin step, `[[files]]` or `[[services]]`) keeps
+An apply that probes its targets (`[packages]` with work, a plugin step, `[[files]]` or `[[services]]`, or on a tasks
+config [as in Tasks in a run](#tasks-in-a-run)) keeps
 `last-apply.json`, which [`anvil rollback`](#anvil-rollback) reads. An apply of plain `[[steps]]` only does not open
 it.
 
@@ -761,6 +885,12 @@ it.
   each file written, the steps that cannot be undone (`cannot_undo`) and, after a rollback, `rolled_back`. Per file:
   the dest, the mode and `sudo` it was written with, the sha256 of the bytes written, how the write ended (`write`) and
   what was there before (`previous`). It never keeps a secret value, a step's script or a package list.
+- **One entry per dest on a tasks config.** A dest two file tasks write in one apply, spelled the same or differing only
+  by repeated slashes, has one file entry under its first spelling: `previous` from
+  before the first write, and the mode, sha256 and `write` of the last, so doctor compares against the final bytes and
+  rollback puts back what was there before the first. `sudo` stays true once a write used it, and a dest with a
+  `rollback = false` task that applies to the target keeps no text from its first write on, even if that task never
+  runs.
 
 ```json
 {
@@ -815,6 +945,11 @@ does not set `rollback = false`. Otherwise `kept` is false and `reason` says why
 `not UTF-8 text`, `contains NUL`, `unreadable`, `no od on the target` or `record full`. The write goes ahead either
 way; only its undo is lost, and rollback shows the file as `cannot undo: DEST (REASON)`. `rollback = false` keeps the
 hash only: use it for a dest that holds a secret ([Files](configuration.md#files)).
+
+`rollback = false` has two limits. A symlink, hard link or case-insensitive alias of a dest cannot be seen on the
+controller and counts as a separate dest, so set `rollback = false` on every entry for that file. Legacy `[[files]]`
+duplicates for one dest, the first with the default rollback and a later one with `rollback = false`, still keep the
+later entry's secret as text on the second apply: use `[[tasks]]` or set `rollback = false` on both.
 
 **Retries keep the first state.** A rerun whose dest already holds the bytes keeps the entry of the apply that wrote
 them, so its `previous` is still the state from before that apply. A write that failed midway keeps the `previous` from
@@ -885,6 +1020,7 @@ secret is set and free of control characters is not checked, so plan can pass wh
 2 targets, nothing executed
 ```
 
+- A [`[[tasks]]`](#tasks-in-a-run) config adds a `PATH  NAME` line above each step.
 - Each step is a `would $ RUN` line (a multi-line `run` shows its first line and `…`), followed by
   `(sudo password from secret NAME)` when apply would type that secret's value at sudo's prompt.
 - The block ends with `✔ N steps`, or `✘ REASON` for a target that failed. The summary is `N targets, nothing executed`,
@@ -892,7 +1028,7 @@ secret is set and free of control characters is not checked, so plan can pass wh
 - Colour and escaping follow apply's rules.
 
 `--json` is apply's document with `"executed": false` first; a step has its `run` and, when apply would type a sudo
-password, its `sudo_secret`, but never `code`, `stdout` or `stderr`:
+password, its `sudo_secret`, plus `task` and `name` on a tasks config, but never `code`, `stdout` or `stderr`:
 
 ```json
 {
@@ -1046,8 +1182,8 @@ random number or a remote API) can make plan show a script that apply then does 
 
 ### File steps
 
-A `[[files]]` entry copies one text file from the workspace or file store onto each selected target whose tags and facts match
-([Files](configuration.md#files)):
+A `[[files]]` entry, or a `file` [task](#tasks-in-a-run), copies one text file from the workspace or file store onto each
+selected target whose tags and facts match ([Files](configuration.md#files)):
 
 ```toml
 [[files]]
@@ -1057,7 +1193,8 @@ mode = "0644"
 facts = { distro = "arch" }
 ```
 
-Every entry is one step on every target, in config order, after the package step and before the `[[steps]]`. On a
+Every `[[files]]` entry is one step on every target, in config order, after the package step and before the `[[steps]]`;
+a `file` task is the same step where it stands. On a
 target that matches, the step shows as `$ file DEST` and prints `wrote DEST`, or `unchanged DEST` when dest already
 holds the same bytes (only `mode` is applied then). On a target that does not match, it is
 `$ skipped file DEST: no match` with no output: it runs nothing, counts in `✔ ok · N steps`, and the target's other
@@ -1131,8 +1268,9 @@ state = "stopped"
 tags = ["web"]
 ```
 
-Every entry is one step on every target, in config order, after the `[[files]]` steps and before the `[[steps]]`, so
-the order is packages, files, services, steps. On a target that matches, the step shows as `$ service NAME`. It asks
+Every `[[services]]` entry is one step on every target, in config order, after the `[[files]]` steps and before the
+`[[steps]]`, so the order is packages, files, services, steps; a `service` task is the same step where it stands. On a target
+that matches, the step shows as `$ service NAME`. It asks
 the init first, changes only what differs and prints one line per change, in the order made: `enabled service NAME`,
 `disabled service NAME`, `started service NAME`, `stopped service NAME`. With nothing to change it prints
 `unchanged service NAME`, so a rerun is a no-op. On a target that does not match, it is
@@ -1318,7 +1456,8 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   DEST already is what it was before the apply (a restore still sets the owner and mode back). A file whose text was not kept
   is a skipped step `cannot undo: DEST (REASON)`, with the reason from the record (`rollback = false`, say).
 - **What cannot be undone.** After the files, the steps of the apply that ran but cannot be undone show as skipped
-  steps: `cannot undo: packages`, `cannot undo: service NAME` and `cannot undo: step N` (the Nth `[[steps]]` entry).
+  steps: `cannot undo: packages`, `cannot undo: service NAME` and `cannot undo: step N` (the Nth `[[steps]]` entry), or
+  on a tasks config `cannot undo: PATH` ([Tasks in a run](#tasks-in-a-run)).
   Rollback never runs a package manager, a service command or a step.
 - **The same path as the write.** Each file is restored as apply wrote it, from the recorded `sudo` and the target's
   current facts: through `sudo -n`, as root, as the connecting user, or on the password path, which stages the text in
@@ -1391,7 +1530,7 @@ Exit codes:
   cannot be read (`rollback: PATH: REASON`, as for apply), is locked by another anvil or cannot be saved; no state
   directory ([The apply record](#the-apply-record)).
 - **2**: a bad flag (`--force` with `--force-all`), a `--force DEST` not in the record, an unknown `--target`, or an
-  invalid config or inventory.
+  invalid config or inventory, including a task or include that does not expand.
 
 ### `anvil run [--timeout SECS] <FILE|->`
 
@@ -1660,7 +1799,8 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 - **`update`**: 0 when up to date, ahead of the latest release, or updated. 1 with `--check` when an update is
   available, and for every failure: the query, a download, a check, a refusal, or `no release key compiled in`; the
   installed binary is then untouched. 2 for a bad flag or argument.
-- **`config --harden`**: 1 while any suggestion remains, else 0; held rules and warnings alone are 0. With `--write`,
+- **`config --harden`**: 1 while any suggestion or unresolved [task entry](#on-a-tasks-config) remains, else 0; held rules
+  and other warnings alone are 0. With `--write`,
   0 after writing (or with nothing to write), 2 for a refusal or a config that does not validate, 1 when a write fails
   ([`--harden`](#anvil-config---harden)).
 - **`files`**: 0 on success. 1 when a store path is missing, already exists without `-f`, is a folder (`rm` without

@@ -26,6 +26,11 @@ install = ["git", "curl"]
 套件 step 最多可執行 `timeout` 秒（預設 300，1..=3600），而 `[[steps]]` 腳本為 30 s。
 取消（TUI 的 `Esc` 或 `q`）會等待執行中的套件 step，最久到 `timeout`。
 
+只有舊版 config 中這個 step 才最先執行。[`[[tasks]]`](configuration.zh-TW.md#tasks) config 改用 `packages` task，
+每個都是在它所在位置的 step，只含 `install`、`pin`、`remove` 與 `upgrade`，不與其他 task 的清單合併。
+`manager`、`local`、`local_sudo_secret`、`timeout` 與 `[packages.alias]` 維持全域，寫在 `[packages]`，而在那裡也寫清單則以 2 結束。
+管理器來自執行前的一次探測，因此安裝管理器的 step 無法在該次執行中服務後面的 `packages` task。
+
 ## 未知的 package 名稱
 
 apply 會先套用 alias、排除與 pin 相同的 install 名稱，再查詢 install 與 pin 名稱是否存在。
@@ -388,5 +393,5 @@ pacman -Syu --noconfirm --ignore vim && { anvil_db=1; { pacman -Si pacman >/dev/
 或上文的解析錯誤（`packages: brew refuses to run as root`），
 或在 brew、apt 或 apk 上的[鎖定](#鎖定與移除)（`packages: pin is not one-shot on brew: vim`），
 或[輸入 sudo 密碼](#輸入-sudo-密碼)中的 sudo 密碼失敗（`packages: secret NAME is not set`）。
-step 本身失敗時，顯示方式和任何 step 一樣，`✘ step 1 exited C`，且 `[[steps]]` 不會執行。
+step 本身失敗時，顯示方式和任何 step 一樣，`✘ step 1 exited C`（在 tasks config 上是該 task 在執行中的位置），且後面的 step 不會執行。
 `anvil doctor` 的 `manager` 列顯示相同的解析結果，因此它會在 apply 執行之前回報 apply 會拒絕的 target。

@@ -51,7 +51,9 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
   inventory 載入失敗時，選擇的位置改以紅色顯示 `inventory error`，錯誤本身則顯示為通知。
 - **Steps。** apply 會執行的 step，附編號：`[packages]` 有工作時為 `packages`，接著是每個 `[[files]]` 項目的 `file DEST`
   與每個 `[[services]]` 項目的 `service NAME`，然後是每個 `[[steps]]` 的指令
-  （第一行，還有更多行時加上 `…`）；沒有 `[[steps]]` 的 config 執行預設的 `hostname` step。游標所在列標記為 `▶`。
+  （第一行，還有更多行時加上 `…`）；沒有 `[[steps]]` 的 config 執行預設的 `hostname` step。
+  [`[[tasks]]`](configuration.zh-TW.md#tasks) config 則依執行順序列出展開後的 task，每列為 `NAME  PATH`（沒有 `name` 時用上述標籤），
+  apply 與 plan 區塊在每個 step 上方多一行 `PATH  NAME`。游標所在列標記為 `▶`。
   在 apply 結果上，列表是該次執行載入的 config 的 step，每列依顯示中分頁的 target 標上記號：
   `✔` 結束碼為 0，`✘` 結束碼非 0 或被終止，`⊘` 未執行（在失敗的 step 或取消之後，或因 target 不符合而被略過的 file 或 service step）。
   傳輸錯誤結束 target 時，被它結束的 step 為 `✘`（尚未執行任何 step 時為第一個：連線或探測失敗），
