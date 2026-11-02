@@ -1,0 +1,1 @@
+deb [signed-by=/etc/apt/keyrings/nginx.asc] https://nginx.org/packages/debian bookworm nginx

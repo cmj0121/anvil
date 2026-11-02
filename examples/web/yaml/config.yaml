@@ -1,0 +1,39 @@
+# Runs top to bottom on each target: packages, a repository, packages again, a
+# role. The legacy sections' fixed order cannot put a file between two installs.
+tasks:
+  - name: Base packages
+    tags:
+      - web
+    packages:
+      install:
+        - ca-certificates
+        - curl
+  - name: Nginx repository
+    tags:
+      - web
+    facts:
+      pkg: apt # inherited by both children
+    tasks:
+      - name: Trust the signing key
+        run: |
+          key=$(mktemp) &&
+          trap 'rm -f "$key"' EXIT &&
+          curl -fsSL https://nginx.org/keys/nginx_signing.key -o "$key" &&
+          sudo -n install -d -m 0755 /etc/apt/keyrings &&
+          sudo -n install -m 0644 "$key" /etc/apt/keyrings/nginx.asc
+      - name: Add the repository
+        file:
+          src: $/apt/nginx.list
+          dest: /etc/apt/sources.list.d/nginx.list
+          mode: "0644"
+  # On apt, an install refreshes the package lists first, so it sees the new repository.
+  - name: Install nginx
+    tags:
+      - web
+    packages:
+      install:
+        - nginx
+  - name: Site role
+    tags:
+      - web
+    include: $/roles/site.toml
