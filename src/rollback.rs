@@ -740,6 +740,7 @@ mod tests {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
             let cancel = AtomicBool::new(false);
             let a_handled = Arc::new(AtomicBool::new(false));
+            let b_started = AtomicBool::new(false);
             let b_saw_cancel = AtomicBool::new(false);
             let result = roll_back_each(
                 &[target("a"), target("b")],
@@ -757,7 +758,18 @@ mod tests {
                     }
                 },
                 |target, _| {
-                    // b is mid-rollback when a's save fails.
+                    // b is mid-rollback when a's save fails: a waits for b to
+                    // start, or the cancel would skip b before it ran.
+                    let since = Instant::now();
+                    while target.name == "a"
+                        && !b_started.load(Ordering::Relaxed)
+                        && since.elapsed() < Duration::from_secs(5)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    if target.name == "b" {
+                        b_started.store(true, Ordering::Relaxed);
+                    }
                     let since = Instant::now();
                     while target.name == "b"
                         && !a_handled.load(Ordering::Relaxed)
