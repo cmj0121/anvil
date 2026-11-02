@@ -15,7 +15,7 @@ use crate::config::{
 use crate::document::{self, Format};
 use crate::facts::Facts;
 use crate::files;
-use crate::filestore::{self, Root};
+use crate::filestore::{self, Root, StoreError};
 use crate::inventory::Target;
 use crate::logger::{escape_invisible, escape_line};
 use crate::packages::Packages;
@@ -234,10 +234,18 @@ pub fn expand(
         visited: 0,
         files: 0,
         services: 0,
+        refused: false,
     };
     // A refusal can name an include's path, which may hold anything.
-    walk.tasks(&config.tasks, "tasks", 1, &Selector::default())
-        .map_err(|why| Failure::usage(escape_invisible(&why)))?;
+    let walked = walk.tasks(&config.tasks, "tasks", 1, &Selector::default());
+    walked.map_err(|why| {
+        let why = escape_invisible(&why);
+        if walk.refused {
+            Failure::refusal(why)
+        } else {
+            Failure::usage(why)
+        }
+    })?;
     Ok(Expanded {
         items: walk.items,
         from_tasks: true,
@@ -296,7 +304,8 @@ impl Found<'_> {
         if self.chain.contains(&rel) {
             return;
         }
-        let Ok(text) = self.root.read_trusted(include) else {
+        // Only names come out of it, for a warning; nothing it says is run.
+        let Ok(text) = self.root.read_text(include) else {
             return;
         };
         let Ok(file) = document::from_str::<IncludeFile>(&text, Format::Toml) else {
@@ -355,6 +364,8 @@ struct Walk<'a> {
     visited: usize,
     files: usize,
     services: usize,
+    /// The walk stopped at an include others can change, not a bad one.
+    refused: bool,
 }
 
 impl Walk<'_> {
@@ -475,10 +486,14 @@ impl Walk<'_> {
                 .collect();
             return Err(refused(format!("cycle: {}", cycle.join(" -> "))));
         }
-        let text = self
-            .root
-            .read_trusted(include)
-            .map_err(|err| refused(err.reason()))?;
+        let text = match self.root.read_trusted(include) {
+            Ok(text) => text,
+            Err(err @ StoreError::Untrusted(_, _)) => {
+                self.refused = true;
+                return Err(refused(files::store_reason(include, &err)));
+            }
+            Err(err) => return Err(refused(err.reason())),
+        };
         let file: IncludeFile = document::from_str(&text, Format::Toml).map_err(refused)?;
         let prefix = format!("{path}/{}:tasks", segment(&rel));
         check_tasks(&file.tasks, &prefix)?;
@@ -631,6 +646,80 @@ mod tests {
         .unwrap();
         assert!(!called.get());
         assert_eq!(expanded, legacy(&config));
+    }
+
+    /// Refused and typed whatever the depth, and for an include whose tags
+    /// match no target: every include is read.
+    #[test]
+    fn an_include_or_a_folder_above_it_others_can_write_is_a_typed_refusal() {
+        let ws = Workspace::new();
+        ws.include("a/b/role.toml", "[[tasks]]\nrun = \"true\"\n");
+        let configs = [
+            (
+                "[[tasks]]\ninclude = \"$/a/b/role.toml\"\n",
+                "tasks[0].include `$/a/b/role.toml`",
+            ),
+            (
+                "[[tasks]]\ntags = [\"nowhere\"]\n\n[[tasks.tasks]]\ninclude = \"$/a/b/role.toml\"\n",
+                "tasks[0].tasks[0].include `$/a/b/role.toml`",
+            ),
+        ];
+        for (rel, mode, shown) in [
+            ("a/b/role.toml", 0o664, "mode 664"),
+            ("a/b", 0o775, "$/a/b mode 775"),
+            ("a", 0o757, "$/a mode 757"),
+            ("", 0o775, "$/ mode 775"),
+        ] {
+            let restored = if rel.ends_with(".toml") { 0o644 } else { 0o755 };
+            ws.mode(rel, mode);
+            for (config, named) in configs {
+                let config: Config = toml::from_str(config).unwrap();
+                let err = expand(&config, || Ok(ws.0.clone())).unwrap_err();
+                assert!(err.refused, "{err:?}");
+                assert_eq!(err.code, 2);
+                assert!(err.message.starts_with(named), "{err:?}");
+                assert!(err.message.contains(shown), "{err:?}");
+            }
+            ws.mode(rel, restored);
+        }
+        let config: Config = toml::from_str(configs[0].0).unwrap();
+        assert!(expand(&config, || Ok(ws.0.clone())).is_ok());
+
+        // Refused in an included file too: the walk's flag is not only top level.
+        ws.include("outer.toml", "[[tasks]]\ninclude = \"$/a/b/role.toml\"\n");
+        ws.mode("a/b", 0o775);
+        let config: Config = toml::from_str("[[tasks]]\ninclude = \"$/outer.toml\"\n").unwrap();
+        let err = expand(&config, || Ok(ws.0.clone())).unwrap_err();
+        assert!(err.refused, "{err:?}");
+        assert!(
+            err.message.contains("outer.toml:tasks[0].include"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn references_follow_an_include_a_run_would_refuse() {
+        let ws = Workspace::new();
+        ws.include(
+            "a/role.toml",
+            "[[tasks]]\nfile = { src = \"$/motd\", dest = \"/etc/motd\", mode = \"0644\" }\n",
+        );
+        ws.mode("a", 0o775);
+        let config: Config = toml::from_str("[[tasks]]\ninclude = \"$/a/role.toml\"\n").unwrap();
+        let found = references(&config, &Root::in_workspace(&ws.0));
+        assert!(found.iter().any(|(_, src)| src == "$/motd"), "{found:?}");
+    }
+
+    #[test]
+    fn a_missing_or_bad_include_is_not_a_refusal() {
+        let ws = Workspace::new();
+        ws.include("bad.toml", "not toml =");
+        for name in ["missing", "bad"] {
+            let text = format!("[[tasks]]\ninclude = \"$/{name}.toml\"\n");
+            let config: Config = toml::from_str(&text).unwrap();
+            let err = expand(&config, || Ok(ws.0.clone())).unwrap_err();
+            assert!(!err.refused, "{err:?}");
+        }
     }
 
     #[test]

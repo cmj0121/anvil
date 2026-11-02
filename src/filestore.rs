@@ -231,13 +231,15 @@ impl Root {
         read_file(file, &rel)
     }
 
-    /// [`Root::read_text`] for a file that decides what runs: owned by the
-    /// current user and not group- or other-writable, checked on the fd it
-    /// reads.
+    /// [`Root::read_text`] for a file that decides what runs: it and every
+    /// folder from the store root down to it owned by the current user and
+    /// not group- or other-writable, checked on the fds walked and read.
     pub fn read_trusted(&self, rel: &str) -> Result<String, StoreError> {
         let rel = parse(rel)?;
-        let (dir, name) = self.parent(&rel, false)?;
-        let file = open_file(&dir, &name, &rel)?;
+        let (parent, name) = rel.rsplit_once('/').unwrap_or(("", &rel));
+        let dir = self.trusted_directory(parent)?;
+        let name = if name.is_empty() { "." } else { name };
+        let file = open_file(&dir, name, &rel)?;
         check_trusted(&file, &rel)?;
         read_file(file, &rel).map_err(|err| match err {
             StoreError::IsDir(rel) => StoreError::NotText(rel),
@@ -274,6 +276,20 @@ impl Root {
             check_private(&dir, "")?;
         }
         walk_dir(dir, rel, create)
+    }
+
+    /// Opens the folder `rel` without creating anything, checking each folder
+    /// on the way.
+    fn trusted_directory(&self, rel: &str) -> Result<File, StoreError> {
+        let mut dir = self.directory("", false)?;
+        check_trusted_dir(&dir, "")?;
+        let mut walked = String::new();
+        for part in rel.split('/').filter(|p| !p.is_empty()) {
+            walked = joined(&walked, part);
+            dir = open_dir(&dir, part.as_ref(), &walked)?;
+            check_trusted_dir(&dir, &walked)?;
+        }
+        Ok(dir)
     }
 
     fn parent(&self, rel: &str, create: bool) -> Result<(File, String), StoreError> {
@@ -785,6 +801,12 @@ fn check_private(dir: &File, rel: &str) -> Result<(), StoreError> {
     check_owner(&meta, 0o022).map_err(|why| io_error(rel, io::Error::other(why)))
 }
 
+/// Owner and mode of an open folder above a file that decides what runs.
+fn check_trusted_dir(dir: &File, rel: &str) -> Result<(), StoreError> {
+    let meta = dir.metadata().map_err(|e| io_error(rel, e))?;
+    check_owner(&meta, 0o022).map_err(|why| StoreError::Untrusted(rel.to_owned(), why))
+}
+
 /// Owner and mode of an open regular file; [`read_file`] refuses anything else.
 fn check_trusted(file: &File, rel: &str) -> Result<(), StoreError> {
     let meta = file.metadata().map_err(|e| io_error(rel, e))?;
@@ -967,6 +989,29 @@ mod tests {
             assert_eq!(err.to_string(), shown);
         }
         assert_eq!(store.1.read_text("role.toml").unwrap(), "tasks = []");
+    }
+
+    #[test]
+    fn read_trusted_refuses_a_folder_others_can_write_at_any_depth() {
+        let store = Store::new();
+        store.1.write("a/b/role.toml", b"tasks = []").unwrap();
+        let chmod = |rel: &str, mode: u32| {
+            let path = store.1.path().join(rel);
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        for (rel, shown) in [("", "$/"), ("a", "$/a"), ("a/b", "$/a/b")] {
+            chmod(rel, 0o775);
+            let err = store.1.read_trusted("a/b/role.toml").unwrap_err();
+            assert!(matches!(err, StoreError::Untrusted(_, _)), "{err}");
+            assert_eq!(err.exit_code(), 2);
+            assert_eq!(
+                err.to_string(),
+                format!("{shown}: mode 775 lets others write to it; run chmod go-w on it")
+            );
+            assert_eq!(store.1.read_text("a/b/role.toml").unwrap(), "tasks = []");
+            chmod(rel, 0o755);
+        }
+        assert_eq!(store.1.read_trusted("a/b/role.toml").unwrap(), "tasks = []");
     }
 
     #[test]

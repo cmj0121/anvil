@@ -33,6 +33,7 @@ use crate::record::{FileRecord, NO_ROLLBACK, Previous, PreviousFile, Write};
 use crate::secret;
 use crate::tasks::{Expanded, Item};
 use crate::transport::RUN_TIMEOUT;
+use crate::trust::{self, TrustError};
 
 /// Each file item's src text, by ordinal.
 #[derive(Debug, Default)]
@@ -81,52 +82,120 @@ pub fn load(
     });
     let sources = expanded.files().map(|(item, entry, i)| {
         let text = if filestore::is_store_path(&entry.src) {
-            store
-                .read_text(&entry.src)
-                .map_err(|err| store_reason(&entry.src, &err))
+            store.read_trusted(&entry.src).map_err(|err| match err {
+                StoreError::Untrusted(_, _) => SrcError::Refused(store_reason(&entry.src, &err)),
+                err => SrcError::Other(store_reason(&entry.src, &err)),
+            })
         } else {
             canonical
                 .as_ref()
-                .map_err(Clone::clone)
+                .map_err(|err| SrcError::Other(err.clone()))
                 .and_then(|dir| read_src(dir, &entry.src))
         };
-        text.map(|text| Source { text }).map_err(|why| {
-            item.shown_message(format!(
-                "{}.src `{}`: {why}",
+        text.map(|text| Source { text }).map_err(|err| {
+            let message = item.shown_message(format!(
+                "{}.src `{}`: {err}",
                 item.label("files", i),
                 secret::shown_name(&entry.src)
-            ))
+            ));
+            match err {
+                SrcError::Refused(_) => Failure::refusal(message),
+                SrcError::Other(_) => Failure::usage(message),
+            }
         })
     });
-    Ok(Sources(
-        sources.collect::<Result<_, _>>().map_err(Failure::usage)?,
-    ))
+    Ok(Sources(sources.collect::<Result<_, _>>()?))
 }
 
-/// Reads a relative src as text, confined to the already canonical workspace `dir`.
-pub(crate) fn read_src(dir: &Path, src: &str) -> Result<String, String> {
+/// Why a src was not read.
+#[derive(Debug)]
+pub(crate) enum SrcError {
+    /// It or a folder above it can be changed by others.
+    Refused(String),
+    Other(String),
+}
+
+impl fmt::Display for SrcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (SrcError::Refused(why) | SrcError::Other(why)) = self;
+        f.write_str(why)
+    }
+}
+
+/// Refuses a folder others can write on the way to `src` as it is written,
+/// from `dir` down, following each link: such a folder could repoint a link it
+/// holds at any file the real-path check would pass. A folder outside `dir` is
+/// checked only when it holds a link the path goes through.
+fn check_written_path(dir: &Path, src: &str) -> Result<(), TrustError> {
+    let parts = |path: &Path| -> Vec<std::ffi::OsString> {
+        let parts = path.components().rev();
+        parts.map(|part| part.as_os_str().to_owned()).collect()
+    };
+    let mut current = dir.to_path_buf();
+    let mut rest = parts(Path::new(src));
+    while let Some(part) = rest.pop() {
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            current.pop();
+            continue;
+        }
+        let next = current.join(&part);
+        let failed = |source| TrustError::Io {
+            path: next.clone(),
+            source,
+        };
+        let is_link = fs::symlink_metadata(&next).map_err(failed)?.is_symlink();
+        if is_link || current.starts_with(dir) {
+            trust::check_dir(&current, trust::INPUT)?;
+        }
+        if is_link {
+            let mut target = parts(&fs::read_link(&next).map_err(failed)?);
+            rest.append(&mut target);
+        } else {
+            current = next;
+        }
+    }
+    Ok(())
+}
+
+/// Reads a relative src as text, confined to the already canonical workspace
+/// `dir`. A symlink inside the workspace works: every folder on the path as
+/// written, the real file and every real folder from `dir` down to it are what
+/// is checked.
+pub(crate) fn read_src(dir: &Path, src: &str) -> Result<String, SrcError> {
     const TEXT_ONLY: &str = "[[files]] copies text files only for now";
-    let path = fs::canonicalize(dir.join(src)).map_err(|err| format!("cannot read: {err}"))?;
+    let other = |why: String| SrcError::Other(why);
+    let unreadable = |err: std::io::Error| other(format!("cannot read: {err}"));
+    let path = fs::canonicalize(dir.join(src)).map_err(unreadable)?;
     if !path.starts_with(dir) {
-        return Err("leaves the workspace".to_string());
+        return Err(other("leaves the workspace".to_string()));
     }
-    let meta = fs::metadata(&path).map_err(|err| format!("cannot read: {err}"))?;
+    let meta = fs::metadata(&path).map_err(unreadable)?;
     if !meta.is_file() {
-        return Err("is not a regular file".to_string());
+        return Err(other("is not a regular file".to_string()));
     }
-    let bytes = document::read_capped(&path).map_err(|err| format!("cannot read: {err}"))?;
-    if bytes.len() as u64 > document::MAX_BYTES {
-        return Err("exceeds the 1 MiB limit".to_string());
+    let trust_error = |err: TrustError| match err {
+        TrustError::Refused { .. } => SrcError::Refused(err.to_string()),
+        TrustError::TooLarge { .. } => other("exceeds the 1 MiB limit".to_string()),
+        TrustError::NotFound { source, .. } | TrustError::Io { source, .. } => unreadable(source),
+    };
+    check_written_path(dir, src).map_err(trust_error)?;
+    for folder in path.ancestors().skip(1).take_while(|a| a.starts_with(dir)) {
+        trust::check_dir(folder, trust::INPUT).map_err(trust_error)?;
     }
-    let text = String::from_utf8(bytes).map_err(|_| format!("is not UTF-8 text; {TEXT_ONLY}"))?;
+    let bytes = trust::load(&path, document::MAX_BYTES).map_err(trust_error)?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| other(format!("is not UTF-8 text; {TEXT_ONLY}")))?;
     if text.contains('\0') {
-        return Err(format!("contains a NUL byte; {TEXT_ONLY}"));
+        return Err(other(format!("contains a NUL byte; {TEXT_ONLY}")));
     }
     Ok(text)
 }
 
 /// Retains a failing store component when it differs from the source.
-fn store_reason(src: &str, err: &StoreError) -> String {
+pub(crate) fn store_reason(src: &str, err: &StoreError) -> String {
     let normalized = |path: &str| {
         filestore::parse(path).unwrap_or_else(|_| {
             path.strip_prefix(filestore::PREFIX)
@@ -1717,6 +1786,99 @@ mod tests {
 
     fn user_facts(sudo: &str) -> Facts {
         facts(&[("user", "u"), ("sudo", sudo), ("distro", "arch")])
+    }
+
+    /// `src` refused, typed, naming its entry and the fix; `path` at `mode` is
+    /// what fails, and passes again at `restored`.
+    fn assert_src_refused(dir: &Path, src: &str, path: &Path, mode: u32, restored: u32) {
+        let config = config_in(dir, vec![entry(src, "/etc/x")]);
+        let chmod = |mode| fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        chmod(mode);
+        let err = super::load(&legacy(&config), || Ok(dir.to_path_buf())).unwrap_err();
+        assert!(err.refused, "{err:?}");
+        assert_eq!(err.code, 2);
+        assert!(
+            err.message.contains(&format!("files[0].src `{src}`: ")),
+            "{err:?}"
+        );
+        assert!(err.message.contains(&format!("mode {mode:o}")), "{err:?}");
+        chmod(restored);
+        assert!(super::load(&legacy(&config), || Ok(dir.to_path_buf())).is_ok());
+    }
+
+    #[test]
+    fn a_src_or_a_folder_above_it_others_can_write_is_refused_at_any_depth() {
+        let dir = dir("files-src-trust");
+        let root = fs::canonicalize(&dir).unwrap();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("files/c/d")).unwrap();
+        for rel in ["a", "a/b", "files", "files/c", "files/c/d"] {
+            fs::set_permissions(root.join(rel), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for rel in ["a/b/src.txt", "files/c/d/src.txt"] {
+            fs::write(root.join(rel), "text").unwrap();
+            fs::set_permissions(root.join(rel), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        for (src, path, mode, restored) in [
+            ("a/b/src.txt", "a/b/src.txt", 0o664, 0o644),
+            ("a/b/src.txt", "a/b/src.txt", 0o646, 0o644),
+            ("a/b/src.txt", "a/b", 0o775, 0o755),
+            ("a/b/src.txt", "a", 0o757, 0o755),
+            ("$/c/d/src.txt", "files/c/d/src.txt", 0o664, 0o644),
+            ("$/c/d/src.txt", "files/c/d", 0o775, 0o755),
+            ("$/c/d/src.txt", "files/c", 0o775, 0o755),
+            ("$/c/d/src.txt", "files", 0o775, 0o755),
+        ] {
+            assert_src_refused(&root, src, &root.join(path), mode, restored);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A link's folder could repoint it, so it counts as well as the real path:
+    /// directly, through a linked folder, and through a link a link names.
+    #[test]
+    fn a_symlink_in_a_folder_others_can_write_is_refused() {
+        let dir = dir("files-src-loose-link");
+        let root = fs::canonicalize(&dir).unwrap();
+        for rel in ["secrets", "loose", "real", "chain"] {
+            fs::create_dir(root.join(rel)).unwrap();
+            fs::set_permissions(root.join(rel), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(root.join("secrets/db.env"), "text").unwrap();
+        fs::set_permissions(
+            root.join("secrets/db.env"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        symlink("../secrets/db.env", root.join("loose/motd")).unwrap();
+        assert_src_refused(&root, "loose/motd", &root.join("loose"), 0o775, 0o755);
+
+        symlink("loose", root.join("folder")).unwrap();
+        assert_src_refused(&root, "folder/motd", &root.join("loose"), 0o757, 0o755);
+
+        symlink("../loose/motd", root.join("chain/first")).unwrap();
+        symlink("chain/first", root.join("start")).unwrap();
+        for (loose, mode) in [("loose", 0o775), ("chain", 0o775)] {
+            assert_src_refused(&root, "start", &root.join(loose), mode, 0o755);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_symlink_src_inside_the_workspace_works_and_its_real_path_is_checked() {
+        let dir = dir("files-src-link");
+        let root = fs::canonicalize(&dir).unwrap();
+        fs::create_dir(root.join("real")).unwrap();
+        fs::set_permissions(root.join("real"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(root.join("real/src.txt"), "text").unwrap();
+        fs::set_permissions(root.join("real/src.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink("real/src.txt", root.join("link.txt")).unwrap();
+        let config = config_in(&root, vec![entry("link.txt", "/etc/x")]);
+        let Sources(loaded) = load(&config, || Ok(root.clone())).unwrap();
+        assert_eq!(loaded[0].text, "text");
+        assert_src_refused(&root, "link.txt", &root.join("real"), 0o775, 0o755);
+        assert_src_refused(&root, "link.txt", &root.join("real/src.txt"), 0o664, 0o644);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn load_err(dir: &Path, src: &str) -> String {

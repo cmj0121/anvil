@@ -179,7 +179,13 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool, write: bool) -> Result<()
         workspace: &workspace,
         strict,
     })
-    .map_err(|err| Failure::usage(err.to_string()))?;
+    .map_err(|err| {
+        if err.refused {
+            Failure::refusal(err.message)
+        } else {
+            Failure::usage(err.message)
+        }
+    })?;
 
     let edited = outcome.doc.to_string();
     let count = outcome.suggestions.len();

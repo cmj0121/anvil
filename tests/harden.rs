@@ -1050,3 +1050,53 @@ fn a_legacy_file_spelling_the_dest_with_extra_slashes_is_not_a_contradiction() {
         "PermitRootLogin yes\n"
     );
 }
+
+/// `--write` must not merge a store src others can change into a private file
+/// that later passes as trusted: the refusal stops it, unwritten.
+#[test]
+fn a_store_src_others_can_write_is_refused_and_not_laundered() {
+    let sb = sandbox(&format!(
+        "[[files]]\nsrc = \"$/sshd.conf\"\ndest = \"{SSHD_DEST}\"\nmode = \"0644\"\n"
+    ));
+    store_file(&sb, "sshd.conf", "PermitRootLogin yes\n");
+    let path = sb.config_dir().join("files/sshd.conf");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+    let before = fs::read(sb.config_dir().join("config.toml")).unwrap();
+    for args in [&[][..], &["--write"]] {
+        let out = harden(&sb, args);
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{stderr}");
+        assert!(
+            stderr.contains("mode 664 lets others write to it"),
+            "{stderr}"
+        );
+    }
+    assert_eq!(fs::read(&path).unwrap(), b"PermitRootLogin yes\n");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o664
+    );
+    assert_eq!(
+        fs::read(sb.config_dir().join("config.toml")).unwrap(),
+        before
+    );
+}
+
+/// A refused src that only contradicts the rule is not skipped either.
+#[test]
+fn a_contradicting_store_src_others_can_write_is_refused() {
+    let sb = sandbox(
+        "[[files]]\nsrc = \"$/other.conf\"\ndest = \"/etc/ssh/sshd_config.d/20-other.conf\"\nmode = \"0644\"\n",
+    );
+    store_file(&sb, "other.conf", "PermitRootLogin yes\n");
+    let path = sb.config_dir().join("files/other.conf");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+    let out = harden(&sb, &["--write"]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("files[0].src `$/other.conf`"), "{stderr}");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o664
+    );
+}

@@ -245,3 +245,90 @@ fn a_first_config_at_a_loose_umask_does_not_lock_out_the_next_command() {
     let out = sb.anvil(&["plan", "--config", config.to_str().unwrap()], &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
 }
+
+/// A config with `tasks` naming `include`, the store folder and the include.
+fn with_include(sb: &Sandbox) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = sb.config_dir();
+    let store = dir.join("files");
+    fs::create_dir(&store).unwrap();
+    chmod(&store, 0o755);
+    let include = store.join("role.toml");
+    put(&include, 0o644, "[[tasks]]\nrun = \"true\"\n");
+    put(
+        &dir.join("config.toml"),
+        0o644,
+        "[[tasks]]\ntags = [\"nowhere\"]\ninclude = \"$/role.toml\"\n",
+    );
+    (store, include)
+}
+
+#[test]
+fn an_include_others_can_write_stops_a_run_naming_the_task() {
+    let sb = Sandbox::new("tl");
+    let (store, include) = with_include(&sb);
+    let out = sb.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for (path, mode, restored) in [(&include, 0o664, 0o644), (&store, 0o775, 0o755)] {
+        chmod(path, mode);
+        for args in [&["plan"][..], &["apply"], &["doctor"], &["rollback"]] {
+            let out = sb.anvil(args, &[]);
+            let stderr = text(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+            assert!(
+                stderr.contains("tasks[0].include `$/role.toml`"),
+                "{stderr}"
+            );
+            assert!(stderr.contains(&format!("mode {mode:o}")), "{stderr}");
+        }
+        chmod(path, restored);
+    }
+}
+
+/// `anvil files` still reads what a run would refuse, to let it be fixed.
+#[test]
+fn anvil_files_keeps_reading_a_store_file_others_can_write() {
+    let sb = Sandbox::new("tf");
+    let (_, include) = with_include(&sb);
+    chmod(&include, 0o664);
+    let out = sb.anvil(&["files", "cat", "$/role.toml"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("run = \"true\""));
+}
+
+/// The editor stops at once on a refused include, not after three attempts.
+#[test]
+fn the_config_editor_stops_at_a_refused_include_without_opening_again() {
+    let sb = Sandbox::new("tk").recording();
+    let (_, include) = with_include(&sb);
+    chmod(&include, 0o664);
+    let config = sb.config_dir().join("config.toml");
+    put(&config, 0o644, "");
+    let edited = sb.root().join("edited.toml");
+    put(&edited, 0o644, "[[tasks]]\ninclude = \"$/role.toml\"\n");
+    let out = sb.edit(&["config"], Some(&edited), None);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(!stderr.contains("still invalid"), "{stderr}");
+    assert!(stderr.contains("tasks[0].include"), "{stderr}");
+    let calls = fs::read_to_string(sb.record("editor.count")).unwrap();
+    assert_eq!(calls.lines().count(), 1, "{stderr}");
+    assert_eq!(fs::read_to_string(&config).unwrap(), "");
+}
+
+#[test]
+fn a_src_others_can_write_stops_a_run_naming_the_entry() {
+    let sb = Sandbox::new("ts");
+    let dir = sb.config_dir();
+    let src = dir.join("motd.txt");
+    put(&src, 0o664, "hello\n");
+    put(
+        &dir.join("config.toml"),
+        0o644,
+        "[[files]]\nsrc = \"motd.txt\"\ndest = \"/tmp/never\"\nmode = \"0644\"\n",
+    );
+    let out = sb.anvil(&["plan"], &[]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("files[0].src `motd.txt`"), "{stderr}");
+    assert!(stderr.contains("run chmod go-w on it"), "{stderr}");
+}
