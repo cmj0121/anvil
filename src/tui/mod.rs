@@ -399,7 +399,7 @@ mod tests {
     use super::*;
     use crate::document::Format;
     use crate::term::testing::{Event, Recorder};
-    use crate::test_util::temp_dir;
+    use crate::test_util::{temp_dir, write_private};
     use app::RunResult;
 
     /// A temp config naming a scripted editor (`script` gets the buffer's
@@ -417,9 +417,11 @@ mod tests {
             fs::write(&editor, format!("set -eu\n{script}\n")).unwrap();
             let config = dir.join("config.toml");
             let toml = format!("[anvil]\neditor = \"/bin/sh {}\"\n", editor.display());
-            fs::write(&config, toml).unwrap();
+            // Private whatever the umask: a refused config would fall back
+            // to the real editor, which waits on the terminal.
+            write_private(&config, toml.as_bytes());
             let inventory = dir.join("inventory.toml");
-            fs::write(&inventory, "[hosts.pi]\nhost = \"pi.lan\"\n").unwrap();
+            write_private(&inventory, b"[hosts.pi]\nhost = \"pi.lan\"\n");
             let mut opts = app::tests::opts();
             opts.config = Some(config);
             opts.inventory = Some(inventory);
@@ -454,6 +456,25 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn a_reload_shows_a_refused_config_and_inventory_as_errors_and_drops_the_hosts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut edits = Edits::new("refused", "");
+        assert_eq!(edits.names(), ["local", "pi"]);
+        let config = edits.dir.join("config.toml");
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o664)).unwrap();
+        edits.app.opts.inventory = None;
+        edits.app.reload();
+        let err = edits.app.config_error.as_deref().unwrap();
+        assert!(err.contains("run chmod go-w on it"), "{err}");
+        let err = edits.app.inventory_error.as_deref().unwrap();
+        assert!(err.contains("run chmod go-w on it"), "{err}");
+        assert!(edits.app.inventory.is_none());
+        assert!(edits.app.steps.is_empty());
+        assert!(edits.app.store.is_err());
     }
 
     #[test]

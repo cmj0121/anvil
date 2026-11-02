@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::paths::DocPath;
+use crate::trust::{self, TrustError};
 
 /// Largest document anvil reads, in bytes.
 pub const MAX_BYTES: u64 = 1 << 20;
@@ -66,6 +67,9 @@ pub enum DocumentError {
         path: PathBuf,
         source: io::Error,
     },
+    /// Not to be used at all, and never to fall back from; the message names
+    /// the path and the fix.
+    Refused(String),
     TooLarge {
         path: PathBuf,
     },
@@ -94,6 +98,10 @@ impl DocumentError {
         }
     }
 
+    pub fn is_refused(&self) -> bool {
+        matches!(self, DocumentError::Refused(_))
+    }
+
     pub fn is_not_found(&self) -> bool {
         matches!(self, DocumentError::Read { source, .. } if source.kind() == io::ErrorKind::NotFound)
     }
@@ -105,6 +113,7 @@ impl fmt::Display for DocumentError {
             DocumentError::Read { path, source } => {
                 write!(f, "{}: cannot read: {source}", path.display())
             }
+            DocumentError::Refused(message) => f.write_str(message),
             DocumentError::TooLarge { path } => write!(
                 f,
                 "{}: larger than the {MAX_BYTES} byte limit",
@@ -127,14 +136,21 @@ impl fmt::Display for DocumentError {
 
 impl std::error::Error for DocumentError {}
 
-/// Reads and parses `doc` in its format.
+/// Reads `doc` through [`trust::load`], so a file others can change is refused
+/// unparsed, and parses it in its format.
 pub fn load<T: DeserializeOwned>(doc: &DocPath) -> Result<T, DocumentError> {
     let path = doc.path.as_path();
     let read = |source| DocumentError::Read {
         path: path.to_path_buf(),
         source,
     };
-    let bytes = read_capped(path).map_err(read)?;
+    let bytes = trust::load(path, MAX_BYTES).map_err(|err| match err {
+        TrustError::Refused { .. } => DocumentError::Refused(err.to_string()),
+        TrustError::TooLarge { .. } => DocumentError::TooLarge {
+            path: path.to_path_buf(),
+        },
+        TrustError::NotFound { source, .. } | TrustError::Io { source, .. } => read(source),
+    })?;
     parse_text(&bytes, path, doc.format, |err| {
         read(io::Error::new(io::ErrorKind::InvalidData, err))
     })

@@ -39,6 +39,7 @@ pub const INPUT: Policy = Policy {
 };
 
 /// A file only the current user may reach, never through a symlink.
+#[cfg_attr(not(test), expect(dead_code, reason = "for the apply record"))]
 pub const PRIVATE: Policy = Policy {
     file: 0o077,
     dir: 0o077,
@@ -52,6 +53,8 @@ pub enum TrustError {
     NotFound { path: PathBuf, source: io::Error },
     /// It exists and must not be used; `why` says why and how to fix it.
     Refused { path: PathBuf, why: String },
+    /// Larger than the caller reads; a matter of size, not of trust.
+    TooLarge { path: PathBuf, limit: u64 },
     /// The check itself could not be made.
     Io { path: PathBuf, source: io::Error },
 }
@@ -64,6 +67,7 @@ impl TrustError {
                 source.to_string()
             }
             TrustError::Refused { why, .. } => why.clone(),
+            TrustError::TooLarge { limit, .. } => format!("larger than the {limit} byte limit"),
         }
     }
 
@@ -88,6 +92,7 @@ impl fmt::Display for TrustError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (TrustError::NotFound { path, .. }
         | TrustError::Refused { path, .. }
+        | TrustError::TooLarge { path, .. }
         | TrustError::Io { path, .. }) = self;
         write!(
             f,
@@ -131,7 +136,10 @@ pub fn open(path: &Path, policy: Policy) -> Result<(File, Metadata), TrustError>
 /// The bytes of the run input at `path`, at most `limit` of them.
 pub fn load(path: &Path, limit: u64) -> Result<Vec<u8>, TrustError> {
     let (file, meta) = open(path, INPUT)?;
-    let too_large = || TrustError::refused(path, format!("larger than the {limit} byte limit"));
+    let too_large = || TrustError::TooLarge {
+        path: path.to_path_buf(),
+        limit,
+    };
     if meta.len() > limit {
         return Err(too_large());
     }
@@ -163,7 +171,10 @@ pub fn check_dir(dir: &Path, policy: Policy) -> Result<(), TrustError> {
     }
     .map_err(|err| TrustError::io(dir, err))?;
     if !meta.is_dir() {
-        return Err(TrustError::refused(dir, "not a directory"));
+        return Err(TrustError::refused(
+            dir,
+            "not a directory; replace it with a real folder",
+        ));
     }
     check_bits(&meta, policy.dir, "chmod 700").map_err(|why| TrustError::refused(dir, why))
 }
@@ -171,7 +182,10 @@ pub fn check_dir(dir: &Path, policy: Policy) -> Result<(), TrustError> {
 /// [`check_owner`], with `private_fix` as the fix for bits that let others in.
 fn check_bits(meta: &Metadata, forbidden: u32, private_fix: &str) -> Result<(), String> {
     if meta.uid() != rustix::process::getuid().as_raw() {
-        return Err("not owned by the current user".to_string());
+        return Err(
+            "not owned by the current user; run chown on it, or do not run anvil through sudo"
+                .to_string(),
+        );
     }
     let mode = meta.mode() & 0o777;
     if mode & forbidden == 0 {
@@ -213,6 +227,8 @@ mod tests {
     use crate::test_util::temp_dir;
 
     const LIMIT: u64 = 64;
+    const NOT_OURS: &str =
+        "not owned by the current user; run chown on it, or do not run anvil through sudo";
 
     fn chmod(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
@@ -293,21 +309,15 @@ mod tests {
         if meta.uid() == rustix::process::getuid().as_raw() {
             return;
         }
-        assert_eq!(
-            check_owner(&meta, 0).unwrap_err(),
-            "not owned by the current user"
-        );
+        assert_eq!(check_owner(&meta, 0).unwrap_err(), NOT_OURS);
         assert_eq!(
             refusal(check_dir(Path::new("/"), INPUT)),
-            "/: not owned by the current user"
+            format!("/: {NOT_OURS}")
         );
         // Its folder fails first: only root can plant a file of another owner
         // in a folder of ours.
         let message = refusal(load(Path::new("/etc/hosts"), LIMIT));
-        assert!(
-            message.ends_with(": not owned by the current user"),
-            "{message}"
-        );
+        assert!(message.ends_with(&format!(": {NOT_OURS}")), "{message}");
     }
 
     #[test]
@@ -337,8 +347,13 @@ mod tests {
         let path = file(&root, "at", 0o644, &[b'x'; LIMIT as usize]);
         assert_eq!(load(&path, LIMIT).unwrap().len(), LIMIT as usize);
         let path = file(&root, "over", 0o644, &[b'x'; LIMIT as usize + 1]);
+        let err = load(&path, LIMIT).unwrap_err();
+        assert!(
+            matches!(err, TrustError::TooLarge { limit: LIMIT, .. }),
+            "{err:?}"
+        );
         assert_eq!(
-            refusal(load(&path, LIMIT)),
+            err.to_string(),
             format!("{}: larger than the 64 byte limit", path.display())
         );
         fs::remove_dir_all(&root).unwrap();
@@ -426,7 +441,10 @@ mod tests {
         symlink(&dir, &linked_dir).unwrap();
         assert_eq!(
             refusal(open(&linked_dir.join("record"), PRIVATE)),
-            format!("{}: not a directory", linked_dir.display())
+            format!(
+                "{}: not a directory; replace it with a real folder",
+                linked_dir.display()
+            )
         );
         fs::remove_dir_all(&root).unwrap();
     }

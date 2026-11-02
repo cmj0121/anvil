@@ -52,7 +52,7 @@ pub struct App {
     /// Shown in the targets overlay instead of the rows, and in the header.
     pub inventory_error: Option<String>,
     /// The inventory the rows were built from; `None` with `inventory_error`.
-    inventory: Option<Inventory>,
+    pub(super) inventory: Option<Inventory>,
     /// The config's steps as of the last reload.
     pub steps: Vec<StepRow>,
     /// Shown instead of the steps.
@@ -1614,7 +1614,6 @@ pub mod tests {
 
     pub fn opts() -> Options {
         Options {
-            checked_workspaces: std::sync::Arc::default(),
             verbose: 0,
             inventory: None,
             config: None,

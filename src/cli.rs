@@ -265,6 +265,8 @@ pub fn resolve(cli: &Cli) -> Option<&Command> {
 pub struct Failure {
     pub code: u8,
     pub message: String,
+    /// A [`crate::trust`] refusal, which no caller may fall back from or retry.
+    pub refused: bool,
 }
 
 impl Failure {
@@ -272,6 +274,15 @@ impl Failure {
         Self {
             code: 2,
             message: message.into(),
+            refused: false,
+        }
+    }
+
+    /// A file or folder others can change (exit 2); `message` names the fix.
+    pub fn refusal(message: impl Into<String>) -> Self {
+        Self {
+            refused: true,
+            ..Self::usage(message)
         }
     }
 
@@ -280,6 +291,7 @@ impl Failure {
         Self {
             code: 1,
             message: message.into(),
+            refused: false,
         }
     }
 }
@@ -287,7 +299,11 @@ impl Failure {
 // Config, inventory and path problems are exit 2.
 impl From<crate::document::DocumentError> for Failure {
     fn from(err: crate::document::DocumentError) -> Self {
-        Failure::usage(err.to_string())
+        if err.is_refused() {
+            Failure::refusal(err.to_string())
+        } else {
+            Failure::usage(err.to_string())
+        }
     }
 }
 
@@ -313,6 +329,7 @@ impl From<crate::editor::EditorError> for Failure {
         Failure {
             code,
             message: err.to_string(),
+            refused: false,
         }
     }
 }

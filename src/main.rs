@@ -36,10 +36,6 @@ mod term;
 #[cfg(test)]
 mod test_util;
 mod transport;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no run input loads through it yet")
-)]
 mod trust;
 #[cfg(feature = "tui")]
 mod tui;

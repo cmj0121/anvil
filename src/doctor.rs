@@ -282,7 +282,11 @@ pub fn check(
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
     // Lenient on purpose: an unresolvable workspace falls back with a warning.
-    let targets = opts.targets();
+    // A refusal is not looked past, not even for the secret checks.
+    let targets = match opts.targets() {
+        Err(failure) if failure.refused => return Err(failure),
+        targets => targets,
+    };
     let names = required_names(config, expanded, targets.as_deref().unwrap_or_default());
     let secrets = check_secrets(&names, store);
     let targets = targets?;

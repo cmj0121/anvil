@@ -12,7 +12,7 @@ clean: $(SUBDIR)	# clean-up environment
 	@find . -name '*.sw[po]' -delete
 
 test:				# run test (the workspace: anvil and anvil-audit)
-	cargo build -p anvil-audit --locked && cargo fmt --all --check && \
+	umask 022 && cargo build -p anvil-audit --locked && cargo fmt --all --check && \
 		cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 
 e2e:				# run the end-to-end suite (archlinux sshd container; skip without docker)

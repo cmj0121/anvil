@@ -1026,7 +1026,7 @@ mod tests {
         );
         assert_eq!(
             check_owner(&meta, 0o077).unwrap_err(),
-            "not owned by the current user"
+            "not owned by the current user; run chown on it, or do not run anvil through sudo"
         );
     }
 

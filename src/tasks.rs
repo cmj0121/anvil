@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::cli::Failure;
 use crate::config::{
     Config, FileEntry, MAX_FILES, MAX_SERVICES, ServiceEntry, Step, Task, TaskPackages, check_file,
     check_selector, check_service, check_tasks,
@@ -219,12 +220,12 @@ pub fn legacy(config: &Config) -> Expanded {
 /// tasks flattened and validated. Every include is read whatever its selector.
 pub fn expand(
     config: &Config,
-    workspace: impl FnOnce() -> Result<PathBuf, String>,
-) -> Result<Expanded, String> {
+    workspace: impl FnOnce() -> Result<PathBuf, Failure>,
+) -> Result<Expanded, Failure> {
     if config.tasks.is_empty() {
         return Ok(legacy(config));
     }
-    check_tasks(&config.tasks, "tasks")?;
+    check_tasks(&config.tasks, "tasks").map_err(Failure::usage)?;
     let mut walk = Walk {
         config,
         root: Root::in_workspace(&workspace()?),
@@ -236,7 +237,7 @@ pub fn expand(
     };
     // A refusal can name an include's path, which may hold anything.
     walk.tasks(&config.tasks, "tasks", 1, &Selector::default())
-        .map_err(|why| escape_invisible(&why))?;
+        .map_err(|why| Failure::usage(escape_invisible(&why)))?;
     Ok(Expanded {
         items: walk.items,
         from_tasks: true,
@@ -523,7 +524,7 @@ mod tests {
 
         fn expand(&self, config: &str) -> Result<Expanded, String> {
             let config: Config = toml::from_str(config).unwrap();
-            expand(&config, || Ok(self.0.clone()))
+            expand(&config, || Ok(self.0.clone())).map_err(|err| err.message)
         }
 
         fn items(&self, config: &str) -> Vec<Item> {
@@ -625,7 +626,7 @@ mod tests {
         let called = Cell::new(false);
         let expanded = expand(&config, || {
             called.set(true);
-            Err("no workspace".to_string())
+            Err(Failure::usage("no workspace"))
         })
         .unwrap();
         assert!(!called.get());
@@ -635,8 +636,14 @@ mod tests {
     #[test]
     fn expand_with_tasks_reports_a_workspace_failure() {
         let config: Config = toml::from_str(&run(0)).unwrap();
-        let err = expand(&config, || Err("no workspace".to_string())).unwrap_err();
-        assert_eq!(err, "no workspace");
+        let err = expand(&config, || Err(Failure::usage("no workspace"))).unwrap_err();
+        assert_eq!(err.message, "no workspace");
+        assert!(!err.refused);
+        let err = expand(&config, || Err(Failure::refusal("loose"))).unwrap_err();
+        assert!(
+            err.refused,
+            "a refusal keeps its type through the expansion"
+        );
     }
 
     #[test]

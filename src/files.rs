@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::apply::{FileRun, PlannedRun, RunKind, Upload};
+use crate::cli::Failure;
 use crate::config::{Config, FileEntry, ModeValue, is_mode, is_sha256};
 use crate::document;
 use crate::facts::Facts;
@@ -68,8 +69,8 @@ impl fmt::Debug for Source {
 /// Returns [`Sources::default`] without resolving the workspace when there are no files.
 pub fn load(
     expanded: &Expanded,
-    workspace: impl FnOnce() -> Result<PathBuf, String>,
-) -> Result<Sources, String> {
+    workspace: impl FnOnce() -> Result<PathBuf, Failure>,
+) -> Result<Sources, Failure> {
     if expanded.files().next().is_none() {
         return Ok(Sources::default());
     }
@@ -97,7 +98,9 @@ pub fn load(
             ))
         })
     });
-    Ok(Sources(sources.collect::<Result<_, _>>()?))
+    Ok(Sources(
+        sources.collect::<Result<_, _>>().map_err(Failure::usage)?,
+    ))
 }
 
 /// Reads a relative src as text, confined to the already canonical workspace `dir`.
@@ -1642,9 +1645,9 @@ mod tests {
     /// [`super::load`] of a legacy config.
     fn load(
         config: &Config,
-        workspace: impl FnOnce() -> Result<PathBuf, String>,
+        workspace: impl FnOnce() -> Result<PathBuf, Failure>,
     ) -> Result<Sources, String> {
-        super::load(&legacy(config), workspace)
+        super::load(&legacy(config), workspace).map_err(|err| err.message)
     }
 
     /// One [`super::run`] per entry of a legacy config.
@@ -1747,7 +1750,9 @@ mod tests {
         );
         let tasks: Config = toml::from_str(&text).unwrap();
         let expanded = crate::tasks::expand(&tasks, || Ok(dir.clone())).unwrap();
-        let err = super::load(&expanded, || Ok(dir.clone())).unwrap_err();
+        let err = super::load(&expanded, || Ok(dir.clone()))
+            .unwrap_err()
+            .message;
         assert!(
             err.starts_with("tasks[0].file.src `a\\u{202e}b`: "),
             "{err}"

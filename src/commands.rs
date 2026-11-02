@@ -39,6 +39,7 @@ use crate::inventory::Inventory;
 use crate::logger::escape_controls;
 use crate::options::Options;
 use crate::paths::{self, DocPath};
+use crate::private;
 use crate::secret::{self, BackendKind, Store};
 use crate::status;
 use crate::tasks;
@@ -168,8 +169,7 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool, write: bool) -> Result<()
     };
     let inventory = opts.inventory_for(&config)?;
     let workspace = opts.workspace(&config)?;
-    let expand =
-        |config: &Config| tasks::expand(config, || Ok(workspace.clone())).map_err(Failure::usage);
+    let expand = |config: &Config| tasks::expand(config, || Ok(workspace.clone()));
     let expanded = expand(&config)?;
     let outcome = harden::suggest(&harden::Input {
         text: &text,
@@ -292,6 +292,7 @@ fn write_harden(
                 |err| Failure {
                     code: err.exit_code(),
                     message: format!("{}: {}", file.shown, err.reason()),
+                    refused: false,
                 },
             )?;
         }
@@ -368,8 +369,13 @@ pub fn edit_config(opts: &Options, format: Option<Format>, full: bool) -> Result
         Config::migrate,
         |value: &Config, path: &Path| {
             value.validate(path)?;
-            opts.expand(value)
-                .map_err(|err| DocumentError::invalid(path, err.message))?;
+            opts.expand(value).map_err(|err| {
+                if err.refused {
+                    DocumentError::Refused(err.message)
+                } else {
+                    DocumentError::invalid(path, err.message)
+                }
+            })?;
             Ok(())
         },
     )
@@ -756,6 +762,8 @@ where
                 parsed = value;
                 break;
             }
+            // Editing again cannot fix a file others can change.
+            Err(err) if err.is_refused() => return Err(err.into()),
             Err(err) => {
                 // Not a log line: runs inside an editor flow, which a front end always
                 // runs with the real terminal (term::with_terminal).
@@ -852,7 +860,8 @@ fn write_atomic_as(
 ) -> Result<(), Failure> {
     let io = |source: std::io::Error| Failure::failed(format!("{}: {source}", path.display()));
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(io)?;
+        // Not left to the umask: a folder others can write refuses the next load.
+        private::create_dir(dir).map_err(io)?;
     }
     let file_name = path
         .file_name()

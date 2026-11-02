@@ -68,8 +68,9 @@ fn private_copy(dir: &Path) -> PathBuf {
 fn expand(workspace: &Path) -> Result<Expanded, String> {
     let doc = paths::explicit(&workspace.join("config.toml")).unwrap();
     let config = Config::load(Some(&doc)).unwrap();
-    let expanded = tasks::expand(&config, || Ok(workspace.to_owned()))?;
-    files::load(&expanded, || Ok(workspace.to_owned()))?;
+    let expanded =
+        tasks::expand(&config, || Ok(workspace.to_owned())).map_err(|err| err.message)?;
+    files::load(&expanded, || Ok(workspace.to_owned())).map_err(|err| err.message)?;
     Ok(expanded)
 }
 
