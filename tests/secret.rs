@@ -4,6 +4,7 @@
 //! The store lives for one invocation, so each test checks a single edit
 //! from an empty store; the persistence cases live in the unit tests.
 
+#![allow(clippy::disallowed_methods)]
 // The `--secret-store memory` flag only exists in debug builds.
 #![cfg(debug_assertions)]
 

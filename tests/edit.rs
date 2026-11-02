@@ -4,6 +4,8 @@
 //! `$TMPDIR`, so neither the real `~/.config/anvil` nor the real temp dir is
 //! touched.
 
+#![allow(clippy::disallowed_methods)]
+
 mod common;
 
 use std::fs;

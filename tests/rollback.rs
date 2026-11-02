@@ -1,6 +1,7 @@
 //! `anvil rollback` on the built binary: an apply over the local target
 //! and a fake-ssh host, then putting back what it wrote.
 
+#![allow(clippy::disallowed_methods)]
 // `--secret-store` and `--ssh-program` only exist in debug builds.
 #![cfg(debug_assertions)]
 

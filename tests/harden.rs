@@ -4,6 +4,8 @@
 //! Every test gets its own root holding `$XDG_CONFIG_HOME`, `$HOME` and
 //! `$TMPDIR`, so the real `~/.config/anvil` is never read or touched.
 
+#![allow(clippy::disallowed_methods)]
+
 mod common;
 
 use std::fs;

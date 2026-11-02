@@ -14,14 +14,14 @@ use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use rustix::fs::{Access, access};
 use rustix::io::Errno;
 use rustix::process::{Pid, geteuid, test_kill_process};
 
-use crate::paths;
+use crate::exec;
 use crate::plugin::last_line;
 use crate::secret::shown_name;
 use crate::transport::{TransportError, collect_capped};
@@ -273,9 +273,8 @@ fn stale(name: &std::ffi::OsStr, uid: u32, euid: u32) -> bool {
 /// Pipes `tarball` to `tar -xzf - -C <stage> <member>`; the extracted
 /// member, which must be a regular file of at most 128 MiB.
 pub fn extract(tarball: &[u8], stage: &Path, member: &str) -> Result<PathBuf, String> {
-    let tar = paths::find_program(Path::new("tar"), std::env::var_os("PATH").as_deref())
-        .ok_or("tar not found on PATH")?;
-    let mut child = Command::new(&tar)
+    let mut tar = exec::program("tar")?;
+    let mut child = tar
         .args(["-xzf", "-", "-C"])
         .arg(stage)
         .arg(member)
@@ -284,7 +283,7 @@ pub fn extract(tarball: &[u8], stage: &Path, member: &str) -> Result<PathBuf, St
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| format!("cannot start {}: {err}", tar.display()))?;
+        .map_err(|err| format!("cannot start {}: {err}", tar.get_program().display()))?;
     let stdin = child.stdin.take();
     let output = std::thread::scope(|scope| {
         if let Some(mut stdin) = stdin {
@@ -321,7 +320,7 @@ pub fn extract(tarball: &[u8], stage: &Path, member: &str) -> Result<PathBuf, St
 /// Runs `binary --version` with stdin null and its output captured, killed
 /// after 10 s; it must exit 0 and print `anvil <version>`.
 pub fn smoke(binary: &Path, version: &str) -> Result<(), String> {
-    let child = Command::new(binary)
+    let child = exec::resolved(binary)
         .arg("--version")
         .process_group(0)
         .stdin(Stdio::null())
@@ -357,6 +356,7 @@ pub fn smoke(binary: &Path, version: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::process::Command;
 
     use super::*;
 

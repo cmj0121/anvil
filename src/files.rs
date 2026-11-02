@@ -3247,7 +3247,7 @@ mod tests {
         use crate::ssh::{CHECK_TIMEOUT, KEY_TIMEOUT, Ssh, SshSettings};
 
         let settings = SshSettings {
-            program: PathBuf::from("ssh"),
+            program: PathBuf::from("/usr/bin/ssh"),
             can_prompt: false,
             key_timeout: KEY_TIMEOUT,
             check_timeout: CHECK_TIMEOUT,
@@ -3266,7 +3266,9 @@ mod tests {
     /// line was logged at all.
     fn assert_no_leak(lines: &[String]) {
         assert!(
-            lines.iter().any(|line| line.contains(": spawn ssh ")),
+            lines
+                .iter()
+                .any(|line| line.contains(": spawn /usr/bin/ssh ")),
             "{lines:?}"
         );
         for line in lines {

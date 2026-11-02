@@ -4,6 +4,8 @@
 //! pseudo-terminal through `pty_passphrase.py`, and the no-terminal case
 //! runs anvil in a new session; both are skipped without python3.
 
+#![allow(clippy::disallowed_methods)]
+
 mod common;
 
 use std::fs;

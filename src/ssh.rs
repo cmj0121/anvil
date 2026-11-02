@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use crate::exec;
 use crate::paths::{self, PrivateDirError};
 use crate::term;
 use crate::transport::{
@@ -248,7 +249,7 @@ impl Ssh {
     /// A command for `program` with `args` and the prompt-answering env removed.
     pub fn command(&self, args: &[String]) -> Command {
         log::debug!("spawn {} {}", self.program.display(), args.join(" "));
-        let mut command = Command::new(&self.program);
+        let mut command = exec::resolved(&self.program);
         command.args(args);
         for key in DROPPED_ENV {
             command.env_remove(key);
@@ -471,7 +472,7 @@ mod tests {
 
     fn full() -> Ssh {
         Ssh {
-            program: PathBuf::from("ssh"),
+            program: PathBuf::from("/usr/bin/ssh"),
             ssh_config: Some(PathBuf::from("/tmp/cfg")),
             host: "box".to_owned(),
             user: Some("me".to_owned()),

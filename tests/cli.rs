@@ -1,5 +1,7 @@
 //! Exit codes and the stdout/stderr split of the built binary.
 
+#![allow(clippy::disallowed_methods)]
+
 mod common;
 
 use std::process::Output;

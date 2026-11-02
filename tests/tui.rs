@@ -3,6 +3,7 @@
 //! ending with `q` and the terminal restored. Skipped without python3
 //! 3.11 or newer, which has `os.login_tty`.
 
+#![allow(clippy::disallowed_methods)]
 #![cfg(feature = "tui")]
 
 mod common;

@@ -26,7 +26,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 
@@ -39,6 +39,7 @@ use zeroize::Zeroizing;
 
 use crate::config::{Config, MAX_DEST_BYTES, MAX_FILES, Plugin};
 use crate::document::MAX_BYTES;
+use crate::exec;
 use crate::facts::Facts;
 use crate::files::{self, FileState};
 use crate::logger::{escape_controls, is_invisible};
@@ -268,7 +269,7 @@ fn spawn(
     let real = pin.real.to_string_lossy();
     let real = escape_controls(&real);
     log::debug!("spawn plugin {} {real}", pin.name);
-    let mut child = Command::new(&pin.real)
+    let mut child = exec::resolved(&pin.real)
         .current_dir(pin.real.parent().unwrap_or(Path::new("/")))
         .env_clear()
         .envs(

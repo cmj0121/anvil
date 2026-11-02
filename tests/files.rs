@@ -1,5 +1,7 @@
 //! File store CLI behavior in an isolated config directory.
 
+#![allow(clippy::disallowed_methods)]
+
 mod common;
 
 use std::fs;

@@ -1,0 +1,5 @@
+disallowed-methods = [
+  { path = "std::process::Command::new", reason = "use exec::program or exec::resolved" },
+  { path = "std::fs::write", reason = "use private::write_atomic" },
+  { path = "std::fs::File::create", reason = "use private::write_atomic" },
+]

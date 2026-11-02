@@ -1,6 +1,7 @@
 //! `anvil plan` on the built binary: the steps apply would run on the
 //! local target and a fake-ssh host, human and `--json`, running none.
 
+#![allow(clippy::disallowed_methods)]
 // `--secret-store` and `--ssh-program` only exist in debug builds.
 #![cfg(debug_assertions)]
 

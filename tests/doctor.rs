@@ -2,6 +2,7 @@
 //! facts and a fake-ssh host, human and `--json`; doctor plugins
 //! (`fake-plugin.sh`) over records an apply wrote or written by hand.
 
+#![allow(clippy::disallowed_methods)]
 // `--secret-store` and `--ssh-program` only exist in debug builds.
 #![cfg(debug_assertions)]
 
@@ -772,4 +773,39 @@ fn drift_covers_a_file_written_by_a_task() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let stdin = plugin_stdin(&sandbox);
     assert!(stdin.contains(&dest), "{stdin}");
+}
+
+/// An `ssh` in the current directory is never run for an empty `PATH` entry,
+/// whether or not a real one follows it.
+#[test]
+fn doctor_ignores_an_ssh_planted_in_the_current_directory() {
+    let sandbox = Sandbox::new("ssh-path");
+    sandbox.write_config(
+        "inventory.toml",
+        "[hosts.box]\nhost = \"127.0.0.1\"\nport = 1\n",
+    );
+    let cwd = sandbox.root().join("cwd");
+    let ran = sandbox.root().join("planted-ran");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::write(
+        cwd.join("ssh"),
+        format!("#!/bin/sh\n: > {}\nexit 1\n", ran.display()),
+    )
+    .unwrap();
+    common::chmod(&cwd.join("ssh"), 0o755);
+    let doctor = |path: &str| {
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", "doctor", "--target", "box"])
+            .current_dir(&cwd)
+            .env("PATH", path)
+            .output()
+            .expect("spawn anvil")
+    };
+    let out = doctor(":/usr/bin");
+    assert!(!ran.exists(), "{}", text(&out.stdout));
+    let out = doctor(":");
+    assert!(!ran.exists(), "{}", text(&out.stdout));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(shown.contains("ssh: not found"), "{shown}");
 }

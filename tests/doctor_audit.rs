@@ -2,6 +2,7 @@
 //! records written by a real apply on `local`, then edited by hand, then
 //! cleared by a re-apply or a rollback.
 
+#![allow(clippy::disallowed_methods)]
 // `--secret-store` and `--ssh-program` only exist in debug builds.
 #![cfg(debug_assertions)]
 
