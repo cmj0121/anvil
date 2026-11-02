@@ -508,8 +508,8 @@ linode1
 - `facts` 是本次的探測結果；`last_apply` 是該 target 在紀錄中的項目，沒有紀錄或紀錄中沒有該 target 時為 `null`。
   它絕不含先前的文字、擁有者或雜湊。
 - `current_files` 對 `last_apply.files` 的每個 dest 各有一項，順序相同。`state` 是 `file`、`absent`、
-  `dangling`（使用者路徑上目標已不存在的連結）、`symlink`（以 root 寫入的 dest 是連結）、`not_regular`、`unreadable`、
-  `not_root_only`（以 root 寫入的 dest 上層有目錄不屬於 root，或群組、其他人可寫入）、
+  `symlink`（dest 是連結，寫入時會拒絕）、`not_regular`、`unreadable`、
+  `not_root_only`（dest 上層有目錄未通過寫入時的擁有者檢查：以 root 寫入時須屬於 root，否則須屬於 root 或登入使用者；或群組、其他人可寫入）、
   `no_hash`（`sha256sum` 與 `shasum` 都沒有）或 `no_sudo`。只有 `file` 帶有 `tag`。
 - 沒有任何 sha256 離開 anvil：每個 `written_sha256` 換成 `written_tag`，每個現場 sha256 換成 `tag`，
   也就是以本次執行的金鑰對該十六進位字串做 HMAC-SHA256 的十六進位值。同一次執行中 tag 相同即雜湊相同；每次執行 tag 都不同。
@@ -577,8 +577,8 @@ tag 讓所有雜湊都不出現在請求與 doctor 的輸出中：任何雜湊�
 （只出現在現場探測中的 fact 會被忽略），接著依紀錄順序檢查每個紀錄中的檔案：
 
 - `file` 且 tag 與寫入時相同：沒有 finding。
-- tag 不同：漂移 `was written, now changed`；`absent`、`dangling`、`symlink`、`not_regular`、`unreadable` 與
-  `not_root_only`：漂移，`now` 分別為 `absent`、`dangling link`、`symlink`、`not a regular file`、`unreadable` 或
+- tag 不同：漂移 `was written, now changed`；`absent`、`symlink`、`not_regular`、`unreadable` 與
+  `not_root_only`：漂移，`now` 分別為 `absent`、`symlink`、`not a regular file`、`unreadable` 或
   `not root-only`。
 - 同上，但該檔案的寫入中途失敗：改為 notice，文字為 `the last apply failed while writing it`。
 - `no_hash`、`no_sudo`，或 apply 之後已被 rollback 的 dest：沒有 finding；doctor 將它計為未比對。
@@ -896,9 +896,10 @@ what it names, then run rollback again
 ```
 
 anvil 把它寫成一行。`previous` 對先前不存在的 dest 為 `{"state": "absent"}`；對指向不存在檔案之 symlink 的
-`sudo = false` dest 為 `{"state": "dangling", "target": "…"}`；否則為 `file`，帶有它的 mode、owner、sha256，
-以及 `kept` 為 true 時的 `text`。`write` 為 `written`（step 以 0 結束）或 `failed_midway`（開始後失敗、逾時或失去連線，
-因此 DEST 可能只有部分位元組）。寫入任何東西之前就被拒絕（`refused`：root 檢查、DEST 是目錄，或 DEST 在讀取後被改過，
+`sudo = false` dest 為 `{"state": "dangling", "target": "…"}`（只有舊版 anvil 會寫入）；否則為 `file`，帶有它的 mode、owner、sha256，
+以及 `kept` 為 true 時的 `text`。`write` 為 `written`（step 以 0 結束）或 `failed_midway`（開始後失敗、逾時或失去連線；
+只有在就地寫入之後 DEST 才可能只有部分位元組，[此時會有警告](configuration.zh-TW.md#files)）。
+寫入任何東西之前就被拒絕（`refused`：root 檢查、DEST 是目錄、DEST 在讀取後被改過，或無法設定 mode 的他人 DEST，
 都以 4 結束）的寫入絕不保存：該 dest 保留前一次 apply 的項目（若有）。
 
 **保存或不保存。** 只有在先前的文字是不含 NUL 位元組的 UTF-8 文字、最多 256 KiB，且項目沒有設定 `rollback = false` 時，
@@ -1183,7 +1184,16 @@ facts = { distro = "arch" }
 否則拒絕該 dest：step 失敗並顯示 `files: DIR is not root-only; root will not write under it`，指出第一個不符合的目錄，
 且不寫入任何東西。因此位於使用者家目錄之下的 dest 需要 `sudo = false`。
 以 root 寫入時也會拒絕本身是 symlink 的 dest，連結與其目標都保持不動；
-step 失敗並顯示 `files: DEST is a symlink; point dest at the real file`。`sudo = false` 以連線使用者身分寫入時會跟隨連結。
+step 失敗並顯示 `files: DEST is a symlink; point dest at the real file`。
+
+`sudo = false` 以連線使用者身分寫入時同樣拒絕 symlink 的 dest，不論是否懸空，也拒絕路徑上不屬於 root 或登入使用者、
+或其群組或其他人可寫入的目錄：
+`files: DIR is not owned by root or the login user, or others can write it; anvil will not write under it`。
+位於 sticky `/tmp` 之下的 dest 會被拒絕。`anvil doctor` 把這些 dest 回報為 `symlink` 與 `not_root_only`。
+
+每次寫入都先寫到 DEST 旁的暫存檔，取得 DEST 的擁有者與 `mode` 後再改名蓋過它，因此中斷時 DEST 保持舊內容或新內容。
+少數就地寫入的情況會顯示警告 `files: DEST: not written atomically: REASON`；
+見 [Files](configuration.zh-TW.md#files)，其中也列出受限的 sudo 規則必須允許的指令。
 
 `apply` 與 `plan` 在連線任何 target 之前讀取每個 src。
 src 不存在、位於工作區之外、不是一般檔案、超過 1 MiB 或不是文字時以 2 結束，
@@ -1394,9 +1404,10 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   （[執行中的 task](#執行中的-task)）。rollback 絕不執行套件管理器、
   service 指令或 step。
 - **與寫入相同的路徑。** 每個檔案都依 apply 寫入的方式還原，依據記錄的 `sudo` 與 target 目前的 facts：透過 `sudo -n`、
-  以 root、以連線使用者，或走密碼路徑：把文字暫存在 0600 的 `/tmp/anvil-` 檔案，再執行 `sudo install -o UID -g GID -m MODE`。
+  以 root、以連線使用者，或走密碼路徑：把文字暫存在 0600 的 `/tmp/anvil-` 檔案，再透過 `sudo` 從該檔案取代 DEST，並套用記錄的擁有者與 mode。
   只要 target 的項目中有 `sudo = true` 的檔案，sudo 密碼就取自該 target 的 sudo secret。
-  寫入時的 root 檢查同樣適用（[File steps](#file-steps)）。只有 root 能把檔案的 owner 還回去；
+  寫入時的檢查同樣適用（[File steps](#file-steps)），因此舊版 anvil 透過 symlink 寫入、記錄為 `file` 的 dest，現在會拒絕 rollback：
+  `files: DEST is a symlink; point dest at the real file`。只有 root 能把檔案的 owner 還回去；
   以連線使用者執行時，若 owner 不同，rollback 會警告 `files: DEST was owned by UID:GID; only root can give it back`。
 - **只還原 config 列出的檔案。** 紀錄是使用者能編輯的檔案，因此 target 記錄的每個 dest 都必須仍是某個 `[[files]]`
   項目的 `dest`，且 `sudo` 相同、該項目適用於這個 target：連線之前檢查它的 tag，探測之後檢查它的 facts。
@@ -1419,8 +1430,8 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   `rollback: TARGET is now host LIVE, the record is from RECORDED; --allow-host-change rolls back anyway`。
   紀錄與探測都有 machine-id 時比較 machine-id，否則比較短 hostname（到第一個 `.` 為止，轉小寫）；
   目前的探測不回報 machine-id，所以比較的是 hostname。`--force` 與 `--force-all` 不能略過它，只有 `--allow-host-change` 可以。
-- **懸空的連結。** 原本是指向不存在檔案之 symlink 的 `sudo = false` dest，會透過連結寫入，因而建立了那個檔案。
-  rollback 只移除連結，它所建立的檔案會留下：`removed link DEST; the file it pointed to was kept`。
+- **懸空的連結。** 舊版 anvil 會透過連結寫入原本是指向不存在檔案之 symlink 的 `sudo = false` dest，因而建立了那個檔案；
+  現在這樣的 dest 會被拒絕。當時的紀錄仍可 rollback，因為 `rm` 不會跟隨連結。rollback 只移除連結，它所建立的檔案會留下：`removed link DEST; the file it pointed to was kept`。
 - **`rolled_back`。** 每個 target 結束後，它還原、移除或發現未變更的 dest 會以 `rolled_back`（`at` 與 `dests`）存進它的項目。
   這是 rollback 對紀錄唯一的變更，所以第二次 rollback 會再次還原相同的位元組，或印出 `unchanged DEST`。
   下一次在該 target 上寫入檔案的 apply 會取代這個項目。

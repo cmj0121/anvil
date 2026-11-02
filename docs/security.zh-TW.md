@@ -129,9 +129,6 @@
 - **doctor plugin 沒有沙箱。** 請求是 anvil 給它的全部，但 plugin 在控制端以你的身分執行，因此能讀取任何你能讀的東西：
   `last-apply.json`（含明文的每份先前文字與每個 `written_sha256`）、你的設定、你的金鑰。
   只釘選你信任的 doctor plugin，信任程度要與信任設定本身相同。
-- **被替換的使用者路徑 dest 可能拖住 doctor。** 若僅 root 可寫路徑以外的 dest 位於他人可寫的目錄中，
-  有人可以在雜湊執行的 `test -f` 與雜湊之間把它換成 FIFO；讀取會因此阻塞到 30 秒逾時，該 target 的 plugin 都會失敗。
-  這是可接受的：它只會拖延 doctor，tag 也讓讀到的任何東西都不會外洩。
 - **doctor 從不輸入 sudo 密碼。** 在 `sudo -n` 被拒或需要密碼的 target 上，僅 root 可寫的 dest 不會被比對（`no_sudo`），
   即使該 target 有 `sudo_secret` 也一樣；doctor 每個 target 以一行警告說明。這些檔案中的漂移要等 doctor 能使用 `sudo -n` 才看得到。
 - **doctor 的輸出中沒有雜湊，只有一個例外。** doctor 不印出任何 sha256 或 tag。它拒絕在 `was`、`now` 或 `text` 中

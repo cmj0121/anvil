@@ -341,13 +341,13 @@ else
   fail "apply --json with [packages]: exit $code"
 fi
 
-step "(l) [[files]] on arch (NOPASSWD): sudo tee writes, refuses a symlinked dest or a user-owned directory, an unmatched entry is skipped"
+step "(l) [[files]] on arch (NOPASSWD): a sudo rename writes, keeps the owner, refuses a symlinked dest or a user-owned directory, an unmatched entry is skipped"
 # The probed distro: arch, or archarm on the arm64 image.
 REMOTE_DISTRO=$(docker exec "$NAME" sh -c '. /etc/os-release && printf %s "$ID"')
 FILES_DIR="$TMP/files"
 mkdir -p "$FILES_DIR"
 printf 'managed = "anvil-e2e"\n' >"$FILES_DIR/managed.conf"
-# sudo = false writes as key, so it still follows the link in key's home.
+# sudo = false writes as key, in key's own home.
 cat >"$FILES_DIR/config.toml" <<CONF
 [[files]]
 src = "managed.conf"
@@ -363,7 +363,27 @@ facts = { distro = "not-$REMOTE_DISTRO" }
 
 [[files]]
 src = "managed.conf"
+dest = "/home/key/anvil-e2e-user"
+mode = "0600"
+sudo = false
+CONF
+cat >"$FILES_DIR/owned.toml" <<CONF
+[[files]]
+src = "managed.conf"
+dest = "/etc/anvil-e2e-owned"
+mode = "0640"
+CONF
+cat >"$FILES_DIR/userlink.toml" <<CONF
+[[files]]
+src = "managed.conf"
 dest = "/home/key/anvil-e2e-link"
+mode = "0600"
+sudo = false
+CONF
+cat >"$FILES_DIR/usertmp.toml" <<CONF
+[[files]]
+src = "managed.conf"
+dest = "/tmp/anvil-e2e-user"
 mode = "0600"
 sudo = false
 CONF
@@ -388,21 +408,22 @@ code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  $ file /etc/anvil-e2e-plain' "$TMP/out" \
   && grep -qxF '  wrote /etc/anvil-e2e-plain' "$TMP/out" \
   && grep -qxF '  $ skipped file /etc/anvil-e2e-skip: no match' "$TMP/out" \
-  && grep -qxF '  wrote /home/key/anvil-e2e-link' "$TMP/out" \
+  && grep -qxF '  wrote /home/key/anvil-e2e-user' "$TMP/out" \
   && docker exec "$NAME" cat /etc/anvil-e2e-plain | cmp -s - "$FILES_DIR/managed.conf" \
   && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-plain)" = '644 root:root' ] \
   && ! docker exec "$NAME" test -e /etc/anvil-e2e-skip \
-  && [ "$(docker exec "$NAME" readlink /home/key/anvil-e2e-link)" = anvil-e2e-real ] \
-  && docker exec "$NAME" cat /home/key/anvil-e2e-real | cmp -s - "$FILES_DIR/managed.conf" \
+  && docker exec "$NAME" cat /home/key/anvil-e2e-user | cmp -s - "$FILES_DIR/managed.conf" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /home/key/anvil-e2e-user)" = '600 key:key' ] \
+  && [ -z "$(docker exec "$NAME" sh -c 'ls -A /etc /home/key | grep "^\.anvil-"')" ] \
   && ! grep -qF 'managed = ' "$TMP/out" "$TMP/err"; then
-  pass "sudo tee wrote a root-owned file, sudo = false wrote through a link, the unmatched entry was skipped"
+  pass "sudo wrote a root-owned file, sudo = false wrote as key, no temp left, the unmatched entry was skipped"
 else
   fail "apply with [[files]]: exit $code"
 fi
 anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/config.toml" apply --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-plain' "$TMP/out" \
-  && grep -qxF '  unchanged /home/key/anvil-e2e-link' "$TMP/out"; then
+  && grep -qxF '  unchanged /home/key/anvil-e2e-user' "$TMP/out"; then
   pass "a rerun prints unchanged"
 else
   fail "rerun with [[files]]: exit $code"
@@ -417,6 +438,38 @@ if [ "$code" -eq 1 ] && grep -qxF '  $ file /etc/anvil-e2e-link' "$TMP/out" \
   pass "sudo refused the symlinked dest, link and target untouched"
 else
   fail "apply to a symlinked dest: exit $code"
+fi
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/userlink.toml" apply --target arch
+code=$?
+if [ "$code" -eq 1 ] \
+  && grep -qF 'files: /home/key/anvil-e2e-link is a symlink; point dest at the real file' "$TMP/err" \
+  && [ "$(docker exec "$NAME" cat /home/key/anvil-e2e-real)" = old ]; then
+  pass "sudo = false refused the symlinked dest, link and target untouched"
+else
+  fail "sudo = false apply to a symlinked dest: exit $code"
+fi
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/usertmp.toml" apply --target arch
+code=$?
+if [ "$code" -eq 1 ] \
+  && grep -qF 'files: /tmp is not owned by root or the login user, or others can write it' "$TMP/err" \
+  && ! docker exec "$NAME" test -e /tmp/anvil-e2e-user; then
+  pass "sudo = false refused a dest under the sticky /tmp"
+else
+  fail "sudo = false apply under /tmp: exit $code"
+fi
+docker exec "$NAME" sh -c 'printf old >/etc/anvil-e2e-owned && chown key:key /etc/anvil-e2e-owned \
+  && chmod 640 /etc/anvil-e2e-owned'
+OWNED_INODE=$(docker exec "$NAME" stat -c %i /etc/anvil-e2e-owned)
+anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/owned.toml" apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  wrote /etc/anvil-e2e-owned' "$TMP/out" \
+  && ! grep -qF 'not written atomically' "$TMP/err" \
+  && docker exec "$NAME" cat /etc/anvil-e2e-owned | cmp -s - "$FILES_DIR/managed.conf" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-owned)" = '640 key:key' ] \
+  && [ "$(docker exec "$NAME" stat -c %i /etc/anvil-e2e-owned)" != "$OWNED_INODE" ]; then
+  pass "a key:key 0640 dest was replaced by a rename and keeps its owner"
+else
+  fail "apply over a key-owned dest: exit $code"
 fi
 anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/home.toml" apply --target arch
 code=$?
@@ -558,11 +611,9 @@ if [ "$code" -eq 0 ] && grep -qxF '  restored /etc/anvil-e2e-rb' "$TMP/out" \
 else
   fail "rollback --force: exit $code"
 fi
-# A write killed midway: a tee that writes 4 bytes of the file, then exits 1.
-# Its own -a (the 0600 create) goes to the real tee, set back right after.
+# A full disk: a tee that writes 4 bytes of the temp, then exits 1. DEST stays whole.
 docker exec -i "$NAME" sh -c 'mv /usr/bin/tee /usr/bin/tee.anvil-e2e && cat >/usr/bin/tee && chmod 755 /usr/bin/tee' <<'STUB'
 #!/bin/sh
-case $1 in -a) exec /usr/bin/tee.anvil-e2e "$@" ;; esac
 head -c 4 >"$1"
 exit 1
 STUB
@@ -571,19 +622,20 @@ code=$?
 docker exec "$NAME" mv /usr/bin/tee.anvil-e2e /usr/bin/tee
 if [ "$code" -eq 1 ] \
   && grep -qE '"dest":"/etc/anvil-e2e-rb","mode":"0644","sudo":true,"written_sha256":"[0-9a-f]{64}","write":"failed_midway"' "$RB_RECORD" \
-  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" = "$(head -c 4 "$RB_DIR/new.conf")" ]; then
-  pass "a write that fails midway leaves part of the bytes, recorded as failed_midway"
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" = "$RB_OLD" ] \
+  && [ -z "$(docker exec "$NAME" sh -c 'ls -A /etc | grep "^\.anvil-"')" ]; then
+  pass "a temp write that fails leaves the dest whole and no temp behind"
 else
-  fail "apply with a tee that fails midway: exit $code"
+  fail "apply with a tee that fails: exit $code"
 fi
 rb_anvil -vv rollback --target arch
 code=$?
-if [ "$code" -eq 0 ] && grep -qxF '  restored /etc/anvil-e2e-rb' "$TMP/out" \
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-rb' "$TMP/out" \
   && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" = "$RB_OLD" ] \
   && [ "$(rb_stat /etc/anvil-e2e-rb)" = '600 root:key' ] && rb_quiet; then
-  pass "rollback restored the dest a write left half-written, without --force"
+  pass "rollback after the failed temp write finds the dest unchanged, without --force"
 else
-  fail "rollback after a write failed midway: exit $code"
+  fail "rollback after a failed temp write: exit $code"
 fi
 
 step "(r) [[tasks]] on arch: nested and included tasks run in order, a selector skips one, rollback restores the files"
@@ -954,7 +1006,7 @@ CONF
   else
     fail "apply --json with the sudo secret: exit $code"
   fi
-  # [[files]] over the password path: staged in /tmp, installed by sudo over a tty.
+  # [[files]] over the password path: staged in /tmp, renamed into place by sudo over a tty.
   SUDO_FILES_DIR="$TMP/sudo-files"
   mkdir -p "$SUDO_FILES_DIR"
   FILE_CONTENT="anvil-e2e-content-$$"
@@ -996,7 +1048,7 @@ CONF
   else
     fail "rerun [[files]] with the sudo secret: exit $code, left: $left"
   fi
-  # Rollback over the password path: staged in /tmp, put back by sudo install
+  # Rollback over the password path: staged in /tmp, renamed into place by sudo
   # with the previous owner and mode, from a state dir of its own.
   PW_STATE="$TMP/state-pw"
   PW_RECORD="$PW_STATE/anvil/last-apply.json"
@@ -1020,10 +1072,10 @@ CONF
   code=$?
   if [ "$code" -eq 0 ] && grep -qxF '  wrote /etc/anvil-e2e-rbpw' "$TMP/out" \
     && grep -qxF '  wrote /etc/anvil-e2e-rbpw-new' "$TMP/out" \
-    && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-rbpw)" = '600 root:root' ] \
+    && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-rbpw)" = '600 pw:pw' ] \
     && [ "$(local_mode "$PW_STATE/anvil")" = 700 ] && [ "$(local_mode "$PW_RECORD")" = 600 ] \
     && ! grep -qF "$PASSWORD" "$PW_RECORD" && pw_quiet; then
-    pass "apply over the password path took a pw-owned dest to root:root 0600, recorded at 0600"
+    pass "apply over the password path kept a pw-owned dest's owner at 0600, recorded at 0600"
   else
     fail "apply [[files]] to record with the sudo secret: exit $code"
   fi

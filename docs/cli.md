@@ -524,9 +524,10 @@ cleared environment of a step plugin:
 
 - `facts` are this run's probe; `last_apply` is the target's record entry, or `null` when there is no record or no
   entry for the target. It never holds a previous text, owner or hash.
-- `current_files` has one entry per `last_apply.files` dest, in that order. `state` is `file`, `absent`, `dangling`
-  (a link on the user path whose target is gone), `symlink` (an as-root dest that is a link), `not_regular`,
-  `unreadable`, `not_root_only` (a directory above an as-root dest is not root's or group or others can write it),
+- `current_files` has one entry per `last_apply.files` dest, in that order. `state` is `file`, `absent`, `symlink` (a
+  dest that is a link, which a write would refuse), `not_regular`, `unreadable`, `not_root_only` (a directory above the
+  dest fails the write's owner test: root's for an as-root dest, root's or the login user's otherwise; or group or
+  others can write it),
   `no_hash` (neither `sha256sum` nor `shasum`) or `no_sudo`. Only `file` has a `tag`.
 - No sha256 leaves anvil: each `written_sha256` becomes `written_tag` and each live sha256 a `tag`, the hex
   HMAC-SHA256 of the hex under this run's key. Equal tags mean equal hashes within one run; the tags change on every
@@ -595,8 +596,8 @@ kills them and anvil dies by SIGINT. doctor runs one target at a time: in the wo
 drift (a fact only in the live probe is ignored), then each recorded file in record order:
 
 - `file` with the written tag: no finding.
-- another tag: drift `was written, now changed`; `absent`, `dangling`, `symlink`, `not_regular`, `unreadable` and
-  `not_root_only`: drift with `now` `absent`, `dangling link`, `symlink`, `not a regular file`, `unreadable` or
+- another tag: drift `was written, now changed`; `absent`, `symlink`, `not_regular`, `unreadable` and
+  `not_root_only`: drift with `now` `absent`, `symlink`, `not a regular file`, `unreadable` or
   `not root-only`.
 - the same on a file whose write failed midway: a notice instead, with the text `the last apply failed while writing it`.
 - `no_hash`, `no_sudo`, or a dest rolled back since the apply: no finding; doctor counts it as not compared.
@@ -934,10 +935,13 @@ it.
 ```
 
 anvil writes it on one line. `previous` is `{"state": "absent"}` for a dest that did not exist,
-`{"state": "dangling", "target": "…"}` for a `sudo = false` dest that was a symlink to a missing file, or a `file`
+`{"state": "dangling", "target": "…"}`, which only an older anvil wrote, for a `sudo = false` dest that was a symlink
+to a missing file, or a `file`
 with its mode, owner, sha256 and, when `kept` is true, its `text`. `write` is `written` (the step exited 0) or
-`failed_midway` (it started, then failed, timed out or lost the connection, so DEST may hold part of the bytes). A
-write `refused` before it wrote anything (a root check, a directory DEST or a DEST changed since the read, all exit 4)
+`failed_midway` (it started, then failed, timed out or lost the connection; DEST holds part of the bytes only after an
+in-place write, [which warns](configuration.md#files)). A
+write `refused` before it wrote anything (a root check, a directory DEST, a DEST changed since the read, or another
+user's DEST whose mode it cannot set, all exit 4)
 is never stored: the dest keeps its entry from the apply before, if any.
 
 **Kept or not.** The previous text is kept only when it is UTF-8 text with no NUL byte, at most 256 KiB, and the entry
@@ -1239,8 +1243,16 @@ and writable by neither its group nor others; the step fails with
 `files: DIR is not root-only; root will not write under it`, naming the first directory that fails, and writes
 nothing. A dest under a user's home therefore needs `sudo = false`. A write as root also refuses a dest that is a
 symlink and leaves the link and its target alone; the step fails with
-`files: DEST is a symlink; point dest at the real file`. A `sudo = false` write as the connecting user follows the
-link.
+`files: DEST is a symlink; point dest at the real file`.
+
+A `sudo = false` write as the connecting user refuses a symlinked dest too, dangling or not, and any directory on the
+path that is not root's or the login user's or that its group or others can write:
+`files: DIR is not owned by root or the login user, or others can write it; anvil will not write under it`. A dest under
+the sticky `/tmp` is refused. `anvil doctor` reports these dests as `symlink` and `not_root_only`.
+
+Each write goes to a temp file beside DEST, gets DEST's owner and `mode`, and is renamed over it, so interrupting it
+leaves DEST old or new. A warning, `files: DEST: not written atomically: REASON`, marks the few cases that write in
+place; see [Files](configuration.md#files), which also lists the commands a restricted sudo rule must allow.
 
 `apply` and `plan` read every src before any target is contacted. A src that is missing, outside the workspace, not
 a regular file, over 1 MiB, or not text is exit 2, and one bad src stops the command for every target, those the entry
@@ -1464,9 +1476,11 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   Rollback never runs a package manager, a service command or a step.
 - **The same path as the write.** Each file is restored as apply wrote it, from the recorded `sudo` and the target's
   current facts: through `sudo -n`, as root, as the connecting user, or on the password path, which stages the text in
-  a 0600 `/tmp/anvil-` file and runs `sudo install -o UID -g GID -m MODE`. The sudo password comes from the target's
-  sudo secret whenever its entry has a `sudo = true` file. The root checks of a write apply too
-  ([File steps](#file-steps)). Only root can give a file back its owner;
+  a 0600 `/tmp/anvil-` file and replaces DEST from it through `sudo`, with the recorded owner and mode. The sudo
+  password comes from the target's
+  sudo secret whenever its entry has a `sudo = true` file. The checks of a write apply too
+  ([File steps](#file-steps)), so a dest that an older anvil wrote through a symlink, recorded as a `file`, now refuses
+  rollback: `files: DEST is a symlink; point dest at the real file`. Only root can give a file back its owner;
   as the connecting user, rollback warns `files: DEST was owned by UID:GID; only root can give it back` when it differs.
 - **Only what the config names.** The record is a file the user can edit, so each of a target's recorded dests must
   still be the `dest` of a `[[files]]` entry with the same `sudo` that applies to the target: its tags before the
@@ -1492,8 +1506,9 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   The check compares the machine-id when both the record and the probe have one, else the short hostname (up to the
   first `.`, lowercased); today's probe reports no machine-id, so it is the hostname. `--force` and `--force-all` do not
   pass it; only `--allow-host-change` does.
-- **A dangling link.** A `sudo = false` dest that was a symlink to a missing file was written through the link, which
-  created that file. Rollback removes the link only, and the file it created stays:
+- **A dangling link.** An older anvil wrote a `sudo = false` dest that was a symlink to a missing file through the
+  link, which created that file; today's refuses such a dest. A record from then still rolls back, since `rm` does not
+  follow the link. Rollback removes the link only, and the file it created stays:
   `removed link DEST; the file it pointed to was kept`.
 - **`rolled_back`.** After each target, the dests it restored, removed or found unchanged are saved in its entry as
   `rolled_back` (`at` and `dests`). That is the only change rollback makes to the record, so a second rollback restores

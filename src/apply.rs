@@ -4358,7 +4358,8 @@ mod tests {
         assert!(stage.contains(FILE_TEXT) && stage.contains(temp));
         assert!(install.starts_with("export TERM=dumb\n"), "{install}");
         assert!(
-            install.contains(&format!("sudo install -m 0644 '{temp}' '/etc/b.conf'")),
+            install.contains(&format!("anvil_bytes() {{ cat '{temp}'; }}"))
+                && install.contains("sudo mv -f '/etc/.anvil-"),
             "{install}"
         );
         assert!(

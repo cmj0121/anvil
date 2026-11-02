@@ -147,10 +147,6 @@ English | [繁體中文](security.zh-TW.md)
 - **A doctor plugin is not sandboxed.** The request is all anvil gives it, but the plugin runs as you, on the
   controller, so it can read anything you can: `last-apply.json` (with each previous text in plain text and each
   `written_sha256`), your config, your keys. Pin only a doctor plugin you trust as you trust the config itself.
-- **A swapped user-path dest can stall doctor.** When a dest outside the root-only paths sits in a directory others can
-  write, someone can replace it with a FIFO between the hash run's `test -f` and the hash; the read then blocks until
-  the 30 s timeout and that target's plugins fail. This is accepted: it delays doctor and nothing more, and the tags
-  keep anything read from leaking.
 - **Doctor never types the sudo password.** On a target whose `sudo -n` is refused or asks for a password, root-only
   dests are not compared (`no_sudo`), even when the target has a `sudo_secret`; doctor says so with one warning line per
   target. Drift in those files goes unseen until doctor can use `sudo -n`.

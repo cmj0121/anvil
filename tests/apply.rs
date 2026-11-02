@@ -342,7 +342,9 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
     }
     let (sandbox, secrets, path) = common::sudo_sandbox("aa");
     std::fs::create_dir(sandbox.root().join("out")).unwrap();
-    std::fs::write(sandbox.config_dir().join("motd.txt"), FILE_TEXT).unwrap();
+    // No other test stages these bytes, so a temp holding them is this test's.
+    const STAGED_TEXT: &str = "token = file-bytes-never-shown\nstaged by one test\n";
+    std::fs::write(sandbox.config_dir().join("motd.txt"), STAGED_TEXT).unwrap();
     let dest = sandbox.root().join("out/pw.conf");
     sandbox.write_config(
         "config.toml",
@@ -356,7 +358,6 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
         sandbox.root().join("ssh.log"),
         sandbox.root().join("sudo.log"),
     );
-    let before = temp_files();
     let apply = |args: &[&str], password: &str| {
         let _ = std::fs::remove_file(&sudo_log);
         sandbox
@@ -386,16 +387,27 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
             "the temp name is not logged before the stage: {}",
             text(&out.stderr)
         );
-        // Other tests in this binary stage and remove their own temp files at the
-        // same time, so a new name may be theirs: only one that stays fails.
+        let mine = || {
+            temp_files().into_iter().any(|name| {
+                std::fs::read(std::path::Path::new("/tmp").join(name))
+                    .is_ok_and(|bytes| bytes == STAGED_TEXT.as_bytes())
+            })
+        };
+        // The cleanup may still be on its way when anvil's child has gone.
         let gone = (0..20).any(|_| {
-            let left = temp_files().iter().any(|name| !before.contains(name));
+            let left = mine();
             if left {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             !left
         });
         assert!(gone, "no temp file left: {:?}", temp_files());
+        let beside: Vec<_> = std::fs::read_dir(sandbox.root().join("out"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".anvil-"))
+            .collect();
+        assert!(beside.is_empty(), "no temp beside dest: {beside:?}");
     };
 
     let out = apply(&["-vvv"], common::VALUE);
@@ -408,11 +420,13 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
         text(&out.stdout)
     );
     assert_clean(&out);
-    assert_eq!(std::fs::read_to_string(&dest).unwrap(), FILE_TEXT);
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), STAGED_TEXT);
     let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
     assert_eq!(mode & 0o7777, 0o640);
     let sudo = std::fs::read_to_string(&sudo_log).unwrap();
-    assert!(sudo.contains("\ninstall -m 0640 /tmp/anvil-"), "{sudo}");
+    assert!(sudo.contains("\nchmod 0640 "), "{sudo}");
+    assert!(sudo.contains("\nmv -f "), "{sudo}");
+    assert!(!sudo.contains("install"), "{sudo}");
 
     let out = apply(&["--json"], common::VALUE);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
@@ -515,7 +529,7 @@ fn heartbeat(dir: &Path) -> String {
     )
 }
 
-/// How a step under SIGINT runs: a plain step, a `[[files]]` install
+/// How a step under SIGINT runs: a plain step, a `[[files]]` rename
 /// through sudo on a terminal, an `anvil run` script, or a plain step on
 /// `fake` while `local`'s block, larger than a pipe buffer, waits on a
 /// stdout nobody reads.
@@ -1325,4 +1339,87 @@ fn a_transport_error_on_a_task_shows_its_line_and_names_it_in_json() {
             "name": "Boom\u{202e}",
         })
     );
+}
+
+/// Writes "motd\n" to `dest` as the login user, through the built binary.
+fn apply_as_user(
+    sandbox: &Sandbox,
+    dest: &std::path::Path,
+    safe_top: bool,
+) -> std::process::Output {
+    std::fs::write(sandbox.config_dir().join("motd.txt"), "motd\n").unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"motd.txt\"\ndest = \"{}\"\nmode = \"0640\"\nsudo = false\n",
+            dest.display()
+        ),
+    );
+    let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
+    command.args(["--secret-store", "memory", "--ssh-program"]);
+    command.arg(common::fixture("fake-ssh.sh")).args(["apply"]);
+    if !safe_top {
+        command.env_remove("ANVIL_DEBUG_SAFE_TOP");
+    }
+    command.output().unwrap()
+}
+
+#[test]
+fn without_the_debug_override_a_user_write_under_tmp_is_refused() {
+    let sandbox = Sandbox::new("au");
+    let dest = sandbox.root().join("motd");
+    let out = apply_as_user(&sandbox, &dest, false);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("/tmp is not owned by root or the login user"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!dest.exists());
+
+    let out = apply_as_user(&sandbox, &dest, true);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "motd\n");
+}
+
+#[test]
+fn a_user_write_refuses_a_symlinked_dest_dangling_or_not_and_an_open_directory() {
+    let sandbox = Sandbox::new("al");
+    let (real, link, dangling) = (
+        sandbox.root().join("real"),
+        sandbox.root().join("link"),
+        sandbox.root().join("dangling"),
+    );
+    std::fs::write(&real, "old\n").unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    std::os::unix::fs::symlink(sandbox.root().join("made"), &dangling).unwrap();
+    for dest in [&link, &dangling] {
+        let out = apply_as_user(&sandbox, dest, true);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+        assert!(
+            text(&out.stderr).contains(&format!(
+                "files: {} is a symlink; point dest at the real file",
+                dest.display()
+            )),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "old\n");
+    assert!(!sandbox.root().join("made").exists());
+
+    let open = sandbox.root().join("open");
+    std::fs::create_dir(&open).unwrap();
+    common::chmod(&open, 0o777);
+    let out = apply_as_user(&sandbox, &open.join("conf"), true);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains(&format!(
+            "files: {} is not owned by root or the login user",
+            open.display()
+        )),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!open.join("conf").exists());
 }

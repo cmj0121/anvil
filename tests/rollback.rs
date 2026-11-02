@@ -434,7 +434,8 @@ fn rollback_through_sudo_with_a_password_installs_the_previous_owner_and_mode() 
         sudo.lines().any(|line| line == "-v"),
         "the password was typed: {sudo}"
     );
-    assert!(sudo.contains("install -o "), "{sudo}");
+    assert!(sudo.contains("\nchown "), "{sudo}");
+    assert!(sudo.contains("\nmv -f "), "{sudo}");
 }
 
 #[test]
@@ -727,4 +728,67 @@ fn a_cannot_undo_note_escapes_a_hostile_include_path_for_people() {
     let out = sandbox.anvil(&["-vv", "rollback"], &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(text(&out.stdout).contains(shown), "{}", text(&out.stdout));
+}
+
+/// Rewrites the record of `dest`'s entry into what an older anvil recorded
+/// for a write through a link there, then rolls back.
+fn rollback_of_a_v1_link(
+    sandbox: &Sandbox,
+    dest: &str,
+    previous: serde_json::Value,
+) -> std::process::Output {
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    let files = record["targets"]["local"]["files"].as_array_mut().unwrap();
+    let file = files.iter_mut().find(|file| file["dest"] == dest).unwrap();
+    file["previous"] = previous;
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    sandbox.anvil(&["rollback", "--target", "local"], &[])
+}
+
+#[test]
+fn a_v1_dangling_record_still_removes_the_link() {
+    let sandbox = Sandbox::new("rd");
+    let (_, local) = applied(&sandbox);
+    // What a v1 write through a dangling link left: the link and its new file.
+    let made = sandbox.root().join("out/made");
+    std::fs::rename(&local, &made).unwrap();
+    std::os::unix::fs::symlink(&made, &local).unwrap();
+    let out = rollback_of_a_v1_link(
+        &sandbox,
+        &local,
+        serde_json::json!({"state": "dangling", "target": made.display().to_string()}),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        std::fs::symlink_metadata(&local).is_err(),
+        "the link is gone"
+    );
+    assert_eq!(std::fs::read_to_string(&made).unwrap(), FILE_TEXT);
+}
+
+#[test]
+fn a_v1_file_record_written_through_a_link_refuses_rollback() {
+    let sandbox = Sandbox::new("rl");
+    let (_, local) = applied(&sandbox);
+    let real = sandbox.root().join("out/real");
+    std::fs::rename(&local, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &local).unwrap();
+    let record = sandbox.last_apply().unwrap();
+    let files = record["targets"]["local"]["files"].as_array().unwrap();
+    let previous = files
+        .iter()
+        .find(|file| file["dest"] == local.as_str())
+        .unwrap()["previous"]
+        .clone();
+    let out = rollback_of_a_v1_link(&sandbox, &local, previous);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains(&format!(
+            "files: {local} is a symlink; point dest at the real file"
+        )),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), FILE_TEXT);
 }

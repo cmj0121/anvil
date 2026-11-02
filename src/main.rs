@@ -27,6 +27,7 @@ mod plan;
 mod plugin;
 mod private;
 mod record;
+mod remote;
 mod rollback;
 mod run;
 mod secret;

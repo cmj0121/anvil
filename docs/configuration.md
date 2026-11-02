@@ -439,9 +439,9 @@ connecting user: no `sudo`, no temp file, no terminal and no secret. Use it for 
 whose `user` fact is `root` still writes as root, with `sudo = false` and with `sudo = true`; a root login never takes
 the password path.
 
-With `sudo = true` and a login that is not root, `nopasswd` uses `sudo -n tee`. `binary` with a sudo secret uses the
-password path: the bytes go on stdin to a new mode-0600 `/tmp/anvil-` file (32 hex digits) owned by the connecting
-user, then a terminal run types the secret and runs `sudo install -m MODE`. The temp file is removed after the step,
+With `sudo = true` and a login that is not root, `nopasswd` writes through `sudo -n`. `binary` with a sudo secret uses
+the password path: the bytes go on stdin to a new mode-0600 `/tmp/anvil-` file (32 hex digits) owned by the connecting
+user, then a terminal run types the secret and replaces dest from that file through `sudo`. The temp file is removed after the step,
 on success, failure or cancel; a lost connection or a killed anvil (a Ctrl-C while the bytes are staged, say) can leave
 it behind, readable only by that user. The secret is the host's `sudo_secret`, or
 `[packages].local_sudo_secret` for `local` when `[packages]` is present; without `[packages]`, only a host's
@@ -465,9 +465,9 @@ byte, is kept; any other is kept as its hash only, and the write still goes ahea
 applies `mode`, and the step prints `unchanged DEST`. Otherwise it prints `wrote DEST`. Both exit 0. A missing or
 unreadable dest is written. The comparison needs `cmp` (diffutils) on the target, on the `PATH` the write runs with
 (sudo's when the write is through sudo). Without it the file is always rewritten and the step always prints
-`wrote DEST`; some minimal container images lack it. A mode without owner write, such as `0444`, still writes: on the
-tee path the file is mode 0600 for the write and `chmod` to `mode` after it. anvil sets `mode` only. It does not set owner or
-group, and it does not create a missing parent directory; the step fails with `tee`'s or `install`'s own message.
+`wrote DEST`; some minimal container images lack it. A mode without owner write, such as `0444`, still writes. anvil
+sets `mode`, and keeps an existing dest's owner and group. It does not create a missing parent directory; the step
+fails with `tee`'s own message.
 
 A write as root (through sudo, or on a root login) refuses a dest unless every directory on its path, from `/` to the
 one that holds dest, is owned by root and writable by neither its group nor others. Root checks each one in turn,
@@ -476,26 +476,66 @@ before anything else touches dest; the first that fails stops the step with
 nothing is written. A directory on the path that is a symlink also fails. A root write refuses symlinked system
 directories too: macOS `/etc`, `/var` and `/tmp` (links into `/private`), and the merged-/usr links `/bin`, `/sbin` and
 `/lib` on current Linux distributions; use the real path instead, e.g. `/usr/bin/x`. A directory missing from the path
-passes, and the write then fails as above. So a dest under a user's home, or under `/tmp`, needs `sudo = false`.
+passes, and the write then fails as above. So a dest under a user's home needs `sudo = false`.
 Without this rule, whoever can write a directory on the path could swap it, or what is in it, for a symlink or a hard
 link to another file, and root would write that file.
+
+A write as the connecting user (`sudo = false` on a login that is not root) has the same rule with a wider owner: every
+directory on the path must be owned by root or by the login user and be writable by neither its group nor others. The
+first that fails stops the step with
+`files: DIR is not owned by root or the login user, or others can write it; anvil will not write under it`. So a dest
+under `/tmp` is refused, sticky or not (on macOS `/tmp` is also a link), as is one in a directory shared with a group.
+Move it to a directory of your own.
 
 Root then refuses a dest that is itself a symlink: the step fails with
 `files: DEST is a symlink; point dest at the real file`, and the link and the file it points to are left alone. Point
 dest at the real file instead. That check and the write are separate commands, so the check alone is not atomic and
 would not stop a link put in place between them; what stops it is the directory rule above, since only root can
-change what a root-only directory holds. A write as the connecting user (`sudo = false` on a login that is not
-root) follows the link and writes the file it points to, since it can only write what that user can. A dest that is a
-directory fails the step with `files: DEST is a directory` (`files: /etc/a is a directory` for `/etc/a`) and is left
-alone.
+change what a root-only directory holds. A write as the connecting user refuses a symlinked dest the same way,
+dangling or not, so that nobody who swaps in a link can redirect the write and the `chmod` to another of that user's
+files. A dest that is a directory fails the step with `files: DEST is a directory` (`files: /etc/a is a directory` for
+`/etc/a`) and is left alone.
 
-`tee` (root, `sudo = false`, or `nopasswd`) rewrites an existing file in place, so it keeps its owner, group, ACLs and
-SELinux label. In place also means a process that opened the file before the write can read the new bytes, even
-before the final `chmod` applies `mode`. A new file written as root is owned by root; its group is root's primary
-group on Linux, and the parent directory's group on macOS and the BSDs or under a setgid parent directory. With
-`sudo = false` it is owned by the connecting user. `install` (the password path) puts a new file in place, owned by
-root with the group as above, and the old file's ACLs and SELinux label are dropped. `install` would replace a symlink
-with a regular file; the symlink refusal above runs first.
+**How the file is replaced.** Every write, on every path, puts the bytes in a mode-0600 temp file in dest's own
+directory, named `.anvil-<16 hex of dest's sha256>-<16 random hex>` on the controller, and renames it over dest with
+`mv -f`. So an interrupted write leaves dest fully old or fully new. Before the rename the temp gets dest's owner and
+group, its SELinux label where `selinuxenabled` succeeds (`chcon --reference`), its ACL where the GNU `getfacl` and
+`setfacl` exist, and last `mode`. A temp left by a killed run is removed by the next write of the same dest once it is
+over an hour old, so that a concurrent run keeps its own; another dest's temp stays. A new file written as root is
+owned by root; its group is root's primary group
+on Linux, and the parent directory's group on macOS and the BSDs or under a setgid parent directory. With
+`sudo = false` it is owned by the connecting user.
+
+The rename gives dest a new inode. A hard link to the old file keeps the old bytes, and a process that holds the old
+file open keeps reading them. Extended attributes other than the SELinux label, file flags such as `chattr +i`, and an
+ACL on a target without the GNU tools are lost; the ACL with the warning
+`files: DEST: its ACL was not kept: no GNU getfacl and setfacl`. The warning follows the `+` that `ls` prints, so it can
+miss a file that has both an ACL and extended attributes on macOS, where `ls` shows `@` instead. A `mv` onto a
+directory someone raced in between the checks and the
+rename moves the temp into it; only root or the login user can do that, under the checks above.
+
+**When it is not atomic.** Three cases write dest in place instead, each with a warning on stderr,
+`files: DEST: not written atomically: REASON`, and an exit of 0:
+
+- the directory is not writable through the same `sudo`, while dest exists (`its directory is not writable`);
+- a write as the connecting user would change dest's owner or group, which it cannot `chown` back
+  (`it is owned by UID:GID, which only root can keep`). A dest of another user cannot be given a new `mode` either: when
+  its mode differs, the step fails before any byte is written with
+  `files: DEST cannot be given mode MODE: only its owner can chmod it`;
+- `mv` failed with the temp fully written, as on a bind-mounted file (`mv failed`).
+
+A temp that cannot be fully written is never one of them: the step fails with
+`files: cannot write a temp file beside DEST; DEST is unchanged`, so a full disk does not reach dest. Each in-place
+write checks its source's size first and
+compares dest with the bytes after; a mismatch fails the step with
+`files: DEST does not hold the bytes written; re-run apply or anvil rollback`. Writing in place needs `wc` too.
+
+**A restricted sudo rule.** An in-place write from a file runs `sh -c 'tee "$1" <"$2"'`, so that a missing source leaves
+dest intact; a rule that allows `tee` but not `sh` breaks it. A `NOPASSWD` rule that lists commands needs `true`,
+`test`, `find`, `tee`, `cmp`,
+`mv`, `chown`, `chmod`, `rm`, `ls`, `getfacl`, `setfacl`, `chcon`, `od`, `sha256sum` or `shasum`, and `sh` (it probes for tools with
+`sh -c`). Without `getfacl` and `setfacl` the ACL is lost. Without `sh`, the SELinux label is lost and the
+comparison always rewrites.
 
 ## Services
 

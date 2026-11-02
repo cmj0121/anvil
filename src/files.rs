@@ -8,14 +8,14 @@
 //! stdin, never on argv, and `Debug` never shows them.
 //!
 //! A root target, a `sudo = false` entry, or sudo without a password writes
-//! with `tee` in place. sudo with a password stages the bytes in a 0600 temp
-//! file over a plain run, then a terminal run types the password and runs
-//! `sudo install`.
+//! the bytes to a temp file beside DEST and renames it over DEST
+//! ([`Replacement`]). sudo with a password first stages the bytes in a 0600
+//! temp file over a plain run, then a terminal run types the password and
+//! does the same from there.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -30,6 +30,12 @@ use crate::facts::Facts;
 use crate::filestore::{self, StoreError};
 use crate::inventory::{self, Target, TargetKind};
 use crate::record::{FileRecord, NO_ROLLBACK, Previous, PreviousFile, Write};
+use crate::remote::{
+    Bytes, Heredoc, LOGIN_OWNED, ROOT_OWNED, Replacement, is_owned_only, link_removal_checks,
+    login_checks, login_top, not_a_directory, random_hex, root_checks, root_only_find, sweep,
+    temp_beside, zeroizing,
+};
+pub(crate) use crate::remote::{REFUSED, hex, quote};
 use crate::secret;
 use crate::tasks::{Expanded, Item};
 use crate::transport::RUN_TIMEOUT;
@@ -235,16 +241,18 @@ pub fn run(
                 mode: mode.clone(),
                 sudo: "sudo ".to_owned(),
                 checks: root_checks("sudo ", dest),
+                as_root: true,
                 password: true,
             }
         }
         None => {
             log::info!("{}: {label} {dest}", target.name);
             let sudo = if root || !entry.sudo { "" } else { "sudo -n " };
-            let checks = if root || entry.sudo {
+            let as_root = root || entry.sudo;
+            let checks = if as_root {
                 root_checks(sudo, dest)
             } else {
-                String::new()
+                login_checks(dest, &login_top())
             };
             FileWrite {
                 ordinal: i,
@@ -252,6 +260,7 @@ pub fn run(
                 mode: mode.clone(),
                 sudo: sudo.to_owned(),
                 checks,
+                as_root,
                 password: false,
             }
         }
@@ -281,23 +290,19 @@ pub(crate) struct FileWrite {
     pub mode: String,
     /// `""`, `"sudo -n "`, or `"sudo "` on the password path.
     pub sudo: String,
-    /// [`root_checks`] when the write runs as root, else empty.
+    /// [`root_checks`] or [`login_checks`], by `as_root`.
     pub checks: String,
+    /// Whether the write runs as root, through sudo or on a root login.
+    pub as_root: bool,
     /// Whether the bytes are staged in a temp file and installed by a
     /// terminal run that types the sudo password.
     pub password: bool,
 }
 
 impl FileWrite {
-    /// Whether the write runs as root, through sudo or on a root login:
-    /// only then does it carry [`root_checks`].
-    pub(crate) fn as_root(&self) -> bool {
-        !self.checks.is_empty()
-    }
-
     /// The run before the write that reports what DEST holds.
     pub(crate) fn capture(&self) -> String {
-        capture_script(&self.dest, &self.sudo, &self.checks, self.as_root())
+        capture_script(&self.dest, &self.sudo, &self.checks)
     }
 
     /// The record of this write, from what the capture saw before it and
@@ -318,7 +323,6 @@ impl FileWrite {
         let written = sources.0.get(self.ordinal).map_or("", |s| s.text.as_str());
         let previous = match captured {
             Captured::Absent => Previous::Absent,
-            Captured::Dangling { target } => Previous::Dangling { target },
             Captured::File {
                 mode,
                 uid,
@@ -364,7 +368,7 @@ impl FileWrite {
 pub(crate) enum Expected {
     /// No check.
     Unchecked,
-    /// No file at DEST (a dangling link counts as none).
+    /// No file at DEST.
     Absent,
     /// A file with this sha256; `""` (no hash tool at capture) is no check.
     Sha256(String),
@@ -385,12 +389,20 @@ pub(crate) fn write_script(
     let heredoc = Heredoc::new(text).map_err(|why| format!("files[{i}].src: {why}"))?;
     let (dest, mode) = (step.dest.as_str(), step.mode.as_str());
     if !step.password {
-        let script = tee_script(&heredoc, dest, mode, &step.sudo, &step.checks, expected);
-        return Ok((script, None));
+        let script = tee_script(
+            &heredoc,
+            dest,
+            mode,
+            &step.sudo,
+            &step.checks,
+            step.as_root,
+            expected,
+        );
+        return script.map(|script| (script, None));
     }
     let (temp, upload) = staged(&heredoc)?;
-    let script = install_script(&temp, dest, mode, &step.checks, expected);
-    Ok((script.into(), Some(upload)))
+    let script = install_script(&temp, text.len(), dest, mode, &step.checks, expected)?;
+    Ok((script, Some(upload)))
 }
 
 /// The password path's upload of `heredoc`: a fresh temp name, the stage
@@ -403,10 +415,6 @@ fn staged(heredoc: &Heredoc<'_>) -> Result<(String, Upload), String> {
     };
     Ok((temp, upload))
 }
-
-/// The status of a write script that refused before writing anything:
-/// a root check, a directory DEST, or [`guard`].
-pub(crate) const REFUSED: i32 = 4;
 
 /// The lines that refuse the write, exit [`REFUSED`], when DEST no longer
 /// holds what `expected` says, hashed through `sudo`; nothing when there is
@@ -463,183 +471,53 @@ pub(crate) fn skip_run(dest: &str, label: String) -> PlannedRun {
     file_run(dest, Zeroizing::default(), label, None, skip)
 }
 
-/// A text as a quoted heredoc: `head -c N <<'D'`, then the body, which ends
-/// with a newline before `D` that `head -c` cuts off again.
-struct Heredoc<'a> {
-    text: &'a str,
-    delimiter: String,
+/// One run under `umask 077` that runs `checks` first, then refuses a
+/// directory DEST, then the guard; when DEST already holds the bytes, only
+/// the mode, else [`Replacement::replace`].
+fn replace_script(write: &Replacement<'_>, checks: &str, expected: &Expected) -> Zeroizing<String> {
+    let (dest, sudo) = (write.dest, write.sudo);
+    let d = quote(dest);
+    let guard = guard(sudo, dest, expected);
+    let directory = not_a_directory(sudo, &d, dest);
+    let (unchanged, wrote) = (
+        quote(&format!("unchanged {dest}")),
+        quote(&format!("wrote {dest}")),
+    );
+    zeroizing(format_args!(
+        "{open}{checks}{directory} || exit {REFUSED}\n\
+         {guard}{sweep}if {same}; then anvil_mode && echo {unchanged}\n\
+         else {replace}fi\n\
+         }}\n",
+        open = *write.open(),
+        sweep = write.sweep(),
+        same = write.same(),
+        replace = write.replace(&format!("echo {wrote}")),
+    ))
 }
 
-impl<'a> Heredoc<'a> {
-    /// The delimiter is `ANVIL_EOF_` and 32 hex digits of the text's sha256.
-    fn new(text: &'a str) -> Result<Self, String> {
-        let hex: String = Sha256::digest(text.as_bytes())[..16]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        Self::with_delimiter(text, format!("ANVIL_EOF_{hex}"))
-    }
-
-    /// Refuses a text with a line equal to `delimiter`, which would end the
-    /// heredoc early.
-    fn with_delimiter(text: &'a str, delimiter: String) -> Result<Self, String> {
-        if text.split('\n').any(|line| line == delimiter) {
-            return Err(format!(
-                "has a line equal to the heredoc delimiter {delimiter}"
-            ));
-        }
-        Ok(Heredoc { text, delimiter })
-    }
-
-    /// `head -c N <<'D'`, which the body must follow on the next line. An
-    /// empty text is `: <<'D'` instead, since BSD `head` refuses `-c 0`.
-    fn head(&self) -> String {
-        match self.text.len() {
-            0 => format!(": <<'{}'", self.delimiter),
-            n => format!("head -c {n} <<'{}'", self.delimiter),
-        }
-    }
-
-    /// The lines after the command: the text, a newline, and the delimiter,
-    /// written straight into the script rather than copied first.
-    fn body(&self) -> Body<'_> {
-        Body(self)
-    }
-}
-
-struct Body<'a>(&'a Heredoc<'a>);
-
-impl fmt::Display for Body<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}\n{}\n", self.0.text, self.0.delimiter)
-    }
-}
-
-/// `s` in single quotes for `sh`.
-pub(crate) fn quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
-
-/// A message on stderr and a non-zero status when DEST is a directory. A
-/// failing `sudo` passes, so the next `sudo` prints its own message.
-fn not_a_directory(sudo: &str, d: &str, dest: &str) -> String {
-    let message = quote(&format!("files: {dest} is a directory"));
-    format!("{{ ! {sudo}test -d {d} || {{ echo {message} >&2; false; }}; }}")
-}
-
-/// A message on stderr and a non-zero status when DEST is a symlink, which a
-/// write as root would follow. A failing `sudo` passes, as above.
-fn not_a_symlink(sudo: &str, d: &str, dest: &str) -> String {
-    let message = quote(&format!(
-        "files: {dest} is a symlink; point dest at the real file"
-    ));
-    format!("{{ ! {sudo}test -L {d} || {{ echo {message} >&2; false; }}; }} && ")
-}
-
-/// A message on stderr and a non-zero status when `dir` is not a directory
-/// that `owner` owns and neither group nor others may write; `find` does not
-/// follow `dir` when it is a symlink. A missing `dir` passes, so the write
-/// fails as it would, and so does a failing `sudo`, as above.
-fn owned_only(sudo: &str, dir: &str, owner: &str) -> String {
-    let message = quote(&format!(
-        "files: {dir} is not root-only; root will not write under it"
-    ));
-    format!(
-        "{{ {} || {{ echo {message} >&2; false; }}; }} && ",
-        is_owned_only(sudo, dir, owner)
-    )
-}
-
-/// The test [`owned_only`] runs, alone: true when `dir` is missing or a
-/// directory that `owner` owns and neither group nor others may write.
-fn is_owned_only(sudo: &str, dir: &str, owner: &str) -> String {
-    let d = quote(dir);
-    let found = root_only_find(owner);
-    format!(
-        "{{ ! {sudo}test -e {d} && ! {sudo}test -L {d}; }} \
-         || [ -n \"$({sudo}find {d} {found})\" ]"
-    )
-}
-
-/// The `find` test after a directory that prints it only when it is a
-/// directory `owner` owns that group and others cannot write.
-fn root_only_find(owner: &str) -> String {
-    format!("-prune -type d -user {owner} ! -perm -020 ! -perm -002")
-}
-
-/// The checks before a write as root, run as root ahead of any other command
-/// on DEST: every directory on DEST's path is `owner`'s and not group- or
-/// world-writable, from `dirs`, then DEST is no symlink. Otherwise whoever
-/// may write one of them could swap a directory for a link, or hard-link a
-/// file, between the checks and the write.
-fn checks(sudo: &str, dest: &str, dirs: &[&str], owner: &str) -> String {
-    let dirs: String = dirs
-        .iter()
-        .map(|dir| owned_only(sudo, dir, owner))
-        .collect();
-    dirs + &not_a_symlink(sudo, &quote(dest), dest)
-}
-
-/// [`checks`] with root as the owner of each directory from `/` to DEST's.
-fn root_checks(sudo: &str, dest: &str) -> String {
-    let mut dirs: Vec<&str> = Path::new(dest)
-        .ancestors()
-        .skip(1)
-        .filter_map(Path::to_str)
-        .collect();
-    dirs.reverse();
-    checks(sudo, dest, &dirs, "0")
-}
-
-/// Whether `tool` is on the PATH that `sudo` (`""`, `"sudo -n "` or
-/// `"sudo "`) runs it with, quietly.
-fn has_tool(sudo: &str, tool: &str) -> String {
-    match sudo {
-        "" => format!("command -v {tool} >/dev/null 2>&1"),
-        _ => format!("{sudo}sh -c 'command -v {tool}' >/dev/null 2>&1"),
-    }
-}
-
-/// Whether `cmp` is on `sudo`'s PATH; without it every run rewrites DEST.
-fn has_cmp(sudo: &str) -> String {
-    has_tool(sudo, "cmp")
-}
-
-/// One plain run under `umask 077` that runs `checks` first, then refuses a
-/// directory DEST: when DEST already holds the bytes, only `chmod`; else make
-/// a regular DEST 0600 (creating a missing one empty), write the bytes, then
-/// `chmod`. `sudo` is `""` or `"sudo -n "`; `checks` is [`root_checks`] when
-/// the write runs as root, through `sudo` or on a root login, else empty.
+/// The plain run: a root target, a `sudo = false` entry, or `sudo -n`.
 fn tee_script(
     heredoc: &Heredoc<'_>,
     dest: &str,
     mode: &str,
     sudo: &str,
     checks: &str,
+    as_root: bool,
     expected: &Expected,
-) -> Zeroizing<String> {
-    debug_assert!(is_mode(mode), "{mode}");
-    let (head, body) = (heredoc.head(), heredoc.body());
-    let d = quote(dest);
-    let guard = guard(sudo, dest, expected);
-    let directory = not_a_directory(sudo, &d, dest);
-    let has_cmp = has_cmp(sudo);
-    let (unchanged, wrote) = (
-        quote(&format!("unchanged {dest}")),
-        quote(&format!("wrote {dest}")),
-    );
-    zeroizing(format_args!(
-        "{{ umask 077\n\
-         {checks}{directory} || exit {REFUSED}\n\
-         {guard}if {head} | {{ {has_cmp} && {sudo}cmp -s - {d}; }}\n\
-         {body}\
-         then {sudo}chmod {mode} {d} && echo {unchanged}\n\
-         else {{ {sudo}test -f {d} && {sudo}chmod 600 {d} || : | {sudo}tee -a {d} >/dev/null; }} \
-         && {sudo}chmod 600 {d} && {head} | {sudo}tee {d} >/dev/null \
-         && {sudo}chmod {mode} {d} && echo {wrote}\n\
-         {body}\
-         fi\n\
-         }}\n"
+) -> Result<Zeroizing<String>, String> {
+    let temp = temp_beside(dest)?;
+    Ok(replace_script(
+        &Replacement {
+            dest,
+            mode,
+            sudo,
+            as_root,
+            temp: &temp,
+            bytes: Bytes::Inline(heredoc),
+            ids: None,
+        },
+        checks,
+        expected,
     ))
 }
 
@@ -653,48 +531,30 @@ fn stage_script(heredoc: &Heredoc<'_>, temp: &str) -> Zeroizing<String> {
     ))
 }
 
-/// `args` written into a [`Zeroizing`] string sized to fit first, so a
-/// script that carries a file's text is zeroed when dropped and never
-/// leaves a smaller copy behind as it grows.
-fn zeroizing(args: fmt::Arguments<'_>) -> Zeroizing<String> {
-    struct Len(usize);
-    impl fmt::Write for Len {
-        fn write_str(&mut self, s: &str) -> fmt::Result {
-            self.0 += s.len();
-            Ok(())
-        }
-    }
-    let mut len = Len(0);
-    fmt::write(&mut len, args).expect("a script's parts always format");
-    let mut script = Zeroizing::new(String::with_capacity(len.0));
-    fmt::write(&mut *script, args).expect("a script's parts always format");
-    script
-}
-
 /// The password path's terminal run, one brace group so a failed `sudo -v`
-/// before it runs none of it: check `temp` is the user's own regular file, run
-/// `checks` ([`root_checks`] with `"sudo "`), refuse a directory DEST, then
-/// `chmod` an unchanged DEST or `install` over it. The trap keeps
-/// [`crate::packages::with_password`]'s `sudo -k`, which it replaces.
-fn install_script(temp: &str, dest: &str, mode: &str, checks: &str, expected: &Expected) -> String {
-    debug_assert!(is_mode(mode), "{mode}");
-    let (t, d) = (quote(temp), quote(dest));
-    let guard = guard("sudo ", dest, expected);
-    let directory = not_a_directory("sudo ", &d, dest);
-    let has_cmp = has_cmp("sudo ");
-    let (unchanged, wrote) = (
-        quote(&format!("unchanged {dest}")),
-        quote(&format!("wrote {dest}")),
-    );
-    format!(
-        "{{ trap \"rm -f {t}; sudo -k\" EXIT\n\
-         [ -f {t} ] && [ ! -L {t} ] && [ -O {t} ] \
-         || {{ echo 'files: temp file check failed' >&2; exit 1; }}\n\
-         {checks}{directory} || exit {REFUSED}\n\
-         {guard}if {has_cmp} && sudo cmp -s {t} {d}; then sudo chmod {mode} {d} && echo {unchanged}\n\
-         else sudo install -m {mode} {t} {d} && echo {wrote}; fi\n\
-         }}\n"
-    )
+/// before it runs none of it, from the staged `temp` of `len` bytes.
+fn install_script(
+    temp: &str,
+    len: usize,
+    dest: &str,
+    mode: &str,
+    checks: &str,
+    expected: &Expected,
+) -> Result<Zeroizing<String>, String> {
+    let dest_temp = temp_beside(dest)?;
+    Ok(replace_script(
+        &Replacement {
+            dest,
+            mode,
+            sudo: "sudo ",
+            as_root: true,
+            temp: &dest_temp,
+            bytes: Bytes::Staged(temp, len),
+            ids: None,
+        },
+        checks,
+        expected,
+    ))
 }
 
 /// The most bytes of a dest that the capture reads back and the apply
@@ -727,12 +587,9 @@ const MARK: &str = "anvil-capture ";
 
 /// The run before a write that reports what DEST holds, through the same
 /// `sudo` (`""`, `"sudo -n "`, or `"sudo "` on the password path) and after
-/// the same `checks` as the write. `as_root`: the write runs as root, so a
-/// symlink DEST is refused; as the user it is followed, as `tee` would, and
-/// a dangling one is reported as such; [`root_checks`] already refuse a
-/// symlink, so the refusal is added only when `checks` is empty.
+/// the same `checks` as the write, which refuse a symlink DEST.
 ///
-/// It prints `anvil-capture absent`, `anvil-capture dangling TARGET`, or
+/// It prints `anvil-capture absent` or
 /// `anvil-capture file <ls -lLdn line>` and then, for a file of at most
 /// [`MAX_KEPT`] bytes, its bytes in `od` hex between `anvil-capture bytes`
 /// and `anvil-capture end`. When it sends no bytes (too large, no `od`,
@@ -743,27 +600,13 @@ const MARK: &str = "anvil-capture ";
 /// On the password path stderr shares the terminal with stdout, so the
 /// probes whose failure is an answer, not an error, send theirs to
 /// `/dev/null`: a stray sudo warning cannot break [`parse_capture`].
-pub(crate) fn capture_script(dest: &str, sudo: &str, checks: &str, as_root: bool) -> String {
+pub(crate) fn capture_script(dest: &str, sudo: &str, checks: &str) -> String {
     let d = quote(dest);
     let ready = match sudo {
         "" => String::new(),
         _ => format!("{sudo}true || exit 1\n"),
     };
     let quiet = if sudo == "sudo " { " 2>/dev/null" } else { "" };
-    let (symlink, dangling) = if as_root {
-        let symlink = match checks {
-            "" => not_a_symlink(sudo, &d, dest),
-            _ => String::new(),
-        };
-        (symlink, String::new())
-    } else {
-        (
-            String::new(),
-            format!(
-                "if test -L {d}; then printf '{MARK}dangling %s\\n' \"$(readlink {d})\"; exit 0; fi\n"
-            ),
-        )
-    };
     let irregular = quote(&format!("files: {dest} is not a regular file"));
     // `od` itself, not `command -v od`: the probe runs what the read runs,
     // with its flags.
@@ -772,9 +615,9 @@ pub(crate) fn capture_script(dest: &str, sudo: &str, checks: &str, as_root: bool
         "{{ umask 077; LC_ALL=C; export LC_ALL; set -f\n\
          {hash}\
          anvil_sent() {{ anvil_s=$(anvil_sha256 {d}) && echo \"{MARK}sha256 $anvil_s\"; :; }}\n\
-         {ready}{checks}{symlink}: || exit 1\n\
+         {ready}{checks}: || exit 1\n\
          if ! {sudo}test -e {d}{quiet}; then\n\
-         {dangling}echo '{MARK}absent'; exit 0\n\
+         echo '{MARK}absent'; exit 0\n\
          fi\n\
          anvil_line=$({sudo}ls -lLdn {d}) || exit 1\n\
          case $anvil_line in -*) ;; *) echo {irregular} >&2; exit 1 ;; esac\n\
@@ -794,10 +637,6 @@ pub(crate) fn capture_script(dest: &str, sudo: &str, checks: &str, as_root: bool
 /// What [`capture_script`] found at DEST.
 pub(crate) enum Captured {
     Absent,
-    /// A symlink, on the user path, whose target does not exist.
-    Dangling {
-        target: String,
-    },
     /// `sha256` is from `bytes` when read, else the target's own hash, else
     /// `""` (no hash tool). `reason` says why `bytes` is `None`.
     File {
@@ -816,9 +655,6 @@ impl fmt::Debug for Captured {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Captured::Absent => f.write_str("Absent"),
-            Captured::Dangling { target } => {
-                f.debug_struct("Dangling").field("target", target).finish()
-            }
             Captured::File {
                 mode,
                 uid,
@@ -873,14 +709,6 @@ pub(crate) fn parse_capture(dest: &str, stdout: &[u8]) -> Result<Captured, Strin
     if first == "absent" {
         return match rest.next() {
             None => Ok(Captured::Absent),
-            Some(_) => Err(unread()),
-        };
-    }
-    if let Some(target) = first.strip_prefix("dangling ") {
-        return match rest.next() {
-            None => Ok(Captured::Dangling {
-                target: target.to_owned(),
-            }),
             Some(_) => Err(unread()),
         };
     }
@@ -949,7 +777,7 @@ impl Captured {
     /// What the write must find at DEST: nothing, or this file.
     pub(crate) fn expected(&self) -> Expected {
         match self {
-            Captured::Absent | Captured::Dangling { .. } => Expected::Absent,
+            Captured::Absent => Expected::Absent,
             Captured::File { sha256, .. } => Expected::Sha256(sha256.clone()),
         }
     }
@@ -958,7 +786,6 @@ impl Captured {
     pub(crate) fn summary(&self) -> String {
         match self {
             Captured::Absent => "absent".to_owned(),
-            Captured::Dangling { .. } => "a dangling link".to_owned(),
             Captured::File {
                 bytes: Some(bytes), ..
             } => format!("{} bytes", bytes.len()),
@@ -976,14 +803,12 @@ pub enum FileState {
     /// A regular file; its sha256 comes with it.
     File,
     Absent,
-    /// A symlink, on the user path, whose target does not exist.
-    Dangling,
-    /// A symlink, as root, which a write would refuse.
+    /// A symlink, which a write would refuse.
     Symlink,
     NotRegular,
     Unreadable,
-    /// A directory on its path is not root's, or group or others may write
-    /// it, so root would not write under it.
+    /// A directory on its path fails the write's owner test, or group or
+    /// others may write it, so the write would refuse it.
     NotRootOnly,
     /// The target has neither `sha256sum` nor `shasum`.
     NoHash,
@@ -992,10 +817,9 @@ pub enum FileState {
 }
 
 impl FileState {
-    const ALL: [FileState; 9] = [
+    const ALL: [FileState; 8] = [
         FileState::File,
         FileState::Absent,
-        FileState::Dangling,
         FileState::Symlink,
         FileState::NotRegular,
         FileState::Unreadable,
@@ -1009,7 +833,6 @@ impl FileState {
         match self {
             FileState::File => "file",
             FileState::Absent => "absent",
-            FileState::Dangling => "dangling",
             FileState::Symlink => "symlink",
             FileState::NotRegular => "not_regular",
             FileState::Unreadable => "unreadable",
@@ -1021,7 +844,8 @@ impl FileState {
 }
 
 /// A dest to hash, and whether the write runs as root (a root login or a
-/// `sudo` entry), so the hash does too, after the write's root checks.
+/// `sudo` entry), so the hash does too. Either way it runs after the checks
+/// the write would run.
 #[derive(Debug, Clone, Copy)]
 pub struct HashDest<'a> {
     pub dest: &'a str,
@@ -1033,44 +857,50 @@ const HASH_MARK: &str = "anvil-hash ";
 
 /// The whole hash run for one target: one `anvil-hash I STATE [HEX]` line
 /// per index of `dests`, where only `file` has a HEX. User-path dests are
-/// hashed in the outer `sh`, following a link as `tee` would; as-root dests
-/// inside one `{sudo}sh -s` (`sudo` is `""` on a root login, else
-/// `"sudo -n "`) that reads its script from a heredoc, so no argument
-/// grows with the dests. There each directory on their paths is checked
-/// once, as [`root_checks`] checks it, then each dest is refused as a
-/// symlink. The inner `sh` prints [`ROOT_READY`] first: with no output at
-/// all sudo never ran it, and each as-root dest is `no_sudo` (on a root
-/// login nothing, so [`parse_hashes`] refuses the run); output that stops
-/// after it leaves indexes missing, which the parse refuses too. A dest is
-/// only ever a quoted
-/// argument, never printed, so its name cannot forge a line; the run reads
-/// no bytes but the hash tool's.
+/// checked and hashed in a subshell of the outer `sh`; as-root dests inside one
+/// `{sudo}sh -s` (`sudo` is `""` on a root login, else `"sudo -n "`) that reads
+/// its script from a heredoc, so no argument grows with the dests. There each
+/// directory on their paths is checked once, as [`root_checks`] and
+/// [`login_checks`] check it, then each dest is refused as a symlink. The
+/// inner `sh` prints [`ROOT_READY`] first: with no output at all sudo never ran
+/// it, and each as-root dest is `no_sudo` (on a root login nothing, so
+/// [`parse_hashes`] refuses the run); output that stops after it leaves indexes
+/// missing, which the parse refuses too. A dest is only ever a quoted argument,
+/// never printed, so its name cannot forge a line; the run reads no bytes but
+/// the hash tool's.
 pub(crate) fn hash_script(dests: &[HashDest], sudo: &str) -> Result<String, String> {
-    hash_run(dests, sudo, Path::new("/"), "0")
+    hash_run(dests, sudo, Path::new("/"), ROOT_OWNED, &login_top())
 }
 
 /// [`hash_script`] with the as-root directory checks from `top` down, each
-/// owned by `owner`.
-fn hash_run(dests: &[HashDest], sudo: &str, top: &Path, owner: &str) -> Result<String, String> {
+/// passing the `owner` test, and the user-path ones from `user_top`.
+fn hash_run(
+    dests: &[HashDest],
+    sudo: &str,
+    top: &Path,
+    owner: &str,
+    user_top: &Path,
+) -> Result<String, String> {
     let setup = format!(
         "umask 077; LC_ALL=C; export LC_ALL; set -f\n{hash}{state}",
         hash = hash_fn(""),
         state = HASH_STATE,
     );
-    let user: String = dests
-        .iter()
-        .enumerate()
-        .filter(|(_, file)| !file.as_root)
-        .map(|(i, file)| format!("anvil_user {i} {}\n", quote(file.dest)))
-        .collect();
-    let root: Vec<(usize, &str)> = dests
-        .iter()
-        .enumerate()
-        .filter(|(_, file)| file.as_root)
-        .map(|(i, file)| (i, file.dest))
-        .collect();
+    let of = |as_root: bool| -> Vec<(usize, &str)> {
+        dests
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| file.as_root == as_root)
+            .map(|(i, file)| (i, file.dest))
+            .collect()
+    };
+    let (user, root) = (of(false), of(true));
+    let user = match user.is_empty() {
+        true => String::new(),
+        false => format!("(\n{})\n", root_walk(&user, user_top, LOGIN_OWNED)),
+    };
     if root.is_empty() {
-        return Ok(format!("{{ exec 2>/dev/null; {setup}{HASH_USER}{user}}}\n"));
+        return Ok(format!("{{ exec 2>/dev/null; {setup}{user}}}\n"));
     }
     let inner = format!("echo {ROOT_READY}\n{setup}{}", root_walk(&root, top, owner));
     let heredoc = Heredoc::new(&inner).map_err(|why| format!("files: the hash run {why}"))?;
@@ -1082,7 +912,7 @@ fn hash_run(dests: &[HashDest], sudo: &str, top: &Path, owner: &str) -> Result<S
             .collect(),
     };
     Ok(format!(
-        "{{ exec 2>/dev/null; {setup}{HASH_USER}{user}\
+        "{{ exec 2>/dev/null; {setup}{user}\
          anvil_root() {{\n{sudo}sh -s <<'{delimiter}'\n{body}}}\n\
          anvil_out=$(anvil_root)\n\
          if [ -z \"$anvil_out\" ]; then :\n{failed}\
@@ -1096,17 +926,9 @@ fn hash_run(dests: &[HashDest], sudo: &str, top: &Path, owner: &str) -> Result<S
 /// The inner `sh`'s first line: output without it means sudo never ran it.
 const ROOT_READY: &str = "anvil-root-ready";
 
-/// Defines `anvil_user I FILE`: a user-path dest's line, after a dangling
-/// link check.
-const HASH_USER: &str = "anvil_user() {
-if test -L \"$2\" && ! test -e \"$2\"; then echo \"anvil-hash $1 dangling\"
-else anvil_state \"$1\" \"$2\"; fi
-}
-";
-
-/// The as-root part of [`hash_run`]: from `top`, a walk that checks each
-/// directory on the dests' paths once and `cd`s into it only when it is
-/// `owner`'s and root-only, then one line per dest. The dests below each
+/// One part of [`hash_run`]: from `top`, a walk that checks each directory
+/// on the dests' paths once and `cd`s into it only when it passes the `owner`
+/// test and is closed to others, then one line per dest. The dests below each
 /// directory are a range of ranks, recorded in `$anvil_bad` when it exists
 /// and fails the test (`not_root_only`), or in `$anvil_shut` when it passes
 /// but root cannot enter it (`unreadable`). A missing directory is not
@@ -1177,7 +999,7 @@ fn root_walk(root: &[(usize, &str)], top: &Path, owner: &str) -> String {
     out
 }
 
-/// Defines `anvil_one RANK I FILE`: an as-root dest's line, `not_root_only`
+/// Defines `anvil_one RANK I FILE`: a dest's line, `not_root_only`
 /// when RANK is in a range in `$anvil_bad`, `unreadable` when in one in
 /// `$anvil_shut`, else after a symlink check.
 const HASH_ROOT: &str = "anvil_in() {
@@ -1274,11 +1096,6 @@ pub(crate) fn parse_hashes(
         .into_iter()
         .map(|slot| slot.ok_or_else(unread))
         .collect()
-}
-
-/// `bytes` in lowercase hex.
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The first five fields of an `ls -ln` line: the mode as 4 octal digits,
@@ -1395,6 +1212,19 @@ pub(crate) fn restore_runs(
     force: &Force,
     wording: Wording,
 ) -> Result<Vec<PlannedRun>, String> {
+    restore_runs_from(&login_top(), config, target, facts, files, force, wording)
+}
+
+/// [`restore_runs`] with the login user's directory checks from `top`.
+fn restore_runs_from(
+    top: &Path,
+    config: &Config,
+    target: &Target,
+    facts: &Facts,
+    files: &[FileRecord],
+    force: &Force,
+    wording: Wording,
+) -> Result<Vec<PlannedRun>, String> {
     let root = facts.is_root();
     let mut runs = Vec::with_capacity(files.len());
     for file in files.iter().rev() {
@@ -1423,10 +1253,11 @@ pub(crate) fn restore_runs(
             None => "sudo -n ",
         };
         let as_root = root || file.sudo;
-        let checks = if as_root {
-            root_checks(sudo, dest)
-        } else {
-            String::new()
+        let checks = match (&file.previous, as_root) {
+            // Removing the link does not follow it, so a v1 record still rolls back.
+            (Previous::Dangling { .. }, _) => link_removal_checks(sudo, dest, as_root, top),
+            (_, true) => root_checks(sudo, dest),
+            (_, false) => login_checks(dest, top),
         };
         let restore = Restore {
             dest,
@@ -1442,9 +1273,10 @@ pub(crate) fn restore_runs(
                 match secret {
                     Some(_) => {
                         let (temp, upload) = staged(&heredoc)?;
-                        (restore.install(&temp, previous).into(), label, Some(upload))
+                        let run = restore.install(&temp, text.len(), previous)?;
+                        (run, label, Some(upload))
                     }
-                    None => (restore.tee(&heredoc, previous), label, None),
+                    None => (restore.tee(&heredoc, previous)?, label, None),
                 }
             }
             (None, Previous::Dangling { .. }) => (
@@ -1538,7 +1370,8 @@ struct Restore<'a> {
     dest: &'a str,
     /// `""`, `"sudo -n "`, or `"sudo "` on the password path.
     sudo: &'a str,
-    /// [`root_checks`] when the restore runs as root, else empty.
+    /// [`root_checks`], [`login_checks`] or, for a dangling link,
+    /// [`link_removal_checks`].
     checks: &'a str,
     as_root: bool,
     /// [`restore_guard`]'s lines.
@@ -1546,30 +1379,31 @@ struct Restore<'a> {
 }
 
 impl Restore<'_> {
-    /// The opening shared by the plain scripts: `sudo` works, then the root
-    /// checks and the directory refusal, then the guard.
-    fn head(&self) -> String {
+    /// The checks, the directory refusal and the guard, after `open`.
+    fn head(&self, open: &str) -> Zeroizing<String> {
         let d = quote(self.dest);
         let ready = match self.sudo {
             "" => String::new(),
             sudo => format!("{sudo}true || exit 1\n"),
         };
         let directory = not_a_directory(self.sudo, &d, self.dest);
-        format!(
-            "{{ umask 077; LC_ALL=C; export LC_ALL; set -f\n\
-             {ready}{}{directory} || exit 1\n\
-             {}",
-            self.checks, self.guard
-        )
+        zeroizing(format_args!(
+            "{open}{ready}{}{directory} || exit 1\n\
+             {}{}",
+            self.checks,
+            self.guard,
+            sweep(self.sudo, self.dest),
+        ))
     }
 
-    /// Owner: `chown` as root; as the user, a warning when it differs.
-    fn owner(&self, previous: &PreviousFile) -> String {
-        let (d, sudo) = (quote(self.dest), self.sudo);
-        let ids = format!("{}:{}", previous.uid, previous.gid);
+    /// As the user, a warning when DEST's owner is not the recorded one;
+    /// as root the [`Replacement`] or [`Self::same_owner`] sets it.
+    fn owner_warning(&self, previous: &PreviousFile) -> String {
         if self.as_root {
-            return format!("{sudo}chown {ids} {d} && ");
+            return String::new();
         }
+        let d = quote(self.dest);
+        let ids = format!("{}:{}", previous.uid, previous.gid);
         let warning = quote(&format!(
             "files: {} was owned by {ids}; only root can give it back",
             self.dest
@@ -1577,50 +1411,69 @@ impl Restore<'_> {
         format!("{{ set -- $(ls -lLdn {d}); [ \"$3:$4\" = {ids} ] || echo {warning} >&2; }} && ")
     }
 
-    /// The tee path: the bytes into a 0600 DEST in place, then the owner,
-    /// then the mode; only owner and mode when DEST already holds them.
-    fn tee(&self, heredoc: &Heredoc<'_>, previous: &PreviousFile) -> Zeroizing<String> {
-        let (d, sudo, mode) = (quote(self.dest), self.sudo, &previous.mode);
-        let (head, body) = (heredoc.head(), heredoc.body());
-        let owner = self.owner(previous);
-        let (unchanged, restored) = (
-            quote(&format!("unchanged {}", self.dest)),
-            quote(&format!("restored {}", self.dest)),
-        );
-        zeroizing(format_args!(
-            "{}if [ -n \"$anvil_same\" ]; then {owner}{sudo}chmod {mode} {d} && echo {unchanged}\n\
-             else {{ {sudo}test -f {d} && {sudo}chmod 600 {d} || : | {sudo}tee -a {d} >/dev/null; }} \
-             && {sudo}chmod 600 {d} && {head} | {sudo}tee {d} >/dev/null \
-             && {owner}{sudo}chmod {mode} {d} && echo {restored}\n\
-             {body}\
-             fi\n\
-             }}\n",
-            self.head()
-        ))
+    /// As root, gives a DEST that already holds the bytes the recorded owner.
+    fn same_owner(&self, previous: &PreviousFile) -> String {
+        if !self.as_root {
+            return String::new();
+        }
+        format!(
+            "{}chown {}:{} {} && ",
+            self.sudo,
+            previous.uid,
+            previous.gid,
+            quote(self.dest)
+        )
     }
 
-    /// The password path's terminal run: check the staged `temp`, the root
-    /// checks, the guard, then `install -o -g -m` it over DEST, or only
-    /// `chown` and `chmod` when DEST already holds the bytes.
-    fn install(&self, temp: &str, previous: &PreviousFile) -> String {
-        let (t, d, mode) = (quote(temp), quote(self.dest), &previous.mode);
-        let (uid, gid) = (previous.uid, previous.gid);
-        let directory = not_a_directory("sudo ", &d, self.dest);
+    /// The whole restore from `bytes`: when DEST already holds them, only
+    /// owner and mode, else a [`Replacement`] with the recorded owner.
+    fn replace(
+        &self,
+        bytes: Bytes<'_>,
+        previous: &PreviousFile,
+    ) -> Result<Zeroizing<String>, String> {
+        let temp = temp_beside(self.dest)?;
+        let write = Replacement {
+            dest: self.dest,
+            mode: &previous.mode,
+            sudo: self.sudo,
+            as_root: self.as_root,
+            temp: &temp,
+            bytes,
+            ids: Some((previous.uid, previous.gid)),
+        };
         let (unchanged, restored) = (
             quote(&format!("unchanged {}", self.dest)),
             quote(&format!("restored {}", self.dest)),
         );
-        format!(
-            "{{ trap \"rm -f {t}; sudo -k\" EXIT\n\
-             [ -f {t} ] && [ ! -L {t} ] && [ -O {t} ] \
-             || {{ echo 'files: temp file check failed' >&2; exit 1; }}\n\
-             {}{directory} || exit 1\n\
-             {}\
-             if [ -n \"$anvil_same\" ]; then sudo chown {uid}:{gid} {d} && sudo chmod {mode} {d} && echo {unchanged}\n\
-             else sudo install -o {uid} -g {gid} -m {mode} {t} {d} && echo {restored}; fi\n\
+        let warning = self.owner_warning(previous);
+        Ok(zeroizing(format_args!(
+            "{}if [ -n \"$anvil_same\" ]; then {warning}{same}anvil_mode && echo {unchanged}\n\
+             else {replace}fi\n\
              }}\n",
-            self.checks, self.guard
-        )
+            *self.head(&write.open()),
+            same = self.same_owner(previous),
+            replace = write.replace(&format!("{warning}echo {restored}")),
+        )))
+    }
+
+    /// The plain run, with the bytes in a heredoc.
+    fn tee(
+        &self,
+        heredoc: &Heredoc<'_>,
+        previous: &PreviousFile,
+    ) -> Result<Zeroizing<String>, String> {
+        self.replace(Bytes::Inline(heredoc), previous)
+    }
+
+    /// The password path's terminal run, from the staged `temp` of `len` bytes.
+    fn install(
+        &self,
+        temp: &str,
+        len: usize,
+        previous: &PreviousFile,
+    ) -> Result<Zeroizing<String>, String> {
+        self.replace(Bytes::Staged(temp, len), previous)
     }
 
     /// Removes DEST (`rm` does not follow a link), printing `removed`.
@@ -1631,20 +1484,14 @@ impl Restore<'_> {
             "{}if [ -n \"$anvil_same\" ]; then echo {unchanged}\n\
              else {sudo}rm -f {d} && echo {removed}; fi\n\
              }}\n",
-            self.head()
+            *self.head("{ umask 077; LC_ALL=C; export LC_ALL; set -f\n")
         )
     }
 }
 
-/// A new `/tmp/anvil-<32 hex>` from 16 bytes of `/dev/urandom`; there is no
-/// weaker fallback.
+/// A new `/tmp/anvil-<32 hex>`, where the password path stages the bytes.
 fn temp_path() -> Result<String, String> {
-    let mut bytes = [0u8; 16];
-    File::open("/dev/urandom")
-        .and_then(|mut urandom| urandom.read_exact(&mut bytes))
-        .map_err(|err| format!("files: cannot read /dev/urandom: {err}"))?;
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    Ok(format!("/tmp/anvil-{hex}"))
+    Ok(format!("/tmp/anvil-{}", random_hex(16)?))
 }
 
 #[cfg(test)]
@@ -1656,8 +1503,43 @@ mod tests {
     use super::*;
     use crate::config::FileEntry;
     use crate::packages::Packages;
+    use crate::remote::checks;
     use crate::test_util::{logged, temp_dir};
     use crate::transport::{Local, Transport};
+
+    /// [`super::tee_script`] that runs as root when it carries checks.
+    fn tee_script(
+        heredoc: &Heredoc<'_>,
+        dest: &str,
+        mode: &str,
+        sudo: &str,
+        checks: &str,
+        expected: &Expected,
+    ) -> Zeroizing<String> {
+        super::tee_script(
+            heredoc,
+            dest,
+            mode,
+            sudo,
+            checks,
+            !checks.is_empty(),
+            expected,
+        )
+        .unwrap()
+    }
+
+    /// [`super::install_script`] from a staged file of `"new\n"`.
+    fn install_script(
+        temp: &str,
+        dest: &str,
+        mode: &str,
+        checks: &str,
+        expected: &Expected,
+    ) -> String {
+        super::install_script(temp, 4, dest, mode, checks, expected)
+            .unwrap()
+            .to_string()
+    }
 
     /// [`super::load`] of a legacy config.
     fn load(
@@ -2180,6 +2062,10 @@ mod tests {
             assert_eq!(run.file().unwrap().upload, None, "{case}");
             assert_eq!(run.sudo_secret, None, "{case}");
             assert!(
+                run.run.contains(&format!("{prefix}mv -f '/etc/.anvil-")),
+                "{case}"
+            );
+            assert!(
                 run.run.contains(&format!("| {prefix}tee '/etc/a'")),
                 "{case}"
             );
@@ -2209,8 +2095,11 @@ mod tests {
         );
         assert!(
             run.run
-                .contains(&format!("sudo install -m 0644 '{temp}' '/etc/a'"))
+                .contains(&format!("anvil_bytes() {{ cat '{temp}'; }}"))
         );
+        assert!(run.run.contains("anvil_bytes | sudo tee '/etc/.anvil-"));
+        assert!(run.run.contains("sudo mv -f '/etc/.anvil-"));
+        assert!(!run.run.contains("sudo install"));
         let other = only_run(true, Some("WEB"), &user_facts("binary"));
         assert_ne!(
             other.file().unwrap().upload.as_ref().unwrap().cleanup,
@@ -2242,7 +2131,7 @@ mod tests {
     }
 
     #[test]
-    fn the_tty_run_is_one_brace_group_that_sets_the_trap_first() {
+    fn the_tty_run_is_one_brace_group_with_one_ordered_trap_first() {
         let run = install_script(
             "/tmp/anvil-00",
             "/etc/a",
@@ -2250,35 +2139,777 @@ mod tests {
             &root_checks("sudo ", "/etc/a"),
             &Expected::Unchecked,
         );
-        assert!(
-            run.starts_with("{ trap \"rm -f '/tmp/anvil-00'; sudo -k\" EXIT\n"),
-            "{run}"
-        );
+        let trap = run.lines().nth(2).unwrap();
+        let (removed, rest) = trap
+            .strip_prefix("trap '[ -z \"$anvil_t\" ] || sudo rm -f '\\''")
+            .unwrap()
+            .split_once("'\\''; rm -f '\\''/tmp/anvil-00'\\''; sudo -k' EXIT")
+            .expect(&run);
+        assert!(removed.starts_with("/etc/.anvil-"), "{run}");
+        assert_eq!(rest, "");
+        assert_eq!(run.matches(" EXIT").count(), 1, "{run}");
         assert!(run.ends_with("\n}\n"), "{run}");
         let lines: Vec<_> = run.lines().collect();
         assert_eq!(lines.iter().filter(|line| **line == "}").count(), 1);
-        assert!(
-            lines[2]
-                == format!(
-                    "{}{{ ! sudo test -d '/etc/a' || {{ echo 'files: /etc/a is a directory' >&2; false; }}; }} \
-                     || exit 4",
-                    root_checks("sudo ", "/etc/a")
-                ),
-            "{run}"
-        );
-        assert!(
-            lines[3].starts_with("if sudo sh -c 'command -v cmp' >/dev/null 2>&1 && sudo cmp -s "),
-            "{run}"
-        );
+        assert!(lines[3].starts_with(
+            "[ -f '/tmp/anvil-00' ] && [ ! -L '/tmp/anvil-00' ] && [ -O '/tmp/anvil-00' ] ||"
+        ));
+        assert!(run.contains(&format!(
+            "{}{{ ! sudo test -d '/etc/a' || {{ echo 'files: /etc/a is a directory' >&2; false; }}; }} \
+             || exit 4",
+            root_checks("sudo ", "/etc/a")
+        )));
         let wrapped = crate::packages::with_password(&run);
         let syntax = std::process::Command::new("/bin/sh")
             .args(["-n", "-c", &wrapped])
             .status()
             .unwrap();
         assert!(syntax.success(), "{wrapped}");
-        assert!(lines[1].starts_with(
-            "[ -f '/tmp/anvil-00' ] && [ ! -L '/tmp/anvil-00' ] && [ -O '/tmp/anvil-00' ] ||"
-        ));
+    }
+
+    /// A write of "new\n" over `dest`, as the login user or through
+    /// `sudo -n` as root, with the checks from `dest`'s directory.
+    fn replacing(dest: &Path, sudo: &str) -> String {
+        let d = dest.to_str().unwrap();
+        let top = dest.parent().unwrap();
+        let checks = match sudo {
+            "" => login_checks(d, top),
+            _ => user_checks(sudo, dest, top),
+        };
+        super::tee_script(
+            &Heredoc::new("new\n").unwrap(),
+            d,
+            "0640",
+            sudo,
+            &checks,
+            !sudo.is_empty(),
+            &Expected::Unchecked,
+        )
+        .unwrap()
+        .to_string()
+    }
+
+    /// A directory holding `dest` with "old\n", and `bin` first on PATH with
+    /// `scripts` over the real tools.
+    fn write_case(tag: &str, scripts: &[(&str, &str)]) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = dir(tag);
+        let bin = bin_with(
+            &dir,
+            &[],
+            &[
+                &[("sudo", "case $1 in -n) shift ;; esac\nexec \"$@\"")],
+                scripts,
+            ]
+            .concat(),
+        );
+        let target = dir.join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let dest = target.join("conf");
+        fs::write(&dest, "old\n").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
+        (dir, bin, dest)
+    }
+
+    /// What is left in `dest`'s directory but `dest`.
+    fn leftovers(dest: &Path) -> Vec<String> {
+        fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name != dest.file_name().unwrap().to_str().unwrap())
+            .collect()
+    }
+
+    const REAL: &str = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
+
+    #[test]
+    fn a_write_replaces_dest_by_a_new_file_and_leaves_no_temp() {
+        for sudo in ["", "sudo -n "] {
+            let (dir, bin, dest) = write_case("files-rename", &[]);
+            let before = fs::metadata(&dest).unwrap().ino();
+            let link = dest.with_file_name("hardlink");
+            fs::hard_link(&dest, &link).unwrap();
+            let out = sh_with(&bin, &replacing(&dest, sudo));
+            assert_eq!(String::from_utf8(out.stderr).unwrap(), "", "{sudo:?}");
+            assert_eq!(out.code, Some(0), "{sudo:?}");
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+            assert_eq!(mode_of(&dest), 0o640);
+            assert_ne!(fs::metadata(&dest).unwrap().ino(), before, "a new inode");
+            assert_eq!(
+                fs::read_to_string(&link).unwrap(),
+                "old\n",
+                "the link splits"
+            );
+            fs::remove_file(&link).unwrap();
+            assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn owner_acl_label_and_mode_reach_the_temp_before_the_rename() {
+        let log = "\"$ANVIL_LOG\"";
+        let logged = |tool: &str| format!("echo \"{tool} $*\" >>{log}\n{REAL} exec {tool} \"$@\"");
+        let chown = format!("echo \"chown $*\" >>{log}");
+        let ls = format!(
+            "{REAL}\ncase $1 in -lLdn) ls -lLdn \"$2\" | awk '{{$3=1234; $4=5678; print}}' ;; *) ls \"$@\" ;; esac"
+        );
+        let (getfacl, setfacl) = (
+            format!(
+                "case $1 in --version) exit 0 ;; esac\necho \"getfacl $*\" >>{log}\necho user::rw-"
+            ),
+            format!(
+                "case $1 in --version) exit 0 ;; esac\ncat >/dev/null\necho \"setfacl $*\" >>{log}"
+            ),
+        );
+        let (chmod, mv) = (logged("chmod"), logged("mv"));
+        let chcon = format!("echo \"chcon $*\" >>{log}");
+        let (dir, bin, dest) = write_case(
+            "files-attrs",
+            &[
+                ("chown", &chown),
+                ("ls", &ls),
+                ("getfacl", &getfacl),
+                ("setfacl", &setfacl),
+                ("chmod", &chmod),
+                ("mv", &mv),
+                ("chcon", &chcon),
+                ("selinuxenabled", "exit 0"),
+            ],
+        );
+        let log = dir.join("log");
+        let script = format!(
+            "ANVIL_LOG={}; export ANVIL_LOG\n{}",
+            quote(log.to_str().unwrap()),
+            replacing(&dest, "sudo -n ")
+        );
+        let out = sh_with(&bin, &script);
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+        assert_eq!(out.code, Some(0));
+        let log = fs::read_to_string(&log).unwrap();
+        let d = dest.display();
+        let tools: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(".anvil-") && !l.starts_with("chmod 600"))
+            .map(|l| l.split(' ').next().unwrap())
+            .collect();
+        assert_eq!(tools, ["chown", "chcon", "setfacl", "chmod", "mv"], "{log}");
+        assert!(log.contains("chown 1234:5678 "), "{log}");
+        assert!(log.contains(&format!("chcon --reference={d} ")), "{log}");
+        assert!(log.contains(&format!("getfacl -p {d}\n")), "{log}");
+        assert!(
+            log.contains(&format!(
+                "chmod 0640 {}/.anvil-",
+                dest.parent().unwrap().display()
+            )),
+            "{log}"
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_temp_is_private_before_it_holds_the_bytes() {
+        let tee = format!(
+            "{REAL}\n\
+             cat >\"$1.in\"\n\
+             ls -ln \"$1\" >>\"$ANVIL_LOG\" 2>/dev/null\n\
+             cat \"$1.in\" >\"$1\"; rm -f \"$1.in\""
+        );
+        for sudo in ["", "sudo -n "] {
+            let (dir, bin, dest) = write_case("files-private", &[("tee", &tee)]);
+            let log = dir.join("log");
+            let script = format!(
+                "ANVIL_LOG={}; export ANVIL_LOG\numask 022\n{}",
+                quote(log.to_str().unwrap()),
+                replacing(&dest, sudo)
+            );
+            let out = sh_with(&bin, &script);
+            assert_eq!(
+                out.code,
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            for line in fs::read_to_string(&log).unwrap().lines() {
+                assert!(line.starts_with("-rw-------"), "{line}");
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_failed_temp_write_is_a_hard_failure_that_never_reaches_tee_of_dest() {
+        // A full disk: `tee` of the temp writes 2 bytes and fails.
+        let tee = "echo \"$1\" >>\"$ANVIL_LOG\"\n/usr/bin/head -c 2 >\"$1\"\nexit 1";
+        for sudo in ["", "sudo -n "] {
+            let (dir, bin, dest) = write_case("files-enospc", &[("tee", tee)]);
+            let log = dir.join("log");
+            let script = format!(
+                "ANVIL_LOG={}; export ANVIL_LOG\n{}",
+                quote(log.to_str().unwrap()),
+                replacing(&dest, sudo)
+            );
+            let out = sh_with(&bin, &script);
+            assert_eq!(out.code, Some(1), "{sudo:?}");
+            let stderr = String::from_utf8(out.stderr).unwrap();
+            assert!(stderr.contains("cannot write a temp file"), "{stderr}");
+            assert!(!stderr.contains("not written atomically"), "{stderr}");
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+            assert_eq!(mode_of(&dest), 0o644);
+            let log = fs::read_to_string(&log).unwrap();
+            assert!(!log.lines().any(|l| l == dest.to_str().unwrap()), "{log}");
+            assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_short_temp_is_a_hard_failure_too() {
+        // `head` is gone or cut short: `tee` succeeds on fewer bytes than it should.
+        let (dir, bin, dest) = write_case("files-short", &[("head", "exit 0")]);
+        let out = sh_with(&bin, &replacing(&dest, ""));
+        assert_eq!(out.code, Some(1));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        assert!(leftovers(&dest).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failing_mv_falls_back_in_place_from_the_full_temp_and_warns() {
+        for sudo in ["", "sudo -n "] {
+            let (dir, bin, dest) = write_case("files-mvfail", &[("mv", "exit 1")]);
+            let out = sh_with(&bin, &replacing(&dest, sudo));
+            assert_eq!(out.code, Some(0), "{sudo:?}");
+            assert_eq!(
+                String::from_utf8(out.stderr).unwrap(),
+                format!(
+                    "files: {}: not written atomically: mv failed\n",
+                    dest.display()
+                )
+            );
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+            assert_eq!(mode_of(&dest), 0o640);
+            assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_directory_it_cannot_write_falls_back_in_place_and_warns() {
+        if rustix::process::getuid().is_root() {
+            return;
+        }
+        let (dir, bin, dest) = write_case("files-rodir", &[]);
+        let parent = dest.parent().unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let out = sh_with(&bin, &replacing(&dest, ""));
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(out.code, Some(0));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!(
+                "files: {}: not written atomically: its directory is not writable\n",
+                dest.display()
+            )
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+        assert_eq!(mode_of(&dest), 0o640);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `ls -lLdn` of DEST reports it owned by another user or group.
+    fn foreign_ls(uid: bool) -> String {
+        let field = if uid { "$3=1234" } else { "$4=5678" };
+        format!(
+            "{REAL}\ncase $1 in -lLdn) ls -lLdn \"$2\" | awk '{{{field}; print}}' ;; *) ls \"$@\" ;; esac"
+        )
+    }
+
+    #[test]
+    fn an_owner_mismatch_as_the_user_warns_and_writes_in_place() {
+        let (dir, bin, dest) = write_case("files-mismatch", &[("ls", &foreign_ls(false))]);
+        let before = fs::metadata(&dest).unwrap().ino();
+        let out = sh_with(&bin, &replacing(&dest, ""));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.code, Some(0), "{stderr}");
+        assert!(
+            stderr.starts_with(&format!(
+                "files: {}: not written atomically: it is owned by ",
+                dest.display()
+            )),
+            "{stderr}"
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+        assert_eq!(fs::metadata(&dest).unwrap().ino(), before, "in place");
+        assert_eq!(mode_of(&dest), 0o640);
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_foreign_dest_of_another_mode_is_refused_before_the_bytes() {
+        // Its owner alone may chmod it, so a 0640 entry cannot tighten a 0644 file.
+        let (dir, bin, dest) = write_case(
+            "files-foreign",
+            &[
+                ("ls", &foreign_ls(true)),
+                (
+                    "chmod",
+                    "case $2 in *.anvil-*) /bin/chmod \"$@\" ;; *) exit 1 ;; esac",
+                ),
+            ],
+        );
+        let out = sh_with(&bin, &replacing(&dest, ""));
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o640)).unwrap();
+        let out = sh_with(&bin, &replacing(&dest, ""));
+        assert_eq!(out.code, Some(0));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+        let again = sh_with(&bin, &replacing(&dest, ""));
+        assert_eq!(
+            (again.code, String::from_utf8(again.stdout).unwrap()),
+            (Some(0), format!("unchanged {}\n", dest.display()))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Writes a temp as `tee` does, but only empties anything else.
+    const TRUNCATING_TEE: &str =
+        "case $1 in *.anvil-*) exec /usr/bin/tee \"$1\" ;; *) : >\"$1\" ;; esac";
+
+    /// A `chmod` that, when it tightens DEST just before the `tee` of it,
+    /// removes `gone` (a glob) first.
+    fn chmod_removing(gone: &str) -> String {
+        format!("case $2 in *.anvil-*) ;; *) /bin/rm -f {gone} ;; esac\nexec /bin/chmod \"$@\"")
+    }
+
+    #[test]
+    fn a_temp_gone_at_tee_time_leaves_dest_intact() {
+        for sudo in ["", "sudo -n "] {
+            let (dir, _, dest) = write_case("files-race", &[]);
+            let temps = format!("{}/.anvil-*", dest.parent().unwrap().display());
+            let chmod = chmod_removing(&temps);
+            fs::remove_dir_all(dir.join("bin")).unwrap();
+            let bin = bin_with(
+                &dir,
+                &[],
+                &[
+                    ("sudo", "case $1 in -n) shift ;; esac\nexec \"$@\""),
+                    ("mv", "exit 1"),
+                    ("chmod", &chmod),
+                ],
+            );
+            let out = sh_with(&bin, &replacing(&dest, sudo));
+            assert_ne!(out.code, Some(0), "{sudo:?}");
+            assert!(out.stdout.is_empty(), "{sudo:?}");
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n", "{sudo:?}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_stage_gone_at_tee_time_leaves_dest_intact() {
+        if rustix::process::getuid().is_root() {
+            return;
+        }
+        let (dir, _, dest) = write_case("files-stagerace", &[]);
+        let parent = dest.parent().unwrap().to_owned();
+        let staged = dir.join("staged");
+        fs::write(&staged, "new\n").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+        let chmod = chmod_removing(&quote(staged.to_str().unwrap()));
+        fs::remove_dir_all(dir.join("bin")).unwrap();
+        let bin = bin_with(
+            &dir,
+            &[],
+            &[
+                (
+                    "sudo",
+                    "case $1 in -k) exit 0 ;; -n) shift ;; esac\nexec \"$@\"",
+                ),
+                ("chmod", &chmod),
+            ],
+        );
+        let script = install_script(
+            staged.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            "0640",
+            &user_checks("sudo ", &dest, &parent),
+            &Expected::Unchecked,
+        );
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let out = sh_with(&bin, &script);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_ne!(out.code, Some(0));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_wc_is_named_and_leaves_dest_intact() {
+        if rustix::process::getuid().is_root() {
+            return;
+        }
+        let (dir, _, dest) = write_case("files-nowc", &[]);
+        let parent = dest.parent().unwrap().to_owned();
+        fs::remove_dir_all(dir.join("bin")).unwrap();
+        let bin = bin_with(
+            &dir,
+            &[
+                "head", "tee", "chmod", "sh", "cmp", "id", "ls", "find", "rm", "test",
+            ],
+            &[],
+        );
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let out = sh_only(&bin, &replacing(&dest, ""));
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(out.code, Some(1));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains("no wc on the target"), "{stderr}");
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_in_place_fallback_keeps_the_acl_so_it_does_not_warn() {
+        let ls = format!(
+            "{REAL}\ncase $1 in -lLdn) ls -lLdn \"$2\" | awk '{{$1=$1\"+\"; print}}' ;; *) ls \"$@\" ;; esac"
+        );
+        let (dir, bin, dest) = write_case(
+            "files-aclkept",
+            &[("ls", &ls), ("getfacl", "exit 1"), ("mv", "exit 1")],
+        );
+        let out = sh_with(&bin, &replacing(&dest, "sudo -n "));
+        assert_eq!(out.code, Some(0));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!(
+                "files: {}: not written atomically: mv failed\n",
+                dest.display()
+            )
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_temp_gone_when_mv_failed_never_truncates_dest() {
+        for sudo in ["", "sudo -n "] {
+            let (dir, bin, dest) = write_case("files-gone", &[("mv", "/bin/rm -f \"$2\"\nexit 1")]);
+            let out = sh_with(&bin, &replacing(&dest, sudo));
+            assert_eq!(out.code, Some(1), "{sudo:?}");
+            assert!(out.stdout.is_empty(), "{sudo:?}");
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n", "{sudo:?}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_mode_without_owner_read_still_falls_back_from_the_temp() {
+        if rustix::process::getuid().is_root() {
+            return;
+        }
+        let (dir, bin, dest) = write_case("files-0200", &[("mv", "exit 1")]);
+        let d = dest.to_str().unwrap();
+        let script = super::tee_script(
+            &Heredoc::new("new\n").unwrap(),
+            d,
+            "0200",
+            "",
+            &login_checks(d, dest.parent().unwrap()),
+            false,
+            &Expected::Unchecked,
+        )
+        .unwrap();
+        let out = sh_with(&bin, &script);
+        assert_eq!(
+            out.code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(mode_of(&dest), 0o200);
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_fallback_that_wrote_the_wrong_bytes_fails_loudly() {
+        let (dir, bin, dest) =
+            write_case("files-badcat", &[("mv", "exit 1"), ("tee", TRUNCATING_TEE)]);
+        let out = sh_with(&bin, &replacing(&dest, ""));
+        assert_eq!(out.code, Some(1));
+        assert!(out.stdout.is_empty(), "no wrote line");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains(&format!(
+                "files: {} does not hold the bytes written",
+                dest.display()
+            )),
+            "{stderr}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_in_place_write_never_truncates_dest_from_a_missing_source() {
+        if rustix::process::getuid().is_root() {
+            return;
+        }
+        // Without `head` the heredoc prints nothing.
+        let (dir, bin, dest) = write_case("files-nohead", &[("head", "exit 0")]);
+        let parent = dest.parent().unwrap().to_owned();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let out = sh_with(&bin, &replacing(&dest, ""));
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(out.code, Some(1));
+        assert!(out.stdout.is_empty());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        fs::remove_dir_all(&dir).unwrap();
+
+        // A staged file that lost its bytes.
+        let (dir, bin, dest) = write_case("files-nostage", &[]);
+        let parent = dest.parent().unwrap().to_owned();
+        let staged = dir.join("staged");
+        fs::write(&staged, "").unwrap();
+        let script = install_script(
+            staged.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            "0640",
+            &user_checks("sudo ", &dest, &parent),
+            &Expected::Unchecked,
+        );
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let out = sh_with(&bin, &script);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(out.code, Some(1));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_sweep_spares_a_young_temp_of_the_same_dest() {
+        let (dir, bin, dest) = write_case("files-young", &[]);
+        let script = replacing(&dest, "");
+        let prefix = temp_beside(dest.to_str().unwrap()).unwrap();
+        let prefix = &prefix[..prefix.len() - 16];
+        let (young, old) = (
+            format!("{prefix}aaaaaaaaaaaaaaaa"),
+            format!("{prefix}bbbbbbbbbbbbbbbb"),
+        );
+        for temp in [&young, &old] {
+            fs::write(temp, "x").unwrap();
+        }
+        let hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(hours_ago)
+            .unwrap();
+        let out = sh_with(&bin, &script);
+        assert_eq!(out.code, Some(0));
+        assert!(Path::new(&young).exists(), "a concurrent run may own it");
+        assert!(!Path::new(&old).exists(), "an old one is what a kill left");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_dest_with_an_acl_that_cannot_be_copied_warns() {
+        let ls = format!(
+            "{REAL}\ncase $1 in -lLdn) ls -lLdn \"$2\" | awk '{{$1=$1\"+\"; print}}' ;; *) ls \"$@\" ;; esac"
+        );
+        let (dir, bin, dest) = write_case("files-acl", &[("ls", &ls), ("getfacl", "exit 1")]);
+        let out = sh_with(&bin, &replacing(&dest, "sudo -n "));
+        assert_eq!(out.code, Some(0));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!(
+                "files: {}: its ACL was not kept: no GNU getfacl and setfacl\n",
+                dest.display()
+            )
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_foreign_dest_prints_no_atomic_warning() {
+        let chmod = "case $2 in *.anvil-*) /bin/chmod \"$@\" ;; *) exit 1 ;; esac";
+        let (dir, bin, dest) = write_case(
+            "files-nowarn",
+            &[("ls", &foreign_ls(true)), ("chmod", chmod)],
+        );
+        let out = sh_with(&bin, &replacing(&dest, ""));
+        assert_eq!(out.code, Some(REFUSED));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(!stderr.contains("not written atomically"), "{stderr}");
+        assert!(stderr.contains("cannot be given mode"), "{stderr}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_password_path_removes_the_dest_temp_then_the_stage_then_the_ticket() {
+        let sudo = "echo \"sudo $*\" >>\"$ANVIL_LOG\"\ncase $1 in -k) exit 0 ;; esac\nexec \"$@\"";
+        let rm = "echo \"rm $*\" >>\"$ANVIL_LOG\"\nexec /bin/rm \"$@\"";
+        let chmod = "case $1 in 0640) exit 1 ;; esac\nexec /bin/chmod \"$@\"";
+        let (dir, bin, dest) = write_case(
+            "files-pwleak",
+            &[("sudo", sudo), ("rm", rm), ("chmod", chmod)],
+        );
+        let (log, staged) = (dir.join("log"), dir.join("staged"));
+        fs::write(&staged, "new\n").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+        let script = format!(
+            "ANVIL_LOG={}; export ANVIL_LOG\n{}",
+            quote(log.to_str().unwrap()),
+            install_script(
+                staged.to_str().unwrap(),
+                dest.to_str().unwrap(),
+                "0640",
+                &user_checks("sudo ", &dest, dest.parent().unwrap()),
+                &Expected::Unchecked,
+            )
+        );
+        let out = sh_with(&bin, &script);
+        assert_eq!(out.code, Some(1));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+        assert!(!staged.exists());
+        let log = fs::read_to_string(&log).unwrap();
+        let tail: Vec<&str> = log
+            .lines()
+            .filter(|l| {
+                l.starts_with("sudo rm")
+                    || l == &"sudo -k"
+                    || (l.starts_with("rm ") && l.contains("staged"))
+            })
+            .collect();
+        assert_eq!(tail.len(), 3, "{log}");
+        assert!(
+            tail[0].starts_with("sudo rm -f ") && tail[0].contains(".anvil-"),
+            "{log}"
+        );
+        assert!(
+            tail[1].starts_with("rm -f ") && tail[1].ends_with("staged"),
+            "{log}"
+        );
+        assert_eq!(tail[2], "sudo -k");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_interrupted_write_leaves_dest_old_and_a_kill_is_swept_next_time() {
+        for (signal, leaves_temp) in [("TERM", false), ("KILL", true)] {
+            let mv = format!("kill -{signal} $PPID\nsleep 1\nexit 1");
+            let (dir, bin, dest) = write_case("files-interrupt", &[("mv", &mv)]);
+            // Another dest's temp, which must survive the sweep.
+            let other = dest.with_file_name(".anvil-0000000000000000-0000000000000000");
+            fs::write(&other, "other").unwrap();
+            let out = sh_with(&bin, &replacing(&dest, ""));
+            assert_ne!(out.code, Some(0), "{signal}");
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n", "{signal}");
+            assert_eq!(mode_of(&dest), 0o644, "{signal}");
+            assert_eq!(
+                leftovers(&dest).len(),
+                1 + usize::from(leaves_temp),
+                "{signal}"
+            );
+            fs::remove_file(bin.join("mv")).unwrap();
+            // What a kill left, aged past any run that could still own it.
+            let hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+            for name in leftovers(&dest) {
+                fs::File::options()
+                    .write(true)
+                    .open(dest.with_file_name(name))
+                    .unwrap()
+                    .set_modified(hours_ago)
+                    .unwrap();
+            }
+            let out = sh_with(&bin, &replacing(&dest, ""));
+            assert_eq!(out.code, Some(0), "{signal}");
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n", "{signal}");
+            assert_eq!(
+                leftovers(&dest),
+                [other.file_name().unwrap().to_str().unwrap()]
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_write_as_the_user_refuses_an_unsafe_directory_and_the_shared_tmp() {
+        let dir = dir("files-userdir");
+        let open = dir.join("open");
+        fs::create_dir(&open).unwrap();
+        for mode in [0o775, 0o757, 0o1777] {
+            fs::set_permissions(&open, fs::Permissions::from_mode(mode)).unwrap();
+            let dest = open.join("conf");
+            let d = dest.to_str().unwrap();
+            let script = tee_script(
+                &Heredoc::new("new\n").unwrap(),
+                d,
+                "0640",
+                "",
+                &login_checks(d, &dir),
+                &Expected::Unchecked,
+            );
+            let out = Local.run(&script, RUN_TIMEOUT).unwrap();
+            assert_eq!(out.code, Some(REFUSED), "{mode:o}");
+            assert_eq!(
+                String::from_utf8(out.stderr).unwrap(),
+                format!(
+                    "files: {} is not owned by root or the login user, or others can write it; \
+                     anvil will not write under it\n",
+                    open.display()
+                ),
+            );
+            assert!(!dest.exists());
+        }
+        let dest = dir.join("conf");
+        let d = dest.to_str().unwrap();
+        let script = tee_script(
+            &Heredoc::new("new\n").unwrap(),
+            d,
+            "0640",
+            "",
+            &login_checks(d, Path::new("/")),
+            &Expected::Unchecked,
+        );
+        let out = Local.run(&script, RUN_TIMEOUT).unwrap();
+        assert_eq!(out.code, Some(REFUSED));
+        assert!(
+            String::from_utf8(out.stderr)
+                .unwrap()
+                .contains("/tmp is not owned by root or the login user"),
+            "sticky, world-writable /tmp or the macOS link to it"
+        );
+        assert!(!dest.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_scripts_quote_a_hostile_dest_and_carry_the_bytes_once() {
+        let dir = dir("files-hostile");
+        let dest = dir.join("a'b\"c$d e`f");
+        let (out, again) = {
+            let script = replacing(&dest, "");
+            assert_eq!(script.matches("new\n").count(), 1, "{script}");
+            (
+                Local.run(&script, RUN_TIMEOUT).unwrap(),
+                Local.run(&replacing(&dest, ""), RUN_TIMEOUT).unwrap(),
+            )
+        };
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+        assert_eq!(out.code, Some(0));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+        assert_eq!(again.code, Some(0));
+        assert!(leftovers(&dest).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2393,7 +3024,9 @@ mod tests {
         let dir = dir("files-nocmp");
         let bin = passthrough_sudo(&dir);
         let path = std::env::var("PATH").unwrap();
-        for tool in ["head", "tee", "chmod", "test", "sh", "find"] {
+        for tool in [
+            "head", "tee", "chmod", "test", "sh", "find", "mv", "id", "ls", "chown", "rm",
+        ] {
             let found = std::env::split_paths(&path)
                 .map(|p| p.join(tool))
                 .find(|p| p.is_file())
@@ -2485,7 +3118,7 @@ mod tests {
     /// from `top` down to DEST's and with `top`'s owner for root, since a temp
     /// dir is the user's.
     fn user_checks(sudo: &str, dest: &Path, top: &Path) -> String {
-        let owner = fs::metadata(top).unwrap().uid().to_string();
+        let owner = format!("-user {}", fs::metadata(top).unwrap().uid());
         let mut dirs: Vec<&str> = dest
             .ancestors()
             .skip(1)
@@ -2699,25 +3332,31 @@ mod tests {
     }
 
     #[test]
-    fn a_write_as_the_user_follows_a_symlinked_dest() {
+    fn a_write_as_the_user_refuses_a_symlinked_dest_dangling_or_not() {
         let dir = dir("files-userlink");
-        let real = dir.join("real");
-        let link = dir.join("link");
+        let (real, link, dangling) = (dir.join("real"), dir.join("link"), dir.join("dangling"));
         fs::write(&real, "old\n").unwrap();
         symlink(&real, &link).unwrap();
-        let link_str = link.to_str().unwrap();
-        let script = tee_script(
-            &Heredoc::new("new\n").unwrap(),
-            link_str,
-            "0640",
-            "",
-            "",
-            &Expected::Unchecked,
-        );
-        assert_eq!(sh(&script), (Some(0), format!("wrote {link_str}\n")));
-        assert_eq!(fs::read_link(&link).unwrap(), real);
-        assert_eq!(fs::read_to_string(&real).unwrap(), "new\n");
-        assert_eq!(mode_of(&real), 0o640);
+        symlink(dir.join("made"), &dangling).unwrap();
+        for dest in [&link, &dangling] {
+            let d = dest.to_str().unwrap();
+            let script = tee_script(
+                &Heredoc::new("new\n").unwrap(),
+                d,
+                "0640",
+                "",
+                &login_checks(d, &dir),
+                &Expected::Unchecked,
+            );
+            let out = Local.run(&script, RUN_TIMEOUT).unwrap();
+            assert_eq!(out.code, Some(REFUSED), "{d}");
+            assert_eq!(
+                String::from_utf8(out.stderr).unwrap(),
+                format!("files: {d} is a symlink; point dest at the real file\n")
+            );
+        }
+        assert_eq!(fs::read_to_string(&real).unwrap(), "old\n");
+        assert!(!dir.join("made").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2802,9 +3441,7 @@ mod tests {
     /// The capture of `dest` as the user would run it, parsed.
     fn capture(dest: &Path) -> Result<Captured, String> {
         let d = dest.to_str().unwrap();
-        let out = Local
-            .run(&capture_script(d, "", "", false), RUN_TIMEOUT)
-            .unwrap();
+        let out = Local.run(&capture_script(d, "", ""), RUN_TIMEOUT).unwrap();
         match out.code {
             Some(0) => parse_capture(d, &out.stdout),
             _ => Err(String::from_utf8(out.stderr).unwrap()),
@@ -2886,24 +3523,22 @@ mod tests {
     }
 
     #[test]
-    fn the_capture_follows_a_user_symlink_and_reports_a_dangling_one() {
+    fn the_capture_as_the_user_refuses_a_symlink_dangling_or_not() {
         let dir = dir("files-capture-link");
-        let (real, link) = (dir.join("real"), dir.join("link"));
+        let (real, link, dangling) = (dir.join("real"), dir.join("link"), dir.join("dangling"));
         fs::write(&real, "old\n").unwrap();
-        fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
         symlink(&real, &link).unwrap();
-        let (mode, .., bytes, _) = file_of(capture(&link).unwrap());
-        assert_eq!(
-            (mode.as_str(), bytes.as_deref()),
-            ("0644", Some(b"old\n".as_slice()))
-        );
-
-        let missing = dir.join("missing");
-        let dangling = dir.join("dangling");
-        symlink(&missing, &dangling).unwrap();
-        match capture(&dangling).unwrap() {
-            Captured::Dangling { target } => assert_eq!(target, missing.to_str().unwrap()),
-            other => panic!("{other:?}"),
+        symlink(dir.join("missing"), &dangling).unwrap();
+        for dest in [&link, &dangling] {
+            let d = dest.to_str().unwrap();
+            let script = capture_script(d, "", &login_checks(d, &dir));
+            let out = Local.run(&script, RUN_TIMEOUT).unwrap();
+            assert_ne!(out.code, Some(0), "{d}");
+            assert!(out.stdout.is_empty(), "{d}");
+            assert_eq!(
+                String::from_utf8(out.stderr).unwrap(),
+                format!("files: {d} is a symlink; point dest at the real file\n")
+            );
         }
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2988,7 +3623,7 @@ mod tests {
         let dir = dir("files-capture-nood");
         let path = dir.join("conf");
         fs::write(&path, SECRET_TEXT).unwrap();
-        let script = capture_script(path.to_str().unwrap(), "", "", false);
+        let script = capture_script(path.to_str().unwrap(), "", "");
         let tools: Vec<&str> = BASE.iter().chain(&HASHERS).copied().collect();
         // An od that answers the probe, then fails partway through DEST.
         let partial = "[ $# -eq 2 ] && exit 0; printf ' 74 6f\\n'; exit 1";
@@ -3052,7 +3687,7 @@ mod tests {
         let run = |dest: &Path| {
             let d = dest.to_str().unwrap();
             let checks = user_checks("sudo -n ", dest, &dir);
-            sh_with(&bin, &capture_script(d, "sudo -n ", &checks, true))
+            sh_with(&bin, &capture_script(d, "sudo -n ", &checks))
         };
         let sub = dir.join("sub");
         fs::create_dir(&sub).unwrap();
@@ -3103,7 +3738,7 @@ mod tests {
         fs::write(&dest, "x").unwrap();
         let out = sh_with(
             &bin,
-            &capture_script(dest.to_str().unwrap(), "sudo -n ", "", true),
+            &capture_script(dest.to_str().unwrap(), "sudo -n ", ""),
         );
         assert_ne!(out.code, Some(0));
         assert!(out.stdout.is_empty());
@@ -3283,8 +3918,8 @@ mod tests {
         fs::write(&path, SECRET_TEXT).unwrap();
         let d = path.to_str().unwrap();
         let (captured, lines) = logged(|| {
-            for (sudo, as_root) in [("", false), ("sudo -n ", true), ("sudo ", true)] {
-                let script = capture_script(d, sudo, &root_checks(sudo, d), as_root);
+            for sudo in ["", "sudo -n ", "sudo "] {
+                let script = capture_script(d, sudo, &root_checks(sudo, d));
                 assert!(!script.contains("hunter2"), "{script}");
                 spawn_for(&script, sudo == "sudo ");
             }
@@ -3303,10 +3938,8 @@ mod tests {
     #[test]
     fn the_root_checks_refuse_a_symlink_once() {
         let checks = root_checks("sudo -n ", "/etc/a");
-        for checks in ["", checks.as_str()] {
-            let script = capture_script("/etc/a", "sudo -n ", checks, true);
-            assert_eq!(script.matches("is a symlink").count(), 1, "{script}");
-        }
+        let script = capture_script("/etc/a", "sudo -n ", &checks);
+        assert_eq!(script.matches("is a symlink").count(), 1, "{script}");
     }
 
     #[test]
@@ -3324,7 +3957,7 @@ mod tests {
         let d = dest.to_str().unwrap();
         // On a terminal stderr is stdout.
         let run = || {
-            let script = capture_script(d, "sudo ", "", false);
+            let script = capture_script(d, "sudo ", "");
             let out = sh_with(&bin, &format!("{{\n{script}}} 2>&1\n"));
             assert_eq!(out.code, Some(0));
             parse_capture(d, &out.stdout)
@@ -3368,7 +4001,7 @@ mod tests {
         // On a terminal stderr is stdout; `sudo -v` warns first, as
         // `with_password` runs it before the script.
         let run = || {
-            let script = capture_script(d, "sudo ", &checks, true);
+            let script = capture_script(d, "sudo ", &checks);
             let out = sh_with(&bin, &format!("{{\nsudo true\n{script}}} 2>&1\n"));
             assert_eq!(out.code, Some(0));
             parse_capture(d, &out.stdout)
@@ -3382,7 +4015,7 @@ mod tests {
 
     #[test]
     fn the_capture_script_is_valid_sh_on_the_password_path() {
-        let script = capture_script("/etc/a", "sudo ", &root_checks("sudo ", "/etc/a"), true);
+        let script = capture_script("/etc/a", "sudo ", &root_checks("sudo ", "/etc/a"));
         let wrapped = crate::packages::with_password(&script);
         let syntax = std::process::Command::new("/bin/sh")
             .args(["-n", "-c", &wrapped])
@@ -3476,7 +4109,13 @@ mod tests {
     #[test]
     fn without_a_hash_tool_the_write_is_not_checked() {
         let dir = dir("files-guard-nohash");
-        let bin = bin_with(&dir, &["head", "tee", "chmod", "sh", "cmp"], &[]);
+        let bin = bin_with(
+            &dir,
+            &[
+                "head", "tee", "chmod", "sh", "cmp", "mv", "id", "ls", "chown", "rm", "find",
+            ],
+            &[],
+        );
         let dest = dir.join("conf");
         fs::write(&dest, "changed\n").unwrap();
         let expected = Expected::Sha256(sha_hex(b"old\n"));
@@ -3510,9 +4149,6 @@ mod tests {
             assert_eq!(write.password, secret.is_some());
             let (script, upload) = write_script(&write, &sources, &Expected::Unchecked).unwrap();
             assert_eq!(upload.is_some(), secret.is_some());
-            if secret.is_none() {
-                assert_eq!(script, run.run, "Unchecked is the planned script");
-            }
             assert!(!script.contains("anvil_sha256"));
             let (guarded, _) =
                 write_script(&write, &sources, &Expected::Sha256(sha_hex(b"x"))).unwrap();
@@ -3584,7 +4220,9 @@ mod tests {
     /// Runs the restore of each of `files` as the user, `force`d, in order;
     /// each one's exit code, stdout and stderr.
     fn restore(files: &[FileRecord], force: &Force) -> Vec<(Option<i32>, String, String)> {
-        let runs = restore_runs(
+        let top = Path::new(&files[0].dest).parent().unwrap();
+        let runs = restore_runs_from(
+            top,
             &Config::default(),
             &host(&[], None),
             &user_facts("nopasswd"),
@@ -3771,7 +4409,13 @@ mod tests {
     #[test]
     fn without_a_hash_tool_a_written_dest_is_refused_unless_forced() {
         let dir = dir("files-restore-nohash");
-        let bin = bin_with(&dir, &["head", "tee", "chmod", "sh", "ls", "rm"], &[]);
+        let bin = bin_with(
+            &dir,
+            &[
+                "head", "tee", "chmod", "sh", "ls", "rm", "mv", "id", "chown", "find",
+            ],
+            &[],
+        );
         let dest = dir.join("conf");
         let d = dest.display();
         let written = recorded(
@@ -3786,7 +4430,8 @@ mod tests {
         };
         let run = |file: &FileRecord, force: &Force| {
             fs::write(&dest, "v1\n").unwrap();
-            let runs = restore_runs(
+            let runs = restore_runs_from(
+                &dir,
                 &Config::default(),
                 &host(&[], None),
                 &user_facts("nopasswd"),
@@ -3855,6 +4500,7 @@ mod tests {
                 let text = previous.text.as_deref().unwrap();
                 restore
                     .tee(&Heredoc::new(text).unwrap(), previous)
+                    .unwrap()
                     .to_string()
             }
             _ => restore.remove(&format!("removed {}", file.dest)),
@@ -3902,11 +4548,20 @@ mod tests {
         let (uid, gid) = ids(&dir);
         let d = dest.display();
         let log = fs::read_to_string(&log).unwrap();
-        let tail: Vec<&str> = log.lines().rev().take(2).collect();
-        assert_eq!(
-            tail,
-            [format!("chmod 0640 {d}"), format!("chown {uid}:{gid} {d}")]
+        let temp = format!(
+            "{}/.anvil-{}-",
+            sub.display(),
+            &hex(&Sha256::digest(dest.to_str().unwrap().as_bytes()))[..16]
         );
+        let on_temp: Vec<&str> = log.lines().filter(|l| l.contains(&temp)).collect();
+        let (chown, chmod) = (
+            on_temp
+                .iter()
+                .position(|l| l.starts_with(&format!("chown {uid}:{gid} "))),
+            on_temp.iter().position(|l| l.starts_with("chmod 0640 ")),
+        );
+        assert!(chown.unwrap() < chmod.unwrap(), "{log}");
+        assert!(!log.contains(&format!("chown {uid}:{gid} {d}\n")), "{log}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3985,10 +4640,15 @@ mod tests {
             .strip_suffix('\'')
             .unwrap();
         let (uid, gid) = ids(&dir);
-        assert!(run.run.contains(&format!(
-            "sudo install -o {uid} -g {gid} -m 0640 '{temp}' '{}'",
-            dest.display()
-        )));
+        assert!(
+            run.run
+                .contains(&format!("anvil_bytes() {{ cat '{temp}'; }}"))
+        );
+        assert!(run.run.contains(&format!("sudo chown {uid}:{gid} '")));
+        assert!(
+            run.run
+                .contains(&format!("' '{}'; then anvil_t=", dest.display()))
+        );
         assert!(upload.stage.contains(SECRET_TEXT));
         assert!(
             !run.run.contains("hunter2"),
@@ -4008,7 +4668,9 @@ mod tests {
         let Previous::File(previous) = &file.previous else {
             unreachable!()
         };
-        let script = restore.install(local_temp.to_str().unwrap(), previous);
+        let script = restore
+            .install(local_temp.to_str().unwrap(), SECRET_TEXT.len(), previous)
+            .unwrap();
         for expected in ["restored", "unchanged"] {
             let stage = stage_script(
                 &Heredoc::new(SECRET_TEXT).unwrap(),
@@ -4194,8 +4856,8 @@ mod tests {
     /// [`hash_run`] with the parent test over the directories from `top`
     /// down, owned by `top`'s owner, as [`user_checks`] builds them.
     fn user_hash_script(dests: &[HashDest], sudo: &str, top: &Path) -> String {
-        let owner = fs::metadata(top).unwrap().uid().to_string();
-        hash_run(dests, sudo, top, &owner).unwrap()
+        let owner = format!("-user {}", fs::metadata(top).unwrap().uid());
+        hash_run(dests, sudo, top, &owner, top).unwrap()
     }
 
     /// A sudo that logs each call to `calls` and runs the rest as the user.
@@ -4242,6 +4904,7 @@ mod tests {
             (sub.join("link"), false),
             (sub.clone(), false),
             (unreadable.clone(), false),
+            (open.join("conf"), false),
             (file.clone(), true),
             (sub.join("link"), true),
             (sub.join("dangling"), true),
@@ -4262,10 +4925,11 @@ mod tests {
             vec![
                 (FileState::File, x.clone()),
                 (FileState::Absent, None),
-                (FileState::Dangling, None),
-                (FileState::File, x.clone()),
+                (FileState::Symlink, None),
+                (FileState::Symlink, None),
                 (FileState::NotRegular, None),
                 unread,
+                (FileState::NotRootOnly, None),
                 (FileState::File, x),
                 (FileState::Symlink, None),
                 (FileState::Symlink, None),
@@ -4286,7 +4950,7 @@ mod tests {
         fs::remove_file(&calls).unwrap();
         let users: Vec<HashDest> = dests.iter().filter(|d| !d.as_root).copied().collect();
         let out = sh_with(&bin, &user_hash_script(&users, "sudo -n ", &dir));
-        assert_eq!(parse_hashes(users.len(), &out.stdout).unwrap().len(), 6);
+        assert_eq!(parse_hashes(users.len(), &out.stdout).unwrap().len(), 7);
         assert!(!calls.exists(), "no sudo without an as-root dest");
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
         fs::remove_dir_all(&dir).unwrap();
@@ -4297,7 +4961,7 @@ mod tests {
         let dir = dir("files-hash-notool");
         let bin = bin_with(
             &dir,
-            &["sh", "find"],
+            &["sh", "find", "id"],
             &[("sudo", "case $1 in -n) shift ;; esac\nexec \"$@\"")],
         );
         let file = dir.join("conf");
@@ -4539,13 +5203,19 @@ mod tests {
         fs::create_dir_all(locked.join("sub")).unwrap();
         fs::write(locked.join("sub/conf"), "x").unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // BSD `find` cannot even test a directory it may not enter.
+        let locked_state = if cfg!(target_os = "macos") {
+            FileState::NotRootOnly
+        } else {
+            FileState::Unreadable
+        };
         let (conf, gone) = (locked.join("sub/conf"), dir.join("gone/deeper/conf"));
         let dests = [dest(&conf, false), dest(&gone, false)];
         let out = sh_with(&dir, &user_hash_script(&dests, "", &dir));
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
             parse_hashes(2, &out.stdout).unwrap(),
-            vec![(FileState::Unreadable, None), (FileState::Absent, None)]
+            vec![(locked_state, None), (FileState::Absent, None)]
         );
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -4563,7 +5233,6 @@ mod tests {
         );
         for word in [
             "absent",
-            "dangling",
             "symlink",
             "not_regular",
             "unreadable",
