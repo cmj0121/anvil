@@ -314,7 +314,7 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
 The store is the folder `files` in the [workspace](configuration.md#the-workspace): by default
 `$XDG_CONFIG_HOME/anvil/files`, else `~/.config/anvil/files`; beside the config with `--config PATH`; under
 `[anvil].workspace` when set. Every action loads the config to find it, so a config that does not load is exit 2 with
-its error. A workspace that others can write, or that another user owns, gets a WARN, not a refusal
+its error. A workspace that others can write, or that another user owns, is refused, exit 2
 ([The workspace](configuration.md#the-workspace)): whoever can write it controls what `[[files]]` copies. Every
 action works on this machine only; it ignores `--target` and `--parallel` with a warning, shown from `-v`.
 
@@ -973,7 +973,9 @@ for a rollback). A filesystem without `flock`, as NFS can be, fails with
 ends, and its save is tried too. The command then fails, exit 1, after the blocks print, with the first error and the targets
 the record still lacks: `apply: cannot write last-apply.json: REASON; not recorded: web1, web2`. A record that cannot
 be read fails apply before any target, with `apply: PATH: REASON`: `a symlink, refused`, `not a regular file`,
-`mode 640 lets others in; run chmod 600 on it`, `larger than the 16777216 byte limit`, `version N is not supported` or
+`mode 640 lets others in; run chmod 600 on it`,
+`not owned by the current user; run chown on it, or do not run anvil through sudo`,
+`larger than the 16777216 byte limit`, `version N is not supported` or
 `cannot parse`. Its content is never quoted.
 
 **What is lost.** A target that fails with `internal error: …` (a bug in anvil) is not recorded and keeps its earlier
@@ -1091,7 +1093,8 @@ ERROR anvil: plugins.harden.sha256: does not match /home/me/.config/anvil/plugin
 ERROR anvil: plugins.harden.path `~/.config/anvil/plugins/harden`: mode 775 lets others write to it; run chmod go-w on it
 ```
 
-The other refusals end in `not owned by the current user`, `not executable; run chmod u+x on it`,
+The other refusals end in
+`not owned by the current user; run chown on it, or do not run anvil through sudo`, `not executable; run chmod u+x on it`,
 `not a regular file`, `directory DIR: REASON`, `larger than the 67108864 byte limit`, or the error from resolving or
 opening the path. Only the file and its own directory are checked, not the directories above it
 ([Security notes](security.md)). Right before each spawn anvil checks that the file is still the one it hashed (the same
@@ -1547,7 +1550,8 @@ The script is each target's one step, sent on its stdin to `sh -s` (`/bin/sh -s`
 is always POSIX sh: a shebang line is only a comment. run asks for no confirmation.
 
 - **Config errors do not block run.** Without `--inventory`, run loads the config to locate the workspace inventory;
-  a config error logs a warning and falls back to the config's directory. With `--inventory`, it skips the config.
+  a config error logs a warning and falls back to the config's directory. The exception is a refusal, of a config or
+  workspace others can change: it exits 2 with no fallback. With `--inventory`, it skips the config.
   Nothing is probed, the secret store is never opened and no sudo password is typed. For root work call `sudo -n` in
   the script, or use a target whose sudo is NOPASSWD.
 - **stdin.** The script is sent wrapped in `{ :` … `}`, so sh reads all of it before running any of it: a command that

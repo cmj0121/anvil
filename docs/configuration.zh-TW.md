@@ -92,6 +92,17 @@ YAML 只是編輯檢視：`anvil inventory` 與 `anvil config` 以 `--format` �
 不存在的檔案視為空文件：inventory（主機清單）只含 `local`，config（設定）採用下列預設值。
 兩種格式對應到同一份 schema；未知的鍵一律拒絕，任何違規都以 2 結束並指出檔案、host 與欄位。
 
+config 或 inventory 不屬於你、群組或其他人可寫入，或位於這樣的資料夾中時，每個載入它的指令都會在解析之前拒絕，
+以 2 結束並指出路徑與修正方式；`anvil update` 兩者都不載入。symlink 的檔案可以使用：檢查的是實際檔案與它實際所在的資料夾，
+不檢查更上層的資料夾。除非 `[anvil].workspace` 改變工作區，config 連結所在的資料夾就是工作區，
+因此位於 775 或 777 資料夾中的連結在 `plan` 時會以 2 結束。`anvil secret` 仍可能成功；
+`anvil config` 僅開啟或儲存沒有 `[[tasks]]` 的 config 時也一樣，儲存含 task 的 config 與 `config --harden` 則被拒絕，以 2 結束，不會儲存。
+透過 config 連結儲存時，連結會被換成連結所在資料夾中的一般 0600 檔案，實際檔案則未被編輯，因此 dotfile 管理工具的連結會因儲存而脫離：
+請改為編輯實際檔案。在寬鬆的資料夾中，接下來的 `plan` 與 `anvil config` 都會被拒絕。
+`--config /tmp/x.toml` 會被拒絕，umask 002 下產生的 checkout 也會被拒絕，
+直到你在其中執行 `chmod -R go-w .`（[安全性說明](security.zh-TW.md)）。
+之後由 `git pull` 或編輯器新增的檔案會再次成為 664 並再度被拒絕；請在 shell 中設定 `umask 022`。
+
 ## 工作區
 
 工作區是存放 inventory、[檔案儲存區](cli.zh-TW.md#anvil-files)與每個相對 `[[files]]` src 的目錄，
@@ -130,18 +141,20 @@ config 本身永遠不會在工作區中尋找，狀態目錄、plugin 路徑與
 工作區和 config 本身一樣是信任邊界。能寫入它的人，就能控制 anvil 讀取並複製到 target 的 inventory、`$/` 檔案與相對 `src`。
 像 `~/` 或 `/` 這樣的 `workspace` 會讓相對 src 能指向其下的任何檔案。
 [留在工作區內的檢查](#files)防的是失誤，而不是能寫入工作區的人。
-因此當解析後的工作區存在、但群組或其他人可寫入，或屬於其他使用者時，anvil 每個指令會記錄一次 WARN（從 `-v` 起顯示）並繼續執行；它不會拒絕：
+因此當解析後的工作區存在、但群組或其他人可寫入，或屬於其他使用者時，每個使用它的指令都會以 2 結束（`anvil secret` 不從中讀取；`anvil config` 只在儲存含 `[[tasks]]` 的 config 與 `--harden` 時使用它）：
 
-- ``workspace `PATH`: writable by others (mode 0775); anyone who can write it controls the inventory and files anvil reads``
-- ``workspace `PATH`: owned by uid 501, not you; anyone who can write it controls the inventory and files anvil reads``
+- `workspace PATH: mode 775 lets others write to it; run chmod go-w on it`
+- `workspace PATH: not owned by the current user; run chown on it, or do not run anvil through sudo`
 
-symlink 的工作區會檢查其目標。不存在的工作區，或其他人只能讀取的工作區（`0755`），不會產生警告；
-不是目錄或無法檢查時，訊息會改為指出這點（`not a directory`、`cannot check directory: REASON`）。
+symlink 的工作區會檢查其目標。不存在的工作區，或其他人只能讀取的工作區（`0755`）可以通過；
+不是目錄或無法檢查時也會被拒絕（`not a directory; replace it with a real folder`、`workspace PATH: cannot check it: REASON`）。
+工作區根目錄以上的資料夾不檢查。
 
-config 無法載入（或其工作區無法解析）時，只讀取 inventory 的指令（`run`、`doctor`、TUI 的 targets）
+config 因其他原因無法載入（或其工作區無法解析）時，只讀取 inventory 的指令（`run`、`doctor`、TUI 的 targets）
 會改在 config 所在的目錄尋找，並記錄一則 WARN：`config failed to load (ERROR); looking for the inventory in DIR`，
 讓 inventory 的錯誤仍然單獨回報。
 `anvil files` 需要工作區，因此改以 config 的錯誤結束（以 2 結束）；TUI 的檔案瀏覽器會顯示該錯誤。
+被拒絕的 config 或工作區絕不會這樣退回：指令以 2 結束，TUI 則顯示該拒絕訊息。
 
 **從舊版 anvil 移轉。** 以前 inventory 與 `$/` 一律留在 config 目錄，相對 src 則在 config 檔實際目標的旁邊解析。現在：
 
@@ -348,6 +361,10 @@ setuid 位元（`4000`）與 setgid 位元（`2000`）一律拒絕，不論單�
 目錄則為 ``files[0].src `sub`: is not a regular file``。
 `anvil config`、`anvil doctor`、`anvil inventory` 與 `anvil secret` 只檢查語法，因此缺少的 src 不會讓它們失敗；
 `anvil run` 僅在未指定 `--inventory` 時載入 config 來尋找 inventory；它絕不讀取來源檔案。
+
+src 不屬於你或群組與其他人可寫入，或從工作區根目錄到它的任何資料夾如此時，會被拒絕，以 2 結束並指出 task 路徑：
+``tasks[0].file.src `rel/a`: PATH: mode 775 lets others write to it; run chmod go-w on it``。
+工作區內的 symlink 仍可使用。其限制請見[安全性說明](security.zh-TW.md)。
 
 以 `$/` 開頭的 `src` 改為讀取[檔案儲存區](cli.zh-TW.md#anvil-files)：`$/sub/motd` 代表 `<workspace>/files/sub/motd`。
 這會取代原本工作區中名為 `$` 的目錄的解讀方式。
@@ -637,7 +654,7 @@ selector 不符合的 task 仍是一個 step，回報為略過（`skipped run: n
 且 `tasks` 是唯一允許的鍵，因此 include 無法變更全域設定：`[packages.alias]`、`[plugins]` 或其他鍵都以 2 結束並顯示解析器的訊息
 （``unknown field `packages`, expected `tasks` ``）。`anvil config` 只編輯主檔案。
 include 受儲存區的限制（不含 NUL 的一般 UTF-8 文字檔，最多 1 MiB，不可為 symlink），
-且必須由你擁有、group 與 other 不可寫入（[安全性說明](security.zh-TW.md)）：
+且必須由你擁有、group 與 other 不可寫入，從工作區根目錄到它的每個資料夾也一樣（[安全性說明](security.zh-TW.md)）：
 ``tasks[0].include `$/roles/web.toml`: mode 664 lets others write to it; set mode 644``。
 
 **參照檢查。** 下列情況都在任何 target 開始前以 2 結束；每個 include 不論其 `tags` 或 `facts` 都會讀取，

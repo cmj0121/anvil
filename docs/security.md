@@ -38,15 +38,43 @@ English | [繁體中文](security.zh-TW.md)
   state directory, no shared or synced copy.
 - **An include is trusted as the config is.** A [`[[tasks]]` include](configuration.md#tasks) decides what runs on your
   targets, with sudo where a task uses it, so whoever can write one can run anything there. Keep it as private as the
-  config. anvil refuses, exit 2, an include not owned by you or writable by group or others, checked on the same open
-  file it reads: ``tasks[0].include `$/role.toml`: not owned by the current user`` or
-  ``tasks[0].include `$/role.toml`: mode 664 lets others write to it; set mode 644``. A symlink is refused.
-  What stays unchecked: a file another user plants is refused by the owner check, but a writable folder above an include
-  still allows deleting it (exit 2) or swapping in another file you own. `[[files]]` and `file.src` srcs and the main
-  config have no such check yet (#106): a src in a writable folder can be replaced, then written to its dest, as root
-  with sudo. A world-writable workspace only warns from `-v` up, and `files/` or a subfolder gets no warning. Keep them
-  all yours. An include holds only `tasks`, so it cannot change
-  `[plugins]`, `[secrets]` or any other setting; a `plugin` task in it can still run a plugin the main file pins.
+  config. An include holds only `tasks`, so it cannot change `[plugins]`, `[secrets]` or any other setting; a `plugin`
+  task in it can still run a plugin the main file pins.
+- **Local files others can change are refused.** Whoever can change the config, the inventory, the workspace, an
+  include or a src decides what runs on your targets. anvil refuses, exit 2 and before parsing, any of them that is
+  not owned by you or that group or others can write, and the same for its folder:
+  `PATH: mode 664 lets others write to it; run chmod go-w on it` or
+  `PATH: not owned by the current user; run chown on it, or do not run anvil through sudo`. An include or src adds its task path:
+  ``tasks[0].include `$/role.toml`: mode 664 lets others write to it; set mode 644``. Read bits alone (`0755`, `0644`)
+  are fine, and a missing file is still the default.
+  - **Every config-loading command is refused until it is fixed**: `run`, `plan`, `apply`, `config`, `inventory`,
+    `files`, `secret`, `doctor`, `rollback` and the TUI. There is no bypass flag, because the editor command itself
+    comes from the distrusted file; the fix needs no anvil. `anvil update` loads no config and is not refused. A
+    refused config or inventory never falls back to the hosts beside it.
+  - **A symlinked config works, in a tight folder.** The path is resolved first, and the file check covers the real file
+    and its real folder. The folder holding the link is checked too, as the workspace unless `[anvil].workspace` moves
+    it: a link in a 775 `anvil/` or a 777 folder exits 2 at `plan`. `anvil secret` reads nothing from the workspace, so it can
+    succeed where `plan`, `inventory` and `doctor` refuse. `anvil config` opens without checking it, and saves without
+    checking it when the config has no `[[tasks]]`; saving one with tasks and `config --harden` are refused, exit 2,
+    nothing saved.
+    A save through a config link replaces the link with a regular 0600 file in the link's folder and leaves the real file
+    unedited, so it detaches a dotfile manager's link: edit the real file instead. In a loose folder the next `plan` and
+    `anvil config` are then refused.
+  - **A umask 002 checkout is refused**, `examples/` included, since it leaves files 664 and folders 775. Fix it with
+    `chmod -R go-w .` in the checkout.
+    Files added later, by `git pull` or an editor, come back 664 and are refused again; set `umask 022` in your shell.
+    Folders anvil creates for a config or inventory are 0700.
+  - **`--config /tmp/x.toml` is refused**, as `/tmp` is not yours. Keep the file in a folder you own.
+  - **Through sudo**, a config you own is refused, as it is not root's. Run anvil as yourself; it uses sudo on the
+    target where a step asks for it.
+  - **Only the real parent or the workspace root down is checked, not the folders above.** The config, an inventory
+    (an explicit `--inventory ws/a/b/inv.toml` too, even inside the workspace), a plugin and a sops config check their
+    real parent only. Srcs and includes check each folder from the workspace root to the file.
+    A folder above those that someone else can write can still let them
+    move the whole folder aside, so keep the path yours.
+  - **Two limits of a src.** A folder outside the workspace is checked only if it holds a link the path goes through,
+    so a writable folder above it passes. An absolute link through a root-owned system symlink (`/tmp` on macOS) is
+    refused with the chown hint; use a relative link or the real path.
 - **A change between the read and the write.** Before each `[[files]]` write apply reads DEST, and the write refuses
   when DEST's sha256 changed since: `files: DEST changed while anvil was writing it; re-run apply`. That check needs
   `sha256sum` or `shasum` on the target. Without either there is no check, so a change made between the read and the

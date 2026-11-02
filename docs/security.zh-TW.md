@@ -35,14 +35,36 @@
   請讓它與 config 一樣私密：同一個使用者、0700 的狀態目錄，不要有共用或同步的副本。
 - **include 與 config 受到同等的信任**。[`[[tasks]]` include](configuration.zh-TW.md#tasks) 決定 target 上執行什麼，
   task 使用 sudo 時也包含在內，因此能寫入它的人就能在那裡執行任何東西。請讓它與 config 一樣私密。
-  anvil 會拒絕不屬於你，或 group 與 other 可寫入的 include，以 2 結束，並在它讀取的同一個已開啟檔案上檢查：
-  ``tasks[0].include `$/role.toml`: not owned by the current user`` 或
-  ``tasks[0].include `$/role.toml`: mode 664 lets others write to it; set mode 644``。
-  symlink 會被拒絕。未檢查的部分：其他使用者放入的檔案會被 owner 檢查拒絕，但 include 上層可寫入的資料夾仍允許刪除它（以 2 結束），
-  或換成另一個你擁有的檔案。`[[files]]` 與 `file.src` 的 src 以及主 config 目前還沒有這項檢查（#106）：
-  可寫入資料夾中的 src 可能被替換，然後寫入它的 dest，使用 sudo 時是以 root 寫入。
-  world-writable 的工作區只在 `-v` 以上才警告，`files/` 或其子資料夾則完全沒有警告。這些都請保持為你所有。
   include 只含 `tasks`，因此無法變更 `[plugins]`、`[secrets]` 或其他設定；但其中的 `plugin` task 仍可執行主檔案釘選的 plugin。
+- **其他人能變更的本機檔案會被拒絕**。能變更 config、inventory、工作區、include 或 src 的人，就能決定 target 上執行什麼。
+  只要其中任何一個不屬於你，或群組與其他人可寫入，它所在的資料夾也一樣，anvil 就會在解析之前拒絕並以 2 結束：
+  `PATH: mode 664 lets others write to it; run chmod go-w on it` 或
+  `PATH: not owned by the current user; run chown on it, or do not run anvil through sudo`。include 與 src 會再加上 task 路徑：
+  ``tasks[0].include `$/role.toml`: mode 664 lets others write to it; set mode 644``。
+  只有讀取位元（`0755`、`0644`）沒有問題，不存在的檔案仍視為預設值。
+  - **修好之前，每個會載入 config 的指令都會被拒絕**：`run`、`plan`、`apply`、`config`、`inventory`、`files`、`secret`、
+    `doctor`、`rollback` 與 TUI。沒有略過的旗標，因為編輯器指令本身就來自不受信任的檔案；修正不需要 anvil。
+    `anvil update` 不載入 config，因此不會被拒絕。被拒絕的 config 或 inventory 絕不會退回使用它旁邊的 host 清單。
+  - **symlink 的 config 可以使用，但連結必須在嚴格的資料夾中**。路徑會先解析，檔案檢查涵蓋實際檔案與它實際所在的資料夾。
+    存放連結的資料夾也會被檢查，除非 `[anvil].workspace` 改變工作區，它就是工作區：
+    位於 775 的 `anvil/` 或 777 資料夾中的連結，在 `plan` 時會以 2 結束。
+    `anvil secret` 不從工作區讀取任何東西，因此在 `plan`、`inventory` 與 `doctor` 拒絕時，它仍可能成功。
+    `anvil config` 開啟時不檢查工作區，config 沒有 `[[tasks]]` 時儲存也不檢查；
+    儲存含 task 的 config 與 `config --harden` 會被拒絕，以 2 結束，不會儲存。
+    透過 config 連結儲存時，連結會被換成連結所在資料夾中的一般 0600 檔案，實際檔案則未被編輯，因此 dotfile 管理工具的連結會因儲存而脫離：
+    請改為編輯實際檔案。在寬鬆的資料夾中，接下來的 `plan` 與 `anvil config` 都會被拒絕。
+  - **umask 002 的 checkout 會被拒絕**，包括 `examples/`，因為檔案會是 664、資料夾會是 775。
+    請在該 checkout 中執行 `chmod -R go-w .` 修正。
+    之後由 `git pull` 或編輯器新增的檔案會再次成為 664 並再度被拒絕；請在 shell 中設定 `umask 022`。
+    anvil 為 config 或 inventory 建立的資料夾是 0700。
+  - **`--config /tmp/x.toml` 會被拒絕**，因為 `/tmp` 不屬於你。請把檔案放在你擁有的資料夾中。
+  - **透過 sudo 執行時**，你擁有的 config 會被拒絕，因為它不屬於 root。請以自己的身分執行 anvil；step 要求時它會在 target 上使用 sudo。
+  - **只檢查實際的上層資料夾，或從工作區根目錄往下，不檢查更上層的資料夾**。config、inventory
+    （明確的 `--inventory ws/a/b/inv.toml` 也一樣，即使在工作區內）、plugin 與 sops config 只檢查實際的上層資料夾；
+    src 與 include 則檢查從工作區根目錄到該檔案的每個資料夾。
+    其他人能寫入的更上層資料夾，仍可能讓他們把整個資料夾移開，因此請讓整條路徑都屬於你。
+  - **src 的兩項限制**。工作區外的資料夾只有在存放路徑經過的連結時才會檢查，因此它上層可寫入的資料夾會通過。
+    經過 root 擁有的系統 symlink（macOS 的 `/tmp`）的絕對連結會被拒絕並顯示 chown 提示；請改用相對連結或實際路徑。
 - **讀取與寫入之間的變更**。每次 `[[files]]` 寫入之前 apply 會讀取 DEST，若 DEST 的 sha256 在那之後改變，寫入就會拒絕：
   `files: DEST changed while anvil was writing it; re-run apply`。這項檢查需要 target 上有 `sha256sum` 或 `shasum`。
   兩者都沒有時就沒有檢查，因此在讀取與寫入之間做的變更會被覆寫，而紀錄保存的是較舊的狀態。

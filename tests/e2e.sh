@@ -1291,6 +1291,27 @@ else
   fail "sops not found on PATH: install sops (e.g. \`brew install sops\`) to run this check"
 fi
 
+step "(t) a config others can write is refused, exit 2, naming the path and the fix; fixed, the command runs"
+TRUST_XDG="$TMP/trust"
+mkdir -p "$TRUST_XDG/anvil"
+chmod 755 "$TRUST_XDG/anvil"
+printf '[anvil]\n' >"$TRUST_XDG/anvil/config.toml"
+chmod 664 "$TRUST_XDG/anvil/config.toml"
+run_env XDG_CONFIG_HOME="$TRUST_XDG" "$ANVIL" plan --target local </dev/null >"$TMP/out" 2>"$TMP/err"
+code=$?
+if [ "$code" -eq 2 ] && grep -q 'config.toml: mode 664 lets others write to it; run chmod go-w on it' "$TMP/err"; then
+  chmod 644 "$TRUST_XDG/anvil/config.toml"
+  run_env XDG_CONFIG_HOME="$TRUST_XDG" "$ANVIL" plan --target local </dev/null >"$TMP/out" 2>"$TMP/err"
+  code=$?
+  if [ "$code" -eq 0 ]; then
+    pass "refused while writable, runs once fixed"
+  else
+    fail "plan after chmod go-w: exit $code"
+  fi
+else
+  fail "plan on a writable config: exit $code"
+fi
+
 if [ -n "$sd_skip" ]; then
   echo "SKIP systemd: $sd_skip"
   if [ "${ANVIL_E2E_SYSTEMD:-}" = 1 ]; then

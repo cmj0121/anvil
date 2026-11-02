@@ -18,6 +18,10 @@ anvil --inventory examples/minimal/inventory.toml \
       --target local plan
 ```
 
+在 umask 002 下，checkout 的這些檔案與資料夾群組可寫入，每個指令都會拒絕它們；請先執行
+`chmod -R go-w examples`（[安全性說明](../../docs/security.zh-TW.md)）。
+之後由 `git pull` 或編輯器新增的檔案會再次成為 664 並再度被拒絕；請在 shell 中設定 `umask 022`。
+
 ## `yaml/` 目錄
 
 `yaml/` 放的是同樣兩份文件的 YAML 版本，也就是 `anvil inventory --format yaml` 與 `anvil config --format yaml`

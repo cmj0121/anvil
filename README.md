@@ -42,6 +42,10 @@ anvil                      # all of the above in one terminal UI (also: anvil tu
 anvil update               # replace the binary with the latest signed release
 ```
 
+A config, inventory or other local input that others can change is refused until fixed, by every command but
+`anvil update`. A checkout made at umask 002, `examples/` included, needs `chmod -R go-w .` in it.
+Files added later, by `git pull` or an editor, come back 664 and are refused again; set `umask 022` in your shell. ([Security notes](docs/security.md)).
+
 `--json` prints one document on stdout and logs go to stderr ([Common flags](docs/cli.md#common-flags)); `--parallel N`
 works on up to N targets at once ([Running in parallel](docs/cli.md#running-in-parallel)).
 

@@ -23,6 +23,9 @@ itself with `cargo build -p anvil-audit --locked`, so a plain `cargo test` works
 and fails unless the literal is anvil's `DOCTOR_REQUEST_LIMIT + 1` (the request and its newline), and
 `tests/doctor_audit.rs` pipes a request of exactly the limit and one byte over through the built plugin.
 
+`make test` sets `umask 022` itself, as a loose umask leaves fixtures that anvil refuses. A bare `cargo test` at umask
+002 fails for the same reason.
+
 The terminal tests in `make test` (the age passphrase prompt and `anvil tui` on a pseudo-terminal) need python3 3.11
 or newer, for `os.login_tty`, and are skipped with a message without it.
 

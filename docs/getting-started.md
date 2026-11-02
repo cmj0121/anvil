@@ -79,6 +79,17 @@ anvil                      # all of the above in one terminal UI (also: anvil tu
 With no files at all, the inventory holds only `local` (this machine) and the config runs `hostname`, so a fresh install
 passes `anvil doctor` and `anvil apply` straight away.
 
+Every command that loads the config or inventory refuses, exit 2, one that others can change or that is not yours, and
+names the path and the fix, usually `chmod go-w PATH`; `anvil update` does not load them. That hits a checkout made at
+umask 002, `examples/` included (`chmod -R go-w .` in it), `--config /tmp/x.toml` (use a folder you own) and running anvil
+through sudo on your own config.
+Files added later, by `git pull` or an editor, come back 664 and are refused again; set `umask 022` in your shell.
+A symlinked config works: the real file and folder are checked, not
+the folders above. The link's own folder must be tight too, as it is the workspace by default: a link in a 775 or 777
+folder exits 2 at `plan`, and so do `config --harden` and saving a config with `[[tasks]]`, though just opening
+`anvil config` or saving one without tasks still succeeds. Such a save replaces the link with a regular 0600 file and
+leaves the real file unedited, detaching a dotfile manager's link, so edit the real file ([Security notes](security.md)).
+
 ## Output
 
 `anvil doctor` on this Mac with an empty config:
