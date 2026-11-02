@@ -23,17 +23,17 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata};
-use std::io::{self, Read};
-use std::os::unix::fs::MetadataExt;
+use std::io::Read;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 
-use rustix::fs::{Mode, OFlags};
 use zeroize::Zeroizing;
 
 use super::{BackendKind, SecretError, Store, Vault, is_name};
 use crate::private::{self, LockError};
+use crate::trust::{self, TrustError};
+pub(crate) use crate::trust::{check_owner, open_regular};
 
 /// How a file store turns its plaintext into the bytes on disk and back.
 pub trait Codec {
@@ -85,43 +85,6 @@ impl<T: FileBacked> Store for T {
     }
 }
 
-/// Refuses `meta` unless the current user owns it and none of the
-/// `forbidden` permission bits is set: `0o077` for a key file no one else
-/// may even read, `0o022` for a config file or directory no one else may
-/// change. The error says why and how to fix it.
-pub fn check_owner(meta: &Metadata, forbidden: u32) -> Result<(), String> {
-    if meta.uid() != rustix::process::getuid().as_raw() {
-        return Err("not owned by the current user".to_string());
-    }
-    let mode = meta.mode() & 0o777;
-    if mode & forbidden == 0 {
-        Ok(())
-    } else if forbidden & 0o044 != 0 {
-        Err(format!("mode {mode:o} lets others in; run chmod 600 on it"))
-    } else {
-        Err(format!(
-            "mode {mode:o} lets others write to it; run chmod go-w on it"
-        ))
-    }
-}
-
-/// Opens `path` read-only and non-blocking, so a FIFO in its place cannot
-/// hang the open; anything but a regular file is refused. The metadata is
-/// that of what was actually opened.
-pub fn open_regular(path: &Path) -> io::Result<(File, Metadata)> {
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    let file = File::from(fd);
-    let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(io::Error::other("not a regular file"));
-    }
-    Ok((file, meta))
-}
-
 /// [`open_regular`] for a key file: refused, naming `path`, unless the
 /// current user owns it and no one else has any permission on it.
 pub fn open_private(path: &Path) -> Result<(File, Metadata), SecretError> {
@@ -133,16 +96,7 @@ pub fn open_private(path: &Path) -> Result<(File, Metadata), SecretError> {
 
 /// Refuses a directory that is not ours or that others can write to.
 pub fn check_dir(dir: &Path) -> Result<(), SecretError> {
-    let meta = fs::metadata(dir).map_err(|err| SecretError::store(dir, err.to_string()))?;
-    check_dir_meta(dir, &meta)
-}
-
-/// [`check_dir`] on the metadata of `dir`.
-fn check_dir_meta(dir: &Path, meta: &Metadata) -> Result<(), SecretError> {
-    if !meta.is_dir() {
-        return Err(SecretError::store(dir, "not a directory"));
-    }
-    check_owner(meta, 0o022).map_err(|message| SecretError::store(dir, message))
+    trust::check_dir(dir, trust::INPUT).map_err(|err| SecretError::store(dir, err.reason()))
 }
 
 /// The refusal of a commit that would write a store `open` could not read
@@ -178,17 +132,14 @@ impl<'a, C: Codec> FileVault<'a, C> {
     pub fn open(path: &'a Path, limit: u64, codec: C) -> Result<Self, SecretError> {
         let mut vault = FileVault::new(path, limit, codec, false);
         let dir = vault.dir()?;
-        match fs::metadata(dir) {
-            Ok(meta) => {
-                check_dir_meta(dir, &meta)?;
-                vault.lock = Some(vault.lock()?);
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(SecretError::store(dir, err.to_string())),
+        match trust::check_dir(dir, trust::INPUT) {
+            Ok(()) => vault.lock = Some(vault.lock()?),
+            Err(TrustError::NotFound { .. }) => {}
+            Err(err) => return Err(SecretError::store(dir, err.reason())),
         }
         let (file, meta) = match open_regular(path) {
             Ok(opened) => opened,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 vault.absent = true;
                 return Ok(vault);
             }
