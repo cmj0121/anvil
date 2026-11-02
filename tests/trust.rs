@@ -328,3 +328,245 @@ fn a_src_others_can_write_stops_a_run_naming_the_entry() {
     assert!(stderr.contains("files[0].src `motd.txt`"), "{stderr}");
     assert!(stderr.contains("run chmod go-w on it"), "{stderr}");
 }
+
+/// Refused with the fix and no ssh started, unlike a target that merely failed.
+fn assert_no_ssh(sb: &Sandbox, args: &[&str], path: &Path, what: &str) {
+    let log = sb.root().join("ssh.log");
+    let out = sb.anvil(args, &[("FAKE_SSH_LOG", log.to_str().unwrap())]);
+    assert_refused(&out, path, what);
+    assert!(!log.exists(), "{what}: ssh ran");
+}
+
+fn with_host(sb: &Sandbox) {
+    put(&sb.config_dir().join("inventory.toml"), 0o644, HOST);
+    put(&sb.config_dir().join("config.toml"), 0o644, "");
+}
+
+#[test]
+fn a_run_script_others_can_change_never_runs() {
+    let sb = Sandbox::new("trs");
+    with_host(&sb);
+    let dir = sb.root().join("scripts");
+    fs::create_dir(&dir).unwrap();
+    chmod(&dir, 0o755);
+    let script = dir.join("fix.sh");
+    put(&script, 0o666, "true\n");
+    let name = script.to_str().unwrap();
+    let args = ["run", "--target", "box", name];
+    assert_no_ssh(&sb, &args, &script, "loose script");
+
+    chmod(&script, 0o644);
+    chmod(&dir, 0o777);
+    assert_no_ssh(&sb, &args, &dir, "loose folder");
+    chmod(&dir, 0o755);
+
+    let log = sb.root().join("ssh.log");
+    let out = sb.anvil(&args, &[("FAKE_SSH_LOG", log.to_str().unwrap())]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+}
+
+#[test]
+fn a_fifo_as_the_run_script_is_refused_without_waiting_for_a_writer() {
+    let sb = Sandbox::new("trf");
+    with_host(&sb);
+    let fifo = sb.root().join("fix.sh");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    assert!(made.unwrap().success());
+    chmod(&fifo, 0o644);
+    let out = sb.anvil(&["run", "--target", "box", fifo.to_str().unwrap()], &[]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("not a regular file"), "{stderr}");
+}
+
+#[test]
+fn an_ssh_config_others_can_change_never_reaches_ssh() {
+    let sb = Sandbox::new("tsc");
+    with_host(&sb);
+    let dir = sb.root().join("ssh");
+    fs::create_dir(&dir).unwrap();
+    chmod(&dir, 0o755);
+    let config = dir.join("config");
+    put(
+        &config,
+        0o666,
+        "Host *\n  ProxyCommand touch /nonexistent\n",
+    );
+    let name = config.to_str().unwrap();
+    let args = ["--ssh-config", name, "doctor"];
+    assert_no_ssh(&sb, &args, &config, "loose file");
+    // Refused for every command, not reported as one target failing.
+    assert_no_ssh(&sb, &["--ssh-config", name, "plan"], &config, "plan");
+
+    chmod(&config, 0o644);
+    chmod(&dir, 0o777);
+    assert_no_ssh(&sb, &args, &dir, "loose folder");
+    chmod(&dir, 0o755);
+
+    // A missing file stops too: ssh must not go on without the config asked for.
+    let gone = sb.root().join("gone");
+    let log = sb.root().join("ssh.log");
+    let vars = [("FAKE_SSH_LOG", log.to_str().unwrap())];
+    let out = sb.anvil(&["--ssh-config", gone.to_str().unwrap(), "plan"], &vars);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(!log.exists());
+}
+
+#[test]
+fn ssh_reads_the_real_path_of_the_config_and_its_default_without_the_flag() {
+    let sb = Sandbox::new("tsr");
+    with_host(&sb);
+    let real = sb.root().join("real_config");
+    put(&real, 0o644, "");
+    let real = fs::canonicalize(real).unwrap();
+    let links = sb.root().join("links");
+    fs::create_dir(&links).unwrap();
+    chmod(&links, 0o755);
+    let link = links.join("config");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    chmod(sb.root(), 0o755);
+
+    let log = sb.root().join("ssh.log");
+    let vars = [("FAKE_SSH_LOG", log.to_str().unwrap())];
+    let script = sb.root().join("fix.sh");
+    put(&script, 0o644, "true\n");
+    let run = ["run", "--target", "box", script.to_str().unwrap()];
+
+    let out = sb.anvil(
+        &[&["--ssh-config", link.to_str().unwrap()], &run[..]].concat(),
+        &vars,
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let argv = fs::read_to_string(&log).unwrap();
+    assert!(argv.contains(&format!("-F {}", real.display())), "{argv}");
+    assert!(!argv.contains(link.to_str().unwrap()), "{argv}");
+
+    fs::remove_file(&log).unwrap();
+    let out = sb.anvil(&run, &vars);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let argv = fs::read_to_string(&log).unwrap();
+    assert!(!argv.contains("-F"), "{argv}");
+
+    // ssh's own word for no config names no file to check.
+    fs::remove_file(&log).unwrap();
+    let out = sb.anvil(&[&["--ssh-config", "none"], &run[..]].concat(), &vars);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(fs::read_to_string(&log).unwrap().contains("-F none"));
+}
+
+/// A link to `real` in a new folder `name` of `sb` with `mode`.
+fn linked(
+    sb: &Sandbox,
+    name: &str,
+    mode: u32,
+    real: &Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let holder = sb.root().join(name);
+    fs::create_dir(&holder).unwrap();
+    chmod(&holder, mode);
+    let link = holder.join("link.toml");
+    std::os::unix::fs::symlink(real, &link).unwrap();
+    (holder, link)
+}
+
+#[test]
+fn a_link_in_a_folder_others_can_write_is_refused_and_never_falls_back() {
+    let sb = Sandbox::new("tln");
+    with_host(&sb);
+    let real_config = sb.root().join("real.toml");
+    put(&real_config, 0o644, "");
+    let (holder, link) = linked(&sb, "cfg", 0o777, &real_config);
+    let args = ["--config", link.to_str().unwrap(), "plan"];
+    assert_refused(&sb.anvil(&args, &[]), &holder, "config link");
+
+    let real_inventory = sb.root().join("inv.toml");
+    put(&real_inventory, 0o644, HOST);
+    let (holder, link) = linked(&sb, "inv", 0o757, &real_inventory);
+    let args = ["--inventory", link.to_str().unwrap(), "plan"];
+    let out = sb.anvil(&args, &[]);
+    assert_refused(&out, &holder, "inventory link");
+    chmod(&holder, 0o755);
+    assert_eq!(sb.anvil(&args, &[]).status.code(), Some(0));
+
+    let real_workspace = sb.root().join("ws");
+    fs::create_dir(&real_workspace).unwrap();
+    chmod(&real_workspace, 0o755);
+    let (holder, link) = linked(&sb, "wsl", 0o777, &real_workspace);
+    put(
+        &sb.config_dir().join("config.toml"),
+        0o644,
+        &format!("[anvil]\nworkspace = \"{}\"\n", link.display()),
+    );
+    assert_refused(&sb.anvil(&["plan"], &[]), &holder, "workspace link");
+    chmod(&holder, 0o755);
+    assert_eq!(sb.anvil(&["plan"], &[]).status.code(), Some(0));
+}
+
+/// `args` on `sb`, killed after 20 s so a run that never ends fails the test;
+/// its exit code and stderr.
+fn bounded(sb: &Sandbox, args: &[&str]) -> (Option<i32>, String) {
+    let stderr = sb.root().join("bounded.err");
+    let mut child = sb
+        .command(env!("CARGO_BIN_EXE_anvil"))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return (status.code(), fs::read_to_string(&stderr).unwrap());
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("{args:?} did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_link_loop_or_growing_link_ends_with_exit_2_wherever_a_path_is_walked() {
+    let sb = Sandbox::new("tlp");
+    with_host(&sb);
+    let links = sb.root().join("links");
+    fs::create_dir(&links).unwrap();
+    chmod(&links, 0o755);
+    let config = sb.config_dir().join("config.toml");
+    for (name, target) in [("self.toml", "self.toml"), ("grow.toml", "grow.toml/b")] {
+        let link = links.join(name);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let path = link.to_str().unwrap();
+
+        let (code, stderr) = bounded(&sb, &["--config", path, "plan"]);
+        assert_eq!(code, Some(2), "config {name}: {stderr}");
+        let (code, stderr) = bounded(&sb, &["--inventory", path, "plan"]);
+        assert_eq!(code, Some(2), "inventory {name}: {stderr}");
+
+        put(
+            &config,
+            0o644,
+            &format!("[anvil]\nworkspace = \"{path}\"\n"),
+        );
+        let (code, stderr) = bounded(&sb, &["plan"]);
+        assert_eq!(code, Some(2), "workspace {name}: {stderr}");
+        assert!(
+            stderr.contains("more than 40 links") && stderr.contains(name),
+            "workspace {name}: {stderr}"
+        );
+
+        let src = sb.config_dir().join(name);
+        std::os::unix::fs::symlink(target, &src).unwrap();
+        put(
+            &config,
+            0o644,
+            &format!("[[files]]\nsrc = \"{name}\"\ndest = \"/tmp/anvil-loop\"\nmode = \"0644\"\n"),
+        );
+        let (code, stderr) = bounded(&sb, &["plan"]);
+        assert_eq!(code, Some(2), "src {name}: {stderr}");
+        assert!(stderr.contains(name), "src {name}: {stderr}");
+        fs::remove_file(&src).unwrap();
+    }
+}

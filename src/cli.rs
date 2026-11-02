@@ -336,7 +336,11 @@ impl From<crate::editor::EditorError> for Failure {
 // A store refusing an operation is a failed command (exit 1).
 impl From<crate::secret::SecretError> for Failure {
     fn from(err: crate::secret::SecretError) -> Self {
-        Failure::failed(err.to_string())
+        if matches!(err, crate::secret::SecretError::Refused { .. }) {
+            Failure::refusal(err.to_string())
+        } else {
+            Failure::failed(err.to_string())
+        }
     }
 }
 
@@ -351,7 +355,8 @@ pub fn print_json(value: &impl Serialize, on_err: fn(String) -> Failure) -> Resu
 
 /// Runs `command`, the one [`resolve`] picked for `cli`.
 pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
-    let opts = Options::from_cli(cli);
+    let mut opts = Options::from_cli(cli);
+    opts.ssh_config = opts.ssh_config()?;
     match command {
         Command::Inventory { format } => crate::commands::inventory(cli, &opts, *format),
         Command::Config {

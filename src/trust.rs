@@ -4,8 +4,9 @@
 //! [`open`] checks one file under a [`Policy`] and hands back the descriptor;
 //! [`load`] reads a run input through it, capped. Under a following policy
 //! the path is canonicalized first, so a symlinked config works and what is
-//! checked is the real file and its real folder; folders above that stay
-//! unchecked. The real path is then opened `O_NOFOLLOW` and `O_NONBLOCK`, so
+//! checked is the real file, its real folder and each folder holding a link on
+//! the path, which could repoint it; other folders above stay unchecked. The
+//! real path is then opened `O_NOFOLLOW` and `O_NONBLOCK`, so
 //! a symlink swapped in meanwhile is refused and a FIFO cannot hang the open,
 //! and the owner and mode are read from the descriptor.
 
@@ -18,7 +19,10 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
-use crate::logger::escape_controls;
+use crate::logger::{escape_invisible, escape_line};
+
+/// The most links a path may go through, as Linux allows.
+const MAX_LINK_HOPS: u32 = 40;
 
 /// What [`open`] and [`check_dir`] require.
 #[derive(Debug, Clone, Copy)]
@@ -94,12 +98,7 @@ impl TrustError {
 
 impl fmt::Display for TrustError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}: {}",
-            escape_controls(&self.path().to_string_lossy()),
-            self.reason()
-        )
+        write!(f, "{}: {}", shown_path(self.path()), self.reason())
     }
 }
 
@@ -109,8 +108,16 @@ impl std::error::Error for TrustError {}
 /// what was actually opened. Refusals name the real path, which is the one to
 /// fix.
 pub fn open(path: &Path, policy: Policy) -> Result<(File, Metadata), TrustError> {
+    open_real(path, policy).map(|(_, file, meta)| (file, meta))
+}
+
+/// [`open`], with the path that was checked, for a tool that must read the file
+/// itself.
+pub fn open_real(path: &Path, policy: Policy) -> Result<(PathBuf, File, Metadata), TrustError> {
     let real = if policy.follow {
-        fs::canonicalize(path).map_err(|err| TrustError::io(path, err))?
+        let real = fs::canonicalize(path).map_err(|err| TrustError::io(path, err))?;
+        check_links(path)?;
+        real
     } else {
         path.to_path_buf()
     };
@@ -130,7 +137,99 @@ pub fn open(path: &Path, policy: Policy) -> Result<(File, Metadata), TrustError>
         return Err(TrustError::refused(&real, "not a regular file"));
     }
     check_owner(&meta, policy.forbidden).map_err(|why| TrustError::refused(&real, why))?;
-    Ok((file, meta))
+    Ok((real, file, meta))
+}
+
+/// `path` on one line, with control and invisible characters escaped, for a
+/// message: a file name can hold anything.
+pub fn shown_path(path: &Path) -> String {
+    escape_invisible(&escape_line(&path.to_string_lossy()))
+}
+
+/// Refuses a folder that holds a link on `path` unless it passes [`INPUT`]:
+/// whoever can write there can repoint the link at a file that would pass.
+pub fn check_links(path: &Path) -> Result<(), TrustError> {
+    let whole = std::path::absolute(path).map_err(|err| TrustError::io(path, err))?;
+    walk_written(Path::new("/"), &whole, None)
+}
+
+/// Refuses a folder others can write on the way to `src` as it is written,
+/// from `dir` down, following each link: such a folder could repoint a link it
+/// holds at any file the real-path check would pass. A folder outside `dir` is
+/// checked only when it holds a link the path goes through.
+pub fn check_written_path(dir: &Path, src: &str) -> Result<(), TrustError> {
+    walk_written(dir, Path::new(src), Some(dir))
+}
+
+/// Walks `path` from `start`, following each link, and checks every folder
+/// holding one, and every folder under `tree`. A loop, or a link that keeps
+/// growing the path, is refused at [`MAX_LINK_HOPS`] links.
+fn walk_written(start: &Path, path: &Path, tree: Option<&Path>) -> Result<(), TrustError> {
+    let parts = |path: &Path| -> Vec<std::ffi::OsString> {
+        let parts = path.components().rev();
+        parts.map(|part| part.as_os_str().to_owned()).collect()
+    };
+    let mut current = start.to_path_buf();
+    let mut rest = parts(path);
+    let mut hops = 0;
+    while let Some(part) = rest.pop() {
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            current.pop();
+            continue;
+        }
+        let next = current.join(&part);
+        let failed = |source| TrustError::io(&next, source);
+        let is_link = fs::symlink_metadata(&next).map_err(failed)?.is_symlink();
+        if is_link {
+            hops += 1;
+            if hops > MAX_LINK_HOPS {
+                return Err(TrustError::refused(
+                    &next,
+                    format!("more than {MAX_LINK_HOPS} links on the path; fix the link loop"),
+                ));
+            }
+            let checked = if tree.is_some_and(|tree| current.starts_with(tree)) {
+                check_dir(&current, INPUT)
+            } else {
+                check_holder(&current)
+            };
+            checked.map_err(link_holder)?;
+            let mut target = parts(&fs::read_link(&next).map_err(failed)?);
+            rest.append(&mut target);
+            continue;
+        }
+        if tree.is_some_and(|tree| current.starts_with(tree)) {
+            check_dir(&current, INPUT)?;
+        }
+        current = next;
+    }
+    Ok(())
+}
+
+/// Refuses a folder holding a link unless only root or the current user can
+/// change it: `/`, which holds `/tmp` on macOS, is as safe as a folder of ours.
+/// A world-writable sticky folder is not, as anyone can plant a link there.
+fn check_holder(dir: &Path) -> Result<(), TrustError> {
+    let meta = fs::metadata(dir).map_err(|err| TrustError::io(dir, err))?;
+    if meta.is_dir() && meta.uid() == 0 && meta.mode() & 0o022 == 0 {
+        return Ok(());
+    }
+    check_dir(dir, INPUT)
+}
+
+/// A refusal of a folder for holding a link, where naming the real path is a
+/// fix that needs no change to the folder.
+fn link_holder(err: TrustError) -> TrustError {
+    match err {
+        TrustError::Refused { path, why } => TrustError::Refused {
+            path,
+            why: format!("{why}; it holds a link on the path, so name the real path instead"),
+        },
+        err => err,
+    }
 }
 
 /// The bytes of the run input at `path`, at most `limit` of them.
@@ -360,8 +459,7 @@ mod tests {
         let root = temp_dir("trust-symlink");
         let good = folder(&root, "good", 0o755);
         let real = file(&good, "config.toml", 0o644, b"real");
-        // The folder of the link itself says nothing about the file it names.
-        let links = folder(&root, "links", 0o777);
+        let links = folder(&root, "links", 0o755);
         let link = links.join("config.toml");
         symlink(&real, &link).unwrap();
         assert_eq!(load(&link, LIMIT).unwrap(), b"real");
@@ -446,11 +544,150 @@ mod tests {
     }
 
     #[test]
-    fn a_control_character_in_a_refused_path_is_escaped() {
+    fn a_refused_path_cannot_forge_a_line_or_reorder_the_text() {
         let root = temp_dir("trust-escape");
-        let path = file(&root, "bad\x1b[2Jname", 0o666, b"");
-        let message = refusal(load(&path, LIMIT));
-        assert!(!message.contains('\x1b'), "{message}");
+        for (name, gone, shown) in [
+            ("bad\x1b[2Jname", '\x1b', "bad\\x1b[2Jname"),
+            ("bad\nERROR forged", '\n', "bad\\nERROR forged"),
+            ("bad\tname", '\t', "bad\\tname"),
+            ("bad\u{202e}name", '\u{202e}', "bad\\u{202e}name"),
+        ] {
+            let path = file(&root, name, 0o666, b"");
+            let message = refusal(load(&path, LIMIT));
+            assert!(!message.contains(gone), "{message}");
+            assert!(message.contains(shown), "{message}");
+        }
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn every_folder_holding_a_link_on_the_path_is_checked_and_named() {
+        let root = fs::canonicalize(temp_dir("trust-holder")).unwrap();
+        let real = folder(&root, "real", 0o755);
+        let target = file(&real, "config.toml", 0o644, b"real");
+        let near = folder(&root, "near", 0o755);
+        let far = folder(&root, "far", 0o755);
+        // near/link -> ../far/hop -> ../real/config.toml
+        symlink("../far/hop", near.join("link")).unwrap();
+        symlink(&target, far.join("hop")).unwrap();
+        let link = near.join("link");
+        assert_eq!(load(&link, LIMIT).unwrap(), b"real");
+
+        for (holder, mode) in [(&near, 0o775), (&near, 0o777), (&far, 0o757)] {
+            chmod(holder, mode);
+            assert_eq!(
+                refusal(load(&link, LIMIT)),
+                format!(
+                    "{}: mode {mode:o} lets others write to it; run chmod go-w on it; \
+                     it holds a link on the path, so name the real path instead",
+                    holder.display()
+                )
+            );
+            chmod(holder, 0o755);
+        }
+        // Sticky changes nothing: the holder can still be written.
+        chmod(&near, 0o1777);
+        assert!(refusal(load(&link, LIMIT)).contains("mode 777"));
+        chmod(&near, 0o755);
+
+        // A folder that holds no link stays unchecked; only its children count.
+        chmod(&root, 0o777);
+        assert!(load(&link, LIMIT).is_ok());
+        chmod(&root, 0o700);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_holder_only_root_can_change_passes_but_not_the_real_folder() {
+        let meta = fs::metadata("/").unwrap();
+        if meta.uid() == 0 && meta.mode() & 0o022 == 0 {
+            assert!(check_holder(Path::new("/")).is_ok());
+        }
+        // Holders only: as a file's real folder, `/` is still another owner's.
+        if rustix::process::getuid().as_raw() != 0 {
+            assert!(refusal(check_dir(Path::new("/"), INPUT)).contains(NOT_OURS));
+        }
+    }
+
+    /// `/tmp` is a link only on macOS, held by a root-owned `/`.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_path_through_the_macos_tmp_link_passes() {
+        let root = temp_dir("trust-root-holder");
+        assert!(root.starts_with("/tmp"));
+        let path = file(&root, "config.toml", 0o644, b"real");
+        assert_eq!(load(&path, LIMIT).unwrap(), b"real");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_link_in_a_world_writable_sticky_root_folder_is_refused() {
+        let meta = fs::metadata("/tmp").unwrap();
+        if meta.uid() != 0 || meta.mode() & 0o1777 != 0o1777 {
+            return;
+        }
+        let root = temp_dir("trust-sticky");
+        let real = file(&root, "config.toml", 0o644, b"real");
+        let link = PathBuf::from(format!("/tmp/anvil-sticky-link-{:08x}", std::process::id()));
+        symlink(&real, &link).unwrap();
+        let message = refusal(load(&link, LIMIT));
+        fs::remove_file(&link).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(
+            message.contains("it holds a link on the path")
+                && message.starts_with(fs::canonicalize("/tmp").unwrap().to_str().unwrap()),
+            "{message}"
+        );
+    }
+
+    /// `check` on another thread, so a walk that never ends fails the test.
+    fn ends<T: Send + 'static>(check: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(check()));
+        result
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the walk did not end")
+    }
+
+    #[test]
+    fn a_link_loop_or_a_growing_link_is_refused_at_the_hop_limit() {
+        let root = fs::canonicalize(temp_dir("trust-loop")).unwrap();
+        symlink("self", root.join("self")).unwrap();
+        symlink("two", root.join("one")).unwrap();
+        symlink("one", root.join("two")).unwrap();
+        symlink("grow/b", root.join("grow")).unwrap();
+        for name in ["self", "one", "grow"] {
+            let path = root.join(name);
+            let dir = root.clone();
+            let message = refusal(ends(move || check_links(&path)));
+            assert!(message.contains("more than 40 links"), "{message}");
+            assert!(message.starts_with(root.to_str().unwrap()), "{message}");
+            let message = refusal(ends(move || check_written_path(&dir, name)));
+            assert!(message.contains("more than 40 links"), "{message}");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn forty_links_on_a_path_are_still_walked() {
+        let root = fs::canonicalize(temp_dir("trust-hops")).unwrap();
+        fs::write(root.join("l0"), b"").unwrap();
+        for hop in 1..=MAX_LINK_HOPS {
+            symlink(format!("l{}", hop - 1), root.join(format!("l{hop}"))).unwrap();
+        }
+        assert!(check_links(&root.join(format!("l{MAX_LINK_HOPS}"))).is_ok());
+        symlink(
+            format!("l{MAX_LINK_HOPS}"),
+            root.join(format!("l{}", MAX_LINK_HOPS + 1)),
+        )
+        .unwrap();
+        let over = root.join(format!("l{}", MAX_LINK_HOPS + 1));
+        assert!(refusal(check_links(&over)).contains("more than 40 links"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_relative_path_is_walked_from_the_working_directory() {
+        assert!(check_links(Path::new("Cargo.toml")).is_ok());
     }
 }

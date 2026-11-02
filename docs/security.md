@@ -41,7 +41,8 @@ English | [繁體中文](security.zh-TW.md)
   config. An include holds only `tasks`, so it cannot change `[plugins]`, `[secrets]` or any other setting; a `plugin`
   task in it can still run a plugin the main file pins.
 - **Local files others can change are refused.** Whoever can change the config, the inventory, the workspace, an
-  include or a src decides what runs on your targets. anvil refuses, exit 2 and before parsing, any of them that is
+  include, a src, an `anvil run` script, a `--ssh-config` file or the secret store decides what runs on your targets.
+  anvil refuses, exit 2 and before parsing, any of them that is
   not owned by you or that group or others can write, and the same for its folder:
   `PATH: mode 664 lets others write to it; run chmod go-w on it` or
   `PATH: not owned by the current user; run chown on it, or do not run anvil through sudo`. An include or src adds its task path:
@@ -51,15 +52,19 @@ English | [繁體中文](security.zh-TW.md)
     `files`, `secret`, `doctor`, `rollback` and the TUI. There is no bypass flag, because the editor command itself
     comes from the distrusted file; the fix needs no anvil. `anvil update` loads no config and is not refused. A
     refused config or inventory never falls back to the hosts beside it.
-  - **A symlinked config works, in a tight folder.** The path is resolved first, and the file check covers the real file
-    and its real folder. The folder holding the link is checked too, as the workspace unless `[anvil].workspace` moves
-    it: a link in a 775 `anvil/` or a 777 folder exits 2 at `plan`. `anvil secret` reads nothing from the workspace, so it can
-    succeed where `plan`, `inventory` and `doctor` refuse. `anvil config` opens without checking it, and saves without
-    checking it when the config has no `[[tasks]]`; saving one with tasks and `config --harden` are refused, exit 2,
-    nothing saved.
+  - **A symlinked config works, in a tight folder.** The path is resolved first, and the check covers the real file, its
+    real folder and each folder that holds a link on the path, since whoever can write there can repoint the link. The
+    same goes for `--inventory`, the workspace, an `anvil run` script, `--ssh-config`, the secret store and a sops
+    config, and a plugin: a link in a 775 or 777 folder exits 2, with
+    `...; it holds a link on the path, so name the real path instead`. A holder only root or you can change passes, so
+    `/tmp` and `/var` on macOS (links in a root-owned `/`) and `/home -> /var/home` work. A world-writable sticky holder
+    is refused. This eases holders only: the real file and its real folder must still be yours.
+    A `[anvil].workspace` elsewhere is checked only by what reads it: `anvil secret` reads nothing from the workspace, so
+    it can succeed where `plan`, `inventory` and `doctor` refuse. `anvil config` opens without checking it, and saves
+    without checking it when the config has no `[[tasks]]`; saving one with tasks and `config --harden` are refused,
+    exit 2, nothing saved.
     A save through a config link replaces the link with a regular 0600 file in the link's folder and leaves the real file
-    unedited, so it detaches a dotfile manager's link: edit the real file instead. In a loose folder the next `plan` and
-    `anvil config` are then refused.
+    unedited, so it detaches a dotfile manager's link: edit the real file instead.
   - **A umask 002 checkout is refused**, `examples/` included, since it leaves files 664 and folders 775. Fix it with
     `chmod -R go-w .` in the checkout.
     Files added later, by `git pull` or an editor, come back 664 and are refused again; set `umask 022` in your shell.
@@ -67,14 +72,26 @@ English | [繁體中文](security.zh-TW.md)
   - **`--config /tmp/x.toml` is refused**, as `/tmp` is not yours. Keep the file in a folder you own.
   - **Through sudo**, a config you own is refused, as it is not root's. Run anvil as yourself; it uses sudo on the
     target where a step asks for it.
-  - **Only the real parent or the workspace root down is checked, not the folders above.** The config, an inventory
-    (an explicit `--inventory ws/a/b/inv.toml` too, even inside the workspace), a plugin and a sops config check their
-    real parent only. Srcs and includes check each folder from the workspace root to the file.
+  - **`anvil run FILE` and `--ssh-config` are read after these checks.** A script refused, or a FIFO in its place, exits
+    2 before any target starts; stdin (`-`) has no file to check. ssh gets the real path of `--ssh-config`, for every
+    command, and a missing file exits 2 rather than go on without it. `--ssh-config none` is passed on as ssh's own
+    `-F none`, which names no file; `--ssh-config /dev/null` and a FIFO are refused, and so is `anvil run <(...)`, whose
+    path is a pipe. Without the flag ssh reads its default config, which anvil does not check.
+  - **The secret store may be read by others but not changed.** Holders of the recipient key could forge a value such
+    as `sudo_secret`, so an age or sops store others can write stops `secret`, `doctor` and `apply`, exit 2. A 0644 store
+    and a link pass; a missing one is still empty. sops gets the real path of its config and of `age_key_file`, whose
+    real folder must pass too, as must an age identity's. A dangling workspace link in a loose folder is refused, not
+    taken as missing.
+  - **Only the real parent, link holders or the workspace root down are checked, not the folders above.** The config,
+    an inventory (an explicit `--inventory ws/a/b/inv.toml` too, even inside the workspace), a script, a `--ssh-config`
+    file, a store, a sops config and a plugin check their real parent and each folder holding a link on the path.
+    Srcs and includes check each folder from the workspace root to the file.
     A folder above those that someone else can write can still let them
     move the whole folder aside, so keep the path yours.
-  - **Two limits of a src.** A folder outside the workspace is checked only if it holds a link the path goes through,
-    so a writable folder above it passes. An absolute link through a root-owned system symlink (`/tmp` on macOS) is
-    refused with the chown hint; use a relative link or the real path.
+  - **A limit of a src.** A folder outside the workspace is checked only if it holds a link the path goes through,
+    so a writable folder above it passes. A folder inside the workspace that holds a link must be yours, even where a
+    holder outside it may be root's.
+  - **macOS ACLs are not seen.** Only the owner and mode bits are read, so an ACL that grants others write passes.
 - **A change between the read and the write.** Before each `[[files]]` write apply reads DEST, and the write refuses
   when DEST's sha256 changed since: `files: DEST changed while anvil was writing it; re-run apply`. That check needs
   `sha256sum` or `shasum` on the target. Without either there is no check, so a change made between the read and the

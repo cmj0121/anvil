@@ -24,13 +24,12 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata};
 use std::io::Read;
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
 
 use super::{BackendKind, SecretError, Store, Vault, is_name};
+use crate::paths;
 use crate::private::{self, LockError};
 use crate::trust::{self, TrustError, check_owner, open_regular};
 
@@ -84,18 +83,42 @@ impl<T: FileBacked> Store for T {
     }
 }
 
-/// [`open_regular`] for a key file: refused, naming `path`, unless the
-/// current user owns it and no one else has any permission on it.
-pub fn open_private(path: &Path) -> Result<(File, Metadata), SecretError> {
-    let (file, meta) =
-        open_regular(path).map_err(|err| SecretError::store(path, err.to_string()))?;
-    check_owner(&meta, 0o077).map_err(|message| SecretError::store(path, message))?;
-    Ok((file, meta))
+/// Opens the private key file named `key_file`, with its real path for a tool
+/// that rereads it: a regular file only the current user owns and can reach, in
+/// a real folder others cannot write, with any folder holding a link to it
+/// checked. A folder refused stays a refusal; the file itself is named as given.
+pub fn open_key(key_file: &Path) -> Result<(PathBuf, File, Metadata), SecretError> {
+    let named = |message: String| SecretError::store(key_file, message);
+    let real = fs::canonicalize(key_file).map_err(|err| named(err.to_string()))?;
+    trust::check_links(key_file).map_err(|err| untrusted(key_file, err))?;
+    if let Some(dir) = real.parent() {
+        trust::check_dir(dir, trust::INPUT).map_err(|err| untrusted(dir, err))?;
+    }
+    let (file, meta) = open_regular(&real).map_err(|err| named(err.to_string()))?;
+    check_owner(&meta, 0o077).map_err(named)?;
+    Ok((real, file, meta))
+}
+
+/// What [`trust::open`] said about `named`: the file as it was named, a folder
+/// as the real one to fix; a refusal stays one.
+pub fn untrusted(named: &Path, err: TrustError) -> SecretError {
+    let shown = if paths::same_file(named, err.path()) {
+        named.to_path_buf()
+    } else {
+        err.path().to_path_buf()
+    };
+    match err {
+        TrustError::Refused { why, .. } => SecretError::Refused {
+            path: shown,
+            message: why,
+        },
+        err => SecretError::store(&shown, err.reason()),
+    }
 }
 
 /// Refuses a directory that is not ours or that others can write to.
 fn check_dir(dir: &Path) -> Result<(), SecretError> {
-    trust::check_dir(dir, trust::INPUT).map_err(|err| SecretError::store(dir, err.reason()))
+    trust::check_dir(dir, trust::INPUT).map_err(|err| untrusted(dir, err))
 }
 
 /// The refusal of a commit that would write a store `open` could not read
@@ -134,15 +157,17 @@ impl<'a, C: Codec> FileVault<'a, C> {
         match trust::check_dir(dir, trust::INPUT) {
             Ok(()) => vault.lock = Some(vault.lock()?),
             Err(TrustError::NotFound { .. }) => {}
-            Err(err) => return Err(SecretError::store(dir, err.reason())),
+            Err(err) => return Err(untrusted(dir, err)),
         }
-        let (file, meta) = match open_regular(path) {
+        // INPUT, not PRIVATE: only writing can forge a value, and a store made
+        // by hand or kept in a repository is often 0644 or a dotfile link.
+        let (file, meta) = match trust::open(path, trust::INPUT) {
             Ok(opened) => opened,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(TrustError::NotFound { .. }) => {
                 vault.absent = true;
                 return Ok(vault);
             }
-            Err(err) => return Err(vault.error(err.to_string())),
+            Err(err) => return Err(untrusted(path, err)),
         };
         let too_big = || vault.error(format!("larger than the {limit} byte limit"));
         if meta.len() > limit {
@@ -362,6 +387,41 @@ mod tests {
                 .chain(plaintext.iter().map(|b| b ^ 0xff))
                 .collect())
         }
+    }
+
+    #[test]
+    fn a_store_others_can_write_is_refused_and_absent_stays_empty() {
+        let root = temp_dir("store-trust");
+        let path = root.join("store");
+        assert!(FileVault::open(&path, LIMIT, Xor::default()).is_ok());
+        fs::remove_file(lock_of(&path)).unwrap();
+
+        fs::write(&path, b"forged").unwrap();
+        for mode in [0o664, 0o646, 0o666] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let Err(err) = FileVault::open(&path, LIMIT, Xor::default()) else {
+                panic!("mode {mode:o} opened");
+            };
+            assert!(matches!(err, SecretError::Refused { .. }), "{err:?}");
+            assert_eq!(crate::cli::Failure::from(err).code, 2);
+        }
+
+        // Read bits are fine: only writing can forge a value.
+        let codec = Xor::default();
+        let ciphertext = codec.encrypt(b"{}").unwrap();
+        fs::write(&path, ciphertext).unwrap();
+        for mode in [0o600, 0o640, 0o644] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(FileVault::open(&path, LIMIT, codec.clone()).is_ok());
+        }
+
+        // A link is followed, and judged at its target and its holder.
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(FileVault::open(&link, LIMIT, codec.clone()).is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(FileVault::open(&link, LIMIT, codec.clone()).is_err());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     fn mode(path: &Path) -> u32 {

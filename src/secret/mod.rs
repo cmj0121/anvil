@@ -96,6 +96,9 @@ pub enum SecretError {
     NotText { name: String },
     /// The store file cannot be read, written or understood.
     Store { path: PathBuf, message: String },
+    /// The store, its sops config or a folder of theirs can be changed by
+    /// others; `message` names the fix.
+    Refused { path: PathBuf, message: String },
     /// A decrypted store holds a key that is not a secret name.
     BadName { name: String },
     /// age refused to unlock the identity at `path`, or to decrypt or
@@ -134,17 +137,26 @@ impl fmt::Display for SecretError {
                     "secret {name}: not UTF-8 text, which a file store requires"
                 )
             }
-            SecretError::Store { path, message } => write!(f, "{}: {message}", path.display()),
+            SecretError::Store { path, message } => {
+                write!(f, "{}: {message}", crate::trust::shown_path(path))
+            }
+            SecretError::Refused { path, message } => {
+                write!(f, "{}: {message}", crate::trust::shown_path(path))
+            }
             SecretError::BadName { name } => {
                 write!(f, "secret store key `{}`: {NAME_RULE}", shown_name(name))
             }
             SecretError::Age { path, message } => {
-                write!(f, "{}: age: {message}", path.display())
+                write!(f, "{}: age: {message}", crate::trust::shown_path(path))
             }
             SecretError::Cancelled => f.write_str("cancelled"),
             SecretError::Sops { message } => write!(f, "sops {message}"),
             SecretError::Busy { path } => {
-                write!(f, "another anvil is using {}", path.display())
+                write!(
+                    f,
+                    "another anvil is using {}",
+                    crate::trust::shown_path(path)
+                )
             }
         }
     }
@@ -265,6 +277,23 @@ pub(crate) const SOURCES: [(&str, &str); 8] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_store_path_in_an_error_cannot_split_the_line() {
+        let err = SecretError::store(Path::new("/x/a\nERROR forged\u{202e}"), "bad");
+        assert_eq!(err.to_string(), "/x/a\\nERROR forged\\u{202e}: bad");
+        let path = PathBuf::from("/x/a\nERROR forged\u{202e}");
+        let err = SecretError::Age {
+            path: path.clone(),
+            message: "bad".to_owned(),
+        };
+        assert_eq!(err.to_string(), "/x/a\\nERROR forged\\u{202e}: age: bad");
+        let err = SecretError::Busy { path };
+        assert_eq!(
+            err.to_string(),
+            "another anvil is using /x/a\\nERROR forged\\u{202e}"
+        );
+    }
 
     #[test]
     fn name_rule_is_upper_snake() {

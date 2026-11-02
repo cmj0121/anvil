@@ -93,12 +93,13 @@ YAML 只是編輯檢視：`anvil inventory` 與 `anvil config` 以 `--format` �
 兩種格式對應到同一份 schema；未知的鍵一律拒絕，任何違規都以 2 結束並指出檔案、host 與欄位。
 
 config 或 inventory 不屬於你、群組或其他人可寫入，或位於這樣的資料夾中時，每個載入它的指令都會在解析之前拒絕，
-以 2 結束並指出路徑與修正方式；`anvil update` 兩者都不載入。symlink 的檔案可以使用：檢查的是實際檔案與它實際所在的資料夾，
-不檢查更上層的資料夾。除非 `[anvil].workspace` 改變工作區，config 連結所在的資料夾就是工作區，
-因此位於 775 或 777 資料夾中的連結在 `plan` 時會以 2 結束。`anvil secret` 仍可能成功；
+以 2 結束並指出路徑與修正方式；`anvil update` 兩者都不載入。symlink 的檔案可以使用：檢查的是實際檔案、它實際所在的資料夾，以及路徑上每個存放連結的資料夾，
+不檢查更上層的資料夾，因此位於 775 或 777 資料夾中的連結，每個指令都會以 2 結束，包括 `anvil secret` 與 `anvil config`。
+只有 root 或你能變更的存放資料夾可以通過，例如存放 macOS `/tmp` 的 `/`；任何人都能寫入的 sticky 存放資料夾會被拒絕。
+位於別處的 `[anvil].workspace` 只有讀取它的指令才會檢查：`anvil secret` 仍可能成功；
 `anvil config` 僅開啟或儲存沒有 `[[tasks]]` 的 config 時也一樣，儲存含 task 的 config 與 `config --harden` 則被拒絕，以 2 結束，不會儲存。
 透過 config 連結儲存時，連結會被換成連結所在資料夾中的一般 0600 檔案，實際檔案則未被編輯，因此 dotfile 管理工具的連結會因儲存而脫離：
-請改為編輯實際檔案。在寬鬆的資料夾中，接下來的 `plan` 與 `anvil config` 都會被拒絕。
+請改為編輯實際檔案。
 `--config /tmp/x.toml` 會被拒絕，umask 002 下產生的 checkout 也會被拒絕，
 直到你在其中執行 `chmod -R go-w .`（[安全性說明](security.zh-TW.md)）。
 之後由 `git pull` 或編輯器新增的檔案會再次成為 664 並再度被拒絕；請在 shell 中設定 `umask 022`。

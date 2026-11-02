@@ -126,6 +126,25 @@ impl Options {
         Ok(TrustedKeys::compiled())
     }
 
+    /// `--ssh-config` as ssh is to read it: the real path once it passes
+    /// [`trust::INPUT`], or nothing, so ssh uses its own default. `none` names no
+    /// file: it is how `ssh -F` skips every config.
+    pub fn ssh_config(&self) -> Result<Option<PathBuf>, Failure> {
+        let Some(path) = &self.ssh_config else {
+            return Ok(None);
+        };
+        if path == Path::new("none") {
+            return Ok(Some(path.clone()));
+        }
+        match trust::open_real(path, trust::INPUT) {
+            Ok((real, ..)) => Ok(Some(real)),
+            Err(err @ TrustError::Refused { .. }) => {
+                Err(Failure::refusal(format!("--ssh-config {err}")))
+            }
+            Err(err) => Err(Failure::usage(format!("--ssh-config {err}"))),
+        }
+    }
+
     /// How ssh runs: [`Options::ssh_program`], a password prompt only when
     /// [`Options::can_prompt`], and the production deadlines.
     fn ssh_settings(&self) -> SshSettings {
@@ -262,7 +281,8 @@ impl Options {
                 #[cfg_attr(not(debug_assertions), expect(unused_mut, reason = "debug: ssh_home"))]
                 let mut ssh = Ssh::new(
                     self.ssh_settings(),
-                    self.ssh_config.clone(),
+                    self.ssh_config()
+                        .map_err(|failure| TransportError::Spawn(failure.message))?,
                     host,
                     user.clone(),
                     *port,
@@ -279,14 +299,19 @@ impl Options {
 
 /// Refuses a workspace that another user owns or can write, who would control
 /// the inventory and files anvil reads, and one that cannot be examined.
-/// Missing counts as empty; a link is checked at its target; bits that only let
-/// others read are allowed.
+/// Missing counts as empty, unless a dangling link stands for it in a loose
+/// folder; a link is checked at its target and at each folder
+/// holding one on the path; bits that only let others read are allowed.
 fn check_workspace(workspace: &Path) -> Result<(), Failure> {
+    // First: a dangling link in a loose holder can be repointed at any time.
+    if let Err(err @ TrustError::Refused { .. }) = trust::check_links(workspace) {
+        return Err(Failure::refusal(format!("workspace {err}")));
+    }
     let real = match fs::canonicalize(workspace) {
         Ok(real) => real,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {
-            let shown = workspace.display();
+            let shown = trust::shown_path(workspace);
             return Err(Failure::refusal(format!(
                 "workspace {shown}: cannot check it: {err}"
             )));
@@ -308,6 +333,35 @@ mod tests {
         let cli =
             Cli::try_parse_from(std::iter::once("anvil").chain(args.iter().copied())).unwrap();
         Options::from_cli(&cli)
+    }
+
+    #[test]
+    fn a_dangling_workspace_link_in_a_loose_holder_is_refused_and_missing_stays_empty() {
+        let dir = fs::canonicalize(crate::test_util::temp_dir("workspace-dangling")).unwrap();
+        assert!(check_workspace(&dir.join("gone")).is_ok());
+        let holder = dir.join("holder");
+        fs::create_dir(&holder).unwrap();
+        let link = holder.join("ws");
+        std::os::unix::fs::symlink(dir.join("gone"), &link).unwrap();
+        crate::test_util::chmod(&holder, 0o755);
+        assert!(check_workspace(&link).is_ok());
+        crate::test_util::chmod(&holder, 0o777);
+        let err = check_workspace(&link).unwrap_err();
+        assert!(err.refused, "{err:?}");
+        assert_eq!(err.code, 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_workspace_cannot_forge_a_line_or_reorder_the_text() {
+        let dir = crate::test_util::temp_dir("workspace-escape");
+        let workspace = dir.join("ws\nERROR forged\u{202e}");
+        fs::create_dir(&workspace).unwrap();
+        crate::test_util::chmod(&workspace, 0o777);
+        let message = check_workspace(&workspace).unwrap_err().message;
+        assert!(!message.contains(['\n', '\u{202e}']), "{message}");
+        assert!(message.contains("ws\\nERROR forged\\u{202e}"), "{message}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A writable workspace is refused however it is named; read bits are not.

@@ -63,10 +63,11 @@ identity = "~/.config/anvil/age-identity.txt"
 identity 必須是你擁有的一般檔案，最大 64 KiB，且沒有任何 group 或 other 權限位元（權限較寬鬆時會以 exit 1 失敗，
 並提示對它執行 `chmod 600`）。純文字 identity 檔案可以包含多個 identity；
 儲存庫會加密給它們自己的 recipient，不會加密給其他任何人。
+identity 實際所在的資料夾，以及存放其連結的資料夾，其他人都不可寫入（否則以 exit 2 結束）。
 受密碼短語保護的 identity（如 `age -p` 所寫出的，不論是否 armored）會以[密碼短語提示](#密碼短語提示)解鎖。
 儲存庫檔案不必事先存在：不存在時視為空的儲存庫，第一次儲存時會建立它（以及它的目錄，權限 0700）。
-既有的目錄必須屬於你，且 group 與 others 不可寫入，因為他們可能調換檔案（不符合時以 exit 1 失敗，
-並附上要執行的 `chmod go-w`）。每次寫入都會透過同一目錄中一個全新的 0600 暫存檔原子地取代檔案，
+既有的目錄必須屬於你，且 group 與 others 不可寫入，因為他們可能調換檔案；儲存庫檔案本身與存放其連結的資料夾也一樣，
+因為持有收件者金鑰的人可能偽造值（不符合時以 exit 2 失敗，並附上要執行的 `chmod go-w`）。每次寫入都會透過同一目錄中一個全新的 0600 暫存檔原子地取代檔案，
 該暫存檔只含密文。儲存庫最多讀取 1 MiB 的 armored 密文，約 750 KiB 的 secret；
 超過此大小的儲存會被拒絕，儲存庫保持不變。屬於其他 identity 的儲存庫會以 `no identity matched` 失敗。
 
@@ -81,7 +82,7 @@ anvil 開著 age 或 sops 儲存庫時，會對旁邊的 `<store>.lock`（0600�
 否則為 `PATH` 上的 `sops`）時只使用 `decrypt` 與 `encrypt`，並透過管線，因此 sops 不會自行寫入任何檔案。
 請在儲存庫旁放一個 `.sops.yaml`，或以 `[secrets.sops].config` 指定另一個：
 anvil 一律以 `--config` 傳入它，因此 sops 永遠不會從儲存庫的目錄往上層尋找可能被別人放置在那裡的設定檔。
-它必須是你擁有、group 與 others 無法寫入的一般檔案，位於一個你擁有且他們同樣無法寫入的目錄中（否則以 exit 1 失敗，
+它必須是你擁有、group 與 others 無法寫入的一般檔案，位於一個你擁有且他們同樣無法寫入的目錄中（否則以 exit 2 失敗，
 並附上要執行的 `chmod go-w`）。儲存時需要它；讀取時不需要（沒有它時，
 sops 會收到 `--config /dev/null`），因此缺少設定檔只有在儲存東西時才會失敗。
 規則會與儲存庫路徑比對。以 age 金鑰為例：
@@ -108,6 +109,8 @@ age_key_file = "~/.config/sops/age/keys.txt"   # given to sops as SOPS_AGE_KEY_F
 
 `age_key_file` 若有設定，必須通過與 age identity 相同的檢查：
 你擁有的一般檔案，且沒有任何 group 或 other 權限位元（`chmod 600`）。
+它實際所在的資料夾，以及存放其連結的資料夾，其他人都不可寫入（否則以 exit 2 結束），sops 拿到的是它的實際路徑。
+`.sops.yaml` 的實際路徑也一樣。
 
 sops 在清空的環境中執行：只傳遞 `PATH`、`HOME`、`TMPDIR`、`LANG`、`LC_*`、`GNUPGHOME` 與 `XDG_CONFIG_HOME`，
 外加來自 `age_key_file` 的 `SOPS_AGE_KEY_FILE`。因此 anvil 環境中的雲端 KMS 憑證（AWS、GCP、Azure、Vault token）

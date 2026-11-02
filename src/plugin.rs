@@ -167,7 +167,7 @@ fn verify_one(name: &str, plugin: &Plugin, home: Option<&OsStr>) -> Result<Pin, 
     };
     let path = plugin.path(name, home)?;
     let real = fs::canonicalize(&path).map_err(|err| refuse(&err))?;
-    let (mut file, meta) = trust::open(&real, trust::INPUT).map_err(|err| {
+    let (mut file, meta) = trust::open(&path, trust::INPUT).map_err(|err| {
         if err.path() == real {
             refuse(&err.reason())
         } else {

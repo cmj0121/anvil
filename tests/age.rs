@@ -293,3 +293,31 @@ fn without_a_terminal_a_passphrase_identity_is_locked() {
         text(&out.stderr)
     );
 }
+
+#[test]
+fn a_store_others_can_write_is_refused_and_never_read_as_a_forgery() {
+    let sandbox = age_sandbox("as");
+    plain_identity(&sandbox);
+    let store = home(&sandbox, "secrets.age");
+    fs::write(&store, "not reached").unwrap();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o666)).unwrap();
+    for args in [&["doctor"][..], &["secret", "HOST_SUDO"][..]] {
+        let out = sandbox.anvil(args, &[]);
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains("run chmod go-w on it"), "{stderr}");
+    }
+    let edits = sandbox.record("editor.count");
+    assert!(!edits.exists(), "no editor opened");
+
+    // A link is judged at its target and its holder.
+    fs::remove_file(&store).unwrap();
+    let real = sandbox.root().join("real.age");
+    fs::write(&real, "not reached").unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o666)).unwrap();
+    std::os::unix::fs::symlink(&real, &store).unwrap();
+    let out = sandbox.anvil(&["doctor"], &[]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("mode 666"), "{stderr}");
+}

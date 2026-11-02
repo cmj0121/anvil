@@ -41,7 +41,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
 | `-v`, `--verbose`   | stderr 上更多日誌（`tui`：Log pane）；`-v` 警告、`-vv` info、`-vvv` debug（[日誌](#日誌)）         |
 | `--inventory PATH`  | 使用此 inventory 檔案而非自動找到的；須以 `.toml` 結尾（否則以 2 結束；見 [tui](#anvil-tui)）      |
 | `--config PATH`     | 使用此 config 檔案而非自動找到的；其目錄即工作區；PATH 須以 `.toml` 結尾（否則以 2 結束）          |
-| `--ssh-config PATH` | 以 `-F PATH` 傳給每個 `ssh`                                                                        |
+| `--ssh-config PATH` | 其實際路徑以 `-F` 傳給每個 `ssh`，`none` 為 `-F none`；其他人能變更時會被[拒絕](security.zh-TW.md) |
 | `--json`            | 在 stdout 印出恰好一份 JSON 文件，取代給人看的輸出                                                 |
 | `--target SEL`      | `local`、host 名稱或 tag；可重複以取聯集；未指定表示 `local` 加上所有 host                         |
 | `--parallel N`      | `apply`、`plan`、`run` 與 `rollback` 同時處理的 target 數，1..=32，預設 1（[平行執行](#平行執行)） |
@@ -1471,6 +1471,8 @@ target 的選法與 apply 相同（`--target`；未指定表示 `local` 加上�
 腳本是每個 target 唯一的 step，經其 stdin 送到 `sh -s`（`local` 則為 `/bin/sh -s`），絕不放在 argv 上。
 它一律是 POSIX sh：shebang 行只是註解。run 不詢問確認。
 
+- **其他人能變更的 `FILE` 會被拒絕。** 與 config 一樣，在任何 target 開始前以 2 結束，FIFO 或其他非一般檔案亦然
+  （[安全性說明](security.zh-TW.md)）。stdin 不檢查。
 - **config 錯誤不會擋住 run。** 未指定 `--inventory` 時，run 會載入 config 來尋找工作區的 inventory；
   config 出錯時會記錄警告，並退回 config 所在目錄。例外是拒絕，也就是其他人能變更的 config 或工作區：
   以 2 結束，不會退回。指定 `--inventory` 時則略過 config。

@@ -41,7 +41,7 @@ Every flag is global: it may come before or after the command.
 | `-v`, `--verbose`   | more logs on stderr (`tui`: Log pane); `-v` warnings, `-vv` info, `-vvv` debug ([Logging](#logging))  |
 | `--inventory PATH`  | this inventory file, not the discovered one; must end in `.toml` (else exit 2; see [tui](#anvil-tui)) |
 | `--config PATH`     | this config file, not the discovered one; sets the workspace; must end in `.toml` (else exit 2)       |
-| `--ssh-config PATH` | passed to every `ssh` as `-F PATH`                                                                    |
+| `--ssh-config PATH` | real path as `-F` to every `ssh`, `none` as `-F none`; [refused](security.md) if others can change it |
 | `--json`            | print exactly one JSON document on stdout instead of human output                                     |
 | `--target SEL`      | `local`, a host name or a tag; repeat to take the union; none means `local` plus every host           |
 | `--parallel N`      | targets at once (apply, plan, run, rollback): 1..=32, default 1 ([parallel](#running-in-parallel))    |
@@ -1549,6 +1549,8 @@ Targets are chosen as for apply (`--target`; none means `local` plus every host)
 The script is each target's one step, sent on its stdin to `sh -s` (`/bin/sh -s` for `local`), never on an argv. It
 is always POSIX sh: a shebang line is only a comment. run asks for no confirmation.
 
+- **A `FILE` others can change is refused.** Exit 2 before any target starts, as for the config, and a FIFO or other
+  non-regular file too ([Security notes](security.md)). Stdin is not checked.
 - **Config errors do not block run.** Without `--inventory`, run loads the config to locate the workspace inventory;
   a config error logs a warning and falls back to the config's directory. The exception is a refusal, of a config or
   workspace others can change: it exits 2 with no fallback. With `--inventory`, it skips the config.

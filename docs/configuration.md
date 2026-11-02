@@ -94,13 +94,14 @@ violation is exit 2 naming the file, host and field.
 
 A config or inventory that is not yours, or that group or others can write, or in such a folder, is refused before it
 is parsed, exit 2 naming the path and the fix, for every command that loads it; `anvil update` loads neither. A symlinked
-file works: the real file and its real folder are checked, not the folders above. A config link's own folder is the
-workspace unless `[anvil].workspace` moves it, so a link in a 775 or 777 folder exits 2 at `plan`. `anvil secret` can
-still succeed, and so can `anvil config` when it only opens or saves a config with no `[[tasks]]`; saving one with tasks
-and `config --harden` are refused, exit 2, nothing saved.
+file works: the real file, its real folder and each folder holding a link on the path are checked, not the folders
+above, so a link in a 775 or 777 folder exits 2 for every command, `anvil secret` and `anvil config` included. A holder
+only root or you can change passes, such as `/` holding `/tmp` on macOS; a world-writable sticky one is refused.
+A `[anvil].workspace` elsewhere is checked only by what reads it: `anvil secret` can still succeed, and so can
+`anvil config` when it only opens or saves a config with no `[[tasks]]`; saving one with tasks and `config --harden` are
+refused, exit 2, nothing saved.
 A save through a config link replaces the link with a regular 0600 file in the link's folder and leaves the real file
-unedited, so it detaches a dotfile manager's link: edit the real file instead. In a loose folder the next `plan` and
-`anvil config` are then refused.
+unedited, so it detaches a dotfile manager's link: edit the real file instead.
 `--config /tmp/x.toml` is refused, and so is a
 checkout made at umask 002 until you run `chmod -R go-w .` in it ([Security notes](security.md)).
 Files added later, by `git pull` or an editor, come back 664 and are refused again; set `umask 022` in your shell.

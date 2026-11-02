@@ -45,26 +45,40 @@
   - **修好之前，每個會載入 config 的指令都會被拒絕**：`run`、`plan`、`apply`、`config`、`inventory`、`files`、`secret`、
     `doctor`、`rollback` 與 TUI。沒有略過的旗標，因為編輯器指令本身就來自不受信任的檔案；修正不需要 anvil。
     `anvil update` 不載入 config，因此不會被拒絕。被拒絕的 config 或 inventory 絕不會退回使用它旁邊的 host 清單。
-  - **symlink 的 config 可以使用，但連結必須在嚴格的資料夾中**。路徑會先解析，檔案檢查涵蓋實際檔案與它實際所在的資料夾。
-    存放連結的資料夾也會被檢查，除非 `[anvil].workspace` 改變工作區，它就是工作區：
-    位於 775 的 `anvil/` 或 777 資料夾中的連結，在 `plan` 時會以 2 結束。
-    `anvil secret` 不從工作區讀取任何東西，因此在 `plan`、`inventory` 與 `doctor` 拒絕時，它仍可能成功。
+  - **symlink 的 config 可以使用，但連結必須在嚴格的資料夾中**。路徑會先解析，檢查涵蓋實際檔案、它實際所在的資料夾，
+    以及路徑上每個存放連結的資料夾，因為能寫入該處的人就能讓連結改指向別處。`--inventory`、工作區、`anvil run` 腳本、
+    `--ssh-config`、secret 儲存庫、sops config 與 plugin 也一樣：位於 775 或 777 資料夾中的連結會以 2 結束，
+    訊息為 `...; it holds a link on the path, so name the real path instead`。只有 root 或你能變更的存放資料夾可以通過，
+    因此 macOS 的 `/tmp` 與 `/var`（root 擁有的 `/` 中的連結）以及 `/home -> /var/home` 都能使用。
+    任何人都能寫入的 sticky 存放資料夾會被拒絕。這只放寬存放連結的資料夾：實際檔案與它實際所在的資料夾仍必須屬於你。
+    位於別處的 `[anvil].workspace` 只有讀取它的指令才會檢查：`anvil secret` 不從工作區讀取任何東西，
+    因此在 `plan`、`inventory` 與 `doctor` 拒絕時，它仍可能成功。
     `anvil config` 開啟時不檢查工作區，config 沒有 `[[tasks]]` 時儲存也不檢查；
     儲存含 task 的 config 與 `config --harden` 會被拒絕，以 2 結束，不會儲存。
     透過 config 連結儲存時，連結會被換成連結所在資料夾中的一般 0600 檔案，實際檔案則未被編輯，因此 dotfile 管理工具的連結會因儲存而脫離：
-    請改為編輯實際檔案。在寬鬆的資料夾中，接下來的 `plan` 與 `anvil config` 都會被拒絕。
+    請改為編輯實際檔案。
   - **umask 002 的 checkout 會被拒絕**，包括 `examples/`，因為檔案會是 664、資料夾會是 775。
     請在該 checkout 中執行 `chmod -R go-w .` 修正。
     之後由 `git pull` 或編輯器新增的檔案會再次成為 664 並再度被拒絕；請在 shell 中設定 `umask 022`。
     anvil 為 config 或 inventory 建立的資料夾是 0700。
   - **`--config /tmp/x.toml` 會被拒絕**，因為 `/tmp` 不屬於你。請把檔案放在你擁有的資料夾中。
   - **透過 sudo 執行時**，你擁有的 config 會被拒絕，因為它不屬於 root。請以自己的身分執行 anvil；step 要求時它會在 target 上使用 sudo。
-  - **只檢查實際的上層資料夾，或從工作區根目錄往下，不檢查更上層的資料夾**。config、inventory
-    （明確的 `--inventory ws/a/b/inv.toml` 也一樣，即使在工作區內）、plugin 與 sops config 只檢查實際的上層資料夾；
+  - **`anvil run FILE` 與 `--ssh-config` 會先通過這些檢查才讀取**。被拒絕的腳本，或佔據其位置的 FIFO，
+    會在任何 target 開始前以 2 結束；stdin（`-`）沒有檔案可檢查。ssh 拿到的是 `--ssh-config` 的實際路徑，每個指令都一樣，
+    檔案不存在時以 2 結束，不會在沒有它的情況下繼續。`--ssh-config none` 會當作 ssh 自己的 `-F none` 傳入，它不指名任何檔案；
+    `--ssh-config /dev/null` 與 FIFO 會被拒絕，`anvil run <(...)` 也一樣，因為它的路徑是管線。未指定此旗標時 ssh 讀取它的預設設定，anvil 不檢查該設定。
+  - **secret 儲存庫可讓其他人讀取，但不可變更**。持有收件者金鑰的人可能偽造 `sudo_secret` 之類的值，
+    因此其他人能寫入的 age 或 sops 儲存庫會讓 `secret`、`doctor` 與 `apply` 以 2 結束。
+    0644 的儲存庫與連結可以通過；不存在時仍視為空的。sops 拿到的是其 config 與 `age_key_file` 的實際路徑，
+    後者實際所在的資料夾也必須通過檢查，age identity 的亦然。寬鬆資料夾中懸空的工作區連結會被拒絕，不視為不存在。
+  - **只檢查實際的上層資料夾、存放連結的資料夾，或從工作區根目錄往下，不檢查更上層的資料夾**。config、inventory
+    （明確的 `--inventory ws/a/b/inv.toml` 也一樣，即使在工作區內）、腳本、`--ssh-config` 檔案、儲存庫、sops config 與 plugin
+    檢查實際的上層資料夾與路徑上每個存放連結的資料夾；
     src 與 include 則檢查從工作區根目錄到該檔案的每個資料夾。
     其他人能寫入的更上層資料夾，仍可能讓他們把整個資料夾移開，因此請讓整條路徑都屬於你。
-  - **src 的兩項限制**。工作區外的資料夾只有在存放路徑經過的連結時才會檢查，因此它上層可寫入的資料夾會通過。
-    經過 root 擁有的系統 symlink（macOS 的 `/tmp`）的絕對連結會被拒絕並顯示 chown 提示；請改用相對連結或實際路徑。
+  - **src 的一項限制**。工作區外的資料夾只有在存放路徑經過的連結時才會檢查，因此它上層可寫入的資料夾會通過。
+    工作區內存放連結的資料夾必須屬於你，即使工作區外的存放資料夾可以屬於 root。
+  - **看不到 macOS 的 ACL**。只讀取擁有者與權限位元，因此授予其他人寫入權限的 ACL 會通過檢查。
 - **讀取與寫入之間的變更**。每次 `[[files]]` 寫入之前 apply 會讀取 DEST，若 DEST 的 sha256 在那之後改變，寫入就會拒絕：
   `files: DEST changed while anvil was writing it; re-run apply`。這項檢查需要 target 上有 `sha256sum` 或 `shasum`。
   兩者都沒有時就沒有檢查，因此在讀取與寫入之間做的變更會被覆寫，而紀錄保存的是較舊的狀態。

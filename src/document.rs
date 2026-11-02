@@ -111,21 +111,25 @@ impl fmt::Display for DocumentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DocumentError::Read { path, source } => {
-                write!(f, "{}: cannot read: {source}", path.display())
+                write!(f, "{}: cannot read: {source}", trust::shown_path(path))
             }
             DocumentError::Refused(message) => f.write_str(message),
             DocumentError::TooLarge { path } => write!(
                 f,
                 "{}: larger than the {MAX_BYTES} byte limit",
-                path.display()
+                trust::shown_path(path)
             ),
             DocumentError::Parse {
                 path,
                 format,
                 message,
-            } => write!(f, "{}: invalid {format}: {message}", path.display()),
+            } => write!(
+                f,
+                "{}: invalid {format}: {message}",
+                trust::shown_path(path)
+            ),
             DocumentError::Invalid { path, message } => {
-                write!(f, "{}: {message}", path.display())
+                write!(f, "{}: {message}", trust::shown_path(path))
             }
             DocumentError::Serialize { format, message } => {
                 write!(f, "cannot write {format}: {message}")
@@ -249,6 +253,36 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn a_path_in_an_error_cannot_split_the_line() {
+        let path = PathBuf::from("/x/a\nERROR forged\u{202e}.toml");
+        let source = io::Error::other("no");
+        let message = String::from("bad");
+        for err in [
+            DocumentError::Read {
+                path: path.clone(),
+                source,
+            },
+            DocumentError::TooLarge { path: path.clone() },
+            DocumentError::Parse {
+                path: path.clone(),
+                format: Format::Toml,
+                message: message.clone(),
+            },
+            DocumentError::Invalid {
+                path: path.clone(),
+                message,
+            },
+        ] {
+            let shown = err.to_string();
+            assert!(!shown.contains(['\n', '\u{202e}']), "{shown}");
+            assert!(
+                shown.starts_with("/x/a\\nERROR forged\\u{202e}.toml: "),
+                "{shown}"
+            );
+        }
+    }
 
     type Doc = BTreeMap<String, BTreeMap<String, String>>;
 

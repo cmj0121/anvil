@@ -62,11 +62,13 @@ identity = "~/.config/anvil/age-identity.txt"
 ```
 
 The identity must be a regular file owned by you, at most 64 KiB, with no group or other permission bits (a looser
-mode fails with exit 1 and says to run `chmod 600` on it). A plain identity file may hold several identities; the store
+mode fails with exit 1 and says to run `chmod 600` on it), in a real folder others cannot write, with any folder holding
+a link to it the same (exit 2 otherwise). A plain identity file may hold several identities; the store
 is encrypted to their own recipients and nobody else's. A passphrase-protected one (as `age -p` writes it, armored or
 not) is unlocked with the [passphrase prompt](#the-passphrase-prompt). The store file need not exist: a missing one is
 an empty store, and the first save creates it (and its directory, mode 0700). An existing directory must be yours and
-not writable by group or others, who could swap the file (exit 1 otherwise, with the `chmod go-w` to run). Every write
+not writable by group or others, who could swap the file, and the store file itself, or a folder holding a link to it,
+the same: a holder of the recipient key could forge a value (exit 2 otherwise, with the `chmod go-w` to run). Every write
 replaces the file atomically through a fresh 0600 temp file in the same directory that holds ciphertext only. The
 store is read up to 1 MiB of armored ciphertext, about 750 KiB of secrets; a save past that is refused and the store is
 kept. A store of another identity fails with `no identity matched`.
@@ -82,7 +84,7 @@ creation rules pick the keys. anvil runs `sops` (`[secrets.sops].program`, an ab
 with `decrypt` and `encrypt` only, over pipes, so sops writes no file of its own. Put a `.sops.yaml` next to the store,
 or name another with `[secrets.sops].config`: anvil always passes it with `--config`, so sops never looks upward from
 the store's directory for one that someone else may have planted there. It must be a regular file owned by you that
-group and others cannot write, in a directory of yours they cannot write either (else exit 1, with the `chmod go-w` to
+group and others cannot write, in a directory of yours they cannot write either (else exit 2, with the `chmod go-w` to
 run). Saving needs it; reading does not (without
 it, sops gets `--config /dev/null`), so a missing config fails only when something is stored. The rules are matched
 against the store path. For an age key:
@@ -108,7 +110,8 @@ age_key_file = "~/.config/sops/age/keys.txt"   # given to sops as SOPS_AGE_KEY_F
 ```
 
 `age_key_file`, when set, must pass the same checks as an age identity: a regular file owned by you with no group or
-other permission bits (`chmod 600`).
+other permission bits (`chmod 600`). Its real folder, and any folder holding a link to it, must not be writable by
+others (exit 2 otherwise), and sops gets its real path. The same goes for the real path of the `.sops.yaml`.
 
 sops runs with a cleared environment: only `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_*`, `GNUPGHOME` and
 `XDG_CONFIG_HOME` are passed on, plus `SOPS_AGE_KEY_FILE` from `age_key_file`. Cloud KMS credentials in anvil's

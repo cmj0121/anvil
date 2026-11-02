@@ -109,44 +109,6 @@ pub(crate) fn src_message(item: &Item, i: usize, src: &str, why: &str) -> String
     ))
 }
 
-/// Refuses a folder others can write on the way to `src` as it is written,
-/// from `dir` down, following each link: such a folder could repoint a link it
-/// holds at any file the real-path check would pass. A folder outside `dir` is
-/// checked only when it holds a link the path goes through.
-fn check_written_path(dir: &Path, src: &str) -> Result<(), TrustError> {
-    let parts = |path: &Path| -> Vec<std::ffi::OsString> {
-        let parts = path.components().rev();
-        parts.map(|part| part.as_os_str().to_owned()).collect()
-    };
-    let mut current = dir.to_path_buf();
-    let mut rest = parts(Path::new(src));
-    while let Some(part) = rest.pop() {
-        if part == "." {
-            continue;
-        }
-        if part == ".." {
-            current.pop();
-            continue;
-        }
-        let next = current.join(&part);
-        let failed = |source| TrustError::Io {
-            path: next.clone(),
-            source,
-        };
-        let is_link = fs::symlink_metadata(&next).map_err(failed)?.is_symlink();
-        if is_link || current.starts_with(dir) {
-            trust::check_dir(&current, trust::INPUT)?;
-        }
-        if is_link {
-            let mut target = parts(&fs::read_link(&next).map_err(failed)?);
-            rest.append(&mut target);
-        } else {
-            current = next;
-        }
-    }
-    Ok(())
-}
-
 /// Reads a relative src as text, confined to the already canonical workspace
 /// `dir`. A symlink inside the workspace works: every folder on the path as
 /// written, the real file and every real folder from `dir` down to it are what
@@ -167,7 +129,7 @@ pub(crate) fn read_src(dir: &Path, src: &str) -> Result<String, Failure> {
         TrustError::TooLarge { .. } => Failure::usage("exceeds the 1 MiB limit"),
         TrustError::NotFound { source, .. } | TrustError::Io { source, .. } => unreadable(source),
     };
-    check_written_path(dir, src).map_err(trust_error)?;
+    trust::check_written_path(dir, src).map_err(trust_error)?;
     for folder in path.ancestors().skip(1).take_while(|a| a.starts_with(dir)) {
         trust::check_dir(folder, trust::INPUT).map_err(trust_error)?;
     }
