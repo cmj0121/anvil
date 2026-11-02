@@ -30,6 +30,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+use hmac::{Hmac, Mac};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -591,28 +592,11 @@ pub fn tag(key: &[u8; 32], sha256_hex: &str) -> String {
 
 /// HMAC-SHA256 (RFC 2104) of `message` under `key`.
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    const BLOCK: usize = 64;
-    let mut block = Zeroizing::new([0u8; BLOCK]);
-    if key.len() > BLOCK {
-        block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let pad = |byte: u8| -> Zeroizing<[u8; BLOCK]> {
-        let mut out = Zeroizing::new([0u8; BLOCK]);
-        for (out, key) in out.iter_mut().zip(block.iter()) {
-            *out = key ^ byte;
-        }
-        out
-    };
-    let inner = Sha256::new()
-        .chain_update(&pad(0x36)[..])
+    Hmac::<Sha256>::new_from_slice(key)
+        .expect("HMAC takes a key of any length")
         .chain_update(message)
-        .finalize();
-    Sha256::new()
-        .chain_update(&pad(0x5c)[..])
-        .chain_update(inner)
         .finalize()
+        .into_bytes()
         .into()
 }
 

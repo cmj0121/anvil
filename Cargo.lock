@@ -162,6 +162,7 @@ dependencies = [
  "age",
  "clap",
  "crossterm",
+ "hmac",
  "log",
  "minisign-verify",
  "ratatui",
