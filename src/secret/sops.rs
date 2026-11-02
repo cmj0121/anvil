@@ -32,7 +32,6 @@
 
 use std::cell::OnceCell;
 use std::ffi::OsString;
-use std::fs;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -195,7 +194,7 @@ impl Runner<'_> {
             }),
             // The file as it was named, a folder as the real one to fix.
             Err(err) => {
-                let is_file = fs::canonicalize(config).is_ok_and(|real| err.path() == real);
+                let is_file = paths::same_file(config, err.path());
                 let shown = if is_file { config } else { err.path() };
                 Err(SecretError::store(shown, err.reason()))
             }

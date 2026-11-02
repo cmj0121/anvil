@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rustix::fs::{FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 
-use crate::secret::check_owner;
+use crate::trust::check_owner;
 
 /// How often a write tries another temp file name that already exists.
 const TEMP_ATTEMPTS: u32 = 8;

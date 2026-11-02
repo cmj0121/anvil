@@ -8,13 +8,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::Output;
 
-use common::{Sandbox, text};
+use common::{Sandbox, chmod, text};
 
 const HOST: &str = "[hosts.box]\nhost = \"fallback.example\"\n";
-
-fn chmod(path: &Path, mode: u32) {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-}
 
 fn put(path: &Path, mode: u32, body: &str) {
     fs::write(path, body).unwrap();

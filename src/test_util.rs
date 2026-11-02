@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -21,6 +21,11 @@ use crate::secret::{BackendKind, SecretError, Store, Vault};
 
 pub fn json(value: &impl Serialize) -> serde_json::Value {
     serde_json::to_value(value).unwrap()
+}
+
+/// Gives `path` exactly `mode`.
+pub fn chmod(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
 /// Waits (30 s at most) until `path` exists.

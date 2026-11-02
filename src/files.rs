@@ -82,44 +82,31 @@ pub fn load(
     });
     let sources = expanded.files().map(|(item, entry, i)| {
         let text = if filestore::is_store_path(&entry.src) {
-            store.read_trusted(&entry.src).map_err(|err| match err {
-                StoreError::Untrusted(_, _) => SrcError::Refused(store_reason(&entry.src, &err)),
-                err => SrcError::Other(store_reason(&entry.src, &err)),
+            store.read_trusted(&entry.src).map_err(|err| Failure {
+                refused: matches!(err, StoreError::Untrusted(_, _)),
+                ..Failure::usage(store_reason(&entry.src, &err))
             })
         } else {
             canonical
                 .as_ref()
-                .map_err(|err| SrcError::Other(err.clone()))
+                .map_err(|err| Failure::usage(err.clone()))
                 .and_then(|dir| read_src(dir, &entry.src))
         };
-        text.map(|text| Source { text }).map_err(|err| {
-            let message = item.shown_message(format!(
-                "{}.src `{}`: {err}",
-                item.label("files", i),
-                secret::shown_name(&entry.src)
-            ));
-            match err {
-                SrcError::Refused(_) => Failure::refusal(message),
-                SrcError::Other(_) => Failure::usage(message),
-            }
+        text.map(|text| Source { text }).map_err(|err| Failure {
+            message: src_message(item, i, &entry.src, &err.message),
+            ..err
         })
     });
     Ok(Sources(sources.collect::<Result<_, _>>()?))
 }
 
-/// Why a src was not read.
-#[derive(Debug)]
-pub(crate) enum SrcError {
-    /// It or a folder above it can be changed by others.
-    Refused(String),
-    Other(String),
-}
-
-impl fmt::Display for SrcError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (SrcError::Refused(why) | SrcError::Other(why)) = self;
-        f.write_str(why)
-    }
+/// `why` the src of the file entry `item` was not read, naming the entry.
+pub(crate) fn src_message(item: &Item, i: usize, src: &str, why: &str) -> String {
+    item.shown_message(format!(
+        "{}.src `{}`: {why}",
+        item.label("files", i),
+        secret::shown_name(src)
+    ))
 }
 
 /// Refuses a folder others can write on the way to `src` as it is written,
@@ -164,21 +151,20 @@ fn check_written_path(dir: &Path, src: &str) -> Result<(), TrustError> {
 /// `dir`. A symlink inside the workspace works: every folder on the path as
 /// written, the real file and every real folder from `dir` down to it are what
 /// is checked.
-pub(crate) fn read_src(dir: &Path, src: &str) -> Result<String, SrcError> {
+pub(crate) fn read_src(dir: &Path, src: &str) -> Result<String, Failure> {
     const TEXT_ONLY: &str = "[[files]] copies text files only for now";
-    let other = |why: String| SrcError::Other(why);
-    let unreadable = |err: std::io::Error| other(format!("cannot read: {err}"));
+    let unreadable = |err: std::io::Error| Failure::usage(format!("cannot read: {err}"));
     let path = fs::canonicalize(dir.join(src)).map_err(unreadable)?;
     if !path.starts_with(dir) {
-        return Err(other("leaves the workspace".to_string()));
+        return Err(Failure::usage("leaves the workspace"));
     }
     let meta = fs::metadata(&path).map_err(unreadable)?;
     if !meta.is_file() {
-        return Err(other("is not a regular file".to_string()));
+        return Err(Failure::usage("is not a regular file"));
     }
     let trust_error = |err: TrustError| match err {
-        TrustError::Refused { .. } => SrcError::Refused(err.to_string()),
-        TrustError::TooLarge { .. } => other("exceeds the 1 MiB limit".to_string()),
+        TrustError::Refused { .. } => Failure::refusal(err.to_string()),
+        TrustError::TooLarge { .. } => Failure::usage("exceeds the 1 MiB limit"),
         TrustError::NotFound { source, .. } | TrustError::Io { source, .. } => unreadable(source),
     };
     check_written_path(dir, src).map_err(trust_error)?;
@@ -186,10 +172,10 @@ pub(crate) fn read_src(dir: &Path, src: &str) -> Result<String, SrcError> {
         trust::check_dir(folder, trust::INPUT).map_err(trust_error)?;
     }
     let bytes = trust::load(&path, document::MAX_BYTES).map_err(trust_error)?;
-    let text =
-        String::from_utf8(bytes).map_err(|_| other(format!("is not UTF-8 text; {TEXT_ONLY}")))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| Failure::usage(format!("is not UTF-8 text; {TEXT_ONLY}")))?;
     if text.contains('\0') {
-        return Err(other(format!("contains a NUL byte; {TEXT_ONLY}")));
+        return Err(Failure::usage(format!("contains a NUL byte; {TEXT_ONLY}")));
     }
     Ok(text)
 }

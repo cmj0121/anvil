@@ -630,7 +630,7 @@ pub(crate) fn last_line(stderr: &[u8]) -> Option<String> {
 mod tests {
     use std::fs::{DirBuilder, OpenOptions};
     use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
     use super::*;
     use crate::config::{Plugin, Step};
@@ -684,9 +684,7 @@ mod tests {
         verify_where(config, Plugin::is_step)
     }
 
-    fn chmod(path: &Path, mode: u32) {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-    }
+    use crate::test_util::chmod;
 
     #[test]
     fn a_matching_plugin_is_pinned_by_its_real_path() {

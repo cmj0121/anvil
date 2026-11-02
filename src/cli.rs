@@ -299,10 +299,9 @@ impl Failure {
 // Config, inventory and path problems are exit 2.
 impl From<crate::document::DocumentError> for Failure {
     fn from(err: crate::document::DocumentError) -> Self {
-        if err.is_refused() {
-            Failure::refusal(err.to_string())
-        } else {
-            Failure::usage(err.to_string())
+        Failure {
+            refused: err.is_refused(),
+            ..Failure::usage(err.to_string())
         }
     }
 }

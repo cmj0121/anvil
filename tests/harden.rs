@@ -1072,10 +1072,7 @@ fn a_store_src_others_can_write_is_refused_and_not_laundered() {
         );
     }
     assert_eq!(fs::read(&path).unwrap(), b"PermitRootLogin yes\n");
-    assert_eq!(
-        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o664
-    );
+    assert_eq!(mode(&path), 0o664);
     assert_eq!(
         fs::read(sb.config_dir().join("config.toml")).unwrap(),
         before
@@ -1095,8 +1092,5 @@ fn a_contradicting_store_src_others_can_write_is_refused() {
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("files[0].src `$/other.conf`"), "{stderr}");
-    assert_eq!(
-        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o664
-    );
+    assert_eq!(mode(&path), 0o664);
 }

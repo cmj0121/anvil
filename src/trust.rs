@@ -23,25 +23,21 @@ use crate::logger::escape_controls;
 /// What [`open`] and [`check_dir`] require.
 #[derive(Debug, Clone, Copy)]
 pub struct Policy {
-    /// Permission bits the file must not have.
-    pub file: u32,
-    /// Permission bits its folder must not have.
-    pub dir: u32,
+    /// Permission bits neither the file nor its folder may have.
+    forbidden: u32,
     /// Whether a symlink is followed to the real file, or refused.
-    pub follow: bool,
+    follow: bool,
 }
 
 /// A local file that drives a run: others may read it but not change it.
 pub const INPUT: Policy = Policy {
-    file: 0o022,
-    dir: 0o022,
+    forbidden: 0o022,
     follow: true,
 };
 
 /// A file only the current user may reach, never through a symlink.
 pub const PRIVATE: Policy = Policy {
-    file: 0o077,
-    dir: 0o077,
+    forbidden: 0o077,
     follow: false,
 };
 
@@ -133,7 +129,7 @@ pub fn open(path: &Path, policy: Policy) -> Result<(File, Metadata), TrustError>
     if !meta.is_file() {
         return Err(TrustError::refused(&real, "not a regular file"));
     }
-    check_owner(&meta, policy.file).map_err(|why| TrustError::refused(&real, why))?;
+    check_owner(&meta, policy.forbidden).map_err(|why| TrustError::refused(&real, why))?;
     Ok((file, meta))
 }
 
@@ -180,7 +176,7 @@ pub fn check_dir(dir: &Path, policy: Policy) -> Result<(), TrustError> {
             "not a directory; replace it with a real folder",
         ));
     }
-    check_bits(&meta, policy.dir, "chmod 700").map_err(|why| TrustError::refused(dir, why))
+    check_bits(&meta, policy.forbidden, "chmod 700").map_err(|why| TrustError::refused(dir, why))
 }
 
 /// [`check_owner`], with `private_fix` as the fix for bits that let others in.
@@ -224,19 +220,15 @@ fn open_read(path: &Path, extra: OFlags) -> Result<File, Errno> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::symlink;
     use std::process::Command;
 
     use super::*;
-    use crate::test_util::temp_dir;
+    use crate::test_util::{chmod, temp_dir};
 
     const LIMIT: u64 = 64;
     const NOT_OURS: &str =
         "not owned by the current user; run chown on it, or do not run anvil through sudo";
-
-    fn chmod(path: &Path, mode: u32) {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-    }
 
     /// `name` in `dir`, holding `body`, with exactly `mode`.
     fn file(dir: &Path, name: &str, mode: u32, body: &[u8]) -> PathBuf {

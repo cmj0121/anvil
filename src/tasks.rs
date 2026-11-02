@@ -238,13 +238,9 @@ pub fn expand(
     };
     // A refusal can name an include's path, which may hold anything.
     let walked = walk.tasks(&config.tasks, "tasks", 1, &Selector::default());
-    walked.map_err(|why| {
-        let why = escape_invisible(&why);
-        if walk.refused {
-            Failure::refusal(why)
-        } else {
-            Failure::usage(why)
-        }
+    walked.map_err(|why| Failure {
+        refused: walk.refused,
+        ..Failure::usage(escape_invisible(&why))
     })?;
     Ok(Expanded {
         items: walk.items,

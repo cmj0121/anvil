@@ -32,8 +32,7 @@ use zeroize::Zeroizing;
 
 use super::{BackendKind, SecretError, Store, Vault, is_name};
 use crate::private::{self, LockError};
-use crate::trust::{self, TrustError};
-pub(crate) use crate::trust::{check_owner, open_regular};
+use crate::trust::{self, TrustError, check_owner, open_regular};
 
 /// How a file store turns its plaintext into the bytes on disk and back.
 pub trait Codec {
@@ -95,7 +94,7 @@ pub fn open_private(path: &Path) -> Result<(File, Metadata), SecretError> {
 }
 
 /// Refuses a directory that is not ours or that others can write to.
-pub fn check_dir(dir: &Path) -> Result<(), SecretError> {
+fn check_dir(dir: &Path) -> Result<(), SecretError> {
     trust::check_dir(dir, trust::INPUT).map_err(|err| SecretError::store(dir, err.reason()))
 }
 

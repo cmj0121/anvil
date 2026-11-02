@@ -9,15 +9,15 @@ pub mod diff;
 pub mod rules;
 
 use std::cell::OnceCell;
-use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
+use crate::cli::Failure;
 use crate::config::Config;
-use crate::files::{self, SrcError};
+use crate::files;
 use crate::filestore::{self, StoreError};
 use crate::inventory::{self, Inventory};
 use crate::logger::escape_invisible;
@@ -97,31 +97,6 @@ pub struct Held {
     pub reason: &'static str,
     pub hosts: Vec<String>,
 }
-
-/// Why no suggestion could be made: the config text or a src is unreadable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Failure {
-    pub message: String,
-    /// A src others can change: never to be downgraded by the caller.
-    pub refused: bool,
-}
-
-impl Failure {
-    fn usage(message: impl Into<String>) -> Self {
-        Failure {
-            message: message.into(),
-            refused: false,
-        }
-    }
-}
-
-impl fmt::Display for Failure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for Failure {}
 
 const ROOT_LOGIN: &str = "ssh.root-login";
 const PASSWORD_AUTH: &str = "ssh.password-auth";
@@ -334,21 +309,20 @@ impl<'a> Sources<'a> {
 
     /// The src's text; `None` when it does not exist yet. Read as a run reads
     /// it: what harden may write back must not launder a file others can change.
-    fn read(&self, src: &str) -> Result<Option<String>, SrcError> {
-        let other = SrcError::Other;
+    fn read(&self, src: &str) -> Result<Option<String>, Failure> {
         if filestore::is_store_path(src) {
             return match self.store.read_trusted(src) {
                 Ok(text) => Ok(Some(text)),
                 Err(StoreError::NotFound(_)) => Ok(None),
                 Err(err @ StoreError::Untrusted(_, _)) => {
-                    Err(SrcError::Refused(files::store_reason(src, &err)))
+                    Err(Failure::refusal(files::store_reason(src, &err)))
                 }
-                Err(err) => Err(other(err.reason())),
+                Err(err) => Err(Failure::usage(err.reason())),
             };
         }
         let path = Path::new(src);
         if path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
-            return Err(other("leaves the workspace".to_string()));
+            return Err(Failure::usage("leaves the workspace"));
         }
         let dir = self
             .canonical
@@ -356,7 +330,7 @@ impl<'a> Sources<'a> {
                 fs::canonicalize(self.workspace).map_err(|err| format!("cannot read: {err}"))
             })
             .as_ref()
-            .map_err(|err| other(err.clone()))?;
+            .map_err(|err| Failure::usage(err.clone()))?;
         let full = self.workspace.join(src);
         if fs::symlink_metadata(&full).is_ok() {
             return files::read_src(dir, src).map(Some);
@@ -365,10 +339,10 @@ impl<'a> Sources<'a> {
             .ancestors()
             .find(|ancestor| fs::symlink_metadata(ancestor).is_ok())
             .unwrap_or(self.workspace);
-        let existing =
-            fs::canonicalize(existing).map_err(|err| other(format!("cannot read: {err}")))?;
+        let existing = fs::canonicalize(existing)
+            .map_err(|err| Failure::usage(format!("cannot read: {err}")))?;
         if !existing.starts_with(dir) {
-            return Err(other("leaves the workspace".to_string()));
+            return Err(Failure::usage("leaves the workspace"));
         }
         Ok(None)
     }
@@ -410,7 +384,7 @@ impl<'a> Run<'a> {
     }
 
     /// The src's text with this run's edits.
-    fn text(&self, src: &str) -> Result<Option<String>, SrcError> {
+    fn text(&self, src: &str) -> Result<Option<String>, Failure> {
         let shown = self.sources.shown(src);
         match self.files.iter().find(|file| file.shown == shown) {
             Some(file) => Ok(Some(file.new.clone())),
@@ -443,16 +417,12 @@ impl<'a> Run<'a> {
                 drop_in.store.to_owned()
             }
         };
-        let fail = |why: SrcError| Failure {
-            refused: matches!(why, SrcError::Refused(_)),
+        let fail = |why: Failure| Failure {
             message: match entry {
-                Some((item, i)) => item.shown_message(format!(
-                    "{}.src `{}`: {why}",
-                    item.label("files", i),
-                    secret::shown_name(&src)
-                )),
-                None => format!("{}: {why}", self.sources.shown(&src)),
+                Some((item, i)) => files::src_message(item, i, &src, &why.message),
+                None => format!("{}: {}", self.sources.shown(&src), why.message),
             },
+            ..why
         };
         let shown = self.sources.shown(&src);
         let is_locked = entry.is_some_and(|(item, _)| locked(item));
@@ -512,17 +482,13 @@ impl<'a> Run<'a> {
             }
             match self.text(&file.src) {
                 Ok(Some(old)) => self.ensure_entry(drop_in, Some((item, i)), &file.src, old, false),
-                Err(why @ SrcError::Refused(_)) => {
+                Err(why) if why.refused => {
                     return Err(Failure {
-                        message: item.shown_message(format!(
-                            "{}.src `{}`: {why}",
-                            item.label("files", i),
-                            secret::shown_name(&file.src)
-                        )),
-                        refused: true,
+                        message: files::src_message(item, i, &file.src, &why.message),
+                        ..why
                     });
                 }
-                Ok(None) | Err(SrcError::Other(_)) => {}
+                Ok(None) | Err(_) => {}
             }
         }
         Ok(())
@@ -1308,7 +1274,7 @@ install = [\"telnet\", \"git\"] # trailing
                 strict: false,
             })
             .unwrap_err()
-            .to_string()
+            .message
         };
         let dest = rules::SSHD_DEST;
         let text = format!(
@@ -1360,7 +1326,7 @@ install = [\"telnet\", \"git\"] # trailing
         })
         .unwrap_err();
         assert_eq!(
-            err.to_string(),
+            err.message,
             "files[0].src `dir.conf`: is not a regular file"
         );
 
@@ -1384,7 +1350,7 @@ install = [\"telnet\", \"git\"] # trailing
             })
             .unwrap_err();
             assert_eq!(
-                err.to_string(),
+                err.message,
                 format!("files[0].src `{src}`: leaves the workspace")
             );
         }
@@ -1406,7 +1372,7 @@ install = [\"telnet\", \"git\"] # trailing
         })
         .unwrap_err();
         assert_eq!(
-            err.to_string(),
+            err.message,
             "files[0].src `link/x.conf`: leaves the workspace"
         );
     }

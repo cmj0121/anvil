@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::document;
 use crate::paths;
 use crate::private;
-use crate::secret::check_owner;
+use crate::trust::check_owner;
 
 /// Store path prefix.
 pub const PREFIX: &str = "$/";
@@ -236,9 +236,8 @@ impl Root {
     /// not group- or other-writable, checked on the fds walked and read.
     pub fn read_trusted(&self, rel: &str) -> Result<String, StoreError> {
         let rel = parse(rel)?;
-        let (parent, name) = rel.rsplit_once('/').unwrap_or(("", &rel));
+        let (parent, name) = split_parent(&rel);
         let dir = self.trusted_directory(parent)?;
-        let name = if name.is_empty() { "." } else { name };
         let file = open_file(&dir, name, &rel)?;
         check_trusted(&file, &rel)?;
         read_file(file, &rel).map_err(|err| match err {
@@ -293,11 +292,8 @@ impl Root {
     }
 
     fn parent(&self, rel: &str, create: bool) -> Result<(File, String), StoreError> {
-        let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
-        Ok((
-            self.directory(parent, create)?,
-            if name.is_empty() { "." } else { name }.to_owned(),
-        ))
+        let (parent, name) = split_parent(rel);
+        Ok((self.directory(parent, create)?, name.to_owned()))
     }
 
     /// Creates a folder and missing parents as 0700.
@@ -723,6 +719,12 @@ fn export_into(
         Kind::Other => return Err(StoreError::NotText(rel.to_owned())),
     }
     Ok(())
+}
+
+/// The folder and name of `rel`; the name of the root itself is `.`.
+fn split_parent(rel: &str) -> (&str, &str) {
+    let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+    (parent, if name.is_empty() { "." } else { name })
 }
 
 fn walk_dir(mut dir: File, rel: &str, create: bool) -> Result<File, StoreError> {

@@ -465,7 +465,6 @@ mod tests {
     use crate::term::testing::{Event, Recorder};
     use crate::test_util::{temp_dir, wait_for, write_knobs};
     use crate::transport::RUN_TIMEOUT;
-    use std::os::unix::fs::PermissionsExt;
 
     const CONTROL: &str = "/tmp/h/.ssh/anvil";
     const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-ssh.sh");
@@ -617,9 +616,7 @@ mod tests {
         rustix::process::getuid().as_raw()
     }
 
-    fn chmod(path: &Path, mode: u32) {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-    }
+    use crate::test_util::chmod;
 
     #[test]
     fn control_dir_and_dot_ssh_are_created_0700() {

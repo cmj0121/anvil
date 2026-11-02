@@ -8,10 +8,9 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use common::{Sandbox, fixture, json, text};
+use common::{Sandbox, chmod, fixture, json, text};
 
 /// The script the fixture replies with.
 const SCRIPT: &str = "echo plugin-ran";
@@ -46,10 +45,6 @@ fn write_plugin_config(sandbox: &Sandbox, path: &Path, sha256: &str) {
 /// What the fixture recorded as `record.<name>`; empty when it did not run.
 fn record(sandbox: &Sandbox, name: &str) -> String {
     fs::read_to_string(sandbox.plugin_dir().join(format!("record.{name}"))).unwrap_or_default()
-}
-
-fn chmod(path: &Path, mode: u32) {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
 /// Runs anvil with `args`, logging fake-ssh calls; returns its output and
