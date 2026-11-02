@@ -39,7 +39,6 @@ pub const INPUT: Policy = Policy {
 };
 
 /// A file only the current user may reach, never through a symlink.
-#[cfg_attr(not(test), expect(dead_code, reason = "for the apply record"))]
 pub const PRIVATE: Policy = Policy {
     file: 0o077,
     dir: 0o077,
@@ -60,6 +59,15 @@ pub enum TrustError {
 }
 
 impl TrustError {
+    /// The file or folder this is about; under a following policy, the real one.
+    pub fn path(&self) -> &Path {
+        let (TrustError::NotFound { path, .. }
+        | TrustError::Refused { path, .. }
+        | TrustError::TooLarge { path, .. }
+        | TrustError::Io { path, .. }) = self;
+        path
+    }
+
     /// The message without the path, for a caller that names the file itself.
     pub fn reason(&self) -> String {
         match self {
@@ -90,14 +98,10 @@ impl TrustError {
 
 impl fmt::Display for TrustError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (TrustError::NotFound { path, .. }
-        | TrustError::Refused { path, .. }
-        | TrustError::TooLarge { path, .. }
-        | TrustError::Io { path, .. }) = self;
         write!(
             f,
             "{}: {}",
-            escape_controls(&path.to_string_lossy()),
+            escape_controls(&self.path().to_string_lossy()),
             self.reason()
         )
     }

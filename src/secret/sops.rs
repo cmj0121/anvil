@@ -33,7 +33,7 @@
 use std::cell::OnceCell;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -42,12 +42,11 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use super::file_store::{
-    Codec, FileBacked, check_dir, check_owner, open_private, open_regular, too_large,
-};
+use super::file_store::{Codec, FileBacked, open_private, too_large};
 use super::{BackendKind, SecretError};
 use crate::paths;
 use crate::transport::{TransportError, collect_capped};
+use crate::trust::{self, TrustError};
 
 /// Most bytes of ciphertext read from the store or taken from `encrypt`.
 const CIPHERTEXT_LIMIT: usize = 4 << 20;
@@ -180,20 +179,12 @@ impl Runner<'_> {
     /// `/dev/null`, which sops 3.13 reads as an empty one.
     fn config_for(&self, op: Op<'_>) -> Result<&Path, SecretError> {
         let config = self.sops.config.as_path();
-        match open_regular(config) {
-            Ok((_, meta)) => {
-                check_owner(&meta, 0o022).map_err(|message| SecretError::store(config, message))?;
-                // Others able to write the directory of the real file, not
-                // of a symlink to it, could swap it.
-                let real = fs::canonicalize(config)
-                    .map_err(|err| SecretError::store(config, err.to_string()))?;
-                check_dir(real.parent().unwrap_or(Path::new("/")))?;
-                Ok(config)
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound && matches!(op, Op::Decrypt) => {
+        match trust::open(config, trust::INPUT) {
+            Ok(_) => Ok(config),
+            Err(TrustError::NotFound { .. }) if matches!(op, Op::Decrypt) => {
                 Ok(Path::new("/dev/null"))
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Err(SecretError::Sops {
+            Err(TrustError::NotFound { .. }) => Err(SecretError::Sops {
                 message: format!(
                     "{}: no config {}: create it with a creation rule for {}, or set \
                      [secrets.sops].config",
@@ -202,7 +193,12 @@ impl Runner<'_> {
                     self.sops.path.display()
                 ),
             }),
-            Err(err) => Err(SecretError::store(config, err.to_string())),
+            // The file as it was named, a folder as the real one to fix.
+            Err(err) => {
+                let is_file = fs::canonicalize(config).is_ok_and(|real| err.path() == real);
+                let shown = if is_file { config } else { err.path() };
+                Err(SecretError::store(shown, err.reason()))
+            }
         }
     }
 
@@ -837,6 +833,30 @@ mod tests {
         let err = fake.sops.open().err().unwrap().to_string();
         assert!(err.contains("No such file"), "{err}");
         assert!(fake.calls().is_empty(), "sops never ran");
+    }
+
+    #[test]
+    fn a_loose_config_in_a_loose_folder_names_the_folder_and_never_falls_back() {
+        let mut fake = Fake::new("sops-both-loose");
+        store_with_value(&fake);
+        let shared = fake.root.join("shared");
+        fs::create_dir(&shared).unwrap();
+        let config = shared.join("sops.yaml");
+        fs::write(&config, "creation_rules: []\n").unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o666)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        fake.sops.config = config;
+        let calls = fake.calls().len();
+        // Refused, not read as absent: decrypt must not get /dev/null.
+        let err = fake.sops.open().err().unwrap().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "{}: mode 777 lets others write to it; run chmod go-w on it",
+                fs::canonicalize(&shared).unwrap().display()
+            )
+        );
+        assert_eq!(fake.calls().len(), calls, "sops never ran");
     }
 
     #[test]
