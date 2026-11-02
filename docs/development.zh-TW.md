@@ -25,6 +25,9 @@ anvil-audit 的 stdin 上限，也就是 `plugins/anvil-audit/src/main.rs` 中�
 `make test` 中的終端機測試（age passphrase 提示，以及在虛擬終端機上執行的 `anvil tui`）需要 python3 3.11 或更新版本，
 以使用 `os.login_tty`；缺少時會顯示訊息並略過。
 
+`make test` 會自行設定 `umask 022`，因為寬鬆的 umask 會留下 anvil 拒絕的測試資料。
+在 umask 002 下直接執行 `cargo test` 會因此失敗。
+
 `make e2e` 需要 docker、以 digest 釘選的 `alpine:3.20` 映像（第一次執行時下載；doctor 的雜湊執行在它的 busybox 上跑），
 且 `PATH` 上要有 `sops`（它的 sops 往返測試在本機執行，缺少時會失敗）；
 它的互動式密碼檢查（從 CLI 與從 `anvil tui`）也需要 `python3`（TUI 的檢查需要 3.11 或更新版本，

@@ -21,6 +21,10 @@ anvil --inventory examples/workstation/inventory.toml \
       --target local plan
 ```
 
+At umask 002 a checkout leaves these files and folders writable by your group, and every command refuses them; run
+`chmod -R go-w examples` first ([Security notes](../../docs/security.md)).
+Files added later, by `git pull` or an editor, come back 664 and are refused again; set `umask 022` in your shell.
+
 ## The `yaml/` directory
 
 `yaml/` holds the same two documents in YAML, the format `anvil inventory --format yaml` and

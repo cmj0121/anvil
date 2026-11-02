@@ -36,6 +36,7 @@ mod term;
 #[cfg(test)]
 mod test_util;
 mod transport;
+mod trust;
 #[cfg(feature = "tui")]
 mod tui;
 mod update;

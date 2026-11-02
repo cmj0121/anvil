@@ -30,6 +30,10 @@ There is no plugin example: a plugin is pinned by the sha256 of its binary, whic
 [Doctor plugins](../../docs/cli.md#doctor-plugins-drift-since-the-last-apply); `make audit-plugin` builds the
 reference `anvil-audit` and prints its path and sha256.
 
+At umask 002 a checkout leaves these files and folders writable by your group, and every command refuses them; run
+`chmod -R go-w examples` first ([Security notes](../../docs/security.md)).
+Files added later, by `git pull` or an editor, come back 664 and are refused again; set `umask 022` in your shell.
+
 ## The `yaml/` directory
 
 `yaml/` holds the same two documents in YAML, the format `anvil inventory --format yaml` and

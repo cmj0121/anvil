@@ -8,7 +8,7 @@
 //! the rest from that same stdin; the `:` keeps a comment-only script a
 //! valid group.
 
-use std::fs::File;
+use std::fs;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -22,6 +22,7 @@ use crate::logger::escape_controls;
 use crate::options::Options;
 use crate::packages::MAX_TIMEOUT;
 use crate::transport::{Transport, TransportError};
+use crate::trust::{self, TrustError};
 
 /// `--timeout` when unset, in seconds.
 pub const DEFAULT_TIMEOUT: u64 = 300;
@@ -100,8 +101,15 @@ pub fn run(cli: &Cli, opts: &Options, source: &Path, timeout: u64) -> Result<(),
     apply::print_report(cli, "run", |on| run_targets(opts, script, timeout, on))
 }
 
-/// The script at `source`, or stdin for `-`: refused when unreadable, over
-/// [`MAX_BYTES`] (read no further than one byte past it), not UTF-8, or blank.
+fn over_limit(size: u64) -> Failure {
+    Failure::usage(format!(
+        "run: the script is {size} bytes, over the 1 MiB limit"
+    ))
+}
+
+/// The script at `source`, read through [`trust::load`], or stdin for `-`:
+/// refused when unreadable, over [`MAX_BYTES`] (read no further than one byte
+/// past it), not UTF-8, or blank.
 fn read_script(source: &Path) -> Result<String, Failure> {
     let stdin = source == Path::new("-");
     let cannot_read = |err: std::io::Error| {
@@ -115,21 +123,28 @@ fn read_script(source: &Path) -> Result<String, Failure> {
         Failure::usage(format!("run: cannot read {name}: {err}"))
     };
     let mut bytes = Vec::new();
-    // A file reports its full size; stdin is never read past the cap.
-    let size = if stdin {
+    // stdin is never read past the cap.
+    if stdin {
         read_capped_from(std::io::stdin().lock(), &mut bytes).map_err(cannot_read)?;
-        None
     } else {
-        let file = File::open(source).map_err(cannot_read)?;
-        let size = file.metadata().map_err(cannot_read)?.len();
-        read_capped_from(file, &mut bytes).map_err(cannot_read)?;
-        Some(size.max(bytes.len() as u64))
+        match trust::load(source, MAX_BYTES) {
+            Ok(file) => bytes = file,
+            Err(err @ TrustError::Refused { .. }) => {
+                return Err(Failure::refusal(format!("run: {err}")));
+            }
+            Err(TrustError::TooLarge { .. }) => {
+                let size = fs::metadata(source).map_err(cannot_read)?.len();
+                return Err(over_limit(size));
+            }
+            Err(TrustError::NotFound { source, .. } | TrustError::Io { source, .. }) => {
+                return Err(cannot_read(source));
+            }
+        }
     };
     if bytes.len() as u64 > MAX_BYTES {
-        return Err(Failure::usage(match size {
-            Some(size) => format!("run: the script is {size} bytes, over the 1 MiB limit"),
-            None => "run: the script on stdin is over the 1 MiB limit".to_owned(),
-        }));
+        return Err(Failure::usage(
+            "run: the script on stdin is over the 1 MiB limit",
+        ));
     }
     let script =
         String::from_utf8(bytes).map_err(|_| Failure::usage("run: the script is not UTF-8"))?;

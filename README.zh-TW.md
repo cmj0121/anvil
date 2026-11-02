@@ -42,6 +42,10 @@ anvil                      # all of the above in one terminal UI (also: anvil tu
 anvil update               # replace the binary with the latest signed release
 ```
 
+其他人能變更的 config、inventory 或其他本機輸入，在修好之前會被 `anvil update` 以外的每個指令拒絕。
+在 umask 002 下產生的 checkout（包括 `examples/`）需要在其中執行 `chmod -R go-w .`。
+之後由 `git pull` 或編輯器新增的檔案會再次成為 664 並再度被拒絕；請在 shell 中設定 `umask 022`。（[安全性說明](docs/security.zh-TW.md)）。
+
 `--json` 在 stdout 印出一份文件，log 只寫到 stderr（[通用旗標](docs/cli.zh-TW.md#通用旗標)）；`--parallel N`
 同時處理最多 N 個 target（[平行執行](docs/cli.zh-TW.md#平行執行)）。
 

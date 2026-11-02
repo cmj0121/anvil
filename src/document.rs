@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::paths::DocPath;
+use crate::trust::{self, TrustError};
 
 /// Largest document anvil reads, in bytes.
 pub const MAX_BYTES: u64 = 1 << 20;
@@ -66,6 +67,9 @@ pub enum DocumentError {
         path: PathBuf,
         source: io::Error,
     },
+    /// Not to be used at all, and never to fall back from; the message names
+    /// the path and the fix.
+    Refused(String),
     TooLarge {
         path: PathBuf,
     },
@@ -94,6 +98,10 @@ impl DocumentError {
         }
     }
 
+    pub fn is_refused(&self) -> bool {
+        matches!(self, DocumentError::Refused(_))
+    }
+
     pub fn is_not_found(&self) -> bool {
         matches!(self, DocumentError::Read { source, .. } if source.kind() == io::ErrorKind::NotFound)
     }
@@ -103,20 +111,25 @@ impl fmt::Display for DocumentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DocumentError::Read { path, source } => {
-                write!(f, "{}: cannot read: {source}", path.display())
+                write!(f, "{}: cannot read: {source}", trust::shown_path(path))
             }
+            DocumentError::Refused(message) => f.write_str(message),
             DocumentError::TooLarge { path } => write!(
                 f,
                 "{}: larger than the {MAX_BYTES} byte limit",
-                path.display()
+                trust::shown_path(path)
             ),
             DocumentError::Parse {
                 path,
                 format,
                 message,
-            } => write!(f, "{}: invalid {format}: {message}", path.display()),
+            } => write!(
+                f,
+                "{}: invalid {format}: {message}",
+                trust::shown_path(path)
+            ),
             DocumentError::Invalid { path, message } => {
-                write!(f, "{}: {message}", path.display())
+                write!(f, "{}: {message}", trust::shown_path(path))
             }
             DocumentError::Serialize { format, message } => {
                 write!(f, "cannot write {format}: {message}")
@@ -127,14 +140,21 @@ impl fmt::Display for DocumentError {
 
 impl std::error::Error for DocumentError {}
 
-/// Reads and parses `doc` in its format.
+/// Reads `doc` through [`trust::load`], so a file others can change is refused
+/// unparsed, and parses it in its format.
 pub fn load<T: DeserializeOwned>(doc: &DocPath) -> Result<T, DocumentError> {
     let path = doc.path.as_path();
     let read = |source| DocumentError::Read {
         path: path.to_path_buf(),
         source,
     };
-    let bytes = read_capped(path).map_err(read)?;
+    let bytes = trust::load(path, MAX_BYTES).map_err(|err| match err {
+        TrustError::Refused { .. } => DocumentError::Refused(err.to_string()),
+        TrustError::TooLarge { .. } => DocumentError::TooLarge {
+            path: path.to_path_buf(),
+        },
+        TrustError::NotFound { source, .. } | TrustError::Io { source, .. } => read(source),
+    })?;
     parse_text(&bytes, path, doc.format, |err| {
         read(io::Error::new(io::ErrorKind::InvalidData, err))
     })
@@ -233,6 +253,36 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn a_path_in_an_error_cannot_split_the_line() {
+        let path = PathBuf::from("/x/a\nERROR forged\u{202e}.toml");
+        let source = io::Error::other("no");
+        let message = String::from("bad");
+        for err in [
+            DocumentError::Read {
+                path: path.clone(),
+                source,
+            },
+            DocumentError::TooLarge { path: path.clone() },
+            DocumentError::Parse {
+                path: path.clone(),
+                format: Format::Toml,
+                message: message.clone(),
+            },
+            DocumentError::Invalid {
+                path: path.clone(),
+                message,
+            },
+        ] {
+            let shown = err.to_string();
+            assert!(!shown.contains(['\n', '\u{202e}']), "{shown}");
+            assert!(
+                shown.starts_with("/x/a\\nERROR forged\\u{202e}.toml: "),
+                "{shown}"
+            );
+        }
+    }
 
     type Doc = BTreeMap<String, BTreeMap<String, String>>;
 

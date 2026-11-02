@@ -8,10 +8,9 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use common::{Sandbox, fixture, json, text};
+use common::{Sandbox, chmod, fixture, json, text};
 
 /// The script the fixture replies with.
 const SCRIPT: &str = "echo plugin-ran";
@@ -46,10 +45,6 @@ fn write_plugin_config(sandbox: &Sandbox, path: &Path, sha256: &str) {
 /// What the fixture recorded as `record.<name>`; empty when it did not run.
 fn record(sandbox: &Sandbox, name: &str) -> String {
     fs::read_to_string(sandbox.plugin_dir().join(format!("record.{name}"))).unwrap_or_default()
-}
-
-fn chmod(path: &Path, mode: u32) {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
 /// Runs anvil with `args`, logging fake-ssh calls; returns its output and
@@ -283,4 +278,33 @@ fn a_missing_or_stale_doctor_plugin_never_fails_apply_or_plan() {
             text(&out.stderr)
         );
     }
+}
+
+#[test]
+fn a_plugin_link_in_a_folder_others_can_write_is_refused() {
+    let (sandbox, path) = pinned(None);
+    let config = sandbox.config_dir().join("config.toml");
+    let body = fs::read_to_string(&config).unwrap();
+    let holder = sandbox.root().join("links");
+    fs::create_dir(&holder).unwrap();
+    let link = holder.join("plugin");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    fs::write(
+        &config,
+        body.replace(path.to_str().unwrap(), link.to_str().unwrap()),
+    )
+    .unwrap();
+    chmod(&config, 0o644);
+
+    chmod(&holder, 0o755);
+    let (out, _) = logged(&sandbox, &["apply", "--target", "fake"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+
+    chmod(&holder, 0o777);
+    fs::remove_file(sandbox.root().join("ssh.log")).unwrap();
+    let (out, log) = logged(&sandbox, &["apply", "--target", "fake"]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("it holds a link on the path"), "{stderr}");
+    assert_eq!(log, "", "no ssh");
 }

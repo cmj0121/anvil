@@ -282,9 +282,13 @@ pub fn check(
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
     // Lenient on purpose: an unresolvable workspace falls back with a warning.
-    let targets = opts.targets();
+    // A refusal is not looked past, not even for the secret checks.
+    let targets = match opts.targets() {
+        Err(failure) if failure.refused => return Err(failure),
+        targets => targets,
+    };
     let names = required_names(config, expanded, targets.as_deref().unwrap_or_default());
-    let secrets = check_secrets(&names, store);
+    let secrets = check_secrets(&names, store)?;
     let targets = targets?;
     let mut local = local_checks(
         &opts.ssh_program(),
@@ -699,24 +703,28 @@ fn required_names(config: &Config, expanded: &Expanded, targets: &[Target]) -> V
 /// Opens the store and checks `names` against the names it holds; the
 /// keychain answers from attributes, never the stored data. Nothing is opened
 /// when no name is required. A store that cannot be opened reports every
-/// name `locked` or `error`.
-fn check_secrets(names: &[String], store: &dyn Store) -> BTreeMap<String, SecretStatus> {
+/// name `locked` or `error`, but a store others can change stops doctor.
+fn check_secrets(
+    names: &[String],
+    store: &dyn Store,
+) -> Result<BTreeMap<String, SecretStatus>, Failure> {
     if names.is_empty() {
-        return BTreeMap::new();
+        return Ok(BTreeMap::new());
     }
     log::debug!("opening the {} secret store", store.kind());
     let stored = match store.open().and_then(|vault| vault.names()) {
         Ok(stored) => stored,
+        Err(err @ SecretError::Refused { .. }) => return Err(err.into()),
         Err(err) => {
             log::error!("{err}");
             let status = match err {
                 SecretError::Locked => SecretStatus::Locked,
                 _ => SecretStatus::Error,
             };
-            return names.iter().map(|name| (name.clone(), status)).collect();
+            return Ok(names.iter().map(|name| (name.clone(), status)).collect());
         }
     };
-    names
+    Ok(names
         .iter()
         .map(|name| {
             let status = if stored.binary_search(name).is_ok() {
@@ -727,7 +735,7 @@ fn check_secrets(names: &[String], store: &dyn Store) -> BTreeMap<String, Secret
             };
             (name.clone(), status)
         })
-        .collect()
+        .collect())
 }
 
 fn check_target(
@@ -1203,7 +1211,7 @@ mod tests {
         local_checks(
             Path::new(SH),
             Editor::from_command(SH, None),
-            check_secrets(&secrets, store),
+            check_secrets(&secrets, store).unwrap(),
         )
     }
 

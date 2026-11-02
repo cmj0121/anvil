@@ -9,13 +9,13 @@ pub mod diff;
 pub mod rules;
 
 use std::cell::OnceCell;
-use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
+use crate::cli::Failure;
 use crate::config::Config;
 use crate::files;
 use crate::filestore::{self, StoreError};
@@ -98,18 +98,6 @@ pub struct Held {
     pub hosts: Vec<String>,
 }
 
-/// Why no suggestion could be made: the config text or a src is unreadable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Failure(pub String);
-
-impl fmt::Display for Failure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Failure {}
-
 const ROOT_LOGIN: &str = "ssh.root-login";
 const PASSWORD_AUTH: &str = "ssh.password-auth";
 const SYSCTL_NET: &str = "sysctl.net";
@@ -122,7 +110,7 @@ pub fn suggest(input: &Input) -> Result<Outcome, Failure> {
     let doc = input
         .text
         .parse::<DocumentMut>()
-        .map_err(|err| Failure(format!("config: {err}")))?;
+        .map_err(|err| Failure::usage(format!("config: {err}")))?;
     let mut run = Run {
         input,
         doc,
@@ -319,18 +307,22 @@ impl<'a> Sources<'a> {
         }
     }
 
-    /// The src's text; `None` when it does not exist yet.
-    fn read(&self, src: &str) -> Result<Option<String>, String> {
+    /// The src's text; `None` when it does not exist yet. Read as a run reads
+    /// it: what harden may write back must not launder a file others can change.
+    fn read(&self, src: &str) -> Result<Option<String>, Failure> {
         if filestore::is_store_path(src) {
-            return match self.store.read_text(src) {
+            return match self.store.read_trusted(src) {
                 Ok(text) => Ok(Some(text)),
                 Err(StoreError::NotFound(_)) => Ok(None),
-                Err(err) => Err(err.reason()),
+                Err(err @ StoreError::Untrusted(_, _)) => {
+                    Err(Failure::refusal(files::store_reason(src, &err)))
+                }
+                Err(err) => Err(Failure::usage(err.reason())),
             };
         }
         let path = Path::new(src);
         if path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
-            return Err("leaves the workspace".to_string());
+            return Err(Failure::usage("leaves the workspace"));
         }
         let dir = self
             .canonical
@@ -338,7 +330,7 @@ impl<'a> Sources<'a> {
                 fs::canonicalize(self.workspace).map_err(|err| format!("cannot read: {err}"))
             })
             .as_ref()
-            .map_err(Clone::clone)?;
+            .map_err(|err| Failure::usage(err.clone()))?;
         let full = self.workspace.join(src);
         if fs::symlink_metadata(&full).is_ok() {
             return files::read_src(dir, src).map(Some);
@@ -347,9 +339,10 @@ impl<'a> Sources<'a> {
             .ancestors()
             .find(|ancestor| fs::symlink_metadata(ancestor).is_ok())
             .unwrap_or(self.workspace);
-        let existing = fs::canonicalize(existing).map_err(|err| format!("cannot read: {err}"))?;
+        let existing = fs::canonicalize(existing)
+            .map_err(|err| Failure::usage(format!("cannot read: {err}")))?;
         if !existing.starts_with(dir) {
-            return Err("leaves the workspace".to_string());
+            return Err(Failure::usage("leaves the workspace"));
         }
         Ok(None)
     }
@@ -391,7 +384,7 @@ impl<'a> Run<'a> {
     }
 
     /// The src's text with this run's edits.
-    fn text(&self, src: &str) -> Result<Option<String>, String> {
+    fn text(&self, src: &str) -> Result<Option<String>, Failure> {
         let shown = self.sources.shown(src);
         match self.files.iter().find(|file| file.shown == shown) {
             Some(file) => Ok(Some(file.new.clone())),
@@ -424,15 +417,12 @@ impl<'a> Run<'a> {
                 drop_in.store.to_owned()
             }
         };
-        let fail = |why: String| {
-            Failure(match entry {
-                Some((item, i)) => item.shown_message(format!(
-                    "{}.src `{}`: {why}",
-                    item.label("files", i),
-                    secret::shown_name(&src)
-                )),
-                None => format!("{}: {why}", self.sources.shown(&src)),
-            })
+        let fail = |why: Failure| Failure {
+            message: match entry {
+                Some((item, i)) => files::src_message(item, i, &src, &why.message),
+                None => format!("{}: {}", self.sources.shown(&src), why.message),
+            },
+            ..why
         };
         let shown = self.sources.shown(&src);
         let is_locked = entry.is_some_and(|(item, _)| locked(item));
@@ -451,7 +441,7 @@ impl<'a> Run<'a> {
                 self.suggest(&ids, Action::Add, shown);
             }
         }
-        self.contradictions(drop_in, entry.map(|(_, i)| i));
+        self.contradictions(drop_in, entry.map(|(_, i)| i))?;
         self.step(&ids, drop_in.marker, drop_in.script)
     }
 
@@ -482,17 +472,26 @@ impl<'a> Run<'a> {
     }
 
     /// Rewrites lines in the other srcs of the same daemon that set an active
-    /// directive to another value; unreadable or missing srcs are skipped.
-    fn contradictions(&mut self, drop_in: &DropIn, entry: Option<usize>) {
+    /// directive to another value; unreadable or missing srcs are skipped, a
+    /// refused one stops the run.
+    fn contradictions(&mut self, drop_in: &DropIn, entry: Option<usize>) -> Result<(), Failure> {
         let expanded = self.input.expanded;
         for (item, file, i) in expanded.files() {
             if Some(i) == entry || !drop_in.syntax.shares(&expanded.spelled_dest(&file.dest)) {
                 continue;
             }
-            if let Ok(Some(old)) = self.text(&file.src) {
-                self.ensure_entry(drop_in, Some((item, i)), &file.src, old, false);
+            match self.text(&file.src) {
+                Ok(Some(old)) => self.ensure_entry(drop_in, Some((item, i)), &file.src, old, false),
+                Err(why) if why.refused => {
+                    return Err(Failure {
+                        message: files::src_message(item, i, &file.src, &why.message),
+                        ..why
+                    });
+                }
+                Ok(None) | Err(_) => {}
             }
         }
+        Ok(())
     }
 
     /// [`Self::ensure_src`], or a warning when the entry naming `src` lives
@@ -623,7 +622,11 @@ impl<'a> Run<'a> {
                 tables.insert(i, table);
             }
             Some(Item::Value(Value::Array(array))) => array.insert(i, table.into_inline_table()),
-            _ => return Err(Failure("tasks: is not an array of tables".to_string())),
+            _ => {
+                return Err(Failure::usage(
+                    "tasks: is not an array of tables".to_string(),
+                ));
+            }
         }
         Ok(i)
     }
@@ -652,7 +655,7 @@ impl<'a> Run<'a> {
                 array.push(table.into_inline_table());
                 Ok(array.len() - 1)
             }
-            Some(_) => Err(Failure(format!("{key}: is not an array of tables"))),
+            Some(_) => Err(Failure::usage(format!("{key}: is not an array of tables"))),
         }
     }
 
@@ -693,7 +696,7 @@ impl<'a> Run<'a> {
                     .get_mut("packages")
                     .and_then(Item::as_table_like_mut),
             }
-            .ok_or_else(|| Failure(format!("{prefix}: is not a table")))?;
+            .ok_or_else(|| Failure::usage(format!("{prefix}: is not a table")))?;
             move_to_remove(table, &prefix, &names)?;
             for name in names {
                 self.suggest(
@@ -773,7 +776,7 @@ fn locked(item: &tasks::Item) -> bool {
 
 /// Moves `names` from `table`'s `install` to its `remove`, once each.
 fn move_to_remove(table: &mut dyn TableLike, prefix: &str, names: &[&str]) -> Result<(), Failure> {
-    let not_array = |key: &str| Failure(format!("{prefix}.{key}: is not an array"));
+    let not_array = |key: &str| Failure::usage(format!("{prefix}.{key}: is not an array"));
     let install = table
         .get_mut("install")
         .and_then(Item::as_array_mut)
@@ -1271,7 +1274,7 @@ install = [\"telnet\", \"git\"] # trailing
                 strict: false,
             })
             .unwrap_err()
-            .to_string()
+            .message
         };
         let dest = rules::SSHD_DEST;
         let text = format!(
@@ -1305,7 +1308,7 @@ install = [\"telnet\", \"git\"] # trailing
             workspace: &ws.0,
             strict: false,
         };
-        assert!(suggest(&input).unwrap_err().0.starts_with("config: "));
+        assert!(suggest(&input).unwrap_err().message.starts_with("config: "));
 
         fs::create_dir_all(ws.0.join("dir.conf")).unwrap();
         let text = format!(
@@ -1323,7 +1326,7 @@ install = [\"telnet\", \"git\"] # trailing
         })
         .unwrap_err();
         assert_eq!(
-            err.to_string(),
+            err.message,
             "files[0].src `dir.conf`: is not a regular file"
         );
 
@@ -1347,7 +1350,7 @@ install = [\"telnet\", \"git\"] # trailing
             })
             .unwrap_err();
             assert_eq!(
-                err.to_string(),
+                err.message,
                 format!("files[0].src `{src}`: leaves the workspace")
             );
         }
@@ -1369,7 +1372,7 @@ install = [\"telnet\", \"git\"] # trailing
         })
         .unwrap_err();
         assert_eq!(
-            err.to_string(),
+            err.message,
             "files[0].src `link/x.conf`: leaves the workspace"
         );
     }

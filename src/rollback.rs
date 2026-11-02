@@ -81,12 +81,13 @@ pub fn run(
 /// saying how to recover.
 pub fn load(opts: &Options) -> Result<(Config, Expanded), Failure> {
     let config = opts.load_config()?;
-    let expanded = opts.expand(&config).map_err(|failure| {
-        Failure::usage(format!(
+    let expanded = opts.expand(&config).map_err(|failure| Failure {
+        message: format!(
             "rollback: {}; the config decides which files may be restored: \
-             fix or restore what it names, then run rollback again",
+                 fix or restore what it names, then run rollback again",
             failure.message
-        ))
+        ),
+        ..failure
     })?;
     Ok((config, expanded))
 }

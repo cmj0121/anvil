@@ -22,16 +22,15 @@ use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use zeroize::Zeroizing;
 
 use crate::config::{check_dest, is_mode, is_sha256};
 use crate::facts::Facts;
-use crate::paths::{self, PathsError, PrivateDirError};
+use crate::paths::{self, PathsError};
 use crate::private::{self, LockError};
-use crate::secret::check_owner;
+use crate::trust::{self, TrustError};
 
 /// The record's format version; any other is refused.
 pub const VERSION: u32 = 1;
@@ -254,23 +253,6 @@ pub fn path() -> Result<PathBuf, PathsError> {
     Ok(paths::state_dir()?.join(FILE_NAME))
 }
 
-/// Refuses `dir` unless it is a real directory of the current user's that
-/// no one else can reach.
-fn check_dir(dir: &Path) -> Result<(), String> {
-    let uid = rustix::process::getuid().as_raw();
-    paths::check_private_dir(dir, uid).map_err(|err| {
-        let why = match err {
-            PrivateDirError::NotDir => "not a directory".to_owned(),
-            PrivateDirError::Owner(_) => "not owned by the current user".to_owned(),
-            PrivateDirError::Mode(mode) => {
-                format!("mode {mode:o} lets others in; run chmod 700 on it")
-            }
-            PrivateDirError::Io(err) => err.to_string(),
-        };
-        format!("{}: {why}", dir.display())
-    })
-}
-
 /// Reads the record at `path`; `None` when neither it nor its directory
 /// exists. Refused unless the directory is private, the file is a regular
 /// 0600-or-stricter file of the current user's (a symlink or FIFO is not
@@ -280,29 +262,11 @@ fn check_dir(dir: &Path) -> Result<(), String> {
 /// modes and hex hashes; errors never quote the content.
 pub fn load(path: &Path) -> Result<Option<Record>, String> {
     let shown = path.display();
-    let dir = path
-        .parent()
-        .ok_or_else(|| format!("{shown}: not a file path"))?;
-    match std::fs::symlink_metadata(dir) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        _ => check_dir(dir)?,
-    }
-    let fd = match rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => return Ok(None),
-        Err(rustix::io::Errno::LOOP) => return Err(format!("{shown}: a symlink, refused")),
-        Err(err) => return Err(format!("{shown}: {}", io::Error::from(err))),
+    let (file, meta) = match trust::open(path, trust::PRIVATE) {
+        Ok(opened) => opened,
+        Err(TrustError::NotFound { .. }) => return Ok(None),
+        Err(err) => return Err(err.to_string()),
     };
-    let file = File::from(fd);
-    let meta = file.metadata().map_err(|err| format!("{shown}: {err}"))?;
-    if !meta.is_file() {
-        return Err(format!("{shown}: not a regular file"));
-    }
-    check_owner(&meta, 0o077).map_err(|why| format!("{shown}: {why}"))?;
     let too_large = || format!("{shown}: larger than the {MAX_RECORD} byte limit");
     if meta.size() > MAX_RECORD as u64 {
         return Err(too_large());
@@ -399,7 +363,7 @@ impl Session {
             .parent()
             .ok_or_else(|| format!("{}: not a file path", path.display()))?;
         private::ensure_dir(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
-        check_dir(dir)?;
+        trust::check_dir(dir, trust::PRIVATE).map_err(|err| err.to_string())?;
         let lock = private::lock(path).map_err(|err| match err {
             LockError::Unsupported(_) => {
                 format!("{err}; set $XDG_STATE_HOME to a local disk")
@@ -895,6 +859,17 @@ mod tests {
             )
         );
         assert!(Session::open(&path).is_err());
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let linked = root.join("linked");
+        symlink(dir, &linked).unwrap();
+        assert_eq!(
+            load(&linked.join(FILE_NAME)).unwrap_err(),
+            format!(
+                "{}: not a directory; replace it with a real folder",
+                linked.display()
+            )
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1015,19 +990,20 @@ mod tests {
         // first refuse the temp dir's parents for the same reason, so the
         // test runs the two checks `load` makes on a root-owned path
         // instead: the directory's and the file's.
+        const NOT_OURS: &str =
+            "not owned by the current user; run chown on it, or do not run anvil through sudo";
         let meta = fs::metadata("/").unwrap();
         if meta.uid() == rustix::process::getuid().as_raw() {
             return;
         }
         // `/` belongs to root: its check is the one a planted record would fail.
         assert_eq!(
-            check_dir(Path::new("/")).unwrap_err(),
-            "/: not owned by the current user"
+            trust::check_dir(Path::new("/"), trust::PRIVATE)
+                .unwrap_err()
+                .to_string(),
+            format!("/: {NOT_OURS}")
         );
-        assert_eq!(
-            check_owner(&meta, 0o077).unwrap_err(),
-            "not owned by the current user"
-        );
+        assert_eq!(trust::check_owner(&meta, 0o077).unwrap_err(), NOT_OURS);
     }
 
     /// A session over a fresh record holding `targets`.

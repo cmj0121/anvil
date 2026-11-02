@@ -32,8 +32,7 @@
 
 use std::cell::OnceCell;
 use std::ffi::OsString;
-use std::fs;
-use std::io::{self, Write};
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -42,12 +41,11 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use super::file_store::{
-    Codec, FileBacked, check_dir, check_owner, open_private, open_regular, too_large,
-};
+use super::file_store::{Codec, FileBacked, open_key, too_large, untrusted};
 use super::{BackendKind, SecretError};
 use crate::paths;
 use crate::transport::{TransportError, collect_capped};
+use crate::trust::{self, TrustError};
 
 /// Most bytes of ciphertext read from the store or taken from `encrypt`.
 const CIPHERTEXT_LIMIT: usize = 4 << 20;
@@ -174,26 +172,19 @@ pub(super) struct Runner<'a> {
 }
 
 impl Runner<'_> {
-    /// What `--config` names for `op`, once the file passes the checks:
+    /// What `--config` names for `op`, the real path once the file passes the
+    /// checks, so sops reads the file that was judged:
     /// never left out, so sops never searches upward for a `.sops.yaml`.
     /// `decrypt` needs no creation rule, so an absent config is
     /// `/dev/null`, which sops 3.13 reads as an empty one.
-    fn config_for(&self, op: Op<'_>) -> Result<&Path, SecretError> {
+    fn config_for(&self, op: Op<'_>) -> Result<PathBuf, SecretError> {
         let config = self.sops.config.as_path();
-        match open_regular(config) {
-            Ok((_, meta)) => {
-                check_owner(&meta, 0o022).map_err(|message| SecretError::store(config, message))?;
-                // Others able to write the directory of the real file, not
-                // of a symlink to it, could swap it.
-                let real = fs::canonicalize(config)
-                    .map_err(|err| SecretError::store(config, err.to_string()))?;
-                check_dir(real.parent().unwrap_or(Path::new("/")))?;
-                Ok(config)
+        match trust::open_real(config, trust::INPUT) {
+            Ok((real, ..)) => Ok(real),
+            Err(TrustError::NotFound { .. }) if matches!(op, Op::Decrypt) => {
+                Ok(PathBuf::from("/dev/null"))
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound && matches!(op, Op::Decrypt) => {
-                Ok(Path::new("/dev/null"))
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Err(SecretError::Sops {
+            Err(TrustError::NotFound { .. }) => Err(SecretError::Sops {
                 message: format!(
                     "{}: no config {}: create it with a creation rule for {}, or set \
                      [secrets.sops].config",
@@ -202,7 +193,7 @@ impl Runner<'_> {
                     self.sops.path.display()
                 ),
             }),
-            Err(err) => Err(SecretError::store(config, err.to_string())),
+            Err(err) => Err(untrusted(config, err)),
         }
     }
 
@@ -216,9 +207,11 @@ impl Runner<'_> {
             message: format!("{subcommand}: {message}"),
         };
         let config = self.config_for(op)?;
-        if let Some(key_file) = &sops.age_key_file {
-            open_private(key_file)?;
-        }
+        let key_file = sops
+            .age_key_file
+            .as_deref()
+            .map(|key| open_key(key).map(|(real, ..)| real))
+            .transpose()?;
         let input = match op {
             Op::Decrypt => None,
             Op::Encrypt(plaintext) => Some(plaintext),
@@ -234,7 +227,7 @@ impl Runner<'_> {
             .current_dir(self.cwd)
             .env_clear()
             .envs(sops.env.iter().map(|(name, value)| (name, value)));
-        if let Some(key_file) = &sops.age_key_file {
+        if let Some(key_file) = &key_file {
             command.env("SOPS_AGE_KEY_FILE", key_file);
         }
         log::debug!(
@@ -375,7 +368,8 @@ mod tests {
 
     impl Fake {
         fn new(tag: &str) -> Fake {
-            let root = temp_dir(tag);
+            // Real: sops is given real paths, and `/tmp` is a link on macOS.
+            let root = fs::canonicalize(temp_dir(tag)).unwrap();
             fs::create_dir_all(root.join("store")).unwrap();
             fs::write(root.join("store/.sops.yaml"), "creation_rules: []\n").unwrap();
             fs::set_permissions(
@@ -756,6 +750,57 @@ mod tests {
     }
 
     #[test]
+    fn sops_rereads_the_real_config_and_key_once_they_are_checked() {
+        let mut fake = Fake::new("sops-real");
+        let links = fake.root.join("links");
+        fs::create_dir(&links).unwrap();
+        fs::set_permissions(&links, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = fake.sops.config.clone();
+        let key = fake.root.join("key.txt");
+        std::os::unix::fs::symlink(&config, links.join("sops.yaml")).unwrap();
+        std::os::unix::fs::symlink(&key, links.join("key.txt")).unwrap();
+        fake.sops.config = links.join("sops.yaml");
+        fake.sops.age_key_file = Some(links.join("key.txt"));
+        store_with_value(&fake);
+
+        for call in fake.calls() {
+            assert_eq!(call[1], config.to_str().unwrap(), "{call:?}");
+        }
+        let env = fake.record("env");
+        let wanted = format!("SOPS_AGE_KEY_FILE={}", key.display());
+        assert!(env.lines().any(|line| line == wanted), "{env}");
+    }
+
+    #[test]
+    fn a_key_folder_or_link_holder_others_can_write_stops_sops_with_exit_2() {
+        let mut fake = Fake::new("sops-keydir");
+        let dir = fake.root.join("keys");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        private_copy(&fake.root.join("key.txt"), &dir.join("key.txt"));
+        fake.sops.age_key_file = Some(dir.join("key.txt"));
+        let refused = |fake: &Fake, holder: &Path| {
+            let mut vault = fake.sops.open().unwrap();
+            vault.set("HOST_SUDO", VALUE.as_bytes()).unwrap();
+            let err = vault.commit().unwrap_err();
+            let message = err.to_string();
+            assert!(matches!(err, SecretError::Refused { .. }), "{err:?}");
+            assert!(message.starts_with(holder.to_str().unwrap()), "{message}");
+            assert_eq!(crate::cli::Failure::from(err).code, 2);
+            assert_eq!(fake.record("argv"), "", "sops never ran");
+        };
+        refused(&fake, &dir);
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let holder = fake.root.join("holder");
+        fs::create_dir(&holder).unwrap();
+        fs::set_permissions(&holder, fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(dir.join("key.txt"), holder.join("key.txt")).unwrap();
+        fake.sops.age_key_file = Some(holder.join("key.txt"));
+        refused(&fake, &holder);
+    }
+
+    #[test]
     fn a_config_or_key_file_others_can_change_is_refused_before_sops_runs() {
         let fake = Fake::new("sops-checks");
         let config = fake.config().to_path_buf();
@@ -837,6 +882,30 @@ mod tests {
         let err = fake.sops.open().err().unwrap().to_string();
         assert!(err.contains("No such file"), "{err}");
         assert!(fake.calls().is_empty(), "sops never ran");
+    }
+
+    #[test]
+    fn a_loose_config_in_a_loose_folder_names_the_folder_and_never_falls_back() {
+        let mut fake = Fake::new("sops-both-loose");
+        store_with_value(&fake);
+        let shared = fake.root.join("shared");
+        fs::create_dir(&shared).unwrap();
+        let config = shared.join("sops.yaml");
+        fs::write(&config, "creation_rules: []\n").unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o666)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        fake.sops.config = config;
+        let calls = fake.calls().len();
+        // Refused, not read as absent: decrypt must not get /dev/null.
+        let err = fake.sops.open().err().unwrap().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "{}: mode 777 lets others write to it; run chmod go-w on it",
+                fs::canonicalize(&shared).unwrap().display()
+            )
+        );
+        assert_eq!(fake.calls().len(), calls, "sops never ran");
     }
 
     #[test]

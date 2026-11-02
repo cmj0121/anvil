@@ -78,6 +78,15 @@ anvil                      # all of the above in one terminal UI (also: anvil tu
 完全沒有任何檔案時，inventory 只含 `local`（這台機器），config 執行 `hostname`，
 因此全新安裝後即可直接通過 `anvil doctor` 與 `anvil apply`。
 
+每個會載入 config 或 inventory 的指令，都會拒絕其他人能變更或不屬於你的檔案，以 2 結束並指出路徑與修正方式，
+通常是 `chmod go-w PATH`；`anvil update` 不載入它們。這會影響 umask 002 下產生的 checkout，包括 `examples/`
+（在其中執行 `chmod -R go-w .`）、`--config /tmp/x.toml`（請使用你擁有的資料夾），以及透過 sudo 對自己的 config 執行 anvil。
+之後由 `git pull` 或編輯器新增的檔案會再次成為 664 並再度被拒絕；請在 shell 中設定 `umask 022`。
+symlink 的 config 可以使用：檢查的是實際檔案與資料夾，不檢查更上層的資料夾。連結所在的資料夾也必須嚴格，因為它預設就是工作區：
+位於 775 或 777 資料夾中的連結在 `plan` 時會以 2 結束，`config --harden` 與儲存含 `[[tasks]]` 的 config 也一樣，
+但僅開啟 `anvil config` 或儲存沒有 task 的 config 仍會成功。這樣的儲存會把連結換成一般 0600 檔案，實際檔案則未被編輯，
+dotfile 管理工具的連結因此脫離，所以請編輯實際檔案（[安全性說明](security.zh-TW.md)）。
+
 ## 輸出
 
 在這台 Mac 上以空的 config 執行 `anvil doctor`：

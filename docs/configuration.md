@@ -92,6 +92,20 @@ one file for the same name is ambiguous (exit 2). `--inventory` / `--config` tak
 `local`, the config has the defaults below. Both formats map onto the same schema; unknown keys are refused, and any
 violation is exit 2 naming the file, host and field.
 
+A config or inventory that is not yours, or that group or others can write, or in such a folder, is refused before it
+is parsed, exit 2 naming the path and the fix, for every command that loads it; `anvil update` loads neither. A symlinked
+file works: the real file, its real folder and each folder holding a link on the path are checked, not the folders
+above, so a link in a 775 or 777 folder exits 2 for every command, `anvil secret` and `anvil config` included. A holder
+only root or you can change passes, such as `/` holding `/tmp` on macOS; a world-writable sticky one is refused.
+A `[anvil].workspace` elsewhere is checked only by what reads it: `anvil secret` can still succeed, and so can
+`anvil config` when it only opens or saves a config with no `[[tasks]]`; saving one with tasks and `config --harden` are
+refused, exit 2, nothing saved.
+A save through a config link replaces the link with a regular 0600 file in the link's folder and leaves the real file
+unedited, so it detaches a dotfile manager's link: edit the real file instead.
+`--config /tmp/x.toml` is refused, and so is a
+checkout made at umask 002 until you run `chmod -R go-w .` in it ([Security notes](security.md)).
+Files added later, by `git pull` or an editor, come back 664 and are refused again; set `umask 022` in your shell.
+
 ## The workspace
 
 The workspace is the directory that holds the inventory, the [file store](cli.md#anvil-files) and every relative
@@ -131,20 +145,23 @@ do not move with it. A workspace that does not exist is an empty store and an in
 The workspace is a trust boundary, like the config itself. Whoever can write it controls the inventory, the `$/` files
 and the relative `src` that anvil reads and copies to your targets. A `workspace` such as `~/` or `/` lets a relative
 src name any file under it. The [containment check](#files) guards against mistakes, not against someone who can
-write the workspace. So once per command, when the resolved workspace exists but is group- or world-writable or owned
-by another user, anvil logs a WARN (shown from `-v`) and carries on; it does not refuse:
+write the workspace. So when the resolved workspace exists but is group- or world-writable or owned by another user,
+every command that uses it exits 2 (`anvil secret` reads nothing from it; `anvil config` uses it only to save a config
+with `[[tasks]]` and for `--harden`):
 
-- ``workspace `PATH`: writable by others (mode 0775); anyone who can write it controls the inventory and files anvil reads``
-- ``workspace `PATH`: owned by uid 501, not you; anyone who can write it controls the inventory and files anvil reads``
+- `workspace PATH: mode 775 lets others write to it; run chmod go-w on it`
+- `workspace PATH: not owned by the current user; run chown on it, or do not run anvil through sudo`
 
-A symlinked workspace is checked at its target. A missing workspace, or one others can only read (`0755`), gives no
-warning; one that is not a directory or cannot be checked names that instead (`not a directory`,
-`cannot check directory: REASON`).
+A symlinked workspace is checked at its target. A missing workspace, or one others can only read (`0755`), passes; one
+that is not a directory or cannot be checked is refused too (`not a directory; replace it with a real folder`,
+`workspace PATH: cannot check it: REASON`). Folders above the workspace root are not checked.
 
-When the config does not load (or its workspace does not resolve), the commands that read only the inventory (`run`,
+When the config does not load (or its workspace does not resolve) for any other reason, the commands that read only the
+inventory (`run`,
 `doctor`, the TUI's targets) look for it in the config's directory and log a WARN,
 `config failed to load (ERROR); looking for the inventory in DIR`, so an inventory error is still reported on its own.
 `anvil files` needs the workspace and exits 2 with the config's error instead; the TUI's files browser shows that error.
+A refused config or workspace never falls back this way: the command exits 2, and the TUI shows the refusal.
 
 **Moving from an older anvil.** Before, the inventory and `$/` always stayed in the config directory, and a relative
 src resolved beside the config file's real target. Now:
@@ -357,6 +374,11 @@ exist, is ``files[0].src `missing`: cannot read: REASON``, with the operating sy
 ``files[0].src `sub`: is not a regular file``. `anvil config`, `anvil doctor`, `anvil inventory` and `anvil secret`
 check the syntax only, so a missing src does not break them. `anvil run` loads the config only to locate the inventory
 when `--inventory` is absent; it never reads file sources.
+
+A src that is not yours or that group or others can write, or any folder from the workspace root down to it that is, is
+refused, exit 2 naming the task path:
+``tasks[0].file.src `rel/a`: PATH: mode 775 lets others write to it; run chmod go-w on it``. A symlink inside the
+workspace keeps working. Its limits are in the [Security notes](security.md).
 
 A `src` starting with `$/` instead reads the [file store](cli.md#anvil-files): `$/sub/motd` means
 `<workspace>/files/sub/motd`. This replaces the old meaning of a literal
@@ -665,7 +687,8 @@ matches by membership, so each level is checked on its own.
 `tasks` is its only allowed key, so an include cannot change a global setting: `[packages.alias]`, `[plugins]` or any
 other key is exit 2 with the parser's message (``unknown field `packages`, expected `tasks` ``). `anvil config` edits only
 the main file. An include has the store's limits (a regular UTF-8 text file without NUL, at most 1 MiB, no symlink) and
-must be owned by you and not group- or other-writable ([Security notes](security.md)):
+must be owned by you and not group- or other-writable, as must each folder from the workspace root down to it
+([Security notes](security.md)):
 ``tasks[0].include `$/roles/web.toml`: mode 664 lets others write to it; set mode 644``.
 
 **Reference checks.** All of these are exit 2 before any target starts, and every include is read whatever its `tags` or

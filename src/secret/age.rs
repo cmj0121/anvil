@@ -22,7 +22,7 @@ use age::secrecy::SecretString;
 use age::{Callbacks, DecryptError, Decryptor, EncryptError, Encryptor, IdentityFile};
 use zeroize::Zeroizing;
 
-use super::file_store::{Codec, FileBacked, open_private};
+use super::file_store::{Codec, FileBacked, open_key};
 use super::prompt::{self, PromptError};
 use super::{BackendKind, SecretError};
 
@@ -61,7 +61,7 @@ impl AgeStore {
     /// permission checks.
     fn read_identity(&self) -> Result<Zeroizing<Vec<u8>>, SecretError> {
         let io = |err: io::Error| self.identity_error(err.to_string());
-        let (file, _) = open_private(&self.identity)?;
+        let (_, file, _) = open_key(&self.identity)?;
         let mut bytes = Zeroizing::new(Vec::with_capacity(IDENTITY_LIMIT as usize + 1));
         file.take(IDENTITY_LIMIT + 1)
             .read_to_end(&mut bytes)
@@ -88,7 +88,10 @@ impl AgeStore {
         }
         let ask = Ask::new(
             self.ask.clone(),
-            format!("passphrase for {}: ", self.identity.display()),
+            format!(
+                "passphrase for {}: ",
+                crate::trust::shown_path(&self.identity)
+            ),
         );
         let decryptor = Decryptor::new(ArmoredReader::new(&bytes[..]))
             .map_err(|err| self.identity_error(decrypt_message(&err)))?;
@@ -307,6 +310,40 @@ mod tests {
         write_private(path, &writer.finish().unwrap().finish().unwrap());
     }
 
+    #[test]
+    fn an_identity_folder_or_link_holder_others_can_write_is_refused_unread() {
+        let root = fs::canonicalize(temp_dir("age-keydir")).unwrap();
+        let dir = root.join("keys");
+        fs::create_dir(&dir).unwrap();
+        let key = dir.join("key.txt");
+        plain_identity(&key);
+        let holder = root.join("holder");
+        fs::create_dir(&holder).unwrap();
+        let link = holder.join("key.txt");
+        std::os::unix::fs::symlink(&key, &link).unwrap();
+        let chmod = crate::test_util::chmod;
+        chmod(&dir, 0o755);
+        chmod(&holder, 0o755);
+        let read = |path: &Path| {
+            AgeStore::new(root.join("store"), path.to_path_buf())
+                .read_identity()
+                .map(|_| ())
+        };
+
+        assert!(read(&key).is_ok());
+        assert!(read(&link).is_ok());
+        for (loose, path) in [(&dir, &key), (&holder, &link)] {
+            chmod(loose, 0o777);
+            let err = read(path).unwrap_err();
+            let shown = err.to_string();
+            assert!(matches!(err, SecretError::Refused { .. }), "{err:?}");
+            assert!(shown.starts_with(loose.to_str().unwrap()), "{shown}");
+            assert_eq!(crate::cli::Failure::from(err).code, 2);
+            chmod(loose, 0o755);
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     type Reply = fn() -> Result<SecretString, PromptError>;
 
     /// A store that answers each prompt with `reply`, counting the prompts.
@@ -516,9 +553,12 @@ mod tests {
         fs::set_permissions(&identity, fs::Permissions::from_mode(0o600)).unwrap();
 
         assert!(open(&root.join("absent.txt")).contains("No such file"));
+        let folder = root.join("folder");
+        fs::create_dir(&folder).unwrap();
+        crate::test_util::chmod(&folder, 0o700);
         assert_eq!(
-            open(&root),
-            format!("{}: not a regular file", root.display())
+            open(&folder),
+            format!("{}: not a regular file", folder.display())
         );
         // Refused, not waited on for a writer.
         let fifo = root.join("fifo");

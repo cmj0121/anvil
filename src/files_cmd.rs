@@ -15,6 +15,7 @@ impl From<StoreError> for Failure {
         Self {
             code: err.exit_code(),
             message: err.to_string(),
+            refused: false,
         }
     }
 }

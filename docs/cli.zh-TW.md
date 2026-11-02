@@ -41,7 +41,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
 | `-v`, `--verbose`   | stderr 上更多日誌（`tui`：Log pane）；`-v` 警告、`-vv` info、`-vvv` debug（[日誌](#日誌)）         |
 | `--inventory PATH`  | 使用此 inventory 檔案而非自動找到的；須以 `.toml` 結尾（否則以 2 結束；見 [tui](#anvil-tui)）      |
 | `--config PATH`     | 使用此 config 檔案而非自動找到的；其目錄即工作區；PATH 須以 `.toml` 結尾（否則以 2 結束）          |
-| `--ssh-config PATH` | 以 `-F PATH` 傳給每個 `ssh`                                                                        |
+| `--ssh-config PATH` | 其實際路徑以 `-F` 傳給每個 `ssh`，`none` 為 `-F none`；其他人能變更時會被[拒絕](security.zh-TW.md) |
 | `--json`            | 在 stdout 印出恰好一份 JSON 文件，取代給人看的輸出                                                 |
 | `--target SEL`      | `local`、host 名稱或 tag；可重複以取聯集；未指定表示 `local` 加上所有 host                         |
 | `--parallel N`      | `apply`、`plan`、`run` 與 `rollback` 同時處理的 target 數，1..=32，預設 1（[平行執行](#平行執行)） |
@@ -305,7 +305,7 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
 儲存區是[工作區](configuration.zh-TW.md#工作區)中的 `files` 資料夾：預設為 `$XDG_CONFIG_HOME/anvil/files`，否則為
 `~/.config/anvil/files`；使用 `--config PATH` 時在該 config 旁邊；設定 `[anvil].workspace` 時在其下。
 每個動作都會載入 config 來找到它，因此無法載入的 config 會以 2 結束並顯示其錯誤。
-其他人可寫入、或屬於其他使用者的工作區會得到一則 WARN 而不是拒絕（[工作區](configuration.zh-TW.md#工作區)）：
+其他人可寫入、或屬於其他使用者的工作區會被拒絕，以 2 結束（[工作區](configuration.zh-TW.md#工作區)）：
 能寫入它的人就能控制 `[[files]]` 複製的內容。每個動作都只在這台機器上進行；會忽略 `--target` 與 `--parallel` 並發出警告，從 `-v` 起顯示。
 
 **儲存區路徑。** `$/sub/motd` 指 `files/sub/motd`，`$/` 則是儲存區本身。除了 `cp` 以外，每個動作也接受不帶 `$/` 的路徑
@@ -930,6 +930,7 @@ rollback 會把該檔案顯示為 `cannot undo: DEST (REASON)`。`rollback = fal
 接著指令在各區塊印出後以 1 結束失敗，訊息為第一個錯誤加上紀錄仍缺少的 target：
 `apply: cannot write last-apply.json: REASON; not recorded: web1, web2`。無法讀取的紀錄會讓 apply 在任何 target 之前以
 `apply: PATH: REASON` 失敗：`a symlink, refused`、`not a regular file`、`mode 640 lets others in; run chmod 600 on it`、
+`not owned by the current user; run chown on it, or do not run anvil through sudo`、
 `larger than the 16777216 byte limit`、`version N is not supported` 或 `cannot parse`。訊息絕不引用它的內容。
 
 **會遺失什麼。** 以 `internal error: …`（anvil 的 bug）失敗的 target 不會被記錄，並保留它先前的項目。第一次 Ctrl-C
@@ -1044,7 +1045,8 @@ ERROR anvil: plugins.harden.sha256: does not match /home/me/.config/anvil/plugin
 ERROR anvil: plugins.harden.path `~/.config/anvil/plugins/harden`: mode 775 lets others write to it; run chmod go-w on it
 ```
 
-其他拒絕訊息的結尾為 `not owned by the current user`、`not executable; run chmod u+x on it`、
+其他拒絕訊息的結尾為
+`not owned by the current user; run chown on it, or do not run anvil through sudo`、`not executable; run chmod u+x on it`、
 `not a regular file`、`directory DIR: REASON`、`larger than the 67108864 byte limit`，或解析、開啟路徑時的錯誤。
 只檢查檔案本身與它所在的目錄，不檢查更上層的目錄（[安全須知](security.zh-TW.md)）。
 每次啟動 plugin 之前，anvil 會確認檔案仍是它雜湊過的那一個（相同的 device、inode、大小、mtime 與 ctime），
@@ -1469,8 +1471,11 @@ target 的選法與 apply 相同（`--target`；未指定表示 `local` 加上�
 腳本是每個 target 唯一的 step，經其 stdin 送到 `sh -s`（`local` 則為 `/bin/sh -s`），絕不放在 argv 上。
 它一律是 POSIX sh：shebang 行只是註解。run 不詢問確認。
 
+- **其他人能變更的 `FILE` 會被拒絕。** 與 config 一樣，在任何 target 開始前以 2 結束，FIFO 或其他非一般檔案亦然
+  （[安全性說明](security.zh-TW.md)）。stdin 不檢查。
 - **config 錯誤不會擋住 run。** 未指定 `--inventory` 時，run 會載入 config 來尋找工作區的 inventory；
-  config 出錯時會記錄警告，並退回 config 所在目錄。指定 `--inventory` 時則略過 config。
+  config 出錯時會記錄警告，並退回 config 所在目錄。例外是拒絕，也就是其他人能變更的 config 或工作區：
+  以 2 結束，不會退回。指定 `--inventory` 時則略過 config。
   不執行任何探測、絕不開啟 secret store，也不輸入 sudo 密碼。
   需要 root 的工作請在腳本中呼叫 `sudo -n`，或使用 sudo 為 NOPASSWD 的 target。
 - **stdin。** 腳本以 `{ :` … `}` 包住後送出，因此 sh 會先讀完整份再執行其中任何一行：

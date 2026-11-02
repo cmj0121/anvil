@@ -24,6 +24,11 @@ use sha2::{Digest, Sha256};
 /// The secret value the tests store; it must never show in any output.
 pub const VALUE: &str = "s3cr3t-hunter2";
 
+/// Gives `path` exactly `mode`.
+pub fn chmod(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
 pub fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")

@@ -265,6 +265,8 @@ pub fn resolve(cli: &Cli) -> Option<&Command> {
 pub struct Failure {
     pub code: u8,
     pub message: String,
+    /// A [`crate::trust`] refusal, which no caller may fall back from or retry.
+    pub refused: bool,
 }
 
 impl Failure {
@@ -272,6 +274,15 @@ impl Failure {
         Self {
             code: 2,
             message: message.into(),
+            refused: false,
+        }
+    }
+
+    /// A file or folder others can change (exit 2); `message` names the fix.
+    pub fn refusal(message: impl Into<String>) -> Self {
+        Self {
+            refused: true,
+            ..Self::usage(message)
         }
     }
 
@@ -280,6 +291,7 @@ impl Failure {
         Self {
             code: 1,
             message: message.into(),
+            refused: false,
         }
     }
 }
@@ -287,7 +299,10 @@ impl Failure {
 // Config, inventory and path problems are exit 2.
 impl From<crate::document::DocumentError> for Failure {
     fn from(err: crate::document::DocumentError) -> Self {
-        Failure::usage(err.to_string())
+        Failure {
+            refused: err.is_refused(),
+            ..Failure::usage(err.to_string())
+        }
     }
 }
 
@@ -313,6 +328,7 @@ impl From<crate::editor::EditorError> for Failure {
         Failure {
             code,
             message: err.to_string(),
+            refused: false,
         }
     }
 }
@@ -320,7 +336,11 @@ impl From<crate::editor::EditorError> for Failure {
 // A store refusing an operation is a failed command (exit 1).
 impl From<crate::secret::SecretError> for Failure {
     fn from(err: crate::secret::SecretError) -> Self {
-        Failure::failed(err.to_string())
+        if matches!(err, crate::secret::SecretError::Refused { .. }) {
+            Failure::refusal(err.to_string())
+        } else {
+            Failure::failed(err.to_string())
+        }
     }
 }
 
@@ -335,7 +355,8 @@ pub fn print_json(value: &impl Serialize, on_err: fn(String) -> Failure) -> Resu
 
 /// Runs `command`, the one [`resolve`] picked for `cli`.
 pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
-    let opts = Options::from_cli(cli);
+    let mut opts = Options::from_cli(cli);
+    opts.ssh_config = opts.ssh_config()?;
     match command {
         Command::Inventory { format } => crate::commands::inventory(cli, &opts, *format),
         Command::Config {

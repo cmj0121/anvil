@@ -293,3 +293,17 @@ fn regex_escape(text: &str) -> String {
         })
         .collect()
 }
+
+/// A refused config is shown on the screen, not hung on, and `q` still leaves.
+#[test]
+fn a_refused_config_is_shown_and_the_tui_still_quits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !python() {
+        return;
+    }
+    let sandbox = tui_sandbox("");
+    let config = sandbox.config_dir().join("config.toml");
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o664)).unwrap();
+    drive(&sandbox, &[], &["--wait", "mode 664", "--send", "q"]);
+}

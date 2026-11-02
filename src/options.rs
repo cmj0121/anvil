@@ -1,12 +1,12 @@
 //! What every command runs with: the global flags, without the output mode
 //! or the command, so a front end other than the CLI can build one.
 
-use std::collections::HashSet;
-use std::io::IsTerminal;
+use std::fs;
+use std::io::{self, IsTerminal};
 use std::num::NonZeroU8;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
 
 use crate::cli::{Cli, Failure};
 use crate::config::Config;
@@ -17,6 +17,7 @@ use crate::secret::{self, Store};
 use crate::ssh::{self, Ssh, SshSettings};
 use crate::tasks::{self, Expanded};
 use crate::transport::{Local, Transport, TransportError};
+use crate::trust::{self, TrustError};
 use crate::update::Source;
 use crate::update::keys::TrustedKeys;
 
@@ -38,8 +39,6 @@ pub struct Options {
     /// ssh may run its interactive retry. CLI: stdin && stderr are terminals.
     /// TUI: true only while a term::Handoff is installed.
     pub can_prompt: bool,
-    /// Workspaces already checked for this run, shared with cloned options.
-    pub checked_workspaces: Arc<Mutex<HashSet<PathBuf>>>,
     #[cfg(debug_assertions)]
     pub secret_store: Option<SecretStoreKind>,
     #[cfg(debug_assertions)]
@@ -65,7 +64,6 @@ impl Options {
     /// are both terminals.
     pub fn from_cli(cli: &Cli) -> Options {
         Options {
-            checked_workspaces: Arc::default(),
             verbose: cli.verbose,
             inventory: cli.inventory.clone(),
             config: cli.config.clone(),
@@ -128,6 +126,25 @@ impl Options {
         Ok(TrustedKeys::compiled())
     }
 
+    /// `--ssh-config` as ssh is to read it: the real path once it passes
+    /// [`trust::INPUT`], or nothing, so ssh uses its own default. `none` names no
+    /// file: it is how `ssh -F` skips every config.
+    pub fn ssh_config(&self) -> Result<Option<PathBuf>, Failure> {
+        let Some(path) = &self.ssh_config else {
+            return Ok(None);
+        };
+        if path == Path::new("none") {
+            return Ok(Some(path.clone()));
+        }
+        match trust::open_real(path, trust::INPUT) {
+            Ok((real, ..)) => Ok(Some(real)),
+            Err(err @ TrustError::Refused { .. }) => {
+                Err(Failure::refusal(format!("--ssh-config {err}")))
+            }
+            Err(err) => Err(Failure::usage(format!("--ssh-config {err}"))),
+        }
+    }
+
     /// How ssh runs: [`Options::ssh_program`], a password prompt only when
     /// [`Options::can_prompt`], and the production deadlines.
     fn ssh_settings(&self) -> SshSettings {
@@ -156,8 +173,7 @@ impl Options {
 
     /// `config`'s ordered list; exit 2 when a task or include is refused.
     pub fn expand(&self, config: &Config) -> Result<Expanded, Failure> {
-        tasks::expand(config, || self.workspace(config).map_err(|err| err.message))
-            .map_err(Failure::usage)
+        tasks::expand(config, || self.workspace(config))
     }
 
     /// The located config's base dir ([`paths::base_dir`]).
@@ -171,44 +187,14 @@ impl Options {
         )?)
     }
 
-    /// `config`'s workspace for this run's `--config`; exit 2 on a resolve error.
+    /// `config`'s workspace for this run's `--config`; exit 2 on a resolve error
+    /// or a refusal ([`check_workspace`]).
     pub fn workspace(&self, config: &Config) -> Result<PathBuf, Failure> {
         let workspace = config
             .workspace(&self.base_dir()?)
             .map_err(Failure::usage)?;
-        self.warn_workspace(&workspace);
+        check_workspace(&workspace)?;
         Ok(workspace)
-    }
-
-    /// Warns once per workspace when another user can control its inventory or files.
-    /// Missing workspaces count as empty; directory links are checked at their target.
-    fn warn_workspace(&self, workspace: &std::path::Path) {
-        let canonical = std::fs::canonicalize(workspace);
-        let key = canonical.as_deref().unwrap_or(workspace).to_path_buf();
-        if !self.checked_workspaces.lock().unwrap().insert(key) {
-            return;
-        }
-        let checked = match canonical {
-            Ok(path) => paths::check_private_dir(&path, rustix::process::getuid().as_raw()),
-            Err(err) => Err(paths::PrivateDirError::Io(err)),
-        };
-        let reason = match checked {
-            Ok(()) => return,
-            Err(paths::PrivateDirError::Mode(mode)) if mode & 0o022 == 0 => return,
-            Err(paths::PrivateDirError::Mode(mode)) => {
-                format!("writable by others (mode {mode:04o})")
-            }
-            Err(paths::PrivateDirError::Owner(uid)) => format!("owned by uid {uid}, not you"),
-            Err(paths::PrivateDirError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
-                return;
-            }
-            Err(paths::PrivateDirError::Io(err)) => format!("cannot check directory: {err}"),
-            Err(paths::PrivateDirError::NotDir) => "not a directory".to_owned(),
-        };
-        log::warn!(
-            "workspace `{}`: {reason}; anyone who can write it controls the inventory and files anvil reads",
-            workspace.display()
-        );
     }
 
     /// The inventory: `--inventory`, else discovered in `config`'s workspace.
@@ -232,10 +218,7 @@ impl Options {
     /// `config`'s `[[files]]` sources; the workspace is resolved only when
     /// a relative or store src needs it.
     pub fn sources(&self, config: &Config, expanded: &Expanded) -> Result<Sources, Failure> {
-        files::load(expanded, || {
-            self.workspace(config).map_err(|err| err.message)
-        })
-        .map_err(Failure::usage)
+        files::load(expanded, || self.workspace(config))
     }
 
     /// The targets `--target` selects from `config`'s inventory (all when none).
@@ -244,13 +227,16 @@ impl Options {
     }
 
     /// The workspace of `config`, as loaded; on a config or workspace error,
-    /// warn and look beside the config so inventory errors can be reported separately.
+    /// warn and look beside the config so inventory errors can be reported
+    /// separately. A refusal is returned instead: another host list must not run.
     fn inventory_dir(&self, config: Result<&Config, &Failure>) -> Result<PathBuf, Failure> {
         let err = match config {
             Ok(config) => match self.workspace(config) {
                 Ok(workspace) => return Ok(workspace),
+                Err(err) if err.refused => return Err(err),
                 Err(err) => err.message,
             },
+            Err(err) if err.refused => return Err(Failure::refusal(err.message.clone())),
             Err(err) => err.message.clone(),
         };
         let base = self.base_dir()?;
@@ -258,7 +244,7 @@ impl Options {
             "config failed to load ({err}); looking for the inventory in {}",
             base.display()
         );
-        self.warn_workspace(&base);
+        check_workspace(&base)?;
         Ok(base)
     }
 
@@ -295,7 +281,8 @@ impl Options {
                 #[cfg_attr(not(debug_assertions), expect(unused_mut, reason = "debug: ssh_home"))]
                 let mut ssh = Ssh::new(
                     self.ssh_settings(),
-                    self.ssh_config.clone(),
+                    self.ssh_config()
+                        .map_err(|failure| TransportError::Spawn(failure.message))?,
                     host,
                     user.clone(),
                     *port,
@@ -310,12 +297,37 @@ impl Options {
     }
 }
 
+/// Refuses a workspace that another user owns or can write, who would control
+/// the inventory and files anvil reads, and one that cannot be examined.
+/// Missing counts as empty, unless a dangling link stands for it in a loose
+/// folder; a link is checked at its target and at each folder
+/// holding one on the path; bits that only let others read are allowed.
+fn check_workspace(workspace: &Path) -> Result<(), Failure> {
+    // First: a dangling link in a loose holder can be repointed at any time.
+    if let Err(err @ TrustError::Refused { .. }) = trust::check_links(workspace) {
+        return Err(Failure::refusal(format!("workspace {err}")));
+    }
+    let real = match fs::canonicalize(workspace) {
+        Ok(real) => real,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            let shown = trust::shown_path(workspace);
+            return Err(Failure::refusal(format!(
+                "workspace {shown}: cannot check it: {err}"
+            )));
+        }
+    };
+    match trust::check_dir(&real, trust::INPUT) {
+        Ok(()) | Err(TrustError::NotFound { .. }) => Ok(()),
+        Err(err) => Err(Failure::refusal(format!("workspace {err}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
     use super::*;
-    use crate::test_util::logged;
 
     fn parse(args: &[&str]) -> Options {
         let cli =
@@ -323,9 +335,38 @@ mod tests {
         Options::from_cli(&cli)
     }
 
-    /// Unsafe workspaces warn once even when inventory and sources both resolve them.
     #[test]
-    fn workspace_permissions_warn_once() {
+    fn a_dangling_workspace_link_in_a_loose_holder_is_refused_and_missing_stays_empty() {
+        let dir = fs::canonicalize(crate::test_util::temp_dir("workspace-dangling")).unwrap();
+        assert!(check_workspace(&dir.join("gone")).is_ok());
+        let holder = dir.join("holder");
+        fs::create_dir(&holder).unwrap();
+        let link = holder.join("ws");
+        std::os::unix::fs::symlink(dir.join("gone"), &link).unwrap();
+        crate::test_util::chmod(&holder, 0o755);
+        assert!(check_workspace(&link).is_ok());
+        crate::test_util::chmod(&holder, 0o777);
+        let err = check_workspace(&link).unwrap_err();
+        assert!(err.refused, "{err:?}");
+        assert_eq!(err.code, 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_workspace_cannot_forge_a_line_or_reorder_the_text() {
+        let dir = crate::test_util::temp_dir("workspace-escape");
+        let workspace = dir.join("ws\nERROR forged\u{202e}");
+        fs::create_dir(&workspace).unwrap();
+        crate::test_util::chmod(&workspace, 0o777);
+        let message = check_workspace(&workspace).unwrap_err().message;
+        assert!(!message.contains(['\n', '\u{202e}']), "{message}");
+        assert!(message.contains("ws\\nERROR forged\\u{202e}"), "{message}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A writable workspace is refused however it is named; read bits are not.
+    #[test]
+    fn a_workspace_others_can_write_is_refused() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = crate::test_util::temp_dir("workspace-permissions");
@@ -334,47 +375,81 @@ mod tests {
             ("unsafe", Some(0o777)),
             ("private", Some(0o700)),
             ("readable", Some(0o755)),
+            ("group-readable", Some(0o750)),
             ("group-writable", Some(0o770)),
             ("missing", None),
         ] {
             let workspace = dir.join(name);
             if let Some(mode) = mode {
-                std::fs::create_dir(&workspace).unwrap();
-                std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(mode))
-                    .unwrap();
+                fs::create_dir(&workspace).unwrap();
+                fs::set_permissions(&workspace, fs::Permissions::from_mode(mode)).unwrap();
             }
             let opts = parse(&["--config", path.to_str().unwrap(), "plan"]);
-            let mut config = Config::default();
-            config.anvil.workspace = Some(name.to_owned());
-            let ((), lines) = logged(|| {
-                opts.inventory_for(&config).unwrap();
-                assert_eq!(opts.clone().workspace(&config).unwrap(), workspace);
-                config.anvil.workspace = Some(format!("{name}/../{name}"));
-                opts.workspace(&config).unwrap();
-                if mode.is_some() {
-                    let link = dir.join(format!("{name}-link"));
-                    std::os::unix::fs::symlink(&workspace, &link).unwrap();
-                    config.anvil.workspace = Some(link.to_string_lossy().into_owned());
-                    opts.workspace(&config).unwrap();
+            let mut named = vec![name.to_owned(), format!("{name}/../{name}")];
+            if mode.is_some() {
+                let link = dir.join(format!("{name}-link"));
+                std::os::unix::fs::symlink(&workspace, &link).unwrap();
+                named.push(link.to_string_lossy().into_owned());
+            }
+            for value in named {
+                let mut config = Config::default();
+                config.anvil.workspace = Some(value);
+                let result = opts.workspace(&config);
+                if mode.is_some_and(|mode| mode & 0o022 != 0) {
+                    let err = result.unwrap_err();
+                    assert!(err.refused);
+                    assert_eq!(err.code, 2);
+                    assert!(err.message.contains("run chmod go-w on it"), "{err:?}");
+                    assert!(opts.inventory_for(&config).unwrap_err().refused);
+                } else {
+                    result.unwrap();
                 }
-            });
-            let warnings: Vec<_> = lines
-                .iter()
-                .filter(|line| line.contains(&format!("workspace `{}/", dir.display())))
-                .collect();
-            if mode.is_some_and(|mode| mode & 0o022 != 0) {
-                assert_eq!(warnings.len(), 1, "{lines:?}");
-                assert!(warnings[0].starts_with("WARN "));
-                assert!(
-                    warnings[0]
-                        .contains(&format!("writable by others (mode {:04o})", mode.unwrap()))
-                );
-                assert!(warnings[0].contains("controls the inventory and files anvil reads"));
-            } else {
-                assert!(warnings.is_empty(), "{lines:?}");
             }
         }
-        std::fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A refusal is never a reason to look for another inventory: neither of
+    /// the config nor of the workspace it names. Other errors still fall back.
+    #[test]
+    fn the_inventory_never_falls_back_from_a_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_util::temp_dir("inventory-refusal");
+        let config = dir.join("site.toml");
+        fs::write(&config, "not toml =").unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(
+            dir.join("inventory.toml"),
+            "[hosts.fallback]\nhost = \"example.org\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            dir.join("inventory.toml"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let opts = parse(&["--config", config.to_str().unwrap(), "plan"]);
+        assert_eq!(
+            opts.targets().unwrap().len(),
+            2,
+            "broken config: falls back"
+        );
+
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o664)).unwrap();
+        let err = opts.targets().unwrap_err();
+        assert!(err.refused, "{err:?}");
+        assert!(err.message.contains("chmod go-w"), "{err:?}");
+
+        let workspace = dir.join("ws");
+        fs::create_dir(&workspace).unwrap();
+        fs::set_permissions(&workspace, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::write(&config, "[anvil]\nworkspace = \"ws\"\n").unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = opts.targets().unwrap_err();
+        assert!(err.refused, "{err:?}");
+        assert!(err.message.contains("/ws: mode 775"), "{err:?}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// Callers with a config use that value without loading the on-disk config again.

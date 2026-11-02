@@ -41,8 +41,9 @@ use crate::document::MAX_BYTES;
 use crate::facts::Facts;
 use crate::files::{self, FileState};
 use crate::logger::{escape_controls, is_invisible};
-use crate::secret::{check_dir, check_owner, open_regular, shown_name};
+use crate::secret::shown_name;
 use crate::transport::{Groups, TransportError, collect_tracked};
+use crate::trust;
 
 /// Largest plugin file hashed, in bytes.
 const PLUGIN_LIMIT: u64 = 64 << 20;
@@ -166,18 +167,16 @@ fn verify_one(name: &str, plugin: &Plugin, home: Option<&OsStr>) -> Result<Pin, 
     };
     let path = plugin.path(name, home)?;
     let real = fs::canonicalize(&path).map_err(|err| refuse(&err))?;
-    let (mut file, meta) = open_regular(&real).map_err(|err| refuse(&err))?;
-    check_owner(&meta, 0o022).map_err(|message| refuse(&message))?;
+    let (mut file, meta) = trust::open(&path, trust::INPUT).map_err(|err| {
+        if err.path() == real {
+            refuse(&err.reason())
+        } else {
+            refuse(&format_args!("directory {err}"))
+        }
+    })?;
     if meta.mode() & 0o100 == 0 {
         return Err(refuse(&"not executable; run chmod u+x on it"));
     }
-    // Others able to write the directory of the real file could swap it.
-    check_dir(real.parent().unwrap_or(Path::new("/"))).map_err(|err| {
-        refuse(&format_args!(
-            "directory {}",
-            escape_controls(&err.to_string())
-        ))
-    })?;
     let digest = hash(&mut file, PLUGIN_LIMIT).map_err(|err| refuse(&err))?;
     if digest != plugin.sha256 {
         return Err(format!(
@@ -631,7 +630,7 @@ pub(crate) fn last_line(stderr: &[u8]) -> Option<String> {
 mod tests {
     use std::fs::{DirBuilder, OpenOptions};
     use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
     use super::*;
     use crate::config::{Plugin, Step};
@@ -685,9 +684,7 @@ mod tests {
         verify_where(config, Plugin::is_step)
     }
 
-    fn chmod(path: &Path, mode: u32) {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-    }
+    use crate::test_util::chmod;
 
     #[test]
     fn a_matching_plugin_is_pinned_by_its_real_path() {
@@ -787,6 +784,25 @@ mod tests {
             );
         }
         chmod(&root.join("plugins"), 0o700);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_loose_file_in_a_loose_directory_names_the_directory() {
+        let (root, path) = sandbox("plugin-both-loose");
+        chmod(&path, 0o720);
+        chmod(&root.join("plugins"), 0o770);
+        let real_dir = fs::canonicalize(root.join("plugins")).unwrap();
+        let err = verify_step(&config(&path, &body_sha())).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "plugins.harden.path `{}`: directory {}: \
+                 mode 770 lets others write to it; run chmod go-w on it",
+                path.display(),
+                real_dir.display()
+            )
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
