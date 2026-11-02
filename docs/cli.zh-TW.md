@@ -168,6 +168,10 @@ config 沒用到的每個選用區段都以註解範例附在後面（`# [secret
 緩衝區所代表的 config 與原本相同時，不論怎麼編輯都不會寫入任何東西（`PATH: unchanged`）；
 舊版 YAML config 或舊版的 `[anvil].secrets` 仍會和不加 `--full` 時一樣遷移。
 
+儲存 `[[tasks]]` config 時，不論有無 `--full`，也會執行它的[參照檢查](configuration.zh-TW.md#tasks)：
+不存在的 include 與任何無效的編輯一樣進入重試，最後為 `config: still invalid after 3 attempts`，以 2 結束，不寫入任何東西。
+開啟編輯器時不會展開，因此損壞的 include 仍可在此修復。只會編輯主檔案，儲存的檔案就是你輸入的內容，絕不含展開後的 task。
+
 #### `anvil config --harden`
 
 以 config 與它將新增之檔案的 diff，顯示 config 尚缺的 Linux 強化設定；`--write` 則把它存下：
@@ -178,7 +182,7 @@ anvil config --harden --strict     # also the high-risk rules (ssh.password-auth
 anvil config --harden --write      # write the suggestions, then: anvil plan
 ```
 
-它只讀取 config、inventory，以及它檢查的 `[[files]]` 項目的 src，不讀其他東西：它從不連線任何 target，完全離線執行。
+它只讀取 config、inventory，以及它檢查的 `[[files]]` 項目的 src（在 tasks config 上還有 include 與 file task 的 src），不讀其他東西：它從不連線任何 target，完全離線執行。
 規則、各規則寫入的內容與 `[harden] skip` 請見 [Harden](configuration.zh-TW.md#harden)。
 `--strict` 與 `--write` 需要 `--harden`；`--harden` 搭配 `--full` 或 `--format` 以 2 結束。
 `--target` 與 `--parallel` 會被忽略並發出警告，和 `config` 相同。
@@ -261,9 +265,30 @@ stdout 只有一份 unified diff（三行上下文），每個變更的檔案一
 沒有 `[[steps]]` 的 config 會執行預設的 `hostname` step；`--harden` 加入 step 後，這個預設就不再存在，
 若仍需要，請自行加回一個 `run = "hostname"` 的 step。
 
-結束碼：預覽時有任何建議為 1（`config --harden: 3 suggestions`），否則為 0，只有擱置的規則或警告時也是 0。
+結束碼：預覽時有任何建議（`config --harden: 3 suggestions`）或[未解決的 task 項目](#在-tasks-config-上)為 1，
+否則為 0，只有擱置的規則或其他警告時也是 0。
 `--write` 寫入後或無須寫入時為 0，遇到上述拒絕情形或無法載入的 config 時為 2，寫入失敗時為 1。
 無法讀取的 config、inventory 或 src 為 2。
+
+##### 在 tasks config 上
+
+在 [`[[tasks]]`](configuration.zh-TW.md#tasks) config 上，`--harden` 只在主檔案的頂層加入 task，絕不寫入 include 或巢狀 task：
+
+```text
+harden: add ssh.root-login: tasks[3] /etc/ssh/sshd_config.d/00-anvil-harden.conf
+harden: add ssh.root-login: tasks[5] # anvil-harden: ssh
+harden: remove packages.insecure: telnet: tasks[1].packages.install -> tasks[1].packages.remove
+harden: warning tasks[0]/base.toml:tasks[0].packages: ftp should move from install to remove; change it by hand, …
+```
+
+- 新的 file task 放在讀取它的既有帶標記 step 正前方。其餘的附加在最後，檔案在 step 之前。
+- 已在 include 或巢狀 task 中的項目視為存在。其中需要變更的項目會得到上述警告，
+  或 `harden: warning PATH.file: src SRC must set LINE; change it by hand, …`，且不會寫入。
+  警告結尾為 `harden writes only the main file's top-level tasks`。
+- 只要還有這樣未解決的項目，即使已無建議，預覽仍以 1 結束：
+  `config --harden: entries in includes or nested tasks need changing by hand`。`--write` 寫入其餘部分並以 0 結束。
+- 此時 `--json` 加上 `"unresolved": true`，否則省略這個鍵；警告位於 `warnings`。
+- 第二次 `--write` 不做任何事，主檔案也絕不會多出展開後的 task。
 
 ### `anvil files`
 
@@ -323,7 +348,8 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
   以非零結束的編輯器不寫入任何東西（以 1 結束）。
 
 `mv` 與 `rm` 接著對每個位於被移動或刪除路徑下的 `[[files]]` src 記錄一行 WARN：
-``files[0].src `$/a/motd` names $/a, which is gone``。
+``files[0].src `$/a/motd` names $/a, which is gone``。在 `[[tasks]]` config 上，它對能走訪到的每個 `file.src` 與 `include` 也一樣：
+``tasks[0]/role.toml:tasks[0].file.src `$/inner` names $/inner, which is gone``。
 
 給人看的輸出：`ls` 印出名稱，`cat` 印出檔案，其他動作不印任何東西。`--json` 為一份文件：
 
@@ -571,6 +597,8 @@ tag 讓所有雜湊都不出現在請求與 doctor 的輸出中：任何雜湊�
 每個 target 上的每個 step 都以 0 結束時以 0 結束，否則為 1。
 apply 直接執行：不印出計畫，也不詢問確認；想先看它會執行什麼，請先執行 [`anvil plan`](#anvil-plan)。
 
+本節其餘部分說明舊版區段，其順序固定：套件、檔案、服務、step。`[[tasks]]` config 依你寫的順序執行（[執行中的 task](#執行中的-task)）。
+
 當 `[packages]` 有事可做（`install`、`pin` 或 `remove` 非空，或 `upgrade = true`）時，每個 target 會先透過同一個傳輸執行
 facts 探測、解析其套件管理器，並將產生的腳本作為 step 1 執行，排在 `[[steps]]` 之前。
 該 step 是一般的 step：它顯示為 `$ SCRIPT` 及其輸出，計入 `✔ ok · N steps` 與 `--json` 中的 `steps`，
@@ -583,10 +611,10 @@ anvil 會在 sudo 的提示處輸入密碼（[輸入 sudo 密碼](packages.zh-TW
 其 `$` 行仍是那行一行式腳本。沒有 `[packages]`，或沒有要安裝、升級、鎖定或移除的東西時，不會執行探測，apply 只執行 `[[steps]]`，
 除非有 step 指定 plugin（[Plugin steps](#plugin-steps)），或 config 含有 `[[files]]` 或 `[[services]]`。
 
-每個 `[[files]]` 項目在每個 target 上都是一個 step，排在套件 step 之後、`[[steps]]` 之前：
+在舊版 config 中，每個 `[[files]]` 項目在每個 target 上都是一個 step，排在套件 step 之後、`[[steps]]` 之前：
 target 的 tag 與 fact 符合時複製檔案，不符合時顯示為略過（[File steps](#file-steps)）。
 
-每個 `[[services]]` 項目在每個 target 上都是一個 step，排在 file step 之後、`[[steps]]` 之前：
+在舊版 config 中，每個 `[[services]]` 項目在每個 target 上都是一個 step，排在 file step 之後、`[[steps]]` 之前：
 target 的 tag 與 fact 符合時以 target 的 init 把服務帶到其狀態，不符合時顯示為略過（[Service steps](#service-steps)）。
 
 每個 `install` 名稱在腳本中會換成解析出的管理器的 `[packages.alias]` 項目，沒有則原樣使用（[別名](packages.zh-TW.md#別名)）。
@@ -698,6 +726,91 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 已知名稱仍會安裝，後續 step 照常執行，target 的 `ok`、摘要與 exit code 不因這些警告改變。
 所有 target 成功時仍以 0 結束；實際安裝失敗仍會使 target 失敗。
 
+#### 執行中的 task
+
+[`[[tasks]]`](configuration.zh-TW.md#tasks) config 依所寫的順序執行，而非上述的固定順序：
+`packages`、`file`、`service`、`run` 或 `plugin` task 不論位置，行為都與該種 step 相同。
+`plan` 與 `apply` 的順序相同。使用這份 config 時，在 `local` 上的 `anvil plan` 印出：
+
+```toml
+[[tasks]]
+name = "Create conf dir"
+run = "mkdir -p /tmp/app"
+
+[[tasks]]
+name = "App"
+
+  [[tasks.tasks]]
+  name = "Write config"
+  file = { src = "$/app.conf", dest = "/tmp/app/app.conf", mode = "0644", sudo = false }
+
+[[tasks]]
+name = "Web role"
+include = "$/roles/web.toml"   # Validate config, then Start nginx with tags = ["web"]
+```
+
+```text
+▶ local
+  tasks[0]  Create conf dir
+  would $ mkdir -p /tmp/app
+  tasks[1].tasks[0]  Write config
+  would $ file /tmp/app/app.conf
+  tasks[2]/roles/web.toml:tasks[0]  Validate config
+  would $ cat /tmp/app/app.conf
+  tasks[2]/roles/web.toml:tasks[1]  Start nginx
+  would $ skipped run: no match
+  ✔ 4 steps
+
+1 target, nothing executed
+```
+
+- **`PATH  NAME`。** 每個 task 有一行，列出它穩定的路徑與 `name`（有設定時）；apply 與 plan 在每個 `-v` 等級都會印出，
+  位於該 step 的 `$` 或 `would $` 行正上方。include 在路徑中顯示為 `/roles/web.toml:`，子 task 顯示為 `.tasks[0]`。
+  兩者中的控制字元與不可見字元都會被跳脫。舊版 config 不印這一行。
+- **`--json`。** `apply --json` 與 `plan --json` 的每個 step 加上 `task`，以及 `name`（有設定時）。舊版 config 的 JSON 不變：
+
+```json
+{
+  "run": "skipped run: no match",
+  "code": 0,
+  "stdout": "",
+  "stderr": "",
+  "skipped": true,
+  "task": "tasks[2]/roles/web.toml:tasks[1]",
+  "name": "Start nginx"
+}
+```
+
+- **失敗。** `✘ step N exited C` 依執行順序計算該 target 的 step，略過的也計入，因此 `N` 是在展開清單中的位置。
+  失敗會停止該 target 其餘的 task。
+- **探測。** 清單中有 `packages`、`file`、`service` 或 `plugin` task，或有帶 `facts` 的 task，或 config 有 doctor plugin 時，
+  apply 會探測 target。探測在第一個 task 之前執行一次（[單次探測](configuration.zh-TW.md#tasks)）。
+  任何 task 需要的 sudo 密碼都在執行開始前讀取。
+- **Rollback。** `cannot undo` 以路徑指名 `run`、`plugin`、`packages` 或 `service` task，`--dry-run` 也一樣：
+
+```text
+▶ local
+  would remove /tmp/app/app.conf
+  cannot undo: tasks[0]
+  cannot undo: tasks[2]/roles/web.toml:tasks[0]
+  ✔ 3 steps
+
+1 target, nothing executed
+```
+
+rollback 需要 config 來決定可以還原哪些檔案，因此不存在或被拒絕的 include 會讓它以 2 結束：
+
+```text
+rollback: tasks[1].include `$/r.toml`: not found; the config decides which files may be restored: fix or restore
+what it names, then run rollback again
+```
+
+目前沒有 file task 指名的已記錄 dest 會讓該 target 失敗，並顯示 `rollback: DEST is not in the config; refusing to restore it`。
+
+- **doctor。** doctor 會展開清單（被拒絕的 include 以 2 結束），檢查 selector 符合每個 target 的 `packages` task
+  與這些 task 需要的 sudo secret，並比對 file task 寫入的 dest。
+- **TUI。** Steps 窗格列出展開後的 task；apply 與 plan 區塊顯示相同的 `PATH  NAME` 行（[終端介面](tui.zh-TW.md)）。
+
 #### Ctrl-C
 
 `apply`、`plan`、`run` 與 `rollback` 對 Ctrl-C 的處理相同，不論 `--parallel` 為何；`doctor` 也一樣，
@@ -719,7 +832,8 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 
 #### apply 紀錄
 
-會探測 target 的 apply（有工作的 `[packages]`、plugin step、`[[files]]` 或 `[[services]]`）會保存
+會探測 target 的 apply（有工作的 `[packages]`、plugin step、`[[files]]` 或 `[[services]]`，
+或在 tasks config 上[如執行中的 task 所述](#執行中的-task)）會保存
 `last-apply.json`，供 [`anvil rollback`](#anvil-rollback) 讀取。只有一般 `[[steps]]` 的 apply 不會開啟它。
 
 - **位置。** `$XDG_STATE_HOME/anvil/last-apply.json`，否則為 `~/.local/state/anvil/last-apply.json`；空的或相對路徑的
@@ -734,6 +848,11 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 - **保存的內容。** 每個 target：時間（`at`）、anvil 版本、每個 step 是否都通過（`ok`）、探測得到的 facts、寫入的每個檔案、
   無法復原的 step（`cannot_undo`），以及 rollback 之後的 `rolled_back`。每個檔案：dest、寫入時的 mode 與 `sudo`、
   寫入位元組的 sha256、寫入如何結束（`write`），以及先前的狀態（`previous`）。它絕不保存 secret 的值、step 的腳本或套件清單。
+- **tasks config 上每個 dest 一筆。** 同一次 apply 中兩個 file task 寫入的 dest（拼法相同或只差重複的斜線）只有一筆檔案項目，
+  以第一個拼法記錄：`previous` 取自第一次寫入之前，
+  mode、sha256 與 `write` 取自最後一次，因此 doctor 比對最終的位元組，rollback 放回第一次寫入之前的內容。
+  只要有一次寫入用過 `sudo`，它就維持 true；dest 只要有適用於該 target 且帶 `rollback = false` 的 task，
+  從第一次寫入起就不保存文字，即使該 task 最後沒有執行。
 
 ```json
 {
@@ -787,6 +906,10 @@ anvil 把它寫成一行。`previous` 對先前不存在的 dest 為 `{"state": 
 `contains NUL`、`unreadable`、`no od on the target` 或 `record full`。不論哪種情況寫入都會進行；失去的只是它的復原，
 rollback 會把該檔案顯示為 `cannot undo: DEST (REASON)`。`rollback = false` 只保存雜湊：dest 保存 secret 時請使用它
 （[Files](configuration.zh-TW.md#files)）。
+
+`rollback = false` 有兩項限制。dest 的 symlink、hard link 或不分大小寫的別名在 controller 上看不出來，會算成不同的 dest，
+因此該檔案的每個項目都要設定 `rollback = false`。同一 dest 重複的舊式 `[[files]]` 項目，若第一個使用預設 rollback、
+後面的設定 `rollback = false`，第二次 apply 時仍會把後面項目的 secret 保存為文字：請改用 `[[tasks]]`，或兩者都設定 `rollback = false`。
 
 **重試保留最初的狀態。** dest 已經是相同位元組的重跑，會保留寫入這些位元組的那次 apply 的項目，所以它的 `previous`
 仍是那次 apply 之前的狀態。中途失敗的寫入在下一次嘗試時保留它之前的 `previous`。失敗的 apply（`ok: false`）
@@ -851,6 +974,7 @@ secret 由 `anvil doctor` 檢查。
 2 targets, nothing executed
 ```
 
+- [`[[tasks]]`](#執行中的-task) config 在每個 step 上方多一行 `PATH  NAME`。
 - 每個 step 是一行 `would $ RUN`（多行的 `run` 顯示第一行加上 `…`）；
   apply 會在 sudo 的提示輸入某個 secret 的值時，後面再加上 `(sudo password from secret NAME)`。
 - 區塊以 `✔ N steps` 結尾，失敗的 target 則為 `✘ REASON`。
@@ -858,7 +982,7 @@ secret 由 `anvil doctor` 檢查。
 - 顏色與跳脫規則與 apply 相同。
 
 `--json` 是 apply 的文件，最前面加上 `"executed": false`；
-step 只有 `run`，以及 apply 會輸入 sudo 密碼時的 `sudo_secret`，絕不會有 `code`、`stdout` 或 `stderr`：
+step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`，以及 tasks config 上的 `task` 與 `name`，絕不會有 `code`、`stdout` 或 `stderr`：
 
 ```json
 {
@@ -1007,7 +1131,8 @@ plan 顯示 `would $ SCRIPT (from plugin NAME)`，其 `--json` 的 step 帶有 `
 
 ### File steps
 
-`[[files]]` 項目把工作區或檔案儲存區中的一份文字檔複製到每個 tag 與 fact 都符合的選定 target（[Files](configuration.zh-TW.md#files)）：
+`[[files]]` 項目或 `file` [task](#執行中的-task) 把工作區或檔案儲存區中的一份文字檔複製到每個 tag 與 fact 都符合的選定 target
+（[Files](configuration.zh-TW.md#files)）：
 
 ```toml
 [[files]]
@@ -1017,7 +1142,7 @@ mode = "0644"
 facts = { distro = "arch" }
 ```
 
-每個項目在每個 target 上都是一個 step，依 config 順序排在套件 step 之後、`[[steps]]` 之前。
+每個 `[[files]]` 項目在每個 target 上都是一個 step，依 config 順序排在套件 step 之後、`[[steps]]` 之前；`file` task 則是在它所在位置的同樣 step。
 在符合的 target 上，該 step 顯示為 `$ file DEST` 並印出 `wrote DEST`；dest 已是相同位元組時印出 `unchanged DEST`（此時只套用 `mode`）。
 在不符合的 target 上，它是沒有輸出的 `$ skipped file DEST: no match`：它不執行任何東西，計入 `✔ ok · N steps`，
 該 target 的其他 step 仍會執行。寫入失敗的 step 會像任何 step 一樣結束該 target。使用 `-vv` 時：
@@ -1086,8 +1211,8 @@ state = "stopped"
 tags = ["web"]
 ```
 
-每個項目在每個 target 上都是一個 step，依 config 順序排在 `[[files]]` step 之後、`[[steps]]` 之前，
-因此順序是套件、檔案、服務、step。在符合的 target 上，該 step 顯示為 `$ service NAME`。
+每個 `[[services]]` 項目在每個 target 上都是一個 step，依 config 順序排在 `[[files]]` step 之後、`[[steps]]` 之前，
+因此順序是套件、檔案、服務、step；`service` task 則是在它所在位置的同樣 step。在符合的 target 上，該 step 顯示為 `$ service NAME`。
 它先詢問 init，只變更不同之處，並依變更的順序每項變更印出一行：`enabled service NAME`、
 `disabled service NAME`、`started service NAME`、`stopped service NAME`。沒有要變更的東西時印出
 `unchanged service NAME`，因此再次執行不會有任何動作。在不符合的 target 上，它是沒有輸出的
@@ -1263,7 +1388,8 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   `remove DEST` 印出 `removed DEST`；DEST 已經是 apply 之前的樣子時，兩者都印出 `unchanged DEST`（restore 仍會把 owner 與 mode 設回去）。
   文字沒有保存的檔案是一個略過的 step `cannot undo: DEST (REASON)`，原因取自紀錄（例如 `rollback = false`）。
 - **無法復原的部分。** 在檔案之後，apply 中有執行但無法復原的 step 會顯示為略過的 step：`cannot undo: packages`、
-  `cannot undo: service NAME` 與 `cannot undo: step N`（第 N 個 `[[steps]]` 項目）。rollback 絕不執行套件管理器、
+  `cannot undo: service NAME` 與 `cannot undo: step N`（第 N 個 `[[steps]]` 項目），在 tasks config 上則為 `cannot undo: PATH`
+  （[執行中的 task](#執行中的-task)）。rollback 絕不執行套件管理器、
   service 指令或 step。
 - **與寫入相同的路徑。** 每個檔案都依 apply 寫入的方式還原，依據記錄的 `sudo` 與 target 目前的 facts：透過 `sudo -n`、
   以 root、以連線使用者，或走密碼路徑：把文字暫存在 0600 的 `/tmp/anvil-` 檔案，再執行 `sudo install -o UID -g GID -m MODE`。
@@ -1326,7 +1452,8 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 - **1**：`rollback: no apply recorded`（沒有紀錄，或紀錄中沒有任何項目；不執行任何東西）；某個 target 失敗
   （被拒絕的 dest、不在 `[[files]]` 中或 `sudo` 不同的 dest、host 改變、還原或連線失敗）；紀錄無法讀取（`rollback: PATH: REASON`，與 apply 相同）、
   被另一個 anvil 鎖住或無法儲存；找不到狀態目錄（[apply 紀錄](#apply-紀錄)）。
-- **2**：錯誤的旗標（`--force` 與 `--force-all` 並用）、不在紀錄中的 `--force DEST`、未知的 `--target`，或無效的 config 或 inventory。
+- **2**：錯誤的旗標（`--force` 與 `--force-all` 並用）、不在紀錄中的 `--force DEST`、未知的 `--target`，
+  或無效的 config 或 inventory，包括無法展開的 task 或 include。
 
 ### `anvil run [--timeout SECS] <FILE|->`
 
@@ -1582,7 +1709,7 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
 - **`update`**：已是最新、比最新 release 更新或已更新時為 0。
   搭配 `--check` 且有可用的更新時為 1，任何失敗也為 1：查詢、下載、檢查、拒絕情形，或 `no release key compiled in`；
   此時已安裝的執行檔保持不變。錯誤的旗標或引數為 2。
-- **`config --harden`**：仍有任何建議時為 1，否則為 0；只有擱置的規則或警告時為 0。
+- **`config --harden`**：仍有任何建議或未解決的 [task 項目](#在-tasks-config-上)時為 1，否則為 0；只有擱置的規則或其他警告時為 0。
   搭配 `--write` 時，寫入後（或無須寫入）為 0，遇到拒絕情形或無法通過驗證的 config 為 2，寫入失敗為 1
   （[`--harden`](#anvil-config---harden)）。
 - **`files`**：成功時為 0。儲存區路徑不存在、已存在而沒有 `-f`、是資料夾（`rm` 沒有 `-r`）或不是資料夾、不是文字檔，

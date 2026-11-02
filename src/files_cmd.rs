@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::editor::{Buffer, Editor, Fallback};
 use crate::filestore::{self, Kind, Root, StoreError, shown};
 use crate::options::Options;
+use crate::tasks;
 
 impl From<StoreError> for Failure {
     fn from(err: StoreError) -> Self {
@@ -81,7 +82,7 @@ pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failur
         FilesAction::Mv { src, dest, force } => {
             let from = filestore::parse(src)?;
             let to = root.rename(src, dest, *force)?;
-            warn_orphans(&config, &from);
+            warn_orphans(&config, &root, &from);
             vec![shown(&to)]
         }
         FilesAction::Rm { paths, recursive } => {
@@ -89,7 +90,7 @@ pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failur
             for path in paths {
                 let rel = filestore::parse(path)?;
                 root.remove(path, *recursive)?;
-                warn_orphans(&config, &rel);
+                warn_orphans(&config, &root, &rel);
                 changed.push(shown(&rel));
             }
             changed
@@ -155,18 +156,29 @@ pub fn edit(root: &Root, path: &str, preference: Option<&str>) -> Result<bool, F
     Ok(false)
 }
 
-/// Warns when an entry names a removed file or a child of a removed folder.
-fn warn_orphans(config: &Config, path: &str) {
-    for (i, entry) in config.files.iter().enumerate() {
-        let src = &entry.src;
-        if !filestore::is_store_path(src) {
+/// Warns when an entry, or a task at any depth, names a removed file or a
+/// child of a removed folder.
+fn warn_orphans(config: &Config, root: &Root, path: &str) {
+    let entries = config
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| (format!("files[{i}].src"), entry.src.clone()));
+    for (field, src) in entries.chain(tasks::references(config, root)) {
+        if !filestore::is_store_path(&src) {
             continue;
         }
-        if let Ok(rel) = filestore::parse(src)
+        if let Ok(rel) = filestore::parse(&src)
             && (rel == path || rel.starts_with(&format!("{path}/")))
         {
             let path = shown(path);
-            log::warn!("files[{i}].src `{src}` names {path}, which is gone");
+            let warning = format!("{field} `{src}` names {path}, which is gone");
+            if config.tasks.is_empty() {
+                log::warn!("{warning}");
+            } else {
+                // A task's field and include may hold invisible characters.
+                log::warn!("{}", crate::logger::escape_invisible(&warning));
+            }
         }
     }
 }

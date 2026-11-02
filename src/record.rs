@@ -97,6 +97,26 @@ pub struct FileRecord {
     pub previous: Previous,
 }
 
+/// Why a previous text was not kept when the entry asks for the hash only.
+pub const NO_ROLLBACK: &str = "rollback = false";
+
+impl FileRecord {
+    /// This dest was written again in the same apply: `previous` stays the
+    /// one from before the first write, the rest becomes `later`'s, so doctor
+    /// compares against the final bytes. A refused `later` left DEST as it
+    /// was and changes nothing else; `sudo` stays set once a write needed it,
+    /// so a restore reaches what that write left.
+    pub fn written_again(&mut self, later: FileRecord) {
+        if later.write == Write::Refused {
+            return;
+        }
+        self.mode = later.mode;
+        self.sudo = self.sudo || later.sudo;
+        self.written_sha256 = later.written_sha256;
+        self.write = later.write;
+    }
+}
+
 /// By hand, as [`PreviousFile`]'s: `previous` shows a text as its length.
 impl fmt::Debug for FileRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -687,6 +707,37 @@ mod tests {
             write,
             previous,
         }
+    }
+
+    fn written_with(sudo: bool, sha: &str, write: Write) -> FileRecord {
+        FileRecord {
+            mode: format!("0{sha}{sha}{sha}"),
+            sudo,
+            ..file("/etc/a", sha, write, Previous::Absent)
+        }
+    }
+
+    #[test]
+    fn written_again_keeps_the_first_previous_and_takes_the_last_write() {
+        for (first, later) in [(false, true), (true, false)] {
+            let mut record = written_with(first, "6", Write::Written);
+            record.previous = previous("aa", Some("before"));
+            record.written_again(written_with(later, "4", Write::FailedMidway));
+            assert!(record.sudo, "{first} then {later}");
+            assert_eq!(record.written_sha256, "4");
+            assert_eq!(record.mode, "0444");
+            assert_eq!(record.write, Write::FailedMidway);
+            assert_eq!(record.previous, previous("aa", Some("before")));
+        }
+    }
+
+    #[test]
+    fn written_again_after_a_refused_write_changes_nothing() {
+        let mut record = written_with(false, "6", Write::Written);
+        record.previous = previous("aa", Some("before"));
+        let before = record.clone();
+        record.written_again(written_with(true, "4", Write::Refused));
+        assert_eq!(record, before);
     }
 
     fn target(at: u64, ok: bool, files: Vec<FileRecord>) -> TargetRecord {

@@ -83,6 +83,7 @@ pub enum StoreError {
     NotDir(String),
     NotText(String),
     TooDeep(String),
+    Untrusted(String, String),
     Io(String, io::Error),
 }
 
@@ -90,7 +91,7 @@ impl StoreError {
     /// Usage errors are 2; failed operations are 1.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::BadPath(_) | Self::NoBasename(_) | Self::Symlink(_) => 2,
+            Self::BadPath(_) | Self::NoBasename(_) | Self::Symlink(_) | Self::Untrusted(_, _) => 2,
             _ => 1,
         }
     }
@@ -108,6 +109,7 @@ impl StoreError {
             | Self::NotDir(path)
             | Self::TooDeep(path)
             | Self::NotText(path)
+            | Self::Untrusted(path, _)
             | Self::Io(path, _)
             | Self::Host(path, _) => path,
         }
@@ -125,6 +127,7 @@ impl StoreError {
             Self::NotDir(_) => "is not a folder",
             Self::TooDeep(_) => return format!("nested deeper than {MAX_DEPTH} folders"),
             Self::NotText(_) => "not a regular UTF-8 text file without NUL, at most 1 MiB",
+            Self::Untrusted(_, why) => return why.clone(),
             Self::Io(_, err) | Self::Host(_, err) => return err.to_string(),
         }
         .to_owned()
@@ -226,6 +229,20 @@ impl Root {
         let (dir, name) = self.parent(&rel, false)?;
         let file = open_file(&dir, &name, &rel)?;
         read_file(file, &rel)
+    }
+
+    /// [`Root::read_text`] for a file that decides what runs: owned by the
+    /// current user and not group- or other-writable, checked on the fd it
+    /// reads.
+    pub fn read_trusted(&self, rel: &str) -> Result<String, StoreError> {
+        let rel = parse(rel)?;
+        let (dir, name) = self.parent(&rel, false)?;
+        let file = open_file(&dir, &name, &rel)?;
+        check_trusted(&file, &rel)?;
+        read_file(file, &rel).map_err(|err| match err {
+            StoreError::IsDir(rel) => StoreError::NotText(rel),
+            err => err,
+        })
     }
 
     /// Writes atomically as 0600, creating missing parents as 0700.
@@ -768,6 +785,26 @@ fn check_private(dir: &File, rel: &str) -> Result<(), StoreError> {
     check_owner(&meta, 0o022).map_err(|why| io_error(rel, io::Error::other(why)))
 }
 
+/// Owner and mode of an open regular file; [`read_file`] refuses anything else.
+fn check_trusted(file: &File, rel: &str) -> Result<(), StoreError> {
+    let meta = file.metadata().map_err(|e| io_error(rel, e))?;
+    if !meta.is_file() {
+        return Ok(());
+    }
+    check_owner(&meta, 0).map_err(|why| StoreError::Untrusted(rel.to_owned(), why))?;
+    let mode = meta.mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(StoreError::Untrusted(
+            rel.to_owned(),
+            format!(
+                "mode {mode:o} lets others write to it; set mode {:o}",
+                mode & !0o022
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn open_file(dir: &File, name: &str, rel: &str) -> Result<File, StoreError> {
     at::openat(dir, name, file_flags(), Mode::empty())
         .map(File::from)
@@ -912,6 +949,53 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn read_trusted_refuses_a_file_others_can_write() {
+        let store = Store::new();
+        store.1.write("role.toml", b"tasks = []").unwrap();
+        let path = store.1.path().join("role.toml");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(store.1.read_trusted("$/role.toml").unwrap(), "tasks = []");
+
+        for (mode, shown) in [(0o664, "mode 664"), (0o646, "mode 646")] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let err = store.1.read_trusted("$/role.toml").unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+            let shown = format!("$/role.toml: {shown} lets others write to it; set mode 644");
+            assert_eq!(err.to_string(), shown);
+        }
+        assert_eq!(store.1.read_text("role.toml").unwrap(), "tasks = []");
+    }
+
+    #[test]
+    fn read_trusted_keeps_the_read_text_refusals() {
+        let store = Store::new();
+        store.1.write("real.toml", b"x").unwrap();
+        fs::set_permissions(
+            store.1.path().join("real.toml"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        symlink("real.toml", store.1.path().join("link.toml")).unwrap();
+        fs::create_dir(store.1.path().join("dir")).unwrap();
+        assert!(matches!(
+            store.1.read_trusted("link.toml"),
+            Err(StoreError::Symlink(_))
+        ));
+        assert!(matches!(
+            store.1.read_trusted("missing.toml"),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.1.read_trusted("dir"),
+            Err(StoreError::NotText(_))
+        ));
+        assert!(matches!(
+            store.1.read_trusted("../real.toml"),
+            Err(StoreError::BadPath(_))
+        ));
     }
 
     #[test]

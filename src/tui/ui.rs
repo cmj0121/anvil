@@ -885,14 +885,19 @@ fn text(text: &str) -> String {
     escape_controls(text).into_owned()
 }
 
-/// Like the CLI's block: `▶ target`, each step's `$ command` and indented
-/// output, then `✔ ok · N steps`, `✘ reason` or `⊘ cancelled`.
+/// A task's `PATH  NAME` line, already escaped.
+fn task_line(title: String) -> Line<'static> {
+    Line::from(format!("  {title}"))
+}
+
+/// Like the CLI's block: `▶ target`, each task's `PATH  NAME`, each step's
+/// `$ command` and indented output, then `✔ ok · N steps`, `✘ reason` or `⊘ cancelled`.
 fn apply_block(report: &TargetReport) -> Vec<Line<'static>> {
     apply_lines(report).0
 }
 
-/// The wrapped row, at `width` columns, where step `index`'s `$` line is
-/// in [`apply_block`]; a step past the report's is its end line.
+/// The wrapped row, at `width` columns, where step `index` starts in
+/// [`apply_block`]; a step past the report's is its end line.
 pub(super) fn step_scroll(report: &TargetReport, index: usize, width: u16) -> u16 {
     let (mut lines, starts) = apply_lines(report);
     lines.truncate(starts[index.min(starts.len() - 1)]);
@@ -902,7 +907,7 @@ pub(super) fn step_scroll(report: &TargetReport, index: usize, width: u16) -> u1
     u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
-/// [`apply_block`]'s lines, and the index of each step's `$` line followed
+/// [`apply_block`]'s lines, and the index of each step's first line followed
 /// by the end line's.
 fn apply_lines(report: &TargetReport) -> (Vec<Line<'static>>, Vec<usize>) {
     let steps = report.steps();
@@ -910,7 +915,8 @@ fn apply_lines(report: &TargetReport) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut starts = Vec::new();
     for step in steps {
         starts.push(lines.len());
-        let command = format!("  $ {}", text(&apply::command(&step.run)));
+        lines.extend(step.title().map(task_line));
+        let command = format!("  $ {}", text(&step.command_text()));
         lines.push(Line::from(command).style(Modifier::DIM));
         lines.extend(
             step.stdout
@@ -926,6 +932,8 @@ fn apply_lines(report: &TargetReport) -> (Vec<Line<'static>>, Vec<usize>) {
     for warning in report.warnings() {
         lines.push(Line::from(format!("  ⚠ {}", text(warning))).style(Color::Yellow));
     }
+    starts.push(lines.len());
+    lines.extend(report.ended_title().map(task_line));
     let end = if let TargetReport::Cancelled { .. } = report {
         Line::from("  ⊘ cancelled").style(Color::Red)
     } else {
@@ -934,18 +942,18 @@ fn apply_lines(report: &TargetReport) -> (Vec<Line<'static>>, Vec<usize>) {
             None => Line::from(format!("  ✔ {}", apply::ok_text(steps.len()))).style(Color::Green),
         }
     };
-    starts.push(lines.len());
     lines.extend([end, Line::default()]);
     (lines, starts)
 }
 
-/// Like the CLI's plan block: `▶ target`, a `would $ command` line per
-/// step, then `✔ N steps`, `✘ reason` or `⊘ cancelled`.
+/// Like the CLI's plan block: `▶ target`, a `PATH  NAME` line per task and a
+/// `would $ command` line per step, then `✔ N steps`, `✘ reason` or `⊘ cancelled`.
 fn plan_block(report: &PlanReport) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(format!("▶ {}", text(report.target()))).style(heading())];
     let end = match report {
         PlanReport::Planned { steps, .. } => {
             for step in steps {
+                lines.extend(step.title().map(task_line));
                 let command = format!("  {}", text(&plan::would_text(step)));
                 lines.push(Line::from(command).style(Modifier::DIM));
             }
@@ -1496,6 +1504,8 @@ mod tests {
             target: "pi".to_owned(),
             steps: vec![ok.clone()],
             ok: false,
+            task: None,
+            name: None,
         };
         assert_eq!(marks(Some(&killed), 3), "✔⊘⊘");
         assert_eq!(marks(Some(&cancelled("pi")), 2), "⊘⊘");
@@ -1505,6 +1515,8 @@ mod tests {
             steps,
             error: "ssh: broken pipe".to_owned(),
             ok: false,
+            task: None,
+            name: None,
         };
         assert_eq!(
             marks(Some(&transport(vec![ok.clone()])), 3),
@@ -1548,7 +1560,7 @@ mod tests {
             steps: vec![Step::script("hostname"), Step::script("false")],
             ..Config::default()
         };
-        let rows = crate::tui::app::step_rows(&config);
+        let rows = crate::tui::app::step_rows(&crate::tasks::legacy(&config));
         assert_eq!(
             rows,
             [
@@ -1616,7 +1628,7 @@ mod tests {
             steps: vec![Step::script("hostname")],
             ..Config::default()
         };
-        let rows = crate::tui::app::step_rows(&config);
+        let rows = crate::tui::app::step_rows(&crate::tasks::legacy(&config));
         assert_eq!(
             rows,
             [
@@ -2509,6 +2521,135 @@ mod tests {
     }
 
     #[test]
+    fn a_tasks_command_line_shows_bidi_as_an_escape_in_apply_and_plan_results() {
+        use crate::apply::PlannedRun;
+        use crate::plan::PlanReport;
+        use crate::transport::RUN_TIMEOUT;
+
+        let run = "true \u{202e}x";
+        let (apply, _) = apply_lines(&ran(
+            "local",
+            vec![apply::StepReport {
+                task: Some("tasks[0]".to_owned()),
+                ..step(run, Some(0), "", "")
+            }],
+        ));
+        let plan = plan_block(&PlanReport::Planned {
+            target: "local".to_owned(),
+            steps: vec![PlannedRun {
+                run: run.to_owned().into(),
+                label: None,
+                sudo_secret: None,
+                timeout: RUN_TIMEOUT,
+                kind: crate::apply::RunKind::Script,
+                task: Some("tasks[0]".to_owned()),
+                name: None,
+            }],
+            ok: true,
+        });
+        for (lines, wanted) in [
+            (&apply, "$ true \\u{202e}x"),
+            (&plan, "would $ true \\u{202e}x"),
+        ] {
+            let shown: Vec<String> = lines.iter().map(ToString::to_string).collect();
+            assert!(shown.iter().any(|l| l.contains(wanted)), "{shown:?}");
+        }
+    }
+
+    #[test]
+    fn tasks_show_their_path_and_name_escaped_in_rows_and_results_at_any_width() {
+        let title = "tasks[0]/role\u{202e}.toml:tasks[0]  Inst\u{1b}]0;x\u{7}\n\u{200b}all";
+        let shown = "tasks[0]/role\\u{202e}.toml:tasks[0]  Inst\\x1b]0;x\\x07\\n\\u{200b}all";
+        let (path, name) = title.split_once("  ").unwrap();
+        let report = apply::StepReport {
+            task: Some(path.to_owned()),
+            name: Some(name.to_owned()),
+            ..step("true", Some(0), "", "")
+        };
+        let label = apply::task_title(Some(path), Some(name)).unwrap();
+        assert_eq!(label, shown);
+        let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(vec![step_row(&label)]));
+        show(
+            &mut app,
+            RunResult::Apply {
+                kind: RunKind::Apply,
+                steps: vec![step_row(&label)],
+                targets: done(vec![ran("local", vec![report])]),
+                ok: Some(true),
+                error: None,
+                warnings: Vec::new(),
+            },
+        );
+        let wide = render(&app, 120, 14).join("\n");
+        assert!(wide.contains("1 tasks[0]/role"), "{wide}");
+        assert!(wide.contains(&format!("  {shown}")), "{wide}");
+        for (width, height) in [(40, 10), (20, 6), (10, 3), (1, 1)] {
+            let screen = render(&app, width, height).join("\n");
+            assert!(!screen.contains('\u{202e}') && !screen.contains('\u{1b}'));
+        }
+    }
+
+    #[test]
+    fn a_target_ended_during_a_task_shows_its_line_above_the_reason() {
+        let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
+        show(
+            &mut app,
+            RunResult::Apply {
+                kind: RunKind::Apply,
+                steps: Vec::new(),
+                targets: done(vec![TargetReport::Failed {
+                    warnings: Vec::new(),
+                    target: "local".to_owned(),
+                    steps: Vec::new(),
+                    error: "cannot connect".to_owned(),
+                    ok: false,
+                    task: Some("tasks[0]".to_owned()),
+                    name: Some("Boom".to_owned()),
+                }]),
+                ok: Some(false),
+                error: None,
+                warnings: Vec::new(),
+            },
+        );
+        let screen = results_at(&app, 80, 14).join("\n");
+        let title = screen.find("tasks[0]  Boom").expect(&screen);
+        assert!(title < screen.find("✘ cannot connect").unwrap(), "{screen}");
+    }
+
+    #[test]
+    fn a_plan_result_shows_each_task_before_its_would_line() {
+        use crate::apply::PlannedRun;
+        use crate::plan::PlanReport;
+        use crate::transport::RUN_TIMEOUT;
+
+        let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
+        show(
+            &mut app,
+            RunResult::Plan {
+                targets: done(vec![PlanReport::Planned {
+                    target: "local".to_owned(),
+                    steps: vec![PlannedRun {
+                        run: "true".to_owned().into(),
+                        label: None,
+                        sudo_secret: None,
+                        timeout: RUN_TIMEOUT,
+                        kind: crate::apply::RunKind::Script,
+                        task: Some("tasks[0]".to_owned()),
+                        name: Some("First\u{2066}".to_owned()),
+                    }],
+                    ok: true,
+                }]),
+                ok: Some(true),
+                error: None,
+            },
+        );
+        let screen = results_at(&app, 80, 14).join("\n");
+        assert!(screen.contains("tasks[0]  First\\u{2066}"), "{screen}");
+        let title = screen.find("tasks[0]").unwrap();
+        assert!(title < screen.find("would $ true").unwrap(), "{screen}");
+    }
+
+    #[test]
     fn the_plan_view_shows_would_lines_and_lists_the_steps_unmarked() {
         use crate::apply::PlannedRun;
         use crate::plan::PlanReport;
@@ -2527,21 +2668,19 @@ mod tests {
                                 run: "pacman -S git".to_owned().into(),
                                 label: None,
                                 sudo_secret: Some("LOCAL_SUDO".to_owned()),
-                                plugin: None,
                                 timeout: RUN_TIMEOUT,
-                                file: None,
-                                package_manager: None,
-                                service: None,
+                                kind: crate::apply::RunKind::Script,
+                                task: None,
+                                name: None,
                             },
                             PlannedRun {
                                 run: "hostname".to_owned().into(),
                                 label: None,
                                 sudo_secret: None,
-                                plugin: None,
                                 timeout: RUN_TIMEOUT,
-                                file: None,
-                                package_manager: None,
-                                service: None,
+                                kind: crate::apply::RunKind::Script,
+                                task: None,
+                                name: None,
                             },
                         ],
                         ok: true,
@@ -2599,6 +2738,8 @@ mod tests {
                     steps: Vec::new(),
                     error: "ssh: connect timed out\x07".to_owned(),
                     ok: false,
+                    task: None,
+                    name: None,
                 }]),
                 ok: Some(false),
                 error: Some("apply panicked: boom".to_owned()),
@@ -2631,6 +2772,8 @@ mod tests {
                     steps: vec![step("sleep 40", None, "start\n", "warn\n")],
                     error: "timed out after 30 s".to_owned(),
                     ok: false,
+                    task: None,
+                    name: None,
                 }]),
                 ok: Some(false),
                 error: None,

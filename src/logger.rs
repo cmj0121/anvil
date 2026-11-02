@@ -122,6 +122,27 @@ pub fn escape_controls(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// `text` on one line: as [`escape_controls`], with `\n` and `\t` shown as
+/// those two characters.
+pub fn escape_line(text: &str) -> String {
+    escape_controls(text)
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+}
+
+/// `text` with every [`is_invisible`] character shown as a visible `\u{NNNN}`.
+pub fn escape_invisible(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if is_invisible(c) {
+            let _ = write!(out, "\\u{{{:04x}}}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub const BOLD_CYAN: &str = "1;36";
 pub const CYAN: &str = "36";
 pub const DIM: &str = "2";

@@ -31,6 +31,7 @@ mod secret;
 mod services;
 mod ssh;
 mod status;
+mod tasks;
 mod term;
 #[cfg(test)]
 mod test_util;

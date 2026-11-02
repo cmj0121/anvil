@@ -1594,7 +1594,10 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = ask_doctor(&pins, &facts, Some(&last), &current, Vec::new(), TIMEOUT);
         assert!(outcome.is_ok(), "{outcome:?}");
-        assert!(started.elapsed() < Duration::from_secs(5), "not waited out");
+        // The holder sleeps for all of TIMEOUT, so a writer it blocked returns
+        // no sooner. A tighter bound would measure the plugin's start: the
+        // first exec of a new script takes seconds on a busy macOS.
+        assert!(started.elapsed() < TIMEOUT, "not waited out");
         fs::remove_dir_all(&root).unwrap();
     }
 

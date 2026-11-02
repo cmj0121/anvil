@@ -725,3 +725,51 @@ fn unknown_packages_are_a_read_only_warning_with_exit_zero() {
     );
     assert!(!shown.contains("installed"));
 }
+
+#[test]
+fn package_tasks_are_checked_where_they_match() {
+    let (sandbox, path) = common::package_sandbox("ad", &[]);
+    sandbox.write_config(
+        "config.toml",
+        "[packages]\nmanager = \"pacman\"\n\n\
+         [[tasks]]\npackages = { install = [\"git\"] }\n\n\
+         [[tasks]]\ntasks = [{ packages = { install = [\"missing\"] } }]\n\n\
+         [[tasks]]\ntags = [\"other\"]\npackages = { install = [\"elsewhere\"] }\n\n\
+         [[tasks]]\npackages = { remove = [\"git\"] }\n",
+    );
+    let out = sandbox.anvil(&["--json", "doctor"], &[("PATH", &path)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        json(&out)["targets"][0]["packages"],
+        "WARNING: not found by pacman: missing"
+    );
+}
+
+#[test]
+fn a_target_no_package_task_matches_resolves_no_manager() {
+    let sandbox = Sandbox::new("ad");
+    sandbox.write_config(
+        "config.toml",
+        "[[tasks]]\ntags = [\"other\"]\npackages = { install = [\"git\"] }\n",
+    );
+    let out = sandbox.anvil(&["--json", "doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert!(value["targets"][0]["packages"].is_null());
+    assert!(value["targets"][0]["manager"].is_null());
+}
+
+#[test]
+fn drift_covers_a_file_written_by_a_task() {
+    let sandbox = Sandbox::new("ad");
+    let plugin = doctor_plugin(&sandbox, "audit", r#"{"ok":true,"findings":[]}"#, None);
+    let (entry, dest) = marker_file(&sandbox);
+    let task = entry.replace("[[files]]", "[[tasks]]\n[tasks.file]");
+    sandbox.write_config("config.toml", &format!("{plugin}{task}"));
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let out = sandbox.anvil(&["doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdin = plugin_stdin(&sandbox);
+    assert!(stdin.contains(&dest), "{stdin}");
+}

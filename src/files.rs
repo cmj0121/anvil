@@ -1,7 +1,7 @@
 //! `[[files]]`: a text file in the workspace or store, copied to `dest` on each
 //! target whose tags and facts all match.
 //!
-//! [`load`] reads every src once, before any target runs. [`runs`] turns
+//! [`load`] reads every src once, before any target runs. [`run`] turns
 //! each entry into one step per target: a skip when the entry does not
 //! match, else a script that compares the bytes with DEST and writes them
 //! only when they differ. The bytes travel in a heredoc on the script's
@@ -22,17 +22,18 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::apply::{FileRun, PlannedRun, Upload};
-use crate::config::{Config, ModeValue, is_mode, is_sha256};
+use crate::apply::{FileRun, PlannedRun, RunKind, Upload};
+use crate::config::{Config, FileEntry, ModeValue, is_mode, is_sha256};
 use crate::document;
 use crate::facts::Facts;
 use crate::filestore::{self, StoreError};
 use crate::inventory::{self, Target, TargetKind};
-use crate::record::{FileRecord, Previous, PreviousFile, Write};
+use crate::record::{FileRecord, NO_ROLLBACK, Previous, PreviousFile, Write};
 use crate::secret;
+use crate::tasks::{Expanded, Item};
 use crate::transport::RUN_TIMEOUT;
 
-/// Each `[[files]]` src's text, by entry index.
+/// Each file item's src text, by ordinal.
 #[derive(Debug, Default)]
 pub struct Sources(Vec<Source>);
 
@@ -66,10 +67,10 @@ impl fmt::Debug for Source {
 /// Reads every src from the store or workspace; source errors name the entry.
 /// Returns [`Sources::default`] without resolving the workspace when there are no files.
 pub fn load(
-    config: &Config,
+    expanded: &Expanded,
     workspace: impl FnOnce() -> Result<PathBuf, String>,
 ) -> Result<Sources, String> {
-    if config.files.is_empty() {
+    if expanded.files().next().is_none() {
         return Ok(Sources::default());
     }
     let workspace = workspace()?;
@@ -77,7 +78,7 @@ pub fn load(
     let canonical = std::cell::LazyCell::new(|| {
         fs::canonicalize(&workspace).map_err(|err| format!("cannot read: {err}"))
     });
-    let sources = config.files.iter().enumerate().map(|(i, entry)| {
+    let sources = expanded.files().map(|(item, entry, i)| {
         let text = if filestore::is_store_path(&entry.src) {
             store
                 .read_text(&entry.src)
@@ -88,8 +89,13 @@ pub fn load(
                 .map_err(Clone::clone)
                 .and_then(|dir| read_src(dir, &entry.src))
         };
-        text.map(|text| Source { text })
-            .map_err(|why| format!("files[{i}].src `{}`: {why}", secret::shown_name(&entry.src)))
+        text.map(|text| Source { text }).map_err(|why| {
+            item.shown_message(format!(
+                "{}.src `{}`: {why}",
+                item.label("files", i),
+                secret::shown_name(&entry.src)
+            ))
+        })
     });
     Ok(Sources(sources.collect::<Result<_, _>>()?))
 }
@@ -135,14 +141,15 @@ fn store_reason(src: &str, err: &StoreError) -> String {
 
 /// Whether `target` carries every one of `tags` (`local` carries `local`)
 /// and its facts equal every one of `wanted`; `pkg` matches when the value
-/// is one of the managers present. Shared by `[[files]]` and `[[services]]`.
-pub fn matches(
+/// is one of the managers present, each one when `pkg` repeats. Shared by
+/// every kind of item.
+pub fn matches_list(
     tags: &[String],
-    wanted: &BTreeMap<String, String>,
+    wanted: &[(String, String)],
     target: &Target,
     facts: &Facts,
 ) -> bool {
-    let has_fact = |(key, value): (&String, &String)| match key.as_str() {
+    let has_fact = |(key, value): &(String, String)| match key.as_str() {
         "pkg" => facts.pkg().contains(&value.as_str()),
         _ => facts.get(key) == Some(value.as_str()),
     };
@@ -166,93 +173,90 @@ pub fn sudo_secret_for<'a>(config: &'a Config, target: &'a Target) -> Option<&'a
         .map_or(target.sudo_secret.as_deref(), |p| p.sudo_secret_for(target))
 }
 
-/// One step per `[[files]]` entry for `target`, in config order: a skip when
-/// it does not match, else the tee script, or the password path's when sudo
-/// asks for a password and a secret holds it.
-pub fn runs(
+/// The step of file `item` for `target`: a skip when it does not match, else
+/// the tee script, or the password path's when sudo asks for a password and a
+/// secret holds it.
+pub fn run(
     config: &Config,
+    item: &Item,
+    (entry, i): (&FileEntry, usize),
     sources: &Sources,
     target: &Target,
     facts: Option<&Facts>,
-) -> Result<Vec<PlannedRun>, String> {
-    if config.files.is_empty() {
-        return Ok(Vec::new());
-    }
+) -> Result<PlannedRun, String> {
     let facts = facts.ok_or("files: the probe has not run")?;
     let root = facts.is_root();
-    let mut runs = Vec::with_capacity(config.files.len());
-    for (i, entry) in config.files.iter().enumerate() {
-        let dest = &entry.dest;
-        if !matches(&entry.tags, &entry.facts, target, facts) {
-            log::info!("{}: files[{i}] {dest}: no match", target.name);
-            runs.push(skip_run(format!("skipped file {dest}: no match")));
-            continue;
-        }
-        let Some(ModeValue::Text(mode)) = &entry.mode else {
-            return Err(format!("files[{i}].mode: required"));
-        };
-        if !is_mode(mode) {
-            return Err(format!(
-                "files[{i}].mode `{}`: must be 3 or 4 octal digits",
-                secret::shown_name(mode)
-            ));
-        }
-        let secret =
-            sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
-        let write = match secret {
-            Some(name) => {
-                log::info!(
-                    "{}: files[{i}] {dest}, sudo password from secret {name}",
-                    target.name
-                );
-                FileWrite {
-                    index: i,
-                    dest: dest.clone(),
-                    mode: mode.clone(),
-                    sudo: "sudo ".to_owned(),
-                    checks: root_checks("sudo ", dest),
-                    password: true,
-                }
-            }
-            None => {
-                log::info!("{}: files[{i}] {dest}", target.name);
-                let sudo = if root || !entry.sudo { "" } else { "sudo -n " };
-                let checks = if root || entry.sudo {
-                    root_checks(sudo, dest)
-                } else {
-                    String::new()
-                };
-                FileWrite {
-                    index: i,
-                    dest: dest.clone(),
-                    mode: mode.clone(),
-                    sudo: sudo.to_owned(),
-                    checks,
-                    password: false,
-                }
-            }
-        };
-        let (script, upload) = write_script(&write, sources, &Expected::Unchecked)?;
-        runs.push(file_run(
-            script,
-            format!("file {dest}"),
-            secret.map(str::to_owned),
-            FileRun {
-                upload,
-                skip: false,
-                write: Some(write),
-            },
+    let label = item.label("files", i);
+    let dest = &entry.dest;
+    if !item.matches(target, facts) {
+        log::info!("{}: {label} {dest}: no match", target.name);
+        return Ok(skip_run(dest, format!("skipped file {dest}: no match")));
+    }
+    let Some(ModeValue::Text(mode)) = &entry.mode else {
+        return Err(format!("{label}.mode: required"));
+    };
+    if !is_mode(mode) {
+        return Err(format!(
+            "{label}.mode `{}`: must be 3 or 4 octal digits",
+            secret::shown_name(mode)
         ));
     }
-    Ok(runs)
+    let secret =
+        sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
+    let write = match secret {
+        Some(name) => {
+            log::info!(
+                "{}: {label} {dest}, sudo password from secret {name}",
+                target.name
+            );
+            FileWrite {
+                ordinal: i,
+                dest: dest.clone(),
+                mode: mode.clone(),
+                sudo: "sudo ".to_owned(),
+                checks: root_checks("sudo ", dest),
+                password: true,
+            }
+        }
+        None => {
+            log::info!("{}: {label} {dest}", target.name);
+            let sudo = if root || !entry.sudo { "" } else { "sudo -n " };
+            let checks = if root || entry.sudo {
+                root_checks(sudo, dest)
+            } else {
+                String::new()
+            };
+            FileWrite {
+                ordinal: i,
+                dest: dest.clone(),
+                mode: mode.clone(),
+                sudo: sudo.to_owned(),
+                checks,
+                password: false,
+            }
+        }
+    };
+    let (script, upload) = write_script(&write, sources, &Expected::Unchecked)?;
+    Ok(file_run(
+        dest,
+        script,
+        format!("file {dest}"),
+        secret.map(str::to_owned),
+        FileRun {
+            upload,
+            skip: false,
+            write: Some(write),
+        },
+    ))
 }
 
 /// How one `[[files]]` entry is written on one target, so that the write
 /// can be built again once the capture says what DEST holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileWrite {
-    /// The entry's index, which is also its src's in [`Sources`].
-    pub index: usize,
+    /// The entry's ordinal among the list's file items, which is also its
+    /// src's index in [`Sources`].
+    pub ordinal: usize,
     pub dest: String,
     pub mode: String,
     /// `""`, `"sudo -n "`, or `"sudo "` on the password path.
@@ -278,16 +282,20 @@ impl FileWrite {
 
     /// The record of this write, from what the capture saw before it and
     /// how it ended: `previous` keeps the bytes as text unless the entry
-    /// says `rollback = false` or they are not text.
+    /// says `rollback = false`, the dest is `hash_only`
+    /// ([`Recorder`](crate::apply::Recorder)), or they are not text.
     pub(crate) fn record(
         &self,
-        config: &Config,
+        expanded: &Expanded,
         sources: &Sources,
         captured: Captured,
         write: Write,
+        hash_only: bool,
     ) -> FileRecord {
-        let entry = &config.files[self.index];
-        let written = sources.0.get(self.index).map_or("", |s| s.text.as_str());
+        let entry = expanded
+            .file(self.ordinal)
+            .expect("a write comes from the list it is recorded against");
+        let written = sources.0.get(self.ordinal).map_or("", |s| s.text.as_str());
         let previous = match captured {
             Captured::Absent => Previous::Absent,
             Captured::Dangling { target } => Previous::Dangling { target },
@@ -301,7 +309,7 @@ impl FileWrite {
                 ..
             } => {
                 let text = match bytes {
-                    _ if !entry.rollback => Err("rollback = false"),
+                    _ if hash_only || !entry.rollback => Err(NO_ROLLBACK),
                     None => Err(reason.unwrap_or("unreadable")),
                     Some(bytes) => match std::str::from_utf8(&bytes) {
                         Err(_) => Err("not UTF-8 text"),
@@ -350,7 +358,7 @@ pub(crate) fn write_script(
     sources: &Sources,
     expected: &Expected,
 ) -> Result<(Zeroizing<String>, Option<Upload>), String> {
-    let i = step.index;
+    let i = step.ordinal;
     let Some(Source { text }) = sources.0.get(i) else {
         return Err(format!("files[{i}]: src was not loaded"));
     };
@@ -404,6 +412,7 @@ fn guard(sudo: &str, dest: &str, expected: &Expected) -> String {
 }
 
 fn file_run(
+    dest: &str,
     run: Zeroizing<String>,
     label: String,
     sudo_secret: Option<String>,
@@ -413,22 +422,25 @@ fn file_run(
         run,
         label: Some(label),
         sudo_secret,
-        plugin: None,
         timeout: RUN_TIMEOUT,
-        file: Some(file),
-        package_manager: None,
-        service: None,
+        kind: RunKind::File {
+            dest: dest.to_owned(),
+            run: file,
+        },
+        task: None,
+        name: None,
     }
 }
 
-/// A file step that runs nothing and only shows `label`.
-pub(crate) fn skip_run(label: String) -> PlannedRun {
+/// A file step that runs nothing and only shows `label`; `dest` is empty for
+/// a note about no file.
+pub(crate) fn skip_run(dest: &str, label: String) -> PlannedRun {
     let skip = FileRun {
         upload: None,
         skip: true,
         write: None,
     };
-    file_run(Zeroizing::default(), label, None, skip)
+    file_run(dest, Zeroizing::default(), label, None, skip)
 }
 
 /// A text as a quoted heredoc: `head -c N <<'D'`, then the body, which ends
@@ -1367,7 +1379,7 @@ pub(crate) fn restore_runs(
     let mut runs = Vec::with_capacity(files.len());
     for file in files.iter().rev() {
         let dest = file.dest.as_str();
-        let skip = |reason: &str| skip_run(format!("cannot undo: {dest} ({reason})"));
+        let skip = |reason: &str| skip_run(dest, format!("cannot undo: {dest} ({reason})"));
         let previous = match &file.previous {
             Previous::File(previous) => match previous.text.as_deref() {
                 Some(text) if previous.kept => Some((previous, text)),
@@ -1432,6 +1444,7 @@ pub(crate) fn restore_runs(
         };
         log::info!("{}: {label}", target.name);
         runs.push(file_run(
+            dest,
             run,
             label,
             secret.map(str::to_owned),
@@ -1616,6 +1629,7 @@ fn temp_path() -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::tasks::legacy;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::PathBuf;
 
@@ -1624,6 +1638,28 @@ mod tests {
     use crate::packages::Packages;
     use crate::test_util::{logged, temp_dir};
     use crate::transport::{Local, Transport};
+
+    /// [`super::load`] of a legacy config.
+    fn load(
+        config: &Config,
+        workspace: impl FnOnce() -> Result<PathBuf, String>,
+    ) -> Result<Sources, String> {
+        super::load(&legacy(config), workspace)
+    }
+
+    /// One [`super::run`] per entry of a legacy config.
+    fn runs(
+        config: &Config,
+        sources: &Sources,
+        target: &Target,
+        facts: Option<&Facts>,
+    ) -> Result<Vec<PlannedRun>, String> {
+        let expanded = legacy(config);
+        expanded
+            .files()
+            .map(|(item, entry, i)| super::run(config, item, (entry, i), sources, target, facts))
+            .collect()
+    }
 
     const SECRET_TEXT: &str = "token = hunter2-file-content\n";
 
@@ -1699,6 +1735,31 @@ mod tests {
         let err = load(&config, || Ok(dir.join("missing"))).unwrap_err();
         assert!(err.contains("not found"), "{err}");
         assert!(!err.contains("cannot read:"), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_tasks_src_error_shows_bidi_as_an_escape_and_a_legacy_one_as_it_is() {
+        let dir = dir("files-src-bidi");
+        let src = "a\u{202e}b";
+        let text = format!(
+            "[[tasks]]\nfile = {{ src = \"{src}\", dest = \"/tmp/file\", mode = \"0644\" }}\n"
+        );
+        let tasks: Config = toml::from_str(&text).unwrap();
+        let expanded = crate::tasks::expand(&tasks, || Ok(dir.clone())).unwrap();
+        let err = super::load(&expanded, || Ok(dir.clone())).unwrap_err();
+        assert!(
+            err.starts_with("tasks[0].file.src `a\\u{202e}b`: "),
+            "{err}"
+        );
+        assert!(!err.contains('\u{202e}'), "{err}");
+
+        let legacy = Config {
+            files: vec![entry(src, "/tmp/file")],
+            ..Config::default()
+        };
+        let err = load(&legacy, || Ok(dir.clone())).unwrap_err();
+        assert!(err.starts_with(&format!("files[0].src `{src}`: ")), "{err}");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1838,22 +1899,23 @@ mod tests {
 
     #[test]
     fn matches_needs_every_tag_and_fact() {
-        let mut e = entry("a", "/etc/a");
+        let mut tags: Vec<String> = Vec::new();
+        let mut wanted: Vec<(String, String)> = Vec::new();
         let web = host(&["web", "prod"], None);
         let arch = facts(&[("distro", "arch"), ("pkg", "pacman brew"), ("os", "Linux")]);
         assert!(
-            matches(&e.tags, &e.facts, &web, &arch),
+            matches_list(&tags, &wanted, &web, &arch),
             "no tags and no facts match all"
         );
-        assert!(matches(&e.tags, &e.facts, &web, &Facts::default()));
+        assert!(matches_list(&tags, &wanted, &web, &Facts::default()));
 
-        e.tags = vec!["web".into(), "prod".into()];
-        assert!(matches(&e.tags, &e.facts, &web, &arch));
-        e.tags.push("db".into());
-        assert!(!matches(&e.tags, &e.facts, &web, &arch));
-        e.tags = vec!["local".into()];
+        tags = vec!["web".into(), "prod".into()];
+        assert!(matches_list(&tags, &wanted, &web, &arch));
+        tags.push("db".into());
+        assert!(!matches_list(&tags, &wanted, &web, &arch));
+        tags = vec!["local".into()];
         assert!(
-            !matches(&e.tags, &e.facts, &web, &arch),
+            !matches_list(&tags, &wanted, &web, &arch),
             "an ssh host is not local"
         );
         let local = Target {
@@ -1861,27 +1923,27 @@ mod tests {
             tags: Vec::new(),
             ..host(&[], None)
         };
-        assert!(matches(&e.tags, &e.facts, &local, &arch));
+        assert!(matches_list(&tags, &wanted, &local, &arch));
 
-        e.tags.clear();
-        e.facts = BTreeMap::from([("distro".into(), "arch".into())]);
-        assert!(matches(&e.tags, &e.facts, &web, &arch));
+        tags.clear();
+        wanted = vec![("distro".into(), "arch".into())];
+        assert!(matches_list(&tags, &wanted, &web, &arch));
         for value in ["Arch", "arch ", "debian"] {
-            e.facts.insert("distro".into(), value.into());
-            assert!(!matches(&e.tags, &e.facts, &web, &arch), "{value:?}");
+            wanted = vec![("distro".into(), value.into())];
+            assert!(!matches_list(&tags, &wanted, &web, &arch), "{value:?}");
         }
-        e.facts = BTreeMap::from([("pkg".into(), "brew".into())]);
-        assert!(matches(&e.tags, &e.facts, &web, &arch));
+        wanted = vec![("pkg".into(), "brew".into())];
+        assert!(matches_list(&tags, &wanted, &web, &arch));
         for value in ["apt", "pacman brew", "pac"] {
-            e.facts.insert("pkg".into(), value.into());
-            assert!(!matches(&e.tags, &e.facts, &web, &arch), "{value:?}");
+            wanted = vec![("pkg".into(), value.into())];
+            assert!(!matches_list(&tags, &wanted, &web, &arch), "{value:?}");
         }
-        e.facts = BTreeMap::from([
-            ("os".into(), "Linux".into()),
+        wanted = vec![
             ("arch".into(), "x86_64".into()),
-        ]);
+            ("os".into(), "Linux".into()),
+        ];
         assert!(
-            !matches(&e.tags, &e.facts, &web, &arch),
+            !matches_list(&tags, &wanted, &web, &arch),
             "a fact the probe did not report"
         );
     }
@@ -1933,7 +1995,7 @@ mod tests {
                 "file /etc/b.conf"
             ]
         );
-        let files: Vec<_> = runs.iter().map(|run| run.file.clone().unwrap()).collect();
+        let files: Vec<_> = runs.iter().map(|run| run.file().unwrap().clone()).collect();
         assert_eq!(
             files[1],
             FileRun {
@@ -1946,7 +2008,7 @@ mod tests {
         assert!(!files[0].skip && !files[2].skip);
         for run in &runs {
             assert_eq!(run.timeout, RUN_TIMEOUT);
-            assert_eq!((&run.sudo_secret, &run.plugin), (&None, &None));
+            assert_eq!((&run.sudo_secret, run.plugin()), (&None, None));
         }
     }
 
@@ -2000,7 +2062,7 @@ mod tests {
         for (sudo, secret, facts, prefix) in cases {
             let run = only_run(sudo, secret, facts);
             let case = format!("sudo={sudo} {secret:?} {facts:?}");
-            assert_eq!(run.file.as_ref().unwrap().upload, None, "{case}");
+            assert_eq!(run.file().unwrap().upload, None, "{case}");
             assert_eq!(run.sudo_secret, None, "{case}");
             assert!(
                 run.run.contains(&format!("| {prefix}tee '/etc/a'")),
@@ -2012,7 +2074,7 @@ mod tests {
         let run = only_run(true, Some("WEB"), &user_facts("binary"));
         assert_eq!(run.shown(), "file /etc/a");
         assert_eq!(run.sudo_secret.as_deref(), Some("WEB"));
-        let upload = run.file.as_ref().unwrap().upload.as_ref().unwrap();
+        let upload = run.file().unwrap().upload.as_ref().unwrap();
         let temp = upload
             .cleanup
             .strip_prefix("rm -f '")
@@ -2035,7 +2097,10 @@ mod tests {
                 .contains(&format!("sudo install -m 0644 '{temp}' '/etc/a'"))
         );
         let other = only_run(true, Some("WEB"), &user_facts("binary"));
-        assert_ne!(other.file.unwrap().upload.unwrap().cleanup, upload.cleanup);
+        assert_ne!(
+            other.file().unwrap().upload.as_ref().unwrap().cleanup,
+            upload.cleanup
+        );
     }
 
     #[test]
@@ -3324,7 +3389,7 @@ mod tests {
             let run = runs(&config, &sources, &host(&[], secret), Some(&facts))
                 .unwrap()
                 .remove(0);
-            let write = run.file.as_ref().unwrap().write.clone().unwrap();
+            let write = run.file().unwrap().write.clone().unwrap();
             assert_eq!(write.password, secret.is_some());
             let (script, upload) = write_script(&write, &sources, &Expected::Unchecked).unwrap();
             assert_eq!(upload.is_some(), secret.is_some());
@@ -3352,7 +3417,7 @@ mod tests {
             );
         }
         let missing = FileWrite {
-            index: 1,
+            ordinal: 1,
             ..runs(
                 &config,
                 &sources,
@@ -3360,8 +3425,7 @@ mod tests {
                 Some(&user_facts("nopasswd")),
             )
             .unwrap()[0]
-                .file
-                .as_ref()
+                .file()
                 .unwrap()
                 .write
                 .clone()
@@ -3796,7 +3860,7 @@ mod tests {
         let run = &runs[0];
         assert_eq!(run.shown(), format!("restore {}", dest.display()));
         assert_eq!(run.sudo_secret.as_deref(), Some("WEB"));
-        let upload = run.file.as_ref().unwrap().upload.as_ref().unwrap();
+        let upload = run.file().unwrap().upload.as_ref().unwrap();
         let temp = upload
             .cleanup
             .strip_prefix("rm -f '")
@@ -3895,7 +3959,7 @@ mod tests {
         );
         assert!(
             runs.iter()
-                .all(|run| run.file.as_ref().unwrap().skip && run.run.is_empty())
+                .all(|run| run.file().unwrap().skip && run.run.is_empty())
         );
     }
 
@@ -3937,7 +4001,7 @@ mod tests {
                 .unwrap();
                 let (restore, remove) = (&runs[0], &runs[1]);
                 assert!(!remove.run.contains("hunter2"));
-                match &restore.file.as_ref().unwrap().upload {
+                match &restore.file().unwrap().upload {
                     Some(upload) => {
                         assert!(!restore.run.contains("hunter2"));
                         assert_eq!(upload.stage.matches("hunter2").count(), 1);
@@ -3986,7 +4050,7 @@ mod tests {
             format!("{:?}", Sources::of(&[SECRET_TEXT])),
             format!("{tee:?}"),
             format!("{upload:?}"),
-            format!("{:?}", upload.file.as_ref().unwrap().upload),
+            format!("{:?}", upload.file().unwrap().upload),
             format!("{:?}", entry("a", "/etc/a")),
         ];
         for shown in &shown {
@@ -4000,7 +4064,10 @@ mod tests {
             shown[2]
         );
         assert!(shown[4].contains("dest: \"/etc/a\"") && shown[4].contains("sudo: true"));
-        let plain = PlannedRun { file: None, ..tee };
+        let plain = PlannedRun {
+            kind: RunKind::Script,
+            ..tee
+        };
         assert!(
             format!("{plain:?}").contains("hunter2"),
             "other runs are shown unchanged"

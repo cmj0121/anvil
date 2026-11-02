@@ -586,6 +586,136 @@ else
   fail "rollback after a write failed midway: exit $code"
 fi
 
+step "(r) [[tasks]] on arch: nested and included tasks run in order, a selector skips one, rollback restores the files"
+# A workspace and state dir of their own, so the record holds only this block's apply.
+TK_STATE="$TMP/state-tasks"
+TK_DIR="$TMP/tasks"
+TK_D=/etc/anvil-e2e-tasks
+mkdir -p "$TK_DIR/files/roles"
+TK_OLD="anvil-e2e-tasks-previous-$$"
+TK_NEW="anvil-e2e-tasks-written-$$"
+printf 'new = "%s"\n' "$TK_NEW" >"$TK_DIR/files/new.conf"
+# A step makes the directory the next file needs, which the fixed order cannot do.
+cat >"$TK_DIR/config.toml" <<CONF
+[[tasks]]
+name = "Make dir"
+run = "sudo -n mkdir -p $TK_D"
+
+[[tasks]]
+name = "Base"
+facts = { distro = "$REMOTE_DISTRO" }
+
+  [[tasks.tasks]]
+  name = "Packages"
+  packages = { install = ["inetutils"] }
+
+  [[tasks.tasks]]
+  name = "New file"
+  file = { src = "\$/new.conf", dest = "$TK_D/new", mode = "0644" }
+
+[[tasks]]
+name = "Role"
+facts = { os = "Linux" }
+include = "\$/roles/app.toml"
+CONF
+cat >"$TK_DIR/files/roles/app.toml" <<CONF
+[[tasks]]
+name = "Read it back"
+run = "sudo -n sha256sum $TK_D/new"
+
+[[tasks]]
+name = "Other distro"
+facts = { distro = "not-$REMOTE_DISTRO" }
+file = { src = "\$/new.conf", dest = "$TK_D/skip", mode = "0644" }
+
+[[tasks]]
+name = "Replace file"
+file = { src = "\$/new.conf", dest = "$TK_D-old", mode = "0644" }
+CONF
+chmod 644 "$TK_DIR/files/roles/app.toml"
+tk_anvil() {
+  run_env XDG_STATE_HOME="$TK_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$TK_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+TK_PATHS=$(printf '%s\n' \
+  '  tasks[0]  Make dir' \
+  '  tasks[1].tasks[0]  Packages' \
+  '  tasks[1].tasks[1]  New file' \
+  '  tasks[2]/roles/app.toml:tasks[0]  Read it back' \
+  '  tasks[2]/roles/app.toml:tasks[1]  Other distro' \
+  '  tasks[2]/roles/app.toml:tasks[2]  Replace file')
+tk_paths() { grep -E '^  tasks\[' "$TMP/out"; }
+docker exec "$NAME" sh -c "rm -rf $TK_D && printf '%s\n' '$TK_OLD' >$TK_D-old && chmod 600 $TK_D-old"
+tk_anvil plan --target arch
+code=$?
+if [ "$code" -eq 0 ] && [ "$(tk_paths)" = "$TK_PATHS" ] \
+  && grep -qxF "  would \$ skipped file $TK_D/skip: no match" "$TMP/out" \
+  && grep -qxF '  ✔ 6 steps' "$TMP/out" && ! docker exec "$NAME" test -e "$TK_D"; then
+  pass "plan lists every task in order with its path and name, changes nothing"
+else
+  fail "plan with [[tasks]]: exit $code"
+fi
+tk_anvil -vv apply --target arch
+code=$?
+# Each `$` line in run order; the package step is cut to its first word.
+tk_runs=$(grep -E '^  \$ ' "$TMP/out" | cut -c1-40 | sed 's/^  \$ { anvil_db=1;.*/  $ packages/')
+expected=$(printf '%s\n' \
+  "  \$ sudo -n mkdir -p $TK_D" \
+  '  $ packages' \
+  "  \$ file $TK_D/new" \
+  "  \$ sudo -n sha256sum $TK_D/new" \
+  "  \$ skipped file $TK_D/skip: no match" \
+  "  \$ file $TK_D-old" | cut -c1-40)
+if [ "$code" -eq 0 ] && [ "$(tk_paths)" = "$TK_PATHS" ] && [ "$tk_runs" = "$expected" ] \
+  && grep -qxF "  wrote $TK_D/new" "$TMP/out" && grep -qxF "  wrote $TK_D-old" "$TMP/out" \
+  && grep -qxF '  ✔ ok · 6 steps' "$TMP/out" \
+  && grep -qE "^  [0-9a-f]{64}  $TK_D/new\$" "$TMP/out" \
+  && ! docker exec "$NAME" test -e "$TK_D/skip" \
+  && docker exec "$NAME" cat "$TK_D-old" | cmp -s - "$TK_DIR/files/new.conf"; then
+  pass "apply ran the same order, the step read the file written before it, the unmatched task was skipped"
+else
+  fail "apply with [[tasks]]: exit $code, expected:"
+  printf '%s\n' "$expected" "--- got:" "$tk_runs"
+fi
+tk_anvil apply --json --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qF '"task":"tasks[2]/roles/app.toml:tasks[1]","name":"Other distro"' "$TMP/out" \
+  && grep -qF '"skipped":true,"task":"tasks[2]/roles/app.toml:tasks[1]"' "$TMP/out"; then
+  pass "apply --json carries each step's task and name"
+else
+  fail "apply --json with [[tasks]]: exit $code"
+fi
+tk_anvil rollback --dry-run --target arch
+code=$?
+expected=$(printf '▶ arch\n  would restore %s-old\n  would remove %s/new\n  cannot undo: tasks[0]\n  cannot undo: tasks[1].tasks[0]\n  cannot undo: tasks[2]/roles/app.toml:tasks[0]\n  ✔ 5 steps\n\n1 target, nothing executed' "$TK_D" "$TK_D")
+if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ]; then
+  pass "rollback --dry-run maps every result to its task"
+else
+  fail "rollback --dry-run with [[tasks]]: exit $code, expected:"
+  printf '%s\n' "$expected"
+fi
+tk_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF "  restored $TK_D-old" "$TMP/out" && grep -qxF "  removed $TK_D/new" "$TMP/out" \
+  && [ "$(docker exec "$NAME" cat "$TK_D-old")" = "$TK_OLD" ] \
+  && [ "$(docker exec "$NAME" stat -c '%a' "$TK_D-old")" = 600 ] \
+  && ! docker exec "$NAME" test -e "$TK_D/new"; then
+  pass "rollback restored the replaced file and removed the new one"
+else
+  fail "rollback with [[tasks]]: exit $code"
+fi
+# A group-writable include is refused before any target starts.
+chmod 664 "$TK_DIR/files/roles/app.toml"
+tk_anvil plan --target arch
+code=$?
+if [ "$code" -eq 2 ] && [ ! -s "$TMP/out" ] \
+  && grep -qF 'tasks[2].include `$/roles/app.toml`: mode 664 lets others write to it; set mode 644' "$TMP/err"; then
+  pass "a group-writable include is exit 2 before any target"
+else
+  fail "plan with a group-writable include: exit $code"
+fi
+docker exec "$NAME" rm -rf "$TK_D" "$TK_D-old"
+
 step "(p) drift on arch: anvil-audit pinned, a changed fact and file are drift, a re-apply clears it"
 DR_STATE="$TMP/state-drift"
 DR_DIR="$TMP/drift"

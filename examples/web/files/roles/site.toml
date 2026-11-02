@@ -1,0 +1,24 @@
+# Included from config.toml, whose `tags` every task here inherits.
+[[tasks]]
+name = "Create the site directory"
+run = "sudo -n install -d -m 0755 /var/www/site"
+
+[[tasks]]
+name = "Configure and start"
+
+  [[tasks.tasks]]
+  name = "Write the site config"
+  file = { src = "$/roles/site/site.conf", dest = "/etc/nginx/conf.d/site.conf", mode = "0644" }
+
+  [[tasks.tasks]]
+  name = "Validate the config"
+  run = "sudo -n nginx -t"
+
+  [[tasks.tasks]]
+  name = "Start nginx"
+  service = { name = "nginx", state = "started", enabled = true }
+
+  # `started` leaves a running service as it is, so load the config just written.
+  [[tasks.tasks]]
+  name = "Load the config"
+  run = "sudo -n nginx -s reload"

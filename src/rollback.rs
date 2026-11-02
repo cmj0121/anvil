@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use crate::apply::{
-    self, Escape, Line, Passwords, PlannedRun, Progress, Report, Style, TargetReport, Unresolved,
-    print_lines,
+    self, Entry, Escape, Line, Passwords, PlannedRun, Progress, Report, StepReport, Style,
+    TargetReport, Unresolved, print_lines,
 };
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
@@ -32,10 +32,11 @@ use crate::fanout::{self, Event};
 use crate::files::{self, Force, Wording};
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
-use crate::logger::{DIM, GREEN, RED};
+use crate::logger::{DIM, GREEN, RED, escape_invisible};
 use crate::options::Options;
 use crate::record::{self, Previous, Record, RolledBack, Session, TargetRecord};
 use crate::status;
+use crate::tasks::{Expanded, Item};
 use crate::transport::{Transport, TransportError};
 
 /// What a selected target with no entry in the record shows.
@@ -52,19 +53,42 @@ pub fn run(
     allow_host_change: bool,
     dry_run: bool,
 ) -> Result<(), Failure> {
-    let config = opts.load_config()?;
+    let (config, expanded) = load(opts)?;
     let force = match (force_all, force) {
         (true, _) => Force::All,
         (false, []) => Force::None,
         (false, dests) => Force::Dests(dests.iter().cloned().collect()),
     };
     if dry_run {
-        return print_dry_run(cli, opts, &config, &force);
+        return print_dry_run(cli, opts, &config, &expanded, &force);
     }
     let _interrupt = Interrupt::install(&opts.cancel)?;
     apply::print_report(cli, "rollback", |on| {
-        run_targets(opts, &config, &force, allow_host_change, Wording::Cli, on)
+        run_targets(
+            opts,
+            &config,
+            &expanded,
+            &force,
+            allow_host_change,
+            Wording::Cli,
+            on,
+        )
     })
+}
+
+/// The config and its list. The config decides which dests may be restored,
+/// so the record alone is not enough: a refused task or include is exit 2,
+/// saying how to recover.
+pub fn load(opts: &Options) -> Result<(Config, Expanded), Failure> {
+    let config = opts.load_config()?;
+    let expanded = opts.expand(&config).map_err(|failure| {
+        Failure::usage(format!(
+            "rollback: {}; the config decides which files may be restored: \
+             fix or restore what it names, then run rollback again",
+            failure.message
+        ))
+    })?;
+    Ok((config, expanded))
 }
 
 /// The record, refused when there is none or it has no entry. Core dumps
@@ -103,6 +127,7 @@ fn check_force(record: &Record, targets: &[Target], force: &Force) -> Result<(),
 pub fn run_targets(
     opts: &Options,
     config: &Config,
+    expanded: &Expanded,
     force: &Force,
     allow_host_change: bool,
     wording: Wording,
@@ -144,6 +169,7 @@ pub fn run_targets(
                 target,
                 opts.transport(target),
                 config,
+                expanded,
                 entry,
                 force,
                 host,
@@ -240,7 +266,7 @@ fn nothing_recorded(target: &Target) -> TargetReport {
     TargetReport::Ran {
         warnings: Vec::new(),
         target: target.name.clone(),
-        steps: vec![apply::StepReport::skipped(NOTHING)],
+        steps: vec![apply::StepReport::skipped(NOTHING, Entry::Script)],
         ok: true,
     }
 }
@@ -256,6 +282,7 @@ fn roll_back(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
     config: &Config,
+    expanded: &Expanded,
     entry: &TargetRecord,
     force: &Force,
     host: HostCheck,
@@ -265,7 +292,7 @@ fn roll_back(
     log::info!("rollback {}: start", target.name);
     let failed =
         |error: String| RolledTarget::report(apply::failed("rollback", target, Vec::new(), error));
-    if let Err(error) = check_files(config, target, None, entry) {
+    if let Err(error) = check_files(expanded, target, None, entry) {
         return failed(error);
     }
     let transport = match transport {
@@ -276,7 +303,7 @@ fn roll_back(
         return RolledTarget::report(apply::cancelled("rollback", target, Vec::new()));
     }
     status::phase(&target.name, status::Phase::Probe);
-    let facts = match apply::probe(transport.as_ref(), &Config::default()) {
+    let facts = match apply::probe(transport.as_ref(), &Expanded::default()) {
         Ok(facts) => facts,
         Err(Unresolved::Failed(error)) => return failed(error),
         Err(Unresolved::Cancelled) => {
@@ -288,7 +315,7 @@ fn roll_back(
     {
         return failed(error);
     }
-    if let Err(error) = check_files(config, target, Some(&facts), entry) {
+    if let Err(error) = check_files(expanded, target, Some(&facts), entry) {
         return failed(error);
     }
     let mut runs =
@@ -296,7 +323,6 @@ fn roll_back(
             Ok(runs) => runs,
             Err(error) => return failed(error),
         };
-    let restores = runs.len();
     runs.extend(entry.cannot_undo.iter().map(|what| cannot_undo(what)));
     let report = apply::execute(
         "rollback",
@@ -307,15 +333,7 @@ fn roll_back(
         cancel,
         None,
     );
-    // restore_runs lists the files last written first.
-    let dests: Vec<String> = report
-        .steps()
-        .iter()
-        .take(restores)
-        .zip(entry.files.iter().rev())
-        .filter(|(step, _)| !step.skipped && step.code == Some(0))
-        .map(|(_, file)| file.dest.clone())
-        .collect();
+    let dests = restored(report.steps());
     let rolled_back = (!dests.is_empty()).then(|| RolledBack {
         at: record::now(),
         dests,
@@ -326,47 +344,76 @@ fn roll_back(
     }
 }
 
-/// Refuses `entry` unless each of its files is the dest of a `[[files]]`
-/// entry of `config` with the same `sudo` that applies to `target` (its
+/// The dests of the file steps that passed. A note's `dest` is `""` and it is
+/// always a skip, so the `!step.skipped` filter is what keeps it out.
+fn restored(steps: &[StepReport]) -> Vec<String> {
+    steps
+        .iter()
+        .filter(|step| !step.skipped && step.code == Some(0))
+        .filter_map(|step| match &step.entry {
+            Entry::File { dest } => Some(dest.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Refuses `entry` unless each of its files is the dest of a file item of
+/// `expanded` with the same `sudo` that applies to `target` (its
 /// tags, and its facts when `facts` is given) and, for a file whose text
 /// the record keeps, does not say `rollback = false`. The record is only a
 /// file the user owns, and must not choose what rollback writes, or as whom.
 fn check_files(
-    config: &Config,
+    expanded: &Expanded,
     target: &Target,
     facts: Option<&Facts>,
     entry: &TargetRecord,
 ) -> Result<(), String> {
+    let (section, entry_word) = match expanded.from_tasks {
+        true => ("the config", "file task"),
+        false => ("[[files]]", "[[files]] entry"),
+    };
     for file in &entry.files {
         let dest = file.dest.as_str();
         let refuse = |why: String| Err(format!("rollback: {why}; refusing to restore it"));
-        let named = || config.files.iter().filter(move |f| f.dest == dest);
-        let same = || named().filter(|f| f.sudo == file.sudo);
-        let applies = || {
-            same().filter(|f| match facts {
-                Some(facts) => files::matches(&f.tags, &f.facts, target, facts),
-                None => files::has_tags(&f.tags, target),
-            })
+        let named = || {
+            expanded
+                .files()
+                .filter(move |(_, f, _)| expanded.same_dest(&f.dest, dest))
+                .map(|(item, f, _)| (item, f))
         };
-        let Some(first) = named().next() else {
-            return refuse(format!("{dest} is not in [[files]]"));
+        let same = || named().filter(|(_, f)| f.sudo == file.sudo);
+        let selected = |item: &Item| item.may_match(target, facts);
+        let Some((_, first)) = named().next() else {
+            return refuse(format!("{dest} is not in {section}"));
         };
         if same().next().is_none() {
             return refuse(format!(
-                "{dest} has sudo = {} in [[files]] but sudo = {} in the record",
+                "{dest} has sudo = {} in {section} but sudo = {} in the record",
                 first.sudo, file.sudo
             ));
         }
-        if applies().next().is_none() {
+        if !same().any(|(item, _)| selected(item)) {
             return refuse(format!(
-                "no [[files]] entry for {dest} applies to {}",
+                "no {entry_word} for {dest} applies to {}",
                 target.name
             ));
         }
         let kept = matches!(&file.previous, Previous::File(p) if p.kept || p.text.is_some());
-        if kept && !applies().any(|f| f.rollback) {
+        let forbidden = if expanded.from_tasks {
+            // Any write of a dest may be the one kept in the record. Tags alone
+            // may name writes the facts rule out, so before the probe one entry
+            // allowing it is enough; after it, none may forbid it.
+            let mut applying = named().filter(|(item, _)| selected(item));
+            match facts {
+                Some(_) => applying.any(|(_, f)| !f.rollback),
+                None => !applying.any(|(_, f)| f.rollback),
+            }
+        } else {
+            !same().any(|(item, f)| selected(item) && f.rollback)
+        };
+        if kept && forbidden {
             return refuse(format!(
-                "{dest} has rollback = false in [[files]] but the record keeps its text"
+                "{dest} has rollback = false in {section} but the record keeps its text"
             ));
         }
     }
@@ -375,7 +422,7 @@ fn check_files(
 
 /// A step that only shows `cannot undo: WHAT`.
 fn cannot_undo(what: &str) -> PlannedRun {
-    files::skip_run(format!("cannot undo: {what}"))
+    files::skip_run("", format!("cannot undo: {what}"))
 }
 
 /// The refusal when `live` is not the host `recorded` is from: the
@@ -451,10 +498,10 @@ fn would(entry: Option<&TargetRecord>) -> Vec<String> {
 
 /// What `--dry-run` shows for `target`: what a rollback of its entry would
 /// do, or the refusal the real run would fail it with ([`check_files`]).
-fn dry_target(config: &Config, target: &Target, entry: Option<&TargetRecord>) -> DryTarget {
+fn dry_target(expanded: &Expanded, target: &Target, entry: Option<&TargetRecord>) -> DryTarget {
     // The record's facts stand in for the probe a real run makes.
     let refused =
-        entry.and_then(|entry| check_files(config, target, Some(&entry.facts), entry).err());
+        entry.and_then(|entry| check_files(expanded, target, Some(&entry.facts), entry).err());
     let steps = refused.is_none().then(|| {
         would(entry)
             .into_iter()
@@ -472,14 +519,20 @@ fn dry_target(config: &Config, target: &Target, entry: Option<&TargetRecord>) ->
 /// `--dry-run`: each selected target's block from the record alone (no
 /// connection, no lock), then `N targets, [M failed, ]nothing executed`. A
 /// target the real run would refuse fails here too, exit 1.
-fn print_dry_run(cli: &Cli, opts: &Options, config: &Config, force: &Force) -> Result<(), Failure> {
+fn print_dry_run(
+    cli: &Cli,
+    opts: &Options,
+    config: &Config,
+    expanded: &Expanded,
+    force: &Force,
+) -> Result<(), Failure> {
     let targets = opts.targets_for(config)?;
     let path = record::path().map_err(|err| Failure::failed(format!("rollback: {err}")))?;
     let record = recorded(&path)?;
     check_force(&record, &targets, force)?;
     let dry: Vec<DryTarget> = targets
         .iter()
-        .map(|target| dry_target(config, target, record.targets.get(&target.name)))
+        .map(|target| dry_target(expanded, target, record.targets.get(&target.name)))
         .collect();
     let failed = dry.iter().filter(|target| !target.ok).count();
     let total = dry.len();
@@ -498,7 +551,9 @@ fn print_dry_run(cli: &Cli, opts: &Options, config: &Config, force: &Force) -> R
             let end = match (&target.steps, &target.error) {
                 (Some(steps), _) => {
                     for step in steps {
-                        lines.push(Line::out(step.run.clone(), Escape::Always, Some(DIM)));
+                        // A recorded task path may hold invisible characters.
+                        let run = escape_invisible(&step.run);
+                        lines.push(Line::out(run, Escape::Always, Some(DIM)));
                     }
                     let end = format!("✔ {}", apply::steps_text(steps.len()));
                     Line::out(end, Escape::Never, Some(GREEN))
@@ -524,12 +579,23 @@ fn print_dry_run(cli: &Cli, opts: &Options, config: &Config, force: &Force) -> R
 
 #[cfg(test)]
 mod tests {
+    use crate::tasks::legacy;
     use std::collections::BTreeMap;
 
     use zeroize::Zeroizing;
 
     use super::*;
     use crate::record::{FileRecord, PreviousFile, Write};
+
+    /// [`super::check_files`] on a legacy config's list.
+    fn check_files(
+        config: &Config,
+        target: &Target,
+        facts: Option<&Facts>,
+        entry: &TargetRecord,
+    ) -> Result<(), String> {
+        super::check_files(&legacy(config), target, facts, entry)
+    }
 
     fn facts(pairs: &[(&str, &str)]) -> Facts {
         Facts(
@@ -566,6 +632,31 @@ mod tests {
                 .unwrap()
                 .contains("now host unknown, the record is from unknown")
         );
+    }
+
+    #[test]
+    fn restored_reads_the_dest_of_each_passed_file_step_in_any_order() {
+        let step = |dest: Option<&str>, code, skipped| StepReport {
+            run: String::new(),
+            code,
+            stdout: String::new(),
+            stderr: String::new(),
+            skipped,
+            entry: dest.map_or(Entry::Script, |dest| Entry::File {
+                dest: dest.to_owned(),
+            }),
+            task: None,
+            name: None,
+        };
+        let steps = [
+            step(None, Some(0), false),
+            step(Some("/etc/c"), Some(0), false),
+            step(Some("/etc/kept-out"), Some(0), true),
+            step(Some("/etc/a"), Some(0), false),
+            step(Some("/etc/failed"), Some(1), false),
+            step(Some("/etc/killed"), None, false),
+        ];
+        assert_eq!(restored(&steps), ["/etc/c", "/etc/a"]);
     }
 
     fn file(dest: &str, previous: Previous) -> FileRecord {
@@ -837,5 +928,199 @@ mod tests {
             (err.code, err.message.as_str()),
             (2, "rollback: --force /etc/a: not in the record")
         );
+    }
+
+    /// Two file tasks for one dest: (sudo, rollback) each, and the record
+    /// of writing both.
+    fn two_writes(first: (bool, bool), later: (bool, bool)) -> (Expanded, FileRecord) {
+        let entry = |(sudo, rollback): (bool, bool)| {
+            format!(
+                "[[tasks]]\n[tasks.file]\nsrc = \"a\"\ndest = \"/etc/a\"\nmode = \"0644\"\n\
+                 sudo = {sudo}\nrollback = {rollback}\n"
+            )
+        };
+        let config: Config = toml::from_str(&format!("{}{}", entry(first), entry(later))).unwrap();
+        let config = crate::tasks::expand(&config, || Ok("/nowhere".into())).unwrap();
+        let write = |sudo, rollback: bool| FileRecord {
+            dest: "/etc/a".to_owned(),
+            mode: "0644".to_owned(),
+            sudo,
+            written_sha256: "b".repeat(64),
+            write: Write::Written,
+            previous: Previous::File(PreviousFile {
+                mode: "0644".to_owned(),
+                uid: 0,
+                gid: 0,
+                sha256: "a".repeat(64),
+                kept: rollback,
+                text: rollback.then(|| "old".to_owned().into()),
+                reason: (!rollback).then(|| record::NO_ROLLBACK.to_owned()),
+            }),
+        };
+        // A dest any applying write keeps hash-only is hash-only from the first.
+        let mut record = write(first.0, first.1 && later.1);
+        record.written_again(write(later.0, later.1));
+        (config, record)
+    }
+
+    #[test]
+    fn a_dest_any_write_keeps_hash_only_rolls_back_without_its_text_in_either_order() {
+        let web = web1();
+        for (first, later) in [
+            ((false, true), (true, false)),
+            ((true, false), (false, true)),
+        ] {
+            let (config, record) = two_writes(first, later);
+            assert!(record.sudo);
+            let Previous::File(previous) = &record.previous else {
+                panic!("a file");
+            };
+            assert!(!previous.kept && previous.text.is_none(), "{first:?}");
+            assert_eq!(previous.reason.as_deref(), Some(record::NO_ROLLBACK));
+            let entry = TargetRecord {
+                at: 0,
+                anvil: String::new(),
+                ok: true,
+                facts: Facts::default(),
+                files: vec![record],
+                cannot_undo: Vec::new(),
+                rolled_back: None,
+            };
+            for facts in [None, Some(&Facts::default())] {
+                assert_eq!(
+                    super::check_files(&config, &web, facts, &entry),
+                    Ok(()),
+                    "{facts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tasks_dest_matches_across_repeated_slashes_and_a_legacy_one_does_not() {
+        let web = web1();
+        let (_, mut record) = two_writes((false, true), (false, true));
+        record.dest = "/etc//a".to_owned();
+        let entry = TargetRecord {
+            at: 0,
+            anvil: String::new(),
+            ok: true,
+            facts: Facts::default(),
+            files: vec![record],
+            cannot_undo: Vec::new(),
+            rolled_back: None,
+        };
+        let known = Facts::default();
+        let (tasks, _) = two_writes((false, true), (false, true));
+        assert_eq!(
+            super::check_files(&tasks, &web, Some(&known), &entry),
+            Ok(())
+        );
+        let (forbids, _) = two_writes((false, true), (false, false));
+        assert!(
+            super::check_files(&forbids, &web, Some(&known), &entry)
+                .unwrap_err()
+                .contains("rollback = false")
+        );
+        let config: Config = toml::from_str(
+            "[[files]]\nsrc = \"a\"\ndest = \"/etc/a\"\nmode = \"0644\"\nsudo = false\n",
+        )
+        .unwrap();
+        assert!(
+            super::check_files(&crate::tasks::legacy(&config), &web, Some(&known), &entry)
+                .unwrap_err()
+                .contains("/etc//a is not in [[files]]")
+        );
+    }
+
+    /// A record from before the config said `rollback = false` for one write
+    /// keeps its text: refused once the facts say that write applies. The
+    /// check ignores sudo, so the sudo-matching entry alone does not decide.
+    #[test]
+    fn kept_text_with_a_hash_only_write_applying_is_refused() {
+        let web = web1();
+        let (mut mixed, _) = two_writes((false, true), (true, false));
+        let (_, record) = two_writes((false, true), (true, true));
+        let entry = |record: &FileRecord| TargetRecord {
+            at: 0,
+            anvil: String::new(),
+            ok: true,
+            facts: Facts::default(),
+            files: vec![record.clone()],
+            cannot_undo: Vec::new(),
+            rolled_back: None,
+        };
+        assert!(record.sudo);
+        assert_eq!(
+            super::check_files(&mixed, &web, None, &entry(&record)),
+            Ok(())
+        );
+        let known = Facts::default();
+        assert!(
+            super::check_files(&mixed, &web, Some(&known), &entry(&record))
+                .unwrap_err()
+                .contains("rollback = false")
+        );
+        mixed = two_writes((false, true), (true, true)).0;
+        assert_eq!(
+            super::check_files(&mixed, &web, Some(&known), &entry(&record)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_task_list_with_no_items_still_words_refusals_for_tasks() {
+        let config: Config = toml::from_str("[[tasks]]\ntasks = []\n").unwrap();
+        let expanded = crate::tasks::expand(&config, || Ok("/nowhere".into())).unwrap();
+        assert!(expanded.items.is_empty());
+        let (_, record) = two_writes((false, true), (false, true));
+        let entry = TargetRecord {
+            at: 0,
+            anvil: String::new(),
+            ok: true,
+            facts: Facts::default(),
+            files: vec![record],
+            cannot_undo: Vec::new(),
+            rolled_back: None,
+        };
+        assert_eq!(
+            super::check_files(&expanded, &web1(), None, &entry),
+            Err("rollback: /etc/a is not in the config; refusing to restore it".to_owned())
+        );
+    }
+
+    /// Legacy duplicates keep the check as it was: only the entries with the
+    /// record's sudo decide, and one that allows it is enough.
+    #[test]
+    fn a_legacy_duplicate_dest_decides_rollback_by_the_sudo_matching_entries() {
+        let mut config = files_config(&["/etc/a", "/etc/a"]);
+        let record = |sudo| FileRecord {
+            sudo,
+            ..two_writes((false, true), (false, true)).1
+        };
+        let entry = |sudo| TargetRecord {
+            at: 0,
+            anvil: String::new(),
+            ok: true,
+            facts: Facts::default(),
+            files: vec![record(sudo)],
+            cannot_undo: Vec::new(),
+            rolled_back: None,
+        };
+        config.files[0].sudo = false;
+        config.files[1].sudo = true;
+        config.files[1].rollback = false;
+        let web = web1();
+        for facts in [None, Some(&Facts::default())] {
+            assert_eq!(
+                check_files(&config, &web, facts, &entry(true)),
+                Err(
+                    "rollback: /etc/a has rollback = false in [[files]] but the record keeps \
+                     its text; refusing to restore it"
+                        .to_owned()
+                )
+            );
+            assert_eq!(check_files(&config, &web, facts, &entry(false)), Ok(()));
+        }
     }
 }

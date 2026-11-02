@@ -23,13 +23,26 @@
   （[apply 紀錄](cli.zh-TW.md#apply-紀錄)）。它沒有加密：保護它的是你擁有的 0700 目錄中的 mode 0600，
   每次執行都會檢查兩者，anvil 會拒絕對他人開放的紀錄或目錄。任何能以你的身分讀取你的檔案的人，或能讀取其備份的人，都能讀到它。
   dest 保存 secret 的 `[[files]]` 項目請設定 `rollback = false`：紀錄就只保存它的 sha256（[Files](configuration.zh-TW.md#files)）。
+  dest 的 symlink、hard link 或不分大小寫的別名在 controller 上看不出來，會算成不同的 dest，因此該檔案的每個項目都要設定。
+  同一 dest 重複的舊式 `[[files]]` 項目，若第一個使用預設 rollback、後面的設定 `rollback = false`，第二次 apply 時仍會把後面項目的
+  secret 保存為文字：請改用 `[[tasks]]`，或兩者都設定 `rollback = false`。
   絕不要把 `$XDG_STATE_HOME` 指進 dotfiles 或其他共用的 repository，也絕不要 commit 這份紀錄。
   這些文字絕不會印出或記錄，且讀取紀錄前會先關閉 core dump。紀錄只是你擁有的一個檔案，因此 rollback 絕不讓它決定路徑：
-  dest 或 mode 不可能由 apply 寫出的紀錄會被拒絕，且只還原目前 config 的 `[[files]]` 仍列出、`sudo` 相同、
+  dest 或 mode 不可能由 apply 寫出的紀錄會被拒絕，且只還原目前 config 的 `[[files]]` 或 file task 仍列出、`sudo` 相同、
   且該項目適用於該 target 的 dest（[anvil rollback](cli.zh-TW.md#anvil-rollback)）。
 - **紀錄與 config 受到同等的信任**。它沒有簽章，也沒有驗證。在 config 列出的 dest 上，rollback 放回的位元組、owner
   與 mode 由紀錄決定，因此能寫入紀錄的人，就能讓 rollback（透過 sudo、以 root）在那裡寫入任意文字、任意 owner 與 mode。
   請讓它與 config 一樣私密：同一個使用者、0700 的狀態目錄，不要有共用或同步的副本。
+- **include 與 config 受到同等的信任**。[`[[tasks]]` include](configuration.zh-TW.md#tasks) 決定 target 上執行什麼，
+  task 使用 sudo 時也包含在內，因此能寫入它的人就能在那裡執行任何東西。請讓它與 config 一樣私密。
+  anvil 會拒絕不屬於你，或 group 與 other 可寫入的 include，以 2 結束，並在它讀取的同一個已開啟檔案上檢查：
+  ``tasks[0].include `$/role.toml`: not owned by the current user`` 或
+  ``tasks[0].include `$/role.toml`: mode 664 lets others write to it; set mode 644``。
+  symlink 會被拒絕。未檢查的部分：其他使用者放入的檔案會被 owner 檢查拒絕，但 include 上層可寫入的資料夾仍允許刪除它（以 2 結束），
+  或換成另一個你擁有的檔案。`[[files]]` 與 `file.src` 的 src 以及主 config 目前還沒有這項檢查（#106）：
+  可寫入資料夾中的 src 可能被替換，然後寫入它的 dest，使用 sudo 時是以 root 寫入。
+  world-writable 的工作區只在 `-v` 以上才警告，`files/` 或其子資料夾則完全沒有警告。這些都請保持為你所有。
+  include 只含 `tasks`，因此無法變更 `[plugins]`、`[secrets]` 或其他設定；但其中的 `plugin` task 仍可執行主檔案釘選的 plugin。
 - **讀取與寫入之間的變更**。每次 `[[files]]` 寫入之前 apply 會讀取 DEST，若 DEST 的 sha256 在那之後改變，寫入就會拒絕：
   `files: DEST changed while anvil was writing it; re-run apply`。這項檢查需要 target 上有 `sha256sum` 或 `shasum`。
   兩者都沒有時就沒有檢查，因此在讀取與寫入之間做的變更會被覆寫，而紀錄保存的是較舊的狀態。

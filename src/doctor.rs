@@ -37,7 +37,7 @@ use crate::facts::{self, Facts, PROBE};
 use crate::files::{self, FileState, HashDest};
 use crate::interrupt::Interrupt;
 use crate::inventory::{Target, TargetKind};
-use crate::logger::{escape_controls, is_invisible};
+use crate::logger::{escape_controls, escape_invisible};
 use crate::options::Options;
 use crate::packages::{self, Choice};
 use crate::paths;
@@ -45,6 +45,7 @@ use crate::plugin::{self, CurrentFile, DoctorRequest, Finding, Pin, Severity};
 use crate::record::{self, Record, TargetRecord};
 use crate::secret::{self, SecretError, Store};
 use crate::status::{self, Phase};
+use crate::tasks::{Expanded, ItemKind};
 use crate::transport::{Output, RUN_TIMEOUT, Transport, TransportError};
 
 const SH: &str = "/bin/sh";
@@ -275,13 +276,14 @@ pub enum Progress<'a> {
 pub fn check(
     opts: &Options,
     config: &Config,
+    expanded: &Expanded,
     store: &dyn Store,
     cancel: &AtomicBool,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
     // Lenient on purpose: an unresolvable workspace falls back with a warning.
     let targets = opts.targets();
-    let names = required_names(config, targets.as_deref().unwrap_or_default());
+    let names = required_names(config, expanded, targets.as_deref().unwrap_or_default());
     let secrets = check_secrets(&names, store);
     let targets = targets?;
     let mut local = local_checks(
@@ -302,7 +304,8 @@ pub fn check(
                 false => {
                     let transport = opts.transport(target);
                     let mut report = check_target(target, &transport);
-                    if let Some(packages) = &config.packages {
+                    let work = packages_to_check(config, expanded, target, report.facts.as_ref());
+                    if let Some(packages) = work.first() {
                         report.resolve_manager(
                             packages.choice_for(target),
                             packages.sudo_secret_for(target).is_some(),
@@ -312,7 +315,7 @@ pub fn check(
                             let manager =
                                 packages::Manager::parse(manager).expect("resolved manager");
                             report.packages =
-                                Some(package_row(manager, packages, transport.as_ref()));
+                                Some(package_rows(manager, &work, transport.as_ref()));
                         }
                     }
                     if let (Some(doctor), Some(facts), Ok(transport)) =
@@ -611,12 +614,19 @@ fn summary(
 /// `anvil doctor`: prints the whole report (or one JSON document) at the end.
 /// The first Ctrl-C cancels before the next target or plugin, the second
 /// kills the running probe, hash run or plugin ([`Interrupt`]).
-pub fn run(cli: &Cli, opts: &Options, config: &Config, store: &dyn Store) -> Result<(), Failure> {
+pub fn run(
+    cli: &Cli,
+    opts: &Options,
+    config: &Config,
+    expanded: &Expanded,
+    store: &dyn Store,
+) -> Result<(), Failure> {
     let _interrupt = Interrupt::install(&opts.cancel)?;
     let mut follow = status::Follow::new("doctor", status::enabled(cli.no_progress));
     let report = check(
         opts,
         config,
+        expanded,
         store,
         &opts.cancel,
         &mut |progress| match progress {
@@ -670,13 +680,19 @@ fn local_checks(
     }
 }
 
-/// The secrets doctor checks: the config's names, and with `[packages]` the
-/// sudo secret of each of `targets`; sorted, each once.
-fn required_names(config: &Config, targets: &[Target]) -> Vec<String> {
+/// The secrets doctor checks: the config's names, then with `[packages]` the
+/// sudo secret of each of `targets`; on a tasks config instead what apply may
+/// type on a target its tags reach, as `load_passwords` finds it: for a package
+/// task, a `sudo = true` file task or a service task. Sorted, each once.
+fn required_names(config: &Config, expanded: &Expanded, targets: &[Target]) -> Vec<String> {
     let mut names: BTreeSet<&str> = config.names().iter().map(String::as_str).collect();
-    if let Some(packages) = &config.packages {
-        names.extend(packages.sudo_secrets(targets));
+    if !expanded.from_tasks {
+        if let Some(packages) = &config.packages {
+            names.extend(packages.sudo_secrets(targets));
+        }
+        return names.into_iter().map(str::to_owned).collect();
     }
+    names.extend(expanded.sudo_secrets(config, targets));
     names.into_iter().map(str::to_owned).collect()
 }
 
@@ -756,6 +772,49 @@ fn check_target(
     }
 }
 
+/// What doctor checks on `target`: `[packages]` on a legacy config, else the
+/// package tasks it matches, each its own check since each is validated on its
+/// own (one task may remove what another installs). `facts` narrows them when
+/// the probe reached the target.
+fn packages_to_check<'a>(
+    config: &'a Config,
+    expanded: &'a Expanded,
+    target: &Target,
+    facts: Option<&Facts>,
+) -> Vec<&'a packages::Packages> {
+    if config.tasks.is_empty() {
+        return config.packages.iter().collect();
+    }
+    expanded
+        .items
+        .iter()
+        .filter(|item| item.may_match(target, facts))
+        .filter_map(|item| match &item.kind {
+            ItemKind::Packages(packages) => Some(packages),
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`package_row`] of each of `work`: `ok` when each is, else its warnings.
+fn package_rows(
+    manager: packages::Manager,
+    work: &[&packages::Packages],
+    transport: &dyn Transport,
+) -> String {
+    let mut warnings = Vec::new();
+    for packages in work {
+        let row = package_row(manager, packages, transport);
+        if row != "ok" && !warnings.contains(&row) {
+            warnings.push(row);
+        }
+    }
+    match warnings.is_empty() {
+        true => "ok".to_owned(),
+        false => warnings.join("; "),
+    }
+}
+
 /// Check repository names without sudo, refreshes or installation.
 fn package_row(
     manager: packages::Manager,
@@ -804,13 +863,7 @@ fn exit_text(code: Option<i32>, stderr: &str) -> String {
 /// invisible character in it is escaped too.
 fn hash_exit_message(output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let shown: String = secret::shown_name(stderr.trim())
-        .chars()
-        .map(|c| match is_invisible(c) {
-            true => format!("\\u{{{:04x}}}", u32::from(c)),
-            false => c.to_string(),
-        })
-        .collect();
+    let shown = escape_invisible(&secret::shown_name(stderr.trim()));
     exit_text(output.code, &shown)
 }
 
@@ -1039,11 +1092,28 @@ fn no_sudo_warning(count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::legacy;
 
     use std::time::Duration;
 
     use crate::secret::Memory;
     use crate::test_util::{Unopenable, json, keys};
+
+    /// [`super::check`] on a legacy config's list.
+    fn check(
+        opts: &Options,
+        config: &Config,
+        store: &dyn Store,
+        cancel: &AtomicBool,
+        on: &mut dyn FnMut(Progress<'_>),
+    ) -> Result<Report, Failure> {
+        super::check(opts, config, &legacy(config), store, cancel, on)
+    }
+
+    /// [`super::required_names`] on a legacy config's list.
+    fn required_names(config: &Config, targets: &[Target]) -> Vec<String> {
+        super::required_names(config, &legacy(config), targets)
+    }
 
     /// Answers every script with fixed output, or fails, without a process.
     struct Fake(Result<&'static str, TransportError>);
@@ -1387,7 +1457,14 @@ mod tests {
             ..Config::default()
         };
         let store = Unopenable::new(|| SecretError::Locked);
-        let failure = run(&cli, &Options::from_cli(&cli), &config, &store).unwrap_err();
+        let failure = run(
+            &cli,
+            &Options::from_cli(&cli),
+            &config,
+            &legacy(&config),
+            &store,
+        )
+        .unwrap_err();
         assert_eq!(failure.code, 2, "{}", failure.message);
         assert_eq!(store.opened.get(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2332,5 +2409,58 @@ mod tests {
         let failed = PluginReport::failed("other", "plugin other: exited 3".to_owned());
         let report = with(vec![drift, failed], true);
         assert!(!report.drift_only(), "a plugin error is not drift");
+    }
+
+    #[test]
+    fn a_target_no_package_task_matches_needs_no_sudo_secret() {
+        let config: Config = toml::from_str(
+            "[packages]\nlocal_sudo_secret = \"LOCAL\"\n\n\
+             [[tasks]]\ntags = [\"other\"]\npackages = { install = [\"git\"] }\n",
+        )
+        .unwrap();
+        let expanded = crate::tasks::expand(&config, || Ok(PathBuf::from("/nowhere"))).unwrap();
+        let local = Target {
+            name: "local".to_owned(),
+            kind: TargetKind::Local,
+            pkg: None,
+            sudo_secret: None,
+            tags: Vec::new(),
+        };
+        assert!(super::required_names(&config, &expanded, std::slice::from_ref(&local)).is_empty());
+        let mut tagged = local;
+        tagged.tags = vec!["other".to_owned()];
+        assert_eq!(
+            super::required_names(&config, &expanded, &[tagged]),
+            ["LOCAL"]
+        );
+    }
+
+    #[test]
+    fn a_sudo_file_or_service_task_needs_the_secret_apply_will_type() {
+        let local = Target {
+            name: "local".to_owned(),
+            kind: TargetKind::Local,
+            pkg: None,
+            sudo_secret: None,
+            tags: Vec::new(),
+        };
+        let names = |task: &str| {
+            let config: Config = toml::from_str(&format!(
+                "[packages]\nlocal_sudo_secret = \"LOCAL\"\n\n[[tasks]]\n{task}\n"
+            ))
+            .unwrap();
+            let expanded = crate::tasks::expand(&config, || Ok(PathBuf::from("/nowhere"))).unwrap();
+            super::required_names(&config, &expanded, std::slice::from_ref(&local))
+        };
+        let file = r#"file = { src = "a", dest = "/a", mode = "0644" }"#;
+        let service = r#"service = { name = "db", state = "started" }"#;
+        for task in [file, service] {
+            assert_eq!(names(task), ["LOCAL"], "{task}");
+            let tagged = format!("tags = [\"other\"]\n{task}");
+            assert!(names(&tagged).is_empty(), "{tagged}");
+        }
+        let plain = r#"file = { src = "a", dest = "/a", mode = "0644", sudo = false }"#;
+        assert!(names(plain).is_empty());
+        assert!(names("run = \"x\"").is_empty());
     }
 }

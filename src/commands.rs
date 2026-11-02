@@ -41,6 +41,7 @@ use crate::options::Options;
 use crate::paths::{self, DocPath};
 use crate::secret::{self, BackendKind, Store};
 use crate::status;
+use crate::tasks;
 
 /// How often an invalid buffer is re-opened before the command gives up.
 const ATTEMPTS: u32 = 3;
@@ -123,14 +124,18 @@ struct HardenReport<'a> {
     suggestions: &'a [harden::Suggestion],
     held: &'a [harden::Held],
     warnings: &'a [String],
+    /// An include's or nested task's entry still needs changing by hand.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    unresolved: bool,
     diff: &'a str,
     written: bool,
 }
 
 /// `anvil config --harden`: the hardening the config lacks, as a diff of the
-/// config and the src files it names; exit 1 while any suggestion remains.
-/// With `write`, the edited config is validated, the src files are written
-/// (store files first), then the config is saved; exit 0.
+/// config and the src files it names; exit 1 while any suggestion or entry to
+/// change by hand remains. With `write`, the edited config is validated, the
+/// src files are written (store files first), then the config is saved; exit
+/// 0, with what is left to change by hand shown as warnings.
 pub fn harden(cli: &Cli, opts: &Options, strict: bool, write: bool) -> Result<(), Failure> {
     warn_target(cli);
     let current = paths::locate(opts.config.as_deref(), "config")?;
@@ -163,9 +168,13 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool, write: bool) -> Result<()
     };
     let inventory = opts.inventory_for(&config)?;
     let workspace = opts.workspace(&config)?;
+    let expand =
+        |config: &Config| tasks::expand(config, || Ok(workspace.clone())).map_err(Failure::usage);
+    let expanded = expand(&config)?;
     let outcome = harden::suggest(&harden::Input {
         text: &text,
         config: &config,
+        expanded: &expanded,
         inventory: &inventory,
         workspace: &workspace,
         strict,
@@ -176,7 +185,11 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool, write: bool) -> Result<()
     let count = outcome.suggestions.len();
     let written = write && count > 0;
     if written {
-        parse::<Config>(edited.as_bytes(), &dest, Config::validate)?;
+        expand(&parse::<Config>(
+            edited.as_bytes(),
+            &dest,
+            Config::validate,
+        )?)?;
         write_harden(&workspace, &outcome.files, &dest.path, &edited)?;
     }
 
@@ -209,7 +222,7 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool, write: bool) -> Result<()
     for warning in &outcome.warnings {
         notes.push(format!("harden: warning {warning}"));
     }
-    if !cli.json && count == 0 {
+    if !cli.json && count == 0 && !outcome.unresolved {
         notes.push(
             "config carries every harden rule; anvil plan / apply bring the hosts to it".to_owned(),
         );
@@ -232,6 +245,7 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool, write: bool) -> Result<()
                 suggestions: &outcome.suggestions,
                 held: &outcome.held,
                 warnings: &outcome.warnings,
+                unresolved: outcome.unresolved,
                 diff: &diff,
                 written,
             },
@@ -241,8 +255,11 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool, write: bool) -> Result<()
         let _ = status::write_stdout(&escape_controls(&diff));
     }
     match count {
-        0 => Ok(()),
         _ if write => Ok(()),
+        0 if outcome.unresolved => Err(Failure::failed(
+            "config --harden: entries in includes or nested tasks need changing by hand",
+        )),
+        0 => Ok(()),
         1 => Err(Failure::failed("config --harden: 1 suggestion")),
         n => Err(Failure::failed(format!("config --harden: {n} suggestions"))),
     }
@@ -349,7 +366,12 @@ pub fn edit_config(opts: &Options, format: Option<Format>, full: bool) -> Result
         &dest,
         view.as_mut(),
         Config::migrate,
-        Config::validate,
+        |value: &Config, path: &Path| {
+            value.validate(path)?;
+            opts.expand(value)
+                .map_err(|err| DocumentError::invalid(path, err.message))?;
+            Ok(())
+        },
     )
 }
 

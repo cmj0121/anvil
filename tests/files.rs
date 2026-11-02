@@ -522,3 +522,66 @@ fn missing_config_and_workspace_keep_their_resolved_base() {
         );
     }
 }
+
+#[test]
+fn warns_for_srcs_and_includes_reached_through_tasks() {
+    let s = Sandbox::new("files-tasks");
+    s.write_config(
+        "config.toml",
+        "[[tasks]]\ninclude = '$/role.toml'\n\n\
+         [[tasks]]\ntasks = [{ file = { src = '$/nested', dest = '/tmp/n', mode = '0644' } }]\n",
+    );
+    let store = s.config_dir().join("files");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(
+        store.join("role.toml"),
+        "[[tasks]]\nfile = { src = '$/inner', dest = '/tmp/i', mode = '0644' }\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        store.join("role.toml"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+    for name in ["inner", "nested"] {
+        fs::write(store.join(name), "hi").unwrap();
+    }
+    let out = run(&s, &["-v", "files", "rm", "inner"], 0);
+    assert!(
+        text(&out.stderr).contains(
+            "tasks[0]/role.toml:tasks[0].file.src `$/inner` names $/inner, which is gone"
+        ),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = run(&s, &["-v", "files", "rm", "nested"], 0);
+    assert!(
+        text(&out.stderr)
+            .contains("tasks[1].tasks[0].file.src `$/nested` names $/nested, which is gone"),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = run(&s, &["-v", "files", "rm", "role.toml"], 0);
+    assert!(
+        text(&out.stderr)
+            .contains("tasks[0].include `$/role.toml` names $/role.toml, which is gone"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn the_dangling_warning_escapes_a_bidi_character_in_a_task_reference() {
+    let s = Sandbox::new("files-tasks");
+    s.write_config(
+        "config.toml",
+        "[[tasks]]\nfile = { src = '$/evil\u{202e}', dest = '/tmp/n', mode = '0644' }\n",
+    );
+    let store = s.config_dir().join("files");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("evil\u{202e}"), "hi").unwrap();
+    let out = run(&s, &["-v", "files", "rm", "evil\u{202e}"], 0);
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("`$/evil\\u{202e}`"), "{stderr}");
+    assert!(!stderr.contains('\u{202e}'), "{stderr}");
+}

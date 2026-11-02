@@ -51,7 +51,9 @@ Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
   An inventory that does not load shows `inventory error` in red instead of the selection, and its error as a notice.
 - **Steps.** The steps apply runs, numbered: `packages` when `[packages]` has work, then `file DEST` for each
   `[[files]]` entry and `service NAME` for each `[[services]]` entry, then each `[[steps]]` command (its first line,
-  with `…` when it has more); a config without `[[steps]]` runs the default `hostname` step. The cursor row is marked
+  with `…` when it has more); a config without `[[steps]]` runs the default `hostname` step. A
+  [`[[tasks]]`](configuration.md#tasks) config lists its expanded tasks in run order instead, each as `NAME  PATH` (the
+  label above when it has no `name`), and apply and plan sections add a `PATH  NAME` line above each step. The cursor row is marked
   `▶`. On an apply result the list is the one of the config that run loaded, and each row has a mark for the shown tab's
   target: `✔` exited 0, `✘` exited non-zero or was killed, `⊘` did not run (after a failed step or a cancel, or a file
   or service step skipped because the target does not match). When a transport error ended the target, the step it ended

@@ -256,6 +256,9 @@ skip = ["updates.auto"]    # rule ids anvil config --harden leaves out; default 
 這個預設就不再存在。每個 step 有 `run` 或 `plugin`，不能兩者都有；
 兩者都有時以 2 結束並顯示 `steps[I]: has both run and plugin; keep one`，兩者都沒有時為 `steps[I]: needs run or plugin`。
 
+上述區段依固定順序執行：套件、檔案、服務、step。要自行決定順序，請改用 [`[[tasks]]`](#tasks)，
+取代 `[[files]]`、`[[services]]`、`[[steps]]` 與 `[packages]` 中的清單。
+
 沒有 `[secrets]` 時，backend（後端）在 macOS 上是 keychain（其他平台不支援）。
 只有被選中的 backend 的區段是必要的且會被檢查：缺少該區段、未知的 backend，或在非 macOS 上使用 `keychain`，
 都是 config 錯誤（以 2 結束）。路徑可以 `~/` 開頭，代表 `$HOME`；除此之外必須是絕對路徑。
@@ -298,7 +301,7 @@ names = ["HOST_SUDO"]
 ## Files
 
 `[[files]]` 項目把一份文字檔複製到每個 tag 與 fact 全部符合的選定 target。沒有 `tags` 也沒有 `facts` 時代表每個選定的 target。
-符合的項目依 config 順序執行，排在套件 step 之後、`[[steps]]` 之前；
+符合的項目依 config 順序執行，排在套件 step 之後、`[[steps]]` 之前（`file` [task](#tasks) 則在它所在的位置執行）；
 不符合的項目仍是一個 step，回報為略過，該 target 的其他 step 仍會執行（[File steps](cli.zh-TW.md#file-steps)）。
 最多 64 個項目：多一個就以 2 結束並顯示 `files: N entries exceeds the 64 entry limit`（65 個時為 `files: 65 entries exceeds the 64 entry limit`）。
 未知的鍵，或不是布林值的 `sudo` 或 `rollback`，以 2 結束並顯示解析器的訊息，其中會指出該鍵與行號。
@@ -459,7 +462,7 @@ dest 是目錄時 step 失敗並顯示 `files: DEST is a directory`（`/etc/a` �
 
 `[[services]]` 項目在每個 tag 與 fact 全部符合的選定 target 上，把一個服務帶到指定的狀態；設定了 `enabled` 時，也帶到該啟用狀態。
 它先詢問 target 的 init，只變更不同之處，因此服務已在該狀態時再次執行會印出 `unchanged service NAME`。
-符合的項目依 config 順序執行，排在 `[[files]]` step 之後、`[[steps]]` 之前；
+符合的項目依 config 順序執行，排在 `[[files]]` step 之後、`[[steps]]` 之前（`service` [task](#tasks) 則在它所在的位置執行）；
 不符合的項目仍是一個 step，回報為 `skipped service NAME: no match`，該 target 的其他 step 仍會執行
 （[Service steps](cli.zh-TW.md#service-steps)）。
 
@@ -554,6 +557,126 @@ plist 本身的 `Disabled` 鍵為 true 時不會被偵測到，因為 anvil 不�
 launchd 的變更是以替身工具測試的，而非實際的 launchd；只有 `print-disabled` 的格式在 macOS 26 上以唯讀方式確認過。
 
 各 init 執行什麼，以及找不到服務時的訊息，見 [Service steps](cli.zh-TW.md#service-steps)。
+
+## Tasks
+
+`[[tasks]]` 清單在每個 target 上由上而下，依你寫的順序執行。
+當設定需要舊版區段固定順序（套件、檔案、服務、step）以外的順序時就用它：
+先建立目錄再放入檔案，或在檔案與讀取它的服務之間執行 migration。
+task 可以巢狀，也可以 include [檔案儲存區](cli.zh-TW.md#anvil-files)中的 task 檔。沒有 `[[tasks]]` 的 config 行為完全不變。
+
+`config.toml`：
+
+```toml
+[packages.alias.nginx]             # stays global
+brew = "nginx"
+
+[[tasks]]
+name = "Create conf dir"
+run = "sudo mkdir -p /etc/nginx/conf.d"
+
+[[tasks]]
+name = "Base packages"
+packages = { install = ["git", "curl"] }
+
+[[tasks]]
+name = "Web role"
+tags = ["web"]                     # inherited by every child
+include = "$/roles/web.toml"
+```
+
+`$/roles/web.toml`，也就是工作區中的 `files/roles/web.toml`：
+
+```toml
+[[tasks]]
+name = "Install nginx"
+packages = { install = ["nginx"] }
+
+[[tasks]]
+name = "Configure and start"
+facts = { os = "Linux" }           # ANDed with the parent's tags
+
+  [[tasks.tasks]]
+  name = "Write config"
+  file = { src = "$/roles/web/nginx.conf", dest = "/etc/nginx/nginx.conf", mode = "0644" }
+
+  [[tasks.tasks]]
+  name = "Start nginx"
+  service = { name = "nginx", state = "started", enabled = true }
+```
+
+**種類。** 每個 task 恰有下列其中一種，另可設定 `name`、`tags` 與 `facts`。未知的鍵以 2 結束並顯示解析器的訊息。
+兩種以上以 2 結束並顯示 `tasks[0]: has run and include; keep one`，都沒有時為
+`tasks[0]: needs one of run, plugin, packages, file, service, include, tasks`。
+
+| 種類       | 作用                                                                             |
+| ---------- | -------------------------------------------------------------------------------- |
+| `run`      | POSIX sh 腳本，最多 4 KiB，與 `[[steps]]` 相同                                   |
+| `plugin`   | `[plugins]` 項目，可選 `args`，與 [Plugin steps](cli.zh-TW.md#plugin-steps) 相同 |
+| `packages` | 只有 `install`、`pin`、`remove` 與 `upgrade`，與 `[packages]` 相同               |
+| `file`     | `src`、`dest`、`mode`、`sudo` 與 `rollback`，與 [`[[files]]`](#files) 相同       |
+| `service`  | `name`、`state` 與 `enabled`，與 [`[[services]]`](#services) 相同                |
+| `include`  | `$/…` task 檔，就地展開                                                          |
+| `tasks`    | 子 task，寫成 `[[tasks.tasks]]` 或 inline array                                  |
+
+`tags` 與 `facts` 寫在 task 上，不寫在 `file` 或 `service` 裡：否則以 2 結束並顯示
+`tasks[0].file: tags and facts belong on the task, not the file`。
+selector 不符合的 task 仍是一個 step，回報為略過（`skipped run: no match`、`skipped packages: no match`），
+該 target 的其他 step 仍會執行。失敗的 task 會結束該 target；其他 target 繼續。
+沒有要做任何事的 `packages` task、空的 `tasks` 與沒有 task 的 include 都不產生 step。
+每個 file 與 service task 都是自己的 step，可以重複：[`[[services]]` 的重複規則](#services)不適用，
+因為停止、migration、啟動就是這樣寫的。含 `[[tasks]]` 的 config 沒有預設的 `hostname` step。
+
+**巢狀。** 子 task 繼承 `tags` 與 `facts`，每一層都必須符合：target 必須帶有鏈上的每個 tag，fact 以 AND 結合。
+同一條鏈上同一個 fact 鍵有兩個不同的值永遠不會符合，因此以 2 結束並顯示
+``tasks[0].tasks[0].facts.os `Darwin`: conflicts with `Linux` inherited from a parent``。
+`pkg` 是例外：它以是否包含來比對，因此每一層各自檢查。
+
+**Include。** `include` 只接受 `$/…` 儲存區路徑。其他值以 2 結束並顯示
+``tasks[0].include `roles/web.toml`: must be a $/ store path``。不論 `[anvil].format` 為何，該檔案都只能是 TOML，
+且 `tasks` 是唯一允許的鍵，因此 include 無法變更全域設定：`[packages.alias]`、`[plugins]` 或其他鍵都以 2 結束並顯示解析器的訊息
+（``unknown field `packages`, expected `tasks` ``）。`anvil config` 只編輯主檔案。
+include 受儲存區的限制（不含 NUL 的一般 UTF-8 文字檔，最多 1 MiB，不可為 symlink），
+且必須由你擁有、group 與 other 不可寫入（[安全性說明](security.zh-TW.md)）：
+``tasks[0].include `$/roles/web.toml`: mode 664 lets others write to it; set mode 644``。
+
+**參照檢查。** 下列情況都在任何 target 開始前以 2 結束；每個 include 不論其 `tags` 或 `facts` 都會讀取，
+因此打錯字不必等到有符合的 host 才發現：
+
+- 循環：``tasks[0]/c1.toml:tasks[0]/c2.toml:tasks[0].include `$/c1.toml`: cycle: $/c1.toml -> $/c2.toml -> $/c1.toml``；
+- 不存在的 include：``tasks[1].include `$/r.toml`: not found``；
+- 任何深度上不存在的 `file.src`：``tasks[0].file.src `$/gone`: not found``；
+- 主檔案的任何檢查，在任何深度上都適用，並指名該 task：`tasks[0].run: 4097 bytes exceeds the 4096 byte limit`。
+
+從兩處 include 同一個檔案，只要沒有循環，是允許的。
+
+**限制。** 全部在展開後計算，超過時以 2 結束並指名超過的 task：
+
+| 限制                                     | 訊息                                                  |
+| ---------------------------------------- | ----------------------------------------------------- |
+| 8 層，頂層與 include 都計入              | `PATH: nested deeper than 8 levels`                   |
+| 256 個 task                              | `PATH: more than 256 tasks after expansion`           |
+| 64 個 file task                          | `PATH: more than 64 file tasks after expansion`       |
+| 64 個 service task                       | `PATH: more than 64 service tasks after expansion`    |
+| 走訪 4096 個 task，群組與 include 也計入 | `PATH: more than 4096 tasks visited during expansion` |
+
+**混用。** `[[tasks]]` 與 `[[files]]`、`[[services]]`、`[[steps]]`，或 `[packages]` 的 `install`、`pin`、`remove`、`upgrade` 並用時，
+以 2 結束並顯示 `[[tasks]] cannot be mixed with [[steps]]; move it into a task`。沒有自動遷移。
+`[packages.alias]` 與其他 `[packages]` 設定（`manager`、`local`、`local_sudo_secret`、`timeout`）維持全域，可與 `[[tasks]]` 並用，
+`[plugins]`、`[secrets]`、`[harden]` 與 `[anvil]` 也一樣。
+
+**`packages` task。** 每個都是自己的 step，套用全域的 `[packages]` 設定，清單不會與其他 task 合併：
+兩個 task 可以各自 `pin` 不同的名稱。task 內的 `manager` 或 `alias` 以 2 結束並顯示解析器的訊息。請見[套件](packages.zh-TW.md)。
+
+**哪些指令會展開。** `apply`、`plan`、`rollback`、`doctor`、`config --harden`、儲存 `anvil config`，
+以及 `anvil files mv` 與 `rm` 的懸空 src 警告會讀取展開後的清單，每次執行一次。
+開啟編輯器、查詢 inventory 與 secret 使用原樣的主檔案，因此損壞的 include 仍可用 `anvil config` 修復。
+懸空 src 警告會跟隨它讀得到的 include，且絕不會失敗。
+
+**單次探測。** fact 來自執行前的一次探測，每個 step 都事先據此建立。因此安裝套件管理器的 step 無法在同一次執行中服務後面的 `packages` task，
+變更 fact 的 step 也不會改變後面的 task 符合與否。要使用新狀態，請再 apply 一次。
+
+輸出、紀錄與 rollback 請見[執行中的 task](cli.zh-TW.md#執行中的-task)。
 
 ## Plugins
 
@@ -673,6 +796,9 @@ skip = ["updates.auto"]          # rule ids config --harden never suggests; defa
 `/etc/ssh/sshd_config`、`/etc/ssh/sshd_config.d/…`、`/etc/sysctl.conf` 或 `/etc/sysctl.d/…` 的其他 `[[files]]` src 也一樣。
 帶標記的 step 絕不會被改寫，因此你可以自行編輯它。
 
+在 [`[[tasks]]`](#tasks) config 上，規則建議的是 task 而非區段，且只寫入主檔案的頂層 task。
+已在 include 或巢狀 task 中的項目視為存在；其中需要變更的項目留給你處理（[在 tasks config 上](cli.zh-TW.md#在-tasks-config-上)）。
+
 防止把自己鎖在外面的機制：
 
 - **root 登入會被擱置。** 只要有任何 inventory host（`local` 除外）以 root 連線或沒有指定 `user`，
@@ -691,7 +817,7 @@ skip = ["updates.auto"]          # rule ids config --harden never suggests; defa
 ## 限制與拒絕
 
 每個 config 或 inventory 檔案上限為 1 MiB，於解析前檢查。
-`[[files]]` 的 src 另有自己的 1 MiB 上限，在 `apply` 或 `plan` 讀取它時檢查（[Files](#files)）。
+`[[files]]` 的 src 另有自己的 1 MiB 上限，在 `apply` 或 `plan` 讀取它時檢查（[Files](#files)），[include](#tasks) 也一樣。
 YAML 會拒絕 anchor 與 alias、merge key（`<<`）、重複的鍵、不支援的 tag 以及多於一份的文件，舊版檔案與 YAML 編輯檢視皆然。
 `anvil inventory` 與 `anvil config` 開啟的是解析後的文件，而非檔案原文，因此一旦儲存，註解便不會保留。
 1 MiB 上限同樣適用於編輯檢視與儲存的 TOML：

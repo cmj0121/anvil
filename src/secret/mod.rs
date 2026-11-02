@@ -14,7 +14,7 @@ use std::str::FromStr;
 use zeroize::Zeroizing;
 
 use crate::config::Backend;
-use crate::logger::escape_controls;
+use crate::logger::escape_line;
 
 mod age;
 mod file_store;
@@ -240,9 +240,7 @@ pub fn shown_name(name: &str) -> String {
     if name.chars().nth(SHOWN_NAME_CHARS).is_some() {
         shown.push('…');
     }
-    escape_controls(&shown)
-        .replace('\n', "\\n")
-        .replace('\t', "\\t")
+    escape_line(&shown)
 }
 
 /// `[A-Z][A-Z0-9_]*`: the rule shared with `[secrets].names` in the config.

@@ -1150,3 +1150,178 @@ fn no_progress_draws_no_line_on_a_terminal() {
     assert!(out.contains("▶ local"), "{out:?}");
     assert!(!out.contains("\r\x1b[K"), "{out:?}");
 }
+
+/// Writes `rel` into the workspace's store, as a user's editor leaves it.
+fn store_file(sandbox: &Sandbox, rel: &str, body: &str) {
+    let path = sandbox.config_dir().join("files").join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+}
+
+#[test]
+fn tasks_run_in_order_through_nesting_and_an_include_used_twice() {
+    let sandbox = Sandbox::new("aa");
+    std::fs::write(sandbox.config_dir().join("motd.txt"), "from-the-file\n").unwrap();
+    let log = sandbox.root().join("order.log");
+    let log = log.display();
+    let dest = sandbox.root().join("motd");
+    let dest = dest.display();
+    store_file(
+        &sandbox,
+        "roles/log.toml",
+        &format!("[[tasks]]\nrun = \"echo included >> {log}\"\n"),
+    );
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[tasks]]\nrun = \"echo first >> {log}\"\n\n\
+             [[tasks]]\ninclude = \"$/roles/log.toml\"\n\n\
+             [[tasks]]\nfile = {{ src = \"motd.txt\", dest = \"{dest}\", mode = \"0640\", sudo = false }}\n\n\
+             [[tasks]]\n  [[tasks.tasks]]\n  run = \"cat {dest} >> {log}\"\n\n\
+             [[tasks]]\ninclude = \"$/roles/log.toml\"\n"
+        ),
+    );
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        std::fs::read_to_string(sandbox.root().join("order.log")).unwrap(),
+        "first\nincluded\nfrom-the-file\nincluded\n"
+    );
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["cannot_undo"],
+        serde_json::json!([
+            "tasks[0]",
+            "tasks[1]/roles/log.toml:tasks[0]",
+            "tasks[3].tasks[0]",
+            "tasks[4]/roles/log.toml:tasks[0]",
+        ])
+    );
+}
+
+#[test]
+fn a_missing_include_is_exit_two_before_any_target() {
+    let sandbox = Sandbox::new("aa");
+    let ran = sandbox.root().join("ran");
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[tasks]]\nrun = \"touch {}\"\n\n[[tasks]]\ntags = [\"other\"]\ninclude = \"$/gone.toml\"\n",
+            ran.display()
+        ),
+    );
+    for command in ["apply", "plan", "doctor"] {
+        let out = sandbox.anvil(&[command], &[]);
+        assert_eq!(out.status.code(), Some(2), "{command}");
+        assert!(text(&out.stderr).contains("tasks[1].include"), "{command}");
+    }
+    assert!(!ran.exists());
+}
+
+#[test]
+fn a_missing_src_or_bad_mode_of_a_task_names_its_file_field() {
+    let sandbox = Sandbox::new("aa");
+    sandbox.write_config(
+        "config.toml",
+        "[[tasks]]\nfile = { src = \"gone.txt\", dest = \"/tmp/x\", mode = \"0644\", sudo = false }\n",
+    );
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr).contains("tasks[0].file.src `gone.txt`"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn tasks_show_their_path_and_name_for_each_step_that_ran_or_was_skipped() {
+    let sandbox = Sandbox::new("ap");
+    sandbox.write_config(
+        "config.toml",
+        "[[tasks]]\nname = \"First\"\nrun = \"true\"\n\n\
+         [[tasks]]\nname = \"Elsewhere\"\ntags = [\"other\"]\nrun = \"true\"\n\n\
+         [[tasks]]\nname = \"Breaks\\u202e\\n  ✔ ok\"\nrun = \"echo out; exit 3\"\n",
+    );
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "▶ local\n  tasks[0]  First\n  tasks[1]  Elsewhere\n  $ skipped run: no match\n  \
+         tasks[2]  Breaks\\u{202e}\\n  ✔ ok\n  $ echo out; exit 3\n  out\n  \
+         ✘ step 3 exited 3\n\n0 ok, 1 failed\n"
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    let value = json(&out);
+    let steps = &value["targets"][0]["steps"];
+    assert_eq!(steps[0]["task"], "tasks[0]");
+    assert_eq!(steps[0]["name"], "First");
+    assert_eq!(steps[1]["skipped"], true);
+    assert_eq!(steps[2]["name"], "Breaks\u{202e}\n  ✔ ok");
+}
+
+#[test]
+fn a_nameless_file_task_shows_its_path_and_keeps_it_in_json() {
+    let sandbox = Sandbox::new("ap");
+    std::fs::write(sandbox.config_dir().join("a.txt"), "a\n").unwrap();
+    let dest = sandbox.root().join("dest");
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[tasks]]\nfile = {{ src = \"a.txt\", dest = \"{}\", mode = \"0644\", sudo = false }}\n",
+            dest.display()
+        ),
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let step = &value["targets"][0]["steps"][0];
+    assert_eq!(step["task"], "tasks[0]");
+    assert!(step.get("name").is_none(), "{step}");
+}
+
+#[test]
+fn a_legacy_config_has_no_task_or_name_in_json() {
+    let sandbox = Sandbox::new("ap");
+    sandbox.write_config("config.toml", "[[steps]]\nrun = \"true\"\n");
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert!(
+        text(&out.stdout).contains(r#""steps":[{"run":"true","code":0,"stdout":"","stderr":""}]"#),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn a_transport_error_on_a_task_shows_its_line_and_names_it_in_json() {
+    let sandbox = Sandbox::new("ap");
+    sandbox.with_fake_host();
+    sandbox.write_config(
+        "config.toml",
+        "[[tasks]]\nname = \"Boom\\u202e\"\nrun = \"true\"\n",
+    );
+    let args = ["apply", "--target", "fake"];
+    let out = sandbox.anvil(&args, &CONNECT_REFUSED);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ fake\n  tasks[0]  Boom\\u{{202e}}\n  ✘ {CONNECT_REFUSED_MESSAGE}\n\n0 ok, 1 failed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "fake"], &CONNECT_REFUSED);
+    assert_eq!(
+        json(&out)["targets"][0],
+        serde_json::json!({
+            "target": "fake",
+            "error": CONNECT_REFUSED_MESSAGE,
+            "ok": false,
+            "task": "tasks[0]",
+            "name": "Boom\u{202e}",
+        })
+    );
+}

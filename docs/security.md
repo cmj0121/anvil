@@ -22,16 +22,31 @@ English | [繁體中文](security.zh-TW.md)
   ([The apply record](cli.md#the-apply-record)). It is not encrypted: its protection is mode 0600 in a 0700 directory
   owned by you, both checked on every run, and anvil refuses a record or directory open to others. Anyone who can read
   your files as you, or a backup of them, can read it. Set `rollback = false` on a `[[files]]` entry whose dest holds a
-  secret: the record then keeps only its sha256 ([Files](configuration.md#files)). Never point `$XDG_STATE_HOME` into a
+  secret: the record then keeps only its sha256 ([Files](configuration.md#files)). A symlink, hard link or
+  case-insensitive alias of a dest cannot be seen on the controller and counts as a separate dest, so set it on every
+  entry for that file. Legacy `[[files]]` duplicates for one dest, the first with the default rollback and a later one
+  with `rollback = false`, still keep the later entry's secret as text on the second apply: use `[[tasks]]` or set
+  `rollback = false` on both. Never point `$XDG_STATE_HOME` into a
   dotfiles or other shared repository, and never commit the record. The texts are never printed or logged, and core
   dumps are turned off before the record is read. Since the record is only a file you own, rollback never trusts it to
   choose a path: it refuses a record whose dest or mode apply could not have written, and restores only dests the
-  current config's `[[files]]` still names, with the same `sudo`, for a target the entry applies to
+  current config's `[[files]]` or file tasks still name, with the same `sudo`, for a target the entry applies to
   ([anvil rollback](cli.md#anvil-rollback)).
 - **The record is trusted as the config is.** It is not signed or authenticated. At a dest the config names, the
   record decides the bytes, owner and mode rollback puts back, so whoever can write it can have rollback (through sudo,
   as root) write any text with any owner and mode there. Keep it as private as the config: the same user, the 0700
   state directory, no shared or synced copy.
+- **An include is trusted as the config is.** A [`[[tasks]]` include](configuration.md#tasks) decides what runs on your
+  targets, with sudo where a task uses it, so whoever can write one can run anything there. Keep it as private as the
+  config. anvil refuses, exit 2, an include not owned by you or writable by group or others, checked on the same open
+  file it reads: ``tasks[0].include `$/role.toml`: not owned by the current user`` or
+  ``tasks[0].include `$/role.toml`: mode 664 lets others write to it; set mode 644``. A symlink is refused.
+  What stays unchecked: a file another user plants is refused by the owner check, but a writable folder above an include
+  still allows deleting it (exit 2) or swapping in another file you own. `[[files]]` and `file.src` srcs and the main
+  config have no such check yet (#106): a src in a writable folder can be replaced, then written to its dest, as root
+  with sudo. A world-writable workspace only warns from `-v` up, and `files/` or a subfolder gets no warning. Keep them
+  all yours. An include holds only `tasks`, so it cannot change
+  `[plugins]`, `[secrets]` or any other setting; a `plugin` task in it can still run a plugin the main file pins.
 - **A change between the read and the write.** Before each `[[files]]` write apply reads DEST, and the write refuses
   when DEST's sha256 changed since: `files: DEST changed while anvil was writing it; re-run apply`. That check needs
   `sha256sum` or `shasum` on the target. Without either there is no check, so a change made between the read and the
