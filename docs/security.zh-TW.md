@@ -144,9 +144,8 @@
 `anvil update`（[cli.zh-TW.md](cli.zh-TW.md#anvil-update---check)）只在 release 的 tarball 帶有
 由正在執行的執行檔所編入金鑰做出的 minisign 簽章時，才會安裝它。
 
-- **兩把金鑰。** release 建置會嵌入 `keys/minisign.pub`（目前的金鑰，用來簽署）與 `keys/minisign-next.pub`（下一把金鑰）。
-  在專案的金鑰加入原始碼樹之前，建置中沒有任何金鑰，`anvil update` 會在下載任何東西之前以 `no release key compiled in` 停止；
-  `anvil update --check` 仍可使用。
+- **兩把金鑰。** 每個建置都會嵌入 `keys/minisign.pub`（目前的金鑰，用來簽署；key id `AD34E542D71A889C`）
+  與 `keys/minisign-next.pub`（下一把金鑰；key id `AC31A4597A6B61F8`）。其他金鑰做出的簽章會以 `unknown key id` 拒絕。
 - **簽章涵蓋的範圍。** tarball 的位元組，以及透過它的 trusted comment `anvil vX.Y.Z <target>` 涵蓋的 tag 與 target：
   較舊的已簽署 tarball 無法被安裝成較新的 tag 或另一個 target。`.sha256` 檔案沒有簽署；
   它只是把損毀的下載變成 `checksum mismatch for NAME`。檢查的順序請見 [cli.zh-TW.md](cli.zh-TW.md#anvil-update---check)；

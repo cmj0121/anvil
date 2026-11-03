@@ -166,9 +166,9 @@ English | [繁體中文](security.zh-TW.md)
 `anvil update` ([cli.md](cli.md#anvil-update---check)) installs a release only when its tarball carries a minisign
 signature by a key compiled into the running binary.
 
-- **Two keys.** A release build embeds `keys/minisign.pub` (the current key, which signs) and `keys/minisign-next.pub`
-  (the next one). Until the project's keys are added to the source tree a build embeds none, and `anvil update` stops
-  with `no release key compiled in` before it downloads anything; `anvil update --check` still works.
+- **Two keys.** Every build embeds `keys/minisign.pub` (the current key, which signs; key id `AD34E542D71A889C`) and
+  `keys/minisign-next.pub` (the next one; key id `AC31A4597A6B61F8`). A signature by any other key is refused as
+  `unknown key id`.
 - **What the signature covers.** The tarball's bytes, and through its trusted comment `anvil vX.Y.Z <target>`, the tag
   and the target: an older signed tarball cannot be installed as a newer tag or another target. The `.sha256` file is
   not signed; it only turns a corrupt download into `checksum mismatch for NAME`. The order of the checks is in

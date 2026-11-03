@@ -1816,24 +1816,22 @@ private 0700 directory `anvil-update-<16 hex>` under `$TMPDIR`, removed when anv
 **The checks, in order.** Every one runs before anything is unpacked, and any failure exits 1 with the binary
 untouched:
 
-1. a release key is compiled in (`no release key compiled in`), before any download;
-2. the binary may be replaced (the refusals below), before any download;
-3. the `.sha256` file is one `<64 hex>  NAME` line matching the tarball's SHA-256 (`checksum mismatch for NAME`);
-4. the `.minisig` signature over the tarball is by one of the two compiled-in keys and verifies
+1. the binary may be replaced (the refusals below), before any download;
+2. the `.sha256` file is one `<64 hex>  NAME` line matching the tarball's SHA-256 (`checksum mismatch for NAME`);
+3. the `.minisig` signature over the tarball is by one of the two compiled-in keys and verifies
    (`signature check failed for NAME: unknown key id`, `bad signature` or `legacy signature`);
-5. its trusted comment is exactly `anvil vX.Y.Z <target>` (`signature is for "<comment>", not NAME`), so an older
+4. its trusted comment is exactly `anvil vX.Y.Z <target>` (`signature is for "<comment>", not NAME`), so an older
    signed tarball cannot be passed off as a newer tag or another target;
-6. `tar` unpacks only `anvil-vX.Y.Z-<target>/anvil` from the verified bytes, which must be a regular file of at most
+5. `tar` unpacks only `anvil-vX.Y.Z-<target>/anvil` from the verified bytes, which must be a regular file of at most
    128 MiB;
-7. that binary, copied beside the old one as `.anvil.new-<pid>` with the old file's mode, runs `--version` within 10 s
+6. that binary, copied beside the old one as `.anvil.new-<pid>` with the old file's mode, runs `--version` within 10 s
    (`downloaded binary did not exit in 10 s`) and prints `anvil X.Y.Z` (`downloaded binary reports "<out>", not
 anvil X.Y.Z`).
 
 The signature covers the tarball itself; the `.sha256` file is only a corruption check with a clear message. The
-release keys are those of the anvil release that built this binary: the current key and the next one
-([Security notes](security.md#anvil-update)). The keys are compiled in only once the project owner adds them to the
-source tree; until then `anvil update` reports `no release key compiled in`. `--check` needs no key, so it works in a
-build without one.
+release keys are those of the anvil release that built this binary: the current key `keys/minisign.pub` (key id
+`AD34E542D71A889C`) and the next one `keys/minisign-next.pub` (key id `AC31A4597A6B61F8`)
+([Security notes](security.md#anvil-update)). `--check` needs no key.
 
 **Replacing.** The old binary is kept as a hard link `.anvil.prev-<pid>`, `.anvil.new-<pid>` is renamed over `PATH`,
 and the kept one is renamed to `PATH.prev`, replacing any earlier `.prev`. `PATH` is never missing, even for a
@@ -1900,8 +1898,8 @@ that exits non-zero aborts the command: nothing is written, exit 1.
   ([Plugin steps](#plugin-steps)). For `run`, also a script that is empty, over 1 MiB, not UTF-8 or
   unreadable, or a `--timeout` outside 1..=3600. For `tui`, see below.
 - **`update`**: 0 when up to date, ahead of the latest release, or updated. 1 with `--check` when an update is
-  available, and for every failure: the query, a download, a check, a refusal, or `no release key compiled in`; the
-  installed binary is then untouched. 2 for a bad flag or argument.
+  available, and for every failure: the query, a download, a check, or a refusal; the installed binary is then
+  untouched. 2 for a bad flag or argument.
 - **`config --harden`**: 1 while any suggestion or unresolved [task entry](#on-a-tasks-config) remains, else 0; held rules
   and other warnings alone are 0. With `--write`,
   0 after writing (or with nothing to write), 2 for a refusal or a config that does not validate, 1 when a write fails

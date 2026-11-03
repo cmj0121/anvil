@@ -1714,22 +1714,21 @@ release 列為空的檔案會被拒絕（`release vX.Y.Z lists NAME as 0 bytes`�
 
 **檢查的順序。** 每一項都在解開任何東西之前執行，任何失敗都以 1 結束，執行檔保持不變：
 
-1. 已編入 release 金鑰（`no release key compiled in`），在任何下載之前；
-2. 執行檔可以被取代（見下方的拒絕情形），在任何下載之前；
-3. `.sha256` 檔案是一行 `<64 hex>  NAME`，且與 tarball 的 SHA-256 相符（`checksum mismatch for NAME`）；
-4. tarball 上的 `.minisig` 簽章出自兩把已編入金鑰之一，且驗證通過
+1. 執行檔可以被取代（見下方的拒絕情形），在任何下載之前；
+2. `.sha256` 檔案是一行 `<64 hex>  NAME`，且與 tarball 的 SHA-256 相符（`checksum mismatch for NAME`）；
+3. tarball 上的 `.minisig` 簽章出自兩把已編入金鑰之一，且驗證通過
    （`signature check failed for NAME: unknown key id`、`bad signature` 或 `legacy signature`）；
-5. 它的 trusted comment 恰好是 `anvil vX.Y.Z <target>`（`signature is for "<comment>", not NAME`），
+4. 它的 trusted comment 恰好是 `anvil vX.Y.Z <target>`（`signature is for "<comment>", not NAME`），
    因此較舊的已簽署 tarball 無法冒充較新的 tag 或另一個 target；
-6. `tar` 只從已驗證的位元組解開 `anvil-vX.Y.Z-<target>/anvil`，它必須是最多 128 MiB 的一般檔案；
-7. 該執行檔以舊檔案的 mode 複製到舊執行檔旁的 `.anvil.new-<pid>`，並在 10 秒內執行完 `--version`
+5. `tar` 只從已驗證的位元組解開 `anvil-vX.Y.Z-<target>/anvil`，它必須是最多 128 MiB 的一般檔案；
+6. 該執行檔以舊檔案的 mode 複製到舊執行檔旁的 `.anvil.new-<pid>`，並在 10 秒內執行完 `--version`
    （`downloaded binary did not exit in 10 s`），印出 `anvil X.Y.Z`
    （`downloaded binary reports "<out>", not anvil X.Y.Z`）。
 
 簽章涵蓋 tarball 本身；`.sha256` 檔案只是附帶清楚訊息的損毀檢查。
-release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的金鑰與下一把金鑰（[安全須知](security.zh-TW.md#anvil-update)）。
-金鑰要等專案 owner 把它們加入原始碼樹後才會編入；在那之前，`anvil update` 會回報 `no release key compiled in`。
-`--check` 不需要金鑰，因此在沒有金鑰的建置中也能使用。
+release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的金鑰 `keys/minisign.pub`（key id `AD34E542D71A889C`）
+與下一把金鑰 `keys/minisign-next.pub`（key id `AC31A4597A6B61F8`）（[安全須知](security.zh-TW.md#anvil-update)）。
+`--check` 不需要金鑰。
 
 **取代。** 舊執行檔先以硬連結保留為 `.anvil.prev-<pid>`，`.anvil.new-<pid>` 被重新命名覆蓋 `PATH`，
 保留的那份再重新命名為 `PATH.prev`，取代先前的 `.prev`。`PATH` 從不消失，即使只是一瞬間。
@@ -1791,7 +1790,7 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
   對 `run` 而言，還有空的、超過 1 MiB、不是 UTF-8 或無法讀取的腳本，以及超出 1..=3600 的 `--timeout`。
   `tui` 見下方。
 - **`update`**：已是最新、比最新 release 更新或已更新時為 0。
-  搭配 `--check` 且有可用的更新時為 1，任何失敗也為 1：查詢、下載、檢查、拒絕情形，或 `no release key compiled in`；
+  搭配 `--check` 且有可用的更新時為 1，任何失敗也為 1：查詢、下載、檢查或拒絕情形；
   此時已安裝的執行檔保持不變。錯誤的旗標或引數為 2。
 - **`config --harden`**：仍有任何建議或未解決的 [task 項目](#在-tasks-config-上)時為 1，否則為 0；只有擱置的規則或其他警告時為 0。
   搭配 `--write` 時，寫入後（或無須寫入）為 0，遇到拒絕情形或無法通過驗證的 config 為 2，寫入失敗為 1

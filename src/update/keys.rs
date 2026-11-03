@@ -1,7 +1,7 @@
 //! Minisign public keys trusted to sign a release.
 //!
-//! [`TrustedKeys::compiled`] is empty until the owner's keys are built in, so the caller
-//! can refuse with [`NO_RELEASE_KEY`]. Debug builds can read up to
+//! [`TrustedKeys::compiled`] holds the owner's pair from `keys/`: the current key
+//! (`minisign.pub`) and the next (`minisign-next.pub`). Debug builds can read up to
 //! [`MAX_KEYS`] `.pub` files instead.
 
 #[cfg(debug_assertions)]
@@ -12,9 +12,6 @@ use minisign_verify::PublicKey;
 /// A release trusts the current key and, while one is being retired, the next.
 pub const MAX_KEYS: usize = 2;
 
-/// What the caller says when [`TrustedKeys::compiled`] is empty.
-pub const NO_RELEASE_KEY: &str = "no release key compiled in";
-
 /// The public keys [`super::verify::verify`] accepts, current first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedKeys {
@@ -22,19 +19,18 @@ pub struct TrustedKeys {
 }
 
 impl TrustedKeys {
-    /// Keys compiled into this binary. Empty until U2b adds the owner's pair,
-    /// so a release build verifies nothing and the caller says
-    /// [`NO_RELEASE_KEY`] before it downloads.
+    /// Keys compiled into this binary: `keys/minisign.pub`, then
+    /// `keys/minisign-next.pub`.
     pub fn compiled() -> Self {
-        Self { keys: Vec::new() }
+        Self::parse([
+            include_str!("../../keys/minisign.pub"),
+            include_str!("../../keys/minisign-next.pub"),
+        ])
+        .expect("keys/minisign.pub and keys/minisign-next.pub are minisign public keys")
     }
 
     pub fn as_slice(&self) -> &[PublicKey] {
         &self.keys
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
     }
 
     /// Parse up to [`MAX_KEYS`] minisign public keys, one `.pub` file's text each.
@@ -140,9 +136,20 @@ mod tests {
     }
 
     #[test]
-    fn a_release_build_has_no_key_yet() {
-        assert!(TrustedKeys::compiled().is_empty());
-        assert_eq!(NO_RELEASE_KEY, "no release key compiled in");
+    fn compiles_in_the_current_key_then_the_next() {
+        let compiled = TrustedKeys::compiled();
+        let current = include_str!("../../keys/minisign.pub");
+        let next = include_str!("../../keys/minisign-next.pub");
+        assert_eq!(compiled, TrustedKeys::parse([current, next]).unwrap());
+        let ids: Vec<String> = [current, next]
+            .iter()
+            .map(|text| {
+                let mut id = key_id(text).unwrap();
+                id.reverse();
+                id.iter().map(|byte| format!("{byte:02X}")).collect()
+            })
+            .collect();
+        assert_eq!(ids, ["AD34E542D71A889C", "AC31A4597A6B61F8"]);
     }
 
     #[test]
@@ -151,7 +158,12 @@ mod tests {
         assert_eq!(keys.as_slice().len(), 2);
         assert_ne!(keys.as_slice()[0], keys.as_slice()[1]);
         assert_eq!(TrustedKeys::parse([PUB_A]).unwrap().as_slice().len(), 1);
-        assert!(TrustedKeys::parse(std::iter::empty()).unwrap().is_empty());
+        assert!(
+            TrustedKeys::parse(std::iter::empty())
+                .unwrap()
+                .as_slice()
+                .is_empty()
+        );
     }
 
     #[test]

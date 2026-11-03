@@ -58,8 +58,7 @@ installing it.
 Once installed, `anvil update --check` says whether a newer release exists, and `anvil update` downloads it, checks
 the checksum and the signature, and replaces the binary, keeping the previous one as `anvil.prev` beside it. Restart
 any running anvil, such as `anvil tui`, to use the new version. It refuses a binary a package manager owns, one you do
-not own, and one in a directory you cannot write; the details are in [cli.md](cli.md#anvil-update---check). Until the
-release keys are compiled in, `anvil update` stops with `no release key compiled in`.
+not own, and one in a directory you cannot write; the details are in [cli.md](cli.md#anvil-update---check).
 
 ## Quick start
 

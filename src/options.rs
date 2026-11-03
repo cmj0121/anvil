@@ -636,6 +636,7 @@ mod tests {
             ..Options::default()
         };
         assert_eq!(two.trusted_keys().unwrap().as_slice().len(), 2);
+        assert_ne!(two.trusted_keys().unwrap(), TrustedKeys::compiled());
         let three = Options {
             release_keys: pubs,
             ..Options::default()

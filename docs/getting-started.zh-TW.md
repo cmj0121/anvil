@@ -58,7 +58,7 @@ macOS 上的執行檔沒有程式碼簽署，也沒有經過 notarization。請�
 安裝後，`anvil update --check` 會告訴你是否有較新的 release，`anvil update` 則下載它、檢查 checksum 與簽章，
 再取代執行檔，並把先前的執行檔保留在旁邊的 `anvil.prev`。請重新啟動正在執行的 anvil（例如 `anvil tui`）以使用新版本。
 它會拒絕套件管理器擁有的執行檔、不屬於你的執行檔，以及位於你無法寫入之目錄中的執行檔；
-細節請見 [cli.zh-TW.md](cli.zh-TW.md#anvil-update---check)。在 release 金鑰編入之前，`anvil update` 會以 `no release key compiled in` 停止。
+細節請見 [cli.zh-TW.md](cli.zh-TW.md#anvil-update---check)。
 
 ## 快速開始
 
