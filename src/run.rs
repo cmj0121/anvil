@@ -14,14 +14,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cancel::Cancel;
-use crate::cli::Cli;
 use crate::document::{MAX_BYTES, read_capped_from};
 use crate::engine;
 use crate::error::Failure;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::escape_controls;
-use crate::options::Options;
+use crate::options::{Options, Output};
 use crate::packages::MAX_TIMEOUT;
 use crate::prepared::Prepared;
 use crate::report::{self, Report, TargetReport};
@@ -93,7 +92,7 @@ fn run_target(
 
 /// `anvil run`: reads the script from `source` (`-` for stdin), then prints
 /// each target's block as apply does (or one JSON document), then the summary.
-pub fn run(cli: &Cli, opts: &Options, source: &Path, timeout: u64) -> Result<(), Failure> {
+pub fn run(out: Output, opts: &Options, source: &Path, timeout: u64) -> Result<(), Failure> {
     if !(1..=MAX_TIMEOUT).contains(&timeout) {
         return Err(Failure::usage(format!(
             "--timeout `{timeout}`: must be 1..={MAX_TIMEOUT}"
@@ -103,7 +102,7 @@ pub fn run(cli: &Cli, opts: &Options, source: &Path, timeout: u64) -> Result<(),
     let timeout = Duration::from_secs(timeout);
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
-    report::print_report(cli, "run", |on| {
+    report::print_report(out, "run", |on| {
         Ok(run_targets(
             &Prepared::run(opts, cancel)?,
             script,

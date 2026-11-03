@@ -25,7 +25,6 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::cancel::Cancel;
-use crate::cli::Cli;
 use crate::config::Config;
 use crate::engine::{self, Passwords, Unresolved};
 use crate::error::{Failure, print_json};
@@ -35,7 +34,7 @@ use crate::files::{self, Force, Wording};
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, escape_invisible};
-use crate::options::Options;
+use crate::options::{Options, Output};
 use crate::prepared::Prepared;
 use crate::record::{self, Previous, Record, RolledBack, Session, TargetRecord};
 use crate::report::{
@@ -53,7 +52,7 @@ const NOTHING: &str = "nothing recorded";
 /// connecting or locking; else rolls back and prints each target's block as
 /// apply does (or one JSON document), then the summary.
 pub fn run(
-    cli: &Cli,
+    out: Output,
     opts: &Options,
     force: &[String],
     force_all: bool,
@@ -67,11 +66,11 @@ pub fn run(
         (false, dests) => Force::Dests(dests.iter().cloned().collect()),
     };
     if dry_run {
-        return print_dry_run(cli, opts, &config, &expanded, &force);
+        return print_dry_run(out, opts, &config, &expanded, &force);
     }
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
-    report::print_report(cli, "rollback", |on| {
+    report::print_report(out, "rollback", |on| {
         run_targets(
             opts,
             config,
@@ -553,7 +552,7 @@ fn dry_target(expanded: &Expanded, target: &Target, entry: Option<&TargetRecord>
 /// connection, no lock), then `N targets, [M failed, ]nothing executed`. A
 /// target the real run would refuse fails here too, exit 1.
 fn print_dry_run(
-    cli: &Cli,
+    out: Output,
     opts: &Options,
     config: &Config,
     expanded: &Expanded,
@@ -569,7 +568,7 @@ fn print_dry_run(
         .collect();
     let failed = dry.iter().filter(|target| !target.ok).count();
     let total = dry.len();
-    if cli.json {
+    if out.json {
         print_json(
             &DryRun {
                 ok: failed == 0,

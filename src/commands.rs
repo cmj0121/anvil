@@ -938,7 +938,7 @@ mod tests {
             let _lock = crate::term::test_lock();
             let config = self.config.to_str().unwrap();
             let cli = Cli::try_parse_from(["anvil", "--config", config, "secret", name]).unwrap();
-            let opts = Options::from_cli(&cli);
+            let opts = cli.options();
             secret(&cli, &opts.load_config().unwrap(), name, store)
         }
     }

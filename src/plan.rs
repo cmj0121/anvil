@@ -16,7 +16,6 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::cancel::{AbortReason, Cancel};
-use crate::cli::Cli;
 use crate::config::Config;
 use crate::engine::{self, Unresolved};
 use crate::error::{Failure, print_json};
@@ -25,7 +24,7 @@ use crate::files::Sources;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
-use crate::options::Options;
+use crate::options::{Options, Output};
 use crate::plugin::Plugins;
 use crate::prepared::Prepared;
 use crate::report::{self, Escape, Line, Style, print_lines};
@@ -225,23 +224,23 @@ fn plan_target(
 
 /// `anvil plan`: prints each target's block once it and every earlier
 /// target have ended (or one JSON document), then the summary.
-pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
+pub fn run(out: Output, opts: &Options) -> Result<(), Failure> {
     let style = Style::detect();
     let (config, expanded) = opts.load_expanded()?;
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
     let mut print = fanout::in_order(|report| print_lines(&render(report), style));
-    let mut follow = status::Follow::new("plan", status::enabled(cli.no_progress));
+    let mut follow = status::Follow::new("plan", status::enabled(out.no_progress));
     let prepared = Prepared::plan(opts, config, expanded, cancel)?;
     let plan = run_targets(&prepared, &mut |progress| {
         follow.event(&progress);
-        if !cli.json {
+        if !out.json {
             print(progress);
         }
     });
     drop(follow);
     let failed = plan.targets.iter().filter(|t| !t.ok()).count();
-    if cli.json {
+    if out.json {
         print_json(&plan, Failure::failed)?;
     } else {
         let _ = status::write_stdout(&render_summary(plan.targets.len(), failed, style));
@@ -450,7 +449,7 @@ mod tests {
 
     #[test]
     fn a_bad_pin_is_exit_two_before_any_target() {
-        let (dir, opts, config) = crate::test_util::bad_pin("plan");
+        let (dir, opts, config) = crate::test_util::bad_pin();
         let mut started = 0;
         let failure = run_targets(&opts, &config, &mut |progress| {
             if let Progress::Start(..) = progress {

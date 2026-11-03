@@ -9,13 +9,13 @@ use serde::Serialize;
 
 pub use crate::cancel::AbortReason;
 use crate::cancel::Cancel;
-use crate::cli::Cli;
 use crate::error::{Failure, print_json};
 use crate::fanout::{self, Event};
 use crate::inventory::Target;
 use crate::logger::{
     BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, escape_invisible, is_escaped, paint,
 };
+use crate::options;
 use crate::packages;
 use crate::status;
 use crate::step::{Entry, PlannedRun, RunKind, shown_text, task_title};
@@ -333,17 +333,17 @@ pub type Progress<'a> = Event<'a, TargetReport>;
 /// (or one JSON document), then the summary; any failed target fails
 /// `command`. The progress line runs until the summary.
 pub(crate) fn print_report(
-    cli: &Cli,
+    out: options::Output,
     command: &'static str,
     targets: impl FnOnce(&mut dyn FnMut(Progress<'_>)) -> Result<Report, Failure>,
 ) -> Result<(), Failure> {
     let style = Style::detect();
     let verbose = log::max_level() >= log::LevelFilter::Info;
     let mut print = fanout::in_order(|report| print_lines(&render(report, style, verbose), style));
-    let mut follow = status::Follow::new(command, status::enabled(cli.no_progress));
+    let mut follow = status::Follow::new(command, status::enabled(out.no_progress));
     let report = targets(&mut |progress| {
         follow.event(&progress);
-        if !cli.json {
+        if !out.json {
             print(progress);
         }
     })?;
@@ -352,7 +352,7 @@ pub(crate) fn print_report(
         let _ = status::write_stderr(&format!("{warning}\n"));
     }
     let (ok, failed) = report.counts();
-    if cli.json {
+    if out.json {
         print_json(&report, Failure::failed)?;
     } else {
         let summary = render_summary(ok, failed, &report.not_restored, style);

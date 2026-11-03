@@ -1,16 +1,16 @@
 //! Command line per the CLI contract.
 
-#[cfg(feature = "tui")]
 use std::io::{self, IsTerminal};
+use std::num::NonZeroU8;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 
 use crate::document::Format;
 use crate::error::Failure;
-use crate::options::Options;
 #[cfg(debug_assertions)]
 use crate::options::SecretStoreKind;
+use crate::options::{Options, Output};
 use crate::secret::BackendKind;
 
 #[derive(Debug, Parser)]
@@ -86,6 +86,38 @@ impl Cli {
     /// The command's name; bare `anvil` runs as `tui`.
     pub fn name(&self) -> &'static str {
         self.command.as_ref().map_or("tui", Command::name)
+    }
+
+    /// The output mode: `--json` and `--no-progress`.
+    pub fn output(&self) -> Output {
+        Output {
+            json: self.json,
+            no_progress: self.no_progress,
+        }
+    }
+
+    /// The global flags; ssh may prompt only when stdin and stderr are both
+    /// terminals.
+    pub fn options(&self) -> Options {
+        Options {
+            verbose: self.verbose,
+            inventory: self.inventory.clone(),
+            config: self.config.clone(),
+            ssh_config: self.ssh_config.clone(),
+            target: self.target.clone(),
+            parallel: NonZeroU8::new(self.parallel).expect("clap keeps --parallel in 1..=32"),
+            can_prompt: io::stdin().is_terminal() && io::stderr().is_terminal(),
+            #[cfg(debug_assertions)]
+            secret_store: self.secret_store,
+            #[cfg(debug_assertions)]
+            ssh_program: self.ssh_program.clone(),
+            #[cfg(debug_assertions)]
+            ssh_home: None,
+            #[cfg(debug_assertions)]
+            release_url: self.release_url.clone(),
+            #[cfg(debug_assertions)]
+            release_keys: self.release_key.clone(),
+        }
     }
 }
 
@@ -261,7 +293,8 @@ pub fn resolve(cli: &Cli) -> Option<&Command> {
 
 /// Runs `command`, the one [`resolve`] picked for `cli`.
 pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
-    let mut opts = Options::from_cli(cli);
+    let out = cli.output();
+    let mut opts = cli.options();
     opts.ssh_config = opts.ssh_config()?;
     match command {
         Command::Inventory { format } => crate::commands::inventory(cli, &opts, *format),
@@ -277,17 +310,17 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
             crate::commands::warn_parallel(cli);
             let (config, expanded) = opts.load_expanded()?;
             let store = opts.secret_store(&config)?;
-            crate::doctor::run(cli, &opts, &config, &expanded, store.as_ref())
+            crate::doctor::run(out, &opts, &config, &expanded, store.as_ref())
         }
-        Command::Apply => crate::apply::run(cli, &opts),
-        Command::Plan => crate::plan::run(cli, &opts),
+        Command::Apply => crate::apply::run(out, &opts),
+        Command::Plan => crate::plan::run(out, &opts),
         Command::Rollback {
             force,
             force_all,
             allow_host_change,
             dry_run,
-        } => crate::rollback::run(cli, &opts, force, *force_all, *allow_host_change, *dry_run),
-        Command::Run { script, timeout } => crate::run::run(cli, &opts, script, *timeout),
+        } => crate::rollback::run(out, &opts, force, *force_all, *allow_host_change, *dry_run),
+        Command::Run { script, timeout } => crate::run::run(out, &opts, script, *timeout),
         Command::Secret { to: Some(to), .. } => crate::commands::migrate(cli, &opts, *to),
         Command::Secret { name, .. } => {
             let config = opts.load_config()?;
@@ -299,8 +332,14 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
         Command::Tui if cli.json => Err(Failure::usage("anvil tui: --json is not available")),
         #[cfg(feature = "tui")]
         Command::Tui => crate::tui::run(opts),
-        Command::Update { check: true } => crate::update::check(cli, &opts),
-        Command::Update { check: false } => crate::update::update(cli, &opts),
+        Command::Update { check: true } => {
+            crate::commands::warn_target(cli);
+            crate::update::check(out, &opts)
+        }
+        Command::Update { check: false } => {
+            crate::commands::warn_target(cli);
+            crate::update::update(out, &opts)
+        }
     }
 }
 
@@ -314,6 +353,62 @@ mod tests {
 
     fn command(args: &[&str]) -> Command {
         parse(args).command.unwrap()
+    }
+
+    #[test]
+    fn options_copies_the_global_flags() {
+        let opts = parse(&[
+            "-vv",
+            "apply",
+            "--inventory",
+            "inv.toml",
+            "--config",
+            "cfg.toml",
+            "--ssh-config",
+            "ssh_config",
+            "--target",
+            "local",
+            "--target",
+            "mac",
+        ])
+        .options();
+        assert_eq!(opts.verbose, 2);
+        assert_eq!(opts.inventory, Some(PathBuf::from("inv.toml")));
+        assert_eq!(opts.config, Some(PathBuf::from("cfg.toml")));
+        assert_eq!(opts.ssh_config, Some(PathBuf::from("ssh_config")));
+        assert_eq!(opts.target, ["local", "mac"]);
+        assert_eq!(opts.parallel.get(), 1);
+        assert_eq!(
+            parse(&["--parallel", "4", "plan"]).options().parallel.get(),
+            4
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn options_copies_the_hidden_flags() {
+        let opts = parse(&[
+            "update",
+            "--secret-store",
+            "memory",
+            "--ssh-program",
+            "/x/fake-ssh",
+            "--release-url",
+            "http://127.0.0.1:9",
+            "--release-key",
+            "a.pub",
+            "--release-key",
+            "b.pub",
+        ])
+        .options();
+        assert_eq!(opts.secret_store, Some(SecretStoreKind::Memory));
+        assert_eq!(opts.ssh_program, Some(PathBuf::from("/x/fake-ssh")));
+        assert_eq!(opts.release_url.as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(
+            opts.release_keys,
+            [PathBuf::from("a.pub"), PathBuf::from("b.pub")]
+        );
+        assert_eq!(opts.ssh_home, None);
     }
 
     #[test]

@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::cli::Cli;
 use crate::config::Config;
 use crate::document::{self, Format};
 use crate::editor::random;
@@ -128,19 +127,12 @@ pub fn assert_no_plaintext(dir: &Path, needle: &str) {
     }
 }
 
-/// A new temp dir, options for `command` over an inventory of one host
-/// in it, and a config whose `[plugins.harden]` names a missing file there.
-pub fn bad_pin(command: &str) -> (PathBuf, Options, Config) {
+/// A new temp dir, options over an inventory of one host in it, and a
+/// config whose `[plugins.harden]` names a missing file there.
+pub fn bad_pin() -> (PathBuf, Options, Config) {
     let dir = temp_dir("bad-pin");
     let inventory = dir.join("inventory.toml");
     fs::write(&inventory, "[hosts.fake]\nhost = \"fakehost\"\n").unwrap();
-    let cli = <Cli as clap::Parser>::try_parse_from([
-        "anvil",
-        "--inventory",
-        inventory.to_str().unwrap(),
-        command,
-    ])
-    .unwrap();
     let config = document::from_str(
         &format!(
             "[plugins.harden]\npath = \"{}\"\nsha256 = \"{}\"\n",
@@ -150,7 +142,11 @@ pub fn bad_pin(command: &str) -> (PathBuf, Options, Config) {
         Format::Toml,
     )
     .unwrap();
-    (dir, Options::from_cli(&cli), config)
+    let opts = Options {
+        inventory: Some(inventory),
+        ..Options::default()
+    };
+    (dir, opts, config)
 }
 
 /// Writes a fake's knobs to `path` as shell assignments, for a fake that

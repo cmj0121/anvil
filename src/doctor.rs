@@ -31,7 +31,6 @@ use serde_json::{Map, Value};
 use zeroize::Zeroizing;
 
 use crate::cancel::{AbortReason, Cancel};
-use crate::cli::Cli;
 use crate::config::{Config, MAX_FILES, Plugin};
 use crate::editor::{Editor, EditorError, Fallback};
 use crate::error::{Failure, print_json};
@@ -40,7 +39,7 @@ use crate::files::{self, FileState, HashDest};
 use crate::interrupt::Interrupt;
 use crate::inventory::{Target, TargetKind};
 use crate::logger::{escape_controls, escape_invisible};
-use crate::options::Options;
+use crate::options::{self, Options};
 use crate::packages::{self, Choice};
 use crate::paths;
 use crate::plugin::{self, CurrentFile, DoctorRequest, Finding, Pin, Severity};
@@ -621,7 +620,7 @@ fn summary(
 /// The first Ctrl-C cancels before the next target or plugin, the second
 /// kills the running probe, hash run or plugin ([`Interrupt`]).
 pub fn run(
-    cli: &Cli,
+    out: options::Output,
     opts: &Options,
     config: &Config,
     expanded: &Expanded,
@@ -629,7 +628,7 @@ pub fn run(
 ) -> Result<(), Failure> {
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
-    let mut follow = status::Follow::new("doctor", status::enabled(cli.no_progress));
+    let mut follow = status::Follow::new("doctor", status::enabled(out.no_progress));
     let report = check(
         opts,
         config,
@@ -643,7 +642,7 @@ pub fn run(
         },
     )?;
     drop(follow);
-    if cli.json {
+    if out.json {
         print_json(&report, Failure::failed)?;
     } else {
         let _ = status::write_stdout(&render(&report));
@@ -1454,13 +1453,10 @@ mod tests {
         let dir = crate::test_util::temp_dir("doctor-order");
         let inventory = dir.join("inventory.toml");
         std::fs::write(&inventory, "not = [valid").unwrap();
-        let cli = <Cli as clap::Parser>::try_parse_from([
-            "anvil",
-            "--inventory",
-            inventory.to_str().unwrap(),
-            "doctor",
-        ])
-        .unwrap();
+        let opts = Options {
+            inventory: Some(inventory.clone()),
+            ..Options::default()
+        };
         let config = Config {
             secrets: None,
             packages: None,
@@ -1474,8 +1470,8 @@ mod tests {
         };
         let store = Unopenable::new(|| SecretError::Locked);
         let failure = run(
-            &cli,
-            &Options::from_cli(&cli),
+            options::Output::default(),
+            &opts,
             &config,
             &legacy(&config),
             &store,
@@ -1490,19 +1486,12 @@ mod tests {
     #[test]
     fn check_reports_begin_then_start_and_done_per_target() {
         let inventory = crate::test_util::fixture("inventory.toml");
-        let cli = <Cli as clap::Parser>::try_parse_from([
-            "anvil",
-            "--inventory",
-            inventory.to_str().unwrap(),
-            "--target",
-            "local",
-            "--target",
-            "pi",
-            "--ssh-program",
-            "/nonexistent/ssh",
-            "doctor",
-        ])
-        .unwrap();
+        let opts = Options {
+            inventory: Some(inventory.clone()),
+            target: vec!["local".to_owned(), "pi".to_owned()],
+            ssh_program: Some(PathBuf::from("/nonexistent/ssh")),
+            ..Options::default()
+        };
         let config = Config {
             secrets: None,
             packages: None,
@@ -1513,7 +1502,7 @@ mod tests {
         };
         let mut events = Vec::new();
         let report = check(
-            &Options::from_cli(&cli),
+            &opts,
             &config,
             &Memory::default(),
             &Arc::default(),
@@ -1774,15 +1763,11 @@ mod tests {
             "[hosts.pw]\nhost = \"pw.example\"\nsudo_secret = \"PW_SUDO\"\n",
         )
         .unwrap();
-        let cli = <Cli as clap::Parser>::try_parse_from([
-            "anvil",
-            "--inventory",
-            inventory.to_str().unwrap(),
-            "--ssh-program",
-            "/nonexistent/ssh",
-            "doctor",
-        ])
-        .unwrap();
+        let opts = Options {
+            inventory: Some(inventory.clone()),
+            ssh_program: Some(PathBuf::from("/nonexistent/ssh")),
+            ..Options::default()
+        };
         let config = Config {
             secrets: None,
             packages: Some(packages::Packages {
@@ -1795,14 +1780,7 @@ mod tests {
             ..Config::default()
         };
         let store = Memory::with(&[("LOCAL_SUDO", b"hunter2-secret")]);
-        let report = check(
-            &Options::from_cli(&cli),
-            &config,
-            &store,
-            &Arc::default(),
-            &mut |_| {},
-        )
-        .unwrap();
+        let report = check(&opts, &config, &store, &Arc::default(), &mut |_| {}).unwrap();
         assert_eq!(
             json(&report.local)["secrets"],
             serde_json::json!({"LOCAL_SUDO": "ok", "PW_SUDO": "missing"})
@@ -2148,14 +2126,10 @@ mod tests {
         let inventory = dir.join("inventory.toml");
         std::fs::write(&config, "broken config").unwrap();
         std::fs::write(&inventory, "[hosts.bad]\nhost = \"-bad\"\n").unwrap();
-        let cli = <Cli as clap::Parser>::try_parse_from([
-            "anvil",
-            "--config",
-            config.to_str().unwrap(),
-            "doctor",
-        ])
-        .unwrap();
-        let opts = Options::from_cli(&cli);
+        let opts = Options {
+            config: Some(config.clone()),
+            ..Options::default()
+        };
         let config_error = opts.load_config().unwrap_err();
         assert!(config_error.message.contains(config.to_str().unwrap()));
         let inventory_error = check(
@@ -2180,19 +2154,12 @@ mod tests {
     #[test]
     fn a_cancel_skips_the_remaining_targets_naming_why() {
         let inventory = crate::test_util::fixture("inventory.toml");
-        let cli = <Cli as clap::Parser>::try_parse_from([
-            "anvil",
-            "--inventory",
-            inventory.to_str().unwrap(),
-            "--target",
-            "local",
-            "--target",
-            "pi",
-            "--ssh-program",
-            "/nonexistent/ssh",
-            "doctor",
-        ])
-        .unwrap();
+        let opts = Options {
+            inventory: Some(inventory.clone()),
+            target: vec!["local".to_owned(), "pi".to_owned()],
+            ssh_program: Some(PathBuf::from("/nonexistent/ssh")),
+            ..Options::default()
+        };
         for (reason, text) in [
             (AbortReason::Cancelled, "cancelled"),
             (AbortReason::Terminated, "terminated"),
@@ -2201,7 +2168,7 @@ mod tests {
             let cancel = Arc::new(Cancel::new());
             let mut started = 0;
             let report = check(
-                &Options::from_cli(&cli),
+                &opts,
                 &Config::default(),
                 &Memory::default(),
                 &cancel,

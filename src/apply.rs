@@ -41,7 +41,6 @@ use std::num::NonZeroU8;
 use std::sync::Arc;
 
 use crate::cancel::Cancel;
-use crate::cli::Cli;
 use crate::config::{Config, Plugin};
 use crate::engine::{
     Journal, Passwords, Reached, Recorder, Unresolved, cannot_undo, execute, open_record, probe,
@@ -52,7 +51,7 @@ use crate::fanout::{self, Event};
 use crate::files::Sources;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
-use crate::options::Options;
+use crate::options::{Options, Output};
 use crate::plugin::Plugins;
 use crate::prepared::Prepared;
 use crate::record::Session;
@@ -188,11 +187,11 @@ impl Applied {
 
 /// `anvil apply`: prints each target's block in order (or one JSON
 /// document), then the summary.
-pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
+pub fn run(out: Output, opts: &Options) -> Result<(), Failure> {
     let (config, expanded) = opts.load_expanded()?;
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
-    print_report(cli, "apply", |on| {
+    print_report(out, "apply", |on| {
         run_targets(&Prepared::apply(opts, config, expanded, cancel)?, on)
     })
 }
@@ -2161,7 +2160,7 @@ mod tests {
 
     #[test]
     fn a_bad_pin_is_exit_two_before_any_target() {
-        let (dir, opts, config) = crate::test_util::bad_pin("apply");
+        let (dir, opts, config) = crate::test_util::bad_pin();
         let mut started = 0;
         let failure = run_targets(&opts, &config, &mut |progress| {
             if let Progress::Start(..) = progress {
@@ -4235,11 +4234,11 @@ mod tests {
 
     /// The exit status `print_report` gives `report`.
     fn exit_code(report: Report) -> u8 {
-        use clap::Parser;
-        let cli = Cli::try_parse_from(["anvil", "--json", "--no-progress", "apply"]).unwrap();
-        print_report(&cli, "apply", |_| Ok(report))
-            .unwrap_err()
-            .code
+        let out = crate::options::Output {
+            json: true,
+            no_progress: true,
+        };
+        print_report(out, "apply", |_| Ok(report)).unwrap_err().code
     }
 
     #[test]

@@ -2,13 +2,12 @@
 //! or the command, so a front end other than the CLI can build one.
 
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io;
 use std::num::NonZeroU8;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::cancel::Cancel;
-use crate::cli::Cli;
 use crate::config::Config;
 use crate::error::Failure;
 use crate::files::{self, Sources};
@@ -58,31 +57,40 @@ pub enum SecretStoreKind {
     Memory,
 }
 
-impl Options {
-    /// The global flags of `cli`; ssh may prompt only when stdin and stderr
-    /// are both terminals.
-    pub fn from_cli(cli: &Cli) -> Options {
+impl Default for Options {
+    /// What `anvil <cmd>` with no flags gives, except that ssh may not prompt.
+    fn default() -> Options {
         Options {
-            verbose: cli.verbose,
-            inventory: cli.inventory.clone(),
-            config: cli.config.clone(),
-            ssh_config: cli.ssh_config.clone(),
-            target: cli.target.clone(),
-            parallel: NonZeroU8::new(cli.parallel).expect("clap keeps --parallel in 1..=32"),
-            can_prompt: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+            verbose: 0,
+            inventory: None,
+            config: None,
+            ssh_config: None,
+            target: Vec::new(),
+            parallel: NonZeroU8::MIN,
+            can_prompt: false,
             #[cfg(debug_assertions)]
-            secret_store: cli.secret_store,
+            secret_store: None,
             #[cfg(debug_assertions)]
-            ssh_program: cli.ssh_program.clone(),
+            ssh_program: None,
             #[cfg(debug_assertions)]
             ssh_home: None,
             #[cfg(debug_assertions)]
-            release_url: cli.release_url.clone(),
+            release_url: None,
             #[cfg(debug_assertions)]
-            release_keys: cli.release_key.clone(),
+            release_keys: Vec::new(),
         }
     }
+}
 
+/// How a command prints: one JSON document or text, and whether the live
+/// progress line runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Output {
+    pub json: bool,
+    pub no_progress: bool,
+}
+
+impl Options {
     /// The secret store `config` selects, or `Memory` when a debug build was
     /// started with `--secret-store memory`. Nothing is opened yet.
     pub fn secret_store(&self, config: &Config) -> Result<Box<dyn Store>, Failure> {
@@ -336,14 +344,21 @@ fn check_workspace(workspace: &Path) -> Result<(), Failure> {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
-
     use super::*;
 
-    fn parse(args: &[&str]) -> Options {
-        let cli =
-            Cli::try_parse_from(std::iter::once("anvil").chain(args.iter().copied())).unwrap();
-        Options::from_cli(&cli)
+    fn with_config(path: &Path) -> Options {
+        Options {
+            config: Some(path.to_path_buf()),
+            ..Options::default()
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn with_ssh_program(program: &str) -> Options {
+        Options {
+            ssh_program: Some(PathBuf::from(program)),
+            ..Options::default()
+        }
     }
 
     #[test]
@@ -395,7 +410,7 @@ mod tests {
                 fs::create_dir(&workspace).unwrap();
                 fs::set_permissions(&workspace, fs::Permissions::from_mode(mode)).unwrap();
             }
-            let opts = parse(&["--config", path.to_str().unwrap(), "plan"]);
+            let opts = with_config(&path);
             let mut named = vec![name.to_owned(), format!("{name}/../{name}")];
             if mode.is_some() {
                 let link = dir.join(format!("{name}-link"));
@@ -440,7 +455,7 @@ mod tests {
             fs::Permissions::from_mode(0o644),
         )
         .unwrap();
-        let opts = parse(&["--config", config.to_str().unwrap(), "plan"]);
+        let opts = with_config(&config);
         assert_eq!(
             opts.targets().unwrap().len(),
             2,
@@ -476,7 +491,7 @@ mod tests {
             "[hosts.box]\nhost = \"example.org\"\n",
         )
         .unwrap();
-        let opts = parse(&["--config", config_path.to_str().unwrap(), "plan"]);
+        let opts = with_config(&config_path);
         let mut config = Config::default();
         config.anvil.workspace = Some("workspace".to_owned());
         assert_eq!(opts.targets_for(&config).unwrap().len(), 2);
@@ -488,34 +503,11 @@ mod tests {
     }
 
     #[test]
-    fn from_cli_copies_the_global_flags() {
-        let opts = parse(&[
-            "-vv",
-            "apply",
-            "--inventory",
-            "inv.toml",
-            "--config",
-            "cfg.toml",
-            "--ssh-config",
-            "ssh_config",
-            "--target",
-            "local",
-            "--target",
-            "mac",
-        ]);
-        assert_eq!(opts.verbose, 2);
-        assert_eq!(opts.inventory, Some(PathBuf::from("inv.toml")));
-        assert_eq!(opts.config, Some(PathBuf::from("cfg.toml")));
-        assert_eq!(opts.ssh_config, Some(PathBuf::from("ssh_config")));
-        assert_eq!(opts.target, ["local", "mac"]);
-        assert_eq!(opts.parallel.get(), 1);
-        assert_eq!(parse(&["--parallel", "4", "plan"]).parallel.get(), 4);
-    }
-
-    #[test]
     fn ssh_settings_follow_can_prompt() {
-        let mut opts = parse(&["apply"]);
-        opts.can_prompt = true;
+        let mut opts = Options {
+            can_prompt: true,
+            ..Options::default()
+        };
         let cancel = Arc::new(Cancel::new());
         assert!(opts.ssh_settings(PathBuf::new(), &cancel).can_prompt);
         opts.can_prompt = false;
@@ -524,7 +516,7 @@ mod tests {
 
     #[test]
     fn ssh_settings_share_the_cancel_token() {
-        let opts = parse(&["apply"]);
+        let opts = Options::default();
         let cancel = Arc::new(Cancel::new());
         assert!(Arc::ptr_eq(
             &opts.ssh_settings(PathBuf::new(), &cancel).cancel,
@@ -536,7 +528,7 @@ mod tests {
     #[test]
     fn the_ssh_transport_carries_the_token_passed_to_transport() {
         let found = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-ssh.sh");
-        let mut opts = parse(&["--ssh-program", found, "apply"]);
+        let mut opts = with_ssh_program(found);
         // Never the real home: a CI runner's ~/.ssh may be world-writable.
         let home = crate::test_util::temp_dir("opts-token");
         opts.ssh_home = Some(home.clone());
@@ -564,7 +556,7 @@ mod tests {
 
     #[test]
     fn local_target_gets_the_local_transport_and_hosts_get_ssh() {
-        let opts = parse(&["apply"]);
+        let opts = Options::default();
         let local = Target {
             name: "local".to_owned(),
             kind: TargetKind::Local,
@@ -582,7 +574,7 @@ mod tests {
     #[test]
     fn host_gets_the_ssh_transport_only_when_ssh_is_found() {
         let found = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-ssh.sh");
-        let opts = parse(&["--ssh-program", found, "apply"]);
+        let opts = with_ssh_program(found);
         let host = Target {
             name: "box".to_owned(),
             kind: TargetKind::Ssh {
@@ -599,7 +591,7 @@ mod tests {
             opts.transport(&host, &cancel).unwrap().name(),
             "203.0.113.10"
         );
-        let missing = parse(&["--ssh-program", "/nonexistent/anvil-ssh", "apply"]);
+        let missing = with_ssh_program("/nonexistent/anvil-ssh");
         let Err(err) = missing.transport(&host, &cancel) else {
             panic!("a missing ssh was accepted");
         };
@@ -612,9 +604,9 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn hidden_ssh_program_overrides_ssh() {
-        assert_eq!(parse(&["doctor"]).ssh_name(), PathBuf::from("ssh"));
+        assert_eq!(Options::default().ssh_name(), PathBuf::from("ssh"));
         assert_eq!(
-            parse(&["doctor", "--ssh-program", "/x/fake-ssh"]).ssh_name(),
+            with_ssh_program("/x/fake-ssh").ssh_name(),
             PathBuf::from("/x/fake-ssh")
         );
     }
@@ -622,9 +614,13 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn hidden_release_url_replaces_github() {
-        assert_eq!(parse(&["update"]).release_source(), Source::github());
+        assert_eq!(Options::default().release_source(), Source::github());
         assert_eq!(
-            parse(&["update", "--release-url", "http://127.0.0.1:9"]).release_source(),
+            Options {
+                release_url: Some("http://127.0.0.1:9".to_owned()),
+                ..Options::default()
+            }
+            .release_source(),
             Source::at("http://127.0.0.1:9")
         );
     }
@@ -633,35 +629,22 @@ mod tests {
     #[test]
     fn hidden_release_keys_replace_the_compiled_ones() {
         assert_eq!(
-            parse(&["update"]).trusted_keys().unwrap(),
+            Options::default().trusted_keys().unwrap(),
             TrustedKeys::compiled()
         );
-        let pubs: Vec<String> = ["a.pub", "b.pub", "c.pub"]
+        let pubs: Vec<PathBuf> = ["a.pub", "b.pub", "c.pub"]
             .iter()
-            .map(|name| {
-                crate::test_util::fixture(&format!("update/{name}"))
-                    .to_str()
-                    .unwrap()
-                    .to_owned()
-            })
+            .map(|name| crate::test_util::fixture(&format!("update/{name}")))
             .collect();
-        let two = parse(&[
-            "update",
-            "--release-key",
-            &pubs[0],
-            "--release-key",
-            &pubs[1],
-        ]);
+        let two = Options {
+            release_keys: pubs[..2].to_vec(),
+            ..Options::default()
+        };
         assert_eq!(two.trusted_keys().unwrap().as_slice().len(), 2);
-        let three = parse(&[
-            "update",
-            "--release-key",
-            &pubs[0],
-            "--release-key",
-            &pubs[1],
-            "--release-key",
-            &pubs[2],
-        ]);
+        let three = Options {
+            release_keys: pubs,
+            ..Options::default()
+        };
         let err = three.trusted_keys().unwrap_err();
         assert_eq!(err.code, 2);
         assert_eq!(
