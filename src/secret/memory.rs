@@ -21,7 +21,7 @@ impl Memory {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Memory {
     /// A store holding `items`.
     pub fn with(items: &[(&str, &[u8])]) -> Memory {

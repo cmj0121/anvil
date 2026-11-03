@@ -6,6 +6,11 @@ rust-version = "1.89"
 description = "Setup your env, both for human and agent, in one command."
 license = "GPL-3.0-or-later"
 
+[lib]
+name = "anvil"
+path = "src/lib.rs"
+doc = false
+
 [workspace]
 members = [".", "plugins/anvil-audit"]
 # cargo build, run and install touch only anvil; make audit-plugin builds the plugin.
@@ -38,6 +43,9 @@ signal-hook = { version = "0.3", default-features = false, features = ["iterator
 minisign-verify = "0.3"
 toml_edit = "0.25"
 
+[dev-dependencies]
+anvil = { path = ".", features = ["test-util"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
 
@@ -47,3 +55,4 @@ lto = true
 [features]
 default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm"]
+test-util = []

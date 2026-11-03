@@ -10,17 +10,17 @@ use std::sync::mpsc::Sender;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::cancel::{AbortReason, Cancel};
-use crate::config::{Config, StepKind};
-use crate::document::{Format, MAX_BYTES};
-use crate::error::Failure;
-use crate::filestore::{self, Entry, Kind, Root};
-use crate::inventory::{Inventory, LOCAL, Sel, Target, UnknownSel};
-use crate::options::Options;
-use crate::secret::{self, BackendKind};
-use crate::tasks::{Expanded, ItemKind};
-use crate::update::{Check, Status};
-use crate::{doctor, plan, report};
+use anvil::cancel::{AbortReason, Cancel};
+use anvil::config::{Config, StepKind};
+use anvil::document::{Format, MAX_BYTES};
+use anvil::error::Failure;
+use anvil::filestore::{self, Entry, Kind, Root};
+use anvil::inventory::{Inventory, LOCAL, Sel, Target, UnknownSel};
+use anvil::options::Options;
+use anvil::secret::{self, BackendKind};
+use anvil::tasks::{Expanded, ItemKind};
+use anvil::update::{Check, Status};
+use anvil::{doctor, plan, report};
 
 use super::ui;
 
@@ -588,8 +588,8 @@ pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
             StepRow {
                 label: format!(
                     "{}  {}",
-                    crate::step::shown_text(name.unwrap_or(&label).trim()),
-                    crate::step::shown_text(path)
+                    anvil::step::shown_text(name.unwrap_or(&label).trim()),
+                    anvil::step::shown_text(path)
                 ),
             }
         })
@@ -1009,7 +1009,7 @@ impl App {
             return Err(self.inventory_error.clone().unwrap_or_default());
         };
         let targets = select(inventory, &self.opts.target)
-            .map_err(|err| crate::error::Failure::from(err).message)?;
+            .map_err(|err| anvil::error::Failure::from(err).message)?;
         Ok(targets.into_iter().map(|target| target.name).collect())
     }
 
@@ -1611,8 +1611,8 @@ pub mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::config::Step;
-    use crate::inventory::Host;
+    use anvil::config::Step;
+    use anvil::inventory::Host;
 
     pub fn opts() -> Options {
         Options {
@@ -1687,7 +1687,7 @@ pub mod tests {
 
     impl Store {
         pub fn new(tag: &str, files: &[(&str, &str)]) -> Store {
-            let dir = crate::test_util::temp_dir(&format!("tui-files-{tag}"));
+            let dir = anvil::test_util::temp_dir(&format!("tui-files-{tag}"));
             let root = dir.join("files");
             for (path, body) in files {
                 let at = root.join(path);
@@ -1721,7 +1721,7 @@ pub mod tests {
             stdout: stdout.to_owned(),
             stderr: stderr.to_owned(),
             skipped: false,
-            entry: crate::step::Entry::Script,
+            entry: anvil::step::Entry::Script,
             task: None,
             name: None,
         }
@@ -1750,7 +1750,7 @@ pub mod tests {
     }
 
     pub fn probed(target: &str, error: Option<&str>) -> doctor::TargetReport {
-        let facts = crate::facts::Facts(
+        let facts = anvil::facts::Facts(
             [("hostname", target), ("os", "Linux")]
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -1809,7 +1809,7 @@ pub mod tests {
     /// Reload follows config edits and option changes, and retains strict load errors.
     #[test]
     fn store_reloads_the_workspace_and_config_errors() {
-        let dir = crate::test_util::temp_dir("tui-workspace");
+        let dir = anvil::test_util::temp_dir("tui-workspace");
         let path = dir.join("site.toml");
         let mut options = opts();
         options.config = Some(path.clone());
@@ -1860,7 +1860,7 @@ pub mod tests {
         );
         let err = check_targets(&inventory, &names(&["pi", "nosuch"])).unwrap_err();
         assert_eq!(
-            crate::error::Failure::from(err).message,
+            anvil::error::Failure::from(err).message,
             "unknown target `nosuch`: not `local`, a host name or a tag"
         );
     }
@@ -1875,7 +1875,7 @@ pub mod tests {
 
     /// Options naming a config file holding `toml` and an empty inventory.
     fn config_opts(tag: &str, toml: &str) -> Options {
-        let dir = crate::test_util::temp_dir(tag);
+        let dir = anvil::test_util::temp_dir(tag);
         let (config, inventory) = (dir.join("config.toml"), dir.join("inventory.toml"));
         std::fs::write(&config, toml).unwrap();
         std::fs::write(&inventory, "").unwrap();
@@ -1928,7 +1928,7 @@ pub mod tests {
             ..Config::default()
         };
         assert_eq!(
-            step_rows(&crate::tasks::legacy(&config)),
+            step_rows(&anvil::tasks::legacy(&config)),
             [row("ls"), row("plugin harden")]
         );
     }
@@ -1958,7 +1958,7 @@ pub mod tests {
         let opts = config_opts("tui-steps-default", "[packages]\ninstall = []\n");
         assert_eq!(load_steps(&opts), Ok(vec![row("hostname")]));
         assert_eq!(
-            step_rows(&crate::tasks::legacy(&Config::default())),
+            step_rows(&anvil::tasks::legacy(&Config::default())),
             [row("hostname")]
         );
     }

@@ -317,7 +317,7 @@ impl Report {
     }
 
     /// The failure of `command` when a record save failed.
-    pub(crate) fn saved(&self, command: &str) -> Result<(), Failure> {
+    pub fn saved(&self, command: &str) -> Result<(), Failure> {
         match &self.save_error {
             Some(err) => Err(Failure::failed(format!("{command}: {err}"))),
             None => Ok(()),
@@ -428,7 +428,7 @@ pub(crate) enum Escape {
 /// says and painted in `colour`, then `end`. Stdout and stderr lines are kept
 /// in one list so they interleave in order.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Line {
+pub struct Line {
     stderr: bool,
     lead: &'static str,
     text: String,

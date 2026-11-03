@@ -11,13 +11,13 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::app::{self, Job, Msg};
-use crate::cancel::Cancel;
-use crate::error::Failure;
-use crate::files::{Force, Wording};
-use crate::inventory::Target;
-use crate::options::Options;
-use crate::prepared::Prepared;
-use crate::{apply, doctor, fanout, plan, report, rollback, run, update};
+use anvil::cancel::Cancel;
+use anvil::error::Failure;
+use anvil::files::{Force, Wording};
+use anvil::inventory::Target;
+use anvil::options::Options;
+use anvil::prepared::Prepared;
+use anvil::{apply, doctor, fanout, plan, report, rollback, run, update};
 
 /// A run in progress; [`Worker::join`] waits for it, which is quick once
 /// `Finished` or `Panicked` has arrived.
@@ -214,10 +214,10 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
-    use crate::cancel::AbortReason;
-    use crate::test_util::{temp_dir, wait_for};
     use crate::tui::app::tests::{opts, row};
     use crate::tui::app::{App, RunResult};
+    use anvil::cancel::AbortReason;
+    use anvil::test_util::{temp_dir, wait_for};
 
     /// Every message until `Finished` or `Panicked`, then the worker joined.
     fn collect(worker: Worker, rx: &Receiver<Msg>) -> Vec<Msg> {
@@ -300,7 +300,7 @@ mod tests {
             "[hosts.up]\nhost = \"up.example\"\n\n[hosts.down]\nhost = \"down.example\"\n",
         )
         .unwrap();
-        let fake = crate::test_util::fixture("fake-ssh.sh");
+        let fake = anvil::test_util::fixture("fake-ssh.sh");
         let wrapper = dir.join("ssh");
         fs::write(
             &wrapper,
@@ -316,7 +316,7 @@ mod tests {
         opts.ssh_program = Some(wrapper);
         opts.ssh_home = Some(dir);
         opts.target = vec!["down".to_owned(), "up".to_owned()];
-        opts.secret_store = Some(crate::options::SecretStoreKind::Memory);
+        opts.secret_store = Some(anvil::options::SecretStoreKind::Memory);
         opts
     }
 
@@ -570,7 +570,7 @@ mod tests {
         opts.target = vec!["down".to_owned()];
         let home = opts.ssh_home.clone().unwrap();
         let gate = home.join("gate");
-        crate::test_util::write_knobs(
+        anvil::test_util::write_knobs(
             &home.join("fake-ssh.env"),
             &[("FAKE_SSH_GATE", gate.to_str().unwrap())],
         );
@@ -602,7 +602,7 @@ mod tests {
         opts.target = vec!["down".to_owned()];
         let home = opts.ssh_home.clone().unwrap();
         let gate = home.join("gate");
-        crate::test_util::write_knobs(
+        anvil::test_util::write_knobs(
             &home.join("fake-ssh.env"),
             &[("FAKE_SSH_GATE", gate.to_str().unwrap())],
         );
@@ -676,7 +676,7 @@ mod tests {
     fn doctor_sends_each_target_then_the_report_then_finished() {
         let (tx, rx) = mpsc::channel();
         let mut opts = local_opts("tui-worker-doctor", &[]);
-        opts.secret_store = Some(crate::options::SecretStoreKind::Memory);
+        opts.secret_store = Some(anvil::options::SecretStoreKind::Memory);
         let worker = spawn(Job::Doctor, opts, Arc::new(Cancel::new()), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(msgs.len(), 4);

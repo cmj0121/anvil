@@ -105,7 +105,7 @@ fn path_or_null<S: serde::Serializer>(
 }
 
 impl LocalReport {
-    pub(crate) fn ok(&self) -> bool {
+    pub fn ok(&self) -> bool {
         self.ssh
             && self.sh
             && !self
@@ -118,7 +118,7 @@ impl LocalReport {
     }
 
     /// Whether the record could not be read.
-    pub(crate) fn record_failed(&self) -> bool {
+    pub fn record_failed(&self) -> bool {
         self.record
             .as_deref()
             .is_some_and(|record| record != NO_RECORD && record != FOUND_RECORD)

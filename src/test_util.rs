@@ -13,7 +13,6 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::document::{self, Format};
 use crate::editor::random;
-use crate::inventory::{Target, TargetKind};
 use crate::options::Options;
 use crate::paths::DocPath;
 use crate::plugin::{Plugins, Request};
@@ -301,10 +300,11 @@ pub fn logged<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
     (out, lines)
 }
 
-pub(crate) fn target(name: &str) -> Target {
-    Target {
+#[cfg(test)]
+pub(crate) fn target(name: &str) -> crate::inventory::Target {
+    crate::inventory::Target {
         name: name.to_owned(),
-        kind: TargetKind::Local,
+        kind: crate::inventory::TargetKind::Local,
         pkg: None,
         sudo_secret: None,
         tags: Vec::new(),

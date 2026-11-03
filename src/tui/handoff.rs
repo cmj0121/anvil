@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, ThreadId};
 
 use super::app::Msg;
-use crate::term::{self, Handoff, HandoffGuard};
+use anvil::term::{self, Handoff, HandoffGuard};
 
 /// Leaves and enters raw mode plus the alternate screen. Must not panic.
 pub trait Screen: Send + Sync {

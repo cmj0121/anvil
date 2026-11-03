@@ -23,10 +23,6 @@ use crate::update::keys::TrustedKeys;
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    #[cfg_attr(
-        not(any(test, feature = "tui")),
-        expect(dead_code, reason = "read by the TUI")
-    )]
     pub verbose: u8,
     pub inventory: Option<PathBuf>,
     pub config: Option<PathBuf>,
@@ -270,7 +266,6 @@ impl Options {
     }
 
     /// [`Options::inventory`] for a config load already attempted.
-    #[cfg_attr(not(feature = "tui"), expect(dead_code, reason = "used by the TUI"))]
     pub fn inventory_with(&self, config: Result<&Config, &Failure>) -> Result<Inventory, Failure> {
         let path = self.locate_inventory(|| self.inventory_dir(config))?;
         Ok(Inventory::load(path.as_ref())?)

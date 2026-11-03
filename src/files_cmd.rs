@@ -4,12 +4,12 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::cli::{Cli, FilesAction};
-use crate::config::Config;
-use crate::editor::{Buffer, Editor, Fallback};
-use crate::error::{Failure, print_json};
-use crate::filestore::{self, Kind, Root, StoreError, shown};
-use crate::options::Options;
-use crate::tasks;
+use anvil::config::Config;
+use anvil::editor::{Buffer, Editor, Fallback};
+use anvil::error::{Failure, print_json};
+use anvil::filestore::{self, Kind, Root, StoreError, shown};
+use anvil::options::Options;
+use anvil::tasks;
 
 /// Runs a local store operation.
 pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failure> {
@@ -33,7 +33,7 @@ pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failur
                     };
                     println!(
                         "{}{}",
-                        crate::logger::escape_controls(name),
+                        anvil::logger::escape_controls(name),
                         if entry.kind == Kind::Dir { "/" } else { "" }
                     );
                 }
@@ -169,7 +169,7 @@ fn warn_orphans(config: &Config, root: &Root, path: &str) {
                 log::warn!("{warning}");
             } else {
                 // A task's field and include may hold invisible characters.
-                log::warn!("{}", crate::logger::escape_invisible(&warning));
+                log::warn!("{}", anvil::logger::escape_invisible(&warning));
             }
         }
     }

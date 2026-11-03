@@ -167,21 +167,13 @@ pub fn update(out: Output, opts: &Options) -> Result<(), Failure> {
 }
 
 /// The TUI's `u`: this version against the latest release, printing
-/// nothing. No test calls it, so only the TUI keeps it alive.
-#[cfg_attr(
-    not(feature = "tui"),
-    expect(dead_code, reason = "called by the TUI front end")
-)]
+/// nothing.
 pub fn latest(opts: &Options) -> Result<Check, Failure> {
     resolve(&opts.release_source()).map(|latest| latest.check)
 }
 
 /// The TUI's confirmed `u`: [`update`] to `version`, printing nothing.
 /// Refused when the latest release is no longer `version`.
-#[cfg_attr(
-    not(any(test, feature = "tui")),
-    expect(dead_code, reason = "called by the TUI front end")
-)]
 pub fn update_to(opts: &Options, version: &str) -> Result<Updated, Failure> {
     let keys = trusted_keys(opts)?;
     let source = opts.release_source();

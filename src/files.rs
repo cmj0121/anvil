@@ -285,7 +285,7 @@ pub fn run(
 /// How one `[[files]]` entry is written on one target, so that the write
 /// can be built again once the capture says what DEST holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FileWrite {
+pub struct FileWrite {
     /// The entry's ordinal among the list's file items, which is also its
     /// src's index in [`Sources`].
     pub ordinal: usize,
@@ -1194,7 +1194,7 @@ pub(crate) fn parse_od(text: &str, size: u64) -> Result<Zeroizing<Vec<u8>>, Stri
 }
 
 /// The dests whose conflict guard a rollback drops.
-pub(crate) enum Force {
+pub enum Force {
     None,
     Dests(BTreeSet<String>),
     All,
@@ -1212,13 +1212,9 @@ impl Force {
 
 /// Where a rollback's refusals send the user for `--force DEST`.
 #[derive(Clone, Copy)]
-pub(crate) enum Wording {
+pub enum Wording {
     Cli,
     /// The TUI cannot force, so the message points to a terminal.
-    #[cfg_attr(
-        not(any(test, feature = "tui")),
-        expect(dead_code, reason = "only the TUI rolls back with it")
-    )]
     Tui,
 }
 

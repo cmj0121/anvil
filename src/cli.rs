@@ -6,12 +6,12 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 
-use crate::document::Format;
-use crate::error::Failure;
+use anvil::document::Format;
+use anvil::error::Failure;
 #[cfg(debug_assertions)]
-use crate::options::SecretStoreKind;
-use crate::options::{Options, Output};
-use crate::secret::BackendKind;
+use anvil::options::SecretStoreKind;
+use anvil::options::{Options, Output};
+use anvil::secret::BackendKind;
 
 #[derive(Debug, Parser)]
 #[command(name = "anvil", version, about, propagate_version = true)]
@@ -178,7 +178,7 @@ pub enum Command {
         script: PathBuf,
 
         /// Seconds the script may run on each target, 1..=3600
-        #[arg(long, value_name = "SECS", default_value_t = crate::run::DEFAULT_TIMEOUT)]
+        #[arg(long, value_name = "SECS", default_value_t = anvil::run::DEFAULT_TIMEOUT)]
         timeout: u64,
     },
     /// Edit one secret in the editor, or move every secret to another backend
@@ -310,17 +310,17 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
             crate::commands::warn_parallel(cli);
             let (config, expanded) = opts.load_expanded()?;
             let store = opts.secret_store(&config)?;
-            crate::doctor::run(out, &opts, &config, &expanded, store.as_ref())
+            anvil::doctor::run(out, &opts, &config, &expanded, store.as_ref())
         }
-        Command::Apply => crate::apply::run(out, &opts),
-        Command::Plan => crate::plan::run(out, &opts),
+        Command::Apply => anvil::apply::run(out, &opts),
+        Command::Plan => anvil::plan::run(out, &opts),
         Command::Rollback {
             force,
             force_all,
             allow_host_change,
             dry_run,
-        } => crate::rollback::run(out, &opts, force, *force_all, *allow_host_change, *dry_run),
-        Command::Run { script, timeout } => crate::run::run(out, &opts, script, *timeout),
+        } => anvil::rollback::run(out, &opts, force, *force_all, *allow_host_change, *dry_run),
+        Command::Run { script, timeout } => anvil::run::run(out, &opts, script, *timeout),
         Command::Secret { to: Some(to), .. } => crate::commands::migrate(cli, &opts, *to),
         Command::Secret { name, .. } => {
             let config = opts.load_config()?;
@@ -334,11 +334,11 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
         Command::Tui => crate::tui::run(opts),
         Command::Update { check: true } => {
             crate::commands::warn_target(cli);
-            crate::update::check(out, &opts)
+            anvil::update::check(out, &opts)
         }
         Command::Update { check: false } => {
             crate::commands::warn_target(cli);
-            crate::update::update(out, &opts)
+            anvil::update::update(out, &opts)
         }
     }
 }
