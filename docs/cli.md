@@ -111,8 +111,9 @@ is always stored as `inventory.toml`;
 
 On save the buffer is parsed in the edit format and validated; an invalid buffer prints the error (file, host and
 field) and is re-opened with your text, up to three attempts, after which nothing is written and the exit is 2. A
-valid buffer is written as TOML atomically (`inventory.toml.tmp`, mode 0600, renamed over `inventory.toml`); a legacy
-`inventory.yaml` or `inventory.yml` in the workspace is then removed. A buffer left unchanged writes nothing,
+valid buffer is written as TOML atomically (a fresh `.anvil-<pid>-<nanos>-<n>` beside it, mode 0600, renamed over
+`inventory.toml`; another writer's temp file is left alone); a legacy `inventory.yaml` or `inventory.yml` in the
+workspace is then removed. A buffer left unchanged writes nothing,
 whatever the edit format, when the inventory already is `inventory.toml` or does not exist yet. A legacy YAML inventory
 is migrated even then: it is written as `inventory.toml` and the YAML file is removed.
 

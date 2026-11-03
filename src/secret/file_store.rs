@@ -8,7 +8,7 @@
 //! must belong to the current user and be writable by no one else, who
 //! could otherwise swap the store file; a commit checks it again before
 //! it encrypts anything. Only ciphertext reaches the disk: a
-//! 0600 `<store>.tmp-<pid>-<nanos>-<n>` beside the store, synced, then
+//! 0600 `.anvil-<pid>-<nanos>-<n>` beside the store, synced, then
 //! renamed over it. A commit whose ciphertext would be larger than `open`
 //! reads is refused before anything is written. The decrypted bytes, each
 //! value and the serialised plaintext are zeroized when dropped; serde's own
@@ -268,14 +268,8 @@ impl<'a, C: Codec> FileVault<'a, C> {
     /// Writes `ciphertext` to a fresh 0600 temp file beside the store, syncs
     /// it and renames it over the store; the temp file is removed on error.
     fn write_atomic(&self, ciphertext: &[u8]) -> Result<(), SecretError> {
-        private::write_atomic(self.path, ciphertext).map_err(|err| self.error(err.to_string()))
-    }
-
-    /// A new 0600 `<store>.tmp-<pid>-<nanos>-<n>`, a name not known
-    /// in advance; a name that exists already is tried again.
-    #[cfg(test)]
-    fn create_temp(&self) -> Result<(PathBuf, File), SecretError> {
-        private::create_temp(self.path).map_err(|err| self.error(err.to_string()))
+        private::write_atomic(self.path, ciphertext, None)
+            .map_err(|err| self.error(err.to_string()))
     }
 }
 
@@ -733,28 +727,6 @@ mod tests {
             );
             assert_eq!(fs::read(&path).unwrap(), before);
             assert_eq!(files(&root), [path.clone(), lock_of(&path)]);
-        }
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn each_temp_file_gets_a_fresh_name() {
-        let root = temp_dir("file-store-temp");
-        let path = root.join("secrets.x");
-        let vault = FileVault::open(&path, LIMIT, Xor::default()).unwrap();
-        let (first, _) = vault.create_temp().unwrap();
-        let (second, _) = vault.create_temp().unwrap();
-        assert_ne!(first, second);
-        let prefix = format!("secrets.x.tmp-{}-", std::process::id());
-        for tmp in [&first, &second] {
-            let name = tmp.file_name().unwrap().to_str().unwrap();
-            let rest = name.strip_prefix(&prefix).unwrap();
-            let (nanos, n) = rest.split_once('-').unwrap();
-            assert!(
-                nanos.parse::<u128>().is_ok() && n.parse::<u32>().is_ok(),
-                "{name}"
-            );
-            assert_eq!(mode(tmp), 0o600);
         }
         fs::remove_dir_all(&root).unwrap();
     }

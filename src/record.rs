@@ -596,7 +596,7 @@ impl Session {
                 self.limit
             )));
         }
-        private::write_atomic(&self.path, &bytes).map_err(|err| cannot(err.to_string()))
+        private::write_atomic(&self.path, &bytes, None).map_err(|err| cannot(err.to_string()))
     }
 }
 

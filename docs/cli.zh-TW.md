@@ -109,7 +109,8 @@ anvil run --parallel 4 fix.sh
 
 儲存時，緩衝區會以編輯格式解析並驗證；
 無效的緩衝區會印出錯誤（檔案、host 與欄位），並帶著你的文字重新開啟，最多嘗試三次，之後不寫入任何東西並以 2 結束。
-有效的緩衝區會以 TOML 原子性地寫入（`inventory.toml.tmp`，mode 0600，再 rename 覆蓋 `inventory.toml`）；
+有效的緩衝區會以 TOML 原子性地寫入（在旁邊建立全新的 `.anvil-<pid>-<nanos>-<n>`，mode 0600，再 rename 覆蓋 `inventory.toml`；
+其他寫入者的暫存檔不會被動到）；
 接著移除工作區中舊版的 `inventory.yaml` 或 `inventory.yml`。
 當 inventory 已是 `inventory.toml` 或尚不存在時，未變更的緩衝區不論編輯格式為何都不會寫入任何東西。
 舊版 YAML inventory 即使如此仍會被遷移：寫成 `inventory.toml` 並移除 YAML 檔案。
