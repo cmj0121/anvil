@@ -483,6 +483,11 @@ passes, and the write then fails as above. So a dest under a user's home needs `
 Without this rule, whoever can write a directory on the path could swap it, or what is in it, for a symlink or a hard
 link to another file, and root would write that file.
 
+These checks fail closed. A write through sudo first runs `sudo true`; when that fails, sudo prints its own message and
+the step fails with `files: sudo failed; DEST is unchanged`. When a later check cannot run, because sudo failed for a
+moment or a restricted rule denies `test`, `find` or `sh`, the step fails with
+`files: sudo could not check PATH; nothing was changed`, and nothing is written.
+
 A write as the connecting user (`sudo = false` on a login that is not root) has the same rule with a wider owner: every
 directory on the path must be owned by root or by the login user and be writable by neither its group nor others. The
 first that fails stops the step with
@@ -501,9 +506,12 @@ files. A dest that is a directory fails the step with `files: DEST is a director
 
 **How the file is replaced.** Every write, on every path, puts the bytes in a mode-0600 temp file in dest's own
 directory, named `.anvil-<16 hex of dest's sha256>-<16 random hex>` on the controller, and renames it over dest with
-`mv -f`. So an interrupted write leaves dest fully old or fully new. Before the rename the temp gets dest's owner and
-group, its SELinux label where `selinuxenabled` succeeds (`chcon --reference`), its ACL where the GNU `getfacl` and
-`setfacl` exist, and last `mode`. A temp left by a killed run is removed by the next write of the same dest once it is
+`mv -f`. So an interrupted write leaves dest fully old or fully new. Created mode 0600 by `install`, so that a default ACL
+on the directory cannot open it, and while it is still empty, the temp gets dest's owner and group, its SELinux label
+where `selinuxenabled` succeeds (`chcon --reference`), and its ACL where the GNU `getfacl` and `setfacl` exist, with
+`sed` on the target; the bytes follow, and last `mode`, which opens the ACL's entries, before the rename.
+A temp left by a killed run is removed by the next write of
+the same dest once it is
 over an hour old, so that a concurrent run keeps its own; another dest's temp stays. A new file written as root is
 owned by root; its group is root's primary group
 on Linux, and the parent directory's group on macOS and the BSDs or under a setgid parent directory. With
@@ -535,10 +543,13 @@ compares dest with the bytes after; a mismatch fails the step with
 
 **A restricted sudo rule.** An in-place write from a file runs `sh -c 'tee "$1" <"$2"'`, so that a missing source leaves
 dest intact; a rule that allows `tee` but not `sh` breaks it. A `NOPASSWD` rule that lists commands needs `true`,
-`test`, `find`, `tee`, `cmp`,
+`test`, `find`, `install`, `tee`, `cmp`,
 `mv`, `chown`, `chmod`, `rm`, `ls`, `getfacl`, `setfacl`, `chcon`, `od`, `sha256sum` or `shasum`, and `sh` (it probes for tools with
-`sh -c`). Without `getfacl` and `setfacl` the ACL is lost. Without `sh`, the SELinux label is lost and the
-comparison always rewrites.
+`sh -c`). Without `getfacl` and `setfacl` the ACL is lost. Without `sh`, the SELinux label is lost, the
+comparison always rewrites, and a dest that exists is refused, since the check that it has not changed cannot run.
+A rule that allows `sh` but neither hash tool refuses a file others cannot read the same way, with
+`files: sudo could not check DEST; nothing was changed`. A file root cannot read on a root-squashed mount fails the
+same way; use `sudo = false` where the login user can write it.
 
 ## Services
 

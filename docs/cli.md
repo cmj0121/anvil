@@ -1292,7 +1292,8 @@ and writable by neither its group nor others; the step fails with
 `files: DIR is not root-only; root will not write under it`, naming the first directory that fails, and writes
 nothing. A dest under a user's home therefore needs `sudo = false`. A write as root also refuses a dest that is a
 symlink and leaves the link and its target alone; the step fails with
-`files: DEST is a symlink; point dest at the real file`.
+`files: DEST is a symlink; point dest at the real file`. A sudo that fails refuses the write too:
+`files: sudo failed; DEST is unchanged`, or `files: sudo could not check PATH; nothing was changed` for a later check.
 
 A `sudo = false` write as the connecting user refuses a symlinked dest too, dangling or not, and any directory on the
 path that is not root's or the login user's or that its group or others can write:

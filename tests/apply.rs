@@ -428,7 +428,13 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
     let sudo = std::fs::read_to_string(&sudo_log).unwrap();
     assert!(sudo.contains("\nchmod 0640 "), "{sudo}");
     assert!(sudo.contains("\nmv -f "), "{sudo}");
-    assert!(!sudo.contains("install"), "{sudo}");
+    assert!(
+        sudo.lines()
+            .filter(|line| line.starts_with("install"))
+            .all(|line| line.starts_with("install -m 600 /dev/null ")),
+        "only the empty temp: {sudo}"
+    );
+    assert!(sudo.contains("\ninstall -m 600 /dev/null "), "{sudo}");
 
     let out = apply(&["--json"], common::VALUE);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));

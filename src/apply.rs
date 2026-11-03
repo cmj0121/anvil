@@ -5775,7 +5775,7 @@ mod tests {
         );
         assert_eq!(*typed, None, "a plain run");
         assert!(
-            runs[1].contains("! sudo -n test -e '/etc/a.conf' ||"),
+            runs[1].contains("sudo -n test ! -e '/etc/a.conf' ||"),
             "the write refuses a dest that appeared: {}",
             runs[1]
         );

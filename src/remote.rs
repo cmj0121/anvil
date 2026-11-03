@@ -85,49 +85,80 @@ pub(crate) fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// A message on stderr and a non-zero status when DEST is a directory. A
-/// failing `sudo` passes, so the next `sudo` prints its own message.
-pub(crate) fn not_a_directory(sudo: &str, d: &str, dest: &str) -> String {
-    let message = quote(&format!("files: {dest} is a directory"));
-    format!("{{ ! {sudo}test -d {d} || {{ echo {message} >&2; false; }}; }}")
+/// What a refusal says when `sudo` could not run a check on `path`.
+pub(crate) fn unchecked(path: &str) -> String {
+    format!("files: sudo could not check {path}; nothing was changed")
 }
 
-/// A message on stderr and a non-zero status when DEST is a symlink, which a
-/// write as root would follow. A failing `sudo` passes, as above.
+/// `message` on stderr and a non-zero status, for a check that failed. A
+/// failing `sudo` fails a check just as a bad path does, so under `sudo` this
+/// asks `probe` whether the path really is what `message` says, and otherwise
+/// says that the check could not run. Either way the check has failed.
+pub(crate) fn refusal(sudo: &str, path: &str, probe: &str, message: &str) -> String {
+    let message = quote(message);
+    if sudo.is_empty() {
+        return format!("{{ echo {message} >&2; false; }}");
+    }
+    let unchecked = quote(&unchecked(path));
+    format!(
+        "{{ if {sudo}{probe} >/dev/null 2>&1; then echo {message} >&2; \
+         else echo {unchecked} >&2; fi; false; }}"
+    )
+}
+
+/// A message on stderr and a non-zero status unless `sudo` can say that DEST is
+/// no directory.
+pub(crate) fn not_a_directory(sudo: &str, d: &str, dest: &str) -> String {
+    let refused = refusal(
+        sudo,
+        dest,
+        &format!("test -d {d}"),
+        &format!("files: {dest} is a directory"),
+    );
+    format!("{{ {sudo}test ! -d {d} || {refused}; }}")
+}
+
+/// A message on stderr and a non-zero status unless `sudo` can say that DEST is
+/// no symlink, which a write as root would follow.
 pub(crate) fn not_a_symlink(sudo: &str, d: &str, dest: &str) -> String {
-    let message = quote(&format!(
-        "files: {dest} is a symlink; point dest at the real file"
-    ));
-    format!("{{ ! {sudo}test -L {d} || {{ echo {message} >&2; false; }}; }} && ")
+    let refused = refusal(
+        sudo,
+        dest,
+        &format!("test -L {d}"),
+        &format!("files: {dest} is a symlink; point dest at the real file"),
+    );
+    format!("{{ {sudo}test ! -L {d} || {refused}; }} && ")
 }
 
 /// A message on stderr and a non-zero status when `dir` is not a directory
 /// that passes the `owner` test and neither group nor others may write; `find`
 /// does not follow `dir` when it is a symlink. A missing `dir` passes, so the
-/// write fails as it would, and so does a failing `sudo`, as above.
+/// write fails as it would; a failing `sudo` does not.
 pub(crate) fn owned_only(sudo: &str, dir: &str, owner: &str) -> String {
-    let message = quote(&if owner == LOGIN_OWNED {
+    let message = if owner == LOGIN_OWNED {
         format!(
             "files: {dir} is not owned by root or the login user, or others can write it; \
              anvil will not write under it"
         )
     } else {
         format!("files: {dir} is not root-only; root will not write under it")
-    });
+    };
+    let probe = format!("find {} -prune", quote(dir));
     format!(
-        "{{ {} || {{ echo {message} >&2; false; }}; }} && ",
-        is_owned_only(sudo, dir, owner)
+        "{{ {} || {}; }} && ",
+        is_owned_only(sudo, dir, owner),
+        refusal(sudo, dir, &probe, &message)
     )
 }
 
 /// The test [`owned_only`] runs, alone: true when `dir` is missing or a
 /// directory that passes the `owner` test and neither group nor others may
-/// write.
+/// write; false when `sudo` fails, since both halves need it to answer.
 pub(crate) fn is_owned_only(sudo: &str, dir: &str, owner: &str) -> String {
     let d = quote(dir);
     let found = root_only_find(owner);
     format!(
-        "{{ ! {sudo}test -e {d} && ! {sudo}test -L {d}; }} \
+        "{{ {sudo}test ! -e {d} && {sudo}test ! -L {d}; }} \
          || [ -n \"$({sudo}find {d} {found})\" ]"
     )
 }
@@ -367,7 +398,7 @@ impl Replacement<'_> {
             "{{ umask 077; LC_ALL=C; export LC_ALL; set -f\n\
              anvil_t=\n\
              {trap}{staged_check}{bytes}\
-             anvil_tight() {{ {sudo}test -e {d} || return 0; {sudo}chmod 600 {d} 2>/dev/null && return 0; \
+             anvil_tight() {{ {sudo}test ! -e {d} && return 0; {sudo}chmod 600 {d} 2>/dev/null && return 0; \
              {has_mode} && return 0; echo {foreign} >&2; exit {REFUSED}; }}\n\
              anvil_mode() {{ {sudo}chmod {mode} {d} 2>/dev/null || {has_mode} \
              || {{ echo {foreign} >&2; return 1; }}; }}\n\
@@ -405,7 +436,13 @@ impl Replacement<'_> {
         }
     }
 
-    /// The lines that replace DEST and then run `finish`. Each fallback in
+    /// The lines that replace DEST and then run `finish`. The temp is empty
+    /// until it is 0600 with DEST's owner, label and ACL. An fd opened on it
+    /// would read the bytes later, so it is closed from the start: `install`
+    /// creates it 0600 where a default ACL on the directory would open what
+    /// `tee` creates, despite the umask, and [`Self::labels`] keeps it closed.
+    /// A sudo failure on DEST reaches `ls` and fails, rather than reading as a
+    /// new file that keeps no owner, label or ACL. Each fallback in
     /// place warns: the directory is not writable, a user's write would
     /// change DEST's owner, or `mv` failed with the temp fully written. A
     /// temp that cannot be fully written fails the run with DEST untouched,
@@ -475,18 +512,23 @@ impl Replacement<'_> {
              anvil_verify\n\
              {set_dest_owner}anvil_mode || exit 1\n\
              else\n\
-             anvil_t=1; anvil_fb=; anvil_no_acl=\n\
-             if : | {sudo}tee {t} >/dev/null && {sudo}chmod 600 {t} && anvil_bytes | {sudo}tee {t} >/dev/null; then \
-             set -- $({sudo}ls -ln {t}); [ \"$5\" = {len} ] || {fail}\n\
-             else {fail}; fi\n\
+             anvil_fb=; anvil_no_acl=\n\
+             {sudo}test ! -e {t} && {sudo}test ! -L {t} || {fail}\n\
+             anvil_t=1\n\
+             {sudo}install -m 600 /dev/null {t} || {fail}\n\
+             set -- $({sudo}ls -ln {t}); [ \"$5\" = 0 ] || {fail}\n\
              anvil_mine=$3:$4\n\
              {set_temp_owner}\
-             if {sudo}test -e {d}; then\n\
+             if {sudo}test ! -e {d}; then :\n\
+             else\n\
              anvil_line=$({sudo}ls -lLdn {d}) || {fail}\n\
              set -- $anvil_line\n\
              {owner_of_dest}\
              [ -n \"$anvil_fb\" ] || {{ {labels} }}\n\
              fi\n\
+             if {sudo}chmod 600 {t} && anvil_bytes | {sudo}tee {t} >/dev/null; then \
+             set -- $({sudo}ls -ln {t}); [ \"$5\" = {len} ] || {fail}\n\
+             else {fail}; fi\n\
              if [ -z \"$anvil_fb\" ]; then\n\
              {sudo}chmod {mode} {t} || {fail}\n\
              if {sudo}mv -f {t} {d}; then anvil_t=; [ -z \"$anvil_no_acl\" ] || echo {acl_lost} >&2\n\
@@ -509,6 +551,11 @@ impl Replacement<'_> {
     /// target has them. The GNU tools answer `--version`; other platforms'
     /// differ in their flags, so an ACL there, which `ls` marks with `+` in
     /// `$1`, is noted for the warning after the rename that loses it.
+    ///
+    /// The ACL goes on with its owner, other and mask entries closed, and the
+    /// owning group's too when there is no mask to close it: `--set-file` also
+    /// sets the mode bits, and DEST's may be wider than `mode`. The final
+    /// `chmod` then sets those three, and the entries come out as DEST has them.
     fn labels(&self, fail: &str) -> String {
         let (d, t, sudo) = (quote(self.dest), quote(self.temp), self.sudo);
         let enabled = match sudo {
@@ -519,6 +566,10 @@ impl Replacement<'_> {
             "if {enabled}; then {sudo}chcon --reference={d} {t} || {fail}; fi; \
              if {sudo}getfacl --version >/dev/null 2>&1 && {sudo}setfacl --version >/dev/null 2>&1; then \
              anvil_acl=$({sudo}getfacl -p {d}) || {fail}; \
+             case \"$anvil_acl\" in *'\nmask::'*) anvil_group='s/^group::/group::/' ;; \
+             *) anvil_group='s/^group::.*/group::---/' ;; esac; \
+             anvil_acl=$(printf '%s\\n' \"$anvil_acl\" | sed -e 's/^user::.*/user::rw-/' -e \"$anvil_group\" \
+             -e 's/^mask::.*/mask::---/' -e 's/^other::.*/other::---/') || {fail}; \
              printf '%s\\n' \"$anvil_acl\" | {sudo}setfacl --set-file=- {t} || {fail}; \
              else case $1 in *+) anvil_no_acl=1 ;; esac; fi;"
         )

@@ -463,6 +463,10 @@ anvil 設定 `mode`，並保留既有 dest 的擁有者與群組。它不建立�
 路徑上不存在的目錄會通過檢查，接著寫入如上所述地失敗。因此位於使用者家目錄之下的 dest 需要 `sudo = false`。
 少了這條規則，能寫入路徑上某個目錄的人就能把該目錄或其中的東西換成指向其他檔案的 symlink 或 hard link，讓 root 寫入那個檔案。
 
+這些檢查在失敗時一律拒絕。透過 sudo 寫入時會先執行 `sudo true`；它失敗時 sudo 印出自己的訊息，
+step 失敗並顯示 `files: sudo failed; DEST is unchanged`。之後的檢查無法執行時（sudo 暫時失敗，或受限的規則不允許 `test`、`find` 或 `sh`），
+step 失敗並顯示 `files: sudo could not check PATH; nothing was changed`，且不寫入任何東西。
+
 以連線使用者身分寫入（非 root 登入且 `sudo = false`）時規則相同，只是擁有者較寬：路徑上每個目錄都必須屬於 root 或登入使用者，
 且其群組與其他人都不能寫入。第一個不符合的目錄會讓 step 失敗並顯示
 `files: DIR is not owned by root or the login user, or others can write it; anvil will not write under it`。
@@ -477,8 +481,9 @@ dest 是目錄時 step 失敗並顯示 `files: DEST is a directory`（`/etc/a` �
 
 **檔案如何被取代。** 每次寫入，不論走哪條路徑，都把位元組放進 dest 所在目錄中一個 mode 0600 的暫存檔，
 其名稱在 controller 上產生：`.anvil-<dest 的 sha256 前 16 位十六進位>-<16 位隨機十六進位>`，再以 `mv -f` 改名蓋過 dest。
-因此被中斷的寫入會讓 dest 保持完整的舊內容或完整的新內容。改名之前，暫存檔會取得 dest 的擁有者與群組、
-SELinux 標籤（`selinuxenabled` 成功時，以 `chcon --reference`）、ACL（有 GNU `getfacl` 與 `setfacl` 時），最後是 `mode`。
+因此被中斷的寫入會讓 dest 保持完整的舊內容或完整的新內容。暫存檔由 `install` 以 mode 0600 建立，因此目錄上的預設 ACL 無法開放它；它仍為空時，會取得 dest 的擁有者與群組、
+SELinux 標籤（`selinuxenabled` 成功時，以 `chcon --reference`）、ACL（有 GNU `getfacl` 與 `setfacl`，且 target 有 `sed` 時）；
+接著寫入位元組，最後在改名之前設定 `mode`，此時 ACL 的項目才生效。
 被終止的執行所留下的暫存檔，在超過一小時後由下一次寫入同一個 dest 時移除，因此同時進行的執行能保有自己的暫存檔；其他 dest 的暫存檔不受影響。
 以 root 寫入的新檔案屬於 root；其群組在 Linux 上是 root 的主要群組，在 macOS 與 BSD 上或位於設有 setgid 的上層目錄之下時，
 則是上層目錄的群組。`sudo = false` 時新檔案屬於連線使用者。
@@ -502,9 +507,11 @@ SELinux 標籤以外的延伸屬性、`chattr +i` 之類的檔案旗標，以及
 因此磁碟已滿不會影響到 dest。每次就地寫入都先檢查來源的大小，寫入後再與 dest 比對；不符時 step 失敗並顯示
 `files: DEST does not hold the bytes written; re-run apply or anvil rollback`。就地寫入也需要 `wc`。
 
-**受限的 sudo 規則。** 從檔案就地寫入時會執行 `sh -c 'tee "$1" <"$2"'`，這樣來源不存在時 dest 保持不動；只允許 `tee` 而不允許 `sh` 的規則會讓它失敗。列出指令的 `NOPASSWD` 規則需要 `true`、`test`、`find`、`tee`、`cmp`、`mv`、`chown`、`chmod`、`rm`、`ls`、
+**受限的 sudo 規則。** 從檔案就地寫入時會執行 `sh -c 'tee "$1" <"$2"'`，這樣來源不存在時 dest 保持不動；只允許 `tee` 而不允許 `sh` 的規則會讓它失敗。列出指令的 `NOPASSWD` 規則需要 `true`、`test`、`find`、`install`、`tee`、`cmp`、`mv`、`chown`、`chmod`、`rm`、`ls`、
 `getfacl`、`setfacl`、`chcon`、`od`、`sha256sum` 或 `shasum`，以及 `sh`（它以 `sh -c` 探測工具）。
-沒有 `getfacl` 與 `setfacl` 時 ACL 會遺失。沒有 `sh` 時 SELinux 標籤會遺失，比較也一律重寫。
+沒有 `getfacl` 與 `setfacl` 時 ACL 會遺失。沒有 `sh` 時 SELinux 標籤會遺失，比較也一律重寫，且已存在的 dest 會被拒絕，因為無法檢查它是否已變更。
+允許 `sh` 但不允許任一雜湊工具的規則，對其他人無法讀取的檔案同樣拒絕，並顯示 `files: sudo could not check DEST; nothing was changed`。
+root-squash 掛載點上 root 無法讀取的檔案也會同樣失敗；若登入使用者能寫入，請改用 `sudo = false`。
 
 ## Services
 

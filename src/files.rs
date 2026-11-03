@@ -34,8 +34,8 @@ use crate::record::{
 };
 use crate::remote::{
     Bytes, Heredoc, LOGIN_OWNED, ROOT_OWNED, Replacement, is_owned_only, link_removal_checks,
-    login_checks, login_top, not_a_directory, random_hex, root_checks, root_only_find, sweep,
-    temp_beside, zeroizing,
+    login_checks, login_top, not_a_directory, random_hex, refusal, root_checks, root_only_find,
+    sweep, temp_beside, unchecked, zeroizing,
 };
 pub(crate) use crate::remote::{REFUSED, hex, quote};
 use crate::secret;
@@ -423,19 +423,21 @@ fn staged(heredoc: &Heredoc<'_>) -> Result<(String, Upload), String> {
 /// nothing to check. A target without a hash tool is not checked.
 fn guard(sudo: &str, dest: &str, expected: &Expected) -> String {
     let d = quote(dest);
-    let refuse = format!(
-        "{{ echo {} >&2; exit {REFUSED}; }}",
-        quote(&format!(
-            "files: {dest} changed while anvil was writing it; re-run apply"
-        ))
-    );
+    let changed = format!("files: {dest} changed while anvil was writing it; re-run apply");
+    let refuse = format!("{{ echo {} >&2; exit {REFUSED}; }}", quote(&changed));
     match expected {
         Expected::Unchecked => String::new(),
         Expected::Sha256(sha) if sha.is_empty() => String::new(),
-        Expected::Absent => format!("! {sudo}test -e {d} || {refuse}\n"),
+        Expected::Absent => format!(
+            "{sudo}test ! -e {d} || {} || exit {REFUSED}\n",
+            refusal(sudo, dest, &format!("test -e {d}"), &changed)
+        ),
         Expected::Sha256(sha) => format!(
-            "{}anvil_now=$(anvil_sha256 {d}); [ $? -eq 2 ] || [ \"$anvil_now\" = {} ] || {refuse}\n",
+            "{}anvil_now=$(anvil_sha256 {d})\n\
+             case $? in 2) ;; 3) echo {} >&2; exit {REFUSED} ;; \
+             *) [ \"$anvil_now\" = {} ] || {refuse} ;; esac\n",
             hash_fn(sudo),
+            quote(&unchecked(dest)),
             quote(sha)
         ),
     }
@@ -473,20 +475,27 @@ pub(crate) fn skip_run(dest: &str, label: String) -> PlannedRun {
     file_run(dest, Zeroizing::default(), label, None, skip)
 }
 
-/// One run under `umask 077` that runs `checks` first, then refuses a
-/// directory DEST, then the guard; when DEST already holds the bytes, only
-/// the mode, else [`Replacement::replace`].
+/// One run under `umask 077` that first refuses a `sudo` that fails, then runs
+/// `checks`, then refuses a directory DEST, then the guard; when DEST already
+/// holds the bytes, only the mode, else [`Replacement::replace`].
 fn replace_script(write: &Replacement<'_>, checks: &str, expected: &Expected) -> Zeroizing<String> {
     let (dest, sudo) = (write.dest, write.sudo);
     let d = quote(dest);
     let guard = guard(sudo, dest, expected);
     let directory = not_a_directory(sudo, &d, dest);
+    let ready = match sudo {
+        "" => String::new(),
+        _ => format!(
+            "{sudo}true || {{ echo {} >&2; exit {REFUSED}; }}\n",
+            quote(&format!("files: sudo failed; {dest} is unchanged"))
+        ),
+    };
     let (unchanged, wrote) = (
         quote(&format!("unchanged {dest}")),
         quote(&format!("wrote {dest}")),
     );
     zeroizing(format_args!(
-        "{open}{checks}{directory} || exit {REFUSED}\n\
+        "{open}{ready}{checks}{directory} || exit {REFUSED}\n\
          {guard}{sweep}if {same}; then anvil_mode && echo {unchanged}\n\
          else {replace}fi\n\
          }}\n",
@@ -565,14 +574,16 @@ pub(crate) const MAX_KEPT: u64 = 256 * 1024;
 
 /// Defines `anvil_sha256 FILE`, which prints FILE's sha256 in hex through
 /// `$anvil_sudo` (unquoted, so `sudo -n` is two words): with `sha256sum`,
-/// else `shasum -a 256`. It returns 1 when the tool cannot read FILE and 2,
+/// else `shasum -a 256`. It returns 1 when the tool cannot read FILE,
+/// 3, printing nothing, when `$anvil_sudo` cannot run even `sh -c :`, so that
+/// the search says nothing about the target, and 2,
 /// printing nothing, when the target has neither tool.
 pub(crate) const HASH: &str = "anvil_sha256() {
 if $anvil_sudo sh -c 'command -v sha256sum' >/dev/null 2>&1; then
 anvil_h=$($anvil_sudo sha256sum \"$1\" 2>/dev/null) || return 1
 elif $anvil_sudo sh -c 'command -v shasum' >/dev/null 2>&1; then
 anvil_h=$($anvil_sudo shasum -a 256 \"$1\" 2>/dev/null) || return 1
-else return 2
+else $anvil_sudo sh -c : >/dev/null 2>&1 || return 3; return 2
 fi
 anvil_h=${anvil_h#\\\\}
 printf '%s\\n' \"${anvil_h%% *}\"
@@ -612,15 +623,22 @@ pub(crate) fn capture_script(dest: &str, sudo: &str, checks: &str) -> String {
     };
     let quiet = if sudo == "sudo " { " 2>/dev/null" } else { "" };
     let irregular = quote(&format!("files: {dest} is not a regular file"));
+    // Without a hash the write has no changed-DEST guard. Root can read the
+    // file, so under `sudo` a failed hash is sudo's; the user's may be a mode.
+    let no_hash = if sudo.is_empty() { "3" } else { "1|3" };
+    // In a pipeline `exit` ends only the hash, so the line that
+    // [`parse_capture`] refuses fails the run there.
+    let unchecked = quote(&unchecked(dest));
     // `od` itself, not `command -v od`: the probe runs what the read runs,
     // with its flags.
     let has_od = format!("{sudo}od -An -tx1 </dev/null >/dev/null 2>&1");
     format!(
         "{{ umask 077; LC_ALL=C; export LC_ALL; set -f\n\
          {hash}\
-         anvil_sent() {{ anvil_s=$(anvil_sha256 {d}) && echo \"{MARK}sha256 $anvil_s\"; :; }}\n\
+         anvil_sent() {{ anvil_s=$(anvil_sha256 {d}); case $? in 0) echo \"{MARK}sha256 $anvil_s\" ;; \
+         {no_hash}) echo {unchecked} >&2; echo '{MARK}unchecked'; exit 1 ;; esac; }}\n\
          {ready}{checks}: || exit 1\n\
-         if ! {sudo}test -e {d}{quiet}; then\n\
+         if {sudo}test ! -e {d}{quiet}; then\n\
          echo '{MARK}absent'; exit 0\n\
          fi\n\
          anvil_line=$({sudo}ls -lLdn {d}) || exit 1\n\
@@ -1358,16 +1376,18 @@ fn restore_guard(sudo: &str, file: &FileRecord, forced: bool, wording: Wording) 
         format!(
             "elif [ \"$anvil_cur\" = {written} ]; then :\n\
              elif [ \"$anvil_rc\" -eq 2 ]; then echo {no_tool} >&2; exit {CONFLICT}\n\
+             elif [ \"$anvil_rc\" -eq 3 ]; then echo {unchecked} >&2; exit {CONFLICT}\n\
              else echo {changed} >&2; exit {CONFLICT}\n",
             written = quote(&file.written_sha256),
             no_tool = quote(&no_tool),
+            unchecked = quote(&unchecked(dest)),
             changed = quote(&changed),
         )
     };
     format!(
         "{hash}anvil_same=\n\
-         {link}if {sudo}test -e {d}; then anvil_cur=$(anvil_sha256 {d}); anvil_rc=$?\n\
-         else anvil_cur=absent; anvil_rc=0; fi\n\
+         {link}if {sudo}test ! -e {d}; then anvil_cur=absent; anvil_rc=0\n\
+         else anvil_cur=$(anvil_sha256 {d}); anvil_rc=$?; fi\n\
          if {same}; then anvil_same=1\n\
          {conflict}fi\n",
         hash = hash_fn(sudo),
@@ -2108,7 +2128,10 @@ mod tests {
         );
         assert!(run.run.contains("anvil_bytes | sudo tee '/etc/.anvil-"));
         assert!(run.run.contains("sudo mv -f '/etc/.anvil-"));
-        assert!(!run.run.contains("sudo install"));
+        assert!(
+            run.run
+                .contains("sudo install -m 600 /dev/null '/etc/.anvil-")
+        );
         let other = only_run(true, Some("WEB"), &user_facts("binary"));
         assert_ne!(
             other.file().unwrap().upload.as_ref().unwrap().cleanup,
@@ -2120,23 +2143,26 @@ mod tests {
     fn root_checks_cover_each_directory_from_the_root_then_dest() {
         let guard = |dir: &str| {
             format!(
-                "{{ {{ ! sudo test -e '{dir}' && ! sudo test -L '{dir}'; }} \
+                "{{ {{ sudo test ! -e '{dir}' && sudo test ! -L '{dir}'; }} \
                  || [ -n \"$(sudo find '{dir}' -prune -type d -user 0 ! -perm -020 ! -perm -002)\" ] \
-                 || {{ echo 'files: {dir} is not root-only; root will not write under it' >&2; false; }}; }} && "
+                 || {{ if sudo find '{dir}' -prune >/dev/null 2>&1; \
+                 then echo 'files: {dir} is not root-only; root will not write under it' >&2; \
+                 else echo 'files: sudo could not check {dir}; nothing was changed' >&2; fi; false; }}; }} && "
             )
         };
         assert_eq!(
             root_checks("sudo ", "/etc/ssh/x"),
             format!(
-                "{}{}{}{{ ! sudo test -L '/etc/ssh/x' || {{ echo 'files: /etc/ssh/x is a symlink; \
-                 point dest at the real file' >&2; false; }}; }} && ",
+                "{}{}{}{{ sudo test ! -L '/etc/ssh/x' || {{ if sudo test -L '/etc/ssh/x' >/dev/null 2>&1; \
+                 then echo 'files: /etc/ssh/x is a symlink; point dest at the real file' >&2; \
+                 else echo 'files: sudo could not check /etc/ssh/x; nothing was changed' >&2; fi; false; }}; }} && ",
                 guard("/"),
                 guard("/etc"),
                 guard("/etc/ssh")
             )
         );
         assert!(!root_checks("", "/a").contains("sudo"));
-        assert!(root_checks("", "/a").starts_with("{ { ! test -e '/' && ! test -L '/'; }"));
+        assert!(root_checks("", "/a").starts_with("{ { test ! -e '/' && test ! -L '/'; }"));
     }
 
     #[test]
@@ -2164,7 +2190,9 @@ mod tests {
             "[ -f '/tmp/anvil-00' ] && [ ! -L '/tmp/anvil-00' ] && [ -O '/tmp/anvil-00' ] ||"
         ));
         assert!(run.contains(&format!(
-            "{}{{ ! sudo test -d '/etc/a' || {{ echo 'files: /etc/a is a directory' >&2; false; }}; }} \
+            "{}{{ sudo test ! -d '/etc/a' || {{ if sudo test -d '/etc/a' >/dev/null 2>&1; \
+             then echo 'files: /etc/a is a directory' >&2; \
+             else echo 'files: sudo could not check /etc/a; nothing was changed' >&2; fi; false; }}; }} \
              || exit 4",
             root_checks("sudo ", "/etc/a")
         )));
@@ -2315,6 +2343,84 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_acl_reaches_the_empty_temp_without_opening_it_to_anyone() {
+        let sudo = "case $1 in -k) exit 0 ;; -n) shift ;; esac\nexec \"$@\"";
+        let tee = format!(
+            "{REAL}\n\
+             cat >\"$1.in\"\n\
+             [ ! -s \"$1.in\" ] || ls -ln \"$1\" >>\"$ANVIL_LOG\"\n\
+             cat \"$1.in\" >\"$1\"; rm -f \"$1.in\""
+        );
+        // As the real one does, it takes the file's mode bits from the entries.
+        let setfacl = "case $1 in --version) exit 0 ;; esac\n\
+                       cat >\"$ANVIL_LOG.acl\"\n\
+                       case $(cat \"$ANVIL_LOG.acl\") in *other::r*) chmod 644 \"$2\" ;; esac\n\
+                       ls -ln \"$2\" >>\"$ANVIL_LOG\"";
+        let cases = [
+            (
+                "user::rw-\nuser:bob:r--\ngroup::r-x\nmask::r-x\nother::r--\n",
+                "user::rw-\nuser:bob:r--\ngroup::r-x\nmask::---\nother::---\n",
+            ),
+            (
+                "user::rw-\ngroup::r--\nother::r--\n",
+                "user::rw-\ngroup::---\nother::---\n",
+            ),
+        ];
+        for (acl, set) in cases {
+            for n in 0..2 {
+                let getfacl = format!("case $1 in --version) exit 0 ;; esac\nprintf '{acl}'");
+                let (dir, bin, dest) = write_case(
+                    "files-acl-empty",
+                    &[
+                        ("sudo", sudo),
+                        ("tee", &tee),
+                        ("getfacl", &getfacl),
+                        ("setfacl", setfacl),
+                    ],
+                );
+                let (log, staged) = (dir.join("log"), dir.join("staged"));
+                fs::write(&staged, "new\n").unwrap();
+                fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+                let top = dest.parent().unwrap();
+                let script = if n == 0 {
+                    replacing(&dest, "sudo -n ")
+                } else {
+                    install_script(
+                        staged.to_str().unwrap(),
+                        dest.to_str().unwrap(),
+                        "0640",
+                        &user_checks("sudo ", &dest, top),
+                        &Expected::Unchecked,
+                    )
+                };
+                let script = format!(
+                    "ANVIL_LOG={}; export ANVIL_LOG\n{script}",
+                    quote(log.to_str().unwrap())
+                );
+                let out = sh_with(&bin, &script);
+                assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+                assert_eq!(out.code, Some(0));
+                assert_eq!(fs::read_to_string(dir.join("log.acl")).unwrap(), set);
+                let log = fs::read_to_string(&log).unwrap();
+                let lines: Vec<Vec<&str>> = log
+                    .lines()
+                    .map(|l| l.split_whitespace().collect())
+                    .collect();
+                assert_eq!(lines.len(), 2, "{log}");
+                assert_eq!(lines[0][4], "0", "the ACL comes before the bytes: {log}");
+                assert_eq!(lines[1][4], "0", "still empty when they come: {log}");
+                for line in &lines {
+                    assert_eq!(&line[0][..10], "-rw-------", "{log}");
+                }
+                assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+                assert_eq!(mode_of(&dest), 0o640);
+                assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+                fs::remove_dir_all(&dir).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -2569,7 +2675,7 @@ mod tests {
         let bin = bin_with(
             &dir,
             &[
-                "head", "tee", "chmod", "sh", "cmp", "id", "ls", "find", "rm", "test",
+                "head", "tee", "install", "chmod", "sh", "cmp", "id", "ls", "find", "rm", "test",
             ],
             &[],
         );
@@ -3034,7 +3140,8 @@ mod tests {
         let bin = passthrough_sudo(&dir);
         let path = std::env::var("PATH").unwrap();
         for tool in [
-            "head", "tee", "chmod", "test", "sh", "find", "mv", "id", "ls", "chown", "rm",
+            "head", "tee", "install", "chmod", "test", "true", "sh", "find", "mv", "id", "ls",
+            "chown", "rm",
         ] {
             let found = std::env::split_paths(&path)
                 .map(|p| p.join(tool))
@@ -3136,6 +3243,451 @@ mod tests {
             .collect();
         dirs.reverse();
         checks(sudo, dest.to_str().unwrap(), &dirs, &owner)
+    }
+
+    /// The write through `sudo -n` and on the password path, as [`root_scripts`].
+    fn sudo_scripts(dest: &Path, top: &Path, temp: &Path, expected: &Expected) -> [String; 2] {
+        let (heredoc, d) = (Heredoc::new("new\n").unwrap(), dest.to_str().unwrap());
+        [
+            tee_script(
+                &heredoc,
+                d,
+                "0644",
+                "sudo -n ",
+                &user_checks("sudo -n ", dest, top),
+                expected,
+            )
+            .to_string(),
+            install_script(
+                temp.to_str().unwrap(),
+                d,
+                "0644",
+                &user_checks("sudo ", dest, top),
+                expected,
+            ),
+        ]
+    }
+
+    /// A bin dir whose `sudo` fails with a message when `denied`, a shell test
+    /// of `$1` and the rest of its arguments, holds.
+    fn denying_sudo(dir: &Path, denied: &str) -> PathBuf {
+        let sudo = format!(
+            "case $1 in -k) exit 0 ;; -n) shift ;; esac\n\
+             if {denied}; then echo 'sudo: a password is required' >&2; exit 1; fi\n\
+             exec \"$@\""
+        );
+        bin_with(dir, &[], &[("sudo", &sudo)])
+    }
+
+    /// Each of `scripts` refuses, status [`REFUSED`] and `message` on stderr,
+    /// and writes nothing.
+    fn assert_sudo_refused(
+        dir: &Path,
+        bin: &Path,
+        dest: &Path,
+        expected: &Expected,
+        message: &str,
+    ) {
+        let temp = dir.join("temp");
+        for (n, script) in sudo_scripts(dest, dir, &temp, expected).iter().enumerate() {
+            fs::write(&temp, "new\n").unwrap();
+            let out = sh_with(bin, script);
+            let stderr = String::from_utf8(out.stderr).unwrap();
+            assert_eq!(out.code, Some(REFUSED), "script {n}: {stderr}");
+            assert!(out.stdout.is_empty(), "script {n}");
+            assert!(stderr.contains(message), "script {n}: {stderr}");
+            assert!(
+                leftovers(dest)
+                    .iter()
+                    .all(|name| !name.starts_with(".anvil-"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_sudo_that_denies_test_refuses_a_symlink_a_directory_and_a_plain_file() {
+        let dir = dir("files-sudo-no-test");
+        let bin = denying_sudo(&dir, "[ \"$1\" = test ]");
+        let (target, link) = (dir.join("target"), dir.join("link"));
+        fs::write(&target, "old\n").unwrap();
+        symlink(&target, &link).unwrap();
+        let folder = dir.join("folder");
+        fs::create_dir(&folder).unwrap();
+        let plain = dir.join("plain");
+        fs::write(&plain, "old\n").unwrap();
+        for dest in [&link, &folder, &plain] {
+            let message = format!("files: sudo could not check {}", dest.display());
+            assert_sudo_refused(&dir, &bin, dest, &Expected::Unchecked, &message);
+        }
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old\n");
+        assert_eq!(fs::read_to_string(&plain).unwrap(), "old\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sudo_that_denies_test_and_find_refuses_a_missing_directory_too() {
+        let dir = dir("files-sudo-no-find");
+        let bin = denying_sudo(&dir, "[ \"$1\" = test ] || [ \"$1\" = find ]");
+        let dest = dir.join("conf");
+        let message = format!("files: sudo could not check {}", dir.display());
+        assert_sudo_refused(&dir, &bin, &dest, &Expected::Unchecked, &message);
+        assert!(!dest.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sudo_that_fails_at_the_gate_writes_nothing_and_says_so() {
+        let dir = dir("files-sudo-gate");
+        let bin = denying_sudo(&dir, "[ \"$1\" = true ]");
+        let dest = dir.join("conf");
+        fs::write(&dest, "old\n").unwrap();
+        let message = format!(
+            "sudo: a password is required\nfiles: sudo failed; {} is unchanged",
+            dest.display()
+        );
+        assert_sudo_refused(&dir, &bin, &dest, &Expected::Unchecked, &message);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_absent_guard_refuses_when_sudo_cannot_answer_it() {
+        let dir = dir("files-sudo-absent");
+        let dest = dir.join("conf");
+        let denied = format!(
+            "[ \"$1 $2 $3 $4\" = {} ]",
+            quote(&format!("test ! -e {}", dest.display()))
+        );
+        let bin = denying_sudo(
+            &dir,
+            &format!("[ \"$1\" = test ] && [ \"$2\" = ! ] && {denied}"),
+        );
+        let message = format!("files: sudo could not check {}", dest.display());
+        assert_sudo_refused(&dir, &bin, &dest, &Expected::Absent, &message);
+        assert!(!dest.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `case "$*" in` over a [`denying_sudo`]: fails exactly `lines`, one per path.
+    fn denied(lines: &[String]) -> String {
+        let arms: Vec<String> = lines.iter().map(|line| quote(line)).collect();
+        format!(
+            "case \"$*\" in {}) true ;; *) false ;; esac",
+            arms.join("|")
+        )
+    }
+
+    #[test]
+    fn the_temp_is_never_created_by_a_tee_that_a_default_acl_would_open() {
+        // A default ACL on the directory beats umask 077 for tee's 0666 open.
+        let tee = format!(
+            "{REAL}\n[ -e \"$1\" ] || echo \"tee created $1\" >>\"$ANVIL_LOG\"\ncat >\"$1\""
+        );
+        let (dir, bin, dest) = write_case("files-closed-create", &[("tee", &tee)]);
+        let log = dir.join("log");
+        let script = format!(
+            "ANVIL_LOG={}; export ANVIL_LOG\n{}",
+            quote(log.to_str().unwrap()),
+            replacing(&dest, "sudo -n ")
+        );
+        let out = sh_with(&bin, &script);
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+        assert_eq!(out.code, Some(0));
+        assert!(!log.exists(), "{}", fs::read_to_string(&log).unwrap());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_temp_or_a_link_already_at_the_temp_path_is_refused_and_kept() {
+        for link in [false, true] {
+            let (dir, bin, dest) = write_case("files-temp-taken", &[]);
+            let temp = dest.with_file_name(".anvil-taken");
+            let other = dir.join("other");
+            fs::write(&other, "other\n").unwrap();
+            if link {
+                symlink(&other, &temp).unwrap();
+            } else {
+                fs::write(&temp, "other\n").unwrap();
+            }
+            let heredoc = Heredoc::new("new\n").unwrap();
+            let write = Replacement {
+                dest: dest.to_str().unwrap(),
+                mode: "0640",
+                sudo: "sudo -n ",
+                as_root: true,
+                temp: temp.to_str().unwrap(),
+                bytes: Bytes::Inline(&heredoc),
+                ids: None,
+            };
+            let script = format!("{}{}}}\n", *write.open(), write.replace("echo done"));
+            let out = sh_with(&bin, &script);
+            assert_eq!(out.code, Some(1), "link {link}");
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+            assert_eq!(fs::read_to_string(&temp).unwrap(), "other\n", "link {link}");
+            assert_eq!(fs::read_to_string(&other).unwrap(), "other\n");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_hash_guard_refuses_when_sudo_cannot_look_for_a_hash_tool() {
+        let dir = dir("files-sudo-hash");
+        let bin = denying_sudo(&dir, "[ \"$1\" = sh ]");
+        let dest = dir.join("conf");
+        fs::write(&dest, "changed\n").unwrap();
+        let message = format!(
+            "files: sudo could not check {}; nothing was changed",
+            dest.display()
+        );
+        let expected = Expected::Sha256(sha_hex(b"captured\n"));
+        assert_sudo_refused(&dir, &bin, &dest, &expected, &message);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "changed\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sudo_failure_on_the_existing_dest_fails_instead_of_losing_its_owner() {
+        let (dir, _, dest) = write_case("files-sudo-existing", &[]);
+        let d = dest.to_str().unwrap();
+        fs::remove_dir_all(dir.join("bin")).unwrap();
+        let bin = denying_sudo(
+            &dir,
+            &denied(&[
+                format!("test -e {d}"),
+                format!("test ! -e {d}"),
+                format!("ls -lLdn {d}"),
+            ]),
+        );
+        let out = sh_with(&bin, &replacing(&dest, "sudo -n "));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.code, Some(1), "{stderr}");
+        assert!(
+            stderr.contains("cannot write a temp file beside"),
+            "{stderr}"
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sudo_failure_when_tightening_in_place_refuses_the_write() {
+        let (dir, _, dest) = write_case("files-sudo-tight", &[]);
+        let (d, top) = (
+            dest.to_str().unwrap(),
+            dest.parent().unwrap().to_str().unwrap(),
+        );
+        fs::remove_dir_all(dir.join("bin")).unwrap();
+        let seen = dir.join("seen");
+        // Sudo works until the first check of DEST has sent the write in place.
+        let bin = denying_sudo(
+            &dir,
+            &format!(
+                "case \"$*\" in {}|{}|{}) true ;; {}) [ -e {seen} ] || {{ : >{seen}; false; }} ;; *) false ;; esac",
+                quote(&format!("test -w {top}")),
+                quote(&format!("test ! -e {d}")),
+                quote(&format!("chmod 600 {d}")),
+                quote(&format!("test -e {d}")),
+                seen = quote(seen.to_str().unwrap()),
+            ),
+        );
+        let out = sh_with(&bin, &replacing(&dest, "sudo -n "));
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sudo_failure_does_not_make_a_capture_report_an_absent_dest() {
+        let dir = dir("files-sudo-capture");
+        let bin = denying_sudo(&dir, "[ \"$1\" = test ] || [ \"$1\" = ls ]");
+        let dest = dir.join("conf");
+        fs::write(&dest, "old\n").unwrap();
+        let d = dest.to_str().unwrap();
+        let out = sh_with(&bin, &capture_script(d, "sudo -n ", ""));
+        assert_eq!(out.code, Some(1));
+        assert!(parse_capture(d, &out.stdout).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_rollback_that_cannot_test_dest_does_not_call_it_unchanged() {
+        let dir = dir("files-sudo-restore");
+        let dest = dir.join("conf");
+        fs::write(&dest, "someone else's\n").unwrap();
+        let d = dest.to_str().unwrap();
+        let bin = denying_sudo(
+            &dir,
+            &denied(&[format!("test -e {d}"), format!("test ! -e {d}")]),
+        );
+        let file = recorded(&dest, "applied\n", Write::Written, Previous::Absent);
+        let restore = Restore {
+            dest: &file.dest,
+            sudo: "sudo -n ",
+            checks: "",
+            as_root: true,
+            guard: restore_guard("sudo -n ", &file, false, Wording::Cli),
+        };
+        let out = sh_with(&bin, &restore.remove(&format!("removed {d}")));
+        assert_eq!(out.code, Some(CONFLICT));
+        assert!(out.stdout.is_empty());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "someone else's\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_acl_is_not_set_when_the_target_has_no_sed_to_close_it() {
+        let setfacl = "case $1 in --version) exit 0 ;; esac\ncat >/dev/null";
+        let getfacl = "case $1 in --version) exit 0 ;; esac\nprintf 'user::rw-\\n'";
+        let (dir, bin, dest) = write_case(
+            "files-acl-nosed",
+            &[
+                ("getfacl", getfacl),
+                ("setfacl", setfacl),
+                ("sed", "exit 127"),
+            ],
+        );
+        let out = sh_with(&bin, &replacing(&dest, "sudo -n "));
+        assert_eq!(out.code, Some(1));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_masked_acl_keeps_the_owning_group_without_grep() {
+        let getfacl = "case $1 in --version) exit 0 ;; esac\n\
+                       printf '# file: mask::x\\nuser::rw-\\ngroup::r--\\nmask::r--\\nother::---\\n'";
+        let setfacl = "case $1 in --version) exit 0 ;; esac\ncat >\"$ANVIL_LOG\"";
+        let grep = "exit 127";
+        let (dir, bin, dest) = write_case(
+            "files-acl-nogrep",
+            &[("getfacl", getfacl), ("setfacl", setfacl), ("grep", grep)],
+        );
+        let log = dir.join("acl");
+        let script = format!(
+            "ANVIL_LOG={}; export ANVIL_LOG\n{}",
+            quote(log.to_str().unwrap()),
+            replacing(&dest, "sudo -n ")
+        );
+        let out = sh_with(&bin, &script);
+        assert_eq!(out.code, Some(0));
+        assert!(fs::read_to_string(&log).unwrap().contains("group::r--\n"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sudo_warning_with_no_hash_tool_does_not_break_the_capture() {
+        let dir = dir("files-capture-warn-nohash");
+        let sudo = "echo 'sudo: unable to resolve host web1' >&2\n\
+                    case $3 in 'command -v sha256sum'|'command -v shasum') exit 1 ;; esac\n\
+                    exec \"$@\"";
+        let bin = bin_with(&dir, &[], &[("sudo", sudo)]);
+        let dest = dir.join("conf");
+        fs::write(&dest, "private\n").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
+        let d = dest.to_str().unwrap();
+        let script = capture_script(d, "sudo ", "");
+        let out = sh_with(&bin, &format!("{{\n{script}}} 2>&1\n"));
+        assert_eq!(out.code, Some(0));
+        assert!(parse_capture(d, &out.stdout).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_capture_that_sudo_cannot_hash_fails_rather_than_dropping_the_guard() {
+        let dir = dir("files-capture-nosh");
+        let dest = dir.join("conf");
+        let d = dest.to_str().unwrap();
+        let unchecked = format!("files: sudo could not check {d}; nothing was changed\n");
+        // A private file: the hash is all the capture sends.
+        let bin = denying_sudo(&dir, "[ \"$1\" = sh ]");
+        fs::write(&dest, "private\n").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
+        let out = sh_with(&bin, &capture_script(d, "sudo -n ", ""));
+        assert_eq!(out.code, Some(1));
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), unchecked);
+        fs::remove_dir_all(&bin).unwrap();
+        // An unreadable one: that hash runs in a pipeline, whose exit is `tr`'s.
+        let bin = denying_sudo(&dir, "[ \"$1\" = sh ] || [ \"$1 $2 $3\" = 'od -An -v' ]");
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
+        let out = sh_with(&bin, &capture_script(d, "sudo -n ", ""));
+        assert!(String::from_utf8(out.stderr).unwrap().contains(&unchecked));
+        assert!(parse_capture(d, &out.stdout).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_rollback_that_sudo_cannot_hash_says_so_and_offers_no_force() {
+        let dir = dir("files-sudo-restore-hash");
+        let dest = dir.join("conf");
+        fs::write(&dest, "applied\n").unwrap();
+        let d = dest.to_str().unwrap();
+        let bin = denying_sudo(&dir, "[ \"$1\" = sh ]");
+        let file = recorded(&dest, "applied\n", Write::Written, Previous::Absent);
+        let restore = Restore {
+            dest: &file.dest,
+            sudo: "sudo -n ",
+            checks: "",
+            as_root: true,
+            guard: restore_guard("sudo -n ", &file, false, Wording::Cli),
+        };
+        let out = sh_with(&bin, &restore.remove(&format!("removed {d}")));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.code, Some(CONFLICT), "{stderr}");
+        assert!(
+            stderr.ends_with(&format!(
+                "files: sudo could not check {d}; nothing was changed\n"
+            )),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("--force"), "{stderr}");
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "applied\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_capture_whose_hash_tool_fails_under_sudo_fails_and_as_the_user_does_not() {
+        let dir = dir("files-capture-hash-fails");
+        let dest = dir.join("conf");
+        fs::write(&dest, "private\n").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
+        let d = dest.to_str().unwrap();
+        let bin = denying_sudo(&dir, "[ \"$1\" = sha256sum ] || [ \"$1\" = shasum ]");
+        let out = sh_with(&bin, &capture_script(d, "sudo -n ", ""));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.code, Some(1), "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "files: sudo could not check {d}; nothing was changed\n"
+            )),
+            "{stderr}"
+        );
+        fs::remove_dir_all(&bin).unwrap();
+        // The login user's own file it cannot hash stays a capture with no hash.
+        let bin = bin_with(&dir, &[], &[("sha256sum", "exit 1"), ("shasum", "exit 1")]);
+        let out = sh_with(&bin, &capture_script(d, "", ""));
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+        assert_eq!(out.code, Some(0));
+        assert!(parse_capture(d, &out.stdout).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_path_still_passes_the_sudo_checks() {
+        let dir = dir("files-sudo-missing");
+        let bin = denying_sudo(&dir, "false");
+        let dest = dir.join("conf");
+        let temp = dir.join("temp");
+        for script in sudo_scripts(&dest, &dir, &temp, &Expected::Absent) {
+            fs::write(&temp, "new\n").unwrap();
+            let out = sh_with(&bin, &script);
+            assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+            assert_eq!(out.code, Some(0));
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+            fs::remove_file(&dest).unwrap();
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The tee script with sudo, as root would run it on a root login, and
@@ -4177,7 +4729,8 @@ mod tests {
         let bin = bin_with(
             &dir,
             &[
-                "head", "tee", "chmod", "sh", "cmp", "mv", "id", "ls", "chown", "rm", "find",
+                "head", "tee", "install", "chmod", "sh", "cmp", "mv", "id", "ls", "chown", "rm",
+                "find",
             ],
             &[],
         );
@@ -4477,7 +5030,7 @@ mod tests {
         let bin = bin_with(
             &dir,
             &[
-                "head", "tee", "chmod", "sh", "ls", "rm", "mv", "id", "chown", "find",
+                "head", "tee", "install", "chmod", "sh", "ls", "rm", "mv", "id", "chown", "find",
             ],
             &[],
         );

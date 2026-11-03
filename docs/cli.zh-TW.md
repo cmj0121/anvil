@@ -1220,7 +1220,8 @@ facts = { distro = "arch" }
 否則拒絕該 dest：step 失敗並顯示 `files: DIR is not root-only; root will not write under it`，指出第一個不符合的目錄，
 且不寫入任何東西。因此位於使用者家目錄之下的 dest 需要 `sudo = false`。
 以 root 寫入時也會拒絕本身是 symlink 的 dest，連結與其目標都保持不動；
-step 失敗並顯示 `files: DEST is a symlink; point dest at the real file`。
+step 失敗並顯示 `files: DEST is a symlink; point dest at the real file`。sudo 失敗時同樣拒絕寫入：
+`files: sudo failed; DEST is unchanged`，之後的檢查則為 `files: sudo could not check PATH; nothing was changed`。
 
 `sudo = false` 以連線使用者身分寫入時同樣拒絕 symlink 的 dest，不論是否懸空，也拒絕路徑上不屬於 root 或登入使用者、
 或其群組或其他人可寫入的目錄：
