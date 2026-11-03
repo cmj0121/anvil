@@ -951,7 +951,10 @@ mod tests {
         for shell in wrapper_shells() {
             let dir = temp_dir("wrap-bg");
             let d = dir.display();
-            let script = format!("sleep 6 >/dev/null 2>&1 &\necho $! >{d}/bg\n");
+            // An external sleep: busybox ash built with preferred applets loses
+            // a backgrounded builtin `sleep 6 &` once the shell exits, even under
+            // plain `busybox sh -c` or `sh -s`, with no wrapper involved.
+            let script = format!("(exec sleep 6) >/dev/null 2>&1 &\necho $! >{d}/bg\n");
             let out = run_wrapped(&shell, &script, 1);
             assert_eq!(out.status.code(), Some(0), "{shell:?}");
             let bg = read_pid(&dir.join("bg"));
@@ -1036,10 +1039,38 @@ mod tests {
         }
     }
 
+    /// Whether `shell` finds `ps` through PATH, i.e. would run `fake` placed
+    /// first on it, rather than a `ps` of its own.
+    fn runs_ps_from_path(shell: &[String], fake: &str) -> bool {
+        let bin = temp_dir("wrap-whichps");
+        std::os::unix::fs::symlink(fake, bin.join("ps")).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = Command::new(&shell[0])
+            .args(&shell[1..])
+            .args(["-c", "command -v ps"])
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        let found = String::from_utf8_lossy(&out.stdout).trim() == bin.join("ps").to_str().unwrap();
+        fs::remove_dir_all(&bin).unwrap();
+        found
+    }
+
     #[test]
     fn only_one_pgid_above_1_from_ps_is_killed_else_kill_0() {
         let ps = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-ps.sh");
         for shell in wrapper_shells() {
+            if !runs_ps_from_path(&shell, ps) {
+                // busybox built with preferred applets runs its own `ps`, never
+                // the fake; root_children_are_killed_by_the_sessions_process_group
+                // covers its real read.
+                eprintln!("skip: {shell:?} runs its own ps");
+                continue;
+            }
             for out in ["1", "    0", "01", "00", "   12\n   13\n   14", "12 13"] {
                 let bin = fake_sudo_bin("wrap-badps", &[]);
                 std::os::unix::fs::symlink(ps, bin.join("ps")).unwrap();
