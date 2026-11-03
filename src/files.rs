@@ -923,9 +923,10 @@ fn hash_run(
             .collect()
     };
     let (user, root) = (of(false), of(true));
-    let user = match user.is_empty() {
-        true => String::new(),
-        false => format!("(\n{})\n", root_walk(&user, user_top, LOGIN_OWNED)),
+    let user = if user.is_empty() {
+        String::new()
+    } else {
+        format!("(\n{})\n", root_walk(&user, user_top, LOGIN_OWNED))
     };
     if root.is_empty() {
         return Ok(format!("{{ exec 2>/dev/null; {setup}{user}}}\n"));
@@ -4501,9 +4502,10 @@ mod tests {
         };
         let ssh = Ssh::new(settings, None, "web1", None, None).unwrap();
         let control = Path::new("/tmp/anvil-control");
-        let args = match password {
-            true => ssh.tty_client_args(control, &crate::packages::with_password(script)),
-            false => ssh.client_args(control),
+        let args = if password {
+            ssh.tty_client_args(control, &crate::packages::with_password(script))
+        } else {
+            ssh.client_args(control)
         };
         drop(ssh.command(&args));
     }
@@ -5520,9 +5522,10 @@ mod tests {
         let out = sh_with(&bin, &user_hash_script(&dests, "sudo -n ", &dir));
         assert_eq!(out.code, Some(0));
         let x = Some(sha_hex(b"x"));
-        let unread = match rustix::process::getuid().is_root() {
-            true => (FileState::File, x.clone()),
-            false => (FileState::Unreadable, None),
+        let unread = if rustix::process::getuid().is_root() {
+            (FileState::File, x.clone())
+        } else {
+            (FileState::Unreadable, None)
         };
         assert_eq!(
             parse_hashes(dests.len(), &out.stdout).unwrap(),

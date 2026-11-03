@@ -322,9 +322,10 @@ impl StepReport {
     pub fn command_text(&self) -> String {
         let command = command(&self.run);
         let note = matches!(&self.entry, Entry::File { dest } if dest.is_empty());
-        match note || self.task.is_some() {
-            true => escape_invisible(&command),
-            false => command,
+        if note || self.task.is_some() {
+            escape_invisible(&command)
+        } else {
+            command
         }
     }
 
@@ -677,9 +678,10 @@ pub fn run_targets(
     let pins = plugin::verify_where(config, Plugin::is_step).map_err(Failure::usage)?;
     let sources = opts.sources(config, expanded)?;
     let passwords = load_passwords(&targets, config, expanded, || opts.secret_store(config))?;
-    let session = match needs_facts(config, expanded) {
-        true => Some(open_record("apply")?),
-        false => None,
+    let session = if needs_facts(config, expanded) {
+        Some(open_record("apply")?)
+    } else {
+        None
     };
     Ok(apply_targets(
         &targets,
@@ -947,11 +949,12 @@ impl<'a> Journal<'a> {
     fn ended(&self, name: &str, reached: Reached) {
         let mut books = self.lock();
         let books = &mut *books;
-        match reached.wrote {
-            true => books
+        if reached.wrote {
+            books
                 .warnings
-                .extend(books.session.merge(name, reached.record)),
-            false => books.session.refresh(name, reached.record),
+                .extend(books.session.merge(name, reached.record))
+        } else {
+            books.session.refresh(name, reached.record)
         }
         books.save(name, self.abort);
     }
@@ -1641,13 +1644,10 @@ fn send_file(
     let sent = match transport.run(&upload.stage, timeout) {
         Ok(staged) if staged.code == Some(0) => {
             log::debug!("{command} {}: file staged", target.name);
-            match cancel.load(Ordering::Relaxed) {
-                true => Sent::Cancelled,
-                false => Sent::Installed(transport.run_tty(
-                    &packages::with_password(run),
-                    password,
-                    timeout,
-                )),
+            if cancel.load(Ordering::Relaxed) {
+                Sent::Cancelled
+            } else {
+                Sent::Installed(transport.run_tty(&packages::with_password(run), password, timeout))
             }
         }
         Ok(staged) => Sent::Unstaged(Ok(Output {
@@ -5814,17 +5814,14 @@ mod tests {
                 ("0644", 0, 42)
             );
             assert_eq!(previous.sha256, v0);
-            match rollback {
-                true => {
-                    assert!(previous.kept);
-                    assert_eq!(previous.text.as_deref().map(String::as_str), Some("v0\n"));
-                    assert_eq!(previous.reason, None);
-                }
-                false => {
-                    assert!(!previous.kept);
-                    assert_eq!(previous.text, None, "the hash only");
-                    assert_eq!(previous.reason.as_deref(), Some("rollback = false"));
-                }
+            if rollback {
+                assert!(previous.kept);
+                assert_eq!(previous.text.as_deref().map(String::as_str), Some("v0\n"));
+                assert_eq!(previous.reason, None);
+            } else {
+                assert!(!previous.kept);
+                assert_eq!(previous.text, None, "the hash only");
+                assert_eq!(previous.reason.as_deref(), Some("rollback = false"));
             }
         }
     }
@@ -6378,21 +6375,18 @@ mod tests {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
             let err = report.save_error.unwrap();
             assert!(err.starts_with("cannot write last-apply.json: "), "{err}");
-            match writable_again {
-                true => {
-                    assert!(!err.contains("not recorded"), "{err}");
-                    let record = record::load(&path).unwrap().unwrap();
-                    assert_eq!(record.targets["b"].files[0].dest, "/etc/b.conf");
-                    assert_eq!(record.targets["a"].files[0].dest, "/etc/a.conf");
-                }
-                false => {
-                    assert!(err.ends_with("; not recorded: a, b"), "{err}");
-                    // What the saves before the writes left.
-                    let record = record::load(&path).unwrap().unwrap();
-                    for name in ["a", "b"] {
-                        let write = record.targets[name].files[0].write;
-                        assert_eq!(write, record::Write::FailedMidway, "{name}");
-                    }
+            if writable_again {
+                assert!(!err.contains("not recorded"), "{err}");
+                let record = record::load(&path).unwrap().unwrap();
+                assert_eq!(record.targets["b"].files[0].dest, "/etc/b.conf");
+                assert_eq!(record.targets["a"].files[0].dest, "/etc/a.conf");
+            } else {
+                assert!(err.ends_with("; not recorded: a, b"), "{err}");
+                // What the saves before the writes left.
+                let record = record::load(&path).unwrap().unwrap();
+                for name in ["a", "b"] {
+                    let write = record.targets[name].files[0].write;
+                    assert_eq!(write, record::Write::FailedMidway, "{name}");
                 }
             }
             std::fs::remove_dir_all(&root).unwrap();

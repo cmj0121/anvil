@@ -625,7 +625,13 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(app, f)).unwrap();
         let buffer = terminal.backend().buffer();
-        seen.push(buffer.content().iter().map(|c| c.symbol()).collect());
+        seen.push(
+            buffer
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect(),
+        );
         for text in seen {
             assert!(!text.contains(VALUE), "{text}");
         }

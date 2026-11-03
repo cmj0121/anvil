@@ -1002,9 +1002,10 @@ fn local_block(local: &doctor::LocalReport) -> Vec<Line<'static>> {
         });
     }
     if let Some(record) = &local.record {
-        lines.push(match local.record_failed() {
-            false => row("record", record),
-            true => row("record", &format!("error: {record}")).style(Color::Red),
+        lines.push(if local.record_failed() {
+            row("record", &format!("error: {record}")).style(Color::Red)
+        } else {
+            row("record", record)
         });
     }
     if let Some(error) = &local.tag_key {
@@ -1027,8 +1028,8 @@ fn doctor_block(report: &doctor::TargetReport) -> Vec<Line<'static>> {
     for (key, value) in report.facts.iter().flat_map(doctor::fact_rows) {
         lines.push(row(key, &value));
     }
-    if let Some(manager) = &report.manager {
-        lines.push(row("manager", manager));
+    if let Some(manager) = report.manager {
+        lines.push(row("manager", manager.as_str()));
     }
     if let Some(packages) = &report.packages {
         let line = row("packages", packages);
@@ -2912,7 +2913,7 @@ mod tests {
     fn the_doctor_view_shows_the_manager_after_the_facts() {
         let mut app = app();
         let mut pi = probed("pi", None);
-        pi.manager = Some("pacman".to_owned());
+        pi.manager = Some(crate::packages::Manager::Pacman);
         let mut mac = probed("mac", None);
         mac.manager_error = Some("no package manager found".to_owned());
         show(

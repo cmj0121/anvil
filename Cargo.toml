@@ -11,6 +11,13 @@ members = [".", "plugins/anvil-audit"]
 # cargo build, run and install touch only anvil; make audit-plugin builds the plugin.
 default-members = ["."]
 
+[workspace.lints.clippy]
+match_bool = "warn"
+redundant_closure_for_method_calls = "warn"
+
+[lints]
+workspace = true
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

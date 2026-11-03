@@ -93,7 +93,7 @@ impl Options {
             return Ok(Box::new(secret::Memory::default()));
         }
         let backend = config.backend().map_err(Failure::usage)?;
-        Ok(secret::from_config(&backend)?)
+        Ok(secret::from_config(&backend))
     }
 
     /// The ssh program as named: `ssh`, or the debug-only `--ssh-program`.

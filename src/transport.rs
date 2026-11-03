@@ -1026,7 +1026,7 @@ fn spawn_reader(
             match pipe.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let mut captured = buffer.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut captured = buffer.lock().unwrap_or_else(PoisonError::into_inner);
                     let room = if captured.taken {
                         0
                     } else {
@@ -1070,7 +1070,7 @@ fn wait_with_timeout(
 /// What a reader captured, marked taken so the reader keeps nothing more.
 fn take_captured(stream: Option<&Arc<Mutex<Captured>>>) -> Captured {
     stream.map_or_else(Captured::default, |shared| {
-        let mut captured = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let mut captured = shared.lock().unwrap_or_else(PoisonError::into_inner);
         std::mem::replace(
             &mut *captured,
             Captured {

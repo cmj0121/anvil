@@ -440,7 +440,7 @@ mod tests {
         [head, &json, tail]
             .concat()
             .iter()
-            .map(|arg| arg.to_string())
+            .map(ToString::to_string)
             .collect()
     }
 

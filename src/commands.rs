@@ -622,8 +622,8 @@ pub fn migrate_to(opts: &Options, to: BackendKind) -> Result<Migrated, Failure> 
     let backend = config.backend_named(to).map_err(usage)?;
     let source = config.backend().map_err(usage)?;
     secret::migrate::check_apart(&source, &backend).map_err(usage)?;
-    let from = secret::from_config(&source)?;
-    let target = secret::from_config(&backend)?;
+    let from = secret::from_config(&source);
+    let target = secret::from_config(&backend);
     let dest = destination(opts.config.as_deref(), config_dir, "config", Format::Toml)?;
     migrate_stores(
         config,
@@ -1127,7 +1127,6 @@ mod tests {
                 path: self.dir.join("secrets.age"),
                 identity,
             })
-            .unwrap()
         }
     }
 

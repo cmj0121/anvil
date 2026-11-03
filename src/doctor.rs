@@ -134,7 +134,7 @@ pub struct TargetReport {
     pub error: Option<String>,
     /// The resolved package manager; only with `[packages]`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub manager: Option<String>,
+    pub manager: Option<packages::Manager>,
     /// Read-only repository check: `ok` or a warning; does not affect exit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packages: Option<String>,
@@ -216,7 +216,7 @@ impl TargetReport {
     fn resolve_manager(&mut self, choice: Choice, sudo_secret: bool) {
         let Some(facts) = &self.facts else { return };
         match packages::resolve(choice, facts, sudo_secret) {
-            Ok(manager) => self.manager = Some(manager.as_str().to_owned()),
+            Ok(manager) => self.manager = Some(manager),
             Err(err) => {
                 log::error!("doctor {}: package manager: {err}", self.target);
                 self.manager_error = Some(err);
@@ -303,35 +303,30 @@ pub fn check(
         .map(|target| {
             on(Progress::Start(target));
             cancelled = cancelled || cancel.load(Ordering::Relaxed);
-            let report = match cancelled {
-                true => cancelled_target(target),
-                false => {
-                    let transport = opts.transport(target);
-                    let mut report = check_target(target, &transport);
-                    let work = packages_to_check(config, expanded, target, report.facts.as_ref());
-                    if let Some(packages) = work.first() {
-                        report.resolve_manager(
-                            packages.choice_for(target),
-                            packages.sudo_secret_for(target).is_some(),
-                        );
-                        if let (Some(manager), Ok(transport)) = (&report.manager, &transport) {
-                            status::phase(&target.name, Phase::Check("packages"));
-                            let manager =
-                                packages::Manager::parse(manager).expect("resolved manager");
-                            report.packages =
-                                Some(package_rows(manager, &work, transport.as_ref()));
-                        }
+            let report = if cancelled {
+                cancelled_target(target)
+            } else {
+                let transport = opts.transport(target);
+                let mut report = check_target(target, &transport);
+                let work = packages_to_check(config, expanded, target, report.facts.as_ref());
+                if let Some(packages) = work.first() {
+                    report.resolve_manager(
+                        packages.choice_for(target),
+                        packages.sudo_secret_for(target).is_some(),
+                    );
+                    if let (Some(manager), Ok(transport)) = (report.manager, &transport) {
+                        status::phase(&target.name, Phase::Check("packages"));
+                        report.packages = Some(package_rows(manager, &work, transport.as_ref()));
                     }
-                    if let (Some(doctor), Some(facts), Ok(transport)) =
-                        (&doctor, &report.facts, &transport)
-                    {
-                        let (plugins, drift) =
-                            doctor.target(target, facts, transport.as_ref(), cancel);
-                        report.plugins = plugins;
-                        report.drift = drift;
-                    }
-                    report
                 }
+                if let (Some(doctor), Some(facts), Ok(transport)) =
+                    (&doctor, &report.facts, &transport)
+                {
+                    let (plugins, drift) = doctor.target(target, facts, transport.as_ref(), cancel);
+                    report.plugins = plugins;
+                    report.drift = drift;
+                }
+                report
             };
             on(Progress::Done(&report));
             report
@@ -817,9 +812,10 @@ fn package_rows(
             warnings.push(row);
         }
     }
-    match warnings.is_empty() {
-        true => "ok".to_owned(),
-        false => warnings.join("; "),
+    if warnings.is_empty() {
+        "ok".to_owned()
+    } else {
+        warnings.join("; ")
     }
 }
 
@@ -947,9 +943,10 @@ fn render(report: &Report) -> String {
         };
     }
     if let Some(record) = &local.record {
-        let _ = match local.record_failed() {
-            false => writeln!(out, "  {:<15} {record}", "record"),
-            true => writeln!(out, "  {:<15} error: {record}", "record"),
+        let _ = if local.record_failed() {
+            writeln!(out, "  {:<15} error: {record}", "record")
+        } else {
+            writeln!(out, "  {:<15} {record}", "record")
         };
     }
     if let Some(error) = &local.tag_key {
@@ -1207,7 +1204,7 @@ mod tests {
     }
 
     fn healthy_local(store: &dyn Store, secrets: &[&str]) -> LocalReport {
-        let secrets: Vec<String> = secrets.iter().map(|s| s.to_string()).collect();
+        let secrets: Vec<String> = secrets.iter().map(ToString::to_string).collect();
         local_checks(
             Path::new(SH),
             Editor::from_command(SH, None),
@@ -1700,7 +1697,7 @@ mod tests {
         const SUDO_FACTS: &str = "hostname=box\nos=Linux\ndistro=arch\nuser=cmj\nsudo=binary\npkg=pacman\nanvil-probe-end=1\n";
         let mut report = check_target(&host("up"), &fake(Ok(SUDO_FACTS)));
         report.resolve_manager(Choice::Auto, true);
-        assert_eq!(report.manager.as_deref(), Some("pacman"));
+        assert_eq!(report.manager, Some(packages::Manager::Pacman));
         assert!(report.ok());
         let mut report = check_target(&host("up"), &fake(Ok(SUDO_FACTS)));
         report.resolve_manager(Choice::Auto, false);

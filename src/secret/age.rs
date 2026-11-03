@@ -236,7 +236,7 @@ impl Codec for AgeCodec<'_> {
         let armor = ArmoredWriter::wrap_output(Vec::new(), Format::AsciiArmor).map_err(io)?;
         let mut writer = encryptor.wrap_output(armor).map_err(io)?;
         writer.write_all(plaintext).map_err(io)?;
-        writer.finish().and_then(|armor| armor.finish()).map_err(io)
+        writer.finish().and_then(ArmoredWriter::finish).map_err(io)
     }
 }
 
@@ -365,9 +365,7 @@ mod tests {
             .starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----\n")
     }
 
-    fn right() -> Result<SecretString, PromptError> {
-        Ok(SecretString::from(PASSPHRASE))
-    }
+    const RIGHT: Reply = || Ok(SecretString::from(PASSPHRASE));
 
     fn round_trip(store: &AgeStore) {
         let mut vault = store.open().unwrap();
@@ -406,7 +404,7 @@ mod tests {
         let identity = root.join("key.age");
         passphrase_identity(&identity);
         let path = root.join("secrets.age");
-        let (store, asked) = store_with(path.clone(), identity.clone(), right);
+        let (store, asked) = store_with(path.clone(), identity.clone(), RIGHT);
 
         round_trip(&store);
         assert_eq!(asked.load(Ordering::Relaxed), 2, "one prompt per open");
@@ -420,7 +418,7 @@ mod tests {
         let root = temp_dir("age-locked");
         let identity = root.join("key.age");
         passphrase_identity(&identity);
-        let (mut store, asked) = store_with(root.join("secrets.age"), identity, right);
+        let (mut store, asked) = store_with(root.join("secrets.age"), identity, RIGHT);
         store.tty = || false;
         assert!(matches!(store.open().err().unwrap(), SecretError::Locked));
         assert_eq!(asked.load(Ordering::Relaxed), 0);
@@ -440,7 +438,7 @@ mod tests {
         passphrase_identity(&identity);
         let path = root.join("secrets.age");
         fs::write(&path, "not an age file").unwrap();
-        let (mut store, asked) = store_with(path.clone(), identity, right);
+        let (mut store, asked) = store_with(path.clone(), identity, RIGHT);
         assert!(store.open().is_err(), "the junk does not decrypt");
 
         let vault = store.replace().unwrap();

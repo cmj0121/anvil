@@ -13,7 +13,7 @@ use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -107,7 +107,7 @@ pub fn preflight(exe: &Path) -> Result<Installed, String> {
 }
 
 fn managed(exe: &Path) -> bool {
-    let parts: Vec<_> = exe.components().map(|part| part.as_os_str()).collect();
+    let parts: Vec<_> = exe.components().map(Component::as_os_str).collect();
     MANAGED.iter().any(|prefix| exe.starts_with(prefix))
         || MANAGED_RUNS
             .iter()

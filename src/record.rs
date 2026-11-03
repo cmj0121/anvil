@@ -578,7 +578,7 @@ impl Session {
         let mut copy = self.record.clone();
         let mut names: Vec<&String> = order.iter().filter(|n| self.merged.contains(n)).collect();
         names.extend(self.merged.iter().filter(|n| !order.contains(n)));
-        let dropped = share(&mut copy, &names, self.limit)?;
+        let dropped = share(&mut copy, &names, self.limit);
         self.write(&copy)?;
         for warning in &dropped {
             log::warn!("{warning}");
@@ -682,10 +682,10 @@ fn shed(record: &mut Record, name: &str, limit: usize) -> Vec<(String, String)> 
 
 /// Drops every text of `names` from `record`, then gives each back, in
 /// order, while the record still fits `limit`.
-fn share(record: &mut Record, names: &[&String], limit: usize) -> Result<Vec<String>, String> {
+fn share(record: &mut Record, names: &[&String], limit: usize) -> Vec<String> {
     let mut size = encoded_len(record);
     if size <= limit {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let all: Vec<(&String, usize, usize)> = names
         .iter()
@@ -704,7 +704,7 @@ fn share(record: &mut Record, names: &[&String], limit: usize) -> Result<Vec<Str
             dropped.push(drop_text(record, name, i));
         }
     }
-    Ok(dropped)
+    dropped
 }
 
 /// The length of `value` as compact JSON, counted without building it.
