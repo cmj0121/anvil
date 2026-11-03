@@ -180,11 +180,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-    use crate::test_util::{files, temp_dir};
-
-    fn mode(path: &Path) -> u32 {
-        fs::metadata(path).unwrap().permissions().mode() & 0o777
-    }
+    use crate::test_util::{files, mode, temp_dir};
 
     #[test]
     fn ensure_dir_creates_0700_and_refuses_one_others_can_write() {

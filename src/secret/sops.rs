@@ -347,7 +347,6 @@ impl Codec for Runner<'_> {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
 
     use super::*;
     use crate::secret::Store;
@@ -821,8 +820,7 @@ mod tests {
             )
         );
         fs::remove_file(&config).unwrap();
-        let made = Command::new("mkfifo").arg(&config).status().unwrap();
-        assert!(made.success());
+        crate::test_util::mkfifo(&config);
         assert_eq!(
             commit(),
             format!("{}: not a regular file", config.display())

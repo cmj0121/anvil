@@ -349,7 +349,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::test_util::{assert_no_plaintext, files, temp_dir};
+    use crate::test_util::{assert_no_plaintext, files, mode, temp_dir};
 
     const VALUE: &str = "s3cr3t-hunter2";
     const LIMIT: u64 = 1 << 20;
@@ -417,10 +417,6 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(FileVault::open(&link, LIMIT, codec.clone()).is_err());
         fs::remove_dir_all(&root).unwrap();
-    }
-
-    fn mode(path: &Path) -> u32 {
-        fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     fn open<'a>(path: &'a Path, codec: &Xor) -> Box<dyn Vault + 'a> {
@@ -670,11 +666,7 @@ mod tests {
     fn a_store_that_is_not_a_regular_file_is_refused_unread() {
         let root = temp_dir("file-store-fifo");
         let fifo = root.join("secrets.x");
-        let made = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(made.success());
+        crate::test_util::mkfifo(&fifo);
         // Refused, not waited on for a writer.
         let err = FileVault::open(&fifo, LIMIT, Xor::default()).err().unwrap();
         assert_eq!(

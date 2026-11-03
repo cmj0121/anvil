@@ -319,7 +319,6 @@ fn open_read(path: &Path, extra: OFlags) -> Result<File, Errno> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
-    use std::process::Command;
 
     use super::*;
     use crate::test_util::{chmod, temp_dir};
@@ -418,8 +417,7 @@ mod tests {
     fn a_fifo_is_refused_without_waiting_for_a_writer() {
         let root = temp_dir("trust-fifo");
         let fifo = root.join("config.toml");
-        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
-        assert!(made.success());
+        crate::test_util::mkfifo(&fifo);
         chmod(&fifo, 0o644);
         let message = refusal(load(&fifo, LIMIT));
         assert!(message.ends_with(": not a regular file"), "{message}");

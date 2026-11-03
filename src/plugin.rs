@@ -728,11 +728,7 @@ mod tests {
         assert!(err.starts_with(&shown(&missing)), "{err}");
 
         let fifo = root.join("plugins/fifo");
-        let made = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(made.success());
+        crate::test_util::mkfifo(&fifo);
         chmod(&fifo, 0o700);
         let err = verify_step(&config(&fifo, &body_sha())).unwrap_err();
         assert_eq!(err, format!("{}not a regular file", shown(&fifo)));

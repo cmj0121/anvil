@@ -272,7 +272,6 @@ fn encrypt_error(path: &Path, err: EncryptError) -> SecretError {
 mod tests {
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use age::secrecy::ExposeSecret;
@@ -558,13 +557,7 @@ mod tests {
         );
         // Refused, not waited on for a writer.
         let fifo = root.join("fifo");
-        assert!(
-            Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap()
-                .success()
-        );
+        crate::test_util::mkfifo(&fifo);
         fs::set_permissions(&fifo, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
             open(&fifo),

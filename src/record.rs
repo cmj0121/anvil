@@ -729,7 +729,7 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::*;
-    use crate::test_util::temp_dir;
+    use crate::test_util::{mode, temp_dir};
 
     const TEXT: &str = "the previous hunter2 text\n";
 
@@ -751,10 +751,6 @@ mod tests {
 
     fn sha(c: char) -> String {
         c.to_string().repeat(64)
-    }
-
-    fn mode(path: &Path) -> u32 {
-        fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     fn previous(sha256: &str, text: Option<&str>) -> Previous {
@@ -993,11 +989,7 @@ mod tests {
             format!("{}: a symlink, refused", path.display())
         );
         fs::remove_file(&path).unwrap();
-        let made = std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(made.success());
+        crate::test_util::mkfifo(&path);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
             load(&path).unwrap_err(),

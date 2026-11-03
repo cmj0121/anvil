@@ -37,6 +37,28 @@ pub fn chmod(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// Whether python3 has every one of `needs` (`module.attr`, such as
+/// `os.login_tty`), which a terminal script calls; says so when it skips.
+pub fn python(needs: &[&str]) -> bool {
+    let probe: Vec<String> = needs
+        .iter()
+        .map(|need| format!("import {}; {need}", need.split('.').next().unwrap()))
+        .collect();
+    let ok = Command::new("python3")
+        .args(["-c", &probe.join("; ")])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !ok {
+        eprintln!("skip: no python3 with {}", needs.join(", "));
+    }
+    ok
+}
+
+/// The permission bits of `path`, special bits included.
+pub fn mode(path: impl AsRef<Path>) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
 /// Waits until `done`, failing after 20 s, a fail-safe only.
 pub fn until(mut done: impl FnMut() -> bool, what: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);

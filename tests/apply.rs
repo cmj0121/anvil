@@ -1539,12 +1539,7 @@ fn unknown_packages_warn_and_continue_with_exit_zero() {
 /// `pty_capture.py`: the raw bytes it wrote; `None` without a python3 that
 /// has `os.login_tty`.
 fn apply_on_a_terminal(sandbox: &Sandbox, args: &[&str]) -> Option<String> {
-    let python = Command::new("python3")
-        .args(["-c", "import os; os.login_tty"])
-        .output()
-        .is_ok_and(|out| out.status.success());
-    if !python {
-        eprintln!("skip: no python3 with os.login_tty");
+    if !common::python(&["os.login_tty"]) {
         return None;
     }
     let out = sandbox

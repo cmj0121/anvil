@@ -1762,13 +1762,7 @@ mod tests {
         let root = &store.1;
         root.mkdir("").unwrap();
         let fifo = root.path().join("fifo");
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap()
-                .success()
-        );
+        crate::test_util::mkfifo(&fifo);
         assert!(matches!(
             root.read_text("fifo"),
             Err(StoreError::NotText(_))

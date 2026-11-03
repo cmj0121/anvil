@@ -10,16 +10,12 @@ mod common;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use common::{Sandbox, json, text};
+use common::{Sandbox, json, mode, text};
 
 /// What `apply` writes; it never shows in any output.
 const FILE_TEXT: &str = "token = file-bytes-never-shown\n";
 /// What `local.conf` holds before the apply; rollback puts it back.
 const PREVIOUS: &str = "previous = text-kept-only-in-the-record\n";
-
-fn mode(path: &str) -> u32 {
-    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
-}
 
 /// The fake host tagged `web` and a config copying `motd.txt` to
 /// `<root>/out/web.conf` (absent before) on `web` and to
