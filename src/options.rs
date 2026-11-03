@@ -535,7 +535,10 @@ mod tests {
     #[test]
     fn the_ssh_transport_carries_the_token_passed_to_transport() {
         let found = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-ssh.sh");
-        let opts = parse(&["--ssh-program", found, "apply"]);
+        let mut opts = parse(&["--ssh-program", found, "apply"]);
+        // Never the real home: a CI runner's ~/.ssh may be world-writable.
+        let home = crate::test_util::temp_dir("opts-token");
+        opts.ssh_home = Some(home.clone());
         let host = Target {
             name: "box".to_owned(),
             kind: TargetKind::Ssh {
@@ -554,6 +557,8 @@ mod tests {
             panic!("a stopped token opened a master");
         };
         assert!(matches!(err, TransportError::Cancelled), "{err}");
+        assert!(home.join(".ssh/anvil").is_dir(), "the run ignored ssh_home");
+        fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
