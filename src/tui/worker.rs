@@ -276,8 +276,9 @@ mod tests {
     const REFUSED: &str = "ssh: connect to host down.example port 22: Connection refused";
 
     /// Options for hosts `up` and `down` reached through
-    /// tests/fixtures/fake-ssh.sh: `up` connects and runs the script with
-    /// `sh -s`; `down`'s key attempt is refused. A wrapper sets the fake's
+    /// tests/fixtures/fake-ssh.sh: `up` connects and runs the remote command
+    /// (its last argument) with `/bin/sh -c` in a process group of its own;
+    /// `down`'s key attempt is refused. A wrapper sets the fake's
     /// knobs per host; the control directory lives under the temp dir.
     #[cfg(debug_assertions)]
     fn fake_ssh_opts(tag: &str, runs: &[&str]) -> Options {

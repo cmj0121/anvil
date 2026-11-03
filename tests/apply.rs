@@ -1860,3 +1860,51 @@ fn a_user_write_refuses_a_symlinked_dest_dangling_or_not_and_an_open_directory()
     );
     assert!(!open.join("conf").exists());
 }
+
+#[test]
+fn a_fake_host_step_reading_stdin_gets_eof_at_once_through_the_wrapper() {
+    let sandbox = Sandbox::new("aw");
+    sandbox.write_config("inventory.toml", "[hosts.fake]\nhost = \"fakehost\"\n");
+    sandbox.write_config("config.toml", "[[steps]]\nrun = \"cat; echo done\"\n");
+    let ssh_log = sandbox.root().join("ssh.log");
+    let started = Instant::now();
+    let out = sandbox.anvil(
+        &["--json", "apply", "--target", "fake"],
+        &[("FAKE_SSH_LOG", ssh_log.to_str().unwrap())],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(json(&out)["targets"][0]["steps"][0]["stdout"], "done\n");
+    let calls = std::fs::read_to_string(&ssh_log).unwrap();
+    let client = calls
+        .lines()
+        .find(|call| call.contains(" anvil-run "))
+        .unwrap_or_else(|| panic!("no wrapped client: {calls}"));
+    assert!(client.contains("-- fakehost sh -c '"), "{client}");
+    assert!(
+        !calls.contains("cat; echo done"),
+        "the script is not in argv"
+    );
+}
+
+#[test]
+fn a_file_of_1_mib_with_trailing_newlines_lands_byte_for_byte_through_the_wrapper() {
+    let sandbox = Sandbox::new("aw");
+    sandbox.write_config("inventory.toml", "[hosts.fake]\nhost = \"fakehost\"\n");
+    std::fs::create_dir(sandbox.root().join("out")).unwrap();
+    let mut body = "line of text\n".repeat(80_000);
+    body.truncate(1024 * 1024 - 3);
+    body.push_str("\n\n\n");
+    std::fs::write(sandbox.config_dir().join("big.txt"), &body).unwrap();
+    let dest = sandbox.root().join("out/big.txt");
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"big.txt\"\ndest = \"{}\"\nmode = \"0644\"\nsudo = false\n",
+            dest.display()
+        ),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read(&dest).unwrap(), body.as_bytes());
+}

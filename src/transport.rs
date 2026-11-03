@@ -1,7 +1,10 @@
 //! Transport contract and the local implementation.
 //!
 //! A transport runs one shell script on a target: the script goes on the child's
-//! stdin, which is then closed, so a script that reads stdin gets EOF.
+//! stdin. [`run_with_script`] then closes it, so a script that reads stdin gets
+//! EOF; [`run_with_held_script`] writes a trailer after the script and keeps
+//! stdin open until the child exits, as the liveness pipe of a remote wrapper
+//! that runs the script with stdin on `/dev/null` (see [`crate::ssh::WRAPPER`]).
 //!
 //! [`Transport::run_tty`] runs a script on a terminal instead and types a sudo
 //! password into it when sudo shows anvil's per-run prompt (see [`run_tty_with`]).
@@ -9,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 
@@ -351,22 +355,38 @@ fn spawn_thread(f: impl FnOnce() + Send + 'static) -> Result<(), TransportError>
         .map_err(|err| TransportError::Spawn(format!("cannot start a thread: {err}")))
 }
 
-/// [`run_with_script_in`] the [`Groups::global`] registry.
+/// [`run_with_script_in`] the [`Groups::global`] registry, closing stdin
+/// after the script.
 pub fn run_with_script(
     command: &mut Command,
     script: &str,
     timeout: Duration,
 ) -> Result<Output, TransportError> {
-    run_with_script_in(Groups::global(), command, script, timeout)
+    run_with_script_in(Groups::global(), command, script, None, timeout)
+}
+
+/// [`run_with_script_in`] the [`Groups::global`] registry, writing `trailer`
+/// after the script and holding stdin open until the child exits.
+pub fn run_with_held_script(
+    command: &mut Command,
+    script: &str,
+    trailer: &str,
+    timeout: Duration,
+) -> Result<Output, TransportError> {
+    run_with_script_in(Groups::global(), command, script, Some(trailer), timeout)
 }
 
 /// Spawns `command` with piped stdio, tracked in `groups`, writes the script
-/// to stdin, closes it and collects the output within `timeout`. On timeout
-/// the child is killed and the error carries the output read so far.
+/// to stdin and collects the output within `timeout`. Without a `trailer`
+/// stdin is closed after the script; with one, the trailer follows the script
+/// and stdin stays open until the child has exited, so the child sees EOF
+/// only when anvil stops waiting. On timeout the child is killed and the
+/// error carries the output read so far.
 pub fn run_with_script_in(
     groups: &Groups,
     command: &mut Command,
     script: &str,
+    trailer: Option<&str>,
     timeout: Duration,
 ) -> Result<Output, TransportError> {
     // Its own process group, so a timeout also kills the script's children, which
@@ -383,23 +403,38 @@ pub fn run_with_script_in(
     // A script that exits before reading everything closes the pipe early; that is
     // not an error of the transport, the exit code tells.
     let stdin = child.stdin.take().expect("stdin is piped");
-    let script = script.to_owned();
+    let held = match trailer
+        .map(|_| stdin.as_fd().try_clone_to_owned())
+        .transpose()
+    {
+        Ok(held) => held,
+        Err(err) => {
+            kill_and_reap(&mut child, &mut tracked);
+            return Err(TransportError::Spawn(format!("cannot hold stdin: {err}")));
+        }
+    };
+    let script = Zeroizing::new(script.to_owned());
+    let trailer = trailer.unwrap_or_default().to_owned();
     let writer = spawn_thread(move || {
         let mut stdin = stdin;
-        let _ = stdin.write_all(script.as_bytes());
+        let _ = stdin
+            .write_all(script.as_bytes())
+            .and_then(|()| stdin.write_all(trailer.as_bytes()));
     });
     if let Err(err) = writer {
         kill_and_reap(&mut child, &mut tracked);
         return Err(err);
     }
 
-    gather(
+    let output = gather(
         child,
         tracked,
         Some(timeout),
         [OUTPUT_CAP, OUTPUT_CAP],
         true,
-    )
+    );
+    drop(held);
+    output
 }
 
 /// The line the tty script prints once the terminal no longer echoes; the
@@ -1140,6 +1175,54 @@ mod tests {
         assert_eq!(out.stdout, b"eof\n");
     }
 
+    /// A child that reads `script_len` bytes, then checks whether stdin
+    /// reaches EOF within 0.3 s: exit 0 while it is held open, 1 once closed.
+    /// The background `cat` reads fd 3, as an asynchronous list's stdin is
+    /// `/dev/null`.
+    fn eof_probe(dir: &std::path::Path, script_len: usize) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            &format!(
+                "exec 3<&0; head -c {script_len} <&3 >/dev/null; \
+                 (cat <&3 >/dev/null; touch \"$0/eof\") & sleep 0.3; [ ! -e \"$0/eof\" ]"
+            ),
+            dir.to_str().unwrap(),
+        ]);
+        command
+    }
+
+    #[test]
+    fn a_held_script_keeps_stdin_open_until_the_child_exits() {
+        let dir = crate::test_util::temp_dir("held");
+        let script = "echo script";
+        let out = run_with_held_script(
+            &mut eof_probe(&dir, script.len()),
+            script,
+            "marker",
+            RUN_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(out.code, Some(0), "stdin reached EOF: {out:?}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        let dir = crate::test_util::temp_dir("held");
+        let out = run_with_script(&mut eof_probe(&dir, script.len()), script, RUN_TIMEOUT).unwrap();
+        assert_eq!(out.code, Some(1), "stdin stayed open: {out:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_trailer_follows_the_script_byte_for_byte() {
+        let script = "line one\n\n\n";
+        let trailer = "anvil-end-0123";
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &format!("head -c {}", script.len() + trailer.len())]);
+        let out = run_with_held_script(&mut command, script, trailer, RUN_TIMEOUT).unwrap();
+        assert_eq!(out.stdout, format!("{script}{trailer}").as_bytes());
+        assert_eq!(out.code, Some(0));
+    }
+
     #[test]
     fn non_zero_exit_is_output_with_its_code() {
         let out = Local
@@ -1738,7 +1821,7 @@ mod tests {
     fn kill_all_kills_a_running_plain_step() {
         let groups = Groups::new();
         let out = killed_while_running(&groups, || {
-            run_with_script_in(&groups, &mut sh(), "sleep 30; echo late", RUN_TIMEOUT)
+            run_with_script_in(&groups, &mut sh(), "sleep 30; echo late", None, RUN_TIMEOUT)
         })
         .unwrap();
         assert_eq!(out.code, None, "killed by a signal: {out:?}");
@@ -1767,8 +1850,8 @@ mod tests {
     fn a_child_tracked_after_kill_all_is_killed_at_once() {
         let groups = Groups::new();
         groups.kill_all();
-        let out =
-            run_with_script_in(&groups, &mut sh(), "sleep 30; echo late", RUN_TIMEOUT).unwrap();
+        let out = run_with_script_in(&groups, &mut sh(), "sleep 30; echo late", None, RUN_TIMEOUT)
+            .unwrap();
         assert_eq!(out.code, None, "killed by a signal: {out:?}");
         let limits = TtyLimits {
             run: RUN_TIMEOUT,
@@ -1883,18 +1966,24 @@ mod tests {
     #[test]
     fn the_registry_is_empty_after_ok_error_and_timeout_runs() {
         let groups = Groups::new();
-        let ok = run_with_script_in(&groups, &mut sh(), "echo hi", RUN_TIMEOUT).unwrap();
+        let ok = run_with_script_in(&groups, &mut sh(), "echo hi", None, RUN_TIMEOUT).unwrap();
         assert_eq!(ok.code, Some(0));
         assert_eq!(live(&groups), 0);
-        let failed = run_with_script_in(&groups, &mut sh(), "exit 3", RUN_TIMEOUT).unwrap();
+        let failed = run_with_script_in(&groups, &mut sh(), "exit 3", None, RUN_TIMEOUT).unwrap();
         assert_eq!(failed.code, Some(3));
         assert_eq!(live(&groups), 0);
-        let err = run_with_script_in(&groups, &mut sh(), "sleep 30", Duration::from_millis(200))
-            .unwrap_err();
+        let err = run_with_script_in(
+            &groups,
+            &mut sh(),
+            "sleep 30",
+            None,
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
         assert!(matches!(err, TransportError::Timeout { .. }), "{err:?}");
         assert_eq!(live(&groups), 0);
         let mut missing = Command::new("/nonexistent/anvil-test-program");
-        let err = run_with_script_in(&groups, &mut missing, "", RUN_TIMEOUT).unwrap_err();
+        let err = run_with_script_in(&groups, &mut missing, "", None, RUN_TIMEOUT).unwrap_err();
         assert!(matches!(err, TransportError::Spawn(_)), "{err:?}");
         let ok = run_tty_with_in(
             &groups,

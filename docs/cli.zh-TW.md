@@ -92,11 +92,11 @@ anvil run --parallel 4 fix.sh
   請以 `--target` 只選其中一個，或使用 `--parallel 1`。
 - **plugin 會平行執行。** apply 與 plan 在控制端為每個 target 執行一次 plugin，現在最多同時 N 個，
   因此 plugin 必須能安全地同時執行多份（[Plugin steps](#plugin-steps)）。
-- **第二次 Ctrl-C 只停止本機上執行的東西。** 它會終止 anvil 的本機行程，包括 ssh 用戶端。
-  沒有終端機而啟動的遠端指令，在其 ssh 用戶端死亡後仍會在 host 上繼續執行。
+- **第二次 Ctrl-C 之後，遠端稍後也會被終止。** 它會終止 anvil 的本機行程，包括 ssh 用戶端。
+  target 隨後在約 2 秒加一次往返內終止這次執行在其上啟動的行程；網路中斷時則在執行的逾時加 10 秒時終止
+  （[SSH 行為](#ssh-行為)）。step 經 `sudo` 啟動的 root 行程，只在 `sudo -n kill` 可用（NOPASSWD）時才會終止。
   以這種方式停止的 `[[files]]` step 可能在 target 上留下其 `/tmp/anvil-` 暫存檔（[File steps](#file-steps)）。
-  這樣的寫入在 anvil 死亡後仍可能完成它的 `mv`，甚至在 rollback 回報成功之後，把新位元組放回去：
-  請等遠端 step 結束再 rollback，或再執行一次 rollback。
+  在遠端結束之前，寫入仍可能完成它的 `mv`：請等那幾秒再 rollback，或再執行一次 rollback。
 
 ## 指令
 
@@ -595,7 +595,8 @@ tag 讓所有雜湊都不出現在請求與 doctor 的輸出中：任何雜湊�
 
 ### `anvil apply`
 
-在每個選定的 target 上依序執行 config 的 `[[steps]]`：每個 step（步驟）的 `run` 會送到 target 上的 `sh -s`（`local` 則為 `/bin/sh -s`）。
+在每個選定的 target 上依序執行 config 的 `[[steps]]`：每個 step（步驟）的 `run` 經 stdin 送到 target 上的一個
+小型 sh 包裝（[SSH 行為](#ssh-行為)；`local` 則為 `/bin/sh -s`）。
 以非零結束的 step 會結束該 target；其他 target 仍會執行。
 每個 target 上的每個 step 都以 0 結束時以 0 結束，否則為 1。
 apply 直接執行：不印出計畫，也不詢問確認；想先看它會執行什麼，請先執行 [`anvil plan`](#anvil-plan)。
@@ -838,7 +839,7 @@ what it names, then run rollback again
   再按一次即立刻停止。
 - **第二次按下會立刻停止一切。** anvil 終止所有仍在執行的 step，記錄 `ERROR anvil::interrupt: interrupted`，
   並因 SIGINT 結束（shell 顯示 130），不印摘要也不印 JSON。
-  沒有終端機的遠端指令會在 host 上繼續執行，也可能留下 `[[files]]` 暫存檔（[平行執行](#平行執行)）。
+  遠端指令稍後會在 host 上終止（[SSH 行為](#ssh-行為)），也可能留下 `[[files]]` 暫存檔（[平行執行](#平行執行)）。
 - **快速連按兩次可能只算一次。** 兩次按得非常接近時，可能只以一個訊號送達 anvil，此時算作第一次；請再按一次。
 - **SIGTERM 與 SIGHUP 視同按下 Ctrl-C。** 第一個訊號印出
   `terminated: running targets stop after their current step; the same signal again stops now`
@@ -1118,7 +1119,7 @@ ERROR anvil: plugins.harden.path `~/.config/anvil/plugins/harden`: mode 775 lets
 { "script": "sshd -t && systemctl reload sshd" }
 ```
 
-腳本會像一個 step 一樣在 target 上執行：整份送到 `sh -s` 的 stdin，並像 `anvil run` 送出腳本時一樣包在 `{ :` … `}` 中，
+腳本會像一個 step 一樣在 target 上執行：像 step 一樣整份經 stdin 送出，並像 `anvil run` 送出腳本時一樣包在 `{ :` … `}` 中，
 時間上限是 step 的 30 秒。不會為它輸入 sudo 密碼；請在腳本中呼叫 `sudo -n`。
 apply 將它顯示為 `$ SCRIPT`（第一行，還有更多行時加上 `…`），`--json` 中該 step 的 `run` 是不含包裝的腳本。
 plan 顯示 `would $ SCRIPT (from plugin NAME)`，其 `--json` 的 step 帶有 `"plugin"`：
@@ -1525,7 +1526,8 @@ printf 'df -h /\nuptime\n' | anvil run --target pi -
 
 target 的選法與 apply 相同（`--target`；未指定表示 `local` 加上所有 host），並像 apply 一樣執行，
 同時最多 `--parallel N` 個（[平行執行](#平行執行)）；失敗的 target 不會中止其他 target。
-腳本是每個 target 唯一的 step，經其 stdin 送到 `sh -s`（`local` 則為 `/bin/sh -s`），絕不放在 argv 上。
+腳本是每個 target 唯一的 step，經其 stdin 送到 target 的 sh 包裝（[SSH 行為](#ssh-行為)；`local` 則為 `/bin/sh -s`），
+絕不放在 argv 上。
 它一律是 POSIX sh：shebang 行只是註解。run 不詢問確認。
 
 - **其他人能變更的 `FILE` 會被拒絕。** 與 config 一樣，在任何 target 開始前以 2 結束，FIFO 或其他非一般檔案亦然
@@ -1807,10 +1809,23 @@ anvil 以 argv 陣列執行系統的 `ssh`，絕不使用 shell 字串，因此 
 - **絕不自動接受 host key。**
   未知或已變更的 host key 會讓 target 以 ``host key unknown or changed; run `ssh <host>` once to verify the fingerprint`` 失敗。
 - **帶 sudo 密碼的套件 step** 改以 `-tt` 用戶端執行；見 [輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)。
-- **腳本**以 master 的用戶端執行（`-o ControlMaster=no -o BatchMode=yes ... sh -s`），腳本經 stdin 傳入，
-  逾時 30 秒（套件 step 有自己的 `[packages].timeout`，`anvil run` 則用其 `--timeout`）；
-  用戶端絕不提示。每個串流最多保留 1 MiB。
+- **腳本**以 master 的用戶端執行（`-o ControlMaster=no -o BatchMode=yes ... -- HOST REMOTE`，REMOTE 為
+  `sh -c '<wrapper>' anvil-run BYTES MARKER DEADLINE`），逾時 30 秒（套件 step 有自己的 `[packages].timeout`，
+  `anvil run` 則用其 `--timeout`）；用戶端絕不提示。包裝是固定的 POSIX sh 文字。腳本經 stdin 傳入，後面接著隨機的
+  結束標記，絕不落在遠端檔案、argv 或環境變數中：包裝把它讀進記憶體，並以 `/dev/null` 為 stdin 執行，
+  因此讀取 stdin 的 step（`cat`）會立刻得到 EOF。被截斷的腳本（用戶端在傳送途中死亡）絕不執行；包裝以 125 結束。
+  每個串流最多保留 1 MiB。
   離開腳本的行程群組並持續開著其輸出的背景行程，在腳本結束後有 1 秒時間；之後 anvil 停止讀取並回報已取得的內容。
+- **逾時或中斷的執行會在 target 上被終止。** anvil 等待期間 ssh 的 stdin 保持開啟。它關閉時（執行逾時、anvil
+  被終止、用戶端死亡），包裝對該 session 的行程送出 TERM，讓腳本的 trap 得以執行，2 秒後再送 KILL：
+  約 2 秒加一次往返之內，一般執行不會留下任何行程。網路中斷時什麼都不會關閉；包裝自己的期限（逾時加 10 秒）
+  屆時會終止這次執行。step 經 `sudo` 啟動的 root 行程不受 TERM 影響，只會被 `sudo -n kill` 終止，
+  因此只在 sudo 為 NOPASSWD 時才會終止；其他情況下會執行到結束。腳本自行結束後留下的背景工作不受影響。
+  在終端機上的執行（密碼路徑的 `[[files]]` 安裝、帶密碼的套件）不經包裝：它依賴終端機關閉，
+  而在 `sudo` 下以 `use_pty`（sudo 的預設）執行的 root 指令可能在逾時後仍繼續執行。這是已知的缺口。
+- **step 腳本的變動。** 腳本在包裝的子 shell 中經 `eval` 執行，而不是 `sh -s`：`$$`、`$0`（現為 `anvil-run`）
+  與 `$PPID` 指向包裝的行程，`LINENO` 與 sh 錯誤訊息的文字也會改變。包裝經過引號處理，POSIX shell、csh 與
+  fish 都會原樣傳遞；不屬於這些的登入 shell（例如 nushell）可能拒絕這個指令，即使 `sh -s` 原本可行。
 - **控制目錄** `~/.ssh/anvil`：以 mode 0700 建立（缺少 `~/.ssh` 時也以 0700 建立）；
   在由其他使用者擁有、對群組或他人開放、`~/.ssh` 可被群組或所有人寫入、`$HOME` 含 `%`，
   或 socket 路徑放不進 macOS 104 位元組的 `sun_path`（也就是 `$HOME` 長於 34 位元組）時拒絕。

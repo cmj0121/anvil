@@ -4488,8 +4488,8 @@ mod tests {
     }
 
     /// Builds, and so logs, the `ssh` command that would run `script`: on
-    /// stdin, or on the password path inside the remote command, as
-    /// `run_tty` sends it.
+    /// stdin behind the plain wrapper, or on the password path inside the
+    /// remote command, as `run_tty` sends it.
     fn spawn_for(script: &str, password: bool) {
         use crate::ssh::{CHECK_TIMEOUT, KEY_TIMEOUT, Ssh, SshSettings};
 
@@ -4505,7 +4505,8 @@ mod tests {
         let args = if password {
             ssh.tty_client_args(control, &crate::packages::with_password(script))
         } else {
-            ssh.client_args(control)
+            let remote = crate::ssh::plain_command(script.len(), "anvil-end-0", RUN_TIMEOUT);
+            ssh.client_args(control, &remote)
         };
         drop(ssh.command(&args));
     }

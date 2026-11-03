@@ -93,11 +93,12 @@ Limitations:
   the same paths at once. Select one of them with `--target`, or use `--parallel 1`.
 - **Plugins run in parallel.** apply and plan run a plugin once per target on the controller, now up to N at once, so a
   plugin must be safe to run several times concurrently ([Plugin steps](#plugin-steps)).
-- **A second Ctrl-C stops only what runs here.** It kills anvil's local processes, ssh clients included. A remote
-  command started without a terminal keeps running on its host after its ssh client dies. A `[[files]]` step stopped
-  this way can leave its `/tmp/anvil-` temp file on the target ([File steps](#file-steps)). Such a write can still
-  finish its `mv` after anvil died, even after a rollback that reported success, putting the new bytes back: wait for
-  the remote step to end before rolling back, or run rollback again.
+- **A second Ctrl-C kills the remote side a moment later.** It kills anvil's local processes, ssh clients included.
+  The target then kills what the run started there within about 2 s plus a round trip, or at the run's timeout plus
+  10 s when the network is lost ([SSH behaviour](#ssh-behaviour)); root processes a step started through `sudo` die
+  only where `sudo -n kill` works (NOPASSWD). A `[[files]]` step stopped this way can leave its `/tmp/anvil-` temp file
+  on the target ([File steps](#file-steps)). Until the remote side is gone, a write can still finish its `mv`: wait
+  those few seconds before rolling back, or run rollback again.
 
 ## Commands
 
@@ -615,10 +616,10 @@ Its limits:
 
 ### `anvil apply`
 
-Runs the config's `[[steps]]` in order on every selected target: each step's `run` is sent to `sh -s` on the target
-(`/bin/sh -s` for `local`). A step that exits non-zero ends that target; the other targets still run. Exit 0 when
-every step on every target exited 0, else 1. apply runs directly: it prints no plan and asks for no confirmation; run
-[`anvil plan`](#anvil-plan) first to see what it would run.
+Runs the config's `[[steps]]` in order on every selected target: each step's `run` is sent on stdin to a small sh
+wrapper on the target ([SSH behaviour](#ssh-behaviour); `/bin/sh -s` for `local`). A step that exits non-zero ends
+that target; the other targets still run. Exit 0 when every step on every target exited 0, else 1. apply runs directly:
+it prints no plan and asks for no confirmation; run [`anvil plan`](#anvil-plan) first to see what it would run.
 
 The rest of this section describes the legacy sections, whose order is fixed: packages, files, services, steps. A
 `[[tasks]]` config runs in the order you write ([Tasks in a run](#tasks-in-a-run)).
@@ -872,8 +873,8 @@ targets and its doctor plugins ([Doctor plugins](#doctor-plugins-drift-since-the
   `anvil run`). Press again to stop at once.
 - **The second press stops everything at once.** anvil kills every step still running, logs
   `ERROR anvil::interrupt: interrupted` and dies by SIGINT (a shell shows 130), printing no summary and no JSON. A
-  remote command without a terminal keeps running on its host, and a `[[files]]` temp file can be left behind
-  ([Running in parallel](#running-in-parallel)).
+  remote command dies on its host shortly after ([SSH behaviour](#ssh-behaviour)), and a `[[files]]` temp file can be
+  left behind ([Running in parallel](#running-in-parallel)).
 - **A fast double press may count as one.** Two presses very close together can reach anvil as one signal and then
   count as the first; press again.
 - **SIGTERM and SIGHUP count as presses.** The first prints
@@ -1183,7 +1184,7 @@ them.
 { "script": "sshd -t && systemctl reload sshd" }
 ```
 
-The script runs on the target as a step: sent whole on stdin to `sh -s`, wrapped in `{ :` … `}` as `anvil run`
+The script runs on the target as a step: sent whole on stdin as a step is, wrapped in `{ :` … `}` as `anvil run`
 sends a script, with the 30 s step time limit. No sudo password is
 typed for it; call `sudo -n` in the script. apply shows it as `$ SCRIPT` (its first line and `…` when it has more),
 and in `--json` the step's `run` is the script, without the wrapper. plan shows
@@ -1621,8 +1622,9 @@ printf 'df -h /\nuptime\n' | anvil run --target pi -
 
 Targets are chosen as for apply (`--target`; none means `local` plus every host) and run as apply runs them, up to
 `--parallel N` at a time ([Running in parallel](#running-in-parallel)); a failing target does not stop the others.
-The script is each target's one step, sent on its stdin to `sh -s` (`/bin/sh -s` for `local`), never on an argv. It
-is always POSIX sh: a shebang line is only a comment. run asks for no confirmation.
+The script is each target's one step, sent on its stdin to the target's sh wrapper ([SSH behaviour](#ssh-behaviour);
+`/bin/sh -s` for `local`), never on an argv. It is always POSIX sh: a shebang line is only a comment. run asks for
+no confirmation.
 
 - **A `FILE` others can change is refused.** Exit 2 before any target starts, as for the config, and a FIFO or other
   non-regular file too ([Security notes](security.md)). Stdin is not checked.
@@ -1922,10 +1924,26 @@ from `--ssh-config`; `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE` and `DISPLAY` are remo
   ``host key unknown or changed; run `ssh <host>` once to verify the fingerprint``.
 - **Package step with a sudo password** runs as a `-tt` client instead; see
   [Typing the sudo password](packages.md#typing-the-sudo-password).
-- **Scripts** run as clients of the master (`-o ControlMaster=no -o BatchMode=yes ... sh -s`), with the script on stdin
-  and a 30 s timeout (the package step has its own `[packages].timeout`, `anvil run` its `--timeout`);
-  a client never prompts. Each stream is kept up to 1 MiB. A background process that leaves the script's process group
-  and keeps its output open is given 1 s after the script ends; then anvil stops reading and reports what it has.
+- **Scripts** run as clients of the master (`-o ControlMaster=no -o BatchMode=yes ... -- HOST REMOTE`, REMOTE being
+  `sh -c '<wrapper>' anvil-run BYTES MARKER DEADLINE`) with a 30 s timeout (the package step has its own
+  `[packages].timeout`, `anvil run` its `--timeout`); a client never prompts. The wrapper is a fixed POSIX sh text. The
+  script goes on stdin, followed by a random end marker, and never lands in a remote file, argv or environment: the
+  wrapper reads it into memory and runs it with stdin on `/dev/null`, so a step that reads stdin (`cat`) gets EOF at
+  once. A script cut short (the client died while sending it) never runs; the wrapper exits 125. Each stream is kept
+  up to 1 MiB. A background process that leaves the script's process group and keeps its output open is given 1 s
+  after the script ends; then anvil stops reading and reports what it has.
+- **A timed-out or dropped run is killed on the target.** ssh's stdin stays open while anvil waits. When it closes (the
+  run timed out, anvil was killed, the client died) the wrapper sends TERM to the session's processes, so a script's
+  traps run, and KILL 2 s later: nothing of a plain run is left within about 2 s plus a round trip. A lost network
+  closes nothing; the wrapper's own deadline, the timeout plus 10 s, kills the run then. Root processes a step started
+  through `sudo` survive the TERM and die only by `sudo -n kill`, so only where sudo is NOPASSWD; elsewhere they run to
+  their end. A background job a script leaves after it ends on its own is not touched. A run on a terminal (a
+  password-path `[[files]]` install, packages with a password) is not wrapped: it relies on the terminal closing, and a
+  root command under `sudo` with `use_pty` (sudo's default) can outlive the timeout. This is a known gap.
+- **Changed for step scripts.** A script runs through `eval` in a subshell of the wrapper, not as `sh -s`: `$$`, `$0`
+  (now `anvil-run`) and `$PPID` name the wrapper's processes, and `LINENO` and the text of sh's error messages change.
+  The wrapper is quoted so POSIX shells, csh and fish pass it unchanged; a login shell that is none of these (nushell,
+  say) may reject the command where `sh -s` worked.
 - **Control directory** `~/.ssh/anvil`: created with mode 0700 (and `~/.ssh` 0700 if missing); refused when owned by
   another user, open to group or others, when `~/.ssh` is group- or world-writable, when `$HOME` contains `%`, or when a
   socket path would not fit macOS' 104-byte `sun_path` — that is, a `$HOME` longer than 34 bytes.

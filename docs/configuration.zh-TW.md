@@ -270,6 +270,13 @@ skip = ["updates.auto"]    # rule ids anvil config --harden leaves out; default 
 這個預設就不再存在。每個 step 有 `run` 或 `plugin`，不能兩者都有；
 兩者都有時以 2 結束並顯示 `steps[I]: has both run and plugin; keep one`，兩者都沒有時為 `steps[I]: needs run or plugin`。
 
+**step 如何在 host 上執行。** host 的 step 經 ssh 的 stdin 送到一個小型 POSIX sh 包裝，由它從記憶體執行，
+stdin 為 `/dev/null`，因此 step 中的 `cat` 或 `read` 會立刻得到 EOF（[SSH 行為](cli.zh-TW.md#ssh-行為)）。
+一般執行逾時，或其 anvil 被終止、失去用戶端時，會在約 2 秒加一次往返內於 host 上被終止；網路中斷時則在逾時加
+10 秒時終止。它經 `sudo` 啟動的 root 行程只在 `sudo -n kill` 可用（NOPASSWD）時才會終止；其他情況下會執行到結束。
+在 step 腳本中，`$$`、`$0`、`$PPID`、`LINENO` 與 sh 錯誤訊息的文字都與 `sh -s` 不同，因為腳本在包裝中經
+`eval` 執行。既非 POSIX sh、也非 csh 或 fish 的登入 shell（例如 nushell）可能拒絕這個指令。
+
 上述區段依固定順序執行：套件、檔案、服務、step。要自行決定順序，請改用 [`[[tasks]]`](#tasks)，
 取代 `[[files]]`、`[[services]]`、`[[steps]]` 與 `[packages]` 中的清單。
 

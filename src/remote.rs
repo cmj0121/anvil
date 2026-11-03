@@ -558,8 +558,9 @@ impl Replacement<'_> {
 /// Removes what an interrupted run left of `dest`, through `sudo`, and no other
 /// dest's temp. Two inventory entries for one machine can run at once and the
 /// target has no lock, so a temp may be a live run's: only one older than an hour
-/// goes, far past the 30 s a file step may take, with room for a stuck `sudo`,
-/// which no remote timeout bounds yet. A `find` without `-mmin` just sweeps nothing.
+/// goes, far past the 30 s a file step may take: a plain run dies on the target
+/// within seconds of its timeout, or at the timeout plus 10 s on a lost network
+/// ([`crate::ssh::WRAPPER`]). A `find` without `-mmin` just sweeps nothing.
 pub(crate) fn sweep(sudo: &str, dest: &str) -> String {
     let dir = quote(&format!("{}/.", dir_of(dest).trim_end_matches('/')));
     let name = quote(&format!("{}*", temp_prefix(dest)));
