@@ -697,6 +697,16 @@ if [ "$code" -eq 1 ] && grep -qF 'timed out after 2 s' "$TMP/out" && gone_within
 else
   fail "a timed-out sudo run on arch: exit $code"
 fi
+docker exec "$NAME" sh -c 'echo "Defaults use_pty" >/etc/sudoers.d/zz-anvil-e2e-pty && chmod 0440 /etc/sudoers.d/zz-anvil-e2e-pty'
+printf 'sudo -n sh -c "sleep 317 & sleep 318"\n' >"$U_DIR/sudo-pty-sleep.sh"
+anvil run --timeout 2 --target arch "$U_DIR/sudo-pty-sleep.sh"
+code=$?
+docker exec "$NAME" rm -f /etc/sudoers.d/zz-anvil-e2e-pty
+if [ "$code" -eq 1 ] && grep -qF 'timed out after 2 s' "$TMP/out" && gone_within 5 '^sleep 31[78] $'; then
+  pass "with use_pty set, no root sleep 317 or 318 on arch within 5 s of the timeout"
+else
+  fail "a timed-out sudo run on arch with use_pty: exit $code"
+fi
 docker exec "$NAME" mv /usr/bin/timeout.anvil-e2e /usr/bin/timeout
 printf 'cat; echo done\n' >"$U_DIR/cat.sh"
 started=$(date +%s)

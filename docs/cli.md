@@ -1950,18 +1950,24 @@ from `--ssh-config`; `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE` and `DISPLAY` are remo
   `sh -c '<wrapper>' anvil-run BYTES MARKER DEADLINE`) with a 30 s timeout (the package step has its own
   `[packages].timeout`, `anvil run` its `--timeout`); a client never prompts. The wrapper is a fixed POSIX sh text. The
   script goes on stdin, followed by a random end marker, and never lands in a remote file, argv or environment: the
-  wrapper reads it into memory and runs it with stdin on `/dev/null`, so a step that reads stdin (`cat`) gets EOF at
-  once. A script cut short (the client died while sending it) never runs; the wrapper exits 125. Each stream is kept
+  wrapper reads it into a shell variable and runs it with stdin on `/dev/null`, so a step that reads stdin (`cat`) gets
+  EOF at once. A heredoc inside the script is up to the remote `/bin/sh`: bash (RHEL, macOS, Arch) may spool its body,
+  a secret-rendered one included, to a short-lived 0600 temp file in `$TMPDIR` that it unlinks; dash and busybox use
+  pipes. A script cut short (the client died while sending it) never runs; the wrapper exits 125. Each stream is kept
   up to 1 MiB. A background process that leaves the script's process group and keeps its output open is given 1 s
   after the script ends; then anvil stops reading and reports what it has.
 - **A timed-out or dropped run is killed on the target.** ssh's stdin stays open while anvil waits. When it closes (the
   run timed out, anvil was killed, the client died) the wrapper sends TERM to the session's processes, so a script's
   traps run, and KILL 2 s later: nothing of a plain run is left within about 2 s plus a round trip. A lost network
   closes nothing; the wrapper's own deadline, the timeout plus 10 s, kills the run then. Root processes a step started
-  through `sudo` survive the TERM and die only by `sudo -n kill`, so only where sudo is NOPASSWD; elsewhere they run to
-  their end. A background job a script leaves after it ends on its own is not touched. A run on a terminal (a
-  password-path `[[files]]` install, packages with a password) is not wrapped: it relies on the terminal closing, and a
-  root command under `sudo` with `use_pty` (sudo's default) can outlive the timeout. This is a known gap.
+  through `sudo` survive the TERM and die only by `sudo -n -- kill -s KILL -PGID`, the session's process group read
+  before the script starts (`kill 0` when it cannot be read). That needs a NOPASSWD rule that allows `kill` (a `kill`
+  program in sudo's `secure_path`); a password typed for the script's own `sudo` does not help, as sudo's default
+  `timestamp_type=tty` keeps cached credentials per terminal and the kill runs without one. Elsewhere they run to their
+  end. Root processes started through `doas`, `su` or `pkexec` are not covered. A background job a script leaves after
+  it ends on its own is not touched. A run on a terminal (a password-path `[[files]]` install, packages with a password)
+  is not wrapped: it relies on the terminal closing, and a root command under `sudo` with `use_pty` (sudo's default)
+  can outlive the timeout. This is a known gap.
 - **Changed for step scripts.** A script runs through `eval` in a subshell of the wrapper, not as `sh -s`: `$$`, `$0`
   (now `anvil-run`) and `$PPID` name the wrapper's processes, and `LINENO` and the text of sh's error messages change.
   The wrapper is quoted so POSIX shells, csh and fish pass it unchanged; a login shell that is none of these (nushell,

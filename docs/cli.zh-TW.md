@@ -1833,15 +1833,20 @@ anvil 以 argv 陣列執行系統的 `ssh`，絕不使用 shell 字串，因此 
 - **腳本**以 master 的用戶端執行（`-o ControlMaster=no -o BatchMode=yes ... -- HOST REMOTE`，REMOTE 為
   `sh -c '<wrapper>' anvil-run BYTES MARKER DEADLINE`），逾時 30 秒（套件 step 有自己的 `[packages].timeout`，
   `anvil run` 則用其 `--timeout`）；用戶端絕不提示。包裝是固定的 POSIX sh 文字。腳本經 stdin 傳入，後面接著隨機的
-  結束標記，絕不落在遠端檔案、argv 或環境變數中：包裝把它讀進記憶體，並以 `/dev/null` 為 stdin 執行，
-  因此讀取 stdin 的 step（`cat`）會立刻得到 EOF。被截斷的腳本（用戶端在傳送途中死亡）絕不執行；包裝以 125 結束。
+  結束標記，絕不落在遠端檔案、argv 或環境變數中：包裝把它讀進 shell 變數，並以 `/dev/null` 為 stdin 執行，
+  因此讀取 stdin 的 step（`cat`）會立刻得到 EOF。腳本中的 heredoc 則取決於遠端的 `/bin/sh`：bash（RHEL、macOS、
+  Arch）可能把其內容（包括渲染了 secret 的內容）暫存到 `$TMPDIR` 中短暫存在的 0600 暫存檔，隨後刪除；dash 與
+  busybox 使用管線。被截斷的腳本（用戶端在傳送途中死亡）絕不執行；包裝以 125 結束。
   每個串流最多保留 1 MiB。
   離開腳本的行程群組並持續開著其輸出的背景行程，在腳本結束後有 1 秒時間；之後 anvil 停止讀取並回報已取得的內容。
 - **逾時或中斷的執行會在 target 上被終止。** anvil 等待期間 ssh 的 stdin 保持開啟。它關閉時（執行逾時、anvil
   被終止、用戶端死亡），包裝對該 session 的行程送出 TERM，讓腳本的 trap 得以執行，2 秒後再送 KILL：
   約 2 秒加一次往返之內，一般執行不會留下任何行程。網路中斷時什麼都不會關閉；包裝自己的期限（逾時加 10 秒）
-  屆時會終止這次執行。step 經 `sudo` 啟動的 root 行程不受 TERM 影響，只會被 `sudo -n kill` 終止，
-  因此只在 sudo 為 NOPASSWD 時才會終止；其他情況下會執行到結束。腳本自行結束後留下的背景工作不受影響。
+  屆時會終止這次執行。step 經 `sudo` 啟動的 root 行程不受 TERM 影響，只會被 `sudo -n -- kill -s KILL -PGID`
+  終止，PGID 是腳本開始前讀取的 session 行程群組（讀不到時改用 `kill 0`）。這需要允許 `kill` 的 NOPASSWD 規則
+  （sudo 的 `secure_path` 中要有 `kill` 程式）；為腳本自己的 `sudo` 輸入過密碼也無濟於事，因為 sudo 預設的
+  `timestamp_type=tty` 依終端機保存快取的憑證，而這次 kill 沒有終端機。其他情況下會執行到結束。經 `doas`、`su`
+  或 `pkexec` 啟動的 root 行程不在涵蓋範圍內。腳本自行結束後留下的背景工作不受影響。
   在終端機上的執行（密碼路徑的 `[[files]]` 安裝、帶密碼的套件）不經包裝：它依賴終端機關閉，
   而在 `sudo` 下以 `use_pty`（sudo 的預設）執行的 root 指令可能在逾時後仍繼續執行。這是已知的缺口。
 - **step 腳本的變動。** 腳本在包裝的子 shell 中經 `eval` 執行，而不是 `sh -s`：`$$`、`$0`（現為 `anvil-run`）

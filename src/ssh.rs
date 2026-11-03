@@ -3,8 +3,12 @@
 //! Every invocation is an argv array on the configured `program`, never a shell
 //! string. The master authenticates once (key first, a password prompt only when
 //! anvil has a terminal); clients run [`WRAPPER`] over the socket in BatchMode,
-//! which reads the script from stdin into memory and runs it with stdin on
-//! `/dev/null`. stdin stays open as a liveness pipe: once it closes (anvil
+//! which reads the script from stdin into a shell variable and runs it with
+//! stdin on `/dev/null`; the script itself is never written to a remote file.
+//! Heredocs inside it are another matter: bash (`/bin/sh` on RHEL, macOS and
+//! Arch) may spool a heredoc body, a secret-rendered one included, to a 0600
+//! temp file in `$TMPDIR` that it unlinks soon after; dash and busybox use
+//! pipes. stdin stays open as a liveness pipe: once it closes (anvil
 //! timed out, was killed, or the connection dropped) or the remote deadline
 //! passes, the wrapper kills the session's process group on the target.
 //!
@@ -48,15 +52,25 @@ pub const DEADLINE_SLACK: u64 = 10;
 /// `/dev/null` and no positional parameters. A watcher waits for EOF on the
 /// held stdin, a watchdog for `deadline` seconds; either then sends TERM to the
 /// session's process group (sshd gives each session its own), 2 s later
-/// `sudo -n kill -s KILL 0` when the script uses sudo, then KILL. A short or
+/// `sudo -n -- kill -s KILL -<pgid>` when the script uses sudo, then KILL. The
+/// pgid is read before anything forks, from `ps -o pgid=` or, when `ps` fails
+/// (busybox `ps` has no `-p`), `/proc/$$/stat`, so the kill still reaches the
+/// group when sudo runs `kill` in a session of its own (`use_pty`). Anything
+/// but one number above 1 counts as unread (`-1` would be every process, `-0`
+/// sudo's own group) and falls back to `sudo -n kill -s KILL 0`. A short or
 /// unmarked frame exits 125 without running anything. It holds no `'`, `\`
 /// or newline, so every login shell passes it unchanged.
 pub const WRAPPER: &str = concat!(
     r#"exec 3<&0 </dev/null; anvil_s=$(head -c "$1" <&3) || exit 125; "#,
     r#"case $anvil_s in *"$2") anvil_s=${anvil_s%"$2"} ;; *) exit 125 ;; esac; "#,
-    r#"anvil_u=; case $anvil_s in *sudo*) anvil_u=1 ;; esac; "#,
-    r#"anvil_k() { kill -TERM 0; sleep 2; [ -z "$anvil_u" ] || sudo -n kill -s KILL 0; kill -KILL 0; }; "#,
-    r#"(exec 3<&-; set --; eval "unset anvil_s anvil_u; unset -f anvil_k; $anvil_s") & anvil_p=$!; anvil_s=; "#,
+    r#"anvil_u=; anvil_g=; case $anvil_s in *sudo*) anvil_u=1; "#,
+    r#"if anvil_g=$(ps -o pgid= -p $$ 2>/dev/null); then :; else anvil_g=$(cat /proc/$$/stat 2>/dev/null); "#,
+    r#"anvil_g=${anvil_g##*") "}; anvil_g=${anvil_g#* }; anvil_g=${anvil_g#* }; anvil_g=${anvil_g%% *}; fi; "#,
+    r#"anvil_g=${anvil_g#"${anvil_g%%[! ]*}"}; case $anvil_g in ""|0*|1|*[!0-9]*) anvil_g= ;; esac ;; esac; "#,
+    r#"anvil_k() { kill -TERM 0; sleep 2; if [ -z "$anvil_u" ]; then :; "#,
+    r#"elif [ -n "$anvil_g" ]; then sudo -n -- kill -s KILL -"$anvil_g"; else sudo -n kill -s KILL 0; fi; "#,
+    r#"kill -KILL 0; }; "#,
+    r#"(exec 3<&-; set --; eval "unset anvil_s anvil_u anvil_g; unset -f anvil_k; $anvil_s") & anvil_p=$!; anvil_s=; "#,
     r#"(trap "" TERM; cat <&3; anvil_k) >/dev/null 2>&1 & anvil_w=$!; "#,
     r#"(exec 3<&-; trap "" TERM; anvil_i=0; while [ "$anvil_i" -lt "$3" ]; do sleep 1; anvil_i=$((anvil_i + 1)); done; "#,
     r#"anvil_k) >/dev/null 2>&1 & anvil_d=$!; "#,
@@ -793,11 +807,13 @@ mod tests {
         bytes: usize,
         marker: &str,
         deadline: u64,
+        env: &[(&str, String)],
     ) -> (std::process::Child, std::process::ChildStdin) {
         let mut child = Command::new(&shell[0])
             .args(&shell[1..])
             .args(["-c", WRAPPER, "anvil-run"])
             .args([bytes.to_string(), marker.to_owned(), deadline.to_string()])
+            .envs(env.iter().map(|(key, value)| (key, value)))
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -815,7 +831,7 @@ mod tests {
     /// the wrapper exits.
     fn run_wrapped(shell: &[String], script: &str, deadline: u64) -> std::process::Output {
         let frame = format!("{script}{MARKER}");
-        let (child, stdin) = start_wrapper(shell, &frame, frame.len(), MARKER, deadline);
+        let (child, stdin) = start_wrapper(shell, &frame, frame.len(), MARKER, deadline, &[]);
         let out = child.wait_with_output().unwrap();
         drop(stdin);
         out
@@ -848,15 +864,15 @@ mod tests {
     }
 
     #[test]
-    fn the_wrapper_runs_the_script_byte_for_byte_from_memory() {
-        let script = "echo \"start $# ${anvil_s-unset} ${anvil_u-unset}\"\n\
+    fn the_wrapper_runs_the_script_byte_for_byte() {
+        let script = "echo \"start $# ${anvil_s-unset} ${anvil_u-unset} ${anvil_g-unset}\"\n\
                       cat <<'EOF'\n$HOME `x` \\ 'q'\n\n\n\nEOF\n\
                       set -- $(echo a b)\necho \"$# $1 $2\"\nexit 7\n\n\n\n";
         for shell in wrapper_shells() {
             let out = run_wrapped(&shell, script, 30);
             assert_eq!(
                 String::from_utf8_lossy(&out.stdout),
-                "start 0 unset unset\n$HOME `x` \\ 'q'\n\n\n\n2 a b\n",
+                "start 0 unset unset unset\n$HOME `x` \\ 'q'\n\n\n\n2 a b\n",
                 "{shell:?}: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
@@ -881,7 +897,7 @@ mod tests {
             let dir = temp_dir("wrap-short");
             let script = format!("touch {}/ran\n", dir.display());
             let full = script.len() + MARKER.len();
-            let (child, stdin) = start_wrapper(&shell, &script, full, MARKER, 30);
+            let (child, stdin) = start_wrapper(&shell, &script, full, MARKER, 30, &[]);
             drop(stdin);
             let out = child.wait_with_output().unwrap();
             assert_eq!(out.status.code(), Some(125), "{shell:?}");
@@ -900,7 +916,7 @@ mod tests {
                  sleep 300 >/dev/null 2>&1 &\necho $! >{d}/bg\nsleep 301\n"
             );
             let frame = format!("{script}{MARKER}");
-            let (mut child, stdin) = start_wrapper(&shell, &frame, frame.len(), MARKER, 60);
+            let (mut child, stdin) = start_wrapper(&shell, &frame, frame.len(), MARKER, 60, &[]);
             let bg = read_pid(&dir.join("bg"));
             drop(stdin);
             let gone = within(Duration::from_secs(5), || {
@@ -919,7 +935,7 @@ mod tests {
             let d = dir.display();
             let script = format!("sleep 300 >/dev/null 2>&1 &\necho $! >{d}/bg\nsleep 301\n");
             let frame = format!("{script}{MARKER}");
-            let (mut child, stdin) = start_wrapper(&shell, &frame, frame.len(), MARKER, 1);
+            let (mut child, stdin) = start_wrapper(&shell, &frame, frame.len(), MARKER, 1, &[]);
             let bg = read_pid(&dir.join("bg"));
             let gone = within(Duration::from_secs(5), || {
                 child.try_wait().unwrap().is_some() && !pid_alive(bg)
@@ -946,6 +962,96 @@ mod tests {
                 rustix::process::Signal::KILL,
             );
             fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// Drops stdin while a script naming sudo runs, with PATH set to `bin`
+    /// (plus the rest of PATH when `whole_path`) and `sudo` in `bin` the
+    /// fake that logs its arguments; returns the wrapper's pid and what sudo was given.
+    fn sudo_kill_args(
+        shell: &[String],
+        bin: &Path,
+        whole_path: bool,
+        ps_out: &str,
+    ) -> (u32, String) {
+        let log = bin.join("sudo.log");
+        let mut path = bin.display().to_string();
+        if whole_path {
+            path = format!("{path}:{}", std::env::var("PATH").unwrap_or_default());
+        }
+        let env = [
+            ("PATH", path),
+            ("FAKE_SUDO_LOG", log.display().to_string()),
+            ("FAKE_PS_OUT", ps_out.to_owned()),
+        ];
+        let frame = format!(": sudo\nsleep 301\n{MARKER}");
+        let (mut child, stdin) = start_wrapper(shell, &frame, frame.len(), MARKER, 60, &env);
+        std::thread::sleep(Duration::from_millis(300));
+        drop(stdin);
+        let logged = within(Duration::from_secs(5), || {
+            fs::read_to_string(&log).is_ok_and(|text| text.ends_with('\n'))
+        });
+        assert!(logged, "{shell:?}: sudo never ran");
+        child.wait().unwrap();
+        (child.id(), fs::read_to_string(&log).unwrap())
+    }
+
+    fn fake_sudo_bin(tag: &str, tools: &[&str]) -> PathBuf {
+        let bin = temp_dir(tag);
+        let sudo = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-sudo.sh");
+        std::os::unix::fs::symlink(sudo, bin.join("sudo")).unwrap();
+        for tool in tools {
+            let target = ["/bin", "/usr/bin"]
+                .iter()
+                .map(|dir| Path::new(dir).join(tool))
+                .find(|path| path.is_file())
+                .unwrap();
+            std::os::unix::fs::symlink(target, bin.join(tool)).unwrap();
+        }
+        bin
+    }
+
+    #[test]
+    fn root_children_are_killed_by_the_sessions_process_group() {
+        for shell in wrapper_shells() {
+            let bin = fake_sudo_bin("wrap-pgid", &[]);
+            let (pid, args) = sudo_kill_args(&shell, &bin, true, "");
+            assert_eq!(args, format!("-n -- kill -s KILL -{pid}\n"), "{shell:?}");
+            fs::remove_dir_all(&bin).unwrap();
+        }
+    }
+
+    #[test]
+    fn without_ps_root_children_are_killed_by_proc_or_kill_0() {
+        for shell in wrapper_shells() {
+            let bin = fake_sudo_bin("wrap-nops", &["head", "cat", "sleep"]);
+            let (pid, args) = sudo_kill_args(&shell, &bin, false, "");
+            let want = if Path::new("/proc/self/stat").exists() {
+                format!("-n -- kill -s KILL -{pid}\n")
+            } else {
+                "-n kill -s KILL 0\n".to_owned()
+            };
+            assert_eq!(args, want, "{shell:?}");
+            fs::remove_dir_all(&bin).unwrap();
+        }
+    }
+
+    #[test]
+    fn only_one_pgid_above_1_from_ps_is_killed_else_kill_0() {
+        let ps = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-ps.sh");
+        for shell in wrapper_shells() {
+            for out in ["1", "    0", "01", "00", "   12\n   13\n   14", "12 13"] {
+                let bin = fake_sudo_bin("wrap-badps", &[]);
+                std::os::unix::fs::symlink(ps, bin.join("ps")).unwrap();
+                let (_, args) = sudo_kill_args(&shell, &bin, true, out);
+                assert_eq!(args, "-n kill -s KILL 0\n", "{shell:?} {out:?}");
+                fs::remove_dir_all(&bin).unwrap();
+            }
+            let bin = fake_sudo_bin("wrap-otherpg", &[]);
+            std::os::unix::fs::symlink(ps, bin.join("ps")).unwrap();
+            let (_, args) = sudo_kill_args(&shell, &bin, true, "  4242");
+            assert_eq!(args, "-n -- kill -s KILL -4242\n", "{shell:?}");
+            fs::remove_dir_all(&bin).unwrap();
         }
     }
 
