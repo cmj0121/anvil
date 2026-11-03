@@ -5735,10 +5735,7 @@ mod tests {
 
     fn sha256_hex(text: &str) -> String {
         use sha2::{Digest, Sha256};
-        Sha256::digest(text.as_bytes())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        crate::bytes::hex(&Sha256::digest(text.as_bytes()))
     }
 
     /// A capture of a world-readable root file holding `v0\n`.

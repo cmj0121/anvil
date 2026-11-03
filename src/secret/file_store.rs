@@ -23,12 +23,12 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
 
 use super::{BackendKind, SecretError, Store, Vault, is_name};
+use crate::bytes;
 use crate::paths;
 use crate::private::{self, LockError};
 use crate::trust::{self, TrustError, check_owner, open_regular};
@@ -169,19 +169,14 @@ impl<'a, C: Codec> FileVault<'a, C> {
             }
             Err(err) => return Err(untrusted(path, err)),
         };
-        let too_big = || vault.error(format!("larger than the {limit} byte limit"));
         if meta.len() > limit {
-            return Err(too_big());
+            return Err(vault.error(format!("larger than the {limit} byte limit")));
         }
         let mut ciphertext = Vec::new();
         if vault.codec.reads_store() {
             ciphertext.reserve_exact(meta.len() as usize + 1);
-            file.take(limit + 1)
-                .read_to_end(&mut ciphertext)
+            bytes::read_capped(file, limit, &mut ciphertext)
                 .map_err(|err| vault.error(err.to_string()))?;
-            if ciphertext.len() as u64 > limit {
-                return Err(too_big());
-            }
         }
         let plaintext = vault.codec.decrypt(&ciphertext)?;
         // The parse error names a position only: serde's message can quote a value.

@@ -12,13 +12,14 @@
 
 use std::fmt;
 use std::fs::{self, File, Metadata};
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
+use crate::bytes::{self, CappedError};
 use crate::logger::{escape_invisible, escape_line};
 
 /// The most links a path may go through, as Linux allows.
@@ -243,12 +244,10 @@ pub fn load(path: &Path, limit: u64) -> Result<Vec<u8>, TrustError> {
         return Err(too_large());
     }
     let mut bytes = Vec::with_capacity(meta.len() as usize + 1);
-    file.take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|err| TrustError::io(path, err))?;
-    if bytes.len() as u64 > limit {
-        return Err(too_large());
-    }
+    bytes::read_capped(file, limit, &mut bytes).map_err(|err| match err {
+        CappedError::Over { .. } => too_large(),
+        CappedError::Io(err) => TrustError::io(path, err),
+    })?;
     Ok(bytes)
 }
 

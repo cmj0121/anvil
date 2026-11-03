@@ -2,6 +2,7 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 mod apply;
+mod bytes;
 mod cli;
 mod commands;
 mod config;

@@ -13,7 +13,7 @@ use std::io::Write;
 
 use common::{
     AUTH_DENIED, AUTH_DENIED_MESSAGE, CONNECT_REFUSED, CONNECT_REFUSED_MESSAGE, Sandbox, fixture,
-    json, keys, text, until,
+    json, keys, sha256_hex, text, until,
 };
 
 #[test]
@@ -239,14 +239,6 @@ fn marker_file(sandbox: &Sandbox) -> (String, String) {
 /// What the fixture recorded as its stdin; empty when it did not run.
 fn plugin_stdin(sandbox: &Sandbox) -> String {
     fs::read_to_string(sandbox.plugin_dir().join("record.stdin")).unwrap_or_default()
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 #[test]

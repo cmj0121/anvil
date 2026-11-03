@@ -1822,7 +1822,7 @@ mod tests {
             &dir.join("fake-plugin.env"),
             &[("FAKE_PLUGIN_REPLY", reply)],
         );
-        let sha256 = files::hex(&Sha256::digest(&body));
+        let sha256 = crate::bytes::hex(&Sha256::digest(&body));
         let config = Config {
             plugins: BTreeMap::from([(
                 "audit".to_owned(),

@@ -18,7 +18,7 @@ use rustix::process::Signal;
 
 use common::{
     AUTH_DENIED, AUTH_DENIED_MESSAGE, CONNECT_REFUSED, CONNECT_REFUSED_MESSAGE, Sandbox, json,
-    keys, text, until,
+    keys, sha256_hex, text, until,
 };
 
 fn local_hostname() -> String {
@@ -1066,14 +1066,6 @@ fn a_second_ctrl_c_kills_the_running_step_and_anvil_dies_by_sigint() {
 /// What `local.conf` holds before the first apply; it must show only in
 /// the record.
 const PREVIOUS: &str = "previous = text-kept-only-in-the-record\n";
-
-fn sha256_hex(text: &str) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
 
 #[test]
 fn apply_records_what_each_target_held_before_it_wrote() {

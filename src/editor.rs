@@ -12,11 +12,12 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::bytes;
 use crate::document;
 use crate::exec;
 use crate::paths::{self, PrivateDirError};
@@ -314,10 +315,7 @@ fn create_temp(dir: &Path, ext: &str) -> Result<(PathBuf, File), EditorError> {
 /// 64 random bits from `/dev/urandom`, else the clock mixed with the pid.
 pub fn random() -> u64 {
     let mut bytes = [0u8; 8];
-    if File::open("/dev/urandom")
-        .and_then(|mut urandom| urandom.read_exact(&mut bytes))
-        .is_ok()
-    {
+    if bytes::fill_random(&mut bytes).is_ok() {
         return u64::from_ne_bytes(bytes);
     }
     let nanos = SystemTime::now()

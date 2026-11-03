@@ -4,13 +4,12 @@
 //! builds its apply, password-path and rollback scripts from these.
 
 use std::fmt;
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::bytes::{fill_random, hex};
 use crate::config::is_mode;
 
 /// The `find` test for a directory root owns.
@@ -262,15 +261,8 @@ pub(crate) fn zeroizing(args: fmt::Arguments<'_>) -> Zeroizing<String> {
 /// `n` random bytes from `/dev/urandom` in hex; there is no weaker fallback.
 pub(crate) fn random_hex(n: usize) -> Result<String, String> {
     let mut bytes = vec![0u8; n];
-    File::open("/dev/urandom")
-        .and_then(|mut urandom| urandom.read_exact(&mut bytes))
-        .map_err(|err| format!("files: cannot read /dev/urandom: {err}"))?;
+    fill_random(&mut bytes).map_err(|err| format!("files: cannot read /dev/urandom: {err}"))?;
     Ok(hex(&bytes))
-}
-
-/// `bytes` in lowercase hex.
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// What every temp file of `dest` is called up to its random part.

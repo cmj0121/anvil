@@ -8,7 +8,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -20,6 +19,7 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, wa
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::bytes;
 use crate::exec;
 
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -428,15 +428,13 @@ impl Nonce {
     /// A new nonce from 16 bytes of `/dev/urandom`; there is no weaker fallback.
     pub fn generate() -> Result<Self, TransportError> {
         let mut bytes = [0u8; 16];
-        File::open("/dev/urandom")
-            .and_then(|mut urandom| urandom.read_exact(&mut bytes))
+        bytes::fill_random(&mut bytes)
             .map_err(|err| TransportError::Spawn(format!("cannot read /dev/urandom: {err}")))?;
         Ok(Self::from_bytes(bytes))
     }
 
     fn from_bytes(bytes: [u8; 16]) -> Self {
-        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-        Self(format!("anvil-sudo-{hex}:"))
+        Self(format!("anvil-sudo-{}:", bytes::hex(&bytes)))
     }
 
     pub fn as_str(&self) -> &str {

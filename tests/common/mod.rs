@@ -24,6 +24,14 @@ use sha2::{Digest, Sha256};
 /// The secret value the tests store; it must never show in any output.
 pub const VALUE: &str = "s3cr3t-hunter2";
 
+/// The lowercase hex sha256 of `bytes`.
+pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Gives `path` exactly `mode`.
 pub fn chmod(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
@@ -223,11 +231,7 @@ impl Sandbox {
             .unwrap()
             .write_all(body)
             .unwrap();
-        let sha256 = Sha256::digest(body)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        (path, sha256)
+        (path, sha256_hex(body))
     }
 
     /// `<root>/plugins`, where [`Sandbox::plugin`] puts each plugin.

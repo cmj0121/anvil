@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::apply::{FileRun, PlannedRun, RunKind, Upload};
+use crate::bytes::hex;
 use crate::cli::Failure;
 use crate::config::{Config, FileEntry, ModeValue, is_mode, is_sha256};
 use crate::document;
@@ -37,7 +38,7 @@ use crate::remote::{
     login_checks, login_top, not_a_directory, random_hex, refusal, root_checks, root_only_find,
     sweep, temp_beside, unchecked, zeroizing,
 };
-pub(crate) use crate::remote::{REFUSED, hex, quote};
+pub(crate) use crate::remote::{REFUSED, quote};
 use crate::secret;
 use crate::tasks::{Expanded, Item};
 use crate::transport::RUN_TIMEOUT;

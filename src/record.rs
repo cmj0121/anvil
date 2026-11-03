@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use zeroize::Zeroizing;
 
+use crate::bytes::{self, CappedError};
 use crate::config::{check_dest, is_mode, is_sha256};
 use crate::facts::Facts;
 use crate::paths::{self, PathsError};
@@ -282,6 +283,17 @@ pub fn path() -> Result<PathBuf, PathsError> {
     Ok(paths::state_dir()?.join(FILE_NAME))
 }
 
+/// Reads `file`, which fstat said holds `size` bytes, into `bytes` reserved
+/// for `size + 1`: a file grown since is refused, never read on into a
+/// reallocated buffer that would leave an unzeroized copy behind.
+fn read_record(file: impl Read, size: u64, bytes: &mut Vec<u8>) -> Result<(), String> {
+    match bytes::read_capped(file, size, bytes) {
+        Ok(()) => Ok(()),
+        Err(CappedError::Over { .. }) => Err("changed while being read".to_owned()),
+        Err(CappedError::Io(err)) => Err(err.to_string()),
+    }
+}
+
 /// Reads the record at `path`; `None` when neither it nor its directory
 /// exists. Refused unless the directory is private, the file is a regular
 /// 0600-or-stricter file of the current user's (a symlink or FIFO is not
@@ -296,17 +308,11 @@ pub fn load(path: &Path) -> Result<Option<Record>, String> {
         Err(TrustError::NotFound { .. }) => return Ok(None),
         Err(err) => return Err(err.to_string()),
     };
-    let too_large = || format!("{shown}: larger than the {MAX_RECORD} byte limit");
     if meta.size() > MAX_RECORD as u64 {
-        return Err(too_large());
+        return Err(format!("{shown}: larger than the {MAX_RECORD} byte limit"));
     }
     let mut bytes = Zeroizing::new(Vec::with_capacity(meta.size() as usize + 1));
-    file.take(MAX_RECORD as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|err| format!("{shown}: {err}"))?;
-    if bytes.len() > MAX_RECORD {
-        return Err(too_large());
-    }
+    read_record(file, meta.size(), &mut bytes).map_err(|err| format!("{shown}: {err}"))?;
     let cannot_parse = || format!("{shown}: cannot parse");
     let unsupported = |version: u32| format!("{shown}: version {version} is not supported");
     #[derive(Deserialize)]
@@ -726,6 +732,22 @@ mod tests {
     use crate::test_util::temp_dir;
 
     const TEXT: &str = "the previous hunter2 text\n";
+
+    #[test]
+    fn a_record_grown_after_fstat_is_refused_without_reallocating() {
+        let text = "x".repeat(4096);
+        let mut bytes = Zeroizing::new(Vec::with_capacity(text.len() + 1));
+        let reserved = (bytes.as_ptr(), bytes.capacity());
+        let grown = format!("{text}{text}");
+        let err = read_record(grown.as_bytes(), text.len() as u64, &mut bytes).unwrap_err();
+        assert_eq!(err, "changed while being read");
+        assert_eq!((bytes.as_ptr(), bytes.capacity()), reserved);
+
+        bytes.clear();
+        read_record(text.as_bytes(), text.len() as u64, &mut bytes).unwrap();
+        assert_eq!(&bytes[..], text.as_bytes());
+        assert_eq!((bytes.as_ptr(), bytes.capacity()), reserved);
+    }
 
     fn sha(c: char) -> String {
         c.to_string().repeat(64)

@@ -437,10 +437,7 @@ mod tests {
         let mut tampered = TARBALL.to_vec();
         *tampered.last_mut().unwrap() ^= 1;
         let staged = Staged::new("update-forged", &tampered);
-        let digest: String = Sha256::digest(&tampered)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let digest = crate::bytes::hex(&Sha256::digest(&tampered));
         assert_eq!(
             message(staged.verify(&format!("{digest}  {ASSET}\n"), SIG_A, COMMENT)),
             format!("signature check failed for {ASSET}: bad signature")

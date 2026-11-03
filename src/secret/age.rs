@@ -25,6 +25,7 @@ use zeroize::Zeroizing;
 use super::file_store::{Codec, FileBacked, open_key};
 use super::prompt::{self, PromptError};
 use super::{BackendKind, SecretError};
+use crate::bytes;
 
 /// The largest store file read, in bytes of ciphertext.
 const STORE_LIMIT: u64 = 1 << 20;
@@ -60,15 +61,10 @@ impl AgeStore {
     /// The identity file's bytes, once it passes the ownership and
     /// permission checks.
     fn read_identity(&self) -> Result<Zeroizing<Vec<u8>>, SecretError> {
-        let io = |err: io::Error| self.identity_error(err.to_string());
         let (_, file, _) = open_key(&self.identity)?;
         let mut bytes = Zeroizing::new(Vec::with_capacity(IDENTITY_LIMIT as usize + 1));
-        file.take(IDENTITY_LIMIT + 1)
-            .read_to_end(&mut bytes)
-            .map_err(io)?;
-        if bytes.len() as u64 > IDENTITY_LIMIT {
-            return Err(self.identity_error(format!("larger than the {IDENTITY_LIMIT} byte limit")));
-        }
+        bytes::read_capped(file, IDENTITY_LIMIT, &mut bytes)
+            .map_err(|err| self.identity_error(err.to_string()))?;
         Ok(bytes)
     }
 
