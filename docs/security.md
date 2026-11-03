@@ -21,7 +21,12 @@ English | [繁體中文](security.zh-TW.md)
   `~/.local/state/anvil`) keeps the text each `[[files]]` write replaced, so that `anvil rollback` can put it back
   ([The apply record](cli.md#the-apply-record)). It is not encrypted: its protection is mode 0600 in a 0700 directory
   owned by you, both checked on every run, and anvil refuses a record or directory open to others. Anyone who can read
-  your files as you, or a backup of them, can read it. Set `rollback = false` on a `[[files]]` entry whose dest holds a
+  your files as you, or a backup of them, can read it. A previous file others may not read (mode without `0o004`, such
+  as `/etc/sudoers.d/*` at 0440) keeps only its sha256, and its bytes never leave the target, so rollback cannot put it
+  back: apply warns and rollback names it. Text of such a file that an older anvil recorded stays in the record until
+  that target's next apply that writes a file, which drops it with a warning. A 0644 file in a 0700 directory is still
+  kept, as only the file's mode counts.
+  Set `rollback = false` on a `[[files]]` entry whose dest holds a
   secret: the record then keeps only its sha256 ([Files](configuration.md#files)). A symlink, hard link or
   case-insensitive alias of a dest cannot be seen on the controller and counts as a separate dest, so set it on every
   entry for that file. Legacy `[[files]]` duplicates for one dest, the first with the default rollback and a later one

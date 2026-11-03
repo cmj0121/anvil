@@ -756,6 +756,11 @@ Human output and the TUI show a yellow `⚠ packages: not found by MANAGER: a, b
 before the target's end line. Known names still install and later steps continue. These warnings do not change the
 target's `ok`, summary or exit code: all targets ok still exits 0. Actual install failures still fail the target.
 
+The document itself may also have a top-level `warnings`, a JSON array of strings, omitted when empty: what the apply
+record lost on this run, a previous text it had no room for or does not keep ([The apply record](#the-apply-record)).
+They are on stderr too, name dests and targets but never a text, and do not change `ok` or the exit code. A rollback
+has the same shape and adds `not_restored` ([`anvil rollback`](#anvil-rollback)).
+
 #### Tasks in a run
 
 A [`[[tasks]]`](configuration.md#tasks) config runs in the order written, not the fixed order above: a `packages`, `file`,
@@ -944,11 +949,21 @@ write `refused` before it wrote anything (a root check, a directory DEST, a DEST
 user's DEST whose mode it cannot set, all exit 4)
 is never stored: the dest keeps its entry from the apply before, if any.
 
-**Kept or not.** The previous text is kept only when it is UTF-8 text with no NUL byte, at most 256 KiB, and the entry
-does not set `rollback = false`. Otherwise `kept` is false and `reason` says why: `rollback = false`, `over 256 KiB`,
-`not UTF-8 text`, `contains NUL`, `unreadable`, `no od on the target` or `record full`. The write goes ahead either
-way; only its undo is lost, and rollback shows the file as `cannot undo: DEST (REASON)`. `rollback = false` keeps the
-hash only: use it for a dest that holds a secret ([Files](configuration.md#files)).
+**Kept or not.** The previous text is kept only when the previous file is world-readable (its mode has `0o004`), the
+text is UTF-8 with no NUL byte and at most 256 KiB, and the entry does not set `rollback = false`. Otherwise `kept` is
+false and `reason` says why: `rollback = false`, `not world-readable`, `over 256 KiB`, `not UTF-8 text`, `contains NUL`,
+`unreadable`, `no od on the target` or `record full`. The write goes ahead either way; only its undo is lost, and
+rollback shows the file as `cannot undo: DEST (REASON)`. `rollback = false` keeps the hash only: use it for a dest that
+holds a secret ([Files](configuration.md#files)).
+
+**Not world-readable.** The bytes of such a file do not leave the target: the capture sends only its `ls` line and its
+sha256, so a target with no hash tool leaves the hash empty and the write unguarded. Apply warns, `apply: DEST on TARGET
+was not world-readable: its previous text is not kept, so rollback cannot restore it`, on stderr and in `--json`, when
+the write replaced other bytes, no earlier entry still holds the previous state, and the entry does not set `rollback =
+false`, so an unchanged rerun stays quiet. A mode is all it looks at: a 0644 file in a 0700 directory is kept. The first
+apply that writes a file on the target drops the text of such a file an older anvil recorded, with `apply: DEST on
+TARGET was not world-readable: the text an older anvil kept is dropped, so rollback cannot restore it`. A target with no
+hash tool cannot tell such a dest changed by other means: the same bytes written keep the earlier entry.
 
 `rollback = false` has two limits. A symlink, hard link or case-insensitive alias of a dest cannot be seen on the
 controller and counts as a separate dest, so set `rollback = false` on every entry for that file. Legacy `[[files]]`
@@ -1470,6 +1485,11 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   `restore DEST` prints `restored DEST`, `remove DEST` prints `removed DEST`, and either prints `unchanged DEST` when
   DEST already is what it was before the apply (a restore still sets the owner and mode back). A file whose text was not kept
   is a skipped step `cannot undo: DEST (REASON)`, with the reason from the record (`rollback = false`, say).
+- **Not restored.** Each such file, whatever the reason, also shows as `⚠ not restored: DEST (REASON)` in its target's
+  block and in `warnings`, and the summary is not a clean ok: it reads `2 ok, 0 failed, 1 not restored`, then
+  `DEST on TARGET (REASON)` per file; `--json` lists them as `"not_restored":[{"target","dest","reason"}]`, left out when
+  there are none. The exit stays 0, so a repeat rollback stays idempotent. The notes below, which name no file, leave
+  the summary clean.
 - **What cannot be undone.** After the files, the steps of the apply that ran but cannot be undone show as skipped
   steps: `cannot undo: packages`, `cannot undo: service NAME` and `cannot undo: step N` (the Nth `[[steps]]` entry), or
   on a tasks config `cannot undo: PATH` ([Tasks in a run](#tasks-in-a-run)).
@@ -1542,7 +1562,7 @@ Without `--dry-run`, `--json` has apply's shape, a skipped step with `"skipped":
 
 Exit codes:
 
-- **0**: every selected target rolled back, or had nothing recorded.
+- **0**: every selected target rolled back, or had nothing recorded; files whose text was not kept are named, not failed.
 - **1**: `rollback: no apply recorded` (no record, or one with no entry; nothing runs); a target failed (a refused
   dest, a dest not in `[[files]]` or with another `sudo`, a host change, a failed restore or connection); the record
   cannot be read (`rollback: PATH: REASON`, as for apply), is locked by another anvil or cannot be saved; no state

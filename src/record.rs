@@ -4,10 +4,11 @@
 //! The record lives in the state directory ([`paths::state_dir`]), 0700,
 //! never beside the config. It is compact JSON, version [`VERSION`], mode
 //! 0600, and not encrypted: it may hold a file's previous text, which is why
-//! `[[files]] rollback = false` keeps only the hash. Per target it keeps the
-//! probe's facts and, per file written, the previous state (absent, a
-//! dangling link, or a file's mode, owner, hash and text), the hash of the
-//! bytes written and how the write ended.
+//! `[[files]] rollback = false` keeps only the hash, as does a previous file
+//! others may not read ([`NOT_WORLD_READABLE`]): its text would be more exposed
+//! here than on the target. Per target it keeps the probe's facts and, per
+//! file written, the previous state (absent, a dangling link, or a file's mode,
+//! owner, hash and text), the hash of the bytes written and how the write ended.
 //!
 //! An apply holds a [`Session`] (the lock on `<record>.lock`, then the
 //! loaded record) and merges each target as it ends, saving after each, so
@@ -98,8 +99,34 @@ pub struct FileRecord {
 
 /// Why a previous text was not kept when the entry asks for the hash only.
 pub const NO_ROLLBACK: &str = "rollback = false";
+/// Why the text of a previous file others may not read was not kept.
+pub const NOT_WORLD_READABLE: &str = "not world-readable";
+
+/// Whether others may read a file of this octal `mode`; a mode that does not
+/// parse counts as no.
+pub(crate) fn is_world_readable(mode: &str) -> bool {
+    u32::from_str_radix(mode, 8).is_ok_and(|mode| mode & 0o004 != 0)
+}
 
 impl FileRecord {
+    /// Whether this write replaced other bytes of a private file. With
+    /// `rollback = false` the reason differs: that was asked for.
+    fn lost_its_previous(&self) -> bool {
+        matches!(&self.previous, Previous::File(p)
+            if p.reason.as_deref() == Some(NOT_WORLD_READABLE)
+                && p.sha256 != self.written_sha256)
+    }
+
+    /// Why a rollback cannot put back this file's previous text, if so.
+    pub fn not_kept(&self) -> Option<&str> {
+        match &self.previous {
+            Previous::File(p) if !p.kept || p.text.is_none() => {
+                Some(p.reason.as_deref().unwrap_or("not kept"))
+            }
+            _ => None,
+        }
+    }
+
     /// This dest was written again in the same apply: `previous` stays the
     /// one from before the first write, the rest becomes `later`'s, so doctor
     /// compares against the final bytes. A refused `later` left DEST as it
@@ -394,17 +421,29 @@ impl Session {
     ///   one from before, with this write's `write`;
     /// - when `target` failed (`ok: false`), every earlier dest it did not
     ///   touch is kept too, so a retry that stops early loses nothing.
-    pub fn merge(&mut self, name: &str, mut target: TargetRecord) {
+    ///
+    /// An entry an older anvil left, kept in any of these ways, loses the text
+    /// of a previous file others may not read. Such a file's hash is empty on
+    /// a target with no hash tool, and its bytes were not read, so nothing can
+    /// show it changed: with the same bytes written it counts as already
+    /// holding them. Any other empty hash never does.
+    ///
+    /// The warnings name each dest whose previous text this merge lost: only
+    /// the merge knows, as a kept earlier entry may still hold it.
+    pub fn merge(&mut self, name: &str, mut target: TargetRecord) -> Vec<String> {
         let old = self.record.targets.remove(name);
         let mut earlier: BTreeMap<String, FileRecord> = old
             .map(|old| old.files.into_iter().map(|f| (f.dest.clone(), f)).collect())
             .unwrap_or_default();
         let touched: BTreeSet<String> = target.files.iter().map(|f| f.dest.clone()).collect();
+        let mut warnings = Vec::new();
         target.files = std::mem::take(&mut target.files)
             .into_iter()
             .filter_map(|file| {
                 let unchanged = matches!(&file.previous,
-                    Previous::File(p) if p.sha256 == file.written_sha256);
+                    Previous::File(p) if p.sha256 == file.written_sha256
+                        || (p.sha256.is_empty()
+                            && p.reason.as_deref() == Some(NOT_WORLD_READABLE)));
                 match earlier.remove(&file.dest) {
                     old if file.write == Write::Refused => old,
                     Some(old) if old.write == Write::FailedMidway => Some(FileRecord {
@@ -417,7 +456,15 @@ impl Session {
                             ..old
                         })
                     }
-                    _ => Some(file),
+                    _ => {
+                        if file.lost_its_previous() {
+                            let warning = not_kept_warning(&file.dest, name);
+                            if !warnings.contains(&warning) {
+                                warnings.push(warning);
+                            }
+                        }
+                        Some(file)
+                    }
                 }
             })
             .collect();
@@ -428,11 +475,21 @@ impl Session {
                     .filter(|file| !touched.contains(&file.dest)),
             );
         }
+        for file in &mut target.files {
+            if let Previous::File(p) = &mut file.previous
+                && p.text.is_some()
+                && !is_world_readable(&p.mode)
+            {
+                p.drop_text(NOT_WORLD_READABLE);
+                warnings.push(stripped_warning(&file.dest, name));
+            }
+        }
         self.record.targets.insert(name.to_owned(), target);
         self.dropped.retain(|(target, _)| target != name);
         if !self.merged.iter().any(|merged| merged == name) {
             self.merged.push(name.to_owned());
         }
+        warnings
     }
 
     /// The record as loaded, with every change merged since.
@@ -524,6 +581,23 @@ impl Session {
         }
         private::write_atomic(&self.path, &bytes).map_err(|err| cannot(err.to_string()))
     }
+}
+
+/// The warning for a write that replaced a private file, whose text was
+/// never kept.
+fn not_kept_warning(dest: &str, target: &str) -> String {
+    format!(
+        "apply: {dest} on {target} was not world-readable: its previous text is not kept, \
+         so rollback cannot restore it"
+    )
+}
+
+/// The warning for a private file's text from an older anvil, dropped now.
+fn stripped_warning(dest: &str, target: &str) -> String {
+    format!(
+        "apply: {dest} on {target} was not world-readable: the text an older anvil kept \
+         is dropped, so rollback cannot restore it"
+    )
 }
 
 /// The warning for a text dropped to fit the record.
@@ -1192,6 +1266,293 @@ mod tests {
         session.merge("web1", other.clone());
         assert_eq!(session.record.targets["web1"], other);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_strips_the_old_text_of_a_private_previous_however_the_entry_is_kept() {
+        let private = |mode: &str| match previous(&sha('0'), Some(TEXT)) {
+            Previous::File(p) => Previous::File(PreviousFile {
+                mode: mode.to_owned(),
+                ..p
+            }),
+            other => other,
+        };
+        let old = target(
+            1,
+            true,
+            vec![
+                file("/etc/same", &sha('1'), Write::Written, private("0600")),
+                file("/etc/refused", &sha('2'), Write::Written, private("0640")),
+                file(
+                    "/etc/midway",
+                    &sha('3'),
+                    Write::FailedMidway,
+                    private("0600"),
+                ),
+                file("/etc/left", &sha('4'), Write::Written, private("0600")),
+                file("/etc/open", &sha('5'), Write::Written, private("0604")),
+            ],
+        );
+        let (mut session, root) = session_with("record-strip", vec![("web1", old)]);
+        let new = target(
+            2,
+            false,
+            vec![
+                file(
+                    "/etc/same",
+                    &sha('1'),
+                    Write::Written,
+                    previous(&sha('1'), None),
+                ),
+                file("/etc/refused", &sha('9'), Write::Refused, Previous::Absent),
+                file("/etc/midway", &sha('3'), Write::Written, Previous::Absent),
+            ],
+        );
+        session.merge("web1", new);
+        assert!(session.save().unwrap().is_empty());
+        let saved = load(&session.path).unwrap().unwrap();
+        assert_eq!(
+            dests(&saved.targets["web1"]),
+            [
+                "/etc/same",
+                "/etc/refused",
+                "/etc/midway",
+                "/etc/left",
+                "/etc/open"
+            ]
+        );
+        for (i, file) in saved.targets["web1"].files.iter().take(4).enumerate() {
+            let Previous::File(p) = &file.previous else {
+                panic!("{file:?}");
+            };
+            assert_eq!(
+                (
+                    p.kept,
+                    p.text.is_none(),
+                    p.reason.as_deref(),
+                    p.sha256.as_str()
+                ),
+                (false, true, Some(NOT_WORLD_READABLE), sha('0').as_str()),
+                "{i}"
+            );
+        }
+        assert!(kept(&saved, "web1")[4], "others may read 0604");
+        let bytes = fs::read_to_string(&session.path).unwrap();
+        assert_eq!(bytes.matches("hunter2").count(), 1, "only /etc/open's");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// What a capture leaves for a private previous: `sha256` is `""` on a
+    /// target with no hash tool.
+    fn hash_only(sha256: &str) -> Previous {
+        Previous::File(PreviousFile {
+            mode: "0600".to_owned(),
+            uid: 0,
+            gid: 0,
+            sha256: sha256.to_owned(),
+            kept: false,
+            text: None,
+            reason: Some(NOT_WORLD_READABLE.to_owned()),
+        })
+    }
+
+    fn lost(dest: &str) -> String {
+        format!(
+            "apply: {dest} on web1 was not world-readable: its previous text is not kept, \
+             so rollback cannot restore it"
+        )
+    }
+
+    #[test]
+    fn a_rerun_with_no_hash_tool_keeps_the_real_previous_and_stays_quiet() {
+        let kept = previous(&sha('0'), Some(TEXT));
+        let first = target(
+            1,
+            true,
+            vec![file("/etc/a", &sha('1'), Write::Written, kept.clone())],
+        );
+        let (mut session, root) = session_with("record-nohash", vec![("web1", first)]);
+        let rerun = target(
+            2,
+            true,
+            vec![file("/etc/a", &sha('1'), Write::Written, hash_only(""))],
+        );
+        assert!(session.merge("web1", rerun).is_empty());
+        assert_eq!(session.record.targets["web1"].files[0].previous, kept);
+
+        // Other bytes this time: the capture is all there is.
+        let other = target(
+            3,
+            true,
+            vec![file("/etc/a", &sha('2'), Write::Written, hash_only(""))],
+        );
+        assert_eq!(session.merge("web1", other), [lost("/etc/a")]);
+        assert_eq!(
+            session.record.targets["web1"].files[0].previous,
+            hash_only("")
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_empty_hash_for_any_other_reason_never_counts_as_unchanged() {
+        let first = target(
+            1,
+            true,
+            vec![file(
+                "/etc/a",
+                &sha('1'),
+                Write::Written,
+                previous(&sha('0'), Some(TEXT)),
+            )],
+        );
+        let (mut session, root) = session_with("record-empty", vec![("web1", first)]);
+        for reason in ["over 256 KiB", "unreadable", "no od on the target"] {
+            let captured = Previous::File(PreviousFile {
+                mode: "0644".to_owned(),
+                uid: 0,
+                gid: 0,
+                sha256: String::new(),
+                kept: false,
+                text: None,
+                reason: Some(reason.to_owned()),
+            });
+            let rerun = target(
+                2,
+                true,
+                vec![file("/etc/a", &sha('1'), Write::Written, captured.clone())],
+            );
+            session.merge("web1", rerun);
+            assert_eq!(
+                session.record.targets["web1"].files[0].previous, captured,
+                "{reason}"
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_warns_only_for_a_previous_this_apply_lost() {
+        let (mut session, root) = session_with("record-warn", vec![]);
+        let new = target(
+            1,
+            true,
+            vec![
+                file("/etc/a", &sha('1'), Write::Written, hash_only(&sha('0'))),
+                file("/etc/same", &sha('1'), Write::Written, hash_only(&sha('1'))),
+                file(
+                    "/etc/no",
+                    &sha('1'),
+                    Write::Written,
+                    previous(&sha('0'), None),
+                ),
+                file(
+                    "/etc/refused",
+                    &sha('1'),
+                    Write::Refused,
+                    hash_only(&sha('0')),
+                ),
+                file("/etc/a", &sha('2'), Write::Written, hash_only(&sha('1'))),
+            ],
+        );
+        assert_eq!(
+            session.merge("web1", new),
+            [lost("/etc/a")],
+            "once per dest"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_previous_kept_from_a_write_that_failed_midway_is_no_loss() {
+        let kept = previous(&sha('0'), Some(TEXT));
+        let first = target(
+            1,
+            false,
+            vec![file("/etc/a", &sha('1'), Write::FailedMidway, kept.clone())],
+        );
+        let (mut session, root) = session_with("record-midway", vec![("web1", first)]);
+        let retry = target(
+            2,
+            true,
+            vec![file(
+                "/etc/a",
+                &sha('1'),
+                Write::Written,
+                hash_only(&sha('9')),
+            )],
+        );
+        assert!(session.merge("web1", retry).is_empty());
+        assert_eq!(session.record.targets["web1"].files[0].previous, kept);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_warns_when_it_strips_the_text_an_older_anvil_kept() {
+        let private = || match previous(&sha('0'), Some(TEXT)) {
+            Previous::File(p) => Previous::File(PreviousFile {
+                mode: "0640".to_owned(),
+                ..p
+            }),
+            other => other,
+        };
+        let old = target(
+            1,
+            true,
+            vec![
+                file("/etc/same", &sha('1'), Write::Written, private()),
+                file("/etc/left", &sha('2'), Write::Written, private()),
+            ],
+        );
+        let (mut session, root) = session_with("record-strip-warn", vec![("web1", old)]);
+        let rerun = target(
+            2,
+            false,
+            vec![file(
+                "/etc/same",
+                &sha('1'),
+                Write::Written,
+                hash_only(&sha('1')),
+            )],
+        );
+        let dropped = |dest: &str| {
+            format!(
+                "apply: {dest} on web1 was not world-readable: the text an older anvil kept \
+                 is dropped, so rollback cannot restore it"
+            )
+        };
+        assert_eq!(
+            session.merge("web1", rerun),
+            [dropped("/etc/same"), dropped("/etc/left")]
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn not_kept_says_why_a_file_cannot_be_restored() {
+        let entry = |previous| file("/etc/a", &sha('a'), Write::Written, previous);
+        assert_eq!(entry(Previous::Absent).not_kept(), None);
+        assert_eq!(entry(previous(&sha('0'), Some(TEXT))).not_kept(), None);
+        assert_eq!(
+            entry(previous(&sha('0'), None)).not_kept(),
+            Some(NO_ROLLBACK)
+        );
+    }
+
+    #[test]
+    fn a_mode_is_world_readable_by_its_others_read_bit_only() {
+        for (mode, readable) in [
+            ("0644", true),
+            ("0604", true),
+            ("4755", true),
+            ("0600", false),
+            ("0640", false),
+            ("0000", false),
+            ("0603", false),
+            ("not octal", false),
+        ] {
+            assert_eq!(is_world_readable(mode), readable, "{mode}");
+        }
     }
 
     #[test]

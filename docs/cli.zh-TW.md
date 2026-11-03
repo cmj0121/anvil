@@ -726,6 +726,10 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 已知名稱仍會安裝，後續 step 照常執行，target 的 `ok`、摘要與 exit code 不因這些警告改變。
 所有 target 成功時仍以 0 結束；實際安裝失敗仍會使 target 失敗。
 
+文件本身也可能有最上層的 `warnings`（字串陣列，空時省略）：這次執行中 apply 紀錄失去的內容，
+也就是放不下或不保存的先前文字（[apply 紀錄](#apply-紀錄)）。它們同時印在 stderr，只指名 dest 與 target，絕不含文字，
+也不改變 `ok` 或結束碼。rollback 的形狀相同，另外多了 `not_restored`（[`anvil rollback`](#anvil-rollback)）。
+
 #### 執行中的 task
 
 [`[[tasks]]`](configuration.zh-TW.md#tasks) config 依所寫的順序執行，而非上述的固定順序：
@@ -902,11 +906,19 @@ anvil 把它寫成一行。`previous` 對先前不存在的 dest 為 `{"state": 
 寫入任何東西之前就被拒絕（`refused`：root 檢查、DEST 是目錄、DEST 在讀取後被改過，或無法設定 mode 的他人 DEST，
 都以 4 結束）的寫入絕不保存：該 dest 保留前一次 apply 的項目（若有）。
 
-**保存或不保存。** 只有在先前的文字是不含 NUL 位元組的 UTF-8 文字、最多 256 KiB，且項目沒有設定 `rollback = false` 時，
-才會保存它。否則 `kept` 為 false，`reason` 說明原因：`rollback = false`、`over 256 KiB`、`not UTF-8 text`、
-`contains NUL`、`unreadable`、`no od on the target` 或 `record full`。不論哪種情況寫入都會進行；失去的只是它的復原，
-rollback 會把該檔案顯示為 `cannot undo: DEST (REASON)`。`rollback = false` 只保存雜湊：dest 保存 secret 時請使用它
-（[Files](configuration.zh-TW.md#files)）。
+**保存或不保存。** 只有在先前的檔案是所有人可讀（mode 含 `0o004`）、文字是不含 NUL 位元組的 UTF-8、最多 256 KiB，
+且項目沒有設定 `rollback = false` 時，才會保存它。否則 `kept` 為 false，`reason` 說明原因：`rollback = false`、
+`not world-readable`、`over 256 KiB`、`not UTF-8 text`、`contains NUL`、`unreadable`、`no od on the target` 或 `record full`。
+不論哪種情況寫入都會進行；失去的只是它的復原，rollback 會把該檔案顯示為 `cannot undo: DEST (REASON)`。
+`rollback = false` 只保存雜湊：dest 保存 secret 時請使用它（[Files](configuration.zh-TW.md#files)）。
+
+**非所有人可讀。** 這種檔案的位元組不會離開 target：capture 只傳送它的 `ls` 行與 sha256，因此沒有雜湊工具的 target
+會留下空的雜湊，寫入也沒有防護。apply 會在 stderr 與 `--json` 中警告
+`apply: DEST on TARGET was not world-readable: its previous text is not kept, so rollback cannot restore it`，
+條件是寫入取代了不同的位元組、沒有較早的項目仍保存先前狀態，且項目沒有設定 `rollback = false`，因此未變更的重跑保持安靜。只看 mode：0700 目錄中的
+0644 檔案仍會保存。在該 target 上第一次寫入檔案的 apply 會捨棄舊版 anvil 記下的這類檔案的文字，並警告
+`apply: DEST on TARGET was not world-readable: the text an older anvil kept is dropped, so rollback cannot restore it`。
+沒有雜湊工具的 target 無法看出這類 dest 被其他方式改過：寫入相同位元組時會保留較早的項目。
 
 `rollback = false` 有兩項限制。dest 的 symlink、hard link 或不分大小寫的別名在 controller 上看不出來，會算成不同的 dest，
 因此該檔案的每個項目都要設定 `rollback = false`。同一 dest 重複的舊式 `[[files]]` 項目，若第一個使用預設 rollback、
@@ -1399,6 +1411,10 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 - **最後寫入的先處理。** 每個記錄的檔案是一個 step，順序與 apply 寫入時相反：`restore DEST` 印出 `restored DEST`，
   `remove DEST` 印出 `removed DEST`；DEST 已經是 apply 之前的樣子時，兩者都印出 `unchanged DEST`（restore 仍會把 owner 與 mode 設回去）。
   文字沒有保存的檔案是一個略過的 step `cannot undo: DEST (REASON)`，原因取自紀錄（例如 `rollback = false`）。
+- **未還原。** 每個這樣的檔案，不論原因，也會在 target 的區塊與 `warnings` 中顯示為 `⚠ not restored: DEST (REASON)`，
+  摘要也不算乾淨的 ok：它是 `2 ok, 0 failed, 1 not restored`，接著每個檔案一行 `DEST on TARGET (REASON)`；`--json`
+  以 `"not_restored":[{"target","dest","reason"}]` 列出，沒有時省略。結束碼仍為 0，所以重複 rollback 保持冪等。
+  下面那些沒有指名檔案的註記不影響摘要。
 - **無法復原的部分。** 在檔案之後，apply 中有執行但無法復原的 step 會顯示為略過的 step：`cannot undo: packages`、
   `cannot undo: service NAME` 與 `cannot undo: step N`（第 N 個 `[[steps]]` 項目），在 tasks config 上則為 `cannot undo: PATH`
   （[執行中的 task](#執行中的-task)）。rollback 絕不執行套件管理器、
@@ -1461,7 +1477,7 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 
 結束碼：
 
-- **0**：每個選定的 target 都完成 rollback，或沒有任何紀錄。
+- **0**：每個選定的 target 都完成 rollback，或沒有任何紀錄；文字沒有保存的檔案會被指名，但不算失敗。
 - **1**：`rollback: no apply recorded`（沒有紀錄，或紀錄中沒有任何項目；不執行任何東西）；某個 target 失敗
   （被拒絕的 dest、不在 `[[files]]` 中或 `sudo` 不同的 dest、host 改變、還原或連線失敗）；紀錄無法讀取（`rollback: PATH: REASON`，與 apply 相同）、
   被另一個 anvil 鎖住或無法儲存；找不到狀態目錄（[apply 紀錄](#apply-紀錄)）。

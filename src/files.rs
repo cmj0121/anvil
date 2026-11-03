@@ -29,7 +29,9 @@ use crate::document;
 use crate::facts::Facts;
 use crate::filestore::{self, StoreError};
 use crate::inventory::{self, Target, TargetKind};
-use crate::record::{FileRecord, NO_ROLLBACK, Previous, PreviousFile, Write};
+use crate::record::{
+    FileRecord, NO_ROLLBACK, NOT_WORLD_READABLE, Previous, PreviousFile, Write, is_world_readable,
+};
 use crate::remote::{
     Bytes, Heredoc, LOGIN_OWNED, ROOT_OWNED, Replacement, is_owned_only, link_removal_checks,
     login_checks, login_top, not_a_directory, random_hex, root_checks, root_only_find, sweep,
@@ -590,10 +592,12 @@ const MARK: &str = "anvil-capture ";
 /// the same `checks` as the write, which refuse a symlink DEST.
 ///
 /// It prints `anvil-capture absent` or
-/// `anvil-capture file <ls -lLdn line>` and then, for a file of at most
-/// [`MAX_KEPT`] bytes, its bytes in `od` hex between `anvil-capture bytes`
-/// and `anvil-capture end`. When it sends no bytes (too large, no `od`,
-/// unreadable) it adds `anvil-capture sha256 HEX` if a hash tool exists. A
+/// `anvil-capture file <ls -lLdn line>` and then, for a world-readable file
+/// of at most [`MAX_KEPT`] bytes, its bytes in `od` hex between
+/// `anvil-capture bytes` and `anvil-capture end`. When it sends no bytes (not
+/// world-readable, too large, no `od`, unreadable) it adds
+/// `anvil-capture sha256 HEX` if a hash tool exists: the record would not keep
+/// a private file's bytes, so they do not leave the target at all. A
 /// DEST that is not a regular file fails the run, so the write never starts.
 /// `tr -s` squeezes the hex to three characters a byte, as BSD `od` pads
 /// it wider, so [`MAX_KEPT`] bytes stay under the transport's output cap.
@@ -623,6 +627,7 @@ pub(crate) fn capture_script(dest: &str, sudo: &str, checks: &str) -> String {
          case $anvil_line in -*) ;; *) echo {irregular} >&2; exit 1 ;; esac\n\
          printf '{MARK}file %s\\n' \"$anvil_line\"\n\
          set -- $anvil_line\n\
+         case $1 in -??????r*) ;; *) anvil_sent; exit 0 ;; esac\n\
          if [ \"$5\" -gt {MAX_KEPT} ]; then anvil_sent\n\
          elif ! {has_od}; then echo '{MARK}no-od'; anvil_sent\n\
          else echo '{MARK}bytes'\n\
@@ -741,6 +746,9 @@ pub(crate) fn parse_capture(dest: &str, stdout: &[u8]) -> Result<Captured, Strin
             _ => Err(unread()),
         }
     };
+    if !is_world_readable(&mode) {
+        return Ok(file(remote(&mut rest)?, None, Some(NOT_WORLD_READABLE)));
+    }
     if size > MAX_KEPT {
         return Ok(file(remote(&mut rest)?, None, Some("over 256 KiB")));
     }
@@ -3498,8 +3506,8 @@ mod tests {
         assert!(matches!(capture(&dir.join("none")), Ok(Captured::Absent)));
         let (uid, gid) = ids(&dir);
         for (name, bytes, mode) in [
-            ("text", SECRET_TEXT.as_bytes(), 0o640),
-            ("empty", b"".as_slice(), 0o600),
+            ("text", SECRET_TEXT.as_bytes(), 0o644),
+            ("empty", b"".as_slice(), 0o604),
             ("binary", b"\x00\xff\x01\n\x7f".as_slice(), 0o4755),
         ] {
             let path = dir.join(name);
@@ -3561,6 +3569,54 @@ mod tests {
             );
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_others_may_not_read_sends_only_its_hash() {
+        let dir = dir("files-capture-private");
+        let bin = passthrough_sudo(&dir);
+        let big = "a".repeat(MAX_KEPT as usize + 1);
+        for (name, text, mode) in [
+            ("0600", SECRET_TEXT, 0o600),
+            ("0640", SECRET_TEXT, 0o640),
+            ("4750", SECRET_TEXT, 0o4750),
+            ("big", big.as_str(), 0o600),
+        ] {
+            let path = dir.join(name);
+            fs::write(&path, text).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let d = path.to_str().unwrap();
+            for out in [
+                Local.run(&capture_script(d, "", ""), RUN_TIMEOUT).unwrap(),
+                sh_with(&bin, &capture_script(d, "sudo -n ", "")),
+            ] {
+                assert_eq!(out.code, Some(0), "{name}");
+                let shown = String::from_utf8_lossy(&out.stdout).into_owned();
+                let lines: Vec<&str> = shown.lines().collect();
+                assert_eq!(lines.len(), 2, "the ls line and the hash: {shown}");
+                assert_eq!(
+                    lines[1],
+                    format!("{MARK}sha256 {}", sha_hex(text.as_bytes()))
+                );
+                let (.., sha256, bytes, reason) = file_of(parse_capture(d, &out.stdout).unwrap());
+                assert_eq!(
+                    (sha256, bytes, reason),
+                    (sha_hex(text.as_bytes()), None, Some(NOT_WORLD_READABLE)),
+                    "{name}"
+                );
+            }
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_capture_refuses_the_bytes_of_a_file_others_may_not_read() {
+        let out = "anvil-capture file -rw-r----- 1 0 0 2 y\n\
+                   anvil-capture bytes\n 68 69\nanvil-capture end\n";
+        assert_eq!(
+            parse_capture("/etc/a", out.as_bytes()).unwrap_err(),
+            "files: cannot read /etc/a before writing it"
+        );
     }
 
     #[test]
@@ -3670,12 +3726,20 @@ mod tests {
         let dir = dir("files-capture-0000");
         let path = dir.join("conf");
         fs::write(&path, SECRET_TEXT).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        // Others may read it, its owner may not.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o004)).unwrap();
         let (mode, .., sha256, bytes, reason) = file_of(capture(&path).unwrap());
-        assert_eq!(mode, "0000");
+        assert_eq!(mode, "0004");
         assert_eq!(
             (sha256.as_str(), bytes, reason),
             ("", None, Some("unreadable"))
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let (.., sha256, bytes, reason) = file_of(capture(&path).unwrap());
+        assert_eq!(
+            (sha256.as_str(), bytes, reason),
+            ("", None, Some(NOT_WORLD_READABLE)),
+            "the mode decides first"
         );
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -3809,7 +3873,7 @@ mod tests {
 
     #[test]
     fn parse_capture_refuses_anything_but_the_exact_shape() {
-        let file = "anvil-capture file -rw------- 1 0 0 2 Oct 1 10:00 /etc/a\n";
+        let file = "anvil-capture file -rw-r--r-- 1 0 0 2 Oct 1 10:00 /etc/a\n";
         let sha = format!("anvil-capture sha256 {}\n", "a".repeat(64));
         let ok = [
             format!("{file}anvil-capture bytes\n 68 69\nanvil-capture end\n"),
@@ -3865,7 +3929,7 @@ mod tests {
             "files: /etc/a is not a regular file"
         );
         let big = format!(
-            "anvil-capture file -rw------- 1 0 0 {} y\n{sha}",
+            "anvil-capture file -rw-r--r-- 1 0 0 {} y\n{sha}",
             MAX_KEPT + 1
         );
         let (.., sha256, bytes, reason) = file_of(parse_capture("/etc/a", big.as_bytes()).unwrap());
@@ -3973,7 +4037,7 @@ mod tests {
     fn lines_before_the_first_marker_are_skipped() {
         let warn = "sudo: unable to resolve host web1\n";
         let out = format!(
-            "{warn}{warn}anvil-capture file -rw------- 1 0 0 2 y\n\
+            "{warn}{warn}anvil-capture file -rw-r--r-- 1 0 0 2 y\n\
              anvil-capture bytes\n 68 69\nanvil-capture end\n"
         );
         let (.., bytes, _) = file_of(parse_capture("/etc/a", out.as_bytes()).unwrap());

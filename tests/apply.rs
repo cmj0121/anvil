@@ -836,7 +836,7 @@ fn apply_records_what_each_target_held_before_it_wrote() {
     let sandbox = Sandbox::new("aa");
     let (web, local) = with_files(&sandbox);
     std::fs::write(&local, PREVIOUS).unwrap();
-    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644)).unwrap();
     let ssh_log = sandbox.root().join("ssh.log");
     let ssh_log = ssh_log.to_str().unwrap();
     let out = sandbox.anvil(&["-vvv", "apply"], &[("FAKE_SSH_LOG", ssh_log)]);
@@ -877,7 +877,7 @@ fn apply_records_what_each_target_held_before_it_wrote() {
         serde_json::json!([{
             "dest": local, "mode": "0640", "sudo": false,
             "written_sha256": written, "write": "written",
-            "previous": {"state": "file", "mode": "0600", "uid": uid, "gid": gid,
+            "previous": {"state": "file", "mode": "0644", "uid": uid, "gid": gid,
                          "sha256": sha256_hex(PREVIOUS), "kept": true, "text": PREVIOUS},
         }])
     );
@@ -898,6 +898,105 @@ fn apply_records_what_each_target_held_before_it_wrote() {
     assert_eq!(
         again["targets"]["local"]["files"][0]["previous"]["text"],
         PREVIOUS
+    );
+}
+
+#[test]
+fn a_private_previous_file_leaves_only_its_hash_in_the_record_and_warns() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in [0o600, 0o640] {
+        let sandbox = Sandbox::new("aa");
+        let (_, local) = with_files(&sandbox);
+        std::fs::write(&local, PREVIOUS).unwrap();
+        std::fs::set_permissions(&local, std::fs::Permissions::from_mode(mode)).unwrap();
+        let warning = format!(
+            "apply: {local} on local was not world-readable: its previous text is not kept, \
+             so rollback cannot restore it"
+        );
+        let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains(&warning), "{mode:o}");
+        assert_eq!(
+            json(&out)["warnings"],
+            serde_json::json!([warning]),
+            "{mode:o}"
+        );
+        let raw = std::fs::read_to_string(sandbox.state_home().join("anvil/last-apply.json"));
+        assert!(!raw.unwrap().contains(PREVIOUS.trim_end()), "{mode:o}");
+        let record = sandbox.last_apply().unwrap();
+        assert_eq!(record["version"], 1);
+        let previous = &record["targets"]["local"]["files"][0]["previous"];
+        assert_eq!(previous["sha256"], sha256_hex(PREVIOUS), "{mode:o}");
+        assert_eq!(previous["kept"], false, "{mode:o}");
+        assert!(previous.get("text").is_none(), "{previous}");
+        assert_eq!(previous["reason"], "not world-readable", "{mode:o}");
+
+        // An unchanged rerun loses nothing more, and keeps the real previous.
+        let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert!(
+            !text(&out.stderr).contains("not world-readable"),
+            "{mode:o}"
+        );
+        let again = sandbox.last_apply().unwrap();
+        assert_eq!(
+            again["targets"]["local"]["files"][0]["previous"]["sha256"],
+            sha256_hex(PREVIOUS)
+        );
+    }
+}
+
+#[test]
+fn a_retry_after_a_failed_write_keeps_its_previous_and_does_not_warn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new("aa");
+    let (_, local) = with_files(&sandbox);
+    std::fs::write(&local, PREVIOUS).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    record["targets"]["local"]["files"][0]["write"] = "failed_midway".into();
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    // Part of the bytes, at a mode that keeps the capture from reading them.
+    std::fs::write(&local, "part").unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for shown in [text(&out.stdout), text(&out.stderr)] {
+        assert!(!shown.contains("not world-readable"), "{shown}");
+    }
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["files"][0]["previous"]["text"], PREVIOUS,
+        "rollback can still restore it"
+    );
+}
+
+#[test]
+fn a_private_previous_with_rollback_false_says_so_and_does_not_warn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new("aa");
+    let (_, local) = with_files(&sandbox);
+    std::fs::write(&local, PREVIOUS).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let config = std::fs::read_to_string(sandbox.config_dir().join("config.toml")).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &config.replace("sudo = false\n", "sudo = false\nrollback = false\n"),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(!text(&out.stderr).contains("not world-readable"));
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["files"][0]["previous"]["reason"],
+        "rollback = false"
     );
 }
 

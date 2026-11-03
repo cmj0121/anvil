@@ -526,9 +526,9 @@ rb_anvil() {
 # Neither the previous nor the written bytes ever reach the output, logs included.
 rb_quiet() { ! grep -qF -e "$RB_OLD" -e "$RB_NEW" "$TMP/out" "$TMP/err"; }
 rb_stat() { docker exec "$NAME" stat -c '%a %U:%G' "$1"; }
-# Previous: root:key 0600 (tee keeps the owner, so its mode is what changes).
+# Previous: root:key 0644, so its text is kept (tee keeps the owner).
 docker exec "$NAME" sh -c "printf '%s\n' '$RB_OLD' >/etc/anvil-e2e-rb && chown root:key /etc/anvil-e2e-rb \
-  && chmod 600 /etc/anvil-e2e-rb && rm -f /etc/anvil-e2e-rb-new"
+  && chmod 644 /etc/anvil-e2e-rb && rm -f /etc/anvil-e2e-rb-new"
 rb_anvil -vv apply --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  wrote /etc/anvil-e2e-rb' "$TMP/out" \
@@ -569,10 +569,10 @@ code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  restored /etc/anvil-e2e-rb' "$TMP/out" \
   && grep -qxF '  removed /etc/anvil-e2e-rb-new' "$TMP/out" \
   && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" = "$RB_OLD" ] \
-  && [ "$(rb_stat /etc/anvil-e2e-rb)" = '600 root:key' ] \
+  && [ "$(rb_stat /etc/anvil-e2e-rb)" = '644 root:key' ] \
   && ! docker exec "$NAME" test -e /etc/anvil-e2e-rb-new && rb_quiet \
   && grep -qF '"rolled_back":{' "$RB_RECORD"; then
-  pass "rollback restored the previous bytes, mode 0600 and owner root:key, removed the new dest"
+  pass "rollback restored the previous bytes, mode 0644 and owner root:key, removed the new dest"
 else
   fail "rollback: exit $code"
   docker exec "$NAME" stat -c '%a %U:%G %n' /etc/anvil-e2e-rb
@@ -605,7 +605,7 @@ code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  restored /etc/anvil-e2e-rb' "$TMP/out" \
   && grep -qxF '  unchanged /etc/anvil-e2e-rb-new' "$TMP/out" \
   && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" = "$RB_OLD" ] \
-  && [ "$(rb_stat /etc/anvil-e2e-rb)" = '600 root:key' ] \
+  && [ "$(rb_stat /etc/anvil-e2e-rb)" = '644 root:key' ] \
   && ! docker exec "$NAME" test -e /etc/anvil-e2e-rb-new && rb_quiet; then
   pass "--force DEST restored the hand-edited dest"
 else
@@ -632,10 +632,32 @@ rb_anvil -vv rollback --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-rb' "$TMP/out" \
   && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" = "$RB_OLD" ] \
-  && [ "$(rb_stat /etc/anvil-e2e-rb)" = '600 root:key' ] && rb_quiet; then
+  && [ "$(rb_stat /etc/anvil-e2e-rb)" = '644 root:key' ] && rb_quiet; then
   pass "rollback after the failed temp write finds the dest unchanged, without --force"
 else
   fail "rollback after a failed temp write: exit $code"
+fi
+# A previous file others may not read: only its hash reaches the record, and rollback says it cannot undo it.
+# The write that failed midway above would keep its older previous, so start from no record.
+rm -f "$RB_RECORD"
+docker exec "$NAME" sh -c "printf '%s\n' '$RB_OLD' >/etc/anvil-e2e-rb && chmod 600 /etc/anvil-e2e-rb"
+rb_anvil apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && ! grep -qF "$RB_OLD" "$RB_RECORD" \
+  && grep -qF '"reason":"not world-readable"' "$RB_RECORD" \
+  && grep -qF '/etc/anvil-e2e-rb on arch was not world-readable' "$TMP/err" && rb_quiet; then
+  pass "a 0600 previous leaves only its hash in the record, and apply warns"
+else
+  fail "apply over a 0600 previous: exit $code"
+fi
+rb_anvil rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  /etc/anvil-e2e-rb on arch (not world-readable)' "$TMP/out" \
+  && grep -qF '1 not restored' "$TMP/out" \
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rb)" != "$RB_OLD" ] && rb_quiet; then
+  pass "rollback names the 0600 previous it cannot restore, exit 0"
+else
+  fail "rollback over a 0600 previous: exit $code"
 fi
 
 step "(r) [[tasks]] on arch: nested and included tasks run in order, a selector skips one, rollback restores the files"
@@ -697,7 +719,7 @@ TK_PATHS=$(printf '%s\n' \
   '  tasks[2]/roles/app.toml:tasks[1]  Other distro' \
   '  tasks[2]/roles/app.toml:tasks[2]  Replace file')
 tk_paths() { grep -E '^  tasks\[' "$TMP/out"; }
-docker exec "$NAME" sh -c "rm -rf $TK_D && printf '%s\n' '$TK_OLD' >$TK_D-old && chmod 600 $TK_D-old"
+docker exec "$NAME" sh -c "rm -rf $TK_D && printf '%s\n' '$TK_OLD' >$TK_D-old && chmod 644 $TK_D-old"
 tk_anvil plan --target arch
 code=$?
 if [ "$code" -eq 0 ] && [ "$(tk_paths)" = "$TK_PATHS" ] \
@@ -750,7 +772,7 @@ tk_anvil -vv rollback --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qxF "  restored $TK_D-old" "$TMP/out" && grep -qxF "  removed $TK_D/new" "$TMP/out" \
   && [ "$(docker exec "$NAME" cat "$TK_D-old")" = "$TK_OLD" ] \
-  && [ "$(docker exec "$NAME" stat -c '%a' "$TK_D-old")" = 600 ] \
+  && [ "$(docker exec "$NAME" stat -c '%a' "$TK_D-old")" = 644 ] \
   && ! docker exec "$NAME" test -e "$TK_D/new"; then
   pass "rollback restored the replaced file and removed the new one"
 else
@@ -1066,7 +1088,7 @@ dest = "/etc/anvil-e2e-rbpw-new"
 mode = "0600"
 CONF
   docker exec "$NAME" sh -c "printf '%s\n' '$PW_OLD' >/etc/anvil-e2e-rbpw && chown pw:pw /etc/anvil-e2e-rbpw \
-    && chmod 640 /etc/anvil-e2e-rbpw && rm -f /etc/anvil-e2e-rbpw-new"
+    && chmod 644 /etc/anvil-e2e-rbpw && rm -f /etc/anvil-e2e-rbpw-new"
   pw_quiet() { ! grep -qF -e "$PASSWORD" -e "$FILE_CONTENT" -e "$PW_OLD" "$TMP/out" "$TMP/err"; }
   sudo_anvil XDG_STATE_HOME="$PW_STATE" -vv apply --target archpw
   code=$?
@@ -1085,9 +1107,9 @@ CONF
   if [ "$code" -eq 0 ] && grep -qxF '  restored /etc/anvil-e2e-rbpw' "$TMP/out" \
     && grep -qxF '  removed /etc/anvil-e2e-rbpw-new' "$TMP/out" \
     && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-rbpw)" = "$PW_OLD" ] \
-    && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-rbpw)" = '640 pw:pw' ] \
+    && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-rbpw)" = '644 pw:pw' ] \
     && ! docker exec "$NAME" test -e /etc/anvil-e2e-rbpw-new && [ -z "$left" ] && pw_quiet; then
-    pass "rollback with the sudo secret restored the bytes, mode 0640 and owner pw:pw, removed the new dest"
+    pass "rollback with the sudo secret restored the bytes, mode 0644 and owner pw:pw, removed the new dest"
   else
     fail "rollback with the sudo secret: exit $code, left: $left"
     docker exec "$NAME" stat -c '%a %U:%G %n' /etc/anvil-e2e-rbpw

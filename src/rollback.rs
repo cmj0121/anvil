@@ -13,7 +13,10 @@
 //! make rollback write, perhaps as root, a path the config never names. The
 //! sudo passwords come from the record's `sudo` flags. The only change a
 //! rollback makes to the record is `rolled_back`, the dests it put back, so
-//! a second rollback restores the same bytes.
+//! a second rollback restores the same bytes. A file whose text was not kept
+//! cannot be put back: it is named in its target's block, the summary and the
+//! JSON report, yet the exit stays 0, so that a repeat rollback stays
+//! idempotent.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU8;
@@ -22,8 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use crate::apply::{
-    self, Entry, Escape, Line, Passwords, PlannedRun, Progress, Report, StepReport, Style,
-    TargetReport, Unresolved, print_lines,
+    self, Entry, Escape, Line, NotRestored, Passwords, PlannedRun, Progress, Report, StepReport,
+    Style, TargetReport, Unresolved, print_lines,
 };
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
@@ -181,10 +184,25 @@ pub fn run_targets(
     )
     .map_err(|err| Failure::failed(format!("rollback: {err}")))?;
     let ok = reports.iter().all(TargetReport::ok);
+    let not_restored = targets
+        .iter()
+        .zip(&entries)
+        .filter_map(|(target, entry)| Some((target, entry.as_ref()?)))
+        .flat_map(|(target, entry)| {
+            entry.files.iter().filter_map(|file| {
+                Some(NotRestored {
+                    target: target.name.clone(),
+                    dest: file.dest.clone(),
+                    reason: file.not_kept()?.to_owned(),
+                })
+            })
+        })
+        .collect();
     Ok(Report {
         targets: reports,
         ok,
         warnings: Vec::new(),
+        not_restored,
     })
 }
 
@@ -325,7 +343,7 @@ fn roll_back(
             Err(error) => return failed(error),
         };
     runs.extend(entry.cannot_undo.iter().map(|what| cannot_undo(what)));
-    let report = apply::execute(
+    let mut report = apply::execute(
         "rollback",
         target,
         transport.as_ref(),
@@ -334,6 +352,11 @@ fn roll_back(
         cancel,
         None,
     );
+    for file in &entry.files {
+        if let Some(reason) = file.not_kept() {
+            report.warn(format!("not restored: {} ({reason})", file.dest));
+        }
+    }
     let dests = restored(report.steps());
     let rolled_back = (!dests.is_empty()).then(|| RolledBack {
         at: record::now(),
@@ -479,17 +502,17 @@ fn would(entry: Option<&TargetRecord>) -> Vec<String> {
     let Some(entry) = entry else {
         return vec![NOTHING.to_owned()];
     };
-    let files = entry.files.iter().rev().map(|file| match &file.previous {
-        Previous::File(previous) if previous.kept && previous.text.is_some() => {
-            format!("would restore {}", file.dest)
-        }
-        Previous::File(previous) => format!(
-            "cannot undo: {} ({})",
-            file.dest,
-            previous.reason.as_deref().unwrap_or("not kept")
-        ),
-        Previous::Absent | Previous::Dangling { .. } => format!("would remove {}", file.dest),
-    });
+    let files = entry
+        .files
+        .iter()
+        .rev()
+        .map(|file| match (file.not_kept(), &file.previous) {
+            (Some(reason), _) => format!("cannot undo: {} ({reason})", file.dest),
+            (None, Previous::File(_)) => format!("would restore {}", file.dest),
+            (None, Previous::Absent | Previous::Dangling { .. }) => {
+                format!("would remove {}", file.dest)
+            }
+        });
     let rest = entry
         .cannot_undo
         .iter()

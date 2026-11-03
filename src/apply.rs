@@ -449,6 +449,14 @@ impl TargetReport {
         }
     }
 
+    /// Adds a warning, shown in the target's block and its JSON.
+    pub(crate) fn warn(&mut self, warning: String) {
+        let (Self::Ran { warnings, .. }
+        | Self::Failed { warnings, .. }
+        | Self::Cancelled { warnings, .. }) = self;
+        warnings.push(warning);
+    }
+
     /// Lift package markers after execution, including partial timeout output.
     fn collect_warnings(&mut self, runs: &[PlannedRun]) {
         let (steps, warnings) = match self {
@@ -541,9 +549,22 @@ pub struct Report {
     pub targets: Vec<TargetReport>,
     pub ok: bool,
     /// Printed on stderr after the blocks: each file the record had no
-    /// room for.
-    #[serde(skip)]
+    /// room for, or whose previous text it no longer keeps. Also in the JSON,
+    /// left out when empty: they name dests and targets, never a text.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// A rollback's files with no kept text: they do not fail it, but the
+    /// summary and the JSON name them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_restored: Vec<NotRestored>,
+}
+
+/// A recorded file a rollback cannot put back, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NotRestored {
+    pub target: String,
+    pub dest: String,
+    pub reason: String,
 }
 
 impl Report {
@@ -695,6 +716,7 @@ fn apply_targets(
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, String> {
     let mut saves = Saves::default();
+    let mut warnings = Vec::new();
     let results = fanout::fan_out(
         targets,
         parallel,
@@ -705,7 +727,7 @@ fn apply_targets(
             Event::Done(index, applied) => {
                 if let (Some(session), Some(reached)) = (session.as_mut(), &applied.reached) {
                     let name = &targets[index].name;
-                    let saved = save(session, name, reached.clone());
+                    let saved = save(session, name, reached.clone(), &mut warnings);
                     saves.note(name, saved, cancel);
                 }
                 on(Event::Done(index, &applied.report));
@@ -731,16 +753,16 @@ fn apply_targets(
         },
     );
     let order: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
-    let warnings = match session {
-        Some(session) => saves.finish(session.finish(&order))?,
-        None => Vec::new(),
-    };
+    if let Some(session) = session {
+        warnings.extend(saves.finish(session.finish(&order))?);
+    }
     let reports: Vec<TargetReport> = results.into_iter().map(|a| a.report).collect();
     let ok = reports.iter().all(TargetReport::ok);
     Ok(Report {
         targets: reports,
         ok,
         warnings,
+        not_restored: Vec::new(),
     })
 }
 
@@ -791,10 +813,16 @@ impl Saves {
     }
 }
 
-/// Merges `reached` into the record as `name`'s entry and saves it.
-fn save(session: &mut Session, name: &str, reached: Reached) -> Result<(), String> {
+/// Merges `reached` into the record as `name`'s entry, adding what the merge
+/// warns of to `warnings`, and saves it.
+fn save(
+    session: &mut Session,
+    name: &str,
+    reached: Reached,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
     match reached.wrote {
-        true => session.merge(name, reached.record),
+        true => warnings.extend(session.merge(name, reached.record)),
         false => session.refresh(name, reached.record),
     }
     session.save().map(drop)
@@ -857,6 +885,7 @@ pub(crate) fn for_each_target(
         targets: reports,
         ok,
         warnings: Vec::new(),
+        not_restored: Vec::new(),
     }
 }
 
@@ -894,7 +923,8 @@ pub(crate) fn print_report(
     if cli.json {
         print_json(&report, Failure::failed)?;
     } else {
-        let _ = status::write_stdout(&render_summary(ok, failed, style));
+        let summary = render_summary(ok, failed, &report.not_restored, style);
+        let _ = status::write_stdout(&summary);
     }
     if failed == 0 {
         Ok(())
@@ -1895,13 +1925,30 @@ fn render(report: &TargetReport, style: Style, verbose: bool) -> Vec<Line> {
     lines
 }
 
-/// The last line of the human output: `N ok, M failed`.
-fn render_summary(ok: usize, failed: usize, style: Style) -> String {
+/// The end of the human output: `N ok, M failed`, and after a rollback that
+/// could not put every file back, `, K not restored` and one line for each.
+fn render_summary(ok: usize, failed: usize, not_restored: &[NotRestored], style: Style) -> String {
     let colour = style.out.colour && failed > 0;
-    format!(
-        "{ok} ok, {}\n",
+    let mut summary = format!(
+        "{ok} ok, {}",
         paint(colour, RED, &format!("{failed} failed"))
-    )
+    );
+    if !not_restored.is_empty() {
+        let count = format!("{} not restored", not_restored.len());
+        summary += &format!(", {}", paint(style.out.colour, YELLOW, &count));
+    }
+    summary.push('\n');
+    for NotRestored {
+        target,
+        dest,
+        reason,
+    } in not_restored
+    {
+        // The reason comes from the record, which is only a file.
+        let line = shown_text(&format!("{dest} on {target} ({reason})"));
+        summary += &format!("  {line}\n");
+    }
+    summary
 }
 
 #[cfg(test)]
@@ -2548,9 +2595,21 @@ mod tests {
             targets: vec![good, bad],
             ok: false,
             warnings: Vec::new(),
+            not_restored: Vec::new(),
         };
         let value = json(&report);
         assert_eq!(keys(&value), ["ok", "targets"]);
+        let full = "apply: last-apply.json is full; /etc/a on web1 cannot be rolled back";
+        let warned = Report {
+            targets: Vec::new(),
+            ok: true,
+            warnings: vec![full.to_owned()],
+            not_restored: Vec::new(),
+        };
+        assert_eq!(
+            json(&warned),
+            serde_json::json!({"targets": [], "ok": true, "warnings": [full]})
+        );
         assert_eq!(value["ok"], false);
         assert_eq!(value["targets"][0]["ok"], true);
         assert_eq!(value["targets"][1]["ok"], false);
@@ -2731,18 +2790,18 @@ mod tests {
             shown,
             "▶ box\n  $ one\n  one-out\n  $ fail\n  partial\n  boom\n  ✘ step 2 exited 3\n\n"
         );
-        assert_eq!(render_summary(0, 1, no_color), "0 ok, 1 failed\n");
+        assert_eq!(render_summary(0, 1, &[], no_color), "0 ok, 1 failed\n");
     }
 
     #[test]
     fn the_summary_counts_targets_and_reddens_failures_only() {
-        assert_eq!(render_summary(1, 1, piped()), "1 ok, 1 failed\n");
+        assert_eq!(render_summary(1, 1, &[], piped()), "1 ok, 1 failed\n");
         assert_eq!(
-            render_summary(1, 1, terminal()),
+            render_summary(1, 1, &[], terminal()),
             "1 ok, \x1b[31m1 failed\x1b[0m\n"
         );
-        assert_eq!(render_summary(1, 0, terminal()), "1 ok, 0 failed\n");
-        assert_eq!(render_summary(0, 0, piped()), "0 ok, 0 failed\n");
+        assert_eq!(render_summary(1, 0, &[], terminal()), "1 ok, 0 failed\n");
+        assert_eq!(render_summary(0, 0, &[], piped()), "0 ok, 0 failed\n");
     }
 
     #[test]
@@ -2948,6 +3007,7 @@ mod tests {
             targets: vec![good, bad],
             ok: false,
             warnings: Vec::new(),
+            not_restored: Vec::new(),
         };
         assert_eq!(report.counts(), (1, 1));
     }
@@ -5466,9 +5526,9 @@ mod tests {
             .collect()
     }
 
-    /// A capture of a 0640 root file holding `v0\n`.
+    /// A capture of a world-readable root file holding `v0\n`.
     const CAPTURED_V0: &str = "sudo: a warning first\r\n\
-        anvil-capture file -rw-r----- 1 0 42 3 Jan 1 00:00 /etc/a.conf\n\
+        anvil-capture file -rw-r--r-- 1 0 42 3 Jan 1 00:00 /etc/a.conf\n\
         anvil-capture bytes\n 76 30 0a\nanvil-capture end\n";
 
     #[test]
@@ -5539,7 +5599,7 @@ mod tests {
             };
             assert_eq!(
                 (previous.mode.as_str(), previous.uid, previous.gid),
-                ("0640", 0, 42)
+                ("0644", 0, 42)
             );
             assert_eq!(previous.sha256, v0);
             match rollback {

@@ -459,7 +459,10 @@ apply keeps what dest held in the [apply record](cli.md#the-apply-record), `last
 back. The record is plain text, mode 0600, not encrypted. With `rollback = false` it keeps only the sha256 of what was
 there, never its text, and rollback shows that dest as `cannot undo: DEST (rollback = false)`. Set it on every entry
 whose dest holds a secret, such as a token or a private key. Only a previous text of at most 256 KiB, UTF-8 with no NUL
-byte, is kept; any other is kept as its hash only, and the write still goes ahead.
+byte, is kept; any other is kept as its hash only, and the write still goes ahead. A previous file whose mode does not
+let others read it (0600, 0640) is also kept as its hash only, whatever this says: apply warns unless the bytes are
+unchanged or an earlier entry still holds the previous state, and rollback names it,
+`cannot undo: DEST (not world-readable)`, and restores nothing there.
 
 **What lands on the target.** The bytes are compared with dest by `cmp`. The same bytes are left in place, `chmod`
 applies `mode`, and the step prints `unchanged DEST`. Otherwise it prints `wrote DEST`. Both exit 0. A missing or

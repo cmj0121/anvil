@@ -22,6 +22,9 @@
   `last-apply.json` 保存每次 `[[files]]` 寫入所取代的文字，讓 `anvil rollback` 能把它放回去
   （[apply 紀錄](cli.zh-TW.md#apply-紀錄)）。它沒有加密：保護它的是你擁有的 0700 目錄中的 mode 0600，
   每次執行都會檢查兩者，anvil 會拒絕對他人開放的紀錄或目錄。任何能以你的身分讀取你的檔案的人，或能讀取其備份的人，都能讀到它。
+  其他人無法讀取的先前檔案（mode 不含 `0o004`，例如 0440 的 `/etc/sudoers.d/*`）只保存 sha256，位元組也不會離開 target，
+  因此 rollback 無法把它放回去：apply 會警告，rollback 會指名它。舊版 anvil 記下的這類文字會留在紀錄中，
+  直到該 target 下一次寫入檔案的 apply 才捨棄並發出警告。0700 目錄中的 0644 檔案仍會保存，因為只看檔案自身的 mode。
   dest 保存 secret 的 `[[files]]` 項目請設定 `rollback = false`：紀錄就只保存它的 sha256（[Files](configuration.zh-TW.md#files)）。
   dest 的 symlink、hard link 或不分大小寫的別名在 controller 上看不出來，會算成不同的 dest，因此該檔案的每個項目都要設定。
   同一 dest 重複的舊式 `[[files]]` 項目，若第一個使用預設 rollback、後面的設定 `rollback = false`，第二次 apply 時仍會把後面項目的

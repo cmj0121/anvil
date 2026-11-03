@@ -444,7 +444,8 @@ secret 失敗與套件 step 相同，前綴改為 `files`：
 讓 [`anvil rollback`](cli.zh-TW.md#anvil-rollback) 能把它放回去。紀錄是明文，mode 0600，沒有加密。
 設定 `rollback = false` 時，它只保存原內容的 sha256，絕不保存文字，rollback 會把該 dest 顯示為 `cannot undo: DEST (rollback = false)`。
 dest 保存 secret（例如 token 或私鑰）的每個項目都請設定它。只有最多 256 KiB、不含 NUL 位元組的 UTF-8 先前文字才會保存；
-其他的只保存雜湊，寫入仍會進行。
+其他的只保存雜湊，寫入仍會進行。mode 不讓其他人讀取的先前檔案（0600、0640）不論此設定都只保存雜湊：除非位元組未變更或較早的項目仍保存先前狀態，
+apply 會警告，rollback 會以 `cannot undo: DEST (not world-readable)` 指名它，且不在那裡還原任何東西。
 
 **寫到 target 上的結果。** 位元組以 `cmp` 與 dest 比較。位元組相同時保留原檔，`chmod` 套用 `mode`，step 印出 `unchanged DEST`；
 否則印出 `wrote DEST`。兩者都以 0 結束。不存在或無法讀取的 dest 會被寫入。

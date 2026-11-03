@@ -13,7 +13,8 @@ An inventory says where (the hosts) and a config says what (packages, files, ser
 
 - By default apply works in a fixed order on each target: packages, then files, then services, then steps. An ordered
   [`[[tasks]]`](docs/configuration.md#tasks) list, with nesting and `$/` includes, runs in the order you write instead.
-- Rollback undoes files only; packages, services and steps cannot be undone.
+- Rollback undoes files only; packages, services and steps cannot be undone. A file others could not read keeps only its
+  hash in the record, so apply warns and rollback names it instead of restoring it.
 - With no files yet, the inventory is only `local` and the config runs `hostname`, so `doctor` and `apply` already pass.
 
 ## Install and use

@@ -23,7 +23,7 @@ fn mode(path: &str) -> u32 {
 
 /// The fake host tagged `web` and a config copying `motd.txt` to
 /// `<root>/out/web.conf` (absent before) on `web` and to
-/// `<root>/out/local.conf` ([`PREVIOUS`], 0600 before) on `local`, then
+/// `<root>/out/local.conf` ([`PREVIOUS`], 0644 before) on `local`, then
 /// `echo after`; applied once. Returns both dests.
 fn applied(sandbox: &Sandbox) -> (String, String) {
     sandbox.write_config(
@@ -35,7 +35,7 @@ fn applied(sandbox: &Sandbox) -> (String, String) {
     let dest = |name: &str| sandbox.root().join("out").join(name).display().to_string();
     let (web, local) = (dest("web.conf"), dest("local.conf"));
     std::fs::write(&local, PREVIOUS).unwrap();
-    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644)).unwrap();
     let entry = |dest: &str, tag: &str| {
         format!(
             "[[files]]\nsrc = \"motd.txt\"\ndest = \"{dest}\"\nmode = \"0640\"\n\
@@ -96,7 +96,7 @@ fn rollback_restores_and_removes_what_apply_wrote_and_twice_is_the_same() {
     );
     assert!(!text(&out.stdout).contains(PREVIOUS.trim_end()));
     assert_eq!(std::fs::read_to_string(&local).unwrap(), PREVIOUS);
-    assert_eq!(mode(&local), 0o600);
+    assert_eq!(mode(&local), 0o644);
     assert!(!Path::new(&web).exists());
     let record = sandbox.last_apply().unwrap();
     for (name, dest) in [("local", &local), ("fake", &web)] {
@@ -122,6 +122,82 @@ fn rollback_restores_and_removes_what_apply_wrote_and_twice_is_the_same() {
     );
     assert_eq!(std::fs::read_to_string(&local).unwrap(), PREVIOUS);
     assert!(!Path::new(&web).exists());
+}
+
+#[test]
+fn a_private_previous_cannot_be_restored_and_rollback_says_so_with_exit_zero() {
+    let sandbox = Sandbox::new("rb");
+    let (web, local) = applied(&sandbox);
+    // The fixture again, with a private previous on `local`.
+    std::fs::write(&local, PREVIOUS).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), FILE_TEXT);
+    let reason = "not world-readable";
+    let raw = std::fs::read_to_string(sandbox.state_home().join("anvil/last-apply.json"));
+    assert!(!raw.unwrap().contains(PREVIOUS.trim_end()));
+
+    // Twice: a repeat rollback says the same and still exits 0.
+    for _ in 0..2 {
+        let out = sandbox.anvil(&["rollback"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert_eq!(
+            text(&out.stdout),
+            format!(
+                "▶ local\n  ⚠ not restored: {local} ({reason})\n  ✔ ok · 2 steps\n\n\
+                 ▶ fake\n  ✔ ok · 2 steps\n\n\
+                 2 ok, 0 failed, 1 not restored\n  {local} on local ({reason})\n"
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), FILE_TEXT);
+    }
+    assert!(!Path::new(&web).exists());
+    let record = sandbox.last_apply().unwrap();
+    assert!(
+        record["targets"]["local"].get("rolled_back").is_none(),
+        "nothing was put back there"
+    );
+
+    let out = sandbox.anvil(&["--json", "rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(
+        value["not_restored"],
+        serde_json::json!([{"target": "local", "dest": local, "reason": reason}])
+    );
+    assert_eq!(
+        value["targets"][0]["warnings"],
+        serde_json::json!([format!("not restored: {local} ({reason})")])
+    );
+}
+
+#[test]
+fn a_v1_record_holding_the_text_of_a_private_previous_still_restores_it_and_its_mode() {
+    for (mode_text, mode_bits) in [("0600", 0o600), ("0640", 0o640)] {
+        let sandbox = Sandbox::new("rb");
+        let (_, local) = applied(&sandbox);
+        let path = sandbox.state_home().join("anvil/last-apply.json");
+        let mut record = sandbox.last_apply().unwrap();
+        record["targets"]["local"]["files"][0]["previous"]["mode"] = mode_text.into();
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert!(!text(&out.stdout).contains("not restored"), "{mode_text}");
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), PREVIOUS);
+        assert_eq!(mode(&local), mode_bits, "{mode_text}");
+    }
+}
+
+#[test]
+fn a_cannot_undo_note_alone_leaves_the_summary_clean() {
+    let sandbox = Sandbox::new("rb");
+    applied(&sandbox);
+    let out = sandbox.anvil(&["--json", "rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert!(value.get("not_restored").is_none(), "{value}");
+    assert!(value["targets"][0].get("warnings").is_none(), "{value}");
 }
 
 #[test]
@@ -656,9 +732,10 @@ fn a_legacy_duplicate_dest_keeps_one_entry_per_write() {
     std::fs::write(sandbox.config_dir().join("b.txt"), "bytes-b\n").unwrap();
     let dest = out.join("dest");
     std::fs::write(&dest, PREVIOUS).unwrap();
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
     let dest = dest.display().to_string();
     let entry = |src: &str| {
-        format!("[[files]]\nsrc = \"{src}\"\ndest = \"{dest}\"\nmode = \"0640\"\nsudo = false\n\n")
+        format!("[[files]]\nsrc = \"{src}\"\ndest = \"{dest}\"\nmode = \"0644\"\nsudo = false\n\n")
     };
     sandbox.write_config(
         "config.toml",
