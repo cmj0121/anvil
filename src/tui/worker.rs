@@ -11,13 +11,13 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::app::{self, Job, Msg};
-use crate::cancel::Cancel;
-use crate::cli::Failure;
-use crate::files::{Force, Wording};
-use crate::inventory::Target;
-use crate::options::Options;
-use crate::prepared::Prepared;
-use crate::{apply, doctor, fanout, plan, rollback, run, update};
+use anvil::cancel::Cancel;
+use anvil::error::Failure;
+use anvil::files::{Force, Wording};
+use anvil::inventory::Target;
+use anvil::options::Options;
+use anvil::prepared::Prepared;
+use anvil::{apply, doctor, fanout, plan, report, rollback, run, update};
 
 /// A run in progress; [`Worker::join`] waits for it, which is quick once
 /// `Finished` or `Panicked` has arrived.
@@ -147,7 +147,7 @@ fn run_rollback(opts: &Options, cancel: Arc<Cancel>, tx: &Sender<Msg>) -> Result
 }
 
 /// Sends `report`'s warnings; `command` fails when a record save did.
-fn report_done(tx: &Sender<Msg>, command: &str, report: apply::Report) -> Result<(), Failure> {
+fn report_done(tx: &Sender<Msg>, command: &str, report: report::Report) -> Result<(), Failure> {
     let saved = report.saved(command);
     if !report.warnings.is_empty() {
         let _ = tx.send(Msg::Warnings(report.warnings));
@@ -156,14 +156,14 @@ fn report_done(tx: &Sender<Msg>, command: &str, report: apply::Report) -> Result
 }
 
 /// Sends each of apply's (or run's) progress events to the main loop.
-fn send_progress(tx: &Sender<Msg>) -> impl FnMut(apply::Progress<'_>) + '_ {
+fn send_progress(tx: &Sender<Msg>) -> impl FnMut(report::Progress<'_>) + '_ {
     |progress| {
         let msg = match progress {
-            apply::Progress::Begin(targets) => Msg::Begin(names(targets)),
-            apply::Progress::Start(target) => Msg::Start(target.name.clone()),
-            apply::Progress::Done(index, report) => Msg::TargetDone(index, report.clone()),
+            report::Progress::Begin(targets) => Msg::Begin(names(targets)),
+            report::Progress::Start(target) => Msg::Start(target.name.clone()),
+            report::Progress::Done(index, report) => Msg::TargetDone(index, report.clone()),
             // The fixed slots place each report by its index.
-            apply::Progress::Ordered(_) => return,
+            report::Progress::Ordered(_) => return,
         };
         let _ = tx.send(msg);
     }
@@ -181,7 +181,7 @@ fn run_script(
     script: String,
     tx: &Sender<Msg>,
 ) -> Result<(), Failure> {
-    let label = apply::command(&script);
+    let label = report::command(&script);
     let _ = tx.send(Msg::Steps(vec![app::StepRow { label }]));
     let timeout = Duration::from_secs(run::DEFAULT_TIMEOUT);
     let prepared = Prepared::run(opts, cancel)?;
@@ -214,10 +214,10 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
-    use crate::cancel::AbortReason;
-    use crate::test_util::{temp_dir, wait_for};
     use crate::tui::app::tests::{opts, row};
     use crate::tui::app::{App, RunResult};
+    use anvil::cancel::AbortReason;
+    use anvil::test_util::{temp_dir, wait_for};
 
     /// Every message until `Finished` or `Panicked`, then the worker joined.
     fn collect(worker: Worker, rx: &Receiver<Msg>) -> Vec<Msg> {
@@ -239,7 +239,7 @@ mod tests {
     fn a_failed_save_sends_the_warnings_and_finishes_with_its_error() {
         let (tx, rx) = mpsc::channel();
         let worker = spawn_job(tx, |tx| {
-            let report = apply::Report {
+            let report = report::Report {
                 targets: Vec::new(),
                 ok: false,
                 warnings: vec!["careful".to_owned()],
@@ -300,7 +300,7 @@ mod tests {
             "[hosts.up]\nhost = \"up.example\"\n\n[hosts.down]\nhost = \"down.example\"\n",
         )
         .unwrap();
-        let fake = crate::test_util::fixture("fake-ssh.sh");
+        let fake = anvil::test_util::fixture("fake-ssh.sh");
         let wrapper = dir.join("ssh");
         fs::write(
             &wrapper,
@@ -316,7 +316,7 @@ mod tests {
         opts.ssh_program = Some(wrapper);
         opts.ssh_home = Some(dir);
         opts.target = vec!["down".to_owned(), "up".to_owned()];
-        opts.secret_store = Some(crate::options::SecretStoreKind::Memory);
+        opts.secret_store = Some(anvil::options::SecretStoreKind::Memory);
         opts
     }
 
@@ -369,7 +369,7 @@ mod tests {
         match &msgs[3] {
             Msg::TargetDone(
                 _,
-                apply::TargetReport::Failed {
+                report::TargetReport::Failed {
                     target,
                     steps,
                     error,
@@ -386,7 +386,7 @@ mod tests {
         match &msgs[5] {
             Msg::TargetDone(
                 _,
-                apply::TargetReport::Ran {
+                report::TargetReport::Ran {
                     target, steps, ok, ..
                 },
             ) => {
@@ -443,7 +443,7 @@ mod tests {
         match &msgs[3] {
             Msg::TargetDone(
                 _,
-                apply::TargetReport::Ran {
+                report::TargetReport::Ran {
                     target, steps, ok, ..
                 },
             ) => {
@@ -474,7 +474,7 @@ mod tests {
         match &msgs[3] {
             Msg::TargetDone(
                 _,
-                apply::TargetReport::Ran {
+                report::TargetReport::Ran {
                     target, steps, ok, ..
                 },
             ) => {
@@ -494,7 +494,7 @@ mod tests {
         let worker = spawn(Job::Run("true".to_owned()), opts, cancel, tx);
         assert!(matches!(
             &collect(worker, &rx)[3],
-            Msg::TargetDone(_, apply::TargetReport::Cancelled { .. })
+            Msg::TargetDone(_, report::TargetReport::Cancelled { .. })
         ));
     }
 
@@ -559,7 +559,7 @@ mod tests {
         let msgs = collect(worker, &rx);
         assert!(matches!(
             &msgs[3],
-            Msg::TargetDone(_, apply::TargetReport::Cancelled { steps, .. }) if steps.is_empty()
+            Msg::TargetDone(_, report::TargetReport::Cancelled { steps, .. }) if steps.is_empty()
         ));
     }
 
@@ -570,7 +570,7 @@ mod tests {
         opts.target = vec!["down".to_owned()];
         let home = opts.ssh_home.clone().unwrap();
         let gate = home.join("gate");
-        crate::test_util::write_knobs(
+        anvil::test_util::write_knobs(
             &home.join("fake-ssh.env"),
             &[("FAKE_SSH_GATE", gate.to_str().unwrap())],
         );
@@ -588,7 +588,7 @@ mod tests {
         assert!(
             matches!(
                 &msgs[3],
-                Msg::TargetDone(_, apply::TargetReport::Cancelled { target, steps, .. })
+                Msg::TargetDone(_, report::TargetReport::Cancelled { target, steps, .. })
                     if target == "down" && steps.is_empty()
             ),
             "the refused master is cancelled, not a failure"
@@ -602,7 +602,7 @@ mod tests {
         opts.target = vec!["down".to_owned()];
         let home = opts.ssh_home.clone().unwrap();
         let gate = home.join("gate");
-        crate::test_util::write_knobs(
+        anvil::test_util::write_knobs(
             &home.join("fake-ssh.env"),
             &[("FAKE_SSH_GATE", gate.to_str().unwrap())],
         );
@@ -676,7 +676,7 @@ mod tests {
     fn doctor_sends_each_target_then_the_report_then_finished() {
         let (tx, rx) = mpsc::channel();
         let mut opts = local_opts("tui-worker-doctor", &[]);
-        opts.secret_store = Some(crate::options::SecretStoreKind::Memory);
+        opts.secret_store = Some(anvil::options::SecretStoreKind::Memory);
         let worker = spawn(Job::Doctor, opts, Arc::new(Cancel::new()), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(msgs.len(), 4);

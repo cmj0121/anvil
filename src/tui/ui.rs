@@ -14,13 +14,13 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use super::app::{
     self, App, BACKENDS, FilesView, OPTION_FLAGS, Overlay, Pane, RunKind, RunResult, Running, Slot,
 };
-use crate::doctor::{self, RowKind, SecretStatus};
-use crate::filestore::{self, Kind};
-use crate::logger::escape_controls;
-use crate::plan::{self, PlanReport};
-use crate::secret;
-use crate::status::SPINNER;
-use crate::{apply, apply::TargetReport};
+use anvil::doctor::{self, RowKind, SecretStatus};
+use anvil::filestore::{self, Kind};
+use anvil::logger::escape_controls;
+use anvil::plan::{self, PlanReport};
+use anvil::secret;
+use anvil::status::SPINNER;
+use anvil::{report, report::TargetReport};
 
 const LEFT_WIDTH: u16 = 28;
 const LOG_ROWS: u16 = 8;
@@ -939,7 +939,7 @@ fn apply_lines(report: &TargetReport) -> (Vec<Line<'static>>, Vec<usize>) {
     } else {
         match report.failure() {
             Some(reason) => Line::from(format!("  ✘ {}", text(&reason))).style(Color::Red),
-            None => Line::from(format!("  ✔ {}", apply::ok_text(steps.len()))).style(Color::Green),
+            None => Line::from(format!("  ✔ {}", report::ok_text(steps.len()))).style(Color::Green),
         }
     };
     lines.extend([end, Line::default()]);
@@ -957,7 +957,7 @@ fn plan_block(report: &PlanReport) -> Vec<Line<'static>> {
                 let command = format!("  {}", text(&plan::would_text(step)));
                 lines.push(Line::from(command).style(Modifier::DIM));
             }
-            Line::from(format!("  ✔ {}", apply::steps_text(steps.len()))).style(Color::Green)
+            Line::from(format!("  ✔ {}", report::steps_text(steps.len()))).style(Color::Green)
         }
         PlanReport::Failed { error, .. } => {
             Line::from(format!("  ✘ {}", text(error))).style(Color::Red)
@@ -1366,11 +1366,11 @@ mod tests {
 
     use crossterm::event::KeyCode;
 
-    use crate::cancel::Cancel;
     use crate::tui::app::tests::{
         Store, app, cancelled, inventory, local_report, opts, probed, ran, row as step_row, step,
     };
     use crate::tui::app::{LogLine, Msg, RunKind, RunResult, Running};
+    use anvil::cancel::Cancel;
 
     /// `reports` as the slots of targets that all ended.
     fn done<R>(reports: Vec<R>) -> Vec<Slot<R>> {
@@ -1497,7 +1497,7 @@ mod tests {
     #[test]
     fn a_target_stopped_by_a_failed_save_says_so() {
         let report = TargetReport::Cancelled {
-            abort: apply::AbortReason::SaveFailed,
+            abort: report::AbortReason::SaveFailed,
             warnings: Vec::new(),
             target: "pi".to_owned(),
             steps: Vec::new(),
@@ -1523,7 +1523,7 @@ mod tests {
         let mut killed = ran("pi", vec![step("sleep 9", None, "", "")]);
         assert_eq!(marks(Some(&killed), 2), "✘⊘", "no code is a failure");
         killed = TargetReport::Cancelled {
-            abort: apply::AbortReason::Cancelled,
+            abort: report::AbortReason::Cancelled,
             warnings: Vec::new(),
             target: "pi".to_owned(),
             steps: vec![ok.clone()],
@@ -1533,7 +1533,7 @@ mod tests {
         };
         assert_eq!(marks(Some(&killed), 3), "✔⊘⊘");
         assert_eq!(marks(Some(&cancelled("pi")), 2), "⊘⊘");
-        let transport = |steps: Vec<apply::StepReport>| TargetReport::Failed {
+        let transport = |steps: Vec<report::StepReport>| TargetReport::Failed {
             warnings: Vec::new(),
             target: "pi".to_owned(),
             steps,
@@ -1563,8 +1563,8 @@ mod tests {
 
     #[test]
     fn file_rows_sit_between_packages_and_the_steps_and_their_marks_line_up() {
-        use crate::config::{Config, FileEntry, ModeValue, Step};
-        use crate::packages::Packages;
+        use anvil::config::{Config, FileEntry, ModeValue, Step};
+        use anvil::packages::Packages;
 
         let file = |dest: &str, tag: &str| FileEntry {
             src: "src.txt".to_owned(),
@@ -1584,7 +1584,7 @@ mod tests {
             steps: vec![Step::script("hostname"), Step::script("false")],
             ..Config::default()
         };
-        let rows = crate::tui::app::step_rows(&crate::tasks::legacy(&config));
+        let rows = crate::tui::app::step_rows(&anvil::tasks::legacy(&config));
         assert_eq!(
             rows,
             [
@@ -1595,7 +1595,7 @@ mod tests {
                 step_row("false"),
             ]
         );
-        let skip = |dest: &str| apply::StepReport {
+        let skip = |dest: &str| report::StepReport {
             skipped: true,
             ..step(&format!("skipped file {dest}: no match"), Some(0), "", "")
         };
@@ -1629,7 +1629,7 @@ mod tests {
 
     #[test]
     fn a_skipped_service_step_is_marked_and_the_rows_after_it_line_up() {
-        use crate::config::{Config, FileEntry, ModeValue, ServiceEntry, Step};
+        use anvil::config::{Config, FileEntry, ModeValue, ServiceEntry, Step};
 
         let service = |name: &str, tag: &str| ServiceEntry {
             name: name.to_owned(),
@@ -1652,7 +1652,7 @@ mod tests {
             steps: vec![Step::script("hostname")],
             ..Config::default()
         };
-        let rows = crate::tui::app::step_rows(&crate::tasks::legacy(&config));
+        let rows = crate::tui::app::step_rows(&anvil::tasks::legacy(&config));
         assert_eq!(
             rows,
             [
@@ -1665,12 +1665,12 @@ mod tests {
         let local = ran(
             "local",
             vec![
-                apply::StepReport {
+                report::StepReport {
                     skipped: true,
                     ..step("skipped file /etc/a.conf: no match", Some(0), "", "")
                 },
                 step("service sshd", Some(0), "started service sshd\n", ""),
-                apply::StepReport {
+                report::StepReport {
                     skipped: true,
                     ..step("skipped service cron: no match", Some(0), "", "")
                 },
@@ -2424,7 +2424,7 @@ mod tests {
     #[test]
     fn the_status_bar_shows_verbosity_and_format_and_the_header_counts() {
         let mut app = app();
-        app.edit_format = Some(crate::document::Format::Yaml);
+        app.edit_format = Some(anvil::document::Format::Yaml);
         app.opts.verbose = 2;
         app.results.push(RunResult::Apply {
             kind: RunKind::Apply,
@@ -2546,14 +2546,14 @@ mod tests {
 
     #[test]
     fn a_tasks_command_line_shows_bidi_as_an_escape_in_apply_and_plan_results() {
-        use crate::apply::PlannedRun;
-        use crate::plan::PlanReport;
-        use crate::transport::RUN_TIMEOUT;
+        use anvil::plan::PlanReport;
+        use anvil::step::PlannedRun;
+        use anvil::transport::RUN_TIMEOUT;
 
         let run = "true \u{202e}x";
         let (apply, _) = apply_lines(&ran(
             "local",
-            vec![apply::StepReport {
+            vec![report::StepReport {
                 task: Some("tasks[0]".to_owned()),
                 ..step(run, Some(0), "", "")
             }],
@@ -2565,7 +2565,7 @@ mod tests {
                 label: None,
                 sudo_secret: None,
                 timeout: RUN_TIMEOUT,
-                kind: crate::apply::RunKind::Script,
+                kind: anvil::step::RunKind::Script,
                 task: Some("tasks[0]".to_owned()),
                 name: None,
             }],
@@ -2585,12 +2585,12 @@ mod tests {
         let title = "tasks[0]/role\u{202e}.toml:tasks[0]  Inst\u{1b}]0;x\u{7}\n\u{200b}all";
         let shown = "tasks[0]/role\\u{202e}.toml:tasks[0]  Inst\\x1b]0;x\\x07\\n\\u{200b}all";
         let (path, name) = title.split_once("  ").unwrap();
-        let report = apply::StepReport {
+        let report = report::StepReport {
             task: Some(path.to_owned()),
             name: Some(name.to_owned()),
             ..step("true", Some(0), "", "")
         };
-        let label = apply::task_title(Some(path), Some(name)).unwrap();
+        let label = anvil::step::task_title(Some(path), Some(name)).unwrap();
         assert_eq!(label, shown);
         let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(vec![step_row(&label)]));
         show(
@@ -2642,9 +2642,9 @@ mod tests {
 
     #[test]
     fn a_plan_result_shows_each_task_before_its_would_line() {
-        use crate::apply::PlannedRun;
-        use crate::plan::PlanReport;
-        use crate::transport::RUN_TIMEOUT;
+        use anvil::plan::PlanReport;
+        use anvil::step::PlannedRun;
+        use anvil::transport::RUN_TIMEOUT;
 
         let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
         show(
@@ -2657,7 +2657,7 @@ mod tests {
                         label: None,
                         sudo_secret: None,
                         timeout: RUN_TIMEOUT,
-                        kind: crate::apply::RunKind::Script,
+                        kind: anvil::step::RunKind::Script,
                         task: Some("tasks[0]".to_owned()),
                         name: Some("First\u{2066}".to_owned()),
                     }],
@@ -2675,9 +2675,9 @@ mod tests {
 
     #[test]
     fn the_plan_view_shows_would_lines_and_lists_the_steps_unmarked() {
-        use crate::apply::PlannedRun;
-        use crate::plan::PlanReport;
-        use crate::transport::RUN_TIMEOUT;
+        use anvil::plan::PlanReport;
+        use anvil::step::PlannedRun;
+        use anvil::transport::RUN_TIMEOUT;
 
         let steps = Ok(vec![step_row("packages"), step_row("hostname")]);
         let mut app = App::with_inventory(opts(), Ok(inventory()), steps);
@@ -2693,7 +2693,7 @@ mod tests {
                                 label: None,
                                 sudo_secret: Some("LOCAL_SUDO".to_owned()),
                                 timeout: RUN_TIMEOUT,
-                                kind: crate::apply::RunKind::Script,
+                                kind: anvil::step::RunKind::Script,
                                 task: None,
                                 name: None,
                             },
@@ -2702,7 +2702,7 @@ mod tests {
                                 label: None,
                                 sudo_secret: None,
                                 timeout: RUN_TIMEOUT,
-                                kind: crate::apply::RunKind::Script,
+                                kind: anvil::step::RunKind::Script,
                                 task: None,
                                 name: None,
                             },
@@ -2717,7 +2717,7 @@ mod tests {
                     PlanReport::Cancelled {
                         target: "mac".to_owned(),
                         ok: false,
-                        abort: apply::AbortReason::Cancelled,
+                        abort: report::AbortReason::Cancelled,
                     },
                 ]),
                 ok: Some(false),
@@ -2757,7 +2757,7 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: done(vec![crate::apply::TargetReport::Failed {
+                targets: done(vec![anvil::report::TargetReport::Failed {
                     warnings: Vec::new(),
                     target: "pi".to_owned(),
                     steps: Vec::new(),
@@ -2791,7 +2791,7 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: done(vec![crate::apply::TargetReport::Failed {
+                targets: done(vec![anvil::report::TargetReport::Failed {
                     warnings: Vec::new(),
                     target: "pi".to_owned(),
                     steps: vec![step("sleep 40", None, "start\n", "warn\n")],
@@ -2916,7 +2916,7 @@ mod tests {
     fn the_doctor_view_shows_the_manager_after_the_facts() {
         let mut app = app();
         let mut pi = probed("pi", None);
-        pi.manager = Some(crate::packages::Manager::Pacman);
+        pi.manager = Some(anvil::packages::Manager::Pacman);
         let mut mac = probed("mac", None);
         mac.manager_error = Some("no package manager found".to_owned());
         show(
@@ -3344,7 +3344,7 @@ mod tests {
         shown.on_msg(Msg::DoctorTarget(probed("pi", None)));
         shown.on_msg(Msg::DoctorTarget(probed("mac", Some("down"))));
         press(&mut shown, KeyCode::Right);
-        shown.on_msg(Msg::DoctorDone(crate::doctor::Report {
+        shown.on_msg(Msg::DoctorDone(anvil::doctor::Report {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", Some("down"))],
             ok: false,
@@ -3363,7 +3363,7 @@ mod tests {
         older.on_msg(Msg::DoctorTarget(probed("pi", None)));
         older.on_msg(Msg::DoctorTarget(probed("mac", None)));
         press(&mut older, KeyCode::Char('['));
-        older.on_msg(Msg::DoctorDone(crate::doctor::Report {
+        older.on_msg(Msg::DoctorDone(anvil::doctor::Report {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", None)],
             ok: true,
@@ -3410,8 +3410,8 @@ mod tests {
 
     #[test]
     fn the_doctor_tab_shows_plugin_rows_the_summary_and_the_warning() {
-        use crate::doctor::{DriftSummary, PluginReport};
-        use crate::plugin::{Finding, Severity};
+        use anvil::doctor::{DriftSummary, PluginReport};
+        use anvil::plugin::{Finding, Severity};
         let finding = |item: &str, severity, text: Option<&str>| Finding {
             target: "pi".to_owned(),
             item: item.to_owned(),

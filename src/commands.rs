@@ -28,20 +28,21 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use zeroize::Zeroizing;
 
-use crate::cli::{Cli, Failure, print_json};
-use crate::config::Config;
-use crate::document::{self, DocumentError, Format, MAX_BYTES};
-use crate::editor::{Buffer, Editor, Fallback};
-use crate::filestore;
-use crate::harden;
-use crate::inventory::Inventory;
-use crate::logger::escape_controls;
-use crate::options::Options;
-use crate::paths::{self, DocPath};
-use crate::private;
-use crate::secret::{self, BackendKind, Store};
-use crate::status;
-use crate::tasks;
+use crate::cli::Cli;
+use anvil::config::Config;
+use anvil::document::{self, DocumentError, Format, MAX_BYTES};
+use anvil::editor::{Buffer, Editor, Fallback};
+use anvil::error::{Failure, print_json};
+use anvil::filestore;
+use anvil::harden;
+use anvil::inventory::Inventory;
+use anvil::logger::escape_controls;
+use anvil::options::Options;
+use anvil::paths::{self, DocPath};
+use anvil::private;
+use anvil::secret::{self, BackendKind, Store};
+use anvil::status;
+use anvil::tasks;
 
 /// How often an invalid buffer is re-opened before the command gives up.
 const ATTEMPTS: u32 = 3;
@@ -605,7 +606,7 @@ pub fn migrate(cli: &Cli, opts: &Options, to: BackendKind) -> Result<(), Failure
 /// config section is present (exit 2 otherwise).
 pub fn migrate_to(opts: &Options, to: BackendKind) -> Result<Migrated, Failure> {
     #[cfg(debug_assertions)]
-    if opts.secret_store == Some(crate::options::SecretStoreKind::Memory) {
+    if opts.secret_store == Some(anvil::options::SecretStoreKind::Memory) {
         return Err(Failure::usage(
             "secret --migrate: not with --secret-store memory; it moves the configured store",
         ));
@@ -874,8 +875,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-    use crate::secret::{Memory, SecretError, Vault};
-    use crate::test_util::{Unopenable, temp_dir, write_private};
+    use anvil::secret::{Memory, SecretError, Vault};
+    use anvil::test_util::{Unopenable, temp_dir, write_private};
 
     #[test]
     fn harden_srcs_stay_inside_the_workspace_and_off_symlinks() {
@@ -934,10 +935,10 @@ mod tests {
         }
 
         fn run(&self, name: &str, store: &dyn Store) -> Result<(), Failure> {
-            let _lock = crate::term::test_lock();
+            let _lock = anvil::term::test_lock();
             let config = self.config.to_str().unwrap();
             let cli = Cli::try_parse_from(["anvil", "--config", config, "secret", name]).unwrap();
-            let opts = Options::from_cli(&cli);
+            let opts = cli.options();
             secret(&cli, &opts.load_config().unwrap(), name, store)
         }
     }
@@ -1123,7 +1124,7 @@ mod tests {
             let identity = self.dir.join(key);
             let key = age::x25519::Identity::generate().to_string();
             write_private(&identity, format!("{}\n", key.expose_secret()).as_bytes());
-            secret::from_config(&crate::config::Backend::Age {
+            secret::from_config(&anvil::config::Backend::Age {
                 path: self.dir.join("secrets.age"),
                 identity,
             })

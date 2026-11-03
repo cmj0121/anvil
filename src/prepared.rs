@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use crate::apply::{self, Passwords};
 use crate::cancel::Cancel;
-use crate::cli::Failure;
 use crate::config::{Config, Plugin};
+use crate::engine::{self, Passwords};
+use crate::error::Failure;
 use crate::files::{self, Sources};
 use crate::inventory::Target;
 use crate::options::Options;
@@ -43,7 +43,7 @@ impl Prepared {
         cancel: Arc<Cancel>,
     ) -> Result<Prepared, Failure> {
         let mut prepared = Prepared::plan(opts, config, expanded, cancel)?;
-        prepared.passwords = apply::load_passwords(
+        prepared.passwords = engine::load_passwords(
             &prepared.targets,
             &prepared.config,
             &prepared.expanded,
@@ -106,7 +106,7 @@ impl Prepared {
             })
             .filter_map(|target| files::sudo_secret_for(&config, target))
             .collect();
-        let passwords = apply::read_passwords(names, || opts.secret_store(&config))?;
+        let passwords = engine::read_passwords(names, || opts.secret_store(&config))?;
         Ok(Prepared {
             opts: opts.clone(),
             config,
@@ -129,10 +129,7 @@ impl Prepared {
 mod tests {
     use std::fs;
 
-    use clap::Parser;
-
     use super::*;
-    use crate::cli::Cli;
     use crate::test_util::temp_dir;
 
     #[test]
@@ -148,11 +145,11 @@ mod tests {
             dir.join("missing-key.txt").display(),
         );
         fs::write(&config, text).unwrap();
-        let args = ["anvil", "--inventory", inventory.to_str().unwrap()];
-        let args = args
-            .into_iter()
-            .chain(["--config", config.to_str().unwrap()]);
-        let opts = Options::from_cli(&Cli::try_parse_from(args.chain(["plan"])).unwrap());
+        let opts = Options {
+            inventory: Some(inventory),
+            config: Some(config),
+            ..Options::default()
+        };
         let (config, expanded) = opts.load_expanded().unwrap();
         let cancel = Arc::new(Cancel::new());
         let plan = Prepared::plan(&opts, config.clone(), expanded.clone(), cancel.clone());

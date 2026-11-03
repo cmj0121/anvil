@@ -14,13 +14,13 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::apply::{PlannedRun, RunKind, ServiceRun};
 use crate::config::{Config, ServiceEntry, ServiceState, check_service_name};
 use crate::facts::Facts;
 use crate::files::{self, quote};
 use crate::inventory::Target;
 use crate::packages::Manager;
 use crate::secret;
+use crate::step::{PlannedRun, RunKind, ServiceRun};
 use crate::tasks::Item;
 use crate::transport::RUN_TIMEOUT;
 

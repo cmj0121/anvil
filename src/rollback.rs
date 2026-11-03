@@ -24,23 +24,24 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::apply::{
-    self, Entry, Escape, Line, NotRestored, Passwords, PlannedRun, Progress, Report, StepReport,
-    Style, TargetReport, Unresolved, print_lines,
-};
 use crate::cancel::Cancel;
-use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
+use crate::engine::{self, Passwords, Unresolved};
+use crate::error::{Failure, print_json};
 use crate::facts::Facts;
 use crate::fanout::{self, Event};
 use crate::files::{self, Force, Wording};
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, escape_invisible};
-use crate::options::Options;
+use crate::options::{Options, Output};
 use crate::prepared::Prepared;
 use crate::record::{self, Previous, Record, RolledBack, Session, TargetRecord};
+use crate::report::{
+    self, Escape, Line, NotRestored, Progress, Report, StepReport, Style, TargetReport, print_lines,
+};
 use crate::status;
+use crate::step::{Entry, PlannedRun};
 use crate::tasks::{Expanded, Item};
 use crate::transport::{Transport, TransportError};
 
@@ -51,7 +52,7 @@ const NOTHING: &str = "nothing recorded";
 /// connecting or locking; else rolls back and prints each target's block as
 /// apply does (or one JSON document), then the summary.
 pub fn run(
-    cli: &Cli,
+    out: Output,
     opts: &Options,
     force: &[String],
     force_all: bool,
@@ -65,11 +66,11 @@ pub fn run(
         (false, dests) => Force::Dests(dests.iter().cloned().collect()),
     };
     if dry_run {
-        return print_dry_run(cli, opts, &config, &expanded, &force);
+        return print_dry_run(out, opts, &config, &expanded, &force);
     }
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
-    apply::print_report(cli, "rollback", |on| {
+    report::print_report(out, "rollback", |on| {
         run_targets(
             opts,
             config,
@@ -103,7 +104,7 @@ pub fn load(opts: &Options) -> Result<(Config, Expanded), Failure> {
 /// are turned off first: the record holds the previous texts, as does the
 /// session opened after it.
 fn recorded(path: &std::path::Path) -> Result<Record, Failure> {
-    apply::no_core_dumps();
+    engine::no_core_dumps();
     match record::load(path).map_err(|err| Failure::failed(format!("rollback: {err}")))? {
         Some(record) if !record.targets.is_empty() => Ok(record),
         _ => Err(Failure::failed("rollback: no apply recorded")),
@@ -152,7 +153,7 @@ pub fn run_targets(
     // This read, before the lock, only refuses a missing record or an
     // unknown --force dest; the session reads the record again under it.
     check_force(&recorded(&path)?, &targets, force)?;
-    let mut session = apply::open_record("rollback")?;
+    let mut session = engine::open_record("rollback")?;
     let prepared = Prepared::rollback(opts, config, expanded, targets, &session, cancel)?;
     let targets = &prepared.targets;
     let entries: Vec<Option<TargetRecord>> = targets
@@ -212,10 +213,10 @@ pub fn run_targets(
 /// without one is `nothing recorded`), `parallel` at a time, and saves each
 /// target's `rolled_back` into `session` as it ends. Once a save fails,
 /// `cancel` is stopped, so no further target starts and those left end as
-/// [`apply::AbortReason::SaveFailed`], but every target that ends
+/// [`report::AbortReason::SaveFailed`], but every target that ends
 /// is still marked and saved: a later save that succeeds records the earlier
 /// ones too. The reports come back with the first save's error, followed by
-/// every target the record still lacks ([`apply::Saves`]), if one failed.
+/// every target the record still lacks ([`engine::Saves`]), if one failed.
 fn roll_back_each(
     targets: &[Target],
     entries: &[Option<TargetRecord>],
@@ -225,7 +226,7 @@ fn roll_back_each(
     on: &mut dyn FnMut(Progress<'_>),
     roll: impl Fn(&Target, &TargetRecord) -> RolledTarget + Sync,
 ) -> (Vec<TargetReport>, Option<String>) {
-    let mut saves = apply::Saves::default();
+    let mut saves = engine::Saves::default();
     let results = fanout::fan_out(
         targets,
         parallel,
@@ -250,10 +251,10 @@ fn roll_back_each(
                 None => RolledTarget::report(nothing_recorded(target)),
             }
         },
-        |target| RolledTarget::report(apply::cancelled("rollback", target, Vec::new(), cancel)),
+        |target| RolledTarget::report(report::cancelled("rollback", target, Vec::new(), cancel)),
         |target, message| {
             let error = format!("internal error: {message}");
-            RolledTarget::report(apply::failed("rollback", target, Vec::new(), error))
+            RolledTarget::report(report::failed("rollback", target, Vec::new(), error))
         },
     );
     let reports = results.into_iter().map(|r| r.report).collect();
@@ -288,7 +289,7 @@ fn nothing_recorded(target: &Target) -> TargetReport {
     TargetReport::Ran {
         warnings: Vec::new(),
         target: target.name.clone(),
-        steps: vec![apply::StepReport::skipped(NOTHING, Entry::Script)],
+        steps: vec![report::StepReport::skipped(NOTHING, Entry::Script)],
         ok: true,
     }
 }
@@ -313,7 +314,7 @@ fn roll_back(
 ) -> RolledTarget {
     log::info!("rollback {}: start", target.name);
     let failed =
-        |error: String| RolledTarget::report(apply::failed("rollback", target, Vec::new(), error));
+        |error: String| RolledTarget::report(report::failed("rollback", target, Vec::new(), error));
     if let Err(error) = check_files(expanded, target, None, entry) {
         return failed(error);
     }
@@ -322,14 +323,14 @@ fn roll_back(
         Err(err) => return failed(err.to_string()),
     };
     if cancel.is_set() {
-        return RolledTarget::report(apply::cancelled("rollback", target, Vec::new(), cancel));
+        return RolledTarget::report(report::cancelled("rollback", target, Vec::new(), cancel));
     }
     status::phase(&target.name, status::Phase::Probe);
-    let facts = match apply::probe(transport.as_ref(), &Expanded::default()) {
+    let facts = match engine::probe(transport.as_ref(), &Expanded::default()) {
         Ok(facts) => facts,
         Err(Unresolved::Failed(error)) => return failed(error),
         Err(Unresolved::Cancelled) => {
-            return RolledTarget::report(apply::cancelled("rollback", target, Vec::new(), cancel));
+            return RolledTarget::report(report::cancelled("rollback", target, Vec::new(), cancel));
         }
     };
     if !host.allow_change
@@ -346,7 +347,7 @@ fn roll_back(
             Err(error) => return failed(error),
         };
     runs.extend(entry.cannot_undo.iter().map(|what| cannot_undo(what)));
-    let mut report = apply::execute(
+    let mut report = engine::execute(
         "rollback",
         target,
         transport.as_ref(),
@@ -551,7 +552,7 @@ fn dry_target(expanded: &Expanded, target: &Target, entry: Option<&TargetRecord>
 /// connection, no lock), then `N targets, [M failed, ]nothing executed`. A
 /// target the real run would refuse fails here too, exit 1.
 fn print_dry_run(
-    cli: &Cli,
+    out: Output,
     opts: &Options,
     config: &Config,
     expanded: &Expanded,
@@ -567,7 +568,7 @@ fn print_dry_run(
         .collect();
     let failed = dry.iter().filter(|target| !target.ok).count();
     let total = dry.len();
-    if cli.json {
+    if out.json {
         print_json(
             &DryRun {
                 ok: failed == 0,
@@ -586,7 +587,7 @@ fn print_dry_run(
                         let run = escape_invisible(&step.run);
                         lines.push(Line::out(run, Escape::Always, Some(DIM)));
                     }
-                    let end = format!("✔ {}", apply::steps_text(steps.len()));
+                    let end = format!("✔ {}", report::steps_text(steps.len()));
                     Line::out(end, Escape::Never, Some(GREEN))
                 }
                 (None, error) => {
@@ -888,7 +889,7 @@ mod tests {
                 while !a_handled.load(Ordering::Relaxed) {
                     std::thread::yield_now();
                 }
-                RolledTarget::report(apply::cancelled("rollback", target, Vec::new(), &cancel))
+                RolledTarget::report(report::cancelled("rollback", target, Vec::new(), &cancel))
             },
         );
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -898,7 +899,7 @@ mod tests {
             matches!(
                 reports[1],
                 TargetReport::Cancelled {
-                    abort: apply::AbortReason::SaveFailed,
+                    abort: report::AbortReason::SaveFailed,
                     ..
                 }
             ),

@@ -15,8 +15,8 @@ use std::path::{Component, Path, PathBuf};
 use serde::Serialize;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use crate::cli::Failure;
 use crate::config::Config;
+use crate::error::Failure;
 use crate::files;
 use crate::filestore::{self, StoreError};
 use crate::inventory::{self, Inventory};

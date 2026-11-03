@@ -18,9 +18,8 @@ use minisign_verify::PublicKey;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::cli::{Cli, Failure, print_json};
-use crate::commands::warn_target;
-use crate::options::Options;
+use crate::error::{Failure, print_json};
+use crate::options::{Options, Output};
 use install::Installed;
 pub use release::Source;
 use release::{Release, SMALL_LIMIT, Stage, TARBALL_LIMIT, Version};
@@ -127,10 +126,9 @@ fn resolve(source: &Source) -> Result<Latest, Failure> {
 
 /// `anvil update --check`: prints the check; exit 1 when an update is
 /// available.
-pub fn check(cli: &Cli, opts: &Options) -> Result<(), Failure> {
-    warn_target(cli);
+pub fn check(out: Output, opts: &Options) -> Result<(), Failure> {
     let check = resolve(&opts.release_source())?.check;
-    if cli.json {
+    if out.json {
         print_json(&check, Failure::failed)?;
     } else {
         print!("{check}");
@@ -147,13 +145,12 @@ pub fn check(cli: &Cli, opts: &Options) -> Result<(), Failure> {
 /// `anvil update`: replaces this binary with the latest release once it
 /// verifies. Up to date or ahead prints the verdict and changes nothing;
 /// any failure leaves the binary as it was.
-pub fn update(cli: &Cli, opts: &Options) -> Result<(), Failure> {
-    warn_target(cli);
+pub fn update(out: Output, opts: &Options) -> Result<(), Failure> {
     let keys = trusted_keys(opts)?;
     let source = opts.release_source();
     let latest = resolve(&source)?;
     if latest.check.status != Status::Available {
-        if cli.json {
+        if out.json {
             print_json(&latest.check, Failure::failed)?;
         } else {
             println!("{}", latest.check.status.verdict());
@@ -161,7 +158,7 @@ pub fn update(cli: &Cli, opts: &Options) -> Result<(), Failure> {
         return Ok(());
     }
     let updated = replace(&source, latest, &keys)?;
-    if cli.json {
+    if out.json {
         print_json(&updated, Failure::failed)
     } else {
         print!("{updated}");
@@ -170,21 +167,13 @@ pub fn update(cli: &Cli, opts: &Options) -> Result<(), Failure> {
 }
 
 /// The TUI's `u`: this version against the latest release, printing
-/// nothing. No test calls it, so only the TUI keeps it alive.
-#[cfg_attr(
-    not(feature = "tui"),
-    expect(dead_code, reason = "called by the TUI front end")
-)]
+/// nothing.
 pub fn latest(opts: &Options) -> Result<Check, Failure> {
     resolve(&opts.release_source()).map(|latest| latest.check)
 }
 
 /// The TUI's confirmed `u`: [`update`] to `version`, printing nothing.
 /// Refused when the latest release is no longer `version`.
-#[cfg_attr(
-    not(any(test, feature = "tui")),
-    expect(dead_code, reason = "called by the TUI front end")
-)]
 pub fn update_to(opts: &Options, version: &str) -> Result<Updated, Failure> {
     let keys = trusted_keys(opts)?;
     let source = opts.release_source();
@@ -373,17 +362,14 @@ mod tests {
                 .to_string()
         });
         let key = crate::test_util::fixture("update/a.pub");
-        let cli = <Cli as clap::Parser>::parse_from([
-            "anvil",
-            "update",
-            "--release-url",
-            &base,
-            "--release-key",
-            key.to_str().unwrap(),
-        ]);
+        let opts = Options {
+            release_url: Some(base),
+            release_keys: vec![key],
+            ..Options::default()
+        };
         let exe = std::env::current_exe().unwrap();
         let before = std::fs::metadata(&exe).unwrap();
-        let err = update_to(&Options::from_cli(&cli), "9.9.8").unwrap_err();
+        let err = update_to(&opts, "9.9.8").unwrap_err();
         assert_eq!(
             err.message,
             "anvil update: the latest release is now 9.9.9, not 9.9.8; check again"

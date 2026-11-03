@@ -22,11 +22,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::apply::{FileRun, PlannedRun, RunKind, Upload};
 use crate::bytes::hex;
-use crate::cli::Failure;
 use crate::config::{Config, FileEntry, ModeValue, is_mode, is_sha256};
 use crate::document;
+use crate::error::Failure;
 use crate::facts::Facts;
 use crate::filestore::{self, StoreError};
 use crate::inventory::{self, Target, TargetKind};
@@ -40,6 +39,7 @@ use crate::remote::{
 };
 pub(crate) use crate::remote::{REFUSED, quote};
 use crate::secret;
+use crate::step::{FileRun, PlannedRun, RunKind, Upload};
 use crate::tasks::{Expanded, Item};
 use crate::transport::RUN_TIMEOUT;
 use crate::trust::{self, TrustError};
@@ -285,7 +285,7 @@ pub fn run(
 /// How one `[[files]]` entry is written on one target, so that the write
 /// can be built again once the capture says what DEST holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FileWrite {
+pub struct FileWrite {
     /// The entry's ordinal among the list's file items, which is also its
     /// src's index in [`Sources`].
     pub ordinal: usize,
@@ -311,7 +311,7 @@ impl FileWrite {
     /// The record of this write, from what the capture saw before it and
     /// how it ended: `previous` keeps the bytes as text unless the entry
     /// says `rollback = false`, the dest is `hash_only`
-    /// ([`Recorder`](crate::apply::Recorder)), or they are not text.
+    /// ([`Recorder`](crate::engine::Recorder)), or they are not text.
     pub(crate) fn record(
         &self,
         expanded: &Expanded,
@@ -1194,7 +1194,7 @@ pub(crate) fn parse_od(text: &str, size: u64) -> Result<Zeroizing<Vec<u8>>, Stri
 }
 
 /// The dests whose conflict guard a rollback drops.
-pub(crate) enum Force {
+pub enum Force {
     None,
     Dests(BTreeSet<String>),
     All,
@@ -1212,13 +1212,9 @@ impl Force {
 
 /// Where a rollback's refusals send the user for `--force DEST`.
 #[derive(Clone, Copy)]
-pub(crate) enum Wording {
+pub enum Wording {
     Cli,
     /// The TUI cannot force, so the message points to a terminal.
-    #[cfg_attr(
-        not(any(test, feature = "tui")),
-        expect(dead_code, reason = "only the TUI rolls back with it")
-    )]
     Tui,
 }
 

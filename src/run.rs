@@ -13,16 +13,18 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::apply::{self, PlannedRun, Report, RunKind, TargetReport};
 use crate::cancel::Cancel;
-use crate::cli::{Cli, Failure};
 use crate::document::{MAX_BYTES, read_capped_from};
+use crate::engine;
+use crate::error::Failure;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::escape_controls;
-use crate::options::Options;
+use crate::options::{Options, Output};
 use crate::packages::MAX_TIMEOUT;
 use crate::prepared::Prepared;
+use crate::report::{self, Report, TargetReport};
+use crate::step::{PlannedRun, RunKind};
 use crate::transport::{Transport, TransportError};
 use crate::trust::{self, TrustError};
 
@@ -36,7 +38,7 @@ pub fn run_targets(
     prepared: &Prepared,
     script: String,
     timeout: Duration,
-    on: &mut dyn FnMut(apply::Progress<'_>),
+    on: &mut dyn FnMut(report::Progress<'_>),
 ) -> Report {
     let runs = [PlannedRun {
         run: wrap(&script).into(),
@@ -48,7 +50,7 @@ pub fn run_targets(
         name: None,
     }];
     let cancel = &prepared.cancel;
-    apply::for_each_target(
+    engine::for_each_target(
         "run",
         &prepared.targets,
         prepared.opts.parallel,
@@ -74,23 +76,23 @@ fn run_target(
     match transport {
         Ok(transport) => {
             log::info!("run {}: over {}", target.name, transport.name());
-            apply::execute(
+            engine::execute(
                 "run",
                 target,
                 transport.as_ref(),
                 runs,
-                &apply::Passwords::new(),
+                &engine::Passwords::new(),
                 cancel,
                 None,
             )
         }
-        Err(err) => apply::failed("run", target, Vec::new(), err.to_string()),
+        Err(err) => report::failed("run", target, Vec::new(), err.to_string()),
     }
 }
 
 /// `anvil run`: reads the script from `source` (`-` for stdin), then prints
 /// each target's block as apply does (or one JSON document), then the summary.
-pub fn run(cli: &Cli, opts: &Options, source: &Path, timeout: u64) -> Result<(), Failure> {
+pub fn run(out: Output, opts: &Options, source: &Path, timeout: u64) -> Result<(), Failure> {
     if !(1..=MAX_TIMEOUT).contains(&timeout) {
         return Err(Failure::usage(format!(
             "--timeout `{timeout}`: must be 1..={MAX_TIMEOUT}"
@@ -100,7 +102,7 @@ pub fn run(cli: &Cli, opts: &Options, source: &Path, timeout: u64) -> Result<(),
     let timeout = Duration::from_secs(timeout);
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
-    apply::print_report(cli, "run", |on| {
+    report::print_report(out, "run", |on| {
         Ok(run_targets(
             &Prepared::run(opts, cancel)?,
             script,

@@ -1,17 +1,17 @@
 //! Command line per the CLI contract.
 
-#[cfg(feature = "tui")]
 use std::io::{self, IsTerminal};
+use std::num::NonZeroU8;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
-use serde::Serialize;
 
-use crate::document::Format;
-use crate::options::Options;
+use anvil::document::Format;
+use anvil::error::Failure;
 #[cfg(debug_assertions)]
-use crate::options::SecretStoreKind;
-use crate::secret::BackendKind;
+use anvil::options::SecretStoreKind;
+use anvil::options::{Options, Output};
+use anvil::secret::BackendKind;
 
 #[derive(Debug, Parser)]
 #[command(name = "anvil", version, about, propagate_version = true)]
@@ -87,6 +87,38 @@ impl Cli {
     pub fn name(&self) -> &'static str {
         self.command.as_ref().map_or("tui", Command::name)
     }
+
+    /// The output mode: `--json` and `--no-progress`.
+    pub fn output(&self) -> Output {
+        Output {
+            json: self.json,
+            no_progress: self.no_progress,
+        }
+    }
+
+    /// The global flags; ssh may prompt only when stdin and stderr are both
+    /// terminals.
+    pub fn options(&self) -> Options {
+        Options {
+            verbose: self.verbose,
+            inventory: self.inventory.clone(),
+            config: self.config.clone(),
+            ssh_config: self.ssh_config.clone(),
+            target: self.target.clone(),
+            parallel: NonZeroU8::new(self.parallel).expect("clap keeps --parallel in 1..=32"),
+            can_prompt: io::stdin().is_terminal() && io::stderr().is_terminal(),
+            #[cfg(debug_assertions)]
+            secret_store: self.secret_store,
+            #[cfg(debug_assertions)]
+            ssh_program: self.ssh_program.clone(),
+            #[cfg(debug_assertions)]
+            ssh_home: None,
+            #[cfg(debug_assertions)]
+            release_url: self.release_url.clone(),
+            #[cfg(debug_assertions)]
+            release_keys: self.release_key.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -146,7 +178,7 @@ pub enum Command {
         script: PathBuf,
 
         /// Seconds the script may run on each target, 1..=3600
-        #[arg(long, value_name = "SECS", default_value_t = crate::run::DEFAULT_TIMEOUT)]
+        #[arg(long, value_name = "SECS", default_value_t = anvil::run::DEFAULT_TIMEOUT)]
         timeout: u64,
     },
     /// Edit one secret in the editor, or move every secret to another backend
@@ -259,112 +291,10 @@ pub fn resolve(cli: &Cli) -> Option<&Command> {
     cli.command.as_ref()
 }
 
-/// A fatal error: logged once at `Error`, then the process exits with `code`
-/// (1 when a target or check failed, 2 for usage or config).
-#[derive(Debug)]
-pub struct Failure {
-    pub code: u8,
-    pub message: String,
-    /// A [`crate::trust`] refusal, which no caller may fall back from or retry.
-    pub refused: bool,
-}
-
-impl Failure {
-    pub fn usage(message: impl Into<String>) -> Self {
-        Self {
-            code: 2,
-            message: message.into(),
-            refused: false,
-        }
-    }
-
-    /// A file or folder others can change (exit 2); `message` names the fix.
-    pub fn refusal(message: impl Into<String>) -> Self {
-        Self {
-            refused: true,
-            ..Self::usage(message)
-        }
-    }
-
-    /// The command itself failed (exit 1): a target, a check or a write.
-    pub fn failed(message: impl Into<String>) -> Self {
-        Self {
-            code: 1,
-            message: message.into(),
-            refused: false,
-        }
-    }
-
-    /// `self` with the exit status of the signal that ended the run, when
-    /// `abort` is one's and `self` is a code 1 failure; else `self`.
-    pub fn ended_by(self, abort: Option<crate::cancel::AbortReason>) -> Failure {
-        match abort.and_then(crate::cancel::AbortReason::exit_code) {
-            Some(code) if self.code == 1 => Failure { code, ..self },
-            _ => self,
-        }
-    }
-}
-
-// Config, inventory and path problems are exit 2.
-impl From<crate::document::DocumentError> for Failure {
-    fn from(err: crate::document::DocumentError) -> Self {
-        Failure {
-            refused: err.is_refused(),
-            ..Failure::usage(err.to_string())
-        }
-    }
-}
-
-impl From<crate::paths::PathsError> for Failure {
-    fn from(err: crate::paths::PathsError) -> Self {
-        Failure::usage(err.to_string())
-    }
-}
-
-impl From<crate::inventory::UnknownSel> for Failure {
-    fn from(err: crate::inventory::UnknownSel) -> Self {
-        Failure::usage(err.to_string())
-    }
-}
-
-// The editor aborting is a failed command (exit 1); anything else is config.
-impl From<crate::editor::EditorError> for Failure {
-    fn from(err: crate::editor::EditorError) -> Self {
-        let code = match err {
-            crate::editor::EditorError::Aborted(_) => 1,
-            _ => 2,
-        };
-        Failure {
-            code,
-            message: err.to_string(),
-            refused: false,
-        }
-    }
-}
-
-// A store refusing an operation is a failed command (exit 1).
-impl From<crate::secret::SecretError> for Failure {
-    fn from(err: crate::secret::SecretError) -> Self {
-        if matches!(err, crate::secret::SecretError::Refused { .. }) {
-            Failure::refusal(err.to_string())
-        } else {
-            Failure::failed(err.to_string())
-        }
-    }
-}
-
-/// Prints `value` as one line of JSON on stdout; an encoding error becomes
-/// `on_err("cannot encode JSON: …")`.
-pub fn print_json(value: &impl Serialize, on_err: fn(String) -> Failure) -> Result<(), Failure> {
-    let json =
-        serde_json::to_string(value).map_err(|err| on_err(format!("cannot encode JSON: {err}")))?;
-    println!("{json}");
-    Ok(())
-}
-
 /// Runs `command`, the one [`resolve`] picked for `cli`.
 pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
-    let mut opts = Options::from_cli(cli);
+    let out = cli.output();
+    let mut opts = cli.options();
     opts.ssh_config = opts.ssh_config()?;
     match command {
         Command::Inventory { format } => crate::commands::inventory(cli, &opts, *format),
@@ -380,17 +310,17 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
             crate::commands::warn_parallel(cli);
             let (config, expanded) = opts.load_expanded()?;
             let store = opts.secret_store(&config)?;
-            crate::doctor::run(cli, &opts, &config, &expanded, store.as_ref())
+            anvil::doctor::run(out, &opts, &config, &expanded, store.as_ref())
         }
-        Command::Apply => crate::apply::run(cli, &opts),
-        Command::Plan => crate::plan::run(cli, &opts),
+        Command::Apply => anvil::apply::run(out, &opts),
+        Command::Plan => anvil::plan::run(out, &opts),
         Command::Rollback {
             force,
             force_all,
             allow_host_change,
             dry_run,
-        } => crate::rollback::run(cli, &opts, force, *force_all, *allow_host_change, *dry_run),
-        Command::Run { script, timeout } => crate::run::run(cli, &opts, script, *timeout),
+        } => anvil::rollback::run(out, &opts, force, *force_all, *allow_host_change, *dry_run),
+        Command::Run { script, timeout } => anvil::run::run(out, &opts, script, *timeout),
         Command::Secret { to: Some(to), .. } => crate::commands::migrate(cli, &opts, *to),
         Command::Secret { name, .. } => {
             let config = opts.load_config()?;
@@ -402,8 +332,14 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
         Command::Tui if cli.json => Err(Failure::usage("anvil tui: --json is not available")),
         #[cfg(feature = "tui")]
         Command::Tui => crate::tui::run(opts),
-        Command::Update { check: true } => crate::update::check(cli, &opts),
-        Command::Update { check: false } => crate::update::update(cli, &opts),
+        Command::Update { check: true } => {
+            crate::commands::warn_target(cli);
+            anvil::update::check(out, &opts)
+        }
+        Command::Update { check: false } => {
+            crate::commands::warn_target(cli);
+            anvil::update::update(out, &opts)
+        }
     }
 }
 
@@ -420,21 +356,59 @@ mod tests {
     }
 
     #[test]
-    fn ended_by_a_signal_maps_only_a_code_1_failure() {
-        use crate::cancel::AbortReason;
-        let code = |failure: Failure, abort| failure.ended_by(abort).code;
+    fn options_copies_the_global_flags() {
+        let opts = parse(&[
+            "-vv",
+            "apply",
+            "--inventory",
+            "inv.toml",
+            "--config",
+            "cfg.toml",
+            "--ssh-config",
+            "ssh_config",
+            "--target",
+            "local",
+            "--target",
+            "mac",
+        ])
+        .options();
+        assert_eq!(opts.verbose, 2);
+        assert_eq!(opts.inventory, Some(PathBuf::from("inv.toml")));
+        assert_eq!(opts.config, Some(PathBuf::from("cfg.toml")));
+        assert_eq!(opts.ssh_config, Some(PathBuf::from("ssh_config")));
+        assert_eq!(opts.target, ["local", "mac"]);
+        assert_eq!(opts.parallel.get(), 1);
         assert_eq!(
-            code(Failure::failed("x"), Some(AbortReason::Terminated)),
-            143
+            parse(&["--parallel", "4", "plan"]).options().parallel.get(),
+            4
         );
-        assert_eq!(code(Failure::failed("x"), Some(AbortReason::HungUp)), 129);
-        assert_eq!(code(Failure::failed("x"), Some(AbortReason::Cancelled)), 1);
-        assert_eq!(code(Failure::failed("x"), Some(AbortReason::SaveFailed)), 1);
-        assert_eq!(code(Failure::failed("x"), None), 1);
-        assert_eq!(code(Failure::usage("x"), Some(AbortReason::Terminated)), 2);
-        let failure =
-            Failure::failed("apply: 1 of 2 targets failed").ended_by(Some(AbortReason::HungUp));
-        assert_eq!(failure.message, "apply: 1 of 2 targets failed");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn options_copies_the_hidden_flags() {
+        let opts = parse(&[
+            "update",
+            "--secret-store",
+            "memory",
+            "--ssh-program",
+            "/x/fake-ssh",
+            "--release-url",
+            "http://127.0.0.1:9",
+            "--release-key",
+            "a.pub",
+            "--release-key",
+            "b.pub",
+        ])
+        .options();
+        assert_eq!(opts.secret_store, Some(SecretStoreKind::Memory));
+        assert_eq!(opts.ssh_program, Some(PathBuf::from("/x/fake-ssh")));
+        assert_eq!(opts.release_url.as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(
+            opts.release_keys,
+            [PathBuf::from("a.pub"), PathBuf::from("b.pub")]
+        );
+        assert_eq!(opts.ssh_home, None);
     }
 
     #[test]

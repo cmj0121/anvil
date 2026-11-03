@@ -82,13 +82,13 @@ impl Cancel {
     }
 
     /// A token already stopped as [`AbortReason::Cancelled`].
-    #[cfg(test)]
-    pub(crate) fn cancelled() -> Cancel {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn cancelled() -> Cancel {
         Cancel::stopped(true)
     }
 
     /// A token stopped as [`AbortReason::Cancelled`] when `set`, else unset.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn stopped(set: bool) -> Cancel {
         let cancel = Cancel::new();
         if set {

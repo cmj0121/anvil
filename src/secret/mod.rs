@@ -262,8 +262,8 @@ pub fn is_name(s: &str) -> bool {
 }
 
 /// The sources of this module, for the checks that read code.
-#[cfg(test)]
-pub(crate) const SOURCES: [(&str, &str); 8] = [
+#[cfg(any(test, feature = "test-util"))]
+pub const SOURCES: [(&str, &str); 8] = [
     ("secret/mod.rs", include_str!("mod.rs")),
     ("secret/keychain.rs", include_str!("keychain.rs")),
     ("secret/memory.rs", include_str!("memory.rs")),

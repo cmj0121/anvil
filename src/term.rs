@@ -43,10 +43,6 @@ fn state() -> MutexGuard<'static, State> {
 }
 
 /// Installs `h` process-wide until the guard drops.
-#[cfg_attr(
-    not(any(test, feature = "tui")),
-    expect(dead_code, reason = "installed by the TUI front end")
-)]
 pub fn install(h: Arc<dyn Handoff>) -> HandoffGuard {
     state().installed = Some(h);
     HandoffGuard
@@ -113,13 +109,13 @@ impl Drop for Lent {
 }
 
 /// Serializes tests that install a handoff (process-wide state).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 pub fn test_lock() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 pub mod testing {
     use std::sync::{Arc, Mutex};
     use std::thread::{self, ThreadId};

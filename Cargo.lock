@@ -160,6 +160,7 @@ name = "anvil"
 version = "0.1.0"
 dependencies = [
  "age",
+ "anvil",
  "clap",
  "crossterm",
  "hmac",

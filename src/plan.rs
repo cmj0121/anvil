@@ -3,7 +3,7 @@
 //!
 //! Every target is probed, with or without `[packages]` work, so a target
 //! that cannot be reached fails here as it would under apply; then
-//! [`apply::resolve`] lists its steps. The secret store is never opened: a
+//! [`engine::resolve`] lists its steps. The secret store is never opened: a
 //! step that would type a sudo password names its secret, and whether that
 //! secret is set is `anvil doctor`'s job. A plugin step runs its plugin, on
 //! the controller only, to list the script it returns. Each `[[files]]`
@@ -15,19 +15,21 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::apply::{self, Escape, Line, PlannedRun, Style, Unresolved, print_lines};
 use crate::cancel::{AbortReason, Cancel};
-use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
+use crate::engine::{self, Unresolved};
+use crate::error::{Failure, print_json};
 use crate::fanout::{self, Event};
 use crate::files::Sources;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
-use crate::options::Options;
+use crate::options::{Options, Output};
 use crate::plugin::Plugins;
 use crate::prepared::Prepared;
+use crate::report::{self, Escape, Line, Style, print_lines};
 use crate::status;
+use crate::step::PlannedRun;
 use crate::tasks::Expanded;
 use crate::transport::{Transport, TransportError};
 
@@ -191,9 +193,9 @@ fn plan_target(
     status::phase(&target.name, status::Phase::Probe);
     let runs = transport
         .map_err(|err| Unresolved::Failed(err.to_string()))
-        .and_then(|transport| apply::probe(transport.as_ref(), expanded))
+        .and_then(|transport| engine::probe(transport.as_ref(), expanded))
         .and_then(|facts| {
-            apply::resolve(
+            engine::resolve(
                 target,
                 Some(&facts),
                 config,
@@ -222,23 +224,23 @@ fn plan_target(
 
 /// `anvil plan`: prints each target's block once it and every earlier
 /// target have ended (or one JSON document), then the summary.
-pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
+pub fn run(out: Output, opts: &Options) -> Result<(), Failure> {
     let style = Style::detect();
     let (config, expanded) = opts.load_expanded()?;
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
     let mut print = fanout::in_order(|report| print_lines(&render(report), style));
-    let mut follow = status::Follow::new("plan", status::enabled(cli.no_progress));
+    let mut follow = status::Follow::new("plan", status::enabled(out.no_progress));
     let prepared = Prepared::plan(opts, config, expanded, cancel)?;
     let plan = run_targets(&prepared, &mut |progress| {
         follow.event(&progress);
-        if !cli.json {
+        if !out.json {
             print(progress);
         }
     });
     drop(follow);
     let failed = plan.targets.iter().filter(|t| !t.ok()).count();
-    if cli.json {
+    if out.json {
         print_json(&plan, Failure::failed)?;
     } else {
         let _ = status::write_stdout(&render_summary(plan.targets.len(), failed, style));
@@ -269,7 +271,7 @@ pub fn render(report: &PlanReport) -> Vec<Line> {
                 lines.push(Line::out(would_text(step), Escape::Always, Some(DIM)));
             }
             Line::out(
-                format!("✔ {}", apply::steps_text(steps.len())),
+                format!("✔ {}", report::steps_text(steps.len())),
                 Escape::Never,
                 Some(GREEN),
             )
@@ -298,7 +300,7 @@ pub fn would_text(step: &PlannedRun) -> String {
         .plugin()
         .map(|name| format!(" (from plugin {name})"))
         .unwrap_or_default();
-    let text = format!("would $ {}{secret}{from}", apply::command(step.shown()));
+    let text = format!("would $ {}{secret}{from}", report::command(step.shown()));
     match step.task {
         Some(_) => escape_invisible(&text),
         None => text,
@@ -321,7 +323,7 @@ pub(crate) fn render_summary(targets: usize, failed: usize, style: Style) -> Str
 
 #[cfg(test)]
 mod tests {
-    use crate::apply::RunKind;
+    use crate::step::RunKind;
     use crate::tasks::legacy;
     use std::sync::Mutex;
 
@@ -447,7 +449,7 @@ mod tests {
 
     #[test]
     fn a_bad_pin_is_exit_two_before_any_target() {
-        let (dir, opts, config) = crate::test_util::bad_pin("plan");
+        let (dir, opts, config) = crate::test_util::bad_pin();
         let mut started = 0;
         let failure = run_targets(&opts, &config, &mut |progress| {
             if let Progress::Start(..) = progress {
@@ -473,11 +475,11 @@ mod tests {
         }
     }
 
-    /// [`apply::resolve`] for target `local` and a config without plugin
+    /// [`engine::resolve`] for target `local` and a config without plugin
     /// steps.
     fn resolve(facts: &facts::Facts, config: &Config) -> Result<Vec<PlannedRun>, Unresolved> {
         let cancel = Cancel::new();
-        apply::resolve(
+        engine::resolve(
             &target("local"),
             Some(facts),
             config,

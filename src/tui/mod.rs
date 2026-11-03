@@ -21,15 +21,15 @@ use ratatui::layout::Rect;
 use signal_hook::SigId;
 use signal_hook::consts::SIGINT;
 
-use crate::cancel::{AbortReason, Cancel};
-use crate::cli::Failure;
 use crate::commands;
-use crate::editor::{Buffer, Editor, Fallback};
 use crate::files_cmd;
-use crate::filestore::{self, Root};
-use crate::logger::{self, Sink};
-use crate::options::Options;
-use crate::term;
+use anvil::cancel::{AbortReason, Cancel};
+use anvil::editor::{Buffer, Editor, Fallback};
+use anvil::error::Failure;
+use anvil::filestore::{self, Root};
+use anvil::logger::{self, Sink};
+use anvil::options::Options;
+use anvil::term;
 use app::{App, EditKind, Effect, LogLine, Msg};
 use handoff::{Screen, Session};
 use worker::Worker;
@@ -398,9 +398,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::document::Format;
-    use crate::term::testing::{Event, Recorder};
-    use crate::test_util::{temp_dir, write_private};
+    use anvil::document::Format;
+    use anvil::term::testing::{Event, Recorder};
+    use anvil::test_util::{temp_dir, write_private};
     use app::RunResult;
 
     /// A temp config naming a scripted editor (`script` gets the buffer's
@@ -574,7 +574,7 @@ mod tests {
     #[test]
     fn a_failed_flow_shows_its_failure_message() {
         let mut edits = Edits::new("migrate", "");
-        let outcome = edits.run(EditKind::Migrate(crate::secret::BackendKind::Age));
+        let outcome = edits.run(EditKind::Migrate(anvil::secret::BackendKind::Age));
         let err = outcome.unwrap_err();
         assert!(err.starts_with("secret --migrate --to age: "), "{err}");
     }
@@ -588,7 +588,7 @@ mod tests {
 
         const VALUE: &str = "hunter2-s3cr3t";
         let mut edits = Edits::new("secret", &format!("printf '{VALUE}\\n' > \"$1\""));
-        edits.app.opts.secret_store = Some(crate::options::SecretStoreKind::Memory);
+        edits.app.opts.secret_store = Some(anvil::options::SecretStoreKind::Memory);
         edits.app.show_log = true;
 
         let (tx, rx) = mpsc::channel();
@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn dropping_runs_cancels_serves_the_worker_handoff_and_joins() {
-        let _lock = crate::term::test_lock();
+        let _lock = anvil::term::test_lock();
         let fake = Arc::new(handoff::tests::Fake::default());
         let (tx, rx) = mpsc::channel();
         let session = handoff::start(
@@ -653,7 +653,7 @@ mod tests {
         let worker = {
             let fake = fake.clone();
             worker::spawn_job(tx.clone(), move |_| {
-                crate::term::with_terminal(|| fake.mark("child runs"));
+                anvil::term::with_terminal(|| fake.mark("child runs"));
                 Ok(())
             })
         };

@@ -201,7 +201,7 @@ struct GroupsState {
 }
 
 impl Groups {
-    pub const fn new() -> Groups {
+    const fn new() -> Groups {
         Groups {
             inner: Mutex::new(GroupsState {
                 live: BTreeMap::new(),

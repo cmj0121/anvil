@@ -10,17 +10,17 @@ use std::sync::mpsc::Sender;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::cancel::{AbortReason, Cancel};
-use crate::cli::Failure;
-use crate::config::{Config, StepKind};
-use crate::document::{Format, MAX_BYTES};
-use crate::filestore::{self, Entry, Kind, Root};
-use crate::inventory::{Inventory, LOCAL, Sel, Target, UnknownSel};
-use crate::options::Options;
-use crate::secret::{self, BackendKind};
-use crate::tasks::{Expanded, ItemKind};
-use crate::update::{Check, Status};
-use crate::{apply, doctor, plan};
+use anvil::cancel::{AbortReason, Cancel};
+use anvil::config::{Config, StepKind};
+use anvil::document::{Format, MAX_BYTES};
+use anvil::error::Failure;
+use anvil::filestore::{self, Entry, Kind, Root};
+use anvil::inventory::{Inventory, LOCAL, Sel, Target, UnknownSel};
+use anvil::options::Options;
+use anvil::secret::{self, BackendKind};
+use anvil::tasks::{Expanded, ItemKind};
+use anvil::update::{Check, Status};
+use anvil::{doctor, plan, report};
 
 use super::ui;
 
@@ -399,7 +399,7 @@ pub enum RunResult {
         /// differ per target and are not listed.
         kind: RunKind,
         steps: Vec<StepRow>,
-        targets: Vec<Slot<apply::TargetReport>>,
+        targets: Vec<Slot<report::TargetReport>>,
         ok: Option<bool>,
         error: Option<String>,
         /// What the run warns about once it ended, such as a full record.
@@ -427,7 +427,9 @@ impl RunResult {
                 let ok = targets.iter().filter(|t| t.ok()).count();
                 Some((ok, targets.len() - ok))
             }
-            RunResult::Apply { targets, .. } => Some(slot_counts(targets, apply::TargetReport::ok)),
+            RunResult::Apply { targets, .. } => {
+                Some(slot_counts(targets, report::TargetReport::ok))
+            }
             RunResult::Plan { targets, .. } => Some(slot_counts(targets, plan::PlanReport::ok)),
             RunResult::Edit { .. } => None,
         }
@@ -504,7 +506,7 @@ pub enum Msg {
     Start(String),
     DoctorDone(doctor::Report),
     /// Target `index`'s report, in the order the targets end.
-    TargetDone(usize, apply::TargetReport),
+    TargetDone(usize, report::TargetReport),
     PlanDone(usize, plan::PlanReport),
     DoctorTarget(doctor::TargetReport),
     Finished(Result<(), String>),
@@ -576,7 +578,7 @@ pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
                 ItemKind::Service(entry) => format!("service {}", entry.name),
                 ItemKind::Step(step) => match step.kind() {
                     StepKind::Plugin(name) => format!("plugin {name}"),
-                    StepKind::Run(run) => apply::command(run),
+                    StepKind::Run(run) => report::command(run),
                 },
             };
             let Some(path) = &item.path else {
@@ -586,8 +588,8 @@ pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
             StepRow {
                 label: format!(
                     "{}  {}",
-                    apply::shown_text(name.unwrap_or(&label).trim()),
-                    apply::shown_text(path)
+                    anvil::step::shown_text(name.unwrap_or(&label).trim()),
+                    anvil::step::shown_text(path)
                 ),
             }
         })
@@ -1007,7 +1009,7 @@ impl App {
             return Err(self.inventory_error.clone().unwrap_or_default());
         };
         let targets = select(inventory, &self.opts.target)
-            .map_err(|err| crate::cli::Failure::from(err).message)?;
+            .map_err(|err| anvil::error::Failure::from(err).message)?;
         Ok(targets.into_iter().map(|target| target.name).collect())
     }
 
@@ -1367,7 +1369,7 @@ impl App {
                 ..
             }) => {
                 not_run(targets);
-                *ok = Some(error.is_none() && all_ok(targets, apply::TargetReport::ok));
+                *ok = Some(error.is_none() && all_ok(targets, report::TargetReport::ok));
                 *slot = error;
             }
             Some(RunResult::Plan {
@@ -1609,8 +1611,8 @@ pub mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::config::Step;
-    use crate::inventory::Host;
+    use anvil::config::Step;
+    use anvil::inventory::Host;
 
     pub fn opts() -> Options {
         Options {
@@ -1685,7 +1687,7 @@ pub mod tests {
 
     impl Store {
         pub fn new(tag: &str, files: &[(&str, &str)]) -> Store {
-            let dir = crate::test_util::temp_dir(&format!("tui-files-{tag}"));
+            let dir = anvil::test_util::temp_dir(&format!("tui-files-{tag}"));
             let root = dir.join("files");
             for (path, body) in files {
                 let at = root.join(path);
@@ -1712,22 +1714,22 @@ pub mod tests {
         }
     }
 
-    pub fn step(run: &str, code: Option<i32>, stdout: &str, stderr: &str) -> apply::StepReport {
-        apply::StepReport {
+    pub fn step(run: &str, code: Option<i32>, stdout: &str, stderr: &str) -> report::StepReport {
+        report::StepReport {
             run: run.to_owned(),
             code,
             stdout: stdout.to_owned(),
             stderr: stderr.to_owned(),
             skipped: false,
-            entry: apply::Entry::Script,
+            entry: anvil::step::Entry::Script,
             task: None,
             name: None,
         }
     }
 
-    pub fn ran(target: &str, steps: Vec<apply::StepReport>) -> apply::TargetReport {
+    pub fn ran(target: &str, steps: Vec<report::StepReport>) -> report::TargetReport {
         let ok = steps.iter().all(|s| s.code == Some(0));
-        apply::TargetReport::Ran {
+        report::TargetReport::Ran {
             warnings: Vec::new(),
             target: target.to_owned(),
             steps,
@@ -1735,9 +1737,9 @@ pub mod tests {
         }
     }
 
-    pub fn cancelled(target: &str) -> apply::TargetReport {
-        apply::TargetReport::Cancelled {
-            abort: apply::AbortReason::Cancelled,
+    pub fn cancelled(target: &str) -> report::TargetReport {
+        report::TargetReport::Cancelled {
+            abort: report::AbortReason::Cancelled,
             warnings: Vec::new(),
             target: target.to_owned(),
             steps: Vec::new(),
@@ -1748,7 +1750,7 @@ pub mod tests {
     }
 
     pub fn probed(target: &str, error: Option<&str>) -> doctor::TargetReport {
-        let facts = crate::facts::Facts(
+        let facts = anvil::facts::Facts(
             [("hostname", target), ("os", "Linux")]
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -1807,7 +1809,7 @@ pub mod tests {
     /// Reload follows config edits and option changes, and retains strict load errors.
     #[test]
     fn store_reloads_the_workspace_and_config_errors() {
-        let dir = crate::test_util::temp_dir("tui-workspace");
+        let dir = anvil::test_util::temp_dir("tui-workspace");
         let path = dir.join("site.toml");
         let mut options = opts();
         options.config = Some(path.clone());
@@ -1858,7 +1860,7 @@ pub mod tests {
         );
         let err = check_targets(&inventory, &names(&["pi", "nosuch"])).unwrap_err();
         assert_eq!(
-            crate::cli::Failure::from(err).message,
+            anvil::error::Failure::from(err).message,
             "unknown target `nosuch`: not `local`, a host name or a tag"
         );
     }
@@ -1873,7 +1875,7 @@ pub mod tests {
 
     /// Options naming a config file holding `toml` and an empty inventory.
     fn config_opts(tag: &str, toml: &str) -> Options {
-        let dir = crate::test_util::temp_dir(tag);
+        let dir = anvil::test_util::temp_dir(tag);
         let (config, inventory) = (dir.join("config.toml"), dir.join("inventory.toml"));
         std::fs::write(&config, toml).unwrap();
         std::fs::write(&inventory, "").unwrap();
@@ -1926,7 +1928,7 @@ pub mod tests {
             ..Config::default()
         };
         assert_eq!(
-            step_rows(&crate::tasks::legacy(&config)),
+            step_rows(&anvil::tasks::legacy(&config)),
             [row("ls"), row("plugin harden")]
         );
     }
@@ -1956,7 +1958,7 @@ pub mod tests {
         let opts = config_opts("tui-steps-default", "[packages]\ninstall = []\n");
         assert_eq!(load_steps(&opts), Ok(vec![row("hostname")]));
         assert_eq!(
-            step_rows(&crate::tasks::legacy(&Config::default())),
+            step_rows(&anvil::tasks::legacy(&Config::default())),
             [row("hostname")]
         );
     }
@@ -2249,7 +2251,7 @@ pub mod tests {
             plan::PlanReport::Cancelled {
                 target: "pi".to_owned(),
                 ok: false,
-                abort: apply::AbortReason::Cancelled,
+                abort: report::AbortReason::Cancelled,
             },
         ));
         app.on_msg(Msg::Finished(Ok(())));
@@ -3308,7 +3310,7 @@ pub mod tests {
                         plan::PlanReport::Cancelled {
                             target: name.to_owned(),
                             ok: false,
-                            abort: apply::AbortReason::Cancelled,
+                            abort: report::AbortReason::Cancelled,
                         },
                     )
                 });

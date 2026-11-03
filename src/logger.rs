@@ -31,10 +31,6 @@ static LOGGER: OnceLock<Logger> = OnceLock::new();
 static SINK: RwLock<Option<Arc<dyn Sink>>> = RwLock::new(None);
 
 /// Sends every log line to `sink` instead of stderr; `None`: back to stderr.
-#[cfg_attr(
-    not(any(test, feature = "tui")),
-    expect(dead_code, reason = "called by the TUI")
-)]
 pub fn set_sink(sink: Option<Arc<dyn Sink>>) {
     *SINK.write().unwrap_or_else(PoisonError::into_inner) = sink;
 }
@@ -47,10 +43,6 @@ pub fn has_sink() -> bool {
 }
 
 /// Sets the level from a `-v` count, as [`level_for`] maps it.
-#[cfg_attr(
-    not(any(test, feature = "tui")),
-    expect(dead_code, reason = "called by the TUI")
-)]
 pub fn set_verbosity(verbosity: u8) {
     LOGGER
         .get_or_init(|| Logger::new(verbosity))
@@ -213,7 +205,7 @@ impl Log for Logger {
 }
 
 /// Serializes the tests that touch the process-wide sink or level.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(PoisonError::into_inner)

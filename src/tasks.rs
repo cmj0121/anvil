@@ -7,12 +7,12 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::cli::Failure;
 use crate::config::{
     Config, FileEntry, MAX_FILES, MAX_SERVICES, ServiceEntry, Step, Task, TaskPackages, check_file,
     check_selector, check_service, check_tasks,
 };
 use crate::document::{self, Format};
+use crate::error::Failure;
 use crate::facts::Facts;
 use crate::files;
 use crate::filestore::{self, Root, StoreError};

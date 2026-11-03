@@ -1,58 +1,18 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
-mod apply;
-mod bytes;
-mod cancel;
 mod cli;
 mod commands;
-mod config;
-mod doctor;
-mod document;
-mod editor;
-#[cfg(test)]
-mod examples;
-mod exec;
-mod facts;
-mod fanout;
-mod files;
 mod files_cmd;
-mod filestore;
-mod harden;
-mod interrupt;
-mod inventory;
-mod logger;
-mod options;
-mod packages;
-mod paths;
-mod plan;
-mod plugin;
-mod prepared;
-mod private;
-mod record;
-mod remote;
-mod rollback;
-mod run;
-mod secret;
-mod services;
-mod ssh;
-mod status;
-mod tasks;
-mod term;
-#[cfg(test)]
-mod test_util;
-mod transport;
-mod trust;
 #[cfg(feature = "tui")]
 mod tui;
-mod update;
 
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
 
+use anvil::logger::Logger;
 use cli::Cli;
-use logger::Logger;
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
