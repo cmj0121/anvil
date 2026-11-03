@@ -1719,7 +1719,7 @@ pub mod tests {
             stdout: stdout.to_owned(),
             stderr: stderr.to_owned(),
             skipped: false,
-            entry: apply::Entry::Script,
+            entry: crate::step::Entry::Script,
             task: None,
             name: None,
         }

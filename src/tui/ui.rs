@@ -2546,8 +2546,8 @@ mod tests {
 
     #[test]
     fn a_tasks_command_line_shows_bidi_as_an_escape_in_apply_and_plan_results() {
-        use crate::apply::PlannedRun;
         use crate::plan::PlanReport;
+        use crate::step::PlannedRun;
         use crate::transport::RUN_TIMEOUT;
 
         let run = "true \u{202e}x";
@@ -2565,7 +2565,7 @@ mod tests {
                 label: None,
                 sudo_secret: None,
                 timeout: RUN_TIMEOUT,
-                kind: crate::apply::RunKind::Script,
+                kind: crate::step::RunKind::Script,
                 task: Some("tasks[0]".to_owned()),
                 name: None,
             }],
@@ -2642,8 +2642,8 @@ mod tests {
 
     #[test]
     fn a_plan_result_shows_each_task_before_its_would_line() {
-        use crate::apply::PlannedRun;
         use crate::plan::PlanReport;
+        use crate::step::PlannedRun;
         use crate::transport::RUN_TIMEOUT;
 
         let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
@@ -2657,7 +2657,7 @@ mod tests {
                         label: None,
                         sudo_secret: None,
                         timeout: RUN_TIMEOUT,
-                        kind: crate::apply::RunKind::Script,
+                        kind: crate::step::RunKind::Script,
                         task: Some("tasks[0]".to_owned()),
                         name: Some("First\u{2066}".to_owned()),
                     }],
@@ -2675,8 +2675,8 @@ mod tests {
 
     #[test]
     fn the_plan_view_shows_would_lines_and_lists_the_steps_unmarked() {
-        use crate::apply::PlannedRun;
         use crate::plan::PlanReport;
+        use crate::step::PlannedRun;
         use crate::transport::RUN_TIMEOUT;
 
         let steps = Ok(vec![step_row("packages"), step_row("hostname")]);
@@ -2693,7 +2693,7 @@ mod tests {
                                 label: None,
                                 sudo_secret: Some("LOCAL_SUDO".to_owned()),
                                 timeout: RUN_TIMEOUT,
-                                kind: crate::apply::RunKind::Script,
+                                kind: crate::step::RunKind::Script,
                                 task: None,
                                 name: None,
                             },
@@ -2702,7 +2702,7 @@ mod tests {
                                 label: None,
                                 sudo_secret: None,
                                 timeout: RUN_TIMEOUT,
-                                kind: crate::apply::RunKind::Script,
+                                kind: crate::step::RunKind::Script,
                                 task: None,
                                 name: None,
                             },

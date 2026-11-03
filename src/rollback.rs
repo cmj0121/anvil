@@ -25,12 +25,12 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::apply::{
-    self, Entry, Escape, Line, NotRestored, Passwords, PlannedRun, Progress, Report, StepReport,
-    Style, TargetReport, Unresolved, print_lines,
+    self, Escape, Line, NotRestored, Progress, Report, StepReport, Style, TargetReport, print_lines,
 };
 use crate::cancel::Cancel;
 use crate::cli::Cli;
 use crate::config::Config;
+use crate::engine::{self, Passwords, Unresolved};
 use crate::error::{Failure, print_json};
 use crate::facts::Facts;
 use crate::fanout::{self, Event};
@@ -42,6 +42,7 @@ use crate::options::Options;
 use crate::prepared::Prepared;
 use crate::record::{self, Previous, Record, RolledBack, Session, TargetRecord};
 use crate::status;
+use crate::step::{Entry, PlannedRun};
 use crate::tasks::{Expanded, Item};
 use crate::transport::{Transport, TransportError};
 
@@ -104,7 +105,7 @@ pub fn load(opts: &Options) -> Result<(Config, Expanded), Failure> {
 /// are turned off first: the record holds the previous texts, as does the
 /// session opened after it.
 fn recorded(path: &std::path::Path) -> Result<Record, Failure> {
-    apply::no_core_dumps();
+    engine::no_core_dumps();
     match record::load(path).map_err(|err| Failure::failed(format!("rollback: {err}")))? {
         Some(record) if !record.targets.is_empty() => Ok(record),
         _ => Err(Failure::failed("rollback: no apply recorded")),
@@ -153,7 +154,7 @@ pub fn run_targets(
     // This read, before the lock, only refuses a missing record or an
     // unknown --force dest; the session reads the record again under it.
     check_force(&recorded(&path)?, &targets, force)?;
-    let mut session = apply::open_record("rollback")?;
+    let mut session = engine::open_record("rollback")?;
     let prepared = Prepared::rollback(opts, config, expanded, targets, &session, cancel)?;
     let targets = &prepared.targets;
     let entries: Vec<Option<TargetRecord>> = targets
@@ -216,7 +217,7 @@ pub fn run_targets(
 /// [`apply::AbortReason::SaveFailed`], but every target that ends
 /// is still marked and saved: a later save that succeeds records the earlier
 /// ones too. The reports come back with the first save's error, followed by
-/// every target the record still lacks ([`apply::Saves`]), if one failed.
+/// every target the record still lacks ([`engine::Saves`]), if one failed.
 fn roll_back_each(
     targets: &[Target],
     entries: &[Option<TargetRecord>],
@@ -226,7 +227,7 @@ fn roll_back_each(
     on: &mut dyn FnMut(Progress<'_>),
     roll: impl Fn(&Target, &TargetRecord) -> RolledTarget + Sync,
 ) -> (Vec<TargetReport>, Option<String>) {
-    let mut saves = apply::Saves::default();
+    let mut saves = engine::Saves::default();
     let results = fanout::fan_out(
         targets,
         parallel,
@@ -347,7 +348,7 @@ fn roll_back(
             Err(error) => return failed(error),
         };
     runs.extend(entry.cannot_undo.iter().map(|what| cannot_undo(what)));
-    let mut report = apply::execute(
+    let mut report = engine::execute(
         "rollback",
         target,
         transport.as_ref(),

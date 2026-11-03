@@ -3,7 +3,7 @@
 //!
 //! Every target is probed, with or without `[packages]` work, so a target
 //! that cannot be reached fails here as it would under apply; then
-//! [`apply::resolve`] lists its steps. The secret store is never opened: a
+//! [`engine::resolve`] lists its steps. The secret store is never opened: a
 //! step that would type a sudo password names its secret, and whether that
 //! secret is set is `anvil doctor`'s job. A plugin step runs its plugin, on
 //! the controller only, to list the script it returns. Each `[[files]]`
@@ -15,10 +15,11 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::apply::{self, Escape, Line, PlannedRun, Style, Unresolved, print_lines};
+use crate::apply::{self, Escape, Line, Style, print_lines};
 use crate::cancel::{AbortReason, Cancel};
 use crate::cli::Cli;
 use crate::config::Config;
+use crate::engine::{self, Unresolved};
 use crate::error::{Failure, print_json};
 use crate::fanout::{self, Event};
 use crate::files::Sources;
@@ -29,6 +30,7 @@ use crate::options::Options;
 use crate::plugin::Plugins;
 use crate::prepared::Prepared;
 use crate::status;
+use crate::step::PlannedRun;
 use crate::tasks::Expanded;
 use crate::transport::{Transport, TransportError};
 
@@ -194,7 +196,7 @@ fn plan_target(
         .map_err(|err| Unresolved::Failed(err.to_string()))
         .and_then(|transport| apply::probe(transport.as_ref(), expanded))
         .and_then(|facts| {
-            apply::resolve(
+            engine::resolve(
                 target,
                 Some(&facts),
                 config,
@@ -322,7 +324,7 @@ pub(crate) fn render_summary(targets: usize, failed: usize, style: Style) -> Str
 
 #[cfg(test)]
 mod tests {
-    use crate::apply::RunKind;
+    use crate::step::RunKind;
     use crate::tasks::legacy;
     use std::sync::Mutex;
 
@@ -474,11 +476,11 @@ mod tests {
         }
     }
 
-    /// [`apply::resolve`] for target `local` and a config without plugin
+    /// [`engine::resolve`] for target `local` and a config without plugin
     /// steps.
     fn resolve(facts: &facts::Facts, config: &Config) -> Result<Vec<PlannedRun>, Unresolved> {
         let cancel = Cancel::new();
-        apply::resolve(
+        engine::resolve(
             &target("local"),
             Some(facts),
             config,

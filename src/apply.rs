@@ -38,12 +38,10 @@
 //! before the write, which then refuses to write if DEST changed meanwhile.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::num::NonZeroU8;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -51,6 +49,9 @@ pub use crate::cancel::AbortReason;
 use crate::cancel::Cancel;
 use crate::cli::Cli;
 use crate::config::{Config, Plugin, Step, StepKind};
+use crate::engine::{
+    Journal, Passwords, Reached, Recorder, Unresolved, cannot_undo, execute, open_record, resolve,
+};
 use crate::error::{Failure, print_json};
 use crate::facts::{self, Facts};
 use crate::fanout::{self, Event};
@@ -65,223 +66,12 @@ use crate::options::Options;
 use crate::packages::{self, Packages};
 use crate::plugin::{Plugins, Request};
 use crate::prepared::Prepared;
-use crate::record::{self, FileRecord, Session, TargetRecord};
-use crate::secret::Store;
-use crate::services;
+use crate::record::Session;
 use crate::status;
+use crate::step::{Entry, PlannedRun, RunKind};
 use crate::tasks::{Expanded, Item, ItemKind};
-use crate::transport::{
-    Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
-};
-use zeroize::{Zeroize, Zeroizing};
-
-/// Sudo passwords by secret name; a name that is not set is absent.
-pub(crate) type Passwords = BTreeMap<String, Zeroizing<Vec<u8>>>;
-
-/// The value of secret `name` to type at sudo's prompt: set, and free of
-/// control characters. Errors start with `prefix`, the step's kind.
-fn sudo_password<'a>(
-    passwords: &'a Passwords,
-    name: &str,
-    prefix: &str,
-) -> Result<&'a [u8], String> {
-    match passwords.get(name) {
-        None => Err(format!("{prefix}: secret {name} is not set")),
-        Some(password) if has_control_bytes(password) => Err(format!(
-            "{prefix}: secret {name} contains control characters"
-        )),
-        Some(password) => Ok(password),
-    }
-}
-
-/// A step apply would run: its one-line script, the secret whose password
-/// is typed when it runs through sudo with a password, its time limit, and
-/// what kind of step it is. It serializes as the user sees it: `run` is the
-/// label when there is one.
-#[derive(Clone, PartialEq, Eq)]
-pub struct PlannedRun {
-    /// Zeroed when dropped: a `[[files]]` step's carries the file's bytes.
-    pub run: Zeroizing<String>,
-    /// What the step's report shows instead of `run`, when what is sent
-    /// differs from what the user wrote.
-    pub label: Option<String>,
-    pub sudo_secret: Option<String>,
-    pub timeout: Duration,
-    pub kind: RunKind,
-    /// The path of the task this step comes from; `None` for a legacy entry.
-    pub task: Option<String>,
-    /// That task's `name`, if it has one.
-    pub name: Option<String>,
-}
-
-/// What a run does.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RunKind {
-    /// The package step; `manager` is for marker extraction.
-    Packages { manager: packages::Manager },
-    /// A `[[files]]` step, whose `run` carries the file's bytes; also a
-    /// rollback restore, and a rollback note, which is always a skip and has
-    /// `dest` `""`.
-    File { dest: String, run: FileRun },
-    /// A `[[services]]` step.
-    Service { name: String, run: ServiceRun },
-    /// A `[[steps]]` entry, 1-based among them, and the plugin that returned it.
-    Step {
-        number: usize,
-        plugin: Option<String>,
-    },
-    /// A `run`, `plugin` or `packages` task the target does not match:
-    /// nothing runs, and no manager was resolved for it.
-    Skip,
-    /// `anvil run`: no config entry.
-    Script,
-}
-
-impl RunKind {
-    pub fn entry(&self) -> Entry {
-        match self {
-            RunKind::Packages { .. } => Entry::Packages,
-            RunKind::File { dest, .. } => Entry::File { dest: dest.clone() },
-            RunKind::Service { name, .. } => Entry::Service { name: name.clone() },
-            RunKind::Step { number, .. } => Entry::Step { number: *number },
-            RunKind::Skip | RunKind::Script => Entry::Script,
-        }
-    }
-}
-
-/// Which config entry a report belongs to. Never serialized. Rollback
-/// restores and notes are `File` too; a note's `dest` is `""`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Entry {
-    Packages,
-    File { dest: String },
-    Service { name: String },
-    Step { number: usize },
-    Script,
-}
-
-/// By hand: a `[[files]]` step's `run` is shown only by its length.
-impl std::fmt::Debug for PlannedRun {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut debug = f.debug_struct("PlannedRun");
-        match self.file() {
-            Some(_) => debug.field("run", &Redacted(self.run.len())),
-            None => debug.field("run", &*self.run),
-        };
-        debug
-            .field("label", &self.label)
-            .field("sudo_secret", &self.sudo_secret)
-            .field("plugin", &self.plugin())
-            .field("timeout", &self.timeout)
-            .field("file", &self.file())
-            .field("service", &self.service())
-            .finish()
-    }
-}
-
-/// A `[[files]]` step: the temp-file scripts of the password path, and
-/// whether the entry matched no tag or fact of the target.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileRun {
-    pub upload: Option<Upload>,
-    pub skip: bool,
-    /// How the step writes, to build it again with what the capture saw;
-    /// `None` for a skip.
-    pub write: Option<files::FileWrite>,
-}
-
-/// A `[[services]]` step: whether the entry matched no tag or fact of the target.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceRun {
-    pub skip: bool,
-}
-
-/// The password path's plain scripts around `run`: `stage` writes the bytes
-/// to the temp file, `cleanup` removes it.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Upload {
-    /// Zeroed when dropped, as it carries the file's bytes.
-    pub stage: Zeroizing<String>,
-    pub cleanup: String,
-}
-
-/// By hand: `stage` carries the file's bytes.
-impl std::fmt::Debug for Upload {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Upload")
-            .field("stage", &Redacted(self.stage.len()))
-            .field("cleanup", &self.cleanup)
-            .finish()
-    }
-}
-
-/// A script's length in place of its text, for `Debug`.
-struct Redacted(usize);
-
-impl std::fmt::Debug for Redacted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<{} bytes redacted>", self.0)
-    }
-}
-
-impl PlannedRun {
-    /// What the step's report shows: `label`, or else `run`.
-    pub fn shown(&self) -> &str {
-        self.label.as_deref().unwrap_or(&self.run)
-    }
-
-    /// This step's task line in human output; `None` for a legacy entry.
-    pub fn title(&self) -> Option<String> {
-        task_title(self.task.as_deref(), self.name.as_deref())
-    }
-
-    /// The plugin that returned this step, if one did.
-    pub fn plugin(&self) -> Option<&str> {
-        match &self.kind {
-            RunKind::Step { plugin, .. } => plugin.as_deref(),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn file(&self) -> Option<&FileRun> {
-        match &self.kind {
-            RunKind::File { run, .. } => Some(run),
-            _ => None,
-        }
-    }
-
-    fn service(&self) -> Option<&ServiceRun> {
-        match &self.kind {
-            RunKind::Service { run, .. } => Some(run),
-            _ => None,
-        }
-    }
-}
-
-impl Serialize for PlannedRun {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Shown<'a> {
-            run: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            sudo_secret: Option<&'a str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            plugin: Option<&'a str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            task: Option<&'a str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            name: Option<&'a str>,
-        }
-        Shown {
-            run: self.shown(),
-            sudo_secret: self.sudo_secret.as_deref(),
-            plugin: self.plugin(),
-            task: self.task.as_deref(),
-            name: self.name.as_deref(),
-        }
-        .serialize(serializer)
-    }
-}
+use crate::transport::{Output, RUN_TIMEOUT, Transport, TransportError, into_string};
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StepReport {
@@ -306,7 +96,7 @@ pub struct StepReport {
 
 impl StepReport {
     /// This report as the report of `planned`'s task.
-    fn of(self, planned: &PlannedRun) -> StepReport {
+    pub(crate) fn of(self, planned: &PlannedRun) -> StepReport {
         StepReport {
             task: planned.task.clone(),
             name: planned.name.clone(),
@@ -332,7 +122,7 @@ impl StepReport {
         }
     }
 
-    fn from_output(run: &str, output: Output, entry: Entry) -> StepReport {
+    pub(crate) fn from_output(run: &str, output: Output, entry: Entry) -> StepReport {
         StepReport {
             run: run.to_owned(),
             code: output.code,
@@ -425,7 +215,7 @@ pub enum TargetReport {
 
 impl TargetReport {
     /// This report as ended during `planned`'s step.
-    fn at(mut self, planned: &PlannedRun) -> TargetReport {
+    pub(crate) fn at(mut self, planned: &PlannedRun) -> TargetReport {
         if let TargetReport::Failed { task, name, .. }
         | TargetReport::Cancelled { task, name, .. } = &mut self
         {
@@ -466,7 +256,7 @@ impl TargetReport {
     }
 
     /// Lift package markers after execution, including partial timeout output.
-    fn collect_warnings(&mut self, runs: &[PlannedRun]) {
+    pub(crate) fn collect_warnings(&mut self, runs: &[PlannedRun]) {
         let (steps, warnings) = match self {
             Self::Ran {
                 steps, warnings, ..
@@ -642,77 +432,6 @@ pub fn run_targets(
     ))
 }
 
-/// Locks and loads the record for `command`; any failure is exit 1. Core
-/// dumps are turned off first: the record holds the previous texts.
-pub(crate) fn open_record(command: &str) -> Result<Session, Failure> {
-    no_core_dumps();
-    let path = record::path().map_err(|err| Failure::failed(format!("{command}: {err}")))?;
-    Session::open(&path).map_err(|err| Failure::failed(format!("{command}: {err}")))
-}
-
-/// The sudo password of each of `targets` with a sudo secret that a step may
-/// type, read from the store `store` builds, opened once: a target's when a
-/// package item, a `sudo = true` file item or a service item carries only tags
-/// it has (its facts are not known yet).
-/// Nothing is built or opened when no step may type one. One trailing
-/// newline is trimmed. A store error fails the command. Core dumps are
-/// turned off first.
-pub(crate) fn load_passwords(
-    targets: &[Target],
-    config: &Config,
-    expanded: &Expanded,
-    store: impl FnOnce() -> Result<Box<dyn Store>, Failure>,
-) -> Result<Passwords, Failure> {
-    read_passwords(expanded.sudo_secrets(config, targets), store)
-}
-
-/// The sudo password of each secret in `names`, read from the store
-/// `store` builds, opened once and only when there are names; an unset
-/// one is absent. One trailing newline is trimmed. Core dumps are turned
-/// off first.
-pub(crate) fn read_passwords(
-    names: BTreeSet<&str>,
-    store: impl FnOnce() -> Result<Box<dyn Store>, Failure>,
-) -> Result<Passwords, Failure> {
-    let mut passwords = Passwords::new();
-    if names.is_empty() {
-        return Ok(passwords);
-    }
-    no_core_dumps();
-    let store = store()?;
-    log::debug!("opening the {} secret store", store.kind());
-    let vault = store.open()?;
-    for name in names {
-        if let Some(mut password) = vault.get(name)? {
-            if password.last() == Some(&b'\n') {
-                password.pop();
-            }
-            passwords.insert(name.to_owned(), password);
-        }
-    }
-    Ok(passwords)
-}
-
-/// Keeps the passwords about to be read out of a core dump: the soft core
-/// limit becomes 0 and, on Linux, the process is no longer dumpable. Best
-/// effort; a failure is only logged.
-pub(crate) fn no_core_dumps() {
-    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
-    let limit = Rlimit {
-        current: Some(0),
-        ..getrlimit(Resource::Core)
-    };
-    if let Err(err) = setrlimit(Resource::Core, limit) {
-        log::debug!("cannot turn core dumps off: {err}");
-    }
-    #[cfg(target_os = "linux")]
-    if let Err(err) =
-        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
-    {
-        log::debug!("cannot make the process non-dumpable: {err}");
-    }
-}
-
 /// Applies to each of `targets`, as [`for_each_target`] runs them. With a
 /// `session`, a target's worker saves its partial entry before and after
 /// each file write ([`Journal`]), each target the probe reached is merged
@@ -788,145 +507,6 @@ fn apply_targets(
     }
 }
 
-/// The saves of one run's targets into the record. Each save writes the
-/// whole record as merged so far, so one that succeeds records every target
-/// whose own save failed before it.
-#[derive(Default)]
-pub(crate) struct Saves {
-    /// The first save error.
-    first: Option<String>,
-    /// The targets whose save failed since the last one that succeeded.
-    unrecorded: Vec<String>,
-}
-
-impl Saves {
-    /// Notes how `name`'s save went; a failure stops the run, so no further
-    /// target starts.
-    pub(crate) fn note(&mut self, name: &str, saved: Result<(), String>, cancel: &Cancel) {
-        match saved {
-            Ok(()) => self.unrecorded.clear(),
-            Err(err) => {
-                cancel.stop(AbortReason::SaveFailed);
-                self.first.get_or_insert(err);
-                if !self.unrecorded.iter().any(|kept| kept == name) {
-                    self.unrecorded.push(name.to_owned());
-                }
-            }
-        }
-    }
-
-    /// [`Saves::error`] once `last`, the last save, has gone too.
-    pub(crate) fn finish<T>(mut self, last: &Result<T, String>) -> Option<String> {
-        match last {
-            Ok(_) => self.unrecorded.clear(),
-            Err(err) => {
-                self.first.get_or_insert_with(|| err.clone());
-            }
-        }
-        self.error()
-    }
-
-    /// `None` when every save succeeded; else the first error, then `; not
-    /// recorded: a, b` for the targets the record still lacks.
-    pub(crate) fn error(self) -> Option<String> {
-        let first = self.first?;
-        Some(match self.unrecorded.as_slice() {
-            [] => first,
-            names => format!("{first}; not recorded: {}", names.join(", ")),
-        })
-    }
-}
-
-/// The record while an apply runs, shared by the event closure on the main
-/// thread and the workers, which save around each write. A Mutex rather than
-/// an event to the main thread: that thread may be blocked on a full stdout,
-/// and a worker's save must not wait for it. Nothing prints under the lock.
-struct Journal<'a> {
-    books: Mutex<Books>,
-    cancel: &'a Cancel,
-}
-
-struct Books {
-    session: Session,
-    saves: Saves,
-    /// What the merges of ended targets warn of. A snapshot's merge says
-    /// nothing: its write may yet be refused, and the target's last merge
-    /// repeats whatever still holds.
-    warnings: Vec<String>,
-    /// What the saves shed; a finish that succeeds reports it afresh.
-    shed: Vec<String>,
-}
-
-impl<'a> Journal<'a> {
-    fn new(session: Session, cancel: &'a Cancel) -> Journal<'a> {
-        Journal {
-            books: Mutex::new(Books {
-                session,
-                saves: Saves::default(),
-                warnings: Vec::new(),
-                shed: Vec::new(),
-            }),
-            cancel,
-        }
-    }
-
-    /// The books, also after a worker panicked holding them: the session
-    /// stays whole, as a merge or save changes it only at its end.
-    fn lock(&self) -> MutexGuard<'_, Books> {
-        self.books.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Saves `record`, what `name` has written so far. False when the save
-    /// failed, which has stopped the run: no write may follow.
-    fn snapshot(&self, name: &str, record: TargetRecord) -> bool {
-        let mut books = self.lock();
-        books.session.merge(name, record);
-        books.save(name, self.cancel)
-    }
-
-    /// Merges and saves `reached`, the entry of a target that ended.
-    fn ended(&self, name: &str, reached: Reached) {
-        let mut books = self.lock();
-        let books = &mut *books;
-        if reached.wrote {
-            books
-                .warnings
-                .extend(books.session.merge(name, reached.record))
-        } else {
-            books.session.refresh(name, reached.record)
-        }
-        books.save(name, self.cancel);
-    }
-
-    /// The last save: the run's warnings and its `save_error`.
-    fn finish(self, order: &[String]) -> (Vec<String>, Option<String>) {
-        let Books {
-            session,
-            saves,
-            mut warnings,
-            shed,
-        } = self
-            .books
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner);
-        let last = session.finish(order);
-        let error = saves.finish(&last);
-        warnings.extend(last.unwrap_or(shed));
-        (warnings, error)
-    }
-}
-
-impl Books {
-    /// Saves the record, noting the outcome for `name` and adding what the
-    /// save warns of to `shed`. False when it failed.
-    fn save(&mut self, name: &str, cancel: &Cancel) -> bool {
-        let saved = self.session.save().map(|shed| self.shed.extend(shed));
-        let ok = saved.is_ok();
-        self.saves.note(name, saved, cancel);
-        ok
-    }
-}
-
 /// One target's report, and what the record keeps of it.
 struct Applied {
     report: TargetReport,
@@ -940,52 +520,6 @@ impl Applied {
             report,
             reached: None,
         }
-    }
-}
-
-/// The record of a target the probe reached; `wrote`: a `[[files]]` write
-/// started on it, so `record` replaces its entry, else only refreshes it.
-#[derive(Clone)]
-struct Reached {
-    record: TargetRecord,
-    wrote: bool,
-}
-
-/// Runs `one` on each of `targets`, `parallel` at a time, reporting each as
-/// it starts and ends. Once `cancel` is set, every target not started is
-/// Cancelled; one whose `one` panics has failed. `command` names the run in
-/// the log.
-pub(crate) fn for_each_target(
-    command: &str,
-    targets: &[Target],
-    parallel: NonZeroU8,
-    cancel: &Cancel,
-    on: &mut dyn FnMut(Progress<'_>),
-    one: impl Fn(&Target) -> TargetReport + Sync,
-) -> Report {
-    let reports = fanout::fan_out(
-        targets,
-        parallel,
-        cancel,
-        on,
-        one,
-        |target| cancelled(command, target, Vec::new(), cancel),
-        |target, message| {
-            failed(
-                command,
-                target,
-                Vec::new(),
-                format!("internal error: {message}"),
-            )
-        },
-    );
-    let ok = reports.iter().all(TargetReport::ok);
-    Report {
-        targets: reports,
-        ok,
-        warnings: Vec::new(),
-        not_restored: Vec::new(),
-        save_error: None,
     }
 }
 
@@ -1149,126 +683,6 @@ fn apply_target(
     Applied { report, reached }
 }
 
-/// What a target's `[[files]]` steps wrote, for the record.
-pub(crate) struct Recorder<'a> {
-    expanded: &'a Expanded,
-    sources: &'a Sources,
-    files: Vec<FileRecord>,
-    /// On a tasks config, the dests with a `rollback = false` file item that
-    /// applies to this target. Known before any write, since one kept text
-    /// could already be that item's bytes from the last apply, and the item
-    /// may never run to drop it.
-    hash_only: Vec<&'a str>,
-    /// Whether a write started: its capture ran, then the write did.
-    wrote: bool,
-    target: &'a str,
-    facts: Option<&'a Facts>,
-    journal: Option<&'a Journal<'a>>,
-}
-
-impl<'a> Recorder<'a> {
-    fn new(
-        expanded: &'a Expanded,
-        sources: &'a Sources,
-        target: &'a Target,
-        facts: Option<&'a Facts>,
-        journal: Option<&'a Journal<'a>>,
-    ) -> Recorder<'a> {
-        let hash_only = match facts.filter(|_| expanded.from_tasks) {
-            Some(facts) => expanded
-                .files()
-                .filter(|(item, entry, _)| !entry.rollback && item.matches(target, facts))
-                .map(|(_, entry, _)| entry.dest.as_str())
-                .collect(),
-            None => Vec::new(),
-        };
-        Recorder {
-            expanded,
-            sources,
-            files: Vec::new(),
-            hash_only,
-            wrote: false,
-            target: &target.name,
-            facts,
-            journal,
-        }
-    }
-
-    /// Whether `dest` is to keep its previous file's hash only.
-    fn is_hash_only(&self, dest: &str) -> bool {
-        (self.hash_only.iter()).any(|hash_only| self.expanded.same_dest(hash_only, dest))
-    }
-
-    /// Saves what the target did so far, with `intent`, a write about to
-    /// start, as though it failed midway; `steps` are the steps that ended.
-    /// False when the save failed, which has stopped the run.
-    fn snapshot(&self, intent: Option<&FileRecord>, steps: &[StepReport]) -> bool {
-        let (Some(journal), Some(facts)) = (self.journal, self.facts) else {
-            return true;
-        };
-        let mut files = self.files.clone();
-        if let Some(intent) = intent {
-            keep(self.expanded, &mut files, intent.clone());
-        }
-        let record = stamped(facts.clone(), false, files, cannot_undo(steps));
-        journal.snapshot(self.target, record)
-    }
-
-    /// The target's record, stamped now; `None` when the probe did not run.
-    fn finish(self, ok: bool, cannot_undo: Vec<String>) -> Option<Reached> {
-        Some(Reached {
-            record: stamped(self.facts?.clone(), ok, self.files, cannot_undo),
-            wrote: self.wrote,
-        })
-    }
-}
-
-/// `file` into `files`: a tasks config keeps one record per dest
-/// ([`FileRecord::written_again`]); a legacy config has one per write.
-fn keep(expanded: &Expanded, files: &mut Vec<FileRecord>, file: FileRecord) {
-    let again = (files.iter_mut())
-        .find(|kept| expanded.from_tasks && expanded.same_dest(&kept.dest, &file.dest));
-    match again {
-        Some(kept) => kept.written_again(file),
-        None => files.push(file),
-    }
-}
-
-/// A target's record, stamped now.
-fn stamped(
-    facts: Facts,
-    ok: bool,
-    files: Vec<FileRecord>,
-    cannot_undo: Vec<String>,
-) -> TargetRecord {
-    TargetRecord {
-        at: record::now(),
-        anvil: env!("CARGO_PKG_VERSION").to_owned(),
-        ok,
-        facts,
-        files,
-        cannot_undo,
-        rolled_back: None,
-    }
-}
-
-/// The steps that ran and that a rollback cannot undo: `packages`,
-/// `service NAME` and `step N` (1-based among `[[steps]]`), or a task's path;
-/// never a skip.
-fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
-    steps
-        .iter()
-        .filter(|step| !step.skipped)
-        .filter_map(|step| match (&step.entry, &step.task) {
-            (Entry::File { .. } | Entry::Script, _) => None,
-            (_, Some(path)) => Some(path.clone()),
-            (Entry::Packages, None) => Some("packages".to_owned()),
-            (Entry::Service { name }, None) => Some(format!("service {name}")),
-            (Entry::Step { number }, None) => Some(format!("step {number}")),
-        })
-        .collect()
-}
-
 /// `target` of `command` (apply, rollback, run) ended by a transport error,
 /// after `steps`.
 pub(crate) fn failed(
@@ -1286,376 +700,6 @@ pub(crate) fn failed(
         ok: false,
         task: None,
         name: None,
-    }
-}
-
-/// Runs `runs` over `transport` in order, stopping at the first that fails;
-/// `cancel` is checked before each, and `passwords` holds the sudo
-/// passwords to type. A skipped `[[files]]` or `[[services]]` step runs
-/// nothing; a file step that needs a sudo password goes through
-/// [`send_file`]. With a `recorder`, each file step first captures DEST
-/// ([`capture`]), then saves an intent entry (`FailedMidway`), so that a kill
-/// during the write keeps what it captured, then writes only if DEST still
-/// holds that, then saves how the write ended. A failed intent save writes
-/// nothing: the target ends as cancelled, with the run stopped.
-pub(crate) fn execute(
-    command: &str,
-    target: &Target,
-    transport: &dyn Transport,
-    runs: &[PlannedRun],
-    passwords: &Passwords,
-    cancel: &Cancel,
-    recorder: Option<&mut Recorder<'_>>,
-) -> TargetReport {
-    let mut report = execute_inner(
-        command, target, transport, runs, passwords, cancel, recorder,
-    );
-    report.collect_warnings(runs);
-    report
-}
-
-fn execute_inner(
-    command: &str,
-    target: &Target,
-    transport: &dyn Transport,
-    runs: &[PlannedRun],
-    passwords: &Passwords,
-    cancel: &Cancel,
-    mut recorder: Option<&mut Recorder<'_>>,
-) -> TargetReport {
-    let mut reports = Vec::with_capacity(runs.len());
-    let mut ok = true;
-    let of = runs.len();
-    for (n, planned) in runs.iter().enumerate() {
-        if cancel.is_set() {
-            return cancelled(command, target, reports, cancel);
-        }
-        // A sudo error on a plain step reads "packages", as before.
-        let (prefix, kind) = match &planned.kind {
-            RunKind::File { .. } => ("files", "files"),
-            RunKind::Service { .. } => ("services", "services"),
-            RunKind::Packages { .. } => ("packages", "packages"),
-            RunKind::Step { .. } | RunKind::Skip | RunKind::Script => ("packages", "step"),
-        };
-        status::phase(&target.name, status::Phase::Run { kind, n: n + 1, of });
-        let label = planned.shown();
-        let entry = planned.kind.entry();
-        if planned.file().is_some_and(|file| file.skip)
-            || planned.service().is_some_and(|service| service.skip)
-            || matches!(planned.kind, RunKind::Skip)
-        {
-            reports.push(StepReport::skipped(label, entry).of(planned));
-            continue;
-        }
-        let password = match planned.sudo_secret.as_deref() {
-            None => None,
-            Some(name) => match sudo_password(passwords, name, prefix) {
-                Ok(password) => Some((name, password)),
-                Err(error) => return failed(command, target, reports, error).at(planned),
-            },
-        };
-        let (mut run, timeout) = (planned.run.as_str(), planned.timeout);
-        let mut upload = planned.file().and_then(|file| file.upload.as_ref());
-        let write = planned.file().and_then(|file| file.write.as_ref());
-        let rebuilt;
-        let mut captured = None;
-        if let (Some(recorder), Some(write)) = (recorder.as_deref_mut(), write) {
-            let found = match capture(target, transport, write, password.map(|(_, p)| p)) {
-                Ok(found) => found,
-                Err(Uncaptured::Step { code, stderr }) => {
-                    reports.push(
-                        StepReport {
-                            run: label.to_owned(),
-                            code,
-                            stdout: String::new(),
-                            stderr,
-                            skipped: false,
-                            entry,
-                            task: None,
-                            name: None,
-                        }
-                        .of(planned),
-                    );
-                    ok = false;
-                    break;
-                }
-                Err(Uncaptured::Transport(TransportError::Cancelled)) => {
-                    return cancelled(command, target, reports, cancel).at(planned);
-                }
-                Err(Uncaptured::Transport(err)) => {
-                    let error = step_error(&err, password.map(|(name, _)| name), prefix);
-                    return failed(command, target, reports, error).at(planned);
-                }
-            };
-            if cancel.is_set() {
-                return cancelled(command, target, reports, cancel).at(planned);
-            }
-            rebuilt = match files::write_script(write, recorder.sources, &found.expected()) {
-                Ok(rebuilt) => rebuilt,
-                Err(error) => return failed(command, target, reports, error).at(planned),
-            };
-            (run, upload) = (rebuilt.0.as_str(), rebuilt.1.as_ref());
-            recorder.wrote = true;
-            let hash_only = recorder.is_hash_only(&write.dest);
-            let intent = write.record(
-                recorder.expanded,
-                recorder.sources,
-                found,
-                record::Write::FailedMidway,
-                hash_only,
-            );
-            if !recorder.snapshot(Some(&intent), &reports) {
-                return cancelled(command, target, reports, cancel).at(planned);
-            }
-            captured = Some(intent);
-        }
-        let mut staged = true;
-        let output = match (password, upload) {
-            (None, None) => transport.run(run, timeout),
-            (None, Some(_)) => {
-                let error = format!("files: internal error: {label} has no sudo secret");
-                return failed(command, target, reports, error).at(planned);
-            }
-            (Some((_, password)), None) => {
-                transport.run_tty(&packages::with_password(run), password, timeout)
-            }
-            (Some((_, password)), Some(upload)) => {
-                match send_file(
-                    command, target, transport, upload, run, password, timeout, cancel,
-                ) {
-                    Sent::Installed(output) => output,
-                    Sent::Unstaged(output) => {
-                        staged = false;
-                        output
-                    }
-                    Sent::Cancelled => {
-                        return cancelled(command, target, reports, cancel).at(planned);
-                    }
-                }
-            }
-        };
-        if let (Some(recorder), Some(mut file)) = (recorder.as_deref_mut(), captured) {
-            // Only a write that may have changed DEST failed midway: a
-            // failed stage, a refusal (root checks, hash guard), a password
-            // sudo -v rejected, and a run that never reached the target (no
-            // master: cancelled, refused, an unknown host key, a denied key,
-            // ssh not spawned) all left it as it was.
-            file.write = match &output {
-                _ if !staged => record::Write::Refused,
-                Ok(output) if output.code == Some(0) => record::Write::Written,
-                Ok(output) if output.code == Some(files::REFUSED) => record::Write::Refused,
-                Err(
-                    TransportError::PasswordRejected
-                    | TransportError::Cancelled
-                    | TransportError::Connect { .. }
-                    | TransportError::HostKey
-                    | TransportError::AuthDenied { .. }
-                    | TransportError::Spawn(_),
-                ) => record::Write::Refused,
-                // NoPrompt: sudo asked some other way, or took the password
-                // without anvil's prompt, so the write may have started
-                // unseen. A timeout, a lost transport or a failed wait on
-                // the running ssh (Wait) may have cut it.
-                _ => record::Write::FailedMidway,
-            };
-            keep(recorder.expanded, &mut recorder.files, file);
-            // A failure has set the cancel token: the next step does not start.
-            recorder.snapshot(None, &reports);
-        }
-        let output = match output {
-            Ok(output) => output,
-            // ssh would have had to open a master after cancel.
-            Err(TransportError::Cancelled) => {
-                return cancelled(command, target, reports, cancel).at(planned);
-            }
-            Err(err) => {
-                let error = step_error(&err, password.map(|(name, _)| name), prefix);
-                // A step killed at the limit still shows what it printed.
-                if let TransportError::Timeout {
-                    output: Some(output),
-                    ..
-                } = err
-                {
-                    reports.push(StepReport::from_output(label, *output, entry).of(planned));
-                }
-                return failed(command, target, reports, error).at(planned);
-            }
-        };
-        let succeeded = output.code == Some(0);
-        if succeeded && output.truncated {
-            log::warn!("{command} {}: step output cut at 1 MiB", target.name);
-        }
-        reports.push(StepReport::from_output(label, output, entry).of(planned));
-        if !succeeded {
-            ok = false;
-            break;
-        }
-    }
-    log::info!(
-        "{command} {}: {}",
-        target.name,
-        if ok { "done" } else { "a step failed" }
-    );
-    TargetReport::Ran {
-        warnings: Vec::new(),
-        target: target.name.clone(),
-        steps: reports,
-        ok,
-    }
-}
-
-/// Why [`capture`] found nothing: how the step failed, without what the
-/// capture printed on stdout, or the transport's error.
-enum Uncaptured {
-    Step { code: Option<i32>, stderr: String },
-    Transport(TransportError),
-}
-
-/// Runs `write`'s capture of DEST through the write's own path: on a
-/// terminal typing `password` on the password path, else plainly. Turns
-/// core dumps off first. Its stdout holds DEST's bytes, so it is parsed and
-/// dropped, never reported or logged; a failed capture keeps only stderr,
-/// or on a terminal, which shares one stream, the `files:` lines.
-fn capture(
-    target: &Target,
-    transport: &dyn Transport,
-    write: &files::FileWrite,
-    password: Option<&[u8]>,
-) -> Result<files::Captured, Uncaptured> {
-    no_core_dumps();
-    let script = write.capture();
-    let output = match password {
-        Some(password) => {
-            transport.run_tty(&packages::with_password(&script), password, RUN_TIMEOUT)
-        }
-        None => transport.run(&script, RUN_TIMEOUT),
-    };
-    let output = output.map_err(|err| match err {
-        // What a timed-out capture printed may be DEST's bytes.
-        TransportError::Timeout { after, output } => {
-            if let Some(mut output) = output {
-                output.stdout.zeroize();
-                output.stderr.zeroize();
-            }
-            Uncaptured::Transport(TransportError::Timeout {
-                after,
-                output: None,
-            })
-        }
-        err => Uncaptured::Transport(err),
-    })?;
-    // The buffer itself, moved rather than copied, so it is zeroed on drop.
-    let stdout = Zeroizing::new(output.stdout);
-    if output.code != Some(0) {
-        let stderr = match password {
-            None => into_string(output.stderr),
-            // Line by line, so that no lossy copy of the whole output, which
-            // may hold DEST's bytes, is ever made.
-            Some(_) => stdout
-                .split(|&byte| byte == b'\n')
-                .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-                .filter(|line| line.starts_with(b"files: "))
-                .map(|line| format!("{}\n", String::from_utf8_lossy(line)))
-                .collect(),
-        };
-        return Err(Uncaptured::Step {
-            code: output.code,
-            stderr,
-        });
-    }
-    let found = files::parse_capture(&write.dest, &stdout).map_err(|error| Uncaptured::Step {
-        code: Some(1),
-        stderr: format!("{error}\n"),
-    })?;
-    log::info!(
-        "apply {}: capture {}: {}",
-        target.name,
-        write.dest,
-        found.summary()
-    );
-    Ok(found)
-}
-
-/// The password path of a `[[files]]` step: `upload.stage` writes the bytes
-/// to the temp file over a plain run; unless it failed or `cancel` was set
-/// meanwhile, `run` then installs it on a terminal, typing `password`.
-/// `upload.cleanup` runs after, whatever happened and even once cancelled,
-/// and its failure is only logged. `command` names the run in the log.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each is one input of the file step, passed through"
-)]
-fn send_file(
-    command: &str,
-    target: &Target,
-    transport: &dyn Transport,
-    upload: &Upload,
-    run: &str,
-    password: &[u8],
-    timeout: Duration,
-    cancel: &Cancel,
-) -> Sent {
-    let sent = match transport.run(&upload.stage, timeout) {
-        Ok(staged) if staged.code == Some(0) => {
-            log::debug!("{command} {}: file staged", target.name);
-            if cancel.is_set() {
-                Sent::Cancelled
-            } else {
-                Sent::Installed(transport.run_tty(&packages::with_password(run), password, timeout))
-            }
-        }
-        Ok(staged) => Sent::Unstaged(Ok(Output {
-            code: staged.code,
-            stderr: b"files: could not stage the file\n".to_vec(),
-            ..Output::default()
-        })),
-        Err(TransportError::Timeout { after, .. }) => {
-            Sent::Unstaged(Err(TransportError::Timeout {
-                after,
-                output: None,
-            }))
-        }
-        Err(err) => Sent::Unstaged(Err(err)),
-    };
-    match transport.run_uncancelled(&upload.cleanup, RUN_TIMEOUT) {
-        Ok(output) if output.code == Some(0) => {}
-        Ok(output) => log::debug!(
-            "{command} {}: removing the temp file exited {:?}",
-            target.name,
-            output.code
-        ),
-        Err(err) => log::debug!(
-            "{command} {}: cannot remove the temp file: {err}",
-            target.name
-        ),
-    }
-    sent
-}
-
-/// How [`send_file`] ended.
-enum Sent {
-    /// The install ran on a terminal; its result.
-    Installed(Result<Output, TransportError>),
-    /// The stage failed, so nothing was installed: a fixed message instead
-    /// of what the shell printed, which names the temp file, or the
-    /// transport's error.
-    Unstaged(Result<Output, TransportError>),
-    /// Cancelled after the stage, before the install.
-    Cancelled,
-}
-
-/// The failure of a step: for a step run on a terminal with the password
-/// from secret `secret`, sudo's refusals name the secret, never its value,
-/// after `prefix`, the step's kind.
-fn step_error(err: &TransportError, secret: Option<&str>, prefix: &str) -> String {
-    match (err, secret) {
-        (TransportError::PasswordRejected, Some(name)) => {
-            format!("{prefix}: sudo rejected the password from secret {name}")
-        }
-        (TransportError::NoPrompt, Some(name)) => {
-            format!("{prefix}: sudo did not show anvil's prompt (secret {name})")
-        }
-        (err, _) => err.to_string(),
     }
 }
 
@@ -1687,80 +731,6 @@ pub fn probe(transport: &dyn Transport, expanded: &Expanded) -> Result<Facts, Un
     Facts::parse(&output.stdout).map_err(|err| reason(err.to_string()).into())
 }
 
-/// Why [`resolve`] lists no steps: the target's failure, or `cancel` was
-/// set before a plugin ran.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Unresolved {
-    Failed(String),
-    Cancelled,
-}
-
-impl From<String> for Unresolved {
-    fn from(error: String) -> Unresolved {
-        Unresolved::Failed(error)
-    }
-}
-
-impl From<TransportError> for Unresolved {
-    fn from(err: TransportError) -> Unresolved {
-        match err {
-            TransportError::Cancelled => Unresolved::Cancelled,
-            err => Unresolved::Failed(err.to_string()),
-        }
-    }
-}
-
-/// The steps apply runs on `target`, one per item of `expanded` in order: a
-/// package item as the step that installs and upgrades with the target's
-/// package manager (none when its script is empty), a file item copying its
-/// src from `sources`, a service item bringing it to its state, a step item as
-/// its command or the script its plugin returns. An item the target does not
-/// match is a skip and resolves nothing. Runs nothing on the target, but each
-/// plugin on the controller, in order, `cancel` checked before each. `facts`,
-/// from [`probe`], is required when [`needs_facts`] says so; being one probe,
-/// no step can change what a later item sees. A failure is
-/// `packages: <reason>`, `files…`, `services: <reason>` or
-/// `plugin <name>: <reason>`; the first one ends the list.
-pub fn resolve(
-    target: &Target,
-    facts: Option<&Facts>,
-    config: &Config,
-    expanded: &Expanded,
-    sources: &Sources,
-    plugins: &dyn Plugins,
-    cancel: &Cancel,
-) -> Result<Vec<PlannedRun>, Unresolved> {
-    let mut runs = Vec::with_capacity(expanded.items.len());
-    let mut services = services::Builder::new(config, target, facts);
-    let mut number = 0;
-    for item in &expanded.items {
-        let run = match &item.kind {
-            ItemKind::Packages(packages) => package_run(target, facts, item, packages)?,
-            ItemKind::File { entry, ordinal } => Some(files::run(
-                config,
-                item,
-                (entry, *ordinal),
-                sources,
-                target,
-                facts,
-            )?),
-            ItemKind::Service(entry) => Some(services.run(item, entry)?),
-            ItemKind::Step(step) => {
-                number += 1;
-                Some(step_run(
-                    target, facts, item, step, number, plugins, cancel,
-                )?)
-            }
-        };
-        runs.extend(run.map(|run| PlannedRun {
-            task: item.path.clone(),
-            name: item.name.clone(),
-            ..run
-        }));
-    }
-    Ok(runs)
-}
-
 /// Whether `target` matches `item`, whose selector needs `facts` only when it
 /// has facts.
 fn selected(item: &Item, target: &Target, facts: Option<&Facts>) -> Result<bool, String> {
@@ -1785,7 +755,7 @@ fn skip_run(label: String) -> PlannedRun {
 }
 
 /// The step of package `item`; `None` when its script has nothing to do.
-fn package_run(
+pub(crate) fn package_run(
     target: &Target,
     facts: Option<&Facts>,
     item: &Item,
@@ -1824,7 +794,7 @@ fn package_run(
 }
 
 /// The step of `item`, the `number`th step, its plugin run on the controller.
-fn step_run(
+pub(crate) fn step_run(
     target: &Target,
     facts: Option<&Facts>,
     item: &Item,
@@ -2110,13 +1080,21 @@ fn render_summary(ok: usize, failed: usize, not_restored: &[NotRestored], style:
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::tasks::legacy;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
     use super::*;
     use crate::config::{FileEntry, ModeValue, ServiceEntry, Step};
+    use crate::engine::{Saves, Sent, for_each_target, send_file};
+    use crate::record::{self, FileRecord};
+    use crate::secret::Store;
+    use crate::services;
+    use crate::step::{FileRun, ServiceRun, Upload};
 
     /// [`super::apply_target`] on a legacy config's list.
     fn apply_target(
@@ -2186,13 +1164,13 @@ mod tests {
         super::run_targets(&prepared, on)
     }
 
-    /// [`super::load_passwords`] on a legacy config's list.
+    /// [`crate::engine::load_passwords`] on a legacy config's list.
     fn load_passwords(
         targets: &[Target],
         config: &Config,
         store: impl FnOnce() -> Result<Box<dyn Store>, Failure>,
     ) -> Result<Passwords, Failure> {
-        super::load_passwords(targets, config, &legacy(config), store)
+        crate::engine::load_passwords(targets, config, &legacy(config), store)
     }
 
     const ONE: NonZeroU8 = NonZeroU8::MIN;
@@ -2394,7 +1372,7 @@ mod tests {
         }
     }
 
-    fn target(name: &str) -> Target {
+    pub(crate) fn target(name: &str) -> Target {
         Target {
             name: name.to_owned(),
             kind: TargetKind::Local,
@@ -6215,57 +5193,6 @@ mod tests {
     }
 
     #[test]
-    fn saves_report_the_first_error_and_the_targets_still_unrecorded() {
-        let cancel = Cancel::new();
-        let err = || Err::<(), _>("cannot write last-apply.json: denied".to_owned());
-        assert_eq!(Saves::default().finish(&Ok(7)), None);
-        assert!(!cancel.is_set());
-
-        let mut saves = Saves::default();
-        saves.note("a", err(), &cancel);
-        assert_eq!(
-            cancel.reason(),
-            Some(AbortReason::SaveFailed),
-            "the first failure stops"
-        );
-        saves.note("b", Err("second".to_owned()), &cancel);
-        assert_eq!(
-            saves.finish(&Err::<(), _>("third".to_owned())).unwrap(),
-            "cannot write last-apply.json: denied; not recorded: a, b"
-        );
-
-        // A later save writes the whole record: a is in it after all.
-        let mut saves = Saves::default();
-        saves.note("a", err(), &cancel);
-        saves.note("b", Ok(()), &cancel);
-        saves.note("c", Err("x".to_owned()), &cancel);
-        assert_eq!(
-            saves.finish(&Err::<(), _>("y".to_owned())).unwrap(),
-            "cannot write last-apply.json: denied; not recorded: c"
-        );
-        let mut saves = Saves::default();
-        saves.note("a", err(), &cancel);
-        assert_eq!(
-            saves.finish(&Ok(())).unwrap(),
-            "cannot write last-apply.json: denied",
-            "the finish recorded a, but the run still fails"
-        );
-        assert_eq!(
-            (Saves::default().finish(&Err::<(), _>("only the finish".to_owned()))).unwrap(),
-            "only the finish"
-        );
-
-        // Without a last save, as rollback ends.
-        assert_eq!(Saves::default().error(), None);
-        let mut saves = Saves::default();
-        saves.note("a", err(), &cancel);
-        assert_eq!(
-            saves.error().unwrap(),
-            "cannot write last-apply.json: denied; not recorded: a"
-        );
-    }
-
-    #[test]
     fn the_first_to_stop_the_token_names_the_abort_reason() {
         let ended = |cancel: &Cancel| cancelled("apply", &target("a"), Vec::new(), cancel);
         let reason = |report: TargetReport| match report {
@@ -6298,28 +5225,6 @@ mod tests {
             serde_json::to_value(ended(&cancel)).unwrap(),
             serde_json::json!({"target": "a", "steps": [], "ok": false, "abort": "save_failed"}),
         );
-    }
-
-    #[test]
-    fn for_each_target_skips_with_the_reason_the_token_was_stopped_for() {
-        let cancel = Cancel::new();
-        cancel.stop(AbortReason::SaveFailed);
-        let targets = [target("a"), target("b")];
-        let report = for_each_target("run", &targets, NonZeroU8::MIN, &cancel, &mut |_| {}, |t| {
-            panic!("{} ran", t.name)
-        });
-        for target in &report.targets {
-            assert!(
-                matches!(
-                    target,
-                    TargetReport::Cancelled {
-                        abort: AbortReason::SaveFailed,
-                        ..
-                    }
-                ),
-                "{target:?}"
-            );
-        }
     }
 
     #[test]
@@ -6967,12 +5872,17 @@ mod tests {
             let (config, expanded) =
                 tasks_of(&format!("[[tasks]]\ntasks = [{{ tasks = [{task}] }}]\n"));
             let built = std::cell::Cell::new(false);
-            let _ = super::load_passwords(std::slice::from_ref(&web), &config, &expanded, || {
-                built.set(true);
-                Ok(Box::new(Unopenable::new(|| {
-                    crate::secret::SecretError::Locked
-                })))
-            });
+            let _ = crate::engine::load_passwords(
+                std::slice::from_ref(&web),
+                &config,
+                &expanded,
+                || {
+                    built.set(true);
+                    Ok(Box::new(Unopenable::new(|| {
+                        crate::secret::SecretError::Locked
+                    })))
+                },
+            );
             built.get()
         };
         let file = r#"file = { src = "a", dest = "/a", mode = "0644""#;

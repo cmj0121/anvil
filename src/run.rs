@@ -13,10 +13,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::apply::{self, PlannedRun, Report, RunKind, TargetReport};
+use crate::apply::{self, Report, TargetReport};
 use crate::cancel::Cancel;
 use crate::cli::Cli;
 use crate::document::{MAX_BYTES, read_capped_from};
+use crate::engine;
 use crate::error::Failure;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
@@ -24,6 +25,7 @@ use crate::logger::escape_controls;
 use crate::options::Options;
 use crate::packages::MAX_TIMEOUT;
 use crate::prepared::Prepared;
+use crate::step::{PlannedRun, RunKind};
 use crate::transport::{Transport, TransportError};
 use crate::trust::{self, TrustError};
 
@@ -49,7 +51,7 @@ pub fn run_targets(
         name: None,
     }];
     let cancel = &prepared.cancel;
-    apply::for_each_target(
+    engine::for_each_target(
         "run",
         &prepared.targets,
         prepared.opts.parallel,
@@ -75,12 +77,12 @@ fn run_target(
     match transport {
         Ok(transport) => {
             log::info!("run {}: over {}", target.name, transport.name());
-            apply::execute(
+            engine::execute(
                 "run",
                 target,
                 transport.as_ref(),
                 runs,
-                &apply::Passwords::new(),
+                &engine::Passwords::new(),
                 cancel,
                 None,
             )

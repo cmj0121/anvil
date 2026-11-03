@@ -22,7 +22,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::apply::{FileRun, PlannedRun, RunKind, Upload};
 use crate::bytes::hex;
 use crate::config::{Config, FileEntry, ModeValue, is_mode, is_sha256};
 use crate::document;
@@ -40,6 +39,7 @@ use crate::remote::{
 };
 pub(crate) use crate::remote::{REFUSED, quote};
 use crate::secret;
+use crate::step::{FileRun, PlannedRun, RunKind, Upload};
 use crate::tasks::{Expanded, Item};
 use crate::transport::RUN_TIMEOUT;
 use crate::trust::{self, TrustError};
@@ -311,7 +311,7 @@ impl FileWrite {
     /// The record of this write, from what the capture saw before it and
     /// how it ended: `previous` keeps the bytes as text unless the entry
     /// says `rollback = false`, the dest is `hash_only`
-    /// ([`Recorder`](crate::apply::Recorder)), or they are not text.
+    /// ([`Recorder`](crate::engine::Recorder)), or they are not text.
     pub(crate) fn record(
         &self,
         expanded: &Expanded,

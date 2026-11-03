@@ -10,6 +10,7 @@ mod config;
 mod doctor;
 mod document;
 mod editor;
+mod engine;
 mod error;
 #[cfg(test)]
 mod examples;
@@ -38,6 +39,7 @@ mod secret;
 mod services;
 mod ssh;
 mod status;
+mod step;
 mod tasks;
 mod term;
 #[cfg(test)]

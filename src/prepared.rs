@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use crate::apply::{self, Passwords};
 use crate::cancel::Cancel;
 use crate::config::{Config, Plugin};
+use crate::engine::{self, Passwords};
 use crate::error::Failure;
 use crate::files::{self, Sources};
 use crate::inventory::Target;
@@ -43,7 +43,7 @@ impl Prepared {
         cancel: Arc<Cancel>,
     ) -> Result<Prepared, Failure> {
         let mut prepared = Prepared::plan(opts, config, expanded, cancel)?;
-        prepared.passwords = apply::load_passwords(
+        prepared.passwords = engine::load_passwords(
             &prepared.targets,
             &prepared.config,
             &prepared.expanded,
@@ -106,7 +106,7 @@ impl Prepared {
             })
             .filter_map(|target| files::sudo_secret_for(&config, target))
             .collect();
-        let passwords = apply::read_passwords(names, || opts.secret_store(&config))?;
+        let passwords = engine::read_passwords(names, || opts.secret_store(&config))?;
         Ok(Prepared {
             opts: opts.clone(),
             config,
