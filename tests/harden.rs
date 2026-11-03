@@ -12,7 +12,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Output;
 
-use common::{Sandbox, json, keys, text};
+use common::{Sandbox, json, keys, mode, text};
 
 const D11: &str = "config carries every harden rule; anvil plan / apply bring the hosts to it";
 
@@ -285,10 +285,6 @@ const COMMENTED: &str = "# my anvil config\n\
                          dest = \"/etc/ssh/sshd_config\"\n\
                          mode = \"0600\" # root only\n";
 
-fn mode(path: &std::path::Path) -> u32 {
-    fs::metadata(path).unwrap().permissions().mode() & 0o777
-}
-
 #[test]
 fn write_saves_the_preview_and_keeps_every_comment() {
     let sb = sandbox(COMMENTED);
@@ -345,7 +341,7 @@ fn write_saves_the_preview_and_keeps_every_comment() {
         fs::read_to_string(store.join("sshd.conf")).unwrap(),
         "# managed by anvil config --harden\nPermitRootLogin no\n"
     );
-    assert_eq!(mode(&store.join("sshd.conf")), 0o600);
+    assert_eq!(mode(store.join("sshd.conf")), 0o600);
     assert!(store.join("sysctl.conf").is_file());
 
     let again = harden(&sb, &[]);

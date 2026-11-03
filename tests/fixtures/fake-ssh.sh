@@ -16,12 +16,14 @@
 #   FAKE_SSH_RETRY_STDERR   stderr text of the interactive master attempt
 #   FAKE_SSH_RETRY_SLEEP    seconds the interactive master attempt sleeps first
 #   FAKE_SSH_RETRY_LOG      append `enter` and `leave` around the interactive attempt
-#   FAKE_SSH_CLIENT_EXIT    exit code of the client; unset runs the script with sh -s
+#   FAKE_SSH_CLIENT_EXIT    exit code of the client; unset runs the remote command
 #   FAKE_SSH_CLIENT_STDERR  stderr text of the client when FAKE_SSH_CLIENT_EXIT is set
 # A master attempt that exits 0 writes the marker `<control dir>/<host>.master`;
 # `-O check` exits 0 while it exists, as with a live master.
-# A client with -tt runs its last argument (the remote command) under script(1),
-# so it gets a terminal as on a real host.
+# A client runs its last argument (the remote command) with /bin/sh -c, in a
+# process group of its own as sshd gives each session, so the wrapper's `kill 0`
+# never reaches the test runner; with -tt under script(1), so it gets a terminal
+# as on a real host.
 for arg in "$@"; do
   case "$arg" in
     ControlPath=*)
@@ -101,8 +103,8 @@ case "$kind" in
       [ -n "${FAKE_SSH_CLIENT_STDERR-}" ] && printf '%s\n' "$FAKE_SSH_CLIENT_STDERR" >&2
       exit "$FAKE_SSH_CLIENT_EXIT"
     fi
+    for remote in "$@"; do :; done
     if [ "$tty" = yes ]; then
-      for remote in "$@"; do :; done
       export SHELL=/bin/sh
       script=/usr/bin/script
       [ -e "$script" ] || script=/bin/script
@@ -111,6 +113,7 @@ case "$kind" in
         *) exec "$script" -q /dev/null /bin/sh -c "$remote" ;;
       esac
     fi
-    exec sh -s
+    exec perl -e 'setpgrp(0, 0) or die "setpgrp: $!\n"; exec @ARGV or die "exec: $!\n"' \
+      /bin/sh -c "$remote"
     ;;
 esac

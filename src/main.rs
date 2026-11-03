@@ -2,6 +2,8 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 mod apply;
+mod bytes;
+mod cancel;
 mod cli;
 mod commands;
 mod config;
@@ -25,6 +27,7 @@ mod packages;
 mod paths;
 mod plan;
 mod plugin;
+mod prepared;
 mod private;
 mod record;
 mod remote;

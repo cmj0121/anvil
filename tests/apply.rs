@@ -18,7 +18,7 @@ use rustix::process::Signal;
 
 use common::{
     AUTH_DENIED, AUTH_DENIED_MESSAGE, CONNECT_REFUSED, CONNECT_REFUSED_MESSAGE, Sandbox, json,
-    keys, text, until,
+    keys, sha256_hex, text, until,
 };
 
 fn local_hostname() -> String {
@@ -544,6 +544,9 @@ fn heartbeat(dir: &Path) -> String {
 #[derive(Clone, Copy, Debug)]
 enum Kind {
     Plain,
+    /// [`Kind::Plain`] after a `[[files]]` step on facts no host has, so
+    /// apply probes and keeps a record.
+    Recorded,
     Tty,
     /// [`Kind::Tty`] over a dest holding [`PREVIOUS`], 0644.
     TtyOver,
@@ -576,7 +579,7 @@ fn beating(kind: Kind) -> Running {
 /// then hears nothing.
 fn beating_into(kind: Kind, stderr: Option<Stdio>) -> Running {
     let (sandbox, secrets, mut command) = match kind {
-        Kind::Plain | Kind::Run | Kind::Paused => {
+        Kind::Plain | Kind::Recorded | Kind::Run | Kind::Paused => {
             let sandbox = Sandbox::new("ai");
             sandbox.with_fake_host();
             let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
@@ -607,6 +610,18 @@ fn beating_into(kind: Kind, stderr: Option<Stdio>) -> Running {
             sandbox.write_config(
                 "config.toml",
                 &format!("[[steps]]\nrun = '{first}'\n{touch}"),
+            );
+            command.args(["--json", "apply"]);
+        }
+        Kind::Recorded => {
+            std::fs::write(sandbox.config_dir().join("motd.txt"), "motd\n").unwrap();
+            sandbox.write_config(
+                "config.toml",
+                &format!(
+                    "[[files]]\nsrc = \"motd.txt\"\ndest = \"{}\"\nmode = \"0644\"\nfacts = {{ distro = \"none\" }}\n\n\
+                     [[steps]]\nrun = '{first}'\n{touch}",
+                    sandbox.root().join("motd").display()
+                ),
             );
             command.args(["--json", "apply"]);
         }
@@ -765,9 +780,12 @@ fn one_ctrl_c_lets_the_running_step_end_and_cancels_the_rest() {
 }
 
 #[test]
-fn sigterm_and_sighup_cancel_like_a_first_ctrl_c_and_do_not_mention_it() {
-    for (signal, word) in [(Signal::TERM, "terminated"), (Signal::HUP, "hung up")] {
-        let mut running = beating(Kind::Plain);
+fn sigterm_and_sighup_end_the_run_and_exit_by_the_signal() {
+    for (signal, word, code, abort) in [
+        (Signal::TERM, "terminated", 143, "terminated"),
+        (Signal::HUP, "hung up", 129, "hung_up"),
+    ] {
+        let mut running = beating(Kind::Recorded);
         running.signal(signal);
         let line = running.notice_of(word);
         assert!(!line.contains("Ctrl-C"), "{line}");
@@ -775,17 +793,56 @@ fn sigterm_and_sighup_cancel_like_a_first_ctrl_c_and_do_not_mention_it() {
         let mut stdout = String::new();
         std::io::Read::read_to_string(running.child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
         let status = running.child.wait().unwrap();
-        assert_eq!(status.code(), Some(1), "{word}");
+        assert_eq!(status.code(), Some(code), "{word}");
         let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
         let targets = value["targets"].as_array().unwrap();
         assert_eq!(targets[0]["ok"], false, "{word}");
+        assert_eq!(targets[0]["abort"], abort, "{word}");
+        // The skipped file, then the running step.
+        assert_eq!(targets[0]["steps"].as_array().unwrap().len(), 2, "{word}");
         assert_eq!(
             targets[1],
-            serde_json::json!({"target": "fake", "steps": [], "ok": false}),
-            "{word}: fake never started, and the reason reads as cancelled"
+            serde_json::json!({"target": "fake", "steps": [], "ok": false, "abort": abort}),
+            "{word}: fake never started"
         );
         assert!(!running.second.exists(), "{word}: no later step ran");
+        let record = running.sandbox.last_apply().expect("the record is saved");
+        let entry = &record["targets"]["local"];
+        assert_eq!(entry["ok"], false, "{word}");
+        assert_eq!(
+            entry["cannot_undo"],
+            serde_json::json!(["step 1"]),
+            "{word}"
+        );
     }
+}
+
+#[test]
+fn a_ctrl_c_exits_1_with_no_abort_in_the_json() {
+    let mut running = beating(Kind::Plain);
+    running.interrupt();
+    running.notice();
+    std::fs::write(running.beat.with_file_name("go"), "").unwrap();
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(running.child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+    assert_eq!(running.child.wait().unwrap().code(), Some(1));
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    for target in value["targets"].as_array().unwrap() {
+        assert!(target.get("abort").is_none(), "{target}");
+    }
+}
+
+#[test]
+fn a_sigterm_ends_an_anvil_run_with_143() {
+    let mut running = beating(Kind::Run);
+    running.signal(Signal::TERM);
+    running.notice_of("terminated");
+    std::fs::write(running.beat.with_file_name("go"), "").unwrap();
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(running.child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+    assert_eq!(running.child.wait().unwrap().code(), Some(143));
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["targets"][1]["abort"], "terminated", "{value}");
 }
 
 #[test]
@@ -948,7 +1005,7 @@ fn a_kill_function_in_the_environment_does_not_fool_the_probe_for_the_ignore() {
         "SIGHUP was caught: {:?}",
         out.status
     );
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(out.status.code(), Some(129), "{}", text(&out.stderr));
     assert!(
         text(&out.stderr).contains("hung up"),
         "{}",
@@ -1066,14 +1123,6 @@ fn a_second_ctrl_c_kills_the_running_step_and_anvil_dies_by_sigint() {
 /// What `local.conf` holds before the first apply; it must show only in
 /// the record.
 const PREVIOUS: &str = "previous = text-kept-only-in-the-record\n";
-
-fn sha256_hex(text: &str) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
 
 #[test]
 fn apply_records_what_each_target_held_before_it_wrote() {
@@ -1547,12 +1596,7 @@ fn unknown_packages_warn_and_continue_with_exit_zero() {
 /// `pty_capture.py`: the raw bytes it wrote; `None` without a python3 that
 /// has `os.login_tty`.
 fn apply_on_a_terminal(sandbox: &Sandbox, args: &[&str]) -> Option<String> {
-    let python = Command::new("python3")
-        .args(["-c", "import os; os.login_tty"])
-        .output()
-        .is_ok_and(|out| out.status.success());
-    if !python {
-        eprintln!("skip: no python3 with os.login_tty");
+    if !common::python(&["os.login_tty"]) {
         return None;
     }
     let out = sandbox
@@ -1872,4 +1916,52 @@ fn a_user_write_refuses_a_symlinked_dest_dangling_or_not_and_an_open_directory()
         text(&out.stderr)
     );
     assert!(!open.join("conf").exists());
+}
+
+#[test]
+fn a_fake_host_step_reading_stdin_gets_eof_at_once_through_the_wrapper() {
+    let sandbox = Sandbox::new("aw");
+    sandbox.write_config("inventory.toml", "[hosts.fake]\nhost = \"fakehost\"\n");
+    sandbox.write_config("config.toml", "[[steps]]\nrun = \"cat; echo done\"\n");
+    let ssh_log = sandbox.root().join("ssh.log");
+    let started = Instant::now();
+    let out = sandbox.anvil(
+        &["--json", "apply", "--target", "fake"],
+        &[("FAKE_SSH_LOG", ssh_log.to_str().unwrap())],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(json(&out)["targets"][0]["steps"][0]["stdout"], "done\n");
+    let calls = std::fs::read_to_string(&ssh_log).unwrap();
+    let client = calls
+        .lines()
+        .find(|call| call.contains(" anvil-run "))
+        .unwrap_or_else(|| panic!("no wrapped client: {calls}"));
+    assert!(client.contains("-- fakehost sh -c '"), "{client}");
+    assert!(
+        !calls.contains("cat; echo done"),
+        "the script is not in argv"
+    );
+}
+
+#[test]
+fn a_file_of_1_mib_with_trailing_newlines_lands_byte_for_byte_through_the_wrapper() {
+    let sandbox = Sandbox::new("aw");
+    sandbox.write_config("inventory.toml", "[hosts.fake]\nhost = \"fakehost\"\n");
+    std::fs::create_dir(sandbox.root().join("out")).unwrap();
+    let mut body = "line of text\n".repeat(80_000);
+    body.truncate(1024 * 1024 - 3);
+    body.push_str("\n\n\n");
+    std::fs::write(sandbox.config_dir().join("big.txt"), &body).unwrap();
+    let dest = sandbox.root().join("out/big.txt");
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"big.txt\"\ndest = \"{}\"\nmode = \"0644\"\nsudo = false\n",
+            dest.display()
+        ),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read(&dest).unwrap(), body.as_bytes());
 }

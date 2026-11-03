@@ -80,6 +80,7 @@ anvil run --parallel 4 fix.sh
   （`-vv` 時如 `apply linode1: start`），因此區塊被壓住時仍看得出什麼正在執行。
 - **Ctrl-C** 與單一 target 時相同：第一次按下讓執行中的 step 跑完且不再啟動其他 target，第二次立刻停止一切（[Ctrl-C](#ctrl-c)）。
 - **結束碼**不變：任一 target 失敗或被取消時為 1；失敗的 target 絕不會中止其他 target。
+  被 SIGTERM 或 SIGHUP 結束的執行以 143 或 129 結束（[結束碼](#結束碼)）。
 
 限制：
 
@@ -92,11 +93,11 @@ anvil run --parallel 4 fix.sh
   請以 `--target` 只選其中一個，或使用 `--parallel 1`。
 - **plugin 會平行執行。** apply 與 plan 在控制端為每個 target 執行一次 plugin，現在最多同時 N 個，
   因此 plugin 必須能安全地同時執行多份（[Plugin steps](#plugin-steps)）。
-- **第二次 Ctrl-C 只停止本機上執行的東西。** 它會終止 anvil 的本機行程，包括 ssh 用戶端。
-  沒有終端機而啟動的遠端指令，在其 ssh 用戶端死亡後仍會在 host 上繼續執行。
+- **第二次 Ctrl-C 之後，遠端稍後也會被終止。** 它會終止 anvil 的本機行程，包括 ssh 用戶端。
+  target 隨後在約 2 秒加一次往返內終止這次執行在其上啟動的行程；網路中斷時則在執行的逾時加 10 秒時終止
+  （[SSH 行為](#ssh-行為)）。step 經 `sudo` 啟動的 root 行程，只在 `sudo -n kill` 可用（NOPASSWD）時才會終止。
   以這種方式停止的 `[[files]]` step 可能在 target 上留下其 `/tmp/anvil-` 暫存檔（[File steps](#file-steps)）。
-  這樣的寫入在 anvil 死亡後仍可能完成它的 `mv`，甚至在 rollback 回報成功之後，把新位元組放回去：
-  請等遠端 step 結束再 rollback，或再執行一次 rollback。
+  在遠端結束之前，寫入仍可能完成它的 `mv`：請等那幾秒再 rollback，或再執行一次 rollback。
 
 ## 指令
 
@@ -109,7 +110,8 @@ anvil run --parallel 4 fix.sh
 
 儲存時，緩衝區會以編輯格式解析並驗證；
 無效的緩衝區會印出錯誤（檔案、host 與欄位），並帶著你的文字重新開啟，最多嘗試三次，之後不寫入任何東西並以 2 結束。
-有效的緩衝區會以 TOML 原子性地寫入（`inventory.toml.tmp`，mode 0600，再 rename 覆蓋 `inventory.toml`）；
+有效的緩衝區會以 TOML 原子性地寫入（在旁邊建立全新的 `.anvil-<pid>-<nanos>-<n>`，mode 0600，再 rename 覆蓋 `inventory.toml`；
+其他寫入者的暫存檔不會被動到）；
 接著移除工作區中舊版的 `inventory.yaml` 或 `inventory.yml`。
 當 inventory 已是 `inventory.toml` 或尚不存在時，未變更的緩衝區不論編輯格式為何都不會寫入任何東西。
 舊版 YAML inventory 即使如此仍會被遷移：寫成 `inventory.toml` 並移除 YAML 檔案。
@@ -571,6 +573,8 @@ tag 讓所有雜湊都不出現在請求與 doctor 的輸出中：任何雜湊�
 
 **取消與時間。** 第一次 Ctrl-C（或 TUI 中的 Esc）讓正在執行的探測、雜湊執行或 plugin 跑完，
 之後該 target 其餘的 plugin 與之後的每個 target 都以 `cancelled` 結束：`doctor: cancelled`，結束碼 1。
+第一個 SIGTERM 或 SIGHUP 也一樣，但（不相容變更）`error` 為 `terminated` 或 `hung up`，訊息為 `doctor: terminated` 或
+`doctor: hung up`，結束碼為 143 或 129（[Ctrl-C](#ctrl-c)）。
 第二次 Ctrl-C 會殺掉它們，anvil 因 SIGINT 結束。doctor 一次處理一個 target：最壞情況下，每個 target 在 ssh 上
 需要最多 40 秒連線並開啟 master（10 秒的 `ssh -O check`，接著 30 秒的金鑰嘗試，其連線受 `ConnectTimeout=10` 限制），
 接著探測 30 秒、雜湊執行 30 秒，以及每個 doctor plugin 各 30 秒。
@@ -594,7 +598,8 @@ tag 讓所有雜湊都不出現在請求與 doctor 的輸出中：任何雜湊�
 
 ### `anvil apply`
 
-在每個選定的 target 上依序執行 config 的 `[[steps]]`：每個 step（步驟）的 `run` 會送到 target 上的 `sh -s`（`local` 則為 `/bin/sh -s`）。
+在每個選定的 target 上依序執行 config 的 `[[steps]]`：每個 step（步驟）的 `run` 經 stdin 送到 target 上的一個
+小型 sh 包裝（[SSH 行為](#ssh-行為)；`local` 則為 `/bin/sh -s`）。
 以非零結束的 step 會結束該 target；其他 target 仍會執行。
 每個 target 上的每個 step 都以 0 結束時以 0 結束，否則為 1。
 apply 直接執行：不印出計畫，也不詢問確認；想先看它會執行什麼，請先執行 [`anvil plan`](#anvil-plan)。
@@ -734,7 +739,8 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 
 紀錄無法儲存時，文件多一個最上層的 `save_error` 字串（否則省略），且即使每個 target 的 `ok` 都是 true，最上層的 `ok`
 也是 false；`targets` 仍列出執行過的內容（[儲存錯誤](#apply-紀錄)）。因此而沒有完成的 target 帶有
-`"abort": "save_failed"`。被 Ctrl-C 取消的 target 沒有 `abort`。
+`"abort": "save_failed"`。被第一個 SIGTERM 結束的 target 帶有 `"abort": "terminated"`，被第一個 SIGHUP 結束的帶有
+`"abort": "hung_up"`。被 Ctrl-C 取消的 target 沒有 `abort`。只有第一個原因算數：儲存失敗後的 SIGTERM 仍是 `save_failed`。
 
 #### 執行中的 task
 
@@ -837,11 +843,16 @@ what it names, then run rollback again
   再按一次即立刻停止。
 - **第二次按下會立刻停止一切。** anvil 終止所有仍在執行的 step，記錄 `ERROR anvil::interrupt: interrupted`，
   並因 SIGINT 結束（shell 顯示 130），不印摘要也不印 JSON。
-  沒有終端機的遠端指令會在 host 上繼續執行，也可能留下 `[[files]]` 暫存檔（[平行執行](#平行執行)）。
+  遠端指令稍後會在 host 上終止（[SSH 行為](#ssh-行為)），也可能留下 `[[files]]` 暫存檔（[平行執行](#平行執行)）。
 - **快速連按兩次可能只算一次。** 兩次按得非常接近時，可能只以一個訊號送達 anvil，此時算作第一次；請再按一次。
-- **SIGTERM 與 SIGHUP 視同按下 Ctrl-C。** 第一個訊號印出
+- **SIGTERM 與 SIGHUP 視同按下 Ctrl-C，並決定結束碼。** **不相容變更：** 被第一個 SIGTERM 結束的執行以 143 結束，
+  被第一個 SIGHUP 結束的以 129 結束，以前兩者都是 1（Ctrl-C 仍為 1）。第一個訊號印出
   `terminated: running targets stop after their current step; the same signal again stops now`
-  （SIGHUP 為 `hung up: …`）並取消執行：target 顯示 `⊘ cancelled`，以 1 結束。三者中任何第二個訊號都會終止所有 step，
+  （SIGHUP 為 `hung up: …`）並如 Ctrl-C 般取消執行，但 target 顯示 `✘ terminated` 或 `✘ hung up`
+  （plan 為 `⊘ terminated`、`⊘ hung up`），`--json` 中帶有 `"abort": "terminated"` 或 `"hung_up"`。
+  由第一個訊號決定：在紀錄儲存失敗之後才來的訊號保留原因，以 1 結束。所有 target 都結束後才到的訊號不會取消任何東西，
+  指令照原本的結果以 0 或 1 結束。同屬不相容變更：第一個 SIGTERM 或 SIGHUP 之後，doctor 略過的 target 或 plugin 的
+  `error` 為 `terminated` 或 `hung up`，以前為 `cancelled`。三者中任何第二個訊號都會終止所有 step，
   anvil 因該訊號結束，並記錄 `terminated`、`hung up` 或 `interrupted`。TUI 只處理 SIGINT（[Signals](tui.zh-TW.md)）。
 - **第一個 SIGTERM 可能超過服務管理員的期限。** 它只讓目前的 step 跑完：`[[steps]]` 或 `[[files]]` step 最多 30 秒、
   service step 120 秒、套件 step 為 `[packages].timeout`，預設 300 秒。管理員隨後的 SIGKILL 讓 anvil 沒有機會終止這些 step，
@@ -1052,7 +1063,11 @@ step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`，以及 tas
 }
 ```
 
-每個選定的 target 都解析成功時以 0 結束，任一個無法連線或解析時為 1，用法或設定錯誤為 2。
+被取消而略過的 target 為 `{"target": "pi", "ok": false}`，由第一個 SIGTERM 或 SIGHUP 造成時另帶
+`"abort": "terminated"` 或 `"hung_up"`（[Ctrl-C](#ctrl-c)）。
+
+每個選定的 target 都解析成功時以 0 結束，任一個無法連線或解析時為 1，用法或設定錯誤為 2；
+第一個 SIGTERM 或 SIGHUP 結束 plan 時為 143 或 129。
 
 ### Plugin steps
 
@@ -1117,7 +1132,7 @@ ERROR anvil: plugins.harden.path `~/.config/anvil/plugins/harden`: mode 775 lets
 { "script": "sshd -t && systemctl reload sshd" }
 ```
 
-腳本會像一個 step 一樣在 target 上執行：整份送到 `sh -s` 的 stdin，並像 `anvil run` 送出腳本時一樣包在 `{ :` … `}` 中，
+腳本會像一個 step 一樣在 target 上執行：像 step 一樣整份經 stdin 送出，並像 `anvil run` 送出腳本時一樣包在 `{ :` … `}` 中，
 時間上限是 step 的 30 秒。不會為它輸入 sudo 密碼；請在腳本中呼叫 `sudo -n`。
 apply 將它顯示為 `$ SCRIPT`（第一行，還有更多行時加上 `…`），`--json` 中該 step 的 `run` 是不含包裝的腳本。
 plan 顯示 `would $ SCRIPT (from plugin NAME)`，其 `--json` 的 step 帶有 `"plugin"`：
@@ -1524,7 +1539,8 @@ printf 'df -h /\nuptime\n' | anvil run --target pi -
 
 target 的選法與 apply 相同（`--target`；未指定表示 `local` 加上所有 host），並像 apply 一樣執行，
 同時最多 `--parallel N` 個（[平行執行](#平行執行)）；失敗的 target 不會中止其他 target。
-腳本是每個 target 唯一的 step，經其 stdin 送到 `sh -s`（`local` 則為 `/bin/sh -s`），絕不放在 argv 上。
+腳本是每個 target 唯一的 step，經其 stdin 送到 target 的 sh 包裝（[SSH 行為](#ssh-行為)；`local` 則為 `/bin/sh -s`），
+絕不放在 argv 上。
 它一律是 POSIX sh：shebang 行只是註解。run 不詢問確認。
 
 - **其他人能變更的 `FILE` 會被拒絕。** 與 config 一樣，在任何 target 開始前以 2 結束，FIFO 或其他非一般檔案亦然
@@ -1746,11 +1762,17 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
 
 ## 結束碼
 
+> **不相容變更：** 被第一個 SIGTERM 或 SIGHUP 結束的 `apply`、`plan`、`run`、`rollback` 與 `doctor`
+> 以 143 或 129 結束，而非 1（[Ctrl-C](#ctrl-c)）。第一個 SIGTERM 或 SIGHUP 之後，doctor 略過的 target 或 plugin
+> 的 `error` 為 `terminated` 或 `hung up`，以前為 `cancelled`。
+
 | 結束碼 | 意義                                           |
 | ------ | ---------------------------------------------- |
 | 0      | 一切正常                                       |
 | 1      | 某個 target 或檢查失敗；無 target 的指令見下方 |
 | 2      | 用法或設定錯誤；完整清單見下方                 |
+| 129    | 第一個 SIGHUP 結束了執行                       |
+| 143    | 第一個 SIGTERM 結束了執行                      |
 
 - **0**：對 `doctor` 而言，`missing` 的 secret 或無法解析的編輯器只是警告。
 - **1**：`doctor`/`apply`：某個 target 或檢查失敗（包括 `locked` 或 `error` 的 secret，以及有 `[packages]` 時無法解析的套件管理器）。
@@ -1760,8 +1782,8 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
   `apply`/`plan`：某個 plugin step 的 plugin 在某個 target 上失敗（[Plugin steps](#plugin-steps)）。
   `run`：某個 target 失敗或無法連線。
   `rollback`：見 [anvil rollback](#anvil-rollback)；`apply` 還有紀錄無法讀取、被鎖住或無法儲存，或找不到狀態目錄時（[apply 紀錄](#apply-紀錄)）。
-  `apply`/`plan`/`run`/`rollback`/`doctor`：第一次 Ctrl-C、SIGTERM 或 SIGHUP 取消了執行（[Ctrl-C](#ctrl-c)）；
-  第二次則讓 anvil 因該訊號結束，SIGINT 時 shell 回報為 130。
+  `apply`/`plan`/`run`/`rollback`/`doctor`：第一次 Ctrl-C 取消了執行（[Ctrl-C](#ctrl-c)）；
+  任何訊號的第二次則讓 anvil 因該訊號結束，SIGINT 時 shell 回報為 130。
   `inventory`/`config`/`secret`：編輯器以非零結束（中止）、檔案寫入失敗，或 secret store 失敗、被鎖住或其密語提示被取消。
 - **2**：錯誤的旗標或引數（包括不以 `.toml` 結尾的 `--inventory` 或 `--config` 路徑）、未知的 `--target`、
   無效、無法讀取或模稜兩可的檔案、沒有 `$HOME`（`apply` 與 `rollback` 的狀態目錄除外，為 1：[apply 紀錄](#apply-紀錄)）、找不到編輯器、三次嘗試後仍無效的緩衝區，或大於 1 MiB 的 secret。
@@ -1783,6 +1805,8 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
   stdin 或 stdout 不是終端機、使用 `--json`，或未知的 `--target`（只在 inventory 載入成功時檢查）時為 2；
   無法載入的 inventory（任何載入錯誤，包括不以 `.toml` 結尾的 `--inventory` 路徑）改為顯示在標頭、狀態列與 `t` overlay 中。
   終端機無法設定（`cannot handle SIGINT: …`、`cannot enter the terminal: …`）或 TUI 執行中失敗（`terminal: …`）時為 1。
+- **129**、**143**：`apply`/`plan`/`run`/`rollback`/`doctor`：第一個 SIGHUP 或 SIGTERM 結束了執行，
+  取消了至少一個 target 或 doctor plugin（[Ctrl-C](#ctrl-c)）。所有 target 都結束後才到的訊號不改變任何事。
 
 ## SSH 行為
 
@@ -1806,10 +1830,28 @@ anvil 以 argv 陣列執行系統的 `ssh`，絕不使用 shell 字串，因此 
 - **絕不自動接受 host key。**
   未知或已變更的 host key 會讓 target 以 ``host key unknown or changed; run `ssh <host>` once to verify the fingerprint`` 失敗。
 - **帶 sudo 密碼的套件 step** 改以 `-tt` 用戶端執行；見 [輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)。
-- **腳本**以 master 的用戶端執行（`-o ControlMaster=no -o BatchMode=yes ... sh -s`），腳本經 stdin 傳入，
-  逾時 30 秒（套件 step 有自己的 `[packages].timeout`，`anvil run` 則用其 `--timeout`）；
-  用戶端絕不提示。每個串流最多保留 1 MiB。
+- **腳本**以 master 的用戶端執行（`-o ControlMaster=no -o BatchMode=yes ... -- HOST REMOTE`，REMOTE 為
+  `sh -c '<wrapper>' anvil-run BYTES MARKER DEADLINE`），逾時 30 秒（套件 step 有自己的 `[packages].timeout`，
+  `anvil run` 則用其 `--timeout`）；用戶端絕不提示。包裝是固定的 POSIX sh 文字。腳本經 stdin 傳入，後面接著隨機的
+  結束標記，絕不落在遠端檔案、argv 或環境變數中：包裝把它讀進 shell 變數，並以 `/dev/null` 為 stdin 執行，
+  因此讀取 stdin 的 step（`cat`）會立刻得到 EOF。腳本中的 heredoc 則取決於遠端的 `/bin/sh`：bash（RHEL、macOS、
+  Arch）可能把其內容（包括渲染了 secret 的內容）暫存到 `$TMPDIR` 中短暫存在的 0600 暫存檔，隨後刪除；dash 與
+  busybox 使用管線。被截斷的腳本（用戶端在傳送途中死亡）絕不執行；包裝以 125 結束。
+  每個串流最多保留 1 MiB。
   離開腳本的行程群組並持續開著其輸出的背景行程，在腳本結束後有 1 秒時間；之後 anvil 停止讀取並回報已取得的內容。
+- **逾時或中斷的執行會在 target 上被終止。** anvil 等待期間 ssh 的 stdin 保持開啟。它關閉時（執行逾時、anvil
+  被終止、用戶端死亡），包裝對該 session 的行程送出 TERM，讓腳本的 trap 得以執行，2 秒後再送 KILL：
+  約 2 秒加一次往返之內，一般執行不會留下任何行程。網路中斷時什麼都不會關閉；包裝自己的期限（逾時加 10 秒）
+  屆時會終止這次執行。step 經 `sudo` 啟動的 root 行程不受 TERM 影響，只會被 `sudo -n -- kill -s KILL -PGID`
+  終止，PGID 是腳本開始前讀取的 session 行程群組（讀不到時改用 `kill 0`）。這需要允許 `kill` 的 NOPASSWD 規則
+  （sudo 的 `secure_path` 中要有 `kill` 程式）；為腳本自己的 `sudo` 輸入過密碼也無濟於事，因為 sudo 預設的
+  `timestamp_type=tty` 依終端機保存快取的憑證，而這次 kill 沒有終端機。其他情況下會執行到結束。經 `doas`、`su`
+  或 `pkexec` 啟動的 root 行程不在涵蓋範圍內。腳本自行結束後留下的背景工作不受影響。
+  在終端機上的執行（密碼路徑的 `[[files]]` 安裝、帶密碼的套件）不經包裝：它依賴終端機關閉，
+  而在 `sudo` 下以 `use_pty`（sudo 的預設）執行的 root 指令可能在逾時後仍繼續執行。這是已知的缺口。
+- **step 腳本的變動。** 腳本在包裝的子 shell 中經 `eval` 執行，而不是 `sh -s`：`$$`、`$0`（現為 `anvil-run`）
+  與 `$PPID` 指向包裝的行程，`LINENO` 與 sh 錯誤訊息的文字也會改變。包裝經過引號處理，POSIX shell、csh 與
+  fish 都會原樣傳遞；不屬於這些的登入 shell（例如 nushell）可能拒絕這個指令，即使 `sh -s` 原本可行。
 - **控制目錄** `~/.ssh/anvil`：以 mode 0700 建立（缺少 `~/.ssh` 時也以 0700 建立）；
   在由其他使用者擁有、對群組或他人開放、`~/.ssh` 可被群組或所有人寫入、`$HOME` 含 `%`，
   或 socket 路徑放不進 macOS 104 位元組的 `sun_path`（也就是 `$HOME` 長於 34 位元組）時拒絕。

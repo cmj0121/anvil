@@ -215,25 +215,25 @@ pub trait Vault {
 }
 
 /// The store `secrets` selects.
-pub fn from_config(secrets: &Backend) -> Result<Box<dyn Store>, SecretError> {
+pub fn from_config(secrets: &Backend) -> Box<dyn Store> {
     match secrets {
-        Backend::Keychain { service } => Ok(Box::new(Keychain {
+        Backend::Keychain { service } => Box::new(Keychain {
             service: service.clone(),
-        })),
+        }),
         Backend::Age { path, identity } => {
-            Ok(Box::new(age::AgeStore::new(path.clone(), identity.clone())))
+            Box::new(age::AgeStore::new(path.clone(), identity.clone()))
         }
         Backend::Sops {
             path,
             age_key_file,
             config,
             program,
-        } => Ok(Box::new(Sops::new(
+        } => Box::new(Sops::new(
             path.clone(),
             age_key_file.clone(),
             config.clone(),
             program.clone(),
-        ))),
+        )),
     }
 }
 
@@ -357,22 +357,19 @@ mod tests {
     fn the_config_selects_the_store() {
         let store = from_config(&Backend::Keychain {
             service: "svc".into(),
-        })
-        .unwrap();
+        });
         assert_eq!(store.kind(), BackendKind::Keychain);
         let store = from_config(&Backend::Age {
             path: "/s".into(),
             identity: "/i".into(),
-        })
-        .unwrap();
+        });
         assert_eq!(store.kind(), BackendKind::Age);
         let store = from_config(&Backend::Sops {
             path: "/s".into(),
             age_key_file: None,
             config: "/.sops.yaml".into(),
             program: None,
-        })
-        .unwrap();
+        });
         assert_eq!(store.kind(), BackendKind::Sops);
     }
 

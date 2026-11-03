@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::apply::{FileRun, PlannedRun, RunKind, Upload};
+use crate::bytes::hex;
 use crate::cli::Failure;
 use crate::config::{Config, FileEntry, ModeValue, is_mode, is_sha256};
 use crate::document;
@@ -37,7 +38,7 @@ use crate::remote::{
     login_checks, login_top, not_a_directory, random_hex, refusal, root_checks, root_only_find,
     sweep, temp_beside, unchecked, zeroizing,
 };
-pub(crate) use crate::remote::{REFUSED, hex, quote};
+pub(crate) use crate::remote::{REFUSED, quote};
 use crate::secret;
 use crate::tasks::{Expanded, Item};
 use crate::transport::RUN_TIMEOUT;
@@ -922,9 +923,10 @@ fn hash_run(
             .collect()
     };
     let (user, root) = (of(false), of(true));
-    let user = match user.is_empty() {
-        true => String::new(),
-        false => format!("(\n{})\n", root_walk(&user, user_top, LOGIN_OWNED)),
+    let user = if user.is_empty() {
+        String::new()
+    } else {
+        format!("(\n{})\n", root_walk(&user, user_top, LOGIN_OWNED))
     };
     if root.is_empty() {
         return Ok(format!("{{ exec 2>/dev/null; {setup}{user}}}\n"));
@@ -1532,7 +1534,7 @@ mod tests {
     use crate::config::FileEntry;
     use crate::packages::Packages;
     use crate::remote::checks;
-    use crate::test_util::{logged, temp_dir};
+    use crate::test_util::{logged, mode, temp_dir};
     use crate::transport::{Local, Transport};
 
     /// [`super::tee_script`] that runs as root when it carries checks.
@@ -2196,11 +2198,7 @@ mod tests {
             root_checks("sudo ", "/etc/a")
         )));
         let wrapped = crate::packages::with_password(&run);
-        let syntax = std::process::Command::new("/bin/sh")
-            .args(["-n", "-c", &wrapped])
-            .status()
-            .unwrap();
-        assert!(syntax.success(), "{wrapped}");
+        assert_valid_sh(&wrapped);
     }
 
     /// A write of "new\n" over `dest`, as the login user or through
@@ -2269,7 +2267,7 @@ mod tests {
             assert_eq!(String::from_utf8(out.stderr).unwrap(), "", "{sudo:?}");
             assert_eq!(out.code, Some(0), "{sudo:?}");
             assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
-            assert_eq!(mode_of(&dest), 0o640);
+            assert_eq!(mode(&dest), 0o640);
             assert_ne!(fs::metadata(&dest).unwrap().ino(), before, "a new inode");
             assert_eq!(
                 fs::read_to_string(&link).unwrap(),
@@ -2415,7 +2413,7 @@ mod tests {
                     assert_eq!(&line[0][..10], "-rw-------", "{log}");
                 }
                 assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
-                assert_eq!(mode_of(&dest), 0o640);
+                assert_eq!(mode(&dest), 0o640);
                 assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
                 fs::remove_dir_all(&dir).unwrap();
             }
@@ -2470,7 +2468,7 @@ mod tests {
             assert!(stderr.contains("cannot write a temp file"), "{stderr}");
             assert!(!stderr.contains("not written atomically"), "{stderr}");
             assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
-            assert_eq!(mode_of(&dest), 0o644);
+            assert_eq!(mode(&dest), 0o644);
             let log = fs::read_to_string(&log).unwrap();
             assert!(!log.lines().any(|l| l == dest.to_str().unwrap()), "{log}");
             assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
@@ -2503,7 +2501,7 @@ mod tests {
                 )
             );
             assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
-            assert_eq!(mode_of(&dest), 0o640);
+            assert_eq!(mode(&dest), 0o640);
             assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
             fs::remove_dir_all(&dir).unwrap();
         }
@@ -2528,7 +2526,7 @@ mod tests {
             )
         );
         assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
-        assert_eq!(mode_of(&dest), 0o640);
+        assert_eq!(mode(&dest), 0o640);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2556,7 +2554,7 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
         assert_eq!(fs::metadata(&dest).unwrap().ino(), before, "in place");
-        assert_eq!(mode_of(&dest), 0o640);
+        assert_eq!(mode(&dest), 0o640);
         assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2745,7 +2743,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert_eq!(mode_of(&dest), 0o200);
+        assert_eq!(mode(&dest), 0o200);
         fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
         assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
@@ -2927,7 +2925,7 @@ mod tests {
             let out = sh_with(&bin, &replacing(&dest, ""));
             assert_ne!(out.code, Some(0), "{signal}");
             assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n", "{signal}");
-            assert_eq!(mode_of(&dest), 0o644, "{signal}");
+            assert_eq!(mode(&dest), 0o644, "{signal}");
             assert_eq!(
                 leftovers(&dest).len(),
                 1 + usize::from(leaves_temp),
@@ -3055,8 +3053,13 @@ mod tests {
         (out.code, String::from_utf8(out.stdout).unwrap())
     }
 
-    fn mode_of(path: &Path) -> u32 {
-        fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    /// Fails unless `/bin/sh -n` parses `script`.
+    fn assert_valid_sh(script: &str) {
+        let syntax = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", script])
+            .status()
+            .unwrap();
+        assert!(syntax.success(), "{script}");
     }
 
     #[test]
@@ -3082,7 +3085,7 @@ mod tests {
                 "{text:?}"
             );
             assert_eq!(fs::read(&dest).unwrap(), text.as_bytes(), "{text:?}");
-            assert_eq!(mode_of(&dest), 0o640);
+            assert_eq!(mode(&dest), 0o640);
             assert_eq!(sh(&script), (Some(0), format!("unchanged {dest_str}\n")));
             assert_eq!(fs::read(&dest).unwrap(), text.as_bytes());
         }
@@ -3108,18 +3111,18 @@ mod tests {
             write("one\n", "0444"),
             (Some(0), format!("wrote {dest_str}\n"))
         );
-        assert_eq!(mode_of(&dest), 0o444);
+        assert_eq!(mode(&dest), 0o444);
         assert_eq!(
             write("two\n", "0444"),
             (Some(0), format!("wrote {dest_str}\n"))
         );
         assert_eq!(fs::read_to_string(&dest).unwrap(), "two\n");
-        assert_eq!(mode_of(&dest), 0o444);
+        assert_eq!(mode(&dest), 0o444);
         assert_eq!(
             write("two\n", "0600"),
             (Some(0), format!("unchanged {dest_str}\n"))
         );
-        assert_eq!(mode_of(&dest), 0o600);
+        assert_eq!(mode(&dest), 0o600);
         fs::set_permissions(&dest, fs::Permissions::from_mode(0o666)).unwrap();
         assert_eq!(
             write("three, longer than two\n", "644"),
@@ -3129,7 +3132,7 @@ mod tests {
             fs::read_to_string(&dest).unwrap(),
             "three, longer than two\n"
         );
-        assert_eq!(mode_of(&dest), 0o644);
+        assert_eq!(mode(&dest), 0o644);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3175,7 +3178,7 @@ mod tests {
                 "{case}"
             );
             assert_eq!(fs::read_to_string(&dest).unwrap(), text, "{case}");
-            assert_eq!(mode_of(&dest), 0o640, "{case}");
+            assert_eq!(mode(&dest), 0o640, "{case}");
         }
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -3790,7 +3793,7 @@ mod tests {
             assert_eq!(String::from_utf8(out.stderr).unwrap(), "", "script {n}");
             assert_eq!(out.code, Some(0), "script {n}");
             assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n", "script {n}");
-            assert_eq!(mode_of(&dest), 0o644, "script {n}");
+            assert_eq!(mode(&dest), 0o644, "script {n}");
         }
         let missing = dir.join("missing").join("conf");
         for (n, script) in root_scripts(&missing, &dir, &temp).iter().enumerate() {
@@ -3881,7 +3884,7 @@ mod tests {
                 assert_eq!(String::from_utf8(out.stderr).unwrap(), refused, "{case}");
                 assert_eq!(fs::read_link(&link).unwrap(), real, "{case}");
                 assert_eq!(fs::read_to_string(&real).unwrap(), old, "{case}");
-                assert_eq!(mode_of(&real), 0o600, "{case}");
+                assert_eq!(mode(&real), 0o600, "{case}");
             }
         }
         assert!(!temp.exists(), "the trap removed the temp file");
@@ -3939,7 +3942,7 @@ mod tests {
             String::from_utf8(out.stderr).unwrap(),
             format!("files: {dest_str} is a directory\n")
         );
-        assert_eq!(mode_of(&dest), 0o751);
+        assert_eq!(mode(&dest), 0o751);
         assert!(fs::read_dir(&dest).unwrap().next().is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -3987,7 +3990,7 @@ mod tests {
             let script = stage_script(&Heredoc::new(text).unwrap(), temp_str);
             assert_eq!(sh(&script), (Some(0), String::new()), "{text:?}");
             assert_eq!(fs::read(&temp).unwrap(), text.as_bytes(), "{text:?}");
-            assert_eq!(mode_of(&temp), 0o600);
+            assert_eq!(mode(&temp), 0o600);
             let again = Local.run(&script, RUN_TIMEOUT).unwrap();
             assert_ne!(again.code, Some(0), "set -C refuses an existing file");
             fs::remove_file(&temp).unwrap();
@@ -4104,11 +4107,7 @@ mod tests {
     fn the_capture_refuses_a_fifo_or_a_directory_without_reading_it() {
         let dir = dir("files-capture-fifo");
         let fifo = dir.join("fifo");
-        let made = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(made.success());
+        crate::test_util::mkfifo(&fifo);
         let sub = dir.join("sub");
         fs::create_dir(&sub).unwrap();
         for path in [fifo, sub] {
@@ -4489,8 +4488,8 @@ mod tests {
     }
 
     /// Builds, and so logs, the `ssh` command that would run `script`: on
-    /// stdin, or on the password path inside the remote command, as
-    /// `run_tty` sends it.
+    /// stdin behind the plain wrapper, or on the password path inside the
+    /// remote command, as `run_tty` sends it.
     fn spawn_for(script: &str, password: bool) {
         use crate::ssh::{CHECK_TIMEOUT, KEY_TIMEOUT, Ssh, SshSettings};
 
@@ -4499,13 +4498,15 @@ mod tests {
             can_prompt: false,
             key_timeout: KEY_TIMEOUT,
             check_timeout: CHECK_TIMEOUT,
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel: std::sync::Arc::default(),
         };
         let ssh = Ssh::new(settings, None, "web1", None, None).unwrap();
         let control = Path::new("/tmp/anvil-control");
-        let args = match password {
-            true => ssh.tty_client_args(control, &crate::packages::with_password(script)),
-            false => ssh.client_args(control),
+        let args = if password {
+            ssh.tty_client_args(control, &crate::packages::with_password(script))
+        } else {
+            let remote = crate::ssh::plain_command(script.len(), "anvil-end-0", RUN_TIMEOUT);
+            ssh.client_args(control, &remote)
         };
         drop(ssh.command(&args));
     }
@@ -4630,11 +4631,7 @@ mod tests {
     fn the_capture_script_is_valid_sh_on_the_password_path() {
         let script = capture_script("/etc/a", "sudo ", &root_checks("sudo ", "/etc/a"));
         let wrapped = crate::packages::with_password(&script);
-        let syntax = std::process::Command::new("/bin/sh")
-            .args(["-n", "-c", &wrapped])
-            .status()
-            .unwrap();
-        assert!(syntax.success(), "{wrapped}");
+        assert_valid_sh(&wrapped);
     }
 
     /// The three write scripts over `dest` under `dir`, each writing
@@ -4690,7 +4687,7 @@ mod tests {
                 assert!(out.stdout.is_empty(), "{case}");
                 assert_eq!(String::from_utf8(out.stderr).unwrap(), refused, "{case}");
                 assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n", "{case}");
-                assert_eq!(mode_of(&dest), 0o600, "{case}");
+                assert_eq!(mode(&dest), 0o600, "{case}");
             }
         }
         for (expected, before) in [
@@ -4878,14 +4875,14 @@ mod tests {
             [ok(format!("restored {d}\n"))]
         );
         assert_eq!(fs::read_to_string(&dest).unwrap(), "v0\n");
-        assert_eq!(mode_of(&dest), 0o640);
+        assert_eq!(mode(&dest), 0o640);
         fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
             restore(&[file], &Force::None),
             [ok(format!("unchanged {d}\n"))]
         );
         assert_eq!(
-            mode_of(&dest),
+            mode(&dest),
             0o640,
             "the mode comes back also when unchanged"
         );
@@ -5158,7 +5155,7 @@ mod tests {
         assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
         assert_eq!(out.code, Some(0));
         assert_eq!(fs::read_to_string(&dest).unwrap(), "v0\n");
-        assert_eq!(mode_of(&dest), 0o640);
+        assert_eq!(mode(&dest), 0o640);
         let (uid, gid) = ids(&dir);
         let d = dest.display();
         let log = fs::read_to_string(&log).unwrap();
@@ -5298,15 +5295,11 @@ mod tests {
                 (Some(0), format!("{expected} {}\n", dest.display()))
             );
             assert_eq!(fs::read_to_string(&dest).unwrap(), SECRET_TEXT);
-            assert_eq!(mode_of(&dest), 0o640);
+            assert_eq!(mode(&dest), 0o640);
             assert!(!local_temp.exists(), "the trap removed the temp file");
         }
         let wrapped = crate::packages::with_password(&script);
-        let syntax = std::process::Command::new("/bin/sh")
-            .args(["-n", "-c", &wrapped])
-            .status()
-            .unwrap();
-        assert!(syntax.success(), "{wrapped}");
+        assert_valid_sh(&wrapped);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -5530,9 +5523,10 @@ mod tests {
         let out = sh_with(&bin, &user_hash_script(&dests, "sudo -n ", &dir));
         assert_eq!(out.code, Some(0));
         let x = Some(sha_hex(b"x"));
-        let unread = match rustix::process::getuid().is_root() {
-            true => (FileState::File, x.clone()),
-            false => (FileState::Unreadable, None),
+        let unread = if rustix::process::getuid().is_root() {
+            (FileState::File, x.clone())
+        } else {
+            (FileState::Unreadable, None)
         };
         assert_eq!(
             parse_hashes(dests.len(), &out.stdout).unwrap(),

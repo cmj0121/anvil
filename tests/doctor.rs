@@ -13,7 +13,7 @@ use std::io::Write;
 
 use common::{
     AUTH_DENIED, AUTH_DENIED_MESSAGE, CONNECT_REFUSED, CONNECT_REFUSED_MESSAGE, Sandbox, fixture,
-    json, keys, text, until,
+    json, keys, sha256_hex, text, until,
 };
 
 #[test]
@@ -239,14 +239,6 @@ fn marker_file(sandbox: &Sandbox) -> (String, String) {
 /// What the fixture recorded as its stdin; empty when it did not run.
 fn plugin_stdin(sandbox: &Sandbox) -> String {
     fs::read_to_string(sandbox.plugin_dir().join("record.stdin")).unwrap_or_default()
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 #[test]
@@ -796,4 +788,28 @@ fn doctor_ignores_an_ssh_planted_in_the_current_directory() {
     assert!(!ran.exists(), "{}", text(&out.stdout));
     let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
     assert!(shown.contains("ssh: not found"), "{shown}");
+}
+
+#[test]
+fn a_doctor_ended_by_sigterm_exits_143_and_names_why() {
+    let sandbox = Sandbox::new("ad");
+    sandbox.with_two_fake_hosts();
+    sandbox.write_config("config.toml", "");
+    let out = sandbox.signalled_at_the_gate(&["--json", "doctor"], rustix::process::Signal::TERM);
+    assert_eq!(out.status.code(), Some(143), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("doctor: terminated"),
+        "{}",
+        text(&out.stderr)
+    );
+    let value = json(&out);
+    let beta = value["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["target"] == "beta");
+    assert_eq!(
+        beta.unwrap(),
+        &serde_json::json!({"target": "beta", "connectable": false, "error": "terminated"})
+    );
 }

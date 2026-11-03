@@ -108,7 +108,7 @@ fn the_script_is_never_on_an_ssh_argv_and_nothing_is_probed() {
         calls.iter().any(|c| c.contains(" -M ")),
         "a master: {calls:?}"
     );
-    let clients: Vec<_> = calls.iter().filter(|c| c.ends_with("sh -s")).collect();
+    let clients: Vec<_> = calls.iter().filter(|c| c.contains(" anvil-run ")).collect();
     assert_eq!(clients.len(), 1, "one client, no probe: {calls:?}");
     assert!(calls.iter().all(|c| !c.contains(marker)), "{calls:?}");
 }
@@ -385,4 +385,22 @@ fn parallel_one_prints_exactly_what_the_default_prints() {
             r#"{{"targets":[{{"target":"local","steps":{step},"ok":true}},{{"target":"fake","steps":{step},"ok":true}}],"ok":true}}"#
         ) + "\n"
     );
+}
+
+#[test]
+fn a_fake_host_script_past_its_timeout_keeps_its_output() {
+    let sandbox = Sandbox::new("ru");
+    sandbox.with_fake_host();
+    let started = std::time::Instant::now();
+    let out = anvil_stdin(
+        &sandbox,
+        &["--json", "run", "--timeout", "1", "--target", "fake", "-"],
+        &[],
+        b"echo before\nsleep 30\n",
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    let target = &json(&out)["targets"][0];
+    assert_eq!(target["error"], "timed out after 1 s");
+    assert_eq!(target["steps"][0]["stdout"], "before\n");
 }

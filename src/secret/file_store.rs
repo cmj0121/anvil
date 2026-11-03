@@ -8,7 +8,7 @@
 //! must belong to the current user and be writable by no one else, who
 //! could otherwise swap the store file; a commit checks it again before
 //! it encrypts anything. Only ciphertext reaches the disk: a
-//! 0600 `<store>.tmp-<pid>-<nanos>-<n>` beside the store, synced, then
+//! 0600 `.anvil-<pid>-<nanos>-<n>` beside the store, synced, then
 //! renamed over it. A commit whose ciphertext would be larger than `open`
 //! reads is refused before anything is written. The decrypted bytes, each
 //! value and the serialised plaintext are zeroized when dropped; serde's own
@@ -23,12 +23,12 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
 
 use super::{BackendKind, SecretError, Store, Vault, is_name};
+use crate::bytes;
 use crate::paths;
 use crate::private::{self, LockError};
 use crate::trust::{self, TrustError, check_owner, open_regular};
@@ -169,19 +169,14 @@ impl<'a, C: Codec> FileVault<'a, C> {
             }
             Err(err) => return Err(untrusted(path, err)),
         };
-        let too_big = || vault.error(format!("larger than the {limit} byte limit"));
         if meta.len() > limit {
-            return Err(too_big());
+            return Err(vault.error(format!("larger than the {limit} byte limit")));
         }
         let mut ciphertext = Vec::new();
         if vault.codec.reads_store() {
             ciphertext.reserve_exact(meta.len() as usize + 1);
-            file.take(limit + 1)
-                .read_to_end(&mut ciphertext)
+            bytes::read_capped(file, limit, &mut ciphertext)
                 .map_err(|err| vault.error(err.to_string()))?;
-            if ciphertext.len() as u64 > limit {
-                return Err(too_big());
-            }
         }
         let plaintext = vault.codec.decrypt(&ciphertext)?;
         // The parse error names a position only: serde's message can quote a value.
@@ -273,14 +268,8 @@ impl<'a, C: Codec> FileVault<'a, C> {
     /// Writes `ciphertext` to a fresh 0600 temp file beside the store, syncs
     /// it and renames it over the store; the temp file is removed on error.
     fn write_atomic(&self, ciphertext: &[u8]) -> Result<(), SecretError> {
-        private::write_atomic(self.path, ciphertext).map_err(|err| self.error(err.to_string()))
-    }
-
-    /// A new 0600 `<store>.tmp-<pid>-<nanos>-<n>`, a name not known
-    /// in advance; a name that exists already is tried again.
-    #[cfg(test)]
-    fn create_temp(&self) -> Result<(PathBuf, File), SecretError> {
-        private::create_temp(self.path).map_err(|err| self.error(err.to_string()))
+        private::write_atomic(self.path, ciphertext, None)
+            .map_err(|err| self.error(err.to_string()))
     }
 }
 
@@ -354,7 +343,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::test_util::{assert_no_plaintext, files, temp_dir};
+    use crate::test_util::{assert_no_plaintext, files, mode, temp_dir};
 
     const VALUE: &str = "s3cr3t-hunter2";
     const LIMIT: u64 = 1 << 20;
@@ -422,10 +411,6 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(FileVault::open(&link, LIMIT, codec.clone()).is_err());
         fs::remove_dir_all(&root).unwrap();
-    }
-
-    fn mode(path: &Path) -> u32 {
-        fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     fn open<'a>(path: &'a Path, codec: &Xor) -> Box<dyn Vault + 'a> {
@@ -675,11 +660,7 @@ mod tests {
     fn a_store_that_is_not_a_regular_file_is_refused_unread() {
         let root = temp_dir("file-store-fifo");
         let fifo = root.join("secrets.x");
-        let made = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(made.success());
+        crate::test_util::mkfifo(&fifo);
         // Refused, not waited on for a writer.
         let err = FileVault::open(&fifo, LIMIT, Xor::default()).err().unwrap();
         assert_eq!(
@@ -746,28 +727,6 @@ mod tests {
             );
             assert_eq!(fs::read(&path).unwrap(), before);
             assert_eq!(files(&root), [path.clone(), lock_of(&path)]);
-        }
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn each_temp_file_gets_a_fresh_name() {
-        let root = temp_dir("file-store-temp");
-        let path = root.join("secrets.x");
-        let vault = FileVault::open(&path, LIMIT, Xor::default()).unwrap();
-        let (first, _) = vault.create_temp().unwrap();
-        let (second, _) = vault.create_temp().unwrap();
-        assert_ne!(first, second);
-        let prefix = format!("secrets.x.tmp-{}-", std::process::id());
-        for tmp in [&first, &second] {
-            let name = tmp.file_name().unwrap().to_str().unwrap();
-            let rest = name.strip_prefix(&prefix).unwrap();
-            let (nanos, n) = rest.split_once('-').unwrap();
-            assert!(
-                nanos.parse::<u128>().is_ok() && n.parse::<u32>().is_ok(),
-                "{name}"
-            );
-            assert_eq!(mode(tmp), 0o600);
         }
         fs::remove_dir_all(&root).unwrap();
     }

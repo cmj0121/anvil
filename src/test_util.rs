@@ -28,6 +28,20 @@ pub fn chmod(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// The permission bits of `path`, special bits included.
+pub fn mode(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+/// Makes a named pipe at `path`.
+pub fn mkfifo(path: &Path) {
+    let made = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo {}", path.display());
+}
+
 /// Waits (30 s at most) until `path` exists.
 pub fn wait_for(path: &Path) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);

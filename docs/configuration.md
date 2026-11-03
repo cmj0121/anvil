@@ -278,6 +278,14 @@ Without any `[[steps]]` the config runs one step, `hostname`; once you or `anvil
 default is gone. Each step has `run` or `plugin`, never both; a step with both is exit 2 with
 `steps[I]: has both run and plugin; keep one`, one with neither with `steps[I]: needs run or plugin`.
 
+**How a step runs on a host.** A host's step goes on ssh's stdin to a small POSIX sh wrapper, which runs it from
+memory with stdin on `/dev/null`, so `cat` or `read` in a step sees EOF at once ([SSH behaviour](cli.md#ssh-behaviour)).
+A plain run that times out, or whose anvil is killed or loses its client, is killed on the host within about 2 s plus a
+round trip, or at its timeout plus 10 s when the network is lost. Root processes it started through `sudo` die only
+where `sudo -n kill` works (NOPASSWD); elsewhere they run to their end. Inside a step script, `$$`, `$0`, `$PPID`,
+`LINENO` and the text of sh's error messages differ from `sh -s`, as the script runs through `eval` in the wrapper. A
+login shell that is neither POSIX sh, csh nor fish (nushell, say) may reject the command.
+
 The sections above run in a fixed order: packages, files, services, steps. To choose the order, use [`[[tasks]]`](#tasks)
 instead of `[[files]]`, `[[services]]`, `[[steps]]` and the lists in `[packages]`.
 

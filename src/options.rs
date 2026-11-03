@@ -6,8 +6,8 @@ use std::io::{self, IsTerminal};
 use std::num::NonZeroU8;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
+use crate::cancel::Cancel;
 use crate::cli::{Cli, Failure};
 use crate::config::Config;
 use crate::files::{self, Sources};
@@ -34,8 +34,6 @@ pub struct Options {
     pub target: Vec<String>,
     /// Targets apply, plan and run work on at once.
     pub parallel: NonZeroU8,
-    /// The run's cancel flag; ssh checks it before opening a master.
-    pub cancel: Arc<AtomicBool>,
     /// ssh may run its interactive retry. CLI: stdin && stderr are terminals.
     /// TUI: true only while a term::Handoff is installed.
     pub can_prompt: bool,
@@ -70,7 +68,6 @@ impl Options {
             ssh_config: cli.ssh_config.clone(),
             target: cli.target.clone(),
             parallel: NonZeroU8::new(cli.parallel).expect("clap keeps --parallel in 1..=32"),
-            cancel: Arc::default(),
             can_prompt: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
             #[cfg(debug_assertions)]
             secret_store: cli.secret_store,
@@ -93,7 +90,7 @@ impl Options {
             return Ok(Box::new(secret::Memory::default()));
         }
         let backend = config.backend().map_err(Failure::usage)?;
-        Ok(secret::from_config(&backend)?)
+        Ok(secret::from_config(&backend))
     }
 
     /// The ssh program as named: `ssh`, or the debug-only `--ssh-program`.
@@ -153,14 +150,15 @@ impl Options {
     }
 
     /// How ssh runs: `program`, a password prompt only when
-    /// [`Options::can_prompt`], and the production deadlines.
-    fn ssh_settings(&self, program: PathBuf) -> SshSettings {
+    /// [`Options::can_prompt`], the production deadlines, and the run's
+    /// `cancel`, checked before opening a master.
+    fn ssh_settings(&self, program: PathBuf, cancel: &Arc<Cancel>) -> SshSettings {
         SshSettings {
             program,
             can_prompt: self.can_prompt,
             key_timeout: ssh::KEY_TIMEOUT,
             check_timeout: ssh::CHECK_TIMEOUT,
-            cancel: Arc::clone(&self.cancel),
+            cancel: Arc::clone(cancel),
         }
     }
 
@@ -280,14 +278,19 @@ impl Options {
         Ok(inventory.select(&sels)?)
     }
 
-    /// The transport for `target`: [`Local`] for `local`, [`Ssh`] otherwise.
-    pub fn transport(&self, target: &Target) -> Result<Box<dyn Transport>, TransportError> {
+    /// The transport for `target`: [`Local`] for `local`, [`Ssh`] otherwise,
+    /// which checks `cancel` before opening a master.
+    pub fn transport(
+        &self,
+        target: &Target,
+        cancel: &Arc<Cancel>,
+    ) -> Result<Box<dyn Transport>, TransportError> {
         match &target.kind {
             TargetKind::Local => Ok(Box::new(Local)),
             TargetKind::Ssh { host, user, port } => {
                 #[cfg_attr(not(debug_assertions), expect(unused_mut, reason = "debug: ssh_home"))]
                 let mut ssh = Ssh::new(
-                    self.ssh_settings(self.ssh_program()?),
+                    self.ssh_settings(self.ssh_program()?, cancel),
                     self.ssh_config()
                         .map_err(|failure| TransportError::Spawn(failure.message))?,
                     host,
@@ -512,19 +515,50 @@ mod tests {
     fn ssh_settings_follow_can_prompt() {
         let mut opts = parse(&["apply"]);
         opts.can_prompt = true;
-        assert!(opts.ssh_settings(PathBuf::new()).can_prompt);
+        let cancel = Arc::new(Cancel::new());
+        assert!(opts.ssh_settings(PathBuf::new(), &cancel).can_prompt);
         opts.can_prompt = false;
-        assert!(!opts.ssh_settings(PathBuf::new()).can_prompt);
+        assert!(!opts.ssh_settings(PathBuf::new(), &cancel).can_prompt);
     }
 
     #[test]
-    fn ssh_settings_share_the_cancel_flag() {
+    fn ssh_settings_share_the_cancel_token() {
         let opts = parse(&["apply"]);
-        assert!(!opts.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        let cancel = Arc::new(Cancel::new());
         assert!(Arc::ptr_eq(
-            &opts.ssh_settings(PathBuf::new()).cancel,
-            &opts.cancel
+            &opts.ssh_settings(PathBuf::new(), &cancel).cancel,
+            &cancel
         ));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_ssh_transport_carries_the_token_passed_to_transport() {
+        let found = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-ssh.sh");
+        let mut opts = parse(&["--ssh-program", found, "apply"]);
+        // Never the real home: a CI runner's ~/.ssh may be world-writable.
+        let home = crate::test_util::temp_dir("opts-token");
+        opts.ssh_home = Some(home.clone());
+        let host = Target {
+            name: "box".to_owned(),
+            kind: TargetKind::Ssh {
+                host: "203.0.113.10".to_owned(),
+                user: None,
+                port: None,
+            },
+            pkg: None,
+            sudo_secret: None,
+            tags: Vec::new(),
+        };
+        let cancel = Arc::new(Cancel::new());
+        let ssh = opts.transport(&host, &cancel).unwrap();
+        cancel.stop(crate::cancel::AbortReason::Cancelled);
+        let Err(err) = ssh.run("true", std::time::Duration::from_secs(5)) else {
+            panic!("a stopped token opened a master");
+        };
+        assert!(matches!(err, TransportError::Cancelled), "{err}");
+        assert!(home.join(".ssh/anvil").is_dir(), "the run ignored ssh_home");
+        fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
@@ -537,7 +571,10 @@ mod tests {
             sudo_secret: None,
             tags: Vec::new(),
         };
-        assert_eq!(opts.transport(&local).unwrap().name(), "local");
+        assert_eq!(
+            opts.transport(&local, &Arc::default()).unwrap().name(),
+            "local"
+        );
     }
 
     #[cfg(debug_assertions)]
@@ -556,9 +593,13 @@ mod tests {
             sudo_secret: None,
             tags: Vec::new(),
         };
-        assert_eq!(opts.transport(&host).unwrap().name(), "203.0.113.10");
+        let cancel = Arc::default();
+        assert_eq!(
+            opts.transport(&host, &cancel).unwrap().name(),
+            "203.0.113.10"
+        );
         let missing = parse(&["--ssh-program", "/nonexistent/anvil-ssh", "apply"]);
-        let Err(err) = missing.transport(&host) else {
+        let Err(err) = missing.transport(&host, &cancel) else {
             panic!("a missing ssh was accepted");
         };
         assert_eq!(

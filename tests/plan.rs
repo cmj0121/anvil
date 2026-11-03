@@ -490,3 +490,25 @@ fn a_refused_include_outside_the_store_escapes_a_bidi_character() {
     assert!(stderr.contains("`\\u{202e}evil.toml`"), "{stderr}");
     assert!(!stderr.contains('\u{202e}'), "{stderr}");
 }
+
+#[test]
+#[cfg(unix)]
+fn a_plan_ended_by_sigterm_exits_143_and_names_why() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.with_two_fake_hosts();
+    sandbox.write_config("config.toml", "[[steps]]\nrun = \"true\"\n");
+    let signal = rustix::process::Signal::TERM;
+    let out = sandbox.signalled_at_the_gate(&["--json", "plan"], signal);
+    assert_eq!(out.status.code(), Some(143), "{}", text(&out.stderr));
+    assert_eq!(
+        json(&out)["targets"][2],
+        serde_json::json!({"target": "beta", "ok": false, "abort": "terminated"})
+    );
+    let out = sandbox.signalled_at_the_gate(&["plan"], signal);
+    assert_eq!(out.status.code(), Some(143), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("▶ beta\n  ⊘ terminated\n"),
+        "{}",
+        text(&out.stdout)
+    );
+}

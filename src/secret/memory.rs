@@ -2,7 +2,7 @@
 //! `--secret-store memory`.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use zeroize::Zeroizing;
 
@@ -17,9 +17,7 @@ pub struct Memory {
 
 impl Memory {
     fn items(&self) -> MutexGuard<'_, Items> {
-        self.items
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.items.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

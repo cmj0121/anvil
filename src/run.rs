@@ -10,10 +10,11 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::apply::{self, PlannedRun, Report, RunKind, TargetReport};
+use crate::cancel::Cancel;
 use crate::cli::{Cli, Failure};
 use crate::document::{MAX_BYTES, read_capped_from};
 use crate::interrupt::Interrupt;
@@ -21,22 +22,22 @@ use crate::inventory::Target;
 use crate::logger::escape_controls;
 use crate::options::Options;
 use crate::packages::MAX_TIMEOUT;
+use crate::prepared::Prepared;
 use crate::transport::{Transport, TransportError};
 use crate::trust::{self, TrustError};
 
 /// `--timeout` when unset, in seconds.
 pub const DEFAULT_TIMEOUT: u64 = 300;
 
-/// Loads the targets and runs `script` on each, `opts.parallel` at a time,
-/// killing it after `timeout`. Before each target, `opts.cancel` is checked; once
-/// set, every target not started is Cancelled.
+/// Runs `script` on each of `prepared`'s targets, `opts.parallel` at a time,
+/// killing it after `timeout`. Before each target, `prepared.cancel` is
+/// checked; once set, every target not started is Cancelled.
 pub fn run_targets(
-    opts: &Options,
+    prepared: &Prepared,
     script: String,
     timeout: Duration,
     on: &mut dyn FnMut(apply::Progress<'_>),
-) -> Result<Report, Failure> {
-    let targets = opts.targets()?;
+) -> Report {
     let runs = [PlannedRun {
         run: wrap(&script).into(),
         label: Some(script),
@@ -46,15 +47,15 @@ pub fn run_targets(
         task: None,
         name: None,
     }];
-    let cancel = &opts.cancel;
-    Ok(apply::for_each_target(
+    let cancel = &prepared.cancel;
+    apply::for_each_target(
         "run",
-        &targets,
-        opts.parallel,
+        &prepared.targets,
+        prepared.opts.parallel,
         cancel,
         on,
-        |target| run_target(target, opts.transport(target), &runs, cancel),
-    ))
+        |target| run_target(target, prepared.transport(target), &runs, cancel),
+    )
 }
 
 /// `script` as it travels on the transport's stdin; see the module
@@ -67,7 +68,7 @@ fn run_target(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
     runs: &[PlannedRun],
-    cancel: &AtomicBool,
+    cancel: &Cancel,
 ) -> TargetReport {
     log::info!("run {}: start", target.name);
     match transport {
@@ -97,8 +98,16 @@ pub fn run(cli: &Cli, opts: &Options, source: &Path, timeout: u64) -> Result<(),
     }
     let script = read_script(source)?;
     let timeout = Duration::from_secs(timeout);
-    let _interrupt = Interrupt::install(&opts.cancel)?;
-    apply::print_report(cli, "run", |on| run_targets(opts, script, timeout, on))
+    let cancel = Arc::new(Cancel::new());
+    let _interrupt = Interrupt::install(&cancel)?;
+    apply::print_report(cli, "run", |on| {
+        Ok(run_targets(
+            &Prepared::run(opts, cancel)?,
+            script,
+            timeout,
+            on,
+        ))
+    })
 }
 
 fn over_limit(size: u64) -> Failure {

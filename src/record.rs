@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use zeroize::Zeroizing;
 
+use crate::bytes::{self, CappedError};
 use crate::config::{check_dest, is_mode, is_sha256};
 use crate::facts::Facts;
 use crate::paths::{self, PathsError};
@@ -282,6 +283,17 @@ pub fn path() -> Result<PathBuf, PathsError> {
     Ok(paths::state_dir()?.join(FILE_NAME))
 }
 
+/// Reads `file`, which fstat said holds `size` bytes, into `bytes` reserved
+/// for `size + 1`: a file grown since is refused, never read on into a
+/// reallocated buffer that would leave an unzeroized copy behind.
+fn read_record(file: impl Read, size: u64, bytes: &mut Vec<u8>) -> Result<(), String> {
+    match bytes::read_capped(file, size, bytes) {
+        Ok(()) => Ok(()),
+        Err(CappedError::Over { .. }) => Err("changed while being read".to_owned()),
+        Err(CappedError::Io(err)) => Err(err.to_string()),
+    }
+}
+
 /// Reads the record at `path`; `None` when neither it nor its directory
 /// exists. Refused unless the directory is private, the file is a regular
 /// 0600-or-stricter file of the current user's (a symlink or FIFO is not
@@ -296,17 +308,11 @@ pub fn load(path: &Path) -> Result<Option<Record>, String> {
         Err(TrustError::NotFound { .. }) => return Ok(None),
         Err(err) => return Err(err.to_string()),
     };
-    let too_large = || format!("{shown}: larger than the {MAX_RECORD} byte limit");
     if meta.size() > MAX_RECORD as u64 {
-        return Err(too_large());
+        return Err(format!("{shown}: larger than the {MAX_RECORD} byte limit"));
     }
     let mut bytes = Zeroizing::new(Vec::with_capacity(meta.size() as usize + 1));
-    file.take(MAX_RECORD as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|err| format!("{shown}: {err}"))?;
-    if bytes.len() > MAX_RECORD {
-        return Err(too_large());
-    }
+    read_record(file, meta.size(), &mut bytes).map_err(|err| format!("{shown}: {err}"))?;
     let cannot_parse = || format!("{shown}: cannot parse");
     let unsupported = |version: u32| format!("{shown}: version {version} is not supported");
     #[derive(Deserialize)]
@@ -572,7 +578,7 @@ impl Session {
         let mut copy = self.record.clone();
         let mut names: Vec<&String> = order.iter().filter(|n| self.merged.contains(n)).collect();
         names.extend(self.merged.iter().filter(|n| !order.contains(n)));
-        let dropped = share(&mut copy, &names, self.limit)?;
+        let dropped = share(&mut copy, &names, self.limit);
         self.write(&copy)?;
         for warning in &dropped {
             log::warn!("{warning}");
@@ -590,7 +596,7 @@ impl Session {
                 self.limit
             )));
         }
-        private::write_atomic(&self.path, &bytes).map_err(|err| cannot(err.to_string()))
+        private::write_atomic(&self.path, &bytes, None).map_err(|err| cannot(err.to_string()))
     }
 }
 
@@ -676,10 +682,10 @@ fn shed(record: &mut Record, name: &str, limit: usize) -> Vec<(String, String)> 
 
 /// Drops every text of `names` from `record`, then gives each back, in
 /// order, while the record still fits `limit`.
-fn share(record: &mut Record, names: &[&String], limit: usize) -> Result<Vec<String>, String> {
+fn share(record: &mut Record, names: &[&String], limit: usize) -> Vec<String> {
     let mut size = encoded_len(record);
     if size <= limit {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let all: Vec<(&String, usize, usize)> = names
         .iter()
@@ -698,7 +704,7 @@ fn share(record: &mut Record, names: &[&String], limit: usize) -> Result<Vec<Str
             dropped.push(drop_text(record, name, i));
         }
     }
-    Ok(dropped)
+    dropped
 }
 
 /// The length of `value` as compact JSON, counted without building it.
@@ -723,16 +729,28 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::*;
-    use crate::test_util::temp_dir;
+    use crate::test_util::{mode, temp_dir};
 
     const TEXT: &str = "the previous hunter2 text\n";
 
-    fn sha(c: char) -> String {
-        c.to_string().repeat(64)
+    #[test]
+    fn a_record_grown_after_fstat_is_refused_without_reallocating() {
+        let text = "x".repeat(4096);
+        let mut bytes = Zeroizing::new(Vec::with_capacity(text.len() + 1));
+        let reserved = (bytes.as_ptr(), bytes.capacity());
+        let grown = format!("{text}{text}");
+        let err = read_record(grown.as_bytes(), text.len() as u64, &mut bytes).unwrap_err();
+        assert_eq!(err, "changed while being read");
+        assert_eq!((bytes.as_ptr(), bytes.capacity()), reserved);
+
+        bytes.clear();
+        read_record(text.as_bytes(), text.len() as u64, &mut bytes).unwrap();
+        assert_eq!(&bytes[..], text.as_bytes());
+        assert_eq!((bytes.as_ptr(), bytes.capacity()), reserved);
     }
 
-    fn mode(path: &Path) -> u32 {
-        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    fn sha(c: char) -> String {
+        c.to_string().repeat(64)
     }
 
     fn previous(sha256: &str, text: Option<&str>) -> Previous {
@@ -971,11 +989,7 @@ mod tests {
             format!("{}: a symlink, refused", path.display())
         );
         fs::remove_file(&path).unwrap();
-        let made = std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(made.success());
+        crate::test_util::mkfifo(&path);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
             load(&path).unwrap_err(),

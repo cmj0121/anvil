@@ -24,9 +24,39 @@ use sha2::{Digest, Sha256};
 /// The secret value the tests store; it must never show in any output.
 pub const VALUE: &str = "s3cr3t-hunter2";
 
+/// The lowercase hex sha256 of `bytes`.
+pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Gives `path` exactly `mode`.
 pub fn chmod(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Whether python3 has every one of `needs` (`module.attr`, such as
+/// `os.login_tty`), which a terminal script calls; says so when it skips.
+pub fn python(needs: &[&str]) -> bool {
+    let probe: Vec<String> = needs
+        .iter()
+        .map(|need| format!("import {}; {need}", need.split('.').next().unwrap()))
+        .collect();
+    let ok = Command::new("python3")
+        .args(["-c", &probe.join("; ")])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !ok {
+        eprintln!("skip: no python3 with {}", needs.join(", "));
+    }
+    ok
+}
+
+/// The permission bits of `path`, special bits included.
+pub fn mode(path: impl AsRef<Path>) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o7777
 }
 
 /// Waits until `done`, failing after 20 s, a fail-safe only.
@@ -223,11 +253,7 @@ impl Sandbox {
             .unwrap()
             .write_all(body)
             .unwrap();
-        let sha256 = Sha256::digest(body)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        (path, sha256)
+        (path, sha256_hex(body))
     }
 
     /// `<root>/plugins`, where [`Sandbox::plugin`] puts each plugin.
@@ -243,6 +269,43 @@ impl Sandbox {
                 fs::remove_file(entry.path()).unwrap();
             }
         }
+    }
+
+    /// Runs anvil with `args` over [`Sandbox::with_two_fake_hosts`]'s
+    /// `alpha` then `beta`, one at a time, whose key master attempts wait on a
+    /// gate. Once `alpha`'s waits, sends `signal`, waits for the line it
+    /// prints, then opens the gate; returns anvil's output.
+    pub fn signalled_at_the_gate(&self, args: &[&str], signal: rustix::process::Signal) -> Output {
+        self.close_masters();
+        let gate = self.root.join("gate");
+        let _ = fs::remove_file(&gate);
+        let wait = self.root.join("gate.wait");
+        let _ = fs::remove_file(&wait);
+        let stderr = self.root.join("signalled.stderr");
+        let mut command = self.command(env!("CARGO_BIN_EXE_anvil"));
+        command
+            .args(["--secret-store", "memory", "--ssh-program"])
+            .arg(fixture("fake-ssh.sh"))
+            .args(["--parallel", "1"])
+            .args(args)
+            .env("FAKE_SSH_GATE", &gate)
+            .stdout(std::process::Stdio::piped())
+            .stderr(fs::File::create(&stderr).unwrap());
+        let child = command.spawn().expect("spawn anvil");
+        until(|| wait.exists(), "alpha's master attempt");
+        let pid = rustix::process::Pid::from_child(&child);
+        rustix::process::kill_process(pid, signal).unwrap();
+        until(
+            || {
+                fs::read_to_string(&stderr)
+                    .is_ok_and(|text| text.contains(": running targets stop after"))
+            },
+            "the signal's notice",
+        );
+        fs::write(&gate, "").unwrap();
+        let mut out = child.wait_with_output().unwrap();
+        out.stderr = fs::read(&stderr).unwrap();
+        out
     }
 
     /// One inventory host, `fake`, reached through `fake-ssh.sh`.

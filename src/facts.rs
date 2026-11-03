@@ -5,7 +5,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// The probe, sent on the transport's stdin as the script of `sh -s`.
+/// The probe, sent as a script on the transport's stdin (over ssh, framed
+/// for [`crate::ssh::WRAPPER`]).
 pub const PROBE: &str = include_str!("probe.sh");
 
 const END_MARKER: &str = "anvil-probe-end=1";

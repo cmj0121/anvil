@@ -5,7 +5,7 @@
 //! a legacy `NAME.yaml` / `NAME.yml`; missing → defaults), show it in the edit
 //! format (`--format`, else `[anvil].format`), parse and validate what comes
 //! back in that format (re-opening up to three times on an error), then write
-//! `NAME.toml.tmp` 0600 and rename it over `NAME.toml`; a legacy YAML file in
+//! a fresh 0600 temp file and rename it over `NAME.toml`; a legacy YAML file in
 //! the config directory is removed afterwards. An unchanged buffer over an
 //! existing `NAME.toml` writes nothing; over a legacy YAML file it still
 //! migrates it.
@@ -20,9 +20,8 @@
 //! was.
 
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
@@ -333,10 +332,10 @@ fn refuse_symlink(path: &Path, shown: &str) -> Result<(), Failure> {
 
 /// [`write_atomic`] with an existing file's permission bits kept.
 fn write_keeping_mode(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
-    let permissions = fs::symlink_metadata(path)
+    let mode = fs::symlink_metadata(path)
         .ok()
-        .map(|meta| meta.permissions());
-    write_atomic_as(path, bytes, permissions)
+        .map(|meta| meta.permissions().mode() & 0o7777);
+    write_atomic_as(path, bytes, mode)
 }
 
 /// The config's editor flow; `format` is the edit view.
@@ -623,8 +622,8 @@ pub fn migrate_to(opts: &Options, to: BackendKind) -> Result<Migrated, Failure> 
     let backend = config.backend_named(to).map_err(usage)?;
     let source = config.backend().map_err(usage)?;
     secret::migrate::check_apart(&source, &backend).map_err(usage)?;
-    let from = secret::from_config(&source)?;
-    let target = secret::from_config(&backend)?;
+    let from = secret::from_config(&source);
+    let target = secret::from_config(&backend);
     let dest = destination(opts.config.as_deref(), config_dir, "config", Format::Toml)?;
     migrate_stores(
         config,
@@ -845,51 +844,19 @@ fn parse<T: DeserializeOwned>(
     Ok(value)
 }
 
-/// Writes a fresh `<path>.tmp` 0600 and renames it over `path`. A stale
-/// `.tmp` (or a symlink planted there) is removed first, never reused.
+/// [`private::write_atomic`] 0600.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
     write_atomic_as(path, bytes, None)
 }
 
-/// [`write_atomic`], giving the temp file `permissions` before the rename.
-fn write_atomic_as(
-    path: &Path,
-    bytes: &[u8],
-    permissions: Option<fs::Permissions>,
-) -> Result<(), Failure> {
+/// [`private::write_atomic`] with `mode`, making the folder first.
+fn write_atomic_as(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(), Failure> {
     let io = |source: std::io::Error| Failure::failed(format!("{}: {source}", path.display()));
     if let Some(dir) = path.parent() {
         // Not left to the umask: a folder others can write refuses the next load.
         private::create_dir(dir).map_err(io)?;
     }
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| Failure::usage(format!("{}: not a file name", path.display())))?;
-    let mut tmp_name = file_name.to_os_string();
-    tmp_name.push(".tmp");
-    let tmp = path.with_file_name(tmp_name);
-    match fs::remove_file(&tmp) {
-        Ok(()) => log::info!("removed stale {}", tmp.display()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(io(err)),
-    }
-    let written = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .and_then(|mut file| {
-            file.write_all(bytes)?;
-            if let Some(permissions) = permissions {
-                file.set_permissions(permissions)?;
-            }
-            file.sync_all()
-        })
-        .and_then(|()| fs::rename(&tmp, path));
-    if written.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    written.map_err(io)
+    private::write_atomic(path, bytes, mode).map_err(io)
 }
 
 fn report(cli: &Cli, outcome: &Outcome) -> Result<(), Failure> {
@@ -1160,7 +1127,6 @@ mod tests {
                 path: self.dir.join("secrets.age"),
                 identity,
             })
-            .unwrap()
         }
     }
 
@@ -1403,7 +1369,14 @@ mod tests {
             "{message}"
         );
         assert_eq!(target.open().unwrap().names().unwrap().len(), 3);
-        assert!(!migration.dir.join("config.toml.tmp").exists());
+        assert!(
+            fs::read_dir(&migration.dir).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".anvil-")),
+            "no temp file is left"
+        );
     }
 
     /// Touches the real keychain under a throwaway service:

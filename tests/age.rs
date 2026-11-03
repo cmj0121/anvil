@@ -17,9 +17,12 @@ use std::process::{Command, Output, Stdio};
 use age::armor::{ArmoredReader, ArmoredWriter, Format};
 use age::secrecy::{ExposeSecret, SecretString};
 use age::{Decryptor, Encryptor, Identity, x25519};
-use common::{Sandbox, VALUE, fixture, json, text, write_private};
+use common::{Sandbox, VALUE, fixture, json, python, text, write_private};
 
 const PASSPHRASE: &str = "correct horse battery staple";
+
+/// What python3 needs for the terminal scripts.
+const TERMINAL: &[&str] = &["os.login_tty", "os.setsid"];
 
 /// A sandbox whose config selects the age store `~/secrets.age`, opened
 /// with `~/key.txt`, and requires `HOST_SUDO`.
@@ -104,18 +107,6 @@ fn command(sandbox: &Sandbox, program: &str, args: &[&str]) -> Command {
         .env("FAKE_EDITOR_CONTENT", sandbox.typed())
         .env_remove("PTY_PASSPHRASE");
     command
-}
-
-/// python3 with `os.login_tty`, which the terminal scripts need.
-fn python() -> bool {
-    let ok = Command::new("python3")
-        .args(["-c", "import os; os.login_tty; os.setsid"])
-        .output()
-        .is_ok_and(|out| out.status.success());
-    if !ok {
-        eprintln!("skip: no python3 with os.login_tty");
-    }
-    ok
 }
 
 /// Runs anvil `args` on a pseudo-terminal, answering the passphrase prompt
@@ -226,7 +217,7 @@ fn an_identity_others_can_read_is_refused() {
 
 #[test]
 fn a_passphrase_is_asked_on_the_terminal_without_echo() {
-    if !python() {
+    if !python(TERMINAL) {
         return;
     }
     let sandbox = age_sandbox("ag");
@@ -251,7 +242,7 @@ fn a_passphrase_is_asked_on_the_terminal_without_echo() {
 
 #[test]
 fn ctrl_c_at_the_prompt_cancels_and_restores_the_terminal() {
-    if !python() {
+    if !python(TERMINAL) {
         return;
     }
     let sandbox = age_sandbox("ag");
@@ -264,7 +255,7 @@ fn ctrl_c_at_the_prompt_cancels_and_restores_the_terminal() {
 
 #[test]
 fn without_a_terminal_a_passphrase_identity_is_locked() {
-    if !python() {
+    if !python(TERMINAL) {
         return;
     }
     let sandbox = age_sandbox("ag");

@@ -9,22 +9,8 @@
 mod common;
 
 use std::fs;
-use std::process::Command;
 
-use common::{Sandbox, fixture, text};
-
-/// python3 with `os.login_tty` (3.11 or newer), which the terminal script
-/// needs.
-fn python() -> bool {
-    let ok = Command::new("python3")
-        .args(["-c", "import os; os.login_tty"])
-        .output()
-        .is_ok_and(|out| out.status.success());
-    if !ok {
-        eprintln!("skip: no python3 with os.login_tty");
-    }
-    ok
-}
+use common::{Sandbox, fixture, python, text};
 
 /// What the editor prints on the terminal before it edits.
 const MARKER: &str = "marked-editor: editing";
@@ -84,7 +70,7 @@ fn drive_args(sandbox: &Sandbox, vars: &[(&str, &str)], steps: &[&str], anvil: &
 
 #[test]
 fn an_inventory_edit_hands_the_terminal_to_the_editor_and_back() {
-    if !python() {
+    if !python(&["os.login_tty"]) {
         return;
     }
     let sandbox = tui_sandbox("");
@@ -120,7 +106,7 @@ fn an_inventory_edit_hands_the_terminal_to_the_editor_and_back() {
 
 #[test]
 fn bare_anvil_on_a_terminal_opens_the_tui_with_its_global_flags() {
-    if !python() {
+    if !python(&["os.login_tty"]) {
         return;
     }
     let sandbox = tui_sandbox("");
@@ -140,7 +126,7 @@ fn bare_anvil_on_a_terminal_opens_the_tui_with_its_global_flags() {
 
 #[test]
 fn apply_shows_each_step_and_the_ok_block() {
-    if !python() {
+    if !python(&["os.login_tty"]) {
         return;
     }
     let sandbox = tui_sandbox("\n[[steps]]\nrun = \"printf 'out-%s\\\\n' tui\"\n");
@@ -171,7 +157,7 @@ fn apply_shows_each_step_and_the_ok_block() {
 
 #[test]
 fn b_rolls_back_after_y_and_words_a_conflict_for_the_tui() {
-    if !python() {
+    if !python(&["os.login_tty"]) {
         return;
     }
     let sandbox = tui_sandbox("");
@@ -226,7 +212,7 @@ fn b_rolls_back_after_y_and_words_a_conflict_for_the_tui() {
 
 #[test]
 fn the_files_browser_previews_edits_and_deletes_a_store_file() {
-    if !python() {
+    if !python(&["os.login_tty"]) {
         return;
     }
     let sandbox = tui_sandbox("");
@@ -300,7 +286,7 @@ fn regex_escape(text: &str) -> String {
 fn a_refused_config_is_shown_and_the_tui_still_quits() {
     use std::os::unix::fs::PermissionsExt;
 
-    if !python() {
+    if !python(&["os.login_tty"]) {
         return;
     }
     let sandbox = tui_sandbox("");

@@ -299,7 +299,7 @@ impl<'a> Sources<'a> {
         }
     }
 
-    fn shown(&self, src: &str) -> String {
+    fn shown(src: &str) -> String {
         if filestore::is_store_path(src) {
             filestore::shown(&filestore::parse(src).unwrap_or_else(|_| src.to_owned()))
         } else {
@@ -385,7 +385,7 @@ impl<'a> Run<'a> {
 
     /// The src's text with this run's edits.
     fn text(&self, src: &str) -> Result<Option<String>, Failure> {
-        let shown = self.sources.shown(src);
+        let shown = Sources::shown(src);
         match self.files.iter().find(|file| file.shown == shown) {
             Some(file) => Ok(Some(file.new.clone())),
             None => self.sources.read(src),
@@ -393,7 +393,7 @@ impl<'a> Run<'a> {
     }
 
     fn set_text(&mut self, src: &str, old: Option<String>, new: String) {
-        let shown = self.sources.shown(src);
+        let shown = Sources::shown(src);
         match self.files.iter_mut().find(|file| file.shown == shown) {
             Some(file) => file.new = new,
             None => self.files.push(FileChange { shown, old, new }),
@@ -420,11 +420,11 @@ impl<'a> Run<'a> {
         let fail = |why: Failure| Failure {
             message: match entry {
                 Some((item, i)) => files::src_message(item, i, &src, &why.message),
-                None => format!("{}: {}", self.sources.shown(&src), why.message),
+                None => format!("{}: {}", Sources::shown(&src), why.message),
             },
             ..why
         };
-        let shown = self.sources.shown(&src);
+        let shown = Sources::shown(&src);
         let is_locked = entry.is_some_and(|(item, _)| locked(item));
         match self.text(&src).map_err(fail)? {
             Some(old) => self.ensure_entry(drop_in, entry, &src, old, true),
@@ -509,7 +509,7 @@ impl<'a> Run<'a> {
                 let (changes, _) = changes(drop_in, &old, append);
                 if !changes.is_empty() {
                     let lines: Vec<&str> = changes.iter().map(|(_, l)| l.as_str()).collect();
-                    let shown = self.sources.shown(src);
+                    let shown = Sources::shown(src);
                     self.unresolved(item.shown_message(format!(
                         "{}: src {} must set {}",
                         item.label("files", i),
@@ -532,7 +532,7 @@ impl<'a> Run<'a> {
     /// Sets every directive of `drop_in` in `src`'s text `old` (appending
     /// missing ones when `append`), one suggestion per changed directive.
     fn ensure_src(&mut self, drop_in: &DropIn, src: &str, old: String, append: bool) {
-        let shown = self.sources.shown(src);
+        let shown = Sources::shown(src);
         let (changes, text) = changes(drop_in, &old, append);
         for (id, line) in changes {
             self.suggest(&[id], Action::Change, format!("{shown} {line}"));

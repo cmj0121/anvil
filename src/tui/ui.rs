@@ -962,7 +962,9 @@ fn plan_block(report: &PlanReport) -> Vec<Line<'static>> {
         PlanReport::Failed { error, .. } => {
             Line::from(format!("  ✘ {}", text(error))).style(Color::Red)
         }
-        PlanReport::Cancelled { .. } => Line::from("  ⊘ cancelled").style(Color::Red),
+        PlanReport::Cancelled { abort, .. } => {
+            Line::from(format!("  ⊘ {}", abort.text())).style(Color::Red)
+        }
     };
     lines.extend([end, Line::default()]);
     lines
@@ -1002,9 +1004,10 @@ fn local_block(local: &doctor::LocalReport) -> Vec<Line<'static>> {
         });
     }
     if let Some(record) = &local.record {
-        lines.push(match local.record_failed() {
-            false => row("record", record),
-            true => row("record", &format!("error: {record}")).style(Color::Red),
+        lines.push(if local.record_failed() {
+            row("record", &format!("error: {record}")).style(Color::Red)
+        } else {
+            row("record", record)
         });
     }
     if let Some(error) = &local.tag_key {
@@ -1027,8 +1030,8 @@ fn doctor_block(report: &doctor::TargetReport) -> Vec<Line<'static>> {
     for (key, value) in report.facts.iter().flat_map(doctor::fact_rows) {
         lines.push(row(key, &value));
     }
-    if let Some(manager) = &report.manager {
-        lines.push(row("manager", manager));
+    if let Some(manager) = report.manager {
+        lines.push(row("manager", manager.as_str()));
     }
     if let Some(packages) = &report.packages {
         let line = row("packages", packages);
@@ -1360,10 +1363,10 @@ mod tests {
 
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     use crossterm::event::KeyCode;
 
+    use crate::cancel::Cancel;
     use crate::tui::app::tests::{
         Store, app, cancelled, inventory, local_report, opts, probed, ran, row as step_row, step,
     };
@@ -1695,7 +1698,7 @@ mod tests {
         app.running = Some(Running {
             kind: RunKind::Apply,
             running: vec!["pi".to_owned()],
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(Cancel::new()),
             tick: 1,
         });
         let buf = buffer(&app, 80, 8);
@@ -1733,7 +1736,7 @@ mod tests {
         app.running = Some(Running {
             kind: RunKind::Apply,
             running: vec!["pi".to_owned(), "local".to_owned()],
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(Cancel::new()),
             tick: 1,
         });
         let buf = buffer(&app, 80, 8);
@@ -2245,7 +2248,7 @@ mod tests {
         app.running = Some(Running {
             kind: RunKind::Update,
             running: vec!["checking for an update".to_owned()],
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(Cancel::new()),
             tick: 0,
         });
         let screen = render(&app, 80, 6);
@@ -2312,7 +2315,7 @@ mod tests {
             app.running = (code == KeyCode::Esc).then(|| Running {
                 kind: RunKind::Apply,
                 running: Vec::new(),
-                cancel: Arc::new(AtomicBool::new(false)),
+                cancel: Arc::new(Cancel::new()),
                 tick: 0,
             });
             if code == KeyCode::Char(' ') {
@@ -2714,6 +2717,7 @@ mod tests {
                     PlanReport::Cancelled {
                         target: "mac".to_owned(),
                         ok: false,
+                        abort: apply::AbortReason::Cancelled,
                     },
                 ]),
                 ok: Some(false),
@@ -2831,7 +2835,7 @@ mod tests {
         app.running = Some(Running {
             kind: RunKind::Apply,
             running: vec!["pi\x1b".to_owned()],
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(Cancel::new()),
             tick: 11,
         });
         assert_eq!(
@@ -2912,7 +2916,7 @@ mod tests {
     fn the_doctor_view_shows_the_manager_after_the_facts() {
         let mut app = app();
         let mut pi = probed("pi", None);
-        pi.manager = Some("pacman".to_owned());
+        pi.manager = Some(crate::packages::Manager::Pacman);
         let mut mac = probed("mac", None);
         mac.manager_error = Some("no package manager found".to_owned());
         show(
@@ -3344,7 +3348,7 @@ mod tests {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", Some("down"))],
             ok: false,
-            cancelled: false,
+            abort: None,
         }));
         let rows = results(&shown, 12);
         assert_eq!(rows[0], "✔ local checks  ✔ pi  [✘ mac]");
@@ -3363,7 +3367,7 @@ mod tests {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", None)],
             ok: true,
-            cancelled: false,
+            abort: None,
         }));
         assert_eq!((older.shown, older.tab), (Some(0), 0));
         let rows = results(&older, 10);

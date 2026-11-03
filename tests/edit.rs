@@ -691,12 +691,11 @@ fn a_missing_configured_editor_fails_inventory_but_config_falls_back() {
 }
 
 #[test]
-fn a_stale_tmp_file_is_replaced_and_the_result_is_0600() {
+fn another_writers_tmp_file_is_left_alone_and_the_result_is_0600() {
     let sb = sandbox();
     fs::create_dir_all(sb.config_dir()).unwrap();
     let tmp = sb.config_dir().join("inventory.toml.tmp");
-    fs::write(&tmp, "stale").unwrap();
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&tmp, "another writer's").unwrap();
 
     let out = sb.edit(&["inventory"], Some(&fixture("inventory.toml")), None);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
@@ -709,7 +708,12 @@ fn a_stale_tmp_file_is_replaced_and_the_result_is_0600() {
         fs::read_to_string(&path).unwrap(),
         fs::read_to_string(fixture("inventory.toml")).unwrap()
     );
-    assert_eq!(sb.files(), ["inventory.toml"], "no .tmp left behind");
+    assert_eq!(fs::read_to_string(&tmp).unwrap(), "another writer's");
+    assert_eq!(
+        sb.files(),
+        ["inventory.toml", "inventory.toml.tmp"],
+        "no temp of this write is left"
+    );
 }
 
 #[test]

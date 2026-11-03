@@ -327,13 +327,16 @@ fn systemd(name: &str, state: ServiceState, enabled: Option<bool>, sudo: &str) -
         ServiceState::Stopped => "stop",
     };
     let verb_of = |on: bool| if on { "enable" } else { "disable" };
-    let enablement = enabled.map(|on| match on {
-        true => sc("enable"),
-        false => format!(
-            "if [ \"$e\" = runtime ]; then {}; else {}; fi",
-            sc("disable --runtime"),
-            sc("disable")
-        ),
+    let enablement = enabled.map(|on| {
+        if on {
+            sc("enable")
+        } else {
+            format!(
+                "if [ \"$e\" = runtime ]; then {}; else {}; fi",
+                sc("disable --runtime"),
+                sc("disable")
+            )
+        }
     });
     let both = match (enabled, state) {
         (Some(on @ true), ServiceState::Started) | (Some(on @ false), ServiceState::Stopped) => {

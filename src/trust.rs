@@ -12,13 +12,14 @@
 
 use std::fmt;
 use std::fs::{self, File, Metadata};
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
+use crate::bytes::{self, CappedError};
 use crate::logger::{escape_invisible, escape_line};
 
 /// The most links a path may go through, as Linux allows.
@@ -243,12 +244,10 @@ pub fn load(path: &Path, limit: u64) -> Result<Vec<u8>, TrustError> {
         return Err(too_large());
     }
     let mut bytes = Vec::with_capacity(meta.len() as usize + 1);
-    file.take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|err| TrustError::io(path, err))?;
-    if bytes.len() as u64 > limit {
-        return Err(too_large());
-    }
+    bytes::read_capped(file, limit, &mut bytes).map_err(|err| match err {
+        CappedError::Over { .. } => too_large(),
+        CappedError::Io(err) => TrustError::io(path, err),
+    })?;
     Ok(bytes)
 }
 
@@ -320,7 +319,6 @@ fn open_read(path: &Path, extra: OFlags) -> Result<File, Errno> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
-    use std::process::Command;
 
     use super::*;
     use crate::test_util::{chmod, temp_dir};
@@ -419,8 +417,7 @@ mod tests {
     fn a_fifo_is_refused_without_waiting_for_a_writer() {
         let root = temp_dir("trust-fifo");
         let fifo = root.join("config.toml");
-        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
-        assert!(made.success());
+        crate::test_util::mkfifo(&fifo);
         chmod(&fifo, 0o644);
         let message = refusal(load(&fifo, LIMIT));
         assert!(message.ends_with(": not a regular file"), "{message}");

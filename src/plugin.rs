@@ -37,11 +37,12 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::bytes;
 use crate::config::{Config, MAX_DEST_BYTES, MAX_FILES, Plugin};
 use crate::document::MAX_BYTES;
 use crate::exec;
 use crate::facts::Facts;
-use crate::files::{self, FileState};
+use crate::files::FileState;
 use crate::logger::{escape_controls, is_invisible};
 use crate::secret::shown_name;
 use crate::transport::{Groups, TransportError, collect_tracked};
@@ -131,7 +132,7 @@ pub struct Pin {
 }
 
 /// Every `[plugins]` entry, verified, by name.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Pins(BTreeMap<String, Pin>);
 
 /// Checks the `[plugins]` entries `keep` accepts, in name order; the first
@@ -200,15 +201,9 @@ fn hash(file: &mut impl Read, limit: u64) -> io::Result<String> {
     let mut hasher = Sha256::new();
     let read = io::copy(&mut file.take(limit + 1), &mut hasher)?;
     if read > limit {
-        return Err(io::Error::other(format!(
-            "larger than the {limit} byte limit"
-        )));
+        return Err(io::Error::other(bytes::too_large(limit)));
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(bytes::hex(&hasher.finalize()))
 }
 
 /// Right before a spawn: the file at `pin.real` must still be the one that
@@ -581,14 +576,14 @@ fn has_hex_run(s: &str) -> bool {
 /// A doctor run's key for [`tag`]: 32 bytes of `/dev/urandom`.
 pub fn tag_key() -> io::Result<Zeroizing<[u8; 32]>> {
     let mut key = Zeroizing::new([0; 32]);
-    fs::File::open("/dev/urandom")?.read_exact(&mut key[..])?;
+    bytes::fill_random(&mut key[..])?;
     Ok(key)
 }
 
 /// What a doctor plugin sees in place of the sha256 `sha256_hex`: the
 /// lowercase hex HMAC-SHA256 of it under this run's `key`.
 pub fn tag(key: &[u8; 32], sha256_hex: &str) -> String {
-    files::hex(&hmac_sha256(key, sha256_hex.as_bytes()))
+    bytes::hex(&hmac_sha256(key, sha256_hex.as_bytes()))
 }
 
 /// HMAC-SHA256 (RFC 2104) of `message` under `key`.
@@ -733,11 +728,7 @@ mod tests {
         assert!(err.starts_with(&shown(&missing)), "{err}");
 
         let fifo = root.join("plugins/fifo");
-        let made = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(made.success());
+        crate::test_util::mkfifo(&fifo);
         chmod(&fifo, 0o700);
         let err = verify_step(&config(&fifo, &body_sha())).unwrap_err();
         assert_eq!(err, format!("{}not a regular file", shown(&fifo)));

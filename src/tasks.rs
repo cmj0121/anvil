@@ -82,9 +82,10 @@ impl Expanded {
         fn parts(dest: &str) -> impl Iterator<Item = &str> {
             dest.split('/').filter(|part| !part.is_empty())
         }
-        match self.from_tasks {
-            true => parts(a).eq(parts(b)),
-            false => a == b,
+        if self.from_tasks {
+            parts(a).eq(parts(b))
+        } else {
+            a == b
         }
     }
 

@@ -294,6 +294,15 @@ impl Failure {
             refused: false,
         }
     }
+
+    /// `self` with the exit status of the signal that ended the run, when
+    /// `abort` is one's and `self` is a code 1 failure; else `self`.
+    pub fn ended_by(self, abort: Option<crate::cancel::AbortReason>) -> Failure {
+        match abort.and_then(crate::cancel::AbortReason::exit_code) {
+            Some(code) if self.code == 1 => Failure { code, ..self },
+            _ => self,
+        }
+    }
 }
 
 // Config, inventory and path problems are exit 2.
@@ -408,6 +417,24 @@ mod tests {
 
     fn command(args: &[&str]) -> Command {
         parse(args).command.unwrap()
+    }
+
+    #[test]
+    fn ended_by_a_signal_maps_only_a_code_1_failure() {
+        use crate::cancel::AbortReason;
+        let code = |failure: Failure, abort| failure.ended_by(abort).code;
+        assert_eq!(
+            code(Failure::failed("x"), Some(AbortReason::Terminated)),
+            143
+        );
+        assert_eq!(code(Failure::failed("x"), Some(AbortReason::HungUp)), 129);
+        assert_eq!(code(Failure::failed("x"), Some(AbortReason::Cancelled)), 1);
+        assert_eq!(code(Failure::failed("x"), Some(AbortReason::SaveFailed)), 1);
+        assert_eq!(code(Failure::failed("x"), None), 1);
+        assert_eq!(code(Failure::usage("x"), Some(AbortReason::Terminated)), 2);
+        let failure =
+            Failure::failed("apply: 1 of 2 targets failed").ended_by(Some(AbortReason::HungUp));
+        assert_eq!(failure.message, "apply: 1 of 2 targets failed");
     }
 
     #[test]

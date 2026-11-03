@@ -9,7 +9,7 @@
 use std::cmp::Ordering;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File};
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::bytes::{self, CappedError};
 use crate::exec;
 use crate::plugin::last_line;
 use crate::secret::shown_name;
@@ -184,13 +185,11 @@ impl Stage {
     /// cannot be guessed ahead; there is no weaker fallback.
     pub fn new() -> io::Result<Stage> {
         const ATTEMPTS: u32 = 16;
-        let mut urandom = File::open("/dev/urandom")?;
         let mut last = None;
         for _ in 0..ATTEMPTS {
-            let mut bytes = [0u8; 8];
-            urandom.read_exact(&mut bytes)?;
-            let suffix: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-            let dir = std::env::temp_dir().join(format!("anvil-update-{suffix}"));
+            let mut suffix = [0u8; 8];
+            bytes::fill_random(&mut suffix)?;
+            let dir = std::env::temp_dir().join(format!("anvil-update-{}", bytes::hex(&suffix)));
             match DirBuilder::new().mode(0o700).create(&dir) {
                 Ok(()) => return Ok(Stage { dir }),
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => last = Some(err),
@@ -427,10 +426,11 @@ fn read_capped(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
         Err(err) => return Err(format!("cannot read {}: {err}", path.display())),
     };
     let mut bytes = Vec::new();
-    file.take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    Ok((bytes.len() as u64 <= limit).then_some(bytes))
+    match bytes::read_capped(file, limit, &mut bytes) {
+        Ok(()) => Ok(Some(bytes)),
+        Err(CappedError::Over { .. }) => Ok(None),
+        Err(CappedError::Io(err)) => Err(format!("cannot read {}: {err}", path.display())),
+    }
 }
 
 /// The last header block of `-D` output: one per response when redirected.

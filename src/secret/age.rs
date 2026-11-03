@@ -25,6 +25,7 @@ use zeroize::Zeroizing;
 use super::file_store::{Codec, FileBacked, open_key};
 use super::prompt::{self, PromptError};
 use super::{BackendKind, SecretError};
+use crate::bytes;
 
 /// The largest store file read, in bytes of ciphertext.
 const STORE_LIMIT: u64 = 1 << 20;
@@ -60,15 +61,10 @@ impl AgeStore {
     /// The identity file's bytes, once it passes the ownership and
     /// permission checks.
     fn read_identity(&self) -> Result<Zeroizing<Vec<u8>>, SecretError> {
-        let io = |err: io::Error| self.identity_error(err.to_string());
         let (_, file, _) = open_key(&self.identity)?;
         let mut bytes = Zeroizing::new(Vec::with_capacity(IDENTITY_LIMIT as usize + 1));
-        file.take(IDENTITY_LIMIT + 1)
-            .read_to_end(&mut bytes)
-            .map_err(io)?;
-        if bytes.len() as u64 > IDENTITY_LIMIT {
-            return Err(self.identity_error(format!("larger than the {IDENTITY_LIMIT} byte limit")));
-        }
+        bytes::read_capped(file, IDENTITY_LIMIT, &mut bytes)
+            .map_err(|err| self.identity_error(err.to_string()))?;
         Ok(bytes)
     }
 
@@ -240,7 +236,7 @@ impl Codec for AgeCodec<'_> {
         let armor = ArmoredWriter::wrap_output(Vec::new(), Format::AsciiArmor).map_err(io)?;
         let mut writer = encryptor.wrap_output(armor).map_err(io)?;
         writer.write_all(plaintext).map_err(io)?;
-        writer.finish().and_then(|armor| armor.finish()).map_err(io)
+        writer.finish().and_then(ArmoredWriter::finish).map_err(io)
     }
 }
 
@@ -276,7 +272,6 @@ fn encrypt_error(path: &Path, err: EncryptError) -> SecretError {
 mod tests {
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use age::secrecy::ExposeSecret;
@@ -370,9 +365,7 @@ mod tests {
             .starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----\n")
     }
 
-    fn right() -> Result<SecretString, PromptError> {
-        Ok(SecretString::from(PASSPHRASE))
-    }
+    const RIGHT: Reply = || Ok(SecretString::from(PASSPHRASE));
 
     fn round_trip(store: &AgeStore) {
         let mut vault = store.open().unwrap();
@@ -411,7 +404,7 @@ mod tests {
         let identity = root.join("key.age");
         passphrase_identity(&identity);
         let path = root.join("secrets.age");
-        let (store, asked) = store_with(path.clone(), identity.clone(), right);
+        let (store, asked) = store_with(path.clone(), identity.clone(), RIGHT);
 
         round_trip(&store);
         assert_eq!(asked.load(Ordering::Relaxed), 2, "one prompt per open");
@@ -425,7 +418,7 @@ mod tests {
         let root = temp_dir("age-locked");
         let identity = root.join("key.age");
         passphrase_identity(&identity);
-        let (mut store, asked) = store_with(root.join("secrets.age"), identity, right);
+        let (mut store, asked) = store_with(root.join("secrets.age"), identity, RIGHT);
         store.tty = || false;
         assert!(matches!(store.open().err().unwrap(), SecretError::Locked));
         assert_eq!(asked.load(Ordering::Relaxed), 0);
@@ -445,7 +438,7 @@ mod tests {
         passphrase_identity(&identity);
         let path = root.join("secrets.age");
         fs::write(&path, "not an age file").unwrap();
-        let (mut store, asked) = store_with(path.clone(), identity, right);
+        let (mut store, asked) = store_with(path.clone(), identity, RIGHT);
         assert!(store.open().is_err(), "the junk does not decrypt");
 
         let vault = store.replace().unwrap();
@@ -562,13 +555,7 @@ mod tests {
         );
         // Refused, not waited on for a writer.
         let fifo = root.join("fifo");
-        assert!(
-            Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap()
-                .success()
-        );
+        crate::test_util::mkfifo(&fifo);
         fs::set_permissions(&fifo, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
             open(&fifo),

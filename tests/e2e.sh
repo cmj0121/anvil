@@ -177,6 +177,21 @@ run_env() {
 # The permission bits of a local path in octal: GNU stat, else BSD stat.
 local_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 
+# Every process on the sshd container, one command line per line, its
+# arguments joined by spaces (plus one at the end). From /proc: no procps there.
+remote_ps() {
+  docker exec "$NAME" sh -c 'for f in /proc/[0-9]*/cmdline; do tr "\000" " " <"$f"; echo; done' 2>/dev/null
+}
+# gone_within SECS ERE: whether no process on the sshd container matches ERE
+# within SECS seconds.
+gone_within() {
+  gone_end=$(($(date +%s) + $1))
+  while remote_ps | grep -Eq "$2"; do
+    [ "$(date +%s)" -lt "$gone_end" ] || { remote_ps | grep -E "$2"; return 1; }
+    sleep 0.25
+  done
+}
+
 # anvil with stdin not a tty; stdout and stderr captured.
 anvil() {
   run_env "$ANVIL" --ssh-config "$CFG" "$@" </dev/null >"$TMP/out" 2>"$TMP/err"
@@ -660,6 +675,89 @@ else
   fail "rollback over a 0600 previous: exit $code"
 fi
 
+step "(u) a timed-out plain run dies on arch, without timeout(1) there; a step reading stdin ends at once"
+U_DIR="$TMP/remote-kill"
+U_STATE="$TMP/state-u"
+U_RECORD="$U_STATE/anvil/last-apply.json"
+mkdir -p "$U_DIR"
+docker exec "$NAME" mv /usr/bin/timeout /usr/bin/timeout.anvil-e2e
+printf 'sleep 312\n' >"$U_DIR/sleep.sh"
+anvil run --timeout 2 --target arch "$U_DIR/sleep.sh"
+code=$?
+if [ "$code" -eq 1 ] && grep -qF 'timed out after 2 s' "$TMP/out" && gone_within 5 '^sleep 312 $'; then
+  pass "no sleep 312 on arch within 5 s of the timeout"
+else
+  fail "a timed-out run on arch: exit $code"
+fi
+printf 'sudo -n sh -c "sleep 313 & sleep 314"\n' >"$U_DIR/sudo-sleep.sh"
+anvil run --timeout 2 --target arch "$U_DIR/sudo-sleep.sh"
+code=$?
+if [ "$code" -eq 1 ] && grep -qF 'timed out after 2 s' "$TMP/out" && gone_within 5 '^sleep 31[34] $'; then
+  pass "no root sleep 313 or 314 on arch within 5 s of the timeout"
+else
+  fail "a timed-out sudo run on arch: exit $code"
+fi
+docker exec "$NAME" sh -c 'echo "Defaults use_pty" >/etc/sudoers.d/zz-anvil-e2e-pty && chmod 0440 /etc/sudoers.d/zz-anvil-e2e-pty'
+printf 'sudo -n sh -c "sleep 317 & sleep 318"\n' >"$U_DIR/sudo-pty-sleep.sh"
+anvil run --timeout 2 --target arch "$U_DIR/sudo-pty-sleep.sh"
+code=$?
+docker exec "$NAME" rm -f /etc/sudoers.d/zz-anvil-e2e-pty
+if [ "$code" -eq 1 ] && grep -qF 'timed out after 2 s' "$TMP/out" && gone_within 5 '^sleep 31[78] $'; then
+  pass "with use_pty set, no root sleep 317 or 318 on arch within 5 s of the timeout"
+else
+  fail "a timed-out sudo run on arch with use_pty: exit $code"
+fi
+docker exec "$NAME" mv /usr/bin/timeout.anvil-e2e /usr/bin/timeout
+printf 'cat; echo done\n' >"$U_DIR/cat.sh"
+started=$(date +%s)
+anvil -vv run --timeout 5 --target arch "$U_DIR/cat.sh"
+code=$?
+# Whole seconds: 2 still means well inside the 5 s timeout.
+if [ "$code" -eq 0 ] && grep -qxF '  done' "$TMP/out" && [ "$(($(date +%s) - started))" -le 2 ]; then
+  pass "cat got EOF at once, done printed"
+else
+  fail "cat; echo done on arch: exit $code"
+fi
+# A write whose tee is still running at the 30 s timeout: tee sleeps first.
+printf 'new = "anvil-e2e-tee-%s"\n' "$$" >"$U_DIR/new.conf"
+cat >"$U_DIR/config.toml" <<CONF
+[[files]]
+src = "new.conf"
+dest = "/etc/anvil-e2e-tee"
+mode = "0644"
+CONF
+u_anvil() {
+  run_env XDG_STATE_HOME="$U_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" \
+    --config "$U_DIR/config.toml" "$@" </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+U_OLD="anvil-e2e-tee-previous-$$"
+docker exec "$NAME" sh -c "printf '%s\n' '$U_OLD' >/etc/anvil-e2e-tee && chmod 644 /etc/anvil-e2e-tee"
+docker exec -i "$NAME" sh -c 'cat >/usr/local/bin/tee && chmod 755 /usr/local/bin/tee' <<'STUB'
+#!/bin/sh
+sleep 300
+exec /usr/bin/tee "$@"
+STUB
+step "(u) a write whose tee still runs at the 30 s timeout leaves nothing running or written"
+u_anvil apply --target arch
+code=$?
+if [ "$code" -eq 1 ] && gone_within 5 '^sleep 300 $|/usr/local/bin/tee|^(/usr/bin/)?tee ' \
+  && [ -z "$(docker exec "$NAME" sh -c 'ls -A /etc | grep "^\.anvil-"')" ] \
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-tee)" = "$U_OLD" ] \
+  && grep -qE '"dest":"/etc/anvil-e2e-tee",[^}]*"write":"failed_midway"' "$U_RECORD"; then
+  pass "no tee or sleep left, no temp beside DEST, DEST unchanged, recorded failed_midway"
+else
+  fail "a write timed out in tee: exit $code"
+  docker exec "$NAME" ls -A /etc | grep '^\.anvil-'
+fi
+docker exec "$NAME" rm -f /usr/local/bin/tee
+u_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-tee)" = "$U_OLD" ]; then
+  pass "rollback after the timed-out write succeeds without --force"
+else
+  fail "rollback after the timed-out write: exit $code"
+fi
+
 step "(r) [[tasks]] on arch: nested and included tasks run in order, a selector skips one, rollback restores the files"
 # A workspace and state dir of their own, so the record holds only this block's apply.
 TK_STATE="$TMP/state-tasks"
@@ -854,13 +952,15 @@ if docker run -d --rm --platform "$PLATFORM" --name "$ALP_NAME" --label anvil-e2
   --label "anvil-e2e.pid=$$" --network none --cap-drop ALL "$ALPINE" sleep 600 \
   >/dev/null 2>"$TMP/err"; then
   # An ssh for the container, given to the debug build's --ssh-program: every
-  # control command and master succeeds, a client runs its script there as root.
+  # control command and master succeeds, a client runs its remote command there
+  # as root, so busybox sh runs the wrapper.
   cat >"$ALP_DIR/ssh" <<SH
 #!/bin/sh
 for arg in "\$@"; do
   case "\$arg" in -O | -M) exit 0 ;; esac
 done
-exec docker exec -i "$ALP_NAME" sh -s
+for remote in "\$@"; do :; done
+exec docker exec -i "$ALP_NAME" sh -c "\$remote"
 SH
   chmod 755 "$ALP_DIR/ssh"
   printf '[hosts.alpine]\nhost = "alpine.invalid"\n' >"$ALP_DIR/inventory.toml"
@@ -1127,6 +1227,9 @@ CONF
   else
     fail "doctor with anvil-audit on archpw: exit $code"
   fi
+  # Known gap (#92 covers plain runs only): a tty run (the password path's
+  # install, packages with a password) relies on the pty closing, and a root
+  # command under sudo with use_pty outlives the timeout, so it is not checked.
   SUDO_CONFIG_USED=$SUDO_CONFIG
   # One wrong attempt only, and last: pam_faillock locks pw after three.
   sudo_anvil apply --json --target archbad

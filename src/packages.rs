@@ -760,7 +760,7 @@ mod tests {
 
     fn packages(install: &[&str], upgrade: bool) -> Packages {
         Packages {
-            install: install.iter().map(|s| s.to_string()).collect(),
+            install: install.iter().map(ToString::to_string).collect(),
             upgrade,
             ..Packages::default()
         }

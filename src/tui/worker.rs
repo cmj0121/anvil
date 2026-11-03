@@ -6,16 +6,17 @@
 
 use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::app::{self, Job, Msg};
+use crate::cancel::Cancel;
 use crate::cli::Failure;
 use crate::files::{Force, Wording};
 use crate::inventory::Target;
 use crate::options::Options;
+use crate::prepared::Prepared;
 use crate::{apply, doctor, fanout, plan, rollback, run, update};
 
 /// A run in progress; [`Worker::join`] waits for it, which is quick once
@@ -34,15 +35,16 @@ impl Worker {
 }
 
 /// Starts `job` with `opts` (its targets already selected); `cancel` stops
-/// apply and run between targets and steps, and plan between targets.
-pub fn spawn(job: Job, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) -> Worker {
-    let opts = job_opts(&job, opts, &cancel);
+/// apply and run between targets and steps, plan between targets, and
+/// doctor between targets and plugins; ssh checks it before opening a
+/// master. An update ignores it.
+pub fn spawn(job: Job, opts: Options, cancel: Arc<Cancel>, tx: Sender<Msg>) -> Worker {
     match job {
         Job::Doctor => spawn_job(tx, move |tx| run_doctor(&opts, &cancel, tx)),
-        Job::Apply => spawn_job(tx, move |tx| run_apply(&opts, tx)),
-        Job::Plan => spawn_job(tx, move |tx| run_plan(&opts, tx)),
-        Job::Run(script) => spawn_job(tx, move |tx| run_script(&opts, script, tx)),
-        Job::Rollback => spawn_job(tx, move |tx| run_rollback(&opts, tx)),
+        Job::Apply => spawn_job(tx, move |tx| run_apply(&opts, cancel, tx)),
+        Job::Plan => spawn_job(tx, move |tx| run_plan(&opts, cancel, tx)),
+        Job::Run(script) => spawn_job(tx, move |tx| run_script(&opts, cancel, script, tx)),
+        Job::Rollback => spawn_job(tx, move |tx| run_rollback(&opts, cancel, tx)),
         // curl, tar and the smoke run capture their output and read no
         // stdin, so nothing reaches the screen.
         Job::UpdateCheck => spawn_task(tx, move |_| {
@@ -56,15 +58,6 @@ pub fn spawn(job: Job, opts: Options, cancel: Arc<AtomicBool>, tx: Sender<Msg>) 
             )
         }),
     }
-}
-
-/// `opts` as `job` runs with them: apply, plan, run and rollback carry
-/// `cancel`, which ssh checks before opening a master.
-fn job_opts(job: &Job, mut opts: Options, cancel: &Arc<AtomicBool>) -> Options {
-    if matches!(job, Job::Apply | Job::Plan | Job::Run(_) | Job::Rollback) {
-        opts.cancel = Arc::clone(cancel);
-    }
-    opts
 }
 
 thread_local! {
@@ -107,7 +100,7 @@ fn spawn_task(tx: Sender<Msg>, task: impl FnOnce(&Sender<Msg>) -> Msg + Send + '
 /// The config and the secret store are opened here, on the worker, so an
 /// age passphrase prompt goes through the terminal handoff. `cancel` stops
 /// doctor between targets and plugins.
-fn run_doctor(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(), Failure> {
+fn run_doctor(opts: &Options, cancel: &Arc<Cancel>, tx: &Sender<Msg>) -> Result<(), Failure> {
     let (config, expanded) = opts.load_expanded()?;
     let store = opts.secret_store(&config)?;
     let on = &mut |progress: doctor::Progress<'_>| {
@@ -125,27 +118,29 @@ fn run_doctor(opts: &Options, cancel: &AtomicBool, tx: &Sender<Msg>) -> Result<(
 }
 
 /// As [`run_doctor`]: the config, and the secret store when a target types a
-/// sudo password (in [`apply::run_targets`]), are opened here, on the worker.
+/// sudo password (in [`Prepared::apply`]), are opened here, on the worker.
 /// The steps sent are this config's, which may be newer than the app's.
-fn run_apply(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
+fn run_apply(opts: &Options, cancel: Arc<Cancel>, tx: &Sender<Msg>) -> Result<(), Failure> {
     let (config, expanded) = opts.load_expanded()?;
     let _ = tx.send(Msg::Steps(app::step_rows(&expanded)));
-    let report = apply::run_targets(opts, &config, &expanded, &mut send_progress(tx))?;
+    let prepared = Prepared::apply(opts, config, expanded, cancel)?;
+    let report = apply::run_targets(&prepared, &mut send_progress(tx))?;
     report_done(tx, "apply", report)
 }
 
 /// As `anvil rollback` with no force and no host change allowed, the
 /// conflicts worded for the TUI; the secret store, when a recorded file
 /// went through sudo, is opened here, on the worker.
-fn run_rollback(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
+fn run_rollback(opts: &Options, cancel: Arc<Cancel>, tx: &Sender<Msg>) -> Result<(), Failure> {
     let (config, expanded) = rollback::load(opts)?;
     let report = rollback::run_targets(
         opts,
-        &config,
-        &expanded,
+        config,
+        expanded,
         &Force::None,
         false,
         Wording::Tui,
+        cancel,
         &mut send_progress(tx),
     )?;
     report_done(tx, "rollback", report)
@@ -180,18 +175,25 @@ fn names(targets: &[Target]) -> Vec<String> {
 
 /// As `anvil run`: no config and no secret store, the default timeout. The
 /// one step sent is the script, as its `$` line shows it.
-fn run_script(opts: &Options, script: String, tx: &Sender<Msg>) -> Result<(), Failure> {
+fn run_script(
+    opts: &Options,
+    cancel: Arc<Cancel>,
+    script: String,
+    tx: &Sender<Msg>,
+) -> Result<(), Failure> {
     let label = apply::command(&script);
     let _ = tx.send(Msg::Steps(vec![app::StepRow { label }]));
     let timeout = Duration::from_secs(run::DEFAULT_TIMEOUT);
-    run::run_targets(opts, script, timeout, &mut send_progress(tx))?;
+    let prepared = Prepared::run(opts, cancel)?;
+    run::run_targets(&prepared, script, timeout, &mut send_progress(tx));
     Ok(())
 }
 
 /// Plan opens no secret store; the steps pane keeps the app's list.
-fn run_plan(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
+fn run_plan(opts: &Options, cancel: Arc<Cancel>, tx: &Sender<Msg>) -> Result<(), Failure> {
     let (config, expanded) = opts.load_expanded()?;
-    plan::run_targets(opts, &config, &expanded, &mut |progress| {
+    let prepared = Prepared::plan(opts, config, expanded, cancel)?;
+    plan::run_targets(&prepared, &mut |progress| {
         let msg = match progress {
             plan::Progress::Begin(targets) => Msg::Begin(names(targets)),
             plan::Progress::Start(target) => Msg::Start(target.name.clone()),
@@ -199,7 +201,7 @@ fn run_plan(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
             plan::Progress::Ordered(_) => return,
         };
         let _ = tx.send(msg);
-    })?;
+    });
     Ok(())
 }
 
@@ -212,6 +214,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
+    use crate::cancel::AbortReason;
     use crate::test_util::{temp_dir, wait_for};
     use crate::tui::app::tests::{opts, row};
     use crate::tui::app::{App, RunResult};
@@ -276,8 +279,9 @@ mod tests {
     const REFUSED: &str = "ssh: connect to host down.example port 22: Connection refused";
 
     /// Options for hosts `up` and `down` reached through
-    /// tests/fixtures/fake-ssh.sh: `up` connects and runs the script with
-    /// `sh -s`; `down`'s key attempt is refused. A wrapper sets the fake's
+    /// tests/fixtures/fake-ssh.sh: `up` connects and runs the remote command
+    /// (its last argument) with `/bin/sh -c` in a process group of its own;
+    /// `down`'s key attempt is refused. A wrapper sets the fake's
     /// knobs per host; the control directory lives under the temp dir.
     #[cfg(debug_assertions)]
     fn fake_ssh_opts(tag: &str, runs: &[&str]) -> Options {
@@ -347,7 +351,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let opts = fake_ssh_opts("tw-a", &["printf 'hi\\n'"]);
         let control = opts.ssh_home.clone().unwrap().join(".ssh/anvil");
-        let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Apply, opts, Arc::new(Cancel::new()), tx);
         let msgs = collect(worker, &rx);
         assert!(control.is_dir(), "ssh runs under the temp home");
         assert_eq!(
@@ -398,7 +402,7 @@ mod tests {
     fn doctor_over_fake_ssh_reports_each_host_in_order() {
         let (tx, rx) = mpsc::channel();
         let opts = fake_ssh_opts("tw-d", &[]);
-        let worker = spawn(Job::Doctor, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Doctor, opts, Arc::new(Cancel::new()), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(
             order(&msgs),
@@ -430,7 +434,7 @@ mod tests {
     fn apply_sends_its_steps_start_the_target_report_then_finished() {
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-apply", &["printf 'hi\\n'"]);
-        let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Apply, opts, Arc::new(Cancel::new()), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(msgs.len(), 5);
         assert!(matches!(&msgs[0], Msg::Steps(rows) if rows[..] == [row("printf 'hi\\n'")]));
@@ -460,7 +464,7 @@ mod tests {
         let worker = spawn(
             Job::Run(script.to_owned()),
             opts,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(Cancel::new()),
             tx,
         );
         let msgs = collect(worker, &rx);
@@ -486,7 +490,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-run-cancel", &[]);
-        let cancel = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(Cancel::cancelled());
         let worker = spawn(Job::Run("true".to_owned()), opts, cancel, tx);
         assert!(matches!(
             &collect(worker, &rx)[3],
@@ -498,7 +502,7 @@ mod tests {
     fn a_set_cancel_flag_ends_the_doctor_targets_cancelled() {
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-doctor-cancel", &[]);
-        let worker = spawn(Job::Doctor, opts, Arc::new(AtomicBool::new(true)), tx);
+        let worker = spawn(Job::Doctor, opts, Arc::new(Cancel::cancelled()), tx);
         let msgs = collect(worker, &rx);
         let report = msgs
             .iter()
@@ -507,7 +511,7 @@ mod tests {
                 _ => None,
             })
             .expect("doctor ends with its report");
-        assert!(report.cancelled && !report.ok);
+        assert!(report.abort == Some(AbortReason::Cancelled) && !report.ok);
         assert_eq!(report.targets[0].error.as_deref(), Some("cancelled"));
     }
 
@@ -522,7 +526,7 @@ mod tests {
             format!("[[steps]]\nrun = \"touch {}\"\n", ran.display()),
         )
         .unwrap();
-        let worker = spawn(Job::Plan, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Plan, opts, Arc::new(Cancel::new()), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(msgs.len(), 4);
         assert!(matches!(&msgs[0], Msg::Begin(names) if names[..] == ["local"]));
@@ -539,7 +543,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-plan-cancel", &["true"]);
-        let worker = spawn(Job::Plan, opts, Arc::new(AtomicBool::new(true)), tx);
+        let worker = spawn(Job::Plan, opts, Arc::new(Cancel::cancelled()), tx);
         let msgs = collect(worker, &rx);
         assert!(matches!(
             &msgs[2],
@@ -551,7 +555,7 @@ mod tests {
     fn a_set_cancel_flag_cancels_the_target() {
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-cancel", &["printf hi"]);
-        let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(true)), tx);
+        let worker = spawn(Job::Apply, opts, Arc::new(Cancel::cancelled()), tx);
         let msgs = collect(worker, &rx);
         assert!(matches!(
             &msgs[3],
@@ -591,24 +595,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn apply_plan_and_run_carry_the_cancel_flag_and_the_parallel_count() {
-        let cancel = Arc::new(AtomicBool::new(false));
-        for job in [
-            Job::Apply,
-            Job::Plan,
-            Job::Run("true".to_owned()),
-            Job::Doctor,
-        ] {
-            let mut opts = opts();
-            opts.parallel = std::num::NonZeroU8::new(4).unwrap();
-            let opts = job_opts(&job, opts, &cancel);
-            assert_eq!(opts.parallel.get(), 4);
-            let carried = Arc::ptr_eq(&opts.cancel, &cancel);
-            assert_eq!(carried, !matches!(job, Job::Doctor));
-        }
-    }
-
     #[cfg(debug_assertions)]
     #[test]
     fn a_cancelled_plan_reaches_the_ssh_check_of_its_probe() {
@@ -621,10 +607,10 @@ mod tests {
             &[("FAKE_SSH_GATE", gate.to_str().unwrap())],
         );
         let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::new());
         let worker = spawn(Job::Plan, opts, Arc::clone(&cancel), tx);
         wait_for(&home.join("gate.wait"));
-        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        cancel.stop(AbortReason::Cancelled);
         fs::write(&gate, "").unwrap();
         let msgs = collect(worker, &rx);
         assert!(
@@ -638,7 +624,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut opts = local_opts("tui-worker-fail", &[]);
         opts.target = vec!["nosuch".to_owned()];
-        let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Apply, opts, Arc::new(Cancel::new()), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(msgs.len(), 2);
         assert!(matches!(&msgs[0], Msg::Steps(_)));
@@ -650,7 +636,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let opts = local_opts("tui-worker-badconfig", &[]);
         fs::write(opts.config.as_ref().unwrap(), "[[steps]]\nnope = 1\n").unwrap();
-        let worker = spawn(Job::Apply, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Apply, opts, Arc::new(Cancel::new()), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(&msgs[0], Msg::Finished(Err(_))));
@@ -691,7 +677,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut opts = local_opts("tui-worker-doctor", &[]);
         opts.secret_store = Some(crate::options::SecretStoreKind::Memory);
-        let worker = spawn(Job::Doctor, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::Doctor, opts, Arc::new(Cancel::new()), tx);
         let msgs = collect(worker, &rx);
         assert_eq!(msgs.len(), 4);
         assert!(matches!(&msgs[0], Msg::Start(name) if name == "local"));
@@ -722,7 +708,7 @@ mod tests {
         let mut opts = opts();
         opts.release_url = Some(format!("http://127.0.0.1:{port}"));
         let (tx, rx) = mpsc::channel();
-        let worker = spawn(Job::UpdateCheck, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(Job::UpdateCheck, opts, Arc::new(Cancel::new()), tx);
         match only_msg(worker, &rx) {
             Msg::UpdateChecked(Err(err)) => assert!(err.starts_with("anvil update: "), "{err}"),
             _ => panic!("expected a failed check"),
@@ -736,7 +722,7 @@ mod tests {
         opts.release_keys = vec![temp_dir("tui-worker-update").join("missing.pub")];
         let (tx, rx) = mpsc::channel();
         let job = Job::Update("0.2.0".to_owned());
-        let worker = spawn(job, opts, Arc::new(AtomicBool::new(false)), tx);
+        let worker = spawn(job, opts, Arc::new(Cancel::new()), tx);
         match only_msg(worker, &rx) {
             Msg::Updated(Err(err)) => {
                 assert!(err.starts_with("anvil update: --release-key: "), "{err}");

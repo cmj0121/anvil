@@ -5,7 +5,7 @@ use rustix::io::Errno;
 use std::fmt;
 use std::fs;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -259,7 +259,7 @@ impl Root {
         }
         let (dir, name) = self.parent(&rel, true)?;
         check_at(&dir, &name, &rel, force)?;
-        atomic_at(&dir, &name, bytes, 0o600).map_err(|e| io_error(&rel, e))
+        private::write_atomic_at(&dir, &name, bytes, None).map_err(|e| io_error(&rel, e))
     }
 
     fn directory(&self, rel: &str, create: bool) -> Result<File, StoreError> {
@@ -514,7 +514,7 @@ pub fn write_beneath(dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), StoreErr
         Err(Errno::NOENT) => 0o600,
         Err(e) => return Err(fd_error(rel, e)),
     };
-    atomic_at(&at_dir, name, bytes, mode).map_err(|e| io_error(rel, e))
+    private::write_atomic_at(&at_dir, name, bytes, Some(mode)).map_err(|e| io_error(rel, e))
 }
 
 /// Whether a host destination lies in a source directory, including host aliases.
@@ -707,11 +707,11 @@ fn export_into(
             )
             .map_err(|e| host_error(host, e))?;
             let content = read_file(source, rel)?;
-            atomic_at(
+            private::write_atomic_at(
                 parent,
                 name,
                 content.as_bytes(),
-                meta.permissions().mode() & 0o755,
+                Some(meta.permissions().mode() & 0o755),
             )
             .map_err(|e| host_io_error(host, e))?;
             changed.push(shown(rel));
@@ -861,42 +861,6 @@ fn check_at(dir: &File, name: &str, rel: &str, force: bool) -> Result<(), StoreE
         Err(Errno::NOENT) => Ok(()),
         Err(e) => Err(fd_error(rel, e)),
     }
-}
-
-fn atomic_at(
-    dir: &File,
-    name: impl AsRef<std::ffi::OsStr>,
-    bytes: &[u8],
-    mode: u32,
-) -> io::Result<()> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let (tmp, mut file) = loop {
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = format!(".anvil-{}-{n}", std::process::id());
-        if name.as_ref() == std::ffi::OsStr::new(&tmp) {
-            continue;
-        }
-        match at::openat(
-            dir,
-            &tmp,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(mode as _),
-        ) {
-            Ok(fd) => break (tmp, File::from(fd)),
-            Err(Errno::EXIST) => continue,
-            Err(e) => return Err(e.into()),
-        }
-    };
-    let result = (|| {
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        at::renameat(dir, &tmp, dir, name.as_ref()).map_err(io::Error::from)
-    })();
-    if result.is_err() {
-        let _ = at::unlinkat(dir, &tmp, AtFlags::empty());
-    }
-    result
 }
 
 fn host_error(path: &Path, err: StoreError) -> StoreError {
@@ -1212,7 +1176,7 @@ mod tests {
             .unwrap(),
             "inside"
         );
-        atomic_at(&dir, &name, b"updated", 0o600).unwrap();
+        private::write_atomic_at(&dir, &name, b"updated", None).unwrap();
         at::mkdirat(&dir, "sub", Mode::from_raw_mode(0o700)).unwrap();
         at::renameat(&dir, &name, &dir, "renamed").unwrap();
         remove_at(&dir, "renamed", "parent/renamed", false, 1).unwrap();
@@ -1762,13 +1726,7 @@ mod tests {
         let root = &store.1;
         root.mkdir("").unwrap();
         let fifo = root.path().join("fifo");
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap()
-                .success()
-        );
+        crate::test_util::mkfifo(&fifo);
         assert!(matches!(
             root.read_text("fifo"),
             Err(StoreError::NotText(_))

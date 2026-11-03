@@ -80,7 +80,8 @@ anvil run --parallel 4 fix.sh
   naming its target (at `-vv`, `apply linode1: start`), so they show what is running while blocks are held.
 - **Ctrl-C** works as for one target: the first press lets the running steps finish and starts no other target, the
   second stops everything at once ([Ctrl-C](#ctrl-c)).
-- **Exit codes** are unchanged: 1 when any target failed or was cancelled; a failing target never stops the others.
+- **Exit codes** are unchanged: 1 when any target failed or was cancelled; a failing target never stops the others. A
+  run ended by SIGTERM or SIGHUP exits 143 or 129 ([Exit codes](#exit-codes)).
 
 Limitations:
 
@@ -93,11 +94,12 @@ Limitations:
   the same paths at once. Select one of them with `--target`, or use `--parallel 1`.
 - **Plugins run in parallel.** apply and plan run a plugin once per target on the controller, now up to N at once, so a
   plugin must be safe to run several times concurrently ([Plugin steps](#plugin-steps)).
-- **A second Ctrl-C stops only what runs here.** It kills anvil's local processes, ssh clients included. A remote
-  command started without a terminal keeps running on its host after its ssh client dies. A `[[files]]` step stopped
-  this way can leave its `/tmp/anvil-` temp file on the target ([File steps](#file-steps)). Such a write can still
-  finish its `mv` after anvil died, even after a rollback that reported success, putting the new bytes back: wait for
-  the remote step to end before rolling back, or run rollback again.
+- **A second Ctrl-C kills the remote side a moment later.** It kills anvil's local processes, ssh clients included.
+  The target then kills what the run started there within about 2 s plus a round trip, or at the run's timeout plus
+  10 s when the network is lost ([SSH behaviour](#ssh-behaviour)); root processes a step started through `sudo` die
+  only where `sudo -n kill` works (NOPASSWD). A `[[files]]` step stopped this way can leave its `/tmp/anvil-` temp file
+  on the target ([File steps](#file-steps)). Until the remote side is gone, a write can still finish its `mv`: wait
+  those few seconds before rolling back, or run rollback again.
 
 ## Commands
 
@@ -111,8 +113,9 @@ is always stored as `inventory.toml`;
 
 On save the buffer is parsed in the edit format and validated; an invalid buffer prints the error (file, host and
 field) and is re-opened with your text, up to three attempts, after which nothing is written and the exit is 2. A
-valid buffer is written as TOML atomically (`inventory.toml.tmp`, mode 0600, renamed over `inventory.toml`); a legacy
-`inventory.yaml` or `inventory.yml` in the workspace is then removed. A buffer left unchanged writes nothing,
+valid buffer is written as TOML atomically (a fresh `.anvil-<pid>-<nanos>-<n>` beside it, mode 0600, renamed over
+`inventory.toml`; another writer's temp file is left alone); a legacy `inventory.yaml` or `inventory.yml` in the
+workspace is then removed. A buffer left unchanged writes nothing,
 whatever the edit format, when the inventory already is `inventory.toml` or does not exist yet. A legacy YAML inventory
 is migrated even then: it is written as `inventory.toml` and the YAML file is removed.
 
@@ -589,7 +592,9 @@ drift the only failure the message is `doctor: drift since the last apply`. Noti
 and files not compared exit 0.
 
 **Cancel and time.** The first Ctrl-C (or Esc in the TUI) lets the running probe, hash run or plugin finish, then the
-rest of that target's plugins and every later target end `cancelled`: `doctor: cancelled`, exit 1. A second Ctrl-C
+rest of that target's plugins and every later target end `cancelled`: `doctor: cancelled`, exit 1. A first SIGTERM or
+SIGHUP does the same, but (a breaking change) their `error` reads `terminated` or `hung up`, the message `doctor: terminated` or
+`doctor: hung up`, and the exit is 143 or 129 ([Ctrl-C](#ctrl-c)). A second Ctrl-C
 kills them and anvil dies by SIGINT. doctor runs one target at a time: in the worst case a target takes, on ssh, up to
 40 s to connect and open its master (the 10 s `ssh -O check`, then the 30 s key attempt, whose connect is capped by
 `ConnectTimeout=10`), then 30 s for the probe, 30 s for the hash run and 30 s for each doctor plugin.
@@ -614,10 +619,10 @@ Its limits:
 
 ### `anvil apply`
 
-Runs the config's `[[steps]]` in order on every selected target: each step's `run` is sent to `sh -s` on the target
-(`/bin/sh -s` for `local`). A step that exits non-zero ends that target; the other targets still run. Exit 0 when
-every step on every target exited 0, else 1. apply runs directly: it prints no plan and asks for no confirmation; run
-[`anvil plan`](#anvil-plan) first to see what it would run.
+Runs the config's `[[steps]]` in order on every selected target: each step's `run` is sent on stdin to a small sh
+wrapper on the target ([SSH behaviour](#ssh-behaviour); `/bin/sh -s` for `local`). A step that exits non-zero ends
+that target; the other targets still run. Exit 0 when every step on every target exited 0, else 1. apply runs directly:
+it prints no plan and asks for no confirmation; run [`anvil plan`](#anvil-plan) first to see what it would run.
 
 The rest of this section describes the legacy sections, whose order is fixed: packages, files, services, steps. A
 `[[tasks]]` config runs in the order you write ([Tasks in a run](#tasks-in-a-run)).
@@ -765,7 +770,9 @@ has the same shape and adds `not_restored` ([`anvil rollback`](#anvil-rollback))
 
 A record that could not be saved adds a top-level `save_error` string, omitted otherwise, and makes the top-level `ok`
 false even when every target's is true; `targets` still names what ran ([Save errors](#the-apply-record)). A target
-that never finished because of it has `"abort": "save_failed"`. A target cancelled by Ctrl-C has no `abort`.
+that never finished because of it has `"abort": "save_failed"`. A target ended by a first SIGTERM has
+`"abort": "terminated"`, by a first SIGHUP `"abort": "hung_up"`. A target cancelled by Ctrl-C has no `abort`. Only the
+first reason counts: a SIGTERM after a failed save leaves `save_failed`.
 
 #### Tasks in a run
 
@@ -871,15 +878,20 @@ targets and its doctor plugins ([Doctor plugins](#doctor-plugins-drift-since-the
   `anvil run`). Press again to stop at once.
 - **The second press stops everything at once.** anvil kills every step still running, logs
   `ERROR anvil::interrupt: interrupted` and dies by SIGINT (a shell shows 130), printing no summary and no JSON. A
-  remote command without a terminal keeps running on its host, and a `[[files]]` temp file can be left behind
-  ([Running in parallel](#running-in-parallel)).
+  remote command dies on its host shortly after ([SSH behaviour](#ssh-behaviour)), and a `[[files]]` temp file can be
+  left behind ([Running in parallel](#running-in-parallel)).
 - **A fast double press may count as one.** Two presses very close together can reach anvil as one signal and then
   count as the first; press again.
-- **SIGTERM and SIGHUP count as presses.** The first prints
-  `terminated: running targets stop after their current step; the same signal again stops now` (`hung up: …` for
-  SIGHUP) and cancels: its targets read `⊘ cancelled`, exit 1. The second signal of any of the three kills every step and
-  anvil dies by that signal, logging `terminated`, `hung up` or `interrupted`. The TUI handles only SIGINT
-  ([Signals](tui.md)).
+- **SIGTERM and SIGHUP count as presses, and set the exit status.** **Breaking change:** a run ended by a first
+  SIGTERM exits 143 and one ended by a first SIGHUP exits 129, where both used to exit 1 (Ctrl-C still exits 1). The
+  first prints `terminated: running targets stop after their current step; the same signal again stops now`
+  (`hung up: …` for SIGHUP) and cancels as Ctrl-C does, but its targets read `✘ terminated` or `✘ hung up` (plan:
+  `⊘ terminated`, `⊘ hung up`), and in `--json` carry `"abort": "terminated"` or `"hung_up"`. The first signal decides:
+  one that comes after a failed record save keeps that reason and exit 1. A signal that arrives after every target
+  ended cancels nothing, so the command exits as it would have, 0 or 1. Also breaking: after a first SIGTERM or SIGHUP,
+  doctor's skipped target or plugin `error` reads `terminated` or `hung up` where it used to read `cancelled`. The
+  second signal of any of the three kills every step and anvil dies by that signal, logging `terminated`, `hung up` or
+  `interrupted`. The TUI handles only SIGINT ([Signals](tui.md)).
 - **A first SIGTERM can outlast a service manager's window.** It only lets the current step finish: up to 30 s for a
   `[[steps]]` or `[[files]]` step, 120 s for a service step, and `[packages].timeout`, 300 s by default, for the package
   step. A manager's SIGKILL then gives anvil no chance to kill the steps, so they go on. Send a second SIGTERM before
@@ -1115,7 +1127,11 @@ password, its `sudo_secret`, plus `task` and `name` on a tasks config, but never
 }
 ```
 
-Exit 0 when every selected target resolves, 1 when any cannot be reached or resolved, 2 for usage or config.
+A target a cancel skipped is `{"target": "pi", "ok": false}`, with `"abort": "terminated"` or `"hung_up"` when a first
+SIGTERM or SIGHUP did it ([Ctrl-C](#ctrl-c)).
+
+Exit 0 when every selected target resolves, 1 when any cannot be reached or resolved, 2 for usage or config; 143 or
+129 when a first SIGTERM or SIGHUP ended the plan.
 
 ### Plugin steps
 
@@ -1182,7 +1198,7 @@ them.
 { "script": "sshd -t && systemctl reload sshd" }
 ```
 
-The script runs on the target as a step: sent whole on stdin to `sh -s`, wrapped in `{ :` … `}` as `anvil run`
+The script runs on the target as a step: sent whole on stdin as a step is, wrapped in `{ :` … `}` as `anvil run`
 sends a script, with the 30 s step time limit. No sudo password is
 typed for it; call `sudo -n` in the script. apply shows it as `$ SCRIPT` (its first line and `…` when it has more),
 and in `--json` the step's `run` is the script, without the wrapper. plan shows
@@ -1620,8 +1636,9 @@ printf 'df -h /\nuptime\n' | anvil run --target pi -
 
 Targets are chosen as for apply (`--target`; none means `local` plus every host) and run as apply runs them, up to
 `--parallel N` at a time ([Running in parallel](#running-in-parallel)); a failing target does not stop the others.
-The script is each target's one step, sent on its stdin to `sh -s` (`/bin/sh -s` for `local`), never on an argv. It
-is always POSIX sh: a shebang line is only a comment. run asks for no confirmation.
+The script is each target's one step, sent on its stdin to the target's sh wrapper ([SSH behaviour](#ssh-behaviour);
+`/bin/sh -s` for `local`), never on an argv. It is always POSIX sh: a shebang line is only a comment. run asks for
+no confirmation.
 
 - **A `FILE` others can change is refused.** Exit 2 before any target starts, as for the config, and a FIFO or other
   non-regular file too ([Security notes](security.md)). Stdin is not checked.
@@ -1850,11 +1867,17 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 
 ## Exit codes
 
+> **Breaking change:** `apply`, `plan`, `run`, `rollback` and `doctor` ended by a first SIGTERM or SIGHUP exit 143 or
+> 129, not 1 ([Ctrl-C](#ctrl-c)). After a first SIGTERM or SIGHUP, doctor's skipped target or plugin `error` reads
+> `terminated` or `hung up` where it used to read `cancelled`.
+
 | Exit | Meaning                                                         |
 | ---- | --------------------------------------------------------------- |
 | 0    | everything ok                                                   |
 | 1    | a target or a check failed; for target-less commands, see below |
 | 2    | usage or configuration error; the full list is below            |
+| 129  | a first SIGHUP ended the run                                    |
+| 143  | a first SIGTERM ended the run                                   |
 
 - **0**: for `doctor`, a `missing` secret or an unresolved editor is only a warning.
 - **1**: `doctor`/`apply`: a target or a check failed (including a `locked` or `error` secret, and, with `[packages]`, a
@@ -1866,8 +1889,8 @@ that exits non-zero aborts the command: nothing is written, exit 1.
   `run`: a target failed or could not be reached.
   `rollback`: see [anvil rollback](#anvil-rollback); `apply` also when the record cannot be read, locked or saved, or
   there is no state directory ([The apply record](#the-apply-record)).
-  `apply`/`plan`/`run`/`rollback`/`doctor`: a first Ctrl-C, SIGTERM or SIGHUP cancelled the run ([Ctrl-C](#ctrl-c)); a
-  second one kills anvil by that signal instead, which a shell reports as 130 for SIGINT.
+  `apply`/`plan`/`run`/`rollback`/`doctor`: a first Ctrl-C cancelled the run ([Ctrl-C](#ctrl-c)); a second one of
+  any signal kills anvil by that signal instead, which a shell reports as 130 for SIGINT.
   `inventory`/`config`/`secret`: the editor exited non-zero (aborted), a file write failed, or the secret store failed,
   is locked or its passphrase prompt was cancelled.
 - **2**: a bad flag or argument (including an `--inventory` or `--config` path not ending in `.toml`), an unknown
@@ -1894,6 +1917,8 @@ that exits non-zero aborts the command: nothing is written, exit 1.
   `--inventory` path not ending in `.toml`) is shown in the header, the status bar and the `t` overlay instead. 1 when
   the terminal cannot be set up (`cannot handle SIGINT: …`, `cannot enter the terminal: …`) or fails while the TUI runs
   (`terminal: …`).
+- **129**, **143**: `apply`/`plan`/`run`/`rollback`/`doctor`: a first SIGHUP or SIGTERM ended the run, cancelling at
+  least one target or doctor plugin ([Ctrl-C](#ctrl-c)). One that arrives after every target ended changes nothing.
 
 ## SSH behaviour
 
@@ -1921,10 +1946,32 @@ from `--ssh-config`; `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE` and `DISPLAY` are remo
   ``host key unknown or changed; run `ssh <host>` once to verify the fingerprint``.
 - **Package step with a sudo password** runs as a `-tt` client instead; see
   [Typing the sudo password](packages.md#typing-the-sudo-password).
-- **Scripts** run as clients of the master (`-o ControlMaster=no -o BatchMode=yes ... sh -s`), with the script on stdin
-  and a 30 s timeout (the package step has its own `[packages].timeout`, `anvil run` its `--timeout`);
-  a client never prompts. Each stream is kept up to 1 MiB. A background process that leaves the script's process group
-  and keeps its output open is given 1 s after the script ends; then anvil stops reading and reports what it has.
+- **Scripts** run as clients of the master (`-o ControlMaster=no -o BatchMode=yes ... -- HOST REMOTE`, REMOTE being
+  `sh -c '<wrapper>' anvil-run BYTES MARKER DEADLINE`) with a 30 s timeout (the package step has its own
+  `[packages].timeout`, `anvil run` its `--timeout`); a client never prompts. The wrapper is a fixed POSIX sh text. The
+  script goes on stdin, followed by a random end marker, and never lands in a remote file, argv or environment: the
+  wrapper reads it into a shell variable and runs it with stdin on `/dev/null`, so a step that reads stdin (`cat`) gets
+  EOF at once. A heredoc inside the script is up to the remote `/bin/sh`: bash (RHEL, macOS, Arch) may spool its body,
+  a secret-rendered one included, to a short-lived 0600 temp file in `$TMPDIR` that it unlinks; dash and busybox use
+  pipes. A script cut short (the client died while sending it) never runs; the wrapper exits 125. Each stream is kept
+  up to 1 MiB. A background process that leaves the script's process group and keeps its output open is given 1 s
+  after the script ends; then anvil stops reading and reports what it has.
+- **A timed-out or dropped run is killed on the target.** ssh's stdin stays open while anvil waits. When it closes (the
+  run timed out, anvil was killed, the client died) the wrapper sends TERM to the session's processes, so a script's
+  traps run, and KILL 2 s later: nothing of a plain run is left within about 2 s plus a round trip. A lost network
+  closes nothing; the wrapper's own deadline, the timeout plus 10 s, kills the run then. Root processes a step started
+  through `sudo` survive the TERM and die only by `sudo -n -- kill -s KILL -PGID`, the session's process group read
+  before the script starts (`kill 0` when it cannot be read). That needs a NOPASSWD rule that allows `kill` (a `kill`
+  program in sudo's `secure_path`); a password typed for the script's own `sudo` does not help, as sudo's default
+  `timestamp_type=tty` keeps cached credentials per terminal and the kill runs without one. Elsewhere they run to their
+  end. Root processes started through `doas`, `su` or `pkexec` are not covered. A background job a script leaves after
+  it ends on its own is not touched. A run on a terminal (a password-path `[[files]]` install, packages with a password)
+  is not wrapped: it relies on the terminal closing, and a root command under `sudo` with `use_pty` (sudo's default)
+  can outlive the timeout. This is a known gap.
+- **Changed for step scripts.** A script runs through `eval` in a subshell of the wrapper, not as `sh -s`: `$$`, `$0`
+  (now `anvil-run`) and `$PPID` name the wrapper's processes, and `LINENO` and the text of sh's error messages change.
+  The wrapper is quoted so POSIX shells, csh and fish pass it unchanged; a login shell that is none of these (nushell,
+  say) may reject the command where `sh -s` worked.
 - **Control directory** `~/.ssh/anvil`: created with mode 0700 (and `~/.ssh` 0700 if missing); refused when owned by
   another user, open to group or others, when `~/.ssh` is group- or world-writable, when `$HOME` contains `%`, or when a
   socket path would not fit macOS' 104-byte `sun_path` — that is, a `$HOME` longer than 34 bytes.
