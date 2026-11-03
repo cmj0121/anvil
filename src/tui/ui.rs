@@ -1361,10 +1361,10 @@ mod tests {
 
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     use crossterm::event::KeyCode;
 
+    use crate::cancel::Cancel;
     use crate::tui::app::tests::{
         Store, app, cancelled, inventory, local_report, opts, probed, ran, row as step_row, step,
     };
@@ -1696,7 +1696,7 @@ mod tests {
         app.running = Some(Running {
             kind: RunKind::Apply,
             running: vec!["pi".to_owned()],
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(Cancel::new()),
             tick: 1,
         });
         let buf = buffer(&app, 80, 8);
@@ -1734,7 +1734,7 @@ mod tests {
         app.running = Some(Running {
             kind: RunKind::Apply,
             running: vec!["pi".to_owned(), "local".to_owned()],
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(Cancel::new()),
             tick: 1,
         });
         let buf = buffer(&app, 80, 8);
@@ -2246,7 +2246,7 @@ mod tests {
         app.running = Some(Running {
             kind: RunKind::Update,
             running: vec!["checking for an update".to_owned()],
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(Cancel::new()),
             tick: 0,
         });
         let screen = render(&app, 80, 6);
@@ -2313,7 +2313,7 @@ mod tests {
             app.running = (code == KeyCode::Esc).then(|| Running {
                 kind: RunKind::Apply,
                 running: Vec::new(),
-                cancel: Arc::new(AtomicBool::new(false)),
+                cancel: Arc::new(Cancel::new()),
                 tick: 0,
             });
             if code == KeyCode::Char(' ') {
@@ -2832,7 +2832,7 @@ mod tests {
         app.running = Some(Running {
             kind: RunKind::Apply,
             running: vec!["pi\x1b".to_owned()],
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(Cancel::new()),
             tick: 11,
         });
         assert_eq!(

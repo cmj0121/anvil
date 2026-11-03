@@ -42,12 +42,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::num::NonZeroU8;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde::Serialize;
 
+pub use crate::cancel::AbortReason;
+use crate::cancel::Cancel;
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::{Config, Plugin, Step, StepKind};
 use crate::facts::{self, Facts};
@@ -61,7 +62,8 @@ use crate::logger::{
 };
 use crate::options::Options;
 use crate::packages::{self, Packages};
-use crate::plugin::{self, Plugins, Request};
+use crate::plugin::{Plugins, Request};
+use crate::prepared::Prepared;
 use crate::record::{self, FileRecord, Session, TargetRecord};
 use crate::secret::Store;
 use crate::services;
@@ -374,67 +376,6 @@ pub fn shown_text(text: &str) -> String {
     escape_invisible(&escape_line(text))
 }
 
-/// Why a run's cancel flag was set, which ended its remaining targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AbortReason {
-    /// The user: Ctrl-C, SIGTERM or SIGHUP, or Esc in the TUI.
-    Cancelled,
-    /// A record save failed, so the run stopped before writing more it could
-    /// not record.
-    SaveFailed,
-}
-
-impl AbortReason {
-    fn is_cancelled(&self) -> bool {
-        *self == AbortReason::Cancelled
-    }
-
-    /// What a target's end line says.
-    pub fn text(self) -> &'static str {
-        match self {
-            AbortReason::Cancelled => "cancelled",
-            AbortReason::SaveFailed => "aborted: a record save failed",
-        }
-    }
-}
-
-/// A run's cancel flag and why anvil itself set it. The flag stays the one
-/// thing workers, ssh and the signal handler poll; a flag set by anyone else
-/// is the user's cancel.
-pub(crate) struct Abort<'a> {
-    cancel: &'a AtomicBool,
-    reason: OnceLock<AbortReason>,
-}
-
-impl<'a> Abort<'a> {
-    pub(crate) fn new(cancel: &'a AtomicBool) -> Abort<'a> {
-        Abort {
-            cancel,
-            reason: OnceLock::new(),
-        }
-    }
-
-    /// Sets the flag for `reason`; a flag already set keeps the reason it had.
-    fn stop(&self, reason: AbortReason) {
-        if !self.cancel.load(Ordering::Relaxed) {
-            let _ = self.reason.set(reason);
-        }
-        self.cancel.store(true, Ordering::Release);
-    }
-
-    /// `report`, when the flag ended it, with the reason the flag was set.
-    pub(crate) fn mark(&self, mut report: TargetReport) -> TargetReport {
-        if let TargetReport::Cancelled { abort, .. } = &mut report {
-            // Pairs with `stop`'s store: this thread saw the flag set, so it
-            // sees the reason set before it, unless the user set it too.
-            self.cancel.load(Ordering::Acquire);
-            *abort = (self.reason.get().copied()).unwrap_or(AbortReason::Cancelled);
-        }
-        report
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum TargetReport {
@@ -462,8 +403,8 @@ pub enum TargetReport {
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
-    /// The cancel flag ended the target; `steps` holds the ones that ran
-    /// before it. `ok` is always false. `abort` says why the flag was set, in
+    /// The cancel token ended the target; `steps` holds the ones that ran
+    /// before it. `ok` is always false. `abort` says why the token was set, in
     /// the JSON only when that was not the user. `task` and `name` are those
     /// of the task whose step was under way, if any.
     Cancelled {
@@ -657,42 +598,35 @@ impl Report {
 /// run, and its report once it ends.
 pub type Progress<'a> = Event<'a, TargetReport>;
 
-/// Loads the targets and applies `config` to each, `opts.parallel` at a
-/// time. Before each target and each step, `opts.cancel` is checked; once set,
-/// each running target ends as Cancelled after its current step (keeping its
-/// completed steps) and every target not started is Cancelled with no steps.
-/// A `[[files]]` src that cannot be read fails the command before any
-/// target.
+/// Applies `prepared.config` to each of its targets, `opts.parallel` at a
+/// time. Before each target and each step, `prepared.cancel` is checked; once
+/// set, each running target ends as Cancelled after its current step (keeping
+/// its completed steps) and every target not started is Cancelled with no
+/// steps.
 ///
 /// When apply probes, the record ([`record::path`]) is locked and loaded
 /// before any target, and each target the probe reached is saved into it
 /// around each file write and as it ends. A record that cannot be opened
 /// fails the command; one that cannot be saved is the report's `save_error`.
 pub fn run_targets(
-    opts: &Options,
-    config: &Config,
-    expanded: &Expanded,
+    prepared: &Prepared,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
-    let targets = opts.targets_for(config)?;
-    let pins = plugin::verify_where(config, Plugin::is_step).map_err(Failure::usage)?;
-    let sources = opts.sources(config, expanded)?;
-    let passwords = load_passwords(&targets, config, expanded, || opts.secret_store(config))?;
-    let session = if needs_facts(config, expanded) {
+    let session = if needs_facts(&prepared.config, &prepared.expanded) {
         Some(open_record("apply")?)
     } else {
         None
     };
     Ok(apply_targets(
-        &targets,
-        opts.parallel,
-        |target| opts.transport(target),
-        config,
-        expanded,
-        &sources,
-        &pins,
-        &passwords,
-        &opts.cancel,
+        &prepared.targets,
+        prepared.opts.parallel,
+        |target| prepared.transport(target),
+        &prepared.config,
+        &prepared.expanded,
+        &prepared.sources,
+        &prepared.pins,
+        &prepared.passwords,
+        &prepared.cancel,
         session,
         on,
     ))
@@ -713,7 +647,7 @@ pub(crate) fn open_record(command: &str) -> Result<Session, Failure> {
 /// Nothing is built or opened when no step may type one. One trailing
 /// newline is trimmed. A store error fails the command. Core dumps are
 /// turned off first.
-fn load_passwords(
+pub(crate) fn load_passwords(
     targets: &[Target],
     config: &Config,
     expanded: &Expanded,
@@ -792,12 +726,11 @@ fn apply_targets(
     sources: &Sources,
     plugins: &dyn Plugins,
     passwords: &Passwords,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
     session: Option<Session>,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Report {
-    let abort = Abort::new(cancel);
-    let journal = session.map(|session| Journal::new(session, &abort));
+    let journal = session.map(|session| Journal::new(session, cancel));
     let results = fanout::fan_out(
         targets,
         parallel,
@@ -814,7 +747,7 @@ fn apply_targets(
             Event::Ordered(applied) => on(Event::Ordered(&applied.report)),
         },
         |target| {
-            let applied = apply_target(
+            apply_target(
                 target,
                 transport(target),
                 config,
@@ -824,13 +757,9 @@ fn apply_targets(
                 passwords,
                 cancel,
                 journal.as_ref(),
-            );
-            Applied {
-                report: abort.mark(applied.report),
-                ..applied
-            }
+            )
         },
-        |target| Applied::unrecorded(abort.mark(cancelled("apply", target, Vec::new()))),
+        |target| Applied::unrecorded(cancelled("apply", target, Vec::new(), cancel)),
         |target, message| {
             let error = format!("internal error: {message}");
             Applied::unrecorded(failed("apply", target, Vec::new(), error))
@@ -863,11 +792,11 @@ pub(crate) struct Saves {
 impl Saves {
     /// Notes how `name`'s save went; a failure stops the run, so no further
     /// target starts.
-    pub(crate) fn note(&mut self, name: &str, saved: Result<(), String>, abort: &Abort<'_>) {
+    pub(crate) fn note(&mut self, name: &str, saved: Result<(), String>, cancel: &Cancel) {
         match saved {
             Ok(()) => self.unrecorded.clear(),
             Err(err) => {
-                abort.stop(AbortReason::SaveFailed);
+                cancel.stop(AbortReason::SaveFailed);
                 self.first.get_or_insert(err);
                 if !self.unrecorded.iter().any(|kept| kept == name) {
                     self.unrecorded.push(name.to_owned());
@@ -904,7 +833,7 @@ impl Saves {
 /// and a worker's save must not wait for it. Nothing prints under the lock.
 struct Journal<'a> {
     books: Mutex<Books>,
-    abort: &'a Abort<'a>,
+    cancel: &'a Cancel,
 }
 
 struct Books {
@@ -919,7 +848,7 @@ struct Books {
 }
 
 impl<'a> Journal<'a> {
-    fn new(session: Session, abort: &'a Abort<'a>) -> Journal<'a> {
+    fn new(session: Session, cancel: &'a Cancel) -> Journal<'a> {
         Journal {
             books: Mutex::new(Books {
                 session,
@@ -927,7 +856,7 @@ impl<'a> Journal<'a> {
                 warnings: Vec::new(),
                 shed: Vec::new(),
             }),
-            abort,
+            cancel,
         }
     }
 
@@ -942,7 +871,7 @@ impl<'a> Journal<'a> {
     fn snapshot(&self, name: &str, record: TargetRecord) -> bool {
         let mut books = self.lock();
         books.session.merge(name, record);
-        books.save(name, self.abort)
+        books.save(name, self.cancel)
     }
 
     /// Merges and saves `reached`, the entry of a target that ended.
@@ -956,7 +885,7 @@ impl<'a> Journal<'a> {
         } else {
             books.session.refresh(name, reached.record)
         }
-        books.save(name, self.abort);
+        books.save(name, self.cancel);
     }
 
     /// The last save: the run's warnings and its `save_error`.
@@ -980,10 +909,10 @@ impl<'a> Journal<'a> {
 impl Books {
     /// Saves the record, noting the outcome for `name` and adding what the
     /// save warns of to `shed`. False when it failed.
-    fn save(&mut self, name: &str, abort: &Abort<'_>) -> bool {
+    fn save(&mut self, name: &str, cancel: &Cancel) -> bool {
         let saved = self.session.save().map(|shed| self.shed.extend(shed));
         let ok = saved.is_ok();
-        self.saves.note(name, saved, abort);
+        self.saves.note(name, saved, cancel);
         ok
     }
 }
@@ -1020,7 +949,7 @@ pub(crate) fn for_each_target(
     command: &str,
     targets: &[Target],
     parallel: NonZeroU8,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
     on: &mut dyn FnMut(Progress<'_>),
     one: impl Fn(&Target) -> TargetReport + Sync,
 ) -> Report {
@@ -1030,7 +959,7 @@ pub(crate) fn for_each_target(
         cancel,
         on,
         one,
-        |target| cancelled(command, target, Vec::new()),
+        |target| cancelled(command, target, Vec::new(), cancel),
         |target, message| {
             failed(
                 command,
@@ -1054,8 +983,11 @@ pub(crate) fn for_each_target(
 /// document), then the summary.
 pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
     let (config, expanded) = opts.load_expanded()?;
-    let _interrupt = Interrupt::install(&opts.cancel)?;
-    print_report(cli, "apply", |on| run_targets(opts, &config, &expanded, on))
+    let cancel = Arc::new(Cancel::new());
+    let _interrupt = Interrupt::install(&cancel)?;
+    print_report(cli, "apply", |on| {
+        run_targets(&Prepared::apply(opts, config, expanded, cancel)?, on)
+    })
 }
 
 /// Prints each target's block once it and every earlier target have ended
@@ -1098,15 +1030,22 @@ pub(crate) fn print_report(
     }
 }
 
-/// `target` of `command` (apply, rollback, run) ended by cancel, after `steps`.
-pub(crate) fn cancelled(command: &str, target: &Target, steps: Vec<StepReport>) -> TargetReport {
+/// `target` of `command` (apply, rollback, run) ended by cancel, after
+/// `steps`, for the reason `cancel` was stopped (the user's when unset: a
+/// transport refused).
+pub(crate) fn cancelled(
+    command: &str,
+    target: &Target,
+    steps: Vec<StepReport>,
+    cancel: &Cancel,
+) -> TargetReport {
     log::info!("{command} {}: cancelled", target.name);
     TargetReport::Cancelled {
         warnings: Vec::new(),
         target: target.name.clone(),
         steps,
         ok: false,
-        abort: AbortReason::Cancelled,
+        abort: cancel.reason().unwrap_or(AbortReason::Cancelled),
         task: None,
         name: None,
     }
@@ -1142,7 +1081,7 @@ fn apply_target(
     sources: &Sources,
     plugins: &dyn Plugins,
     passwords: &Passwords,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
     journal: Option<&Journal<'_>>,
 ) -> Applied {
     log::info!("apply {}: start", target.name);
@@ -1154,8 +1093,8 @@ fn apply_target(
     };
     log::info!("apply {}: over {}", target.name, transport.name());
     let facts = if needs_facts(config, expanded) {
-        if cancel.load(Ordering::Relaxed) {
-            return Applied::unrecorded(cancelled("apply", target, Vec::new()));
+        if cancel.is_set() {
+            return Applied::unrecorded(cancelled("apply", target, Vec::new(), cancel));
         }
         status::phase(&target.name, status::Phase::Probe);
         match probe(transport.as_ref(), expanded) {
@@ -1164,7 +1103,7 @@ fn apply_target(
                 return Applied::unrecorded(failed("apply", target, Vec::new(), error));
             }
             Err(Unresolved::Cancelled) => {
-                return Applied::unrecorded(cancelled("apply", target, Vec::new()));
+                return Applied::unrecorded(cancelled("apply", target, Vec::new(), cancel));
             }
         }
     } else {
@@ -1191,7 +1130,7 @@ fn apply_target(
             Some(&mut recorder),
         ),
         Err(Unresolved::Failed(error)) => failed("apply", target, Vec::new(), error),
-        Err(Unresolved::Cancelled) => cancelled("apply", target, Vec::new()),
+        Err(Unresolved::Cancelled) => cancelled("apply", target, Vec::new(), cancel),
     };
     let reached = recorder.finish(report.ok(), cannot_undo(report.steps()));
     Applied { report, reached }
@@ -1352,7 +1291,7 @@ pub(crate) fn execute(
     transport: &dyn Transport,
     runs: &[PlannedRun],
     passwords: &Passwords,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
     recorder: Option<&mut Recorder<'_>>,
 ) -> TargetReport {
     let mut report = execute_inner(
@@ -1368,15 +1307,15 @@ fn execute_inner(
     transport: &dyn Transport,
     runs: &[PlannedRun],
     passwords: &Passwords,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
     mut recorder: Option<&mut Recorder<'_>>,
 ) -> TargetReport {
     let mut reports = Vec::with_capacity(runs.len());
     let mut ok = true;
     let of = runs.len();
     for (n, planned) in runs.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            return cancelled(command, target, reports);
+        if cancel.is_set() {
+            return cancelled(command, target, reports, cancel);
         }
         // A sudo error on a plain step reads "packages", as before.
         let (prefix, kind) = match &planned.kind {
@@ -1428,15 +1367,15 @@ fn execute_inner(
                     break;
                 }
                 Err(Uncaptured::Transport(TransportError::Cancelled)) => {
-                    return cancelled(command, target, reports).at(planned);
+                    return cancelled(command, target, reports, cancel).at(planned);
                 }
                 Err(Uncaptured::Transport(err)) => {
                     let error = step_error(&err, password.map(|(name, _)| name), prefix);
                     return failed(command, target, reports, error).at(planned);
                 }
             };
-            if cancel.load(Ordering::Relaxed) {
-                return cancelled(command, target, reports).at(planned);
+            if cancel.is_set() {
+                return cancelled(command, target, reports, cancel).at(planned);
             }
             rebuilt = match files::write_script(write, recorder.sources, &found.expected()) {
                 Ok(rebuilt) => rebuilt,
@@ -1453,7 +1392,7 @@ fn execute_inner(
                 hash_only,
             );
             if !recorder.snapshot(Some(&intent), &reports) {
-                return cancelled(command, target, reports).at(planned);
+                return cancelled(command, target, reports, cancel).at(planned);
             }
             captured = Some(intent);
         }
@@ -1476,7 +1415,9 @@ fn execute_inner(
                         staged = false;
                         output
                     }
-                    Sent::Cancelled => return cancelled(command, target, reports).at(planned),
+                    Sent::Cancelled => {
+                        return cancelled(command, target, reports, cancel).at(planned);
+                    }
                 }
             }
         };
@@ -1505,14 +1446,14 @@ fn execute_inner(
                 _ => record::Write::FailedMidway,
             };
             keep(recorder.expanded, &mut recorder.files, file);
-            // A failure has set the cancel flag: the next step does not start.
+            // A failure has set the cancel token: the next step does not start.
             recorder.snapshot(None, &reports);
         }
         let output = match output {
             Ok(output) => output,
             // ssh would have had to open a master after cancel.
             Err(TransportError::Cancelled) => {
-                return cancelled(command, target, reports).at(planned);
+                return cancelled(command, target, reports, cancel).at(planned);
             }
             Err(err) => {
                 let error = step_error(&err, password.map(|(name, _)| name), prefix);
@@ -1639,12 +1580,12 @@ fn send_file(
     run: &str,
     password: &[u8],
     timeout: Duration,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
 ) -> Sent {
     let sent = match transport.run(&upload.stage, timeout) {
         Ok(staged) if staged.code == Some(0) => {
             log::debug!("{command} {}: file staged", target.name);
-            if cancel.load(Ordering::Relaxed) {
+            if cancel.is_set() {
                 Sent::Cancelled
             } else {
                 Sent::Installed(transport.run_tty(&packages::with_password(run), password, timeout))
@@ -1774,7 +1715,7 @@ pub fn resolve(
     expanded: &Expanded,
     sources: &Sources,
     plugins: &dyn Plugins,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
 ) -> Result<Vec<PlannedRun>, Unresolved> {
     let mut runs = Vec::with_capacity(expanded.items.len());
     let mut services = services::Builder::new(config, target, facts);
@@ -1877,7 +1818,7 @@ fn step_run(
     step: &Step,
     number: usize,
     plugins: &dyn Plugins,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
 ) -> Result<PlannedRun, Unresolved> {
     if !selected(item, target, facts)? {
         log::info!("{}: step {number}: no match", target.name);
@@ -1898,7 +1839,7 @@ fn step_run(
     };
     Ok(match step.kind() {
         StepKind::Plugin(name) => {
-            if cancel.load(Ordering::Relaxed) {
+            if cancel.is_set() {
                 return Err(Unresolved::Cancelled);
             }
             let facts = facts.ok_or_else(|| format!("plugin {name}: the probe has not run"))?;
@@ -2158,7 +2099,8 @@ fn render_summary(ok: usize, failed: usize, not_restored: &[NotRestored], style:
 #[cfg(test)]
 mod tests {
     use crate::tasks::legacy;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::config::{FileEntry, ModeValue, ServiceEntry, Step};
@@ -2171,7 +2113,7 @@ mod tests {
         sources: &Sources,
         plugins: &dyn Plugins,
         passwords: &Passwords,
-        cancel: &AtomicBool,
+        cancel: &Cancel,
     ) -> Applied {
         let expanded = legacy(config);
         super::apply_target(
@@ -2189,7 +2131,7 @@ mod tests {
         sources: &Sources,
         plugins: &dyn Plugins,
         passwords: &Passwords,
-        cancel: &AtomicBool,
+        cancel: &Cancel,
         session: Option<Session>,
         on: &mut dyn FnMut(Progress<'_>),
     ) -> Report {
@@ -2207,7 +2149,7 @@ mod tests {
         config: &Config,
         sources: &Sources,
         plugins: &dyn Plugins,
-        cancel: &AtomicBool,
+        cancel: &Cancel,
     ) -> Result<Vec<PlannedRun>, Unresolved> {
         super::resolve(
             target,
@@ -2226,7 +2168,9 @@ mod tests {
         config: &Config,
         on: &mut dyn FnMut(Progress<'_>),
     ) -> Result<Report, Failure> {
-        super::run_targets(opts, config, &legacy(config), on)
+        let expanded = legacy(config);
+        let prepared = Prepared::apply(opts, config.clone(), expanded, Arc::default())?;
+        super::run_targets(&prepared, on)
     }
 
     /// [`super::load_passwords`] on a legacy config's list.
@@ -2265,7 +2209,7 @@ mod tests {
         /// and exits with the code.
         exits: &'static [(&'static str, i32)],
         /// Set once a `run` script containing the text has run.
-        cancel_on: Option<(&'static str, Arc<AtomicBool>)>,
+        cancel_on: Option<(&'static str, Arc<Cancel>)>,
         /// Once that flag is set, `run` (not `run_uncancelled`) fails with
         /// `Cancelled`, as ssh does when it would open a master.
         refuse_once_cancelled: bool,
@@ -2358,7 +2302,7 @@ mod tests {
             if let Some((needle, cancel)) = &self.cancel_on
                 && script.contains(needle)
             {
-                cancel.store(true, Ordering::Relaxed);
+                cancel.stop(AbortReason::Cancelled);
             }
             if let Some((_, code)) = self
                 .exits
@@ -2398,8 +2342,7 @@ mod tests {
         }
 
         fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
-            let cancelled =
-                (self.cancel_on.as_ref()).is_some_and(|(_, c)| c.load(Ordering::Relaxed));
+            let cancelled = (self.cancel_on.as_ref()).is_some_and(|(_, c)| c.is_set());
             if self.refuse_once_cancelled && cancelled {
                 return Err(TransportError::Cancelled);
             }
@@ -2490,7 +2433,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .report;
         let runs = log.lock().unwrap().clone();
@@ -2516,7 +2459,7 @@ mod tests {
             &fake,
             &[run],
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             None,
         )
     }
@@ -2545,7 +2488,7 @@ mod tests {
             &Fake::new(&log),
             &[run],
             &Passwords::new(),
-            &AtomicBool::new(true),
+            &Cancel::cancelled(),
             None,
         );
         assert_eq!(brief(&report, piped()), "▶ pi\n  ✘ cancelled\n\n");
@@ -2583,7 +2526,7 @@ mod tests {
                 &fake,
                 &[config_step(1, "boom")],
                 &Passwords::new(),
-                &AtomicBool::new(false),
+                &Cancel::new(),
                 None,
             );
             assert_eq!(keys(&json(&report)), want);
@@ -2598,10 +2541,10 @@ mod tests {
         assert_sync::<Config>();
         assert_sync::<Sources>();
         assert_sync::<dyn Plugins>();
-        assert_sync::<plugin::Pins>();
+        assert_sync::<crate::plugin::Pins>();
         assert_sync::<Passwords>();
         assert_sync::<Options>();
-        assert_sync::<AtomicBool>();
+        assert_sync::<Cancel>();
         assert_sync::<FakePlugins>();
         assert_send::<TargetReport>();
         assert_send::<crate::plan::PlanReport>();
@@ -2725,7 +2668,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .report;
         assert_eq!(
@@ -3076,10 +3019,10 @@ mod tests {
         );
     }
 
-    /// Like [`Fake`], but running `stop` sets the shared cancel flag.
+    /// Like [`Fake`], but running `stop` stops the shared cancel token.
     struct Stopper {
         log: Arc<Mutex<Vec<String>>>,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<Cancel>,
     }
 
     impl Transport for Stopper {
@@ -3090,7 +3033,7 @@ mod tests {
         fn run(&self, script: &str, _timeout: Duration) -> Result<Output, TransportError> {
             self.log.lock().unwrap().push(script.to_owned());
             if script == "stop" {
-                self.cancel.store(true, Ordering::Relaxed);
+                self.cancel.stop(AbortReason::Cancelled);
             }
             Ok(Output {
                 stdout: format!("{script}-out\n").into_bytes(),
@@ -3118,7 +3061,7 @@ mod tests {
         cancelled: bool,
     ) -> (Report, Vec<String>, Vec<String>) {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let cancel = Arc::new(AtomicBool::new(cancelled));
+        let cancel = Arc::new(Cancel::stopped(cancelled));
         let targets: Vec<Target> = names.iter().map(|name| target(name)).collect();
         let mut events = Vec::new();
         let report = apply_targets(
@@ -3261,7 +3204,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .report;
         let runs = log.lock().unwrap().clone();
@@ -3318,7 +3261,7 @@ mod tests {
                 &Markers { code, timeout },
                 &runs,
                 &Passwords::new(),
-                &AtomicBool::new(false),
+                &Cancel::new(),
                 None,
             );
             assert_eq!(report.ok(), code == 0 && !timeout);
@@ -3413,7 +3356,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .report;
         assert_eq!(*log.lock().unwrap(), [facts::PROBE]);
@@ -3458,7 +3401,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .report;
         assert_eq!(*log.lock().unwrap(), [facts::PROBE]);
@@ -3494,7 +3437,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(cancelled),
+            &Cancel::stopped(cancelled),
             None,
             &mut |_| {},
         );
@@ -3550,7 +3493,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(true),
+            &Cancel::cancelled(),
         )
         .report;
         assert!(log.lock().unwrap().is_empty(), "the probe does not run");
@@ -3617,7 +3560,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::none(),
             &local_passwords(password),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .report;
         let runs = log.lock().unwrap().clone();
@@ -3652,7 +3595,7 @@ mod tests {
                 &Sources::default(),
                 &FakePlugins::none(),
                 &passwords,
-                &AtomicBool::new(false),
+                &Cancel::new(),
             )
             .report;
             assert!(report.ok(), "{probe}");
@@ -3839,7 +3782,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .report;
         assert_eq!(
@@ -3894,7 +3837,7 @@ mod tests {
         facts: Option<&Facts>,
         config: &Config,
     ) -> Result<Vec<PlannedRun>, String> {
-        let cancel = AtomicBool::new(false);
+        let cancel = Cancel::new();
         resolve(
             target,
             facts,
@@ -4017,7 +3960,7 @@ mod tests {
             &["harden"],
             Some(serde_json::json!({"profile": "ssh"})),
         );
-        let cancel = AtomicBool::new(false);
+        let cancel = Cancel::new();
         let runs = resolve(
             &host,
             Some(&facts(ARCH_ROOT)),
@@ -4072,7 +4015,7 @@ mod tests {
                 &config,
                 &Sources::default(),
                 &plugins,
-                &AtomicBool::new(false)
+                &Cancel::new()
             ),
             Err(Unresolved::Failed(
                 "plugin harden: the probe has not run".to_owned()
@@ -4093,7 +4036,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::new(|_, _| Ok("hostname".to_owned())),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .report;
         assert_eq!(*log.lock().unwrap(), [facts::PROBE, "{ :\nhostname\n}\n"]);
@@ -4126,7 +4069,7 @@ mod tests {
             &Sources::default(),
             &plugins,
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             None,
             &mut |_| {},
         );
@@ -4146,11 +4089,11 @@ mod tests {
     #[test]
     fn cancel_before_a_plugin_step_spawns_nothing_more() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::new());
         let stop = Arc::clone(&cancel);
         // Cancelled while the first plugin runs: the second never starts.
         let plugins = FakePlugins::new(move |_, _| {
-            stop.store(true, Ordering::Relaxed);
+            stop.stop(AbortReason::Cancelled);
             Ok("hostname".to_owned())
         });
         let report = apply_target(
@@ -4196,7 +4139,7 @@ mod tests {
                 &with_plugin(&[], &["harden"], None),
                 &Sources::default(),
                 &plugins,
-                &AtomicBool::new(true)
+                &Cancel::cancelled()
             ),
             Err(Unresolved::Cancelled)
         );
@@ -4225,7 +4168,7 @@ mod tests {
                 &Sources::default(),
                 &FakePlugins::none(),
                 &Passwords::new(),
-                &AtomicBool::new(false),
+                &Cancel::new(),
             )
             .report;
             assert_eq!(*log.lock().unwrap(), [facts::PROBE]);
@@ -4303,7 +4246,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::none(),
             &passwords,
-            &AtomicBool::new(false),
+            &Cancel::new(),
             None,
             &mut |_| {},
         );
@@ -4450,7 +4393,7 @@ mod tests {
             &file_sources(config),
             &FakePlugins::none(),
             passwords,
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .report;
         let runs = log.lock().unwrap().clone();
@@ -4693,7 +4636,7 @@ mod tests {
     fn a_cancel_after_the_stage_removes_the_temp_file_and_installs_nothing() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
-            cancel_on: Some(("set -C", Arc::new(AtomicBool::new(false)))),
+            cancel_on: Some(("set -C", Arc::new(Cancel::new()))),
             ..Fake::new(&log)
         };
         let (report, runs, typed) = apply_password_file(&log, fake, Some(PASSWORD.as_bytes()));
@@ -4711,7 +4654,7 @@ mod tests {
     fn the_cleanup_runs_where_a_cancelled_transport_refuses_new_work() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
-            cancel_on: Some(("set -C", Arc::new(AtomicBool::new(false)))),
+            cancel_on: Some(("set -C", Arc::new(Cancel::new()))),
             refuse_once_cancelled: true,
             ..Fake::new(&log)
         };
@@ -4728,7 +4671,7 @@ mod tests {
     #[test]
     fn a_cancelled_transport_ends_the_target_as_cancelled_with_its_steps() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::new());
         let fake = Fake {
             cancel_on: Some(("one", Arc::clone(&cancel))),
             refuse_once_cancelled: true,
@@ -4744,7 +4687,7 @@ mod tests {
                 planned("two", None, RUN_TIMEOUT),
             ],
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             None,
         );
         assert_eq!(
@@ -4763,7 +4706,7 @@ mod tests {
 
         // The probe too.
         let log = Arc::new(Mutex::new(Vec::new()));
-        let cancel = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(Cancel::cancelled());
         let fake = Fake {
             cancel_on: Some(("never", cancel)),
             refuse_once_cancelled: true,
@@ -4776,7 +4719,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .report;
         assert_eq!(
@@ -4875,7 +4818,7 @@ mod tests {
             &file_sources(&config),
             &FakePlugins::none(),
             &local_passwords(Some(PASSWORD.as_bytes())),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             None,
             &mut |_| {},
         );
@@ -4982,7 +4925,7 @@ mod tests {
             &file_sources(&config),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .report;
         assert!(report.ok(), "{report:?}");
@@ -5099,7 +5042,7 @@ mod tests {
                 &Sources::default(),
                 &FakePlugins::none(),
                 &Passwords::new(),
-                &AtomicBool::new(false),
+                &Cancel::new(),
                 None,
                 &mut |_| {},
             );
@@ -5148,7 +5091,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .report;
         assert!(!report.ok());
@@ -5188,7 +5131,7 @@ mod tests {
             &Sources::default(),
             &FakePlugins::none(),
             &local_passwords(password),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .report;
         let runs = log.lock().unwrap().clone();
@@ -5222,7 +5165,7 @@ mod tests {
             &config,
             &Sources::default(),
             &FakePlugins::none(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
         .unwrap();
         assert_eq!(planned[0].sudo_secret.as_deref(), Some("LOCAL_SUDO"));
@@ -5354,7 +5297,7 @@ mod tests {
         names: &[&str],
         parallel: u8,
         runs: &[&str],
-        cancel: &AtomicBool,
+        cancel: &Cancel,
         hook: impl Fn(&str, &str) -> Result<(), i32> + Send + Sync + 'static,
         on: &mut dyn FnMut(Progress<'_>),
     ) -> (Report, usize) {
@@ -5396,7 +5339,7 @@ mod tests {
             &["local", "b"],
             2,
             &["one"],
-            &AtomicBool::new(false),
+            &Cancel::new(),
             // local's step ends only once b's report is in.
             move |name, _| {
                 if name == "local" {
@@ -5430,7 +5373,7 @@ mod tests {
     #[test]
     fn cancel_ends_the_running_targets_after_their_step_and_builds_no_more() {
         for parallel in [1, 2] {
-            let cancel = Arc::new(AtomicBool::new(false));
+            let cancel = Arc::new(Cancel::new());
             let flag = Arc::clone(&cancel);
             let parties = usize::from(parallel);
             let (started, cancelled) = (Meet::new(parties), Meet::new(parties));
@@ -5443,7 +5386,7 @@ mod tests {
                     // With two at once, b is mid-step while a cancels.
                     assert!(started.arrive());
                     if name == "a" {
-                        flag.store(true, Ordering::Relaxed);
+                        flag.stop(AbortReason::Cancelled);
                     }
                     assert!(cancelled.arrive());
                     Ok(())
@@ -5516,7 +5459,7 @@ mod tests {
             &Fake::new(&log),
             &runs,
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             None,
         );
         let entries: Vec<_> = report.steps().iter().map(|s| s.entry.clone()).collect();
@@ -5539,7 +5482,7 @@ mod tests {
             &["a", "b", "c"],
             3,
             &["one", "two"],
-            &AtomicBool::new(false),
+            &Cancel::new(),
             move |name, script| {
                 if script == "one" {
                     assert!(meet.arrive());
@@ -5579,7 +5522,7 @@ mod tests {
             ("B_SUDO".to_owned(), b"pw-b".to_vec().into()),
         ]);
         let targets = [target("a"), target("b")];
-        let cancel = AtomicBool::new(false);
+        let cancel = Cancel::new();
         let report = for_each_target(
             "apply",
             &targets,
@@ -5621,7 +5564,7 @@ mod tests {
         ssh: crate::ssh::Ssh,
         stage: String,
         marker: std::path::PathBuf,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<Cancel>,
     }
 
     #[cfg(debug_assertions)]
@@ -5634,7 +5577,7 @@ mod tests {
             let output = self.ssh.run(script, timeout);
             if script == self.stage {
                 std::fs::remove_file(&self.marker).unwrap();
-                self.cancel.store(true, Ordering::Relaxed);
+                self.cancel.stop(AbortReason::Cancelled);
             }
             output
         }
@@ -5661,7 +5604,7 @@ mod tests {
             &home.join("fake-ssh.env"),
             &[("FAKE_SSH_LOG", log.to_str().unwrap())],
         );
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::new());
         let mut ssh = crate::ssh::Ssh::new(
             crate::ssh::SshSettings {
                 program: crate::test_util::fixture("fake-ssh.sh"),
@@ -5726,7 +5669,7 @@ mod tests {
             &file_sources(config),
             &FakePlugins::none(),
             passwords,
-            &AtomicBool::new(false),
+            &Cancel::new(),
         );
         let runs = log.lock().unwrap().clone();
         let captures = captures.lock().unwrap().clone();
@@ -6186,7 +6129,7 @@ mod tests {
             &file_sources(&config),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             Some(session),
             &mut |event| {
                 if let Event::Done(_, report) = event {
@@ -6196,6 +6139,42 @@ mod tests {
             },
         );
         (result, done)
+    }
+
+    #[test]
+    fn a_panicking_target_fails_alone_and_the_others_are_recorded() {
+        let root = crate::test_util::temp_dir("apply-record-panic");
+        let path = root.join("state/anvil/last-apply.json");
+        let config = config(Some(&packages(&["git"], false)), &[]);
+        let report = apply_targets(
+            &[target("a"), target("b"), target("c")],
+            NonZeroU8::new(3).unwrap(),
+            |target| {
+                assert_ne!(target.name, "b", "b blew up");
+                Ok(Box::new(Fake {
+                    probe: ARCH_ROOT,
+                    ..Fake::new(&Arc::default())
+                }))
+            },
+            &config,
+            &Sources::default(),
+            &FakePlugins::none(),
+            &Passwords::new(),
+            &Cancel::new(),
+            Some(Session::open(&path).unwrap()),
+            &mut |_| {},
+        );
+        assert!(
+            report.targets[0].ok() && report.targets[2].ok(),
+            "{report:?}"
+        );
+        let failure = report.targets[1].failure().unwrap();
+        assert!(failure.starts_with("internal error: "), "{failure}");
+        assert_eq!(report.save_error, None);
+        let record = record::load(&path).unwrap().unwrap();
+        let recorded: Vec<&str> = record.targets.keys().map(String::as_str).collect();
+        assert_eq!(recorded, ["a", "c"]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -6224,16 +6203,19 @@ mod tests {
 
     #[test]
     fn saves_report_the_first_error_and_the_targets_still_unrecorded() {
-        let cancel = AtomicBool::new(false);
-        let abort = Abort::new(&cancel);
+        let cancel = Cancel::new();
         let err = || Err::<(), _>("cannot write last-apply.json: denied".to_owned());
         assert_eq!(Saves::default().finish(&Ok(7)), None);
-        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(!cancel.is_set());
 
         let mut saves = Saves::default();
-        saves.note("a", err(), &abort);
-        assert!(cancel.load(Ordering::Relaxed), "the first failure stops");
-        saves.note("b", Err("second".to_owned()), &abort);
+        saves.note("a", err(), &cancel);
+        assert_eq!(
+            cancel.reason(),
+            Some(AbortReason::SaveFailed),
+            "the first failure stops"
+        );
+        saves.note("b", Err("second".to_owned()), &cancel);
         assert_eq!(
             saves.finish(&Err::<(), _>("third".to_owned())).unwrap(),
             "cannot write last-apply.json: denied; not recorded: a, b"
@@ -6241,15 +6223,15 @@ mod tests {
 
         // A later save writes the whole record: a is in it after all.
         let mut saves = Saves::default();
-        saves.note("a", err(), &abort);
-        saves.note("b", Ok(()), &abort);
-        saves.note("c", Err("x".to_owned()), &abort);
+        saves.note("a", err(), &cancel);
+        saves.note("b", Ok(()), &cancel);
+        saves.note("c", Err("x".to_owned()), &cancel);
         assert_eq!(
             saves.finish(&Err::<(), _>("y".to_owned())).unwrap(),
             "cannot write last-apply.json: denied; not recorded: c"
         );
         let mut saves = Saves::default();
-        saves.note("a", err(), &abort);
+        saves.note("a", err(), &cancel);
         assert_eq!(
             saves.finish(&Ok(())).unwrap(),
             "cannot write last-apply.json: denied",
@@ -6263,7 +6245,7 @@ mod tests {
         // Without a last save, as rollback ends.
         assert_eq!(Saves::default().error(), None);
         let mut saves = Saves::default();
-        saves.note("a", err(), &abort);
+        saves.note("a", err(), &cancel);
         assert_eq!(
             saves.error().unwrap(),
             "cannot write last-apply.json: denied; not recorded: a"
@@ -6271,41 +6253,60 @@ mod tests {
     }
 
     #[test]
-    fn the_first_to_set_the_flag_names_the_abort_reason() {
-        let ended = || cancelled("apply", &target("a"), Vec::new());
+    fn the_first_to_stop_the_token_names_the_abort_reason() {
+        let ended = |cancel: &Cancel| cancelled("apply", &target("a"), Vec::new(), cancel);
         let reason = |report: TargetReport| match report {
             TargetReport::Cancelled { abort, .. } => abort,
             other => panic!("{other:?}"),
         };
 
+        // A transport that refused with the token unset: the user's.
+        assert_eq!(reason(ended(&Cancel::new())), AbortReason::Cancelled);
+
         // Ctrl-C alone, and Ctrl-C before the failed save.
-        let cancel = AtomicBool::new(false);
-        let abort = Abort::new(&cancel);
-        cancel.store(true, Ordering::Relaxed);
-        assert_eq!(reason(abort.mark(ended())), AbortReason::Cancelled);
-        abort.stop(AbortReason::SaveFailed);
-        assert_eq!(reason(abort.mark(ended())), AbortReason::Cancelled);
+        let cancel = Cancel::new();
+        cancel.stop(AbortReason::Cancelled);
+        assert_eq!(reason(ended(&cancel)), AbortReason::Cancelled);
+        let mut saves = Saves::default();
+        saves.note("a", Err("denied".to_owned()), &cancel);
+        assert_eq!(reason(ended(&cancel)), AbortReason::Cancelled);
         assert_eq!(
-            serde_json::to_value(abort.mark(ended())).unwrap(),
+            serde_json::to_value(ended(&cancel)).unwrap(),
             serde_json::json!({"target": "a", "steps": [], "ok": false}),
             "a user's cancel keeps its JSON"
         );
 
         // The failed save before Ctrl-C.
-        let cancel = AtomicBool::new(false);
-        let abort = Abort::new(&cancel);
-        abort.stop(AbortReason::SaveFailed);
-        cancel.store(true, Ordering::Relaxed);
-        assert_eq!(reason(abort.mark(ended())), AbortReason::SaveFailed);
+        let cancel = Cancel::new();
+        Saves::default().note("a", Err("denied".to_owned()), &cancel);
+        cancel.stop(AbortReason::Cancelled);
+        assert_eq!(reason(ended(&cancel)), AbortReason::SaveFailed);
+        assert_eq!(
+            serde_json::to_value(ended(&cancel)).unwrap(),
+            serde_json::json!({"target": "a", "steps": [], "ok": false, "abort": "save_failed"}),
+        );
+    }
 
-        // Only a report the flag ended takes a reason.
-        let ran = TargetReport::Ran {
-            warnings: Vec::new(),
-            target: "a".to_owned(),
-            steps: Vec::new(),
-            ok: true,
-        };
-        assert_eq!(abort.mark(ran.clone()), ran);
+    #[test]
+    fn for_each_target_skips_with_the_reason_the_token_was_stopped_for() {
+        let cancel = Cancel::new();
+        cancel.stop(AbortReason::SaveFailed);
+        let targets = [target("a"), target("b")];
+        let report = for_each_target("run", &targets, NonZeroU8::MIN, &cancel, &mut |_| {}, |t| {
+            panic!("{} ran", t.name)
+        });
+        for target in &report.targets {
+            assert!(
+                matches!(
+                    target,
+                    TargetReport::Cancelled {
+                        abort: AbortReason::SaveFailed,
+                        ..
+                    }
+                ),
+                "{target:?}"
+            );
+        }
     }
 
     #[test]
@@ -6360,7 +6361,7 @@ mod tests {
                 &file_sources(&config),
                 &FakePlugins::none(),
                 &Passwords::new(),
-                &AtomicBool::new(false),
+                &Cancel::new(),
                 Some(session),
                 &mut |event| {
                     if let Event::Done(0, _) = event {
@@ -6468,7 +6469,7 @@ mod tests {
             &file_sources(&config),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             Some(session),
             &mut |event| {
                 if let (Event::Done(..), true) = (event, once_saved) {
@@ -6512,7 +6513,7 @@ mod tests {
             &file_sources(&config),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             Some(session),
             &mut |_| {},
         );
@@ -6556,7 +6557,7 @@ mod tests {
             &file_sources(&config),
             &FakePlugins::none(),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             Some(session),
             &mut |_| {},
         );
@@ -6615,7 +6616,7 @@ mod tests {
             &expanded,
             &Sources::of(&sources),
             &FakePlugins::none(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         )
     }
 
@@ -6640,7 +6641,7 @@ mod tests {
             &Sources::of(&sources),
             &FakePlugins::new(|_, _| panic!("no plugin matches")),
             &Passwords::new(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             None,
         )
     }
@@ -6924,7 +6925,7 @@ mod tests {
             "#
         );
         let (config, expanded) = tasks_of(&text);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::new());
         let log = Arc::new(Mutex::new(Vec::new()));
         let fake = fake(Fake {
             probe: ARCH_ROOT,

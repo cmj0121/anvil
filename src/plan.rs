@@ -11,20 +11,22 @@
 //! shown. A `[[services]]` step shows as `service NAME`, never its script.
 
 use std::num::NonZeroU8;
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use serde::Serialize;
 
 use crate::apply::{self, Escape, Line, PlannedRun, Style, Unresolved, print_lines};
+use crate::cancel::Cancel;
 use crate::cli::{Cli, Failure, print_json};
-use crate::config::{Config, Plugin};
+use crate::config::Config;
 use crate::fanout::{self, Event};
 use crate::files::Sources;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
 use crate::options::Options;
-use crate::plugin::{self, Plugins};
+use crate::plugin::Plugins;
+use crate::prepared::Prepared;
 use crate::status;
 use crate::tasks::Expanded;
 use crate::transport::{Transport, TransportError};
@@ -43,7 +45,7 @@ pub enum PlanReport {
         error: String,
         ok: bool,
     },
-    /// The cancel flag was set before the target. `ok` is always false.
+    /// The cancel token was set before the target. `ok` is always false.
     Cancelled { target: String, ok: bool },
 }
 
@@ -77,28 +79,19 @@ pub struct Plan {
 /// be planned, and its report once it ends.
 pub type Progress<'a> = Event<'a, PlanReport>;
 
-/// Loads the targets and plans `config` for each, as [`plan_targets`]. A
-/// `[[files]]` src that cannot be read fails the command before any target.
-pub fn run_targets(
-    opts: &Options,
-    config: &Config,
-    expanded: &Expanded,
-    on: &mut dyn FnMut(Progress<'_>),
-) -> Result<Plan, Failure> {
-    let targets = opts.targets_for(config)?;
-    let pins = plugin::verify_where(config, Plugin::is_step).map_err(Failure::usage)?;
-    let sources = opts.sources(config, expanded)?;
-    Ok(plan_targets(
-        &targets,
-        opts.parallel,
-        |target| opts.transport(target),
-        config,
-        expanded,
-        &sources,
-        &pins,
-        &opts.cancel,
+/// Plans `prepared.config` for each of its targets, as [`plan_targets`].
+pub fn run_targets(prepared: &Prepared, on: &mut dyn FnMut(Progress<'_>)) -> Plan {
+    plan_targets(
+        &prepared.targets,
+        prepared.opts.parallel,
+        |target| prepared.transport(target),
+        &prepared.config,
+        &prepared.expanded,
+        &prepared.sources,
+        &prepared.pins,
+        &prepared.cancel,
         on,
-    ))
+    )
 }
 
 /// Plans `config` for each of `targets`, `parallel` at a time. Once
@@ -116,7 +109,7 @@ pub fn plan_targets(
     expanded: &Expanded,
     sources: &Sources,
     plugins: &dyn Plugins,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Plan {
     let reports = fanout::fan_out(
@@ -171,7 +164,7 @@ fn plan_target(
     expanded: &Expanded,
     sources: &Sources,
     plugins: &dyn Plugins,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
 ) -> PlanReport {
     log::info!("plan {}: start", target.name);
     status::phase(&target.name, status::Phase::Probe);
@@ -211,15 +204,17 @@ fn plan_target(
 pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
     let style = Style::detect();
     let (config, expanded) = opts.load_expanded()?;
-    let _interrupt = Interrupt::install(&opts.cancel)?;
+    let cancel = Arc::new(Cancel::new());
+    let _interrupt = Interrupt::install(&cancel)?;
     let mut print = fanout::in_order(|report| print_lines(&render(report), style));
     let mut follow = status::Follow::new("plan", status::enabled(cli.no_progress));
-    let plan = run_targets(opts, &config, &expanded, &mut |progress| {
+    let prepared = Prepared::plan(opts, config, expanded, cancel)?;
+    let plan = run_targets(&prepared, &mut |progress| {
         follow.event(&progress);
         if !cli.json {
             print(progress);
         }
-    })?;
+    });
     drop(follow);
     let failed = plan.targets.iter().filter(|t| !t.ok()).count();
     if cli.json {
@@ -305,9 +300,10 @@ pub(crate) fn render_summary(targets: usize, failed: usize, style: Style) -> Str
 mod tests {
     use crate::apply::RunKind;
     use crate::tasks::legacy;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     use super::*;
+    use crate::cancel::AbortReason;
     use crate::config::Step;
     use crate::facts;
     use crate::inventory::TargetKind;
@@ -339,7 +335,9 @@ mod tests {
         config: &Config,
         on: &mut dyn FnMut(Progress<'_>),
     ) -> Result<Plan, Failure> {
-        super::run_targets(opts, config, &legacy(config), on)
+        let expanded = legacy(config);
+        let prepared = Prepared::plan(opts, config.clone(), expanded, Arc::default())?;
+        Ok(super::run_targets(&prepared, on))
     }
 
     /// [`super::plan_targets`] on a legacy config's list.
@@ -351,7 +349,7 @@ mod tests {
         config: &Config,
         sources: &Sources,
         plugins: &dyn Plugins,
-        cancel: &AtomicBool,
+        cancel: &Cancel,
         on: &mut dyn FnMut(Progress<'_>),
     ) -> Plan {
         super::plan_targets(
@@ -455,7 +453,7 @@ mod tests {
     /// [`apply::resolve`] for target `local` and a config without plugin
     /// steps.
     fn resolve(facts: &facts::Facts, config: &Config) -> Result<Vec<PlannedRun>, Unresolved> {
-        let cancel = AtomicBool::new(false);
+        let cancel = Cancel::new();
         apply::resolve(
             &target("local"),
             Some(facts),
@@ -511,7 +509,7 @@ mod tests {
             config,
             &Sources::of(&vec![FILE_TEXT; config.files.len()]),
             plugins,
-            &AtomicBool::new(cancelled),
+            &Cancel::stopped(cancelled),
             &mut |progress| match progress {
                 Progress::Begin(targets) => assert_eq!(targets.len(), names.len()),
                 Progress::Start(target) => events.push(format!("start {}", target.name)),
@@ -824,7 +822,7 @@ mod tests {
             &config(None, &["one"]),
             &Sources::default(),
             &FakePlugins::none(),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             &mut |_| {},
         );
         assert!(!plan.targets[0].ok());
@@ -902,7 +900,7 @@ mod tests {
     fn plan_hooked(
         names: &[&str],
         parallel: u8,
-        cancel: &AtomicBool,
+        cancel: &Cancel,
         hook: impl Fn(&str) + Send + Sync + 'static,
         on: &mut dyn FnMut(Progress<'_>),
     ) -> (Plan, usize) {
@@ -941,7 +939,7 @@ mod tests {
         let (plan, _) = plan_hooked(
             &["local", "b"],
             2,
-            &AtomicBool::new(false),
+            &Cancel::new(),
             // Both probe at once; local's ends only once b's report is in.
             move |name| {
                 assert!(probes.arrive(), "the two probes ran at once");
@@ -975,7 +973,7 @@ mod tests {
 
     #[test]
     fn cancel_with_two_at_once_plans_no_later_target() {
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::new());
         let flag = Arc::clone(&cancel);
         let (started, cancelled) = (Meet::new(2), Meet::new(2));
         let (plan, built) = plan_hooked(
@@ -986,7 +984,7 @@ mod tests {
                 assert!(started.arrive());
                 // b is mid-probe while a cancels.
                 if name == "a" {
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    flag.stop(AbortReason::Cancelled);
                 }
                 assert!(cancelled.arrive());
             },
@@ -1008,7 +1006,7 @@ mod tests {
         let (plan, _) = plan_hooked(
             &["a", "b", "c"],
             2,
-            &AtomicBool::new(false),
+            &Cancel::new(),
             |name| assert_ne!(name, "b", "b blew up"),
             &mut |_| {},
         );

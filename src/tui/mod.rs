@@ -21,6 +21,7 @@ use ratatui::layout::Rect;
 use signal_hook::SigId;
 use signal_hook::consts::SIGINT;
 
+use crate::cancel::{AbortReason, Cancel};
 use crate::cli::Failure;
 use crate::commands;
 use crate::editor::{Buffer, Editor, Fallback};
@@ -207,12 +208,12 @@ struct Runs<'a, S: Screen> {
     tx: Sender<Msg>,
     session: &'a Session,
     screen: &'a S,
-    /// The worker and its run's cancel flag.
-    worker: Option<(Worker, Arc<AtomicBool>)>,
+    /// The worker and its run's cancel token.
+    worker: Option<(Worker, Arc<Cancel>)>,
 }
 
 impl<S: Screen> Runs<'_, S> {
-    fn spawn(&mut self, job: app::Job, app: &App, cancel: Arc<AtomicBool>) {
+    fn spawn(&mut self, job: app::Job, app: &App, cancel: Arc<Cancel>) {
         let worker = worker::spawn(job, app.opts.clone(), cancel.clone(), self.tx.clone());
         self.worker = Some((worker, cancel));
     }
@@ -230,7 +231,7 @@ impl<S: Screen> Drop for Runs<'_, S> {
         let Some((worker, cancel)) = self.worker.take() else {
             return;
         };
-        cancel.store(true, Ordering::Relaxed);
+        cancel.stop(AbortReason::Cancelled);
         if thread::panicking() {
             // The hook restored the terminal, so a handoff failed by the
             // session's drop runs on the real screen; joining could wait on
@@ -648,7 +649,7 @@ mod tests {
             fake.clone(),
             Arc::new(AtomicBool::new(false)),
         );
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::new());
         let worker = {
             let fake = fake.clone();
             worker::spawn_job(tx.clone(), move |_| {
@@ -663,7 +664,7 @@ mod tests {
             worker: Some((worker, cancel.clone())),
         };
         drop(runs);
-        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(cancel.reason(), Some(AbortReason::Cancelled));
         // The drop returned only after the worker resumed and ended.
         assert_eq!(fake.events(), ["leave", "child runs", "enter"]);
     }

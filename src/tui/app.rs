@@ -6,11 +6,11 @@ use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::cancel::{AbortReason, Cancel};
 use crate::cli::Failure;
 use crate::config::{Config, StepKind};
 use crate::document::{Format, MAX_BYTES};
@@ -256,7 +256,7 @@ pub struct Running {
     /// The targets running now, in the order they started; an update's
     /// one line instead.
     pub running: Vec<String>,
-    pub cancel: Arc<AtomicBool>,
+    pub cancel: Arc<Cancel>,
     pub tick: u8,
 }
 
@@ -668,7 +668,7 @@ impl App {
         if ctrl_c || (key.code == KeyCode::Char('q') && !typing && self.files.is_none()) {
             self.quit = true;
             if let Some(running) = &self.running {
-                running.cancel.store(true, Ordering::Relaxed);
+                running.cancel.stop(AbortReason::Cancelled);
                 self.notice = Some(format!("quitting once {} ends", running.kind.as_str()));
             }
             return vec![Effect::Redraw];
@@ -1229,7 +1229,7 @@ impl App {
         self.running = Some(Running {
             kind,
             running,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(Cancel::new()),
             tick: 0,
         });
         let result = match kind {
@@ -1274,14 +1274,14 @@ impl App {
         Some(format!("busy: {} is running{hint}", running.kind.as_str()))
     }
 
-    /// Sets the cancel flag: apply, run and rollback stop before their next
+    /// Stops the cancel token: apply, run and rollback stop before their next
     /// target or step, plan before its next target, doctor before its next
     /// target or doctor plugin.
     fn cancel(&mut self) {
         let Some(running) = &self.running else {
             return;
         };
-        running.cancel.store(true, Ordering::Relaxed);
+        running.cancel.stop(AbortReason::Cancelled);
         self.notice = Some(match running.kind {
             RunKind::Apply | RunKind::Run | RunKind::Rollback => {
                 "cancelling: the running step finishes first".to_owned()
@@ -1620,7 +1620,6 @@ pub mod tests {
             ssh_config: None,
             target: Vec::new(),
             parallel: std::num::NonZeroU8::MIN,
-            cancel: std::sync::Arc::default(),
             can_prompt: false,
             #[cfg(debug_assertions)]
             secret_store: None,
@@ -1792,7 +1791,7 @@ pub mod tests {
     }
 
     fn cancel_flag(app: &App) -> bool {
-        app.running.as_ref().unwrap().cancel.load(Ordering::Relaxed)
+        app.running.as_ref().unwrap().cancel.reason() == Some(AbortReason::Cancelled)
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -2229,7 +2228,7 @@ pub mod tests {
         );
         assert_eq!(app.results.len(), 1);
         press(&mut app, &[KeyCode::Esc]);
-        assert!(app.running.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+        assert!(app.running.as_ref().unwrap().cancel.reason() == Some(AbortReason::Cancelled));
         assert_eq!(
             app.notice.as_deref(),
             Some("cancelling: running targets finish first")
@@ -3543,7 +3542,7 @@ pub mod tests {
         app.running = Some(Running {
             kind: RunKind::Apply,
             running: Vec::new(),
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(Cancel::new()),
             tick: 0,
         });
         assert_eq!(app.on_key(key(KeyCode::Char('e'))), [Effect::Redraw]);

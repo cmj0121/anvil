@@ -16,7 +16,7 @@
 //! one hash-only script for the dests the record lists and each pinned
 //! plugin in name order. A plugin sees per-run tags in place of every
 //! sha256 ([`plugin::tag`]), never a hash or a byte of a file. A bad pin
-//! skips only that plugin; a record or key error runs none. A cancel flag,
+//! skips only that plugin; a record or key error runs none. A cancel token,
 //! checked before each target and each plugin, ends the rest `cancelled`.
 //! A drift finding, `ok: false` or a plugin error exits 1, as an
 //! unreachable target does; notices alone do not. No hash or tag is shown.
@@ -24,12 +24,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{Map, Value};
 use zeroize::Zeroizing;
 
+use crate::cancel::Cancel;
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::{Config, MAX_FILES, Plugin};
 use crate::editor::{Editor, EditorError, Fallback};
@@ -278,7 +279,7 @@ pub fn check(
     config: &Config,
     expanded: &Expanded,
     store: &dyn Store,
-    cancel: &AtomicBool,
+    cancel: &Arc<Cancel>,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
     // Lenient on purpose: an unresolvable workspace falls back with a warning.
@@ -302,11 +303,11 @@ pub fn check(
         .iter()
         .map(|target| {
             on(Progress::Start(target));
-            cancelled = cancelled || cancel.load(Ordering::Relaxed);
+            cancelled = cancelled || cancel.is_set();
             let report = if cancelled {
                 cancelled_target(target)
             } else {
-                let transport = opts.transport(target);
+                let transport = opts.transport(target, cancel);
                 let mut report = check_target(target, &transport);
                 let work = packages_to_check(config, expanded, target, report.facts.as_ref());
                 if let Some(packages) = work.first() {
@@ -422,13 +423,13 @@ impl DoctorRun {
         target: &Target,
         facts: &Facts,
         transport: &dyn Transport,
-        cancel: &AtomicBool,
+        cancel: &Cancel,
     ) -> (Vec<PluginReport>, Option<DriftSummary>) {
         if self.pins.is_empty() {
             return (Vec::new(), None);
         }
         let name = &target.name;
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.is_set() {
             log::info!("doctor {name}: plugins cancelled");
             let cancelled = |pin: &Pin| PluginReport::failed(&pin.name, CANCELLED.to_owned());
             return (self.pins.iter().map(cancelled).collect(), None);
@@ -466,7 +467,7 @@ impl DoctorRun {
             .pins
             .iter()
             .map(|pin| {
-                if cancel.load(Ordering::Relaxed) {
+                if cancel.is_set() {
                     log::info!("doctor {name}: plugin {}: cancelled", pin.name);
                     return PluginReport::failed(&pin.name, CANCELLED.to_owned());
                 }
@@ -620,14 +621,15 @@ pub fn run(
     expanded: &Expanded,
     store: &dyn Store,
 ) -> Result<(), Failure> {
-    let _interrupt = Interrupt::install(&opts.cancel)?;
+    let cancel = Arc::new(Cancel::new());
+    let _interrupt = Interrupt::install(&cancel)?;
     let mut follow = status::Follow::new("doctor", status::enabled(cli.no_progress));
     let report = check(
         opts,
         config,
         expanded,
         store,
-        &opts.cancel,
+        &cancel,
         &mut |progress| match progress {
             Progress::Begin(targets) => follow.begin(targets),
             Progress::Start(target) => status::target_started(&target.name),
@@ -1097,6 +1099,7 @@ fn no_sudo_warning(count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancel::AbortReason;
     use crate::tasks::legacy;
 
     use std::time::Duration;
@@ -1109,7 +1112,7 @@ mod tests {
         opts: &Options,
         config: &Config,
         store: &dyn Store,
-        cancel: &AtomicBool,
+        cancel: &Arc<Cancel>,
         on: &mut dyn FnMut(Progress<'_>),
     ) -> Result<Report, Failure> {
         super::check(opts, config, &legacy(config), store, cancel, on)
@@ -1505,7 +1508,7 @@ mod tests {
             &Options::from_cli(&cli),
             &config,
             &Memory::default(),
-            &AtomicBool::new(false),
+            &Arc::default(),
             &mut |progress| {
                 events.push(match progress {
                     Progress::Begin(targets) => format!("begin {}", targets.len()),
@@ -1788,7 +1791,7 @@ mod tests {
             &Options::from_cli(&cli),
             &config,
             &store,
-            &AtomicBool::new(false),
+            &Arc::default(),
             &mut |_| {},
         )
         .unwrap();
@@ -1910,12 +1913,8 @@ mod tests {
     #[test]
     fn without_a_record_entry_the_plugin_runs_with_null_and_a_notice() {
         let (dir, run) = doctor_run("doctor-null", EMPTY, None);
-        let (reports, drift) = run.target(
-            &host("box"),
-            &facts("user=cmj\n"),
-            &Never,
-            &AtomicBool::new(false),
-        );
+        let (reports, drift) =
+            run.target(&host("box"), &facts("user=cmj\n"), &Never, &Cancel::new());
         assert!(drift.is_none());
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].notice.as_deref(), Some("no apply recorded"));
@@ -1933,7 +1932,7 @@ mod tests {
     fn a_set_cancel_flag_runs_no_hash_run_and_no_plugin() {
         let record = recorded(&[("/etc/a", false)]);
         let (dir, run) = doctor_run("doctor-cancel-hash", EMPTY, Some(record));
-        let cancel = AtomicBool::new(true);
+        let cancel = Cancel::cancelled();
         let (reports, drift) = run.target(&host("box"), &facts("user=cmj\n"), &Never, &cancel);
         assert!(drift.is_none());
         assert_eq!(reports[0].error.as_deref(), Some("cancelled"));
@@ -1948,7 +1947,7 @@ mod tests {
             &host("box"),
             &facts("user=cmj\n"),
             &Never,
-            &AtomicBool::new(true),
+            &Cancel::cancelled(),
         );
         assert_eq!(reports[0].error.as_deref(), Some("cancelled"));
         assert!(!reports[0].passed());
@@ -1964,7 +1963,7 @@ mod tests {
             &host("box"),
             &facts("user=cmj\n"),
             &Fake(Ok("nothing\n")),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         );
         assert_eq!(
             reports[0].error.as_deref(),
@@ -1983,7 +1982,7 @@ mod tests {
             &host("box"),
             &facts("user=cmj\n"),
             &Exits(Some(1), stderr),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         );
         assert_eq!(
             reports[0].error.as_deref(),
@@ -1997,7 +1996,7 @@ mod tests {
             &host("box"),
             &facts("user=cmj\n"),
             &Exits(Some(1), long),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         );
         let err = reports[0].error.as_deref().unwrap();
         assert!(err.ends_with(&format!("{}…", "x".repeat(64))), "{err}");
@@ -2013,7 +2012,7 @@ mod tests {
             &host("box"),
             &facts("user=cmj\nsudo=binary\n"),
             &Never,
-            &AtomicBool::new(false),
+            &Cancel::new(),
         );
         assert!(reports[0].passed(), "{reports:?}");
         assert_eq!(
@@ -2062,7 +2061,7 @@ mod tests {
             &host("box"),
             &facts("user=cmj\n"),
             &Fake(Ok(stdout)),
-            &AtomicBool::new(false),
+            &Cancel::new(),
         );
         assert!(reports[0].passed(), "{reports:?}");
         assert_eq!(
@@ -2155,7 +2154,7 @@ mod tests {
             &opts,
             &Config::default(),
             &Memory::default(),
-            &AtomicBool::new(false),
+            &Arc::default(),
             &mut |_| panic!("invalid inventory must fail before probing"),
         )
         .unwrap_err();
@@ -2186,7 +2185,7 @@ mod tests {
             "doctor",
         ])
         .unwrap();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(Cancel::new());
         let mut started = 0;
         let report = check(
             &Options::from_cli(&cli),
@@ -2197,7 +2196,7 @@ mod tests {
                 if let Progress::Start(_) = progress {
                     started += 1;
                     if started == 2 {
-                        cancel.store(true, Ordering::Relaxed);
+                        cancel.stop(AbortReason::Cancelled);
                     }
                 }
             },

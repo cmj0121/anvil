@@ -2,7 +2,7 @@
 //! doctor. Each counts as a press, whichever came before it. A SIGHUP that came
 //! in ignored, as under `nohup`, stays ignored.
 //!
-//! The first signal sets the run's cancel flag, as Esc does in the TUI: each
+//! The first signal stops the run's cancel token, as Esc does in the TUI: each
 //! running target ends after its current step and no other target starts;
 //! doctor ends its running probe, hash run or plugin and starts no other.
 //! That holds with `--parallel 1` too, so a first Ctrl-C now waits for the
@@ -19,7 +19,6 @@
 use std::io::IsTerminal;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -28,6 +27,7 @@ use log::Level;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle, Signals};
 
+use crate::cancel::{AbortReason, Cancel};
 use crate::cli::Failure;
 use crate::exec;
 use crate::logger::format_line;
@@ -59,6 +59,11 @@ fn word(signal: i32) -> &'static str {
         SIGHUP => "hung up",
         _ => "interrupted",
     }
+}
+
+/// The reason the first `signal` stops the run for: every one is the user's.
+fn reason_of(_signal: i32) -> AbortReason {
+    AbortReason::Cancelled
 }
 
 /// How long the second signal waits for its line before anvil dies.
@@ -122,9 +127,11 @@ pub struct Interrupt {
 }
 
 impl Interrupt {
-    /// Starts handling the signals: the first sets `cancel`, the second kills
-    /// every tracked group and re-raises itself with its default action.
-    pub fn install(cancel: &Arc<AtomicBool>) -> Result<Interrupt, Failure> {
+    /// Starts handling the signals: the first stops `cancel`, the second kills
+    /// every tracked group and re-raises itself with its default action. The
+    /// notice is printed even when `cancel` was already stopped (a save
+    /// failed, say), whose reason it keeps.
+    pub fn install(cancel: &Arc<Cancel>) -> Result<Interrupt, Failure> {
         let cancel = Arc::clone(cancel);
         let groups = Groups::global();
         let mut caught = vec![SIGINT, SIGTERM];
@@ -139,7 +146,7 @@ impl Interrupt {
             for signal in signals.forever() {
                 presses += 1;
                 if presses == 1 {
-                    cancel.store(true, Ordering::Relaxed);
+                    cancel.stop(reason_of(signal));
                     say(notice(signal));
                     continue;
                 }

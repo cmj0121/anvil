@@ -132,7 +132,7 @@ pub struct Pin {
 }
 
 /// Every `[plugins]` entry, verified, by name.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Pins(BTreeMap<String, Pin>);
 
 /// Checks the `[plugins]` entries `keep` accepts, in name order; the first

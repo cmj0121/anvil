@@ -4498,7 +4498,7 @@ mod tests {
             can_prompt: false,
             key_timeout: KEY_TIMEOUT,
             check_timeout: CHECK_TIMEOUT,
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel: std::sync::Arc::default(),
         };
         let ssh = Ssh::new(settings, None, "web1", None, None).unwrap();
         let control = Path::new("/tmp/anvil-control");

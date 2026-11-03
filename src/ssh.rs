@@ -20,11 +20,11 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::bytes;
+use crate::cancel::Cancel;
 use crate::exec;
 use crate::paths::{self, PrivateDirError};
 use crate::term;
@@ -109,8 +109,8 @@ pub struct SshSettings {
     pub key_timeout: Duration,
     /// Deadline for `-O check`.
     pub check_timeout: Duration,
-    /// The run's cancel flag, checked right before a master is opened.
-    pub cancel: Arc<AtomicBool>,
+    /// The run's cancel token, checked right before a master is opened.
+    pub cancel: Arc<Cancel>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,7 +125,7 @@ pub struct Ssh {
     can_prompt: bool,
     key_timeout: Duration,
     check_timeout: Duration,
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<Cancel>,
     /// The checked control directory, once the first run has found it.
     control_dir: OnceCell<PathBuf>,
 }
@@ -241,7 +241,7 @@ impl Ssh {
         if self.master_alive(control_dir) {
             return Ok(control_dir);
         }
-        let cancelled = || cancellable && self.cancel.load(Ordering::Relaxed);
+        let cancelled = || cancellable && self.cancel.is_set();
         if cancelled() {
             return Err(TransportError::Cancelled);
         }
@@ -1464,7 +1464,7 @@ mod tests {
 
     fn cancelled(ssh: Ssh) -> Ssh {
         Ssh {
-            cancel: Arc::new(AtomicBool::new(true)),
+            cancel: Arc::new(Cancel::cancelled()),
             ..ssh
         }
     }
@@ -1607,7 +1607,9 @@ mod tests {
         std::thread::scope(|scope| {
             let run = scope.spawn(move || ssh.run("true", RUN_TIMEOUT));
             wait_for(&home.join("gate.wait"));
-            flag.store(cancel, Ordering::Relaxed);
+            if cancel {
+                flag.stop(crate::cancel::AbortReason::Cancelled);
+            }
             fs::write(&gate, "").unwrap();
             run.join().unwrap().unwrap_err()
         })

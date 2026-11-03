@@ -12,10 +12,11 @@
 use std::any::Any;
 use std::num::NonZeroU8;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
+use crate::cancel::Cancel;
 use crate::inventory::Target;
 
 /// What [`fan_out`] reports, in this order: `Begin` once, then a `Start`
@@ -43,7 +44,7 @@ enum Msg<R> {
 pub fn fan_out<R: Send>(
     targets: &[Target],
     parallel: NonZeroU8,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
     on: &mut dyn FnMut(Event<'_, R>),
     one: impl Fn(&Target) -> R + Sync,
     skipped: impl Fn(&Target) -> R + Sync,
@@ -68,7 +69,7 @@ pub fn fan_out<R: Send>(
                             break;
                         };
                         let _ = tx.send(Msg::Start(index));
-                        let result = if cancel.load(Ordering::Relaxed) {
+                        let result = if cancel.is_set() {
                             skipped(target)
                         } else {
                             panic::catch_unwind(AssertUnwindSafe(|| one(target))).unwrap_or_else(
@@ -148,8 +149,10 @@ pub fn panic_message(payload: &(dyn Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
 
     use super::*;
+    use crate::cancel::AbortReason;
     use crate::inventory::TargetKind;
     use crate::test_util::{Gauge, Meet};
     use std::time::{Duration, Instant};
@@ -177,7 +180,7 @@ mod tests {
     fn run(
         names: &[&str],
         parallel: u8,
-        cancel: &AtomicBool,
+        cancel: &Cancel,
         one: impl Fn(&Target) -> String + Sync,
     ) -> (Vec<String>, Vec<String>) {
         let targets = targets(names);
@@ -212,7 +215,7 @@ mod tests {
     #[test]
     fn one_worker_runs_the_targets_one_by_one_in_order() {
         let gauge = Gauge::default();
-        let (results, events) = run(&["local", "a", "b"], 1, &AtomicBool::new(false), |t| {
+        let (results, events) = run(&["local", "a", "b"], 1, &Cancel::new(), |t| {
             gauge.enter();
             gauge.leave();
             ran(t)
@@ -236,7 +239,7 @@ mod tests {
     #[test]
     fn two_workers_run_two_targets_at_once() {
         let meet = Meet::new(2);
-        let (results, _) = run(&["a", "b"], 2, &AtomicBool::new(false), |t| {
+        let (results, _) = run(&["a", "b"], 2, &Cancel::new(), |t| {
             if meet.arrive() {
                 ran(t)
             } else {
@@ -250,20 +253,15 @@ mod tests {
     fn no_more_than_n_targets_run_at_once() {
         let gauge = Gauge::default();
         let meet = Meet::new(2);
-        let (results, events) = run(
-            &["a", "b", "c", "d", "e"],
-            2,
-            &AtomicBool::new(false),
-            |t| {
-                gauge.enter();
-                // The first two meet, so two did run at once.
-                if t.name.as_str() <= "b" {
-                    assert!(meet.arrive());
-                }
-                gauge.leave();
-                ran(t)
-            },
-        );
+        let (results, events) = run(&["a", "b", "c", "d", "e"], 2, &Cancel::new(), |t| {
+            gauge.enter();
+            // The first two meet, so two did run at once.
+            if t.name.as_str() <= "b" {
+                assert!(meet.arrive());
+            }
+            gauge.leave();
+            ran(t)
+        });
         assert_eq!(results, ["ran a", "ran b", "ran c", "ran d", "ran e"]);
         assert_eq!(gauge.peak(), 2);
         assert_eq!(events[0], "begin 5");
@@ -276,9 +274,9 @@ mod tests {
 
     #[test]
     fn more_workers_than_targets_is_fine_and_no_target_is_nothing() {
-        let (results, _) = run(&["a"], 32, &AtomicBool::new(false), ran);
+        let (results, _) = run(&["a"], 32, &Cancel::new(), ran);
         assert_eq!(results, ["ran a"]);
-        let (results, events) = run(&[], 4, &AtomicBool::new(false), ran);
+        let (results, events) = run(&[], 4, &Cancel::new(), ran);
         assert!(results.is_empty());
         assert_eq!(events, ["begin 0"]);
     }
@@ -286,7 +284,7 @@ mod tests {
     #[test]
     fn once_cancelled_no_target_starts_its_job() {
         for parallel in [1, 2] {
-            let cancel = AtomicBool::new(false);
+            let cancel = Cancel::new();
             let (started_both, cancelled) =
                 (Meet::new(parallel.into()), Meet::new(parallel.into()));
             let started = Mutex::new(Vec::new());
@@ -295,7 +293,7 @@ mod tests {
                 // With two workers, b is running while a cancels.
                 assert!(started_both.arrive());
                 if t.name == "a" {
-                    cancel.store(true, Ordering::Relaxed);
+                    cancel.stop(AbortReason::Cancelled);
                 }
                 assert!(cancelled.arrive());
                 ran(t)
@@ -315,7 +313,7 @@ mod tests {
     #[test]
     fn a_panicking_job_is_its_target_only() {
         for parallel in [1, 2] {
-            let (results, events) = run(&["a", "b", "c"], parallel, &AtomicBool::new(false), |t| {
+            let (results, events) = run(&["a", "b", "c"], parallel, &Cancel::new(), |t| {
                 assert_ne!(t.name, "b", "b blew up");
                 ran(t)
             });
@@ -342,7 +340,7 @@ mod tests {
     #[test]
     fn one_worker_takes_no_target_until_the_last_done_was_handled() {
         let targets = targets(&["a", "b"]);
-        let cancel = AtomicBool::new(false);
+        let cancel = Cancel::new();
         let b_ran = AtomicBool::new(false);
         let results = fan_out(
             &targets,
@@ -352,7 +350,7 @@ mod tests {
                 if let Event::Done(0, _) = event {
                     // A worker that does not wait runs b within this time.
                     wait_for_flag(&b_ran, Duration::from_millis(500));
-                    cancel.store(true, Ordering::Relaxed);
+                    cancel.stop(AbortReason::Cancelled);
                 }
             },
             |target| {
@@ -373,7 +371,7 @@ mod tests {
         fan_out(
             &targets,
             n(2),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             &mut |event| {
                 if let Event::Done(0, _) = event {
                     seen = wait_for_flag(&b_ran, Duration::from_secs(5));
@@ -399,7 +397,7 @@ mod tests {
             fan_out(
                 &targets,
                 n(1),
-                &AtomicBool::new(false),
+                &Cancel::new(),
                 &mut |event| assert!(!matches!(event, Event::Done(..)), "the caller blew up"),
                 |target| {
                     b_ran.fetch_or(target.name == "b", Ordering::Relaxed);
@@ -420,7 +418,7 @@ mod tests {
         let results = fan_out(
             &targets,
             n(1),
-            &AtomicBool::new(true),
+            &Cancel::cancelled(),
             &mut |event| events += usize::from(!matches!(event, Event::Ordered(_))),
             ran,
             |target| panic!("skipping {} blew up", target.name),
@@ -444,7 +442,7 @@ mod tests {
         let results = fan_out(
             &targets,
             n(2),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             &mut on,
             |target| {
                 assert_ne!(target.name, "a", "a blew up");
@@ -474,7 +472,7 @@ mod tests {
         fan_out(
             &targets,
             n(2),
-            &AtomicBool::new(false),
+            &Cancel::new(),
             &mut |event| {
                 if let Event::Done(index, result) = &event {
                     log.lock().unwrap().push(format!("done {result}"));
