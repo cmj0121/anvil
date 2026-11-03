@@ -1,21 +1,24 @@
 //! `anvil apply` on the built binary: the config's steps on the
 //! local target and a fake-ssh host, human and `--json`.
 
+#![allow(clippy::disallowed_methods)]
 // `--secret-store` and `--ssh-program` only exist in debug builds.
 #![cfg(debug_assertions)]
 
 mod common;
 
 use std::io::{BufRead, BufReader};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
+use rustix::process::Signal;
+
 use common::{
     AUTH_DENIED, AUTH_DENIED_MESSAGE, CONNECT_REFUSED, CONNECT_REFUSED_MESSAGE, Sandbox, json,
-    keys, text,
+    keys, text, until,
 };
 
 fn local_hostname() -> String {
@@ -341,7 +344,9 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
     }
     let (sandbox, secrets, path) = common::sudo_sandbox("aa");
     std::fs::create_dir(sandbox.root().join("out")).unwrap();
-    std::fs::write(sandbox.config_dir().join("motd.txt"), FILE_TEXT).unwrap();
+    // No other test stages these bytes, so a temp holding them is this test's.
+    const STAGED_TEXT: &str = "token = file-bytes-never-shown\nstaged by one test\n";
+    std::fs::write(sandbox.config_dir().join("motd.txt"), STAGED_TEXT).unwrap();
     let dest = sandbox.root().join("out/pw.conf");
     sandbox.write_config(
         "config.toml",
@@ -355,7 +360,6 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
         sandbox.root().join("ssh.log"),
         sandbox.root().join("sudo.log"),
     );
-    let before = temp_files();
     let apply = |args: &[&str], password: &str| {
         let _ = std::fs::remove_file(&sudo_log);
         sandbox
@@ -385,16 +389,27 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
             "the temp name is not logged before the stage: {}",
             text(&out.stderr)
         );
-        // Other tests in this binary stage and remove their own temp files at the
-        // same time, so a new name may be theirs: only one that stays fails.
+        let mine = || {
+            temp_files().into_iter().any(|name| {
+                std::fs::read(std::path::Path::new("/tmp").join(name))
+                    .is_ok_and(|bytes| bytes == STAGED_TEXT.as_bytes())
+            })
+        };
+        // The cleanup may still be on its way when anvil's child has gone.
         let gone = (0..20).any(|_| {
-            let left = temp_files().iter().any(|name| !before.contains(name));
+            let left = mine();
             if left {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             !left
         });
         assert!(gone, "no temp file left: {:?}", temp_files());
+        let beside: Vec<_> = std::fs::read_dir(sandbox.root().join("out"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".anvil-"))
+            .collect();
+        assert!(beside.is_empty(), "no temp beside dest: {beside:?}");
     };
 
     let out = apply(&["-vvv"], common::VALUE);
@@ -407,11 +422,19 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
         text(&out.stdout)
     );
     assert_clean(&out);
-    assert_eq!(std::fs::read_to_string(&dest).unwrap(), FILE_TEXT);
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), STAGED_TEXT);
     let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
     assert_eq!(mode & 0o7777, 0o640);
     let sudo = std::fs::read_to_string(&sudo_log).unwrap();
-    assert!(sudo.contains("\ninstall -m 0640 /tmp/anvil-"), "{sudo}");
+    assert!(sudo.contains("\nchmod 0640 "), "{sudo}");
+    assert!(sudo.contains("\nmv -f "), "{sudo}");
+    assert!(
+        sudo.lines()
+            .filter(|line| line.starts_with("install"))
+            .all(|line| line.starts_with("install -m 600 /dev/null ")),
+        "only the empty temp: {sudo}"
+    );
+    assert!(sudo.contains("\ninstall -m 600 /dev/null "), "{sudo}");
 
     let out = apply(&["--json"], common::VALUE);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
@@ -514,7 +537,7 @@ fn heartbeat(dir: &Path) -> String {
     )
 }
 
-/// How a step under SIGINT runs: a plain step, a `[[files]]` install
+/// How a step under SIGINT runs: a plain step, a `[[files]]` rename
 /// through sudo on a terminal, an `anvil run` script, or a plain step on
 /// `fake` while `local`'s block, larger than a pipe buffer, waits on a
 /// stdout nobody reads.
@@ -522,6 +545,8 @@ fn heartbeat(dir: &Path) -> String {
 enum Kind {
     Plain,
     Tty,
+    /// [`Kind::Tty`] over a dest holding [`PREVIOUS`], 0644.
+    TtyOver,
     Run,
     Paused,
 }
@@ -533,7 +558,7 @@ struct Running {
     lines: Receiver<String>,
     beat: PathBuf,
     second: PathBuf,
-    _sandbox: Sandbox,
+    sandbox: Sandbox,
 }
 
 /// Starts `anvil --json apply` whose first step beats a [`heartbeat`] and
@@ -560,7 +585,7 @@ fn beating_into(kind: Kind, stderr: Option<Stdio>) -> Running {
                 .arg(common::fixture("fake-ssh.sh"));
             (sandbox, "", command)
         }
-        Kind::Tty => {
+        Kind::Tty | Kind::TtyOver => {
             let (sandbox, secrets, path) = common::sudo_sandbox("aa");
             let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
             command
@@ -585,9 +610,13 @@ fn beating_into(kind: Kind, stderr: Option<Stdio>) -> Running {
             );
             command.args(["--json", "apply"]);
         }
-        Kind::Tty => {
+        Kind::Tty | Kind::TtyOver => {
             std::fs::write(sandbox.config_dir().join("motd.txt"), "motd\n").unwrap();
             let dest = sandbox.root().join("motd");
+            if let Kind::TtyOver = kind {
+                std::fs::write(&dest, PREVIOUS).unwrap();
+                common::chmod(&dest, 0o644);
+            }
             sandbox.write_config(
                 "config.toml",
                 &format!(
@@ -659,33 +688,35 @@ fn beating_into(kind: Kind, stderr: Option<Stdio>) -> Running {
         lines,
         beat,
         second,
-        _sandbox: sandbox,
-    }
-}
-
-/// Waits until `done`, failing after 20 s, a fail-safe only.
-fn until(mut done: impl FnMut() -> bool, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !done() {
-        assert!(Instant::now() < deadline, "gave up waiting for {what}");
-        std::thread::sleep(Duration::from_millis(20));
+        sandbox,
     }
 }
 
 impl Running {
     fn interrupt(&self) {
+        self.signal(Signal::INT);
+    }
+
+    fn signal(&self, signal: Signal) {
         let pid = rustix::process::Pid::from_child(&self.child);
-        rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
+        rustix::process::kill_process(pid, signal).unwrap();
     }
 
     /// Waits for the line the first SIGINT prints on stderr.
     fn notice(&self) {
+        self.notice_of("interrupted");
+    }
+
+    /// Waits for the line the first signal prints on stderr, starting with
+    /// `word`; returns it.
+    fn notice_of(&self, word: &str) -> String {
+        let start = format!("{word}: running targets stop after their current step");
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            let line = self.lines.recv_timeout(left).expect("no interrupted: line");
-            if line.starts_with("interrupted: running targets stop after their current step") {
-                return;
+            let line = self.lines.recv_timeout(left).expect("no notice line");
+            if line.starts_with(&start) {
+                return line;
             }
         }
     }
@@ -731,6 +762,223 @@ fn one_ctrl_c_lets_the_running_step_end_and_cancels_the_rest() {
         }
         assert!(!running.second.exists(), "{kind:?}: no later step ran");
     }
+}
+
+#[test]
+fn sigterm_and_sighup_cancel_like_a_first_ctrl_c_and_do_not_mention_it() {
+    for (signal, word) in [(Signal::TERM, "terminated"), (Signal::HUP, "hung up")] {
+        let mut running = beating(Kind::Plain);
+        running.signal(signal);
+        let line = running.notice_of(word);
+        assert!(!line.contains("Ctrl-C"), "{line}");
+        std::fs::write(running.beat.with_file_name("go"), "").unwrap();
+        let mut stdout = String::new();
+        std::io::Read::read_to_string(running.child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+        let status = running.child.wait().unwrap();
+        assert_eq!(status.code(), Some(1), "{word}");
+        let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let targets = value["targets"].as_array().unwrap();
+        assert_eq!(targets[0]["ok"], false, "{word}");
+        assert_eq!(
+            targets[1],
+            serde_json::json!({"target": "fake", "steps": [], "ok": false}),
+            "{word}: fake never started, and the reason reads as cancelled"
+        );
+        assert!(!running.second.exists(), "{word}: no later step ran");
+    }
+}
+
+#[test]
+fn a_second_signal_kills_anvil_by_the_signal_it_received() {
+    for (first, second, number) in [
+        (Signal::TERM, Signal::TERM, 15),
+        (Signal::HUP, Signal::HUP, 1),
+        (Signal::TERM, Signal::INT, 2),
+        (Signal::INT, Signal::TERM, 15),
+    ] {
+        let mut running = beating(Kind::Plain);
+        running.signal(first);
+        // The notice keeps the two from merging.
+        running.lines.recv_timeout(Duration::from_secs(20)).unwrap();
+        running.signal(second);
+        until(
+            || running.child.try_wait().unwrap().is_some(),
+            "anvil to die",
+        );
+        let status = running.child.wait().unwrap();
+        assert_eq!(status.signal(), Some(number), "{status:?}");
+        std::thread::sleep(Duration::from_millis(100));
+        let last = running.beats();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(running.beats(), last, "the heartbeat stopped");
+    }
+}
+
+#[test]
+fn a_sigkill_during_a_write_keeps_its_intent() {
+    if !common::have_script() {
+        eprintln!("skip: no script(1) for fake-ssh -tt");
+        return;
+    }
+    let mut running = beating(Kind::Tty);
+    running.child.kill().unwrap();
+    running.child.wait().unwrap();
+    std::fs::write(running.beat.with_file_name("go"), "").unwrap();
+    let record = running.sandbox.last_apply().expect("the intent is saved");
+    let entry = &record["targets"]["fake"];
+    assert_eq!(entry["ok"], false);
+    assert_eq!(entry["files"][0]["write"], "failed_midway");
+    assert_eq!(
+        entry["files"][0]["previous"],
+        serde_json::json!({"state": "absent"})
+    );
+}
+
+#[test]
+fn a_sigkill_during_a_write_over_a_file_rolls_back_to_its_original_bytes() {
+    if !common::have_script() {
+        eprintln!("skip: no script(1) for fake-ssh -tt");
+        return;
+    }
+    let mut running = beating(Kind::TtyOver);
+    running.child.kill().unwrap();
+    running.child.wait().unwrap();
+    let sandbox = &running.sandbox;
+    let dest = sandbox.root().join("motd");
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), PREVIOUS);
+    let record = sandbox.last_apply().expect("the intent is saved");
+    let file = &record["targets"]["fake"]["files"][0];
+    assert_eq!(file["write"], "failed_midway");
+    assert_eq!(file["previous"]["text"], PREVIOUS);
+
+    // The write outlives anvil: let it end, as a rollback must wait for it.
+    std::fs::write(running.beat.with_file_name("go"), "").unwrap();
+    until(
+        || std::fs::read_to_string(&dest).unwrap() == "motd\n",
+        "the orphaned write",
+    );
+    let path = format!(
+        "{}:{}",
+        sandbox.root().join("bin").display(),
+        std::env::var("PATH").unwrap()
+    );
+    let out = sandbox
+        .command(env!("CARGO_BIN_EXE_anvil"))
+        .arg("--ssh-program")
+        .arg(common::fixture("fake-ssh.sh"))
+        .args(["rollback", "--target", "fake"])
+        .env("PATH", path)
+        .env("FAKE_SUDO_LOG", sandbox.root().join("sudo.log"))
+        .env("FAKE_SUDO_PW", common::VALUE)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), PREVIOUS);
+}
+
+#[test]
+fn an_inherited_ignored_sighup_stays_ignored_for_anvil_and_its_steps() {
+    let sandbox = Sandbox::new("aa");
+    let (beat, second, survived) = (
+        sandbox.root().join("beat"),
+        sandbox.root().join("second"),
+        sandbox.root().join("survived"),
+    );
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[steps]]\nrun = '{}'\n[[steps]]\nrun = 'kill -HUP $$; touch {}'\n\
+             [[steps]]\nrun = 'touch {}'\n",
+            heartbeat(&beat),
+            survived.display(),
+            second.display()
+        ),
+    );
+    let child = sandbox
+        .command("/bin/sh")
+        .args(["-c", "trap \"\" HUP; exec \"$0\" \"$@\""])
+        .arg(env!("CARGO_BIN_EXE_anvil"))
+        .args(["--secret-store", "memory", "apply", "--target", "local"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn anvil");
+    until(|| beat.join("beat").exists(), "the first beat");
+    let pid = rustix::process::Pid::from_child(&child);
+    rustix::process::kill_process(pid, Signal::HUP).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(beat.join("go"), "").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(!text(&out.stderr).contains("hung up"), "not cancelled");
+    assert!(survived.exists(), "the step kept the ignore");
+    assert!(second.exists(), "the run went on");
+}
+
+#[test]
+fn a_kill_function_in_the_environment_does_not_fool_the_probe_for_the_ignore() {
+    let sandbox = Sandbox::new("aa");
+    let (beat, second) = (sandbox.root().join("beat"), sandbox.root().join("second"));
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[steps]]\nrun = '{}'\n[[steps]]\nrun = 'touch {}'\n",
+            heartbeat(&beat),
+            second.display()
+        ),
+    );
+    // A shell that imports it (bash as sh) would see `kill` succeed unsent.
+    let child = sandbox
+        .command(env!("CARGO_BIN_EXE_anvil"))
+        .env("BASH_FUNC_kill%%", "() { return 0; }")
+        .args(["--secret-store", "memory", "apply", "--target", "local"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn anvil");
+    until(|| beat.join("beat").exists(), "the first beat");
+    let pid = rustix::process::Pid::from_child(&child);
+    rustix::process::kill_process(pid, Signal::HUP).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(beat.join("go"), "").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.signal(),
+        None,
+        "SIGHUP was caught: {:?}",
+        out.status
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("hung up"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!second.exists(), "cancelled");
+}
+
+#[test]
+fn a_probe_for_the_ignore_leaves_anvil_and_its_group_alone() {
+    // A sibling in anvil's process group: the probe's SIGHUP would end it.
+    let sandbox = Sandbox::new("aa");
+    let second = sandbox.root().join("second");
+    let script = "sleep 30 & anvil_sib=$!; \"$0\" \"$@\"; anvil_code=$?; \
+                  kill -0 $anvil_sib && echo alive; kill $anvil_sib; exit $anvil_code";
+    sandbox.write_config(
+        "config.toml",
+        &format!("[[steps]]\nrun = 'touch {}'\n", second.display()),
+    );
+    let out = sandbox
+        .command("/bin/sh")
+        .args(["-c", script])
+        .arg(env!("CARGO_BIN_EXE_anvil"))
+        .args(["--secret-store", "memory", "apply", "--target", "local"])
+        .process_group(0)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("alive"), "{}", text(&out.stdout));
+    assert!(second.exists(), "anvil went on");
 }
 
 /// A pipe that is full, so a write to it blocks until `PipeReader` is read.
@@ -799,6 +1047,19 @@ fn a_second_ctrl_c_kills_the_running_step_and_anvil_dies_by_sigint() {
             assert_eq!(text(&stdout), "", "{kind:?}: no JSON");
         }
         assert!(!running.second.exists(), "{kind:?}: no later step ran");
+        let record = running.sandbox.last_apply();
+        if let Kind::Tty = kind {
+            let record = record.expect("the intent is saved");
+            let entry = &record["targets"]["fake"];
+            assert_eq!(entry["ok"], false);
+            assert_eq!(entry["files"][0]["write"], "failed_midway");
+            assert_eq!(
+                entry["files"][0]["previous"],
+                serde_json::json!({"state": "absent"})
+            );
+        } else {
+            assert!(record.is_none(), "{kind:?}: nothing probed, nothing kept");
+        }
     }
 }
 
@@ -821,7 +1082,7 @@ fn apply_records_what_each_target_held_before_it_wrote() {
     let sandbox = Sandbox::new("aa");
     let (web, local) = with_files(&sandbox);
     std::fs::write(&local, PREVIOUS).unwrap();
-    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644)).unwrap();
     let ssh_log = sandbox.root().join("ssh.log");
     let ssh_log = ssh_log.to_str().unwrap();
     let out = sandbox.anvil(&["-vvv", "apply"], &[("FAKE_SSH_LOG", ssh_log)]);
@@ -862,7 +1123,7 @@ fn apply_records_what_each_target_held_before_it_wrote() {
         serde_json::json!([{
             "dest": local, "mode": "0640", "sudo": false,
             "written_sha256": written, "write": "written",
-            "previous": {"state": "file", "mode": "0600", "uid": uid, "gid": gid,
+            "previous": {"state": "file", "mode": "0644", "uid": uid, "gid": gid,
                          "sha256": sha256_hex(PREVIOUS), "kept": true, "text": PREVIOUS},
         }])
     );
@@ -887,6 +1148,204 @@ fn apply_records_what_each_target_held_before_it_wrote() {
 }
 
 #[test]
+fn a_private_previous_file_leaves_only_its_hash_in_the_record_and_warns() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in [0o600, 0o640] {
+        let sandbox = Sandbox::new("aa");
+        let (_, local) = with_files(&sandbox);
+        std::fs::write(&local, PREVIOUS).unwrap();
+        std::fs::set_permissions(&local, std::fs::Permissions::from_mode(mode)).unwrap();
+        let warning = format!(
+            "apply: {local} on local was not world-readable: its previous text is not kept, \
+             so rollback cannot restore it"
+        );
+        let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains(&warning), "{mode:o}");
+        assert_eq!(
+            json(&out)["warnings"],
+            serde_json::json!([warning]),
+            "{mode:o}"
+        );
+        let raw = std::fs::read_to_string(sandbox.state_home().join("anvil/last-apply.json"));
+        assert!(!raw.unwrap().contains(PREVIOUS.trim_end()), "{mode:o}");
+        let record = sandbox.last_apply().unwrap();
+        assert_eq!(record["version"], 1);
+        let previous = &record["targets"]["local"]["files"][0]["previous"];
+        assert_eq!(previous["sha256"], sha256_hex(PREVIOUS), "{mode:o}");
+        assert_eq!(previous["kept"], false, "{mode:o}");
+        assert!(previous.get("text").is_none(), "{previous}");
+        assert_eq!(previous["reason"], "not world-readable", "{mode:o}");
+
+        // An unchanged rerun loses nothing more, and keeps the real previous.
+        let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert!(
+            !text(&out.stderr).contains("not world-readable"),
+            "{mode:o}"
+        );
+        let again = sandbox.last_apply().unwrap();
+        assert_eq!(
+            again["targets"]["local"]["files"][0]["previous"]["sha256"],
+            sha256_hex(PREVIOUS)
+        );
+    }
+}
+
+#[test]
+fn a_retry_after_a_failed_write_keeps_its_previous_and_does_not_warn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new("aa");
+    let (_, local) = with_files(&sandbox);
+    std::fs::write(&local, PREVIOUS).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    record["targets"]["local"]["files"][0]["write"] = "failed_midway".into();
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    // Part of the bytes, at a mode that keeps the capture from reading them.
+    std::fs::write(&local, "part").unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for shown in [text(&out.stdout), text(&out.stderr)] {
+        assert!(!shown.contains("not world-readable"), "{shown}");
+    }
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["files"][0]["previous"]["text"], PREVIOUS,
+        "rollback can still restore it"
+    );
+}
+
+#[test]
+fn a_private_previous_with_rollback_false_says_so_and_does_not_warn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new("aa");
+    let (_, local) = with_files(&sandbox);
+    std::fs::write(&local, PREVIOUS).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let config = std::fs::read_to_string(sandbox.config_dir().join("config.toml")).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &config.replace("sudo = false\n", "sudo = false\nrollback = false\n"),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(!text(&out.stderr).contains("not world-readable"));
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["files"][0]["previous"]["reason"],
+        "rollback = false"
+    );
+}
+
+/// A sandbox whose record stops being writable once `local` has written its
+/// file, in the step after: its last save fails, and `fake` should never start.
+/// `local`'s dest is private, so its merge warns. Returns the warning and the
+/// two dests.
+fn with_an_unwritable_state_dir(sandbox: &Sandbox) -> (String, String, String) {
+    let (web, local) = with_files(sandbox);
+    std::fs::write(&local, PREVIOUS).unwrap();
+    common::chmod(Path::new(&local), 0o600);
+    let dir = sandbox.state_home().join("anvil");
+    let config = std::fs::read_to_string(sandbox.config_dir().join("config.toml")).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &config.replace("echo after", &format!("chmod 500 {}", dir.display())),
+    );
+    let warning = format!(
+        "apply: {local} on local was not world-readable: its previous text is not kept, \
+         so rollback cannot restore it"
+    );
+    (warning, web, local)
+}
+
+#[test]
+fn json_with_an_unwritable_state_dir_still_reports_what_changed() {
+    let sandbox = Sandbox::new("aa");
+    let (warning, web, local) = with_an_unwritable_state_dir(&sandbox);
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    common::chmod(&sandbox.state_home().join("anvil"), 0o700);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(value["ok"], false, "{value}");
+    assert_eq!(value["warnings"], serde_json::json!([warning]), "{value}");
+    let error = value["save_error"].as_str().unwrap();
+    assert!(
+        error.starts_with("cannot write last-apply.json: "),
+        "{value}"
+    );
+    assert!(error.ends_with("; not recorded: local"), "{value}");
+    assert!(
+        text(&out.stderr).contains(&format!("apply: {error}")),
+        "{}",
+        text(&out.stderr)
+    );
+
+    let local_report = &value["targets"][0];
+    assert_eq!(local_report["target"], "local", "{value}");
+    assert_eq!(local_report["ok"], true, "{value}");
+    assert!(!local_report["steps"].as_array().unwrap().is_empty());
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), FILE_TEXT);
+
+    assert_eq!(
+        value["targets"][1],
+        serde_json::json!({"target": "fake", "steps": [], "ok": false, "abort": "save_failed"}),
+        "fake never started"
+    );
+    assert!(!Path::new(&web).exists(), "no write once a save failed");
+}
+
+#[test]
+fn a_state_dir_unwritable_from_the_start_writes_nothing() {
+    let sandbox = Sandbox::new("aa");
+    let (web, local) = with_files(&sandbox);
+    std::fs::write(&local, PREVIOUS).unwrap();
+    let dir = sandbox.state_home().join("anvil");
+    std::fs::create_dir_all(&dir).unwrap();
+    common::chmod(&dir, 0o700);
+    std::fs::write(dir.join("last-apply.json.lock"), "").unwrap();
+    common::chmod(&dir.join("last-apply.json.lock"), 0o600);
+    common::chmod(&dir, 0o500);
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    common::chmod(&dir, 0o700);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(value["targets"][0]["abort"], "save_failed", "{value}");
+    assert_eq!(value["targets"][1]["abort"], "save_failed", "{value}");
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), PREVIOUS);
+    assert!(!Path::new(&web).exists());
+}
+
+#[test]
+fn human_output_with_an_unwritable_state_dir_shows_the_summary_and_the_error() {
+    let sandbox = Sandbox::new("aa");
+    with_an_unwritable_state_dir(&sandbox);
+    let out = sandbox.anvil(&["apply"], &[]);
+    common::chmod(&sandbox.state_home().join("anvil"), 0o700);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("✘ aborted: a record save failed"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("cancelled"), "{stdout}");
+    assert!(stdout.ends_with("1 ok, 1 failed\n"), "{stdout}");
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("apply: cannot write last-apply.json: "),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn a_failed_step_still_records_the_files_written_before_it() {
     let sandbox = Sandbox::new("aa");
     let (_, local) = with_files(&sandbox);
@@ -905,7 +1364,7 @@ fn a_failed_step_still_records_the_files_written_before_it() {
 #[test]
 fn a_target_that_ended_is_saved_while_the_next_runs_and_holds_the_lock() {
     let sandbox = Sandbox::new("aa");
-    let (_, local) = with_files(&sandbox);
+    let (web, local) = with_files(&sandbox);
     let (waiting, go) = (sandbox.root().join("waiting"), sandbox.root().join("go"));
     // Exported by fake-ssh to its client, so only `fake` waits.
     std::fs::write(sandbox.root().join("h/fake-ssh.env"), "export ON_FAKE=1\n").unwrap();
@@ -934,7 +1393,10 @@ fn a_target_that_ended_is_saved_while_the_next_runs_and_holds_the_lock() {
     until(|| waiting.exists(), "fake's step");
     let record = sandbox.last_apply().expect("local's entry is saved");
     assert_eq!(record["targets"]["local"]["files"][0]["dest"], local);
-    assert!(record["targets"].get("fake").is_none(), "still running");
+    let partial = &record["targets"]["fake"];
+    assert_eq!(partial["ok"], false, "still running");
+    assert_eq!(partial["files"][0]["dest"], web);
+    assert_eq!(partial["files"][0]["write"], "written");
 
     let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
@@ -951,7 +1413,10 @@ fn a_target_that_ended_is_saved_while_the_next_runs_and_holds_the_lock() {
     std::fs::write(&go, "").unwrap();
     let record = sandbox.last_apply().unwrap();
     assert_eq!(record["targets"]["local"]["files"][0]["dest"], local);
-    assert!(record["targets"].get("fake").is_none(), "killed mid-target");
+    let partial = &record["targets"]["fake"];
+    assert_eq!(partial["ok"], false, "killed mid-target");
+    assert_eq!(partial["files"][0]["dest"], web);
+    assert_eq!(partial["files"][0]["write"], "written");
 }
 
 #[test]
@@ -1324,4 +1789,87 @@ fn a_transport_error_on_a_task_shows_its_line_and_names_it_in_json() {
             "name": "Boom\u{202e}",
         })
     );
+}
+
+/// Writes "motd\n" to `dest` as the login user, through the built binary.
+fn apply_as_user(
+    sandbox: &Sandbox,
+    dest: &std::path::Path,
+    safe_top: bool,
+) -> std::process::Output {
+    std::fs::write(sandbox.config_dir().join("motd.txt"), "motd\n").unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"motd.txt\"\ndest = \"{}\"\nmode = \"0640\"\nsudo = false\n",
+            dest.display()
+        ),
+    );
+    let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
+    command.args(["--secret-store", "memory", "--ssh-program"]);
+    command.arg(common::fixture("fake-ssh.sh")).args(["apply"]);
+    if !safe_top {
+        command.env_remove("ANVIL_DEBUG_SAFE_TOP");
+    }
+    command.output().unwrap()
+}
+
+#[test]
+fn without_the_debug_override_a_user_write_under_tmp_is_refused() {
+    let sandbox = Sandbox::new("au");
+    let dest = sandbox.root().join("motd");
+    let out = apply_as_user(&sandbox, &dest, false);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("/tmp is not owned by root or the login user"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!dest.exists());
+
+    let out = apply_as_user(&sandbox, &dest, true);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "motd\n");
+}
+
+#[test]
+fn a_user_write_refuses_a_symlinked_dest_dangling_or_not_and_an_open_directory() {
+    let sandbox = Sandbox::new("al");
+    let (real, link, dangling) = (
+        sandbox.root().join("real"),
+        sandbox.root().join("link"),
+        sandbox.root().join("dangling"),
+    );
+    std::fs::write(&real, "old\n").unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    std::os::unix::fs::symlink(sandbox.root().join("made"), &dangling).unwrap();
+    for dest in [&link, &dangling] {
+        let out = apply_as_user(&sandbox, dest, true);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+        assert!(
+            text(&out.stderr).contains(&format!(
+                "files: {} is a symlink; point dest at the real file",
+                dest.display()
+            )),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "old\n");
+    assert!(!sandbox.root().join("made").exists());
+
+    let open = sandbox.root().join("open");
+    std::fs::create_dir(&open).unwrap();
+    common::chmod(&open, 0o777);
+    let out = apply_as_user(&sandbox, &open.join("conf"), true);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains(&format!(
+            "files: {} is not owned by root or the login user",
+            open.display()
+        )),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!open.join("conf").exists());
 }

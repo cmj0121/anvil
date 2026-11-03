@@ -43,6 +43,7 @@ use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -372,6 +373,67 @@ pub fn shown_text(text: &str) -> String {
     escape_invisible(&escape_line(text))
 }
 
+/// Why a run's cancel flag was set, which ended its remaining targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AbortReason {
+    /// The user: Ctrl-C, SIGTERM or SIGHUP, or Esc in the TUI.
+    Cancelled,
+    /// A record save failed, so the run stopped before writing more it could
+    /// not record.
+    SaveFailed,
+}
+
+impl AbortReason {
+    fn is_cancelled(&self) -> bool {
+        *self == AbortReason::Cancelled
+    }
+
+    /// What a target's end line says.
+    pub fn text(self) -> &'static str {
+        match self {
+            AbortReason::Cancelled => "cancelled",
+            AbortReason::SaveFailed => "aborted: a record save failed",
+        }
+    }
+}
+
+/// A run's cancel flag and why anvil itself set it. The flag stays the one
+/// thing workers, ssh and the signal handler poll; a flag set by anyone else
+/// is the user's cancel.
+pub(crate) struct Abort<'a> {
+    cancel: &'a AtomicBool,
+    reason: OnceLock<AbortReason>,
+}
+
+impl<'a> Abort<'a> {
+    pub(crate) fn new(cancel: &'a AtomicBool) -> Abort<'a> {
+        Abort {
+            cancel,
+            reason: OnceLock::new(),
+        }
+    }
+
+    /// Sets the flag for `reason`; a flag already set keeps the reason it had.
+    fn stop(&self, reason: AbortReason) {
+        if !self.cancel.load(Ordering::Relaxed) {
+            let _ = self.reason.set(reason);
+        }
+        self.cancel.store(true, Ordering::Release);
+    }
+
+    /// `report`, when the flag ended it, with the reason the flag was set.
+    pub(crate) fn mark(&self, mut report: TargetReport) -> TargetReport {
+        if let TargetReport::Cancelled { abort, .. } = &mut report {
+            // Pairs with `stop`'s store: this thread saw the flag set, so it
+            // sees the reason set before it, unless the user set it too.
+            self.cancel.load(Ordering::Acquire);
+            *abort = (self.reason.get().copied()).unwrap_or(AbortReason::Cancelled);
+        }
+        report
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum TargetReport {
@@ -400,14 +462,17 @@ pub enum TargetReport {
         name: Option<String>,
     },
     /// The cancel flag ended the target; `steps` holds the ones that ran
-    /// before it. `ok` is always false. `task` and `name` are those of the task
-    /// whose step was under way, if any.
+    /// before it. `ok` is always false. `abort` says why the flag was set, in
+    /// the JSON only when that was not the user. `task` and `name` are those
+    /// of the task whose step was under way, if any.
     Cancelled {
         target: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<String>,
         steps: Vec<StepReport>,
         ok: bool,
+        #[serde(skip_serializing_if = "AbortReason::is_cancelled")]
+        abort: AbortReason,
         #[serde(skip_serializing_if = "Option::is_none")]
         task: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -447,6 +512,14 @@ impl TargetReport {
             | Self::Failed { warnings, .. }
             | Self::Cancelled { warnings, .. } => warnings,
         }
+    }
+
+    /// Adds a warning, shown in the target's block and its JSON.
+    pub(crate) fn warn(&mut self, warning: String) {
+        let (Self::Ran { warnings, .. }
+        | Self::Failed { warnings, .. }
+        | Self::Cancelled { warnings, .. }) = self;
+        warnings.push(warning);
     }
 
     /// Lift package markers after execution, including partial timeout output.
@@ -504,12 +577,12 @@ impl TargetReport {
         }
     }
 
-    /// Why the target failed: its error, `cancelled`, else the last step
+    /// Why the target failed: its error, its abort reason, else the last step
     /// that exited non-zero or was killed; `None` when every step passed.
     pub fn failure(&self) -> Option<String> {
         match self {
             TargetReport::Failed { error, .. } => return Some(error.clone()),
-            TargetReport::Cancelled { .. } => return Some("cancelled".to_owned()),
+            TargetReport::Cancelled { abort, .. } => return Some(abort.text().to_owned()),
             TargetReport::Ran { .. } => {}
         }
         let (index, step) = self
@@ -541,9 +614,26 @@ pub struct Report {
     pub targets: Vec<TargetReport>,
     pub ok: bool,
     /// Printed on stderr after the blocks: each file the record had no
-    /// room for.
-    #[serde(skip)]
+    /// room for, or whose previous text it no longer keeps. Also in the JSON,
+    /// left out when empty: they name dests and targets, never a text.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// A rollback's files with no kept text: they do not fail it, but the
+    /// summary and the JSON name them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_restored: Vec<NotRestored>,
+    /// A record save failed: the first error, then the targets the record
+    /// still lacks. `targets` still says what changed; `ok` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub save_error: Option<String>,
+}
+
+/// A recorded file a rollback cannot put back, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NotRestored {
+    pub target: String,
+    pub dest: String,
+    pub reason: String,
 }
 
 impl Report {
@@ -551,6 +641,14 @@ impl Report {
     pub fn counts(&self) -> (usize, usize) {
         let ok = self.targets.iter().filter(|t| t.ok()).count();
         (ok, self.targets.len() - ok)
+    }
+
+    /// The failure of `command` when a record save failed.
+    pub(crate) fn saved(&self, command: &str) -> Result<(), Failure> {
+        match &self.save_error {
+            Some(err) => Err(Failure::failed(format!("{command}: {err}"))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -567,7 +665,8 @@ pub type Progress<'a> = Event<'a, TargetReport>;
 ///
 /// When apply probes, the record ([`record::path`]) is locked and loaded
 /// before any target, and each target the probe reached is saved into it
-/// as it ends; a record that cannot be opened or saved fails the command.
+/// around each file write and as it ends. A record that cannot be opened
+/// fails the command; one that cannot be saved is the report's `save_error`.
 pub fn run_targets(
     opts: &Options,
     config: &Config,
@@ -582,7 +681,7 @@ pub fn run_targets(
         true => Some(open_record("apply")?),
         false => None,
     };
-    apply_targets(
+    Ok(apply_targets(
         &targets,
         opts.parallel,
         |target| opts.transport(target),
@@ -594,8 +693,7 @@ pub fn run_targets(
         &opts.cancel,
         session,
         on,
-    )
-    .map_err(|err| Failure::failed(format!("apply: {err}")))
+    ))
 }
 
 /// Locks and loads the record for `command`; any failure is exit 1. Core
@@ -670,13 +768,15 @@ pub(crate) fn no_core_dumps() {
 }
 
 /// Applies to each of `targets`, as [`for_each_target`] runs them. With a
-/// `session`, each target the probe reached is merged into the record and
-/// saved as soon as it ends, then [`Session::finish`] shares the record's
+/// `session`, a target's worker saves its partial entry before and after
+/// each file write ([`Journal`]), each target the probe reached is merged
+/// and saved as soon as it ends, then [`Session::finish`] shares the record's
 /// room out in the order of `targets`. Once a save fails, `cancel` is set,
-/// so no further target starts, but every target that ends is still merged
+/// so no further write or target starts and those left end as
+/// [`AbortReason::SaveFailed`], but every target that ends is still merged
 /// and saved, and so is the finish: a later save that succeeds records the
-/// earlier ones too. The error is then the first save's, followed by every
-/// target the record still lacks ([`Saves`]).
+/// earlier ones too. The report's `save_error` is then the first save's,
+/// followed by every target the record still lacks ([`Saves`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one input of apply_target, passed through"
@@ -691,10 +791,11 @@ fn apply_targets(
     plugins: &dyn Plugins,
     passwords: &Passwords,
     cancel: &AtomicBool,
-    mut session: Option<Session>,
+    session: Option<Session>,
     on: &mut dyn FnMut(Progress<'_>),
-) -> Result<Report, String> {
-    let mut saves = Saves::default();
+) -> Report {
+    let abort = Abort::new(cancel);
+    let journal = session.map(|session| Journal::new(session, &abort));
     let results = fanout::fan_out(
         targets,
         parallel,
@@ -703,17 +804,15 @@ fn apply_targets(
             Event::Begin(targets) => on(Event::Begin(targets)),
             Event::Start(target) => on(Event::Start(target)),
             Event::Done(index, applied) => {
-                if let (Some(session), Some(reached)) = (session.as_mut(), &applied.reached) {
-                    let name = &targets[index].name;
-                    let saved = save(session, name, reached.clone());
-                    saves.note(name, saved, cancel);
+                if let (Some(journal), Some(reached)) = (&journal, &applied.reached) {
+                    journal.ended(&targets[index].name, reached.clone());
                 }
                 on(Event::Done(index, &applied.report));
             }
             Event::Ordered(applied) => on(Event::Ordered(&applied.report)),
         },
         |target| {
-            apply_target(
+            let applied = apply_target(
                 target,
                 transport(target),
                 config,
@@ -722,26 +821,30 @@ fn apply_targets(
                 plugins,
                 passwords,
                 cancel,
-            )
+                journal.as_ref(),
+            );
+            Applied {
+                report: abort.mark(applied.report),
+                ..applied
+            }
         },
-        |target| Applied::unrecorded(cancelled("apply", target, Vec::new())),
+        |target| Applied::unrecorded(abort.mark(cancelled("apply", target, Vec::new()))),
         |target, message| {
             let error = format!("internal error: {message}");
             Applied::unrecorded(failed("apply", target, Vec::new(), error))
         },
     );
     let order: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
-    let warnings = match session {
-        Some(session) => saves.finish(session.finish(&order))?,
-        None => Vec::new(),
-    };
+    let (warnings, save_error) = journal.map_or_else(Default::default, |j| j.finish(&order));
     let reports: Vec<TargetReport> = results.into_iter().map(|a| a.report).collect();
-    let ok = reports.iter().all(TargetReport::ok);
-    Ok(Report {
+    let ok = save_error.is_none() && reports.iter().all(TargetReport::ok);
+    Report {
         targets: reports,
         ok,
         warnings,
-    })
+        not_restored: Vec::new(),
+        save_error,
+    }
 }
 
 /// The saves of one run's targets into the record. Each save writes the
@@ -756,48 +859,130 @@ pub(crate) struct Saves {
 }
 
 impl Saves {
-    /// Notes how `name`'s save went; the first failure sets `cancel`, so no
-    /// further target starts.
-    pub(crate) fn note(&mut self, name: &str, saved: Result<(), String>, cancel: &AtomicBool) {
+    /// Notes how `name`'s save went; a failure stops the run, so no further
+    /// target starts.
+    pub(crate) fn note(&mut self, name: &str, saved: Result<(), String>, abort: &Abort<'_>) {
         match saved {
             Ok(()) => self.unrecorded.clear(),
             Err(err) => {
-                cancel.store(true, Ordering::Relaxed);
+                abort.stop(AbortReason::SaveFailed);
                 self.first.get_or_insert(err);
-                self.unrecorded.push(name.to_owned());
+                if !self.unrecorded.iter().any(|kept| kept == name) {
+                    self.unrecorded.push(name.to_owned());
+                }
             }
         }
     }
 
-    /// The last save's value when every save succeeded; else
-    /// [`Saves::result`]'s error, without the targets `last` recorded.
-    pub(crate) fn finish<T>(mut self, last: Result<T, String>) -> Result<T, String> {
-        if last.is_ok() {
-            self.unrecorded.clear();
+    /// [`Saves::error`] once `last`, the last save, has gone too.
+    pub(crate) fn finish<T>(mut self, last: &Result<T, String>) -> Option<String> {
+        match last {
+            Ok(_) => self.unrecorded.clear(),
+            Err(err) => {
+                self.first.get_or_insert_with(|| err.clone());
+            }
         }
-        self.result().and(last)
+        self.error()
     }
 
-    /// `Ok` when every save succeeded; else the first error, then `; not
+    /// `None` when every save succeeded; else the first error, then `; not
     /// recorded: a, b` for the targets the record still lacks.
-    pub(crate) fn result(self) -> Result<(), String> {
-        let Some(first) = self.first else {
-            return Ok(());
-        };
-        Err(match self.unrecorded.as_slice() {
+    pub(crate) fn error(self) -> Option<String> {
+        let first = self.first?;
+        Some(match self.unrecorded.as_slice() {
             [] => first,
             names => format!("{first}; not recorded: {}", names.join(", ")),
         })
     }
 }
 
-/// Merges `reached` into the record as `name`'s entry and saves it.
-fn save(session: &mut Session, name: &str, reached: Reached) -> Result<(), String> {
-    match reached.wrote {
-        true => session.merge(name, reached.record),
-        false => session.refresh(name, reached.record),
+/// The record while an apply runs, shared by the event closure on the main
+/// thread and the workers, which save around each write. A Mutex rather than
+/// an event to the main thread: that thread may be blocked on a full stdout,
+/// and a worker's save must not wait for it. Nothing prints under the lock.
+struct Journal<'a> {
+    books: Mutex<Books>,
+    abort: &'a Abort<'a>,
+}
+
+struct Books {
+    session: Session,
+    saves: Saves,
+    /// What the merges of ended targets warn of. A snapshot's merge says
+    /// nothing: its write may yet be refused, and the target's last merge
+    /// repeats whatever still holds.
+    warnings: Vec<String>,
+    /// What the saves shed; a finish that succeeds reports it afresh.
+    shed: Vec<String>,
+}
+
+impl<'a> Journal<'a> {
+    fn new(session: Session, abort: &'a Abort<'a>) -> Journal<'a> {
+        Journal {
+            books: Mutex::new(Books {
+                session,
+                saves: Saves::default(),
+                warnings: Vec::new(),
+                shed: Vec::new(),
+            }),
+            abort,
+        }
     }
-    session.save().map(drop)
+
+    /// The books, also after a worker panicked holding them: the session
+    /// stays whole, as a merge or save changes it only at its end.
+    fn lock(&self) -> MutexGuard<'_, Books> {
+        self.books.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Saves `record`, what `name` has written so far. False when the save
+    /// failed, which has stopped the run: no write may follow.
+    fn snapshot(&self, name: &str, record: TargetRecord) -> bool {
+        let mut books = self.lock();
+        books.session.merge(name, record);
+        books.save(name, self.abort)
+    }
+
+    /// Merges and saves `reached`, the entry of a target that ended.
+    fn ended(&self, name: &str, reached: Reached) {
+        let mut books = self.lock();
+        let books = &mut *books;
+        match reached.wrote {
+            true => books
+                .warnings
+                .extend(books.session.merge(name, reached.record)),
+            false => books.session.refresh(name, reached.record),
+        }
+        books.save(name, self.abort);
+    }
+
+    /// The last save: the run's warnings and its `save_error`.
+    fn finish(self, order: &[String]) -> (Vec<String>, Option<String>) {
+        let Books {
+            session,
+            saves,
+            mut warnings,
+            shed,
+        } = self
+            .books
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        let last = session.finish(order);
+        let error = saves.finish(&last);
+        warnings.extend(last.unwrap_or(shed));
+        (warnings, error)
+    }
+}
+
+impl Books {
+    /// Saves the record, noting the outcome for `name` and adding what the
+    /// save warns of to `shed`. False when it failed.
+    fn save(&mut self, name: &str, abort: &Abort<'_>) -> bool {
+        let saved = self.session.save().map(|shed| self.shed.extend(shed));
+        let ok = saved.is_ok();
+        self.saves.note(name, saved, abort);
+        ok
+    }
 }
 
 /// One target's report, and what the record keeps of it.
@@ -857,6 +1042,8 @@ pub(crate) fn for_each_target(
         targets: reports,
         ok,
         warnings: Vec::new(),
+        not_restored: Vec::new(),
+        save_error: None,
     }
 }
 
@@ -894,8 +1081,10 @@ pub(crate) fn print_report(
     if cli.json {
         print_json(&report, Failure::failed)?;
     } else {
-        let _ = status::write_stdout(&render_summary(ok, failed, style));
+        let summary = render_summary(ok, failed, &report.not_restored, style);
+        let _ = status::write_stdout(&summary);
     }
+    report.saved(command)?;
     if failed == 0 {
         Ok(())
     } else {
@@ -914,6 +1103,7 @@ pub(crate) fn cancelled(command: &str, target: &Target, steps: Vec<StepReport>) 
         target: target.name.clone(),
         steps,
         ok: false,
+        abort: AbortReason::Cancelled,
         task: None,
         name: None,
     }
@@ -950,6 +1140,7 @@ fn apply_target(
     plugins: &dyn Plugins,
     passwords: &Passwords,
     cancel: &AtomicBool,
+    journal: Option<&Journal<'_>>,
 ) -> Applied {
     log::info!("apply {}: start", target.name);
     let transport = match transport {
@@ -976,7 +1167,7 @@ fn apply_target(
     } else {
         None
     };
-    let mut recorder = Recorder::new(expanded, sources, target, facts.as_ref());
+    let mut recorder = Recorder::new(expanded, sources, target, facts.as_ref(), journal);
     let resolved = resolve(
         target,
         facts.as_ref(),
@@ -999,10 +1190,7 @@ fn apply_target(
         Err(Unresolved::Failed(error)) => failed("apply", target, Vec::new(), error),
         Err(Unresolved::Cancelled) => cancelled("apply", target, Vec::new()),
     };
-    let reached = facts.map(|facts| {
-        let cannot_undo = cannot_undo(report.steps());
-        recorder.finish(facts, report.ok(), cannot_undo)
-    });
+    let reached = recorder.finish(report.ok(), cannot_undo(report.steps()));
     Applied { report, reached }
 }
 
@@ -1018,14 +1206,18 @@ pub(crate) struct Recorder<'a> {
     hash_only: Vec<&'a str>,
     /// Whether a write started: its capture ran, then the write did.
     wrote: bool,
+    target: &'a str,
+    facts: Option<&'a Facts>,
+    journal: Option<&'a Journal<'a>>,
 }
 
 impl<'a> Recorder<'a> {
     fn new(
         expanded: &'a Expanded,
         sources: &'a Sources,
-        target: &Target,
-        facts: Option<&Facts>,
+        target: &'a Target,
+        facts: Option<&'a Facts>,
+        journal: Option<&'a Journal<'a>>,
     ) -> Recorder<'a> {
         let hash_only = match facts.filter(|_| expanded.from_tasks) {
             Some(facts) => expanded
@@ -1041,35 +1233,67 @@ impl<'a> Recorder<'a> {
             files: Vec::new(),
             hash_only,
             wrote: false,
+            target: &target.name,
+            facts,
+            journal,
         }
     }
 
-    /// Keeps a tasks config to one record per dest
-    /// ([`FileRecord::written_again`]); a legacy config has one per write.
-    fn keep(&mut self, file: FileRecord) {
-        let again = self.files.iter_mut().find(|kept| {
-            self.expanded.from_tasks && self.expanded.same_dest(&kept.dest, &file.dest)
-        });
-        match again {
-            Some(kept) => kept.written_again(file),
-            None => self.files.push(file),
-        }
+    /// Whether `dest` is to keep its previous file's hash only.
+    fn is_hash_only(&self, dest: &str) -> bool {
+        (self.hash_only.iter()).any(|hash_only| self.expanded.same_dest(hash_only, dest))
     }
 
-    /// The target's record, stamped now.
-    fn finish(self, facts: Facts, ok: bool, cannot_undo: Vec<String>) -> Reached {
-        Reached {
-            record: TargetRecord {
-                at: record::now(),
-                anvil: env!("CARGO_PKG_VERSION").to_owned(),
-                ok,
-                facts,
-                files: self.files,
-                cannot_undo,
-                rolled_back: None,
-            },
+    /// Saves what the target did so far, with `intent`, a write about to
+    /// start, as though it failed midway; `steps` are the steps that ended.
+    /// False when the save failed, which has stopped the run.
+    fn snapshot(&self, intent: Option<&FileRecord>, steps: &[StepReport]) -> bool {
+        let (Some(journal), Some(facts)) = (self.journal, self.facts) else {
+            return true;
+        };
+        let mut files = self.files.clone();
+        if let Some(intent) = intent {
+            keep(self.expanded, &mut files, intent.clone());
+        }
+        let record = stamped(facts.clone(), false, files, cannot_undo(steps));
+        journal.snapshot(self.target, record)
+    }
+
+    /// The target's record, stamped now; `None` when the probe did not run.
+    fn finish(self, ok: bool, cannot_undo: Vec<String>) -> Option<Reached> {
+        Some(Reached {
+            record: stamped(self.facts?.clone(), ok, self.files, cannot_undo),
             wrote: self.wrote,
-        }
+        })
+    }
+}
+
+/// `file` into `files`: a tasks config keeps one record per dest
+/// ([`FileRecord::written_again`]); a legacy config has one per write.
+fn keep(expanded: &Expanded, files: &mut Vec<FileRecord>, file: FileRecord) {
+    let again = (files.iter_mut())
+        .find(|kept| expanded.from_tasks && expanded.same_dest(&kept.dest, &file.dest));
+    match again {
+        Some(kept) => kept.written_again(file),
+        None => files.push(file),
+    }
+}
+
+/// A target's record, stamped now.
+fn stamped(
+    facts: Facts,
+    ok: bool,
+    files: Vec<FileRecord>,
+    cannot_undo: Vec<String>,
+) -> TargetRecord {
+    TargetRecord {
+        at: record::now(),
+        anvil: env!("CARGO_PKG_VERSION").to_owned(),
+        ok,
+        facts,
+        files,
+        cannot_undo,
+        rolled_back: None,
     }
 }
 
@@ -1115,8 +1339,10 @@ pub(crate) fn failed(
 /// passwords to type. A skipped `[[files]]` or `[[services]]` step runs
 /// nothing; a file step that needs a sudo password goes through
 /// [`send_file`]. With a `recorder`, each file step first captures DEST
-/// ([`capture`]), then writes only if DEST still holds what it captured,
-/// and the recorder keeps both and how the write ended.
+/// ([`capture`]), then saves an intent entry (`FailedMidway`), so that a kill
+/// during the write keeps what it captured, then writes only if DEST still
+/// holds that, then saves how the write ended. A failed intent save writes
+/// nothing: the target ends as cancelled, with the run stopped.
 pub(crate) fn execute(
     command: &str,
     target: &Target,
@@ -1215,7 +1441,18 @@ fn execute_inner(
             };
             (run, upload) = (rebuilt.0.as_str(), rebuilt.1.as_ref());
             recorder.wrote = true;
-            captured = Some(found);
+            let hash_only = recorder.is_hash_only(&write.dest);
+            let intent = write.record(
+                recorder.expanded,
+                recorder.sources,
+                found,
+                record::Write::FailedMidway,
+                hash_only,
+            );
+            if !recorder.snapshot(Some(&intent), &reports) {
+                return cancelled(command, target, reports).at(planned);
+            }
+            captured = Some(intent);
         }
         let mut staged = true;
         let output = match (password, upload) {
@@ -1240,15 +1477,13 @@ fn execute_inner(
                 }
             }
         };
-        if let (Some(recorder), Some(write), Some(found)) =
-            (recorder.as_deref_mut(), write, captured)
-        {
+        if let (Some(recorder), Some(mut file)) = (recorder.as_deref_mut(), captured) {
             // Only a write that may have changed DEST failed midway: a
             // failed stage, a refusal (root checks, hash guard), a password
             // sudo -v rejected, and a run that never reached the target (no
             // master: cancelled, refused, an unknown host key, a denied key,
             // ssh not spawned) all left it as it was.
-            let ended = match &output {
+            file.write = match &output {
                 _ if !staged => record::Write::Refused,
                 Ok(output) if output.code == Some(0) => record::Write::Written,
                 Ok(output) if output.code == Some(files::REFUSED) => record::Write::Refused,
@@ -1266,10 +1501,9 @@ fn execute_inner(
                 // the running ssh (Wait) may have cut it.
                 _ => record::Write::FailedMidway,
             };
-            let hash_only = (recorder.hash_only.iter())
-                .any(|dest| recorder.expanded.same_dest(dest, &write.dest));
-            let file = write.record(recorder.expanded, recorder.sources, found, ended, hash_only);
-            recorder.keep(file);
+            keep(recorder.expanded, &mut recorder.files, file);
+            // A failure has set the cancel flag: the next step does not start.
+            recorder.snapshot(None, &reports);
         }
         let output = match output {
             Ok(output) => output,
@@ -1895,13 +2129,30 @@ fn render(report: &TargetReport, style: Style, verbose: bool) -> Vec<Line> {
     lines
 }
 
-/// The last line of the human output: `N ok, M failed`.
-fn render_summary(ok: usize, failed: usize, style: Style) -> String {
+/// The end of the human output: `N ok, M failed`, and after a rollback that
+/// could not put every file back, `, K not restored` and one line for each.
+fn render_summary(ok: usize, failed: usize, not_restored: &[NotRestored], style: Style) -> String {
     let colour = style.out.colour && failed > 0;
-    format!(
-        "{ok} ok, {}\n",
+    let mut summary = format!(
+        "{ok} ok, {}",
         paint(colour, RED, &format!("{failed} failed"))
-    )
+    );
+    if !not_restored.is_empty() {
+        let count = format!("{} not restored", not_restored.len());
+        summary += &format!(", {}", paint(style.out.colour, YELLOW, &count));
+    }
+    summary.push('\n');
+    for NotRestored {
+        target,
+        dest,
+        reason,
+    } in not_restored
+    {
+        // The reason comes from the record, which is only a file.
+        let line = shown_text(&format!("{dest} on {target} ({reason})"));
+        summary += &format!("  {line}\n");
+    }
+    summary
 }
 
 #[cfg(test)]
@@ -1924,7 +2175,7 @@ mod tests {
     ) -> Applied {
         let expanded = legacy(config);
         super::apply_target(
-            target, transport, config, &expanded, sources, plugins, passwords, cancel,
+            target, transport, config, &expanded, sources, plugins, passwords, cancel, None,
         )
     }
 
@@ -1941,7 +2192,7 @@ mod tests {
         cancel: &AtomicBool,
         session: Option<Session>,
         on: &mut dyn FnMut(Progress<'_>),
-    ) -> Result<Report, String> {
+    ) -> Report {
         let expanded = legacy(config);
         super::apply_targets(
             targets, parallel, transport, config, &expanded, sources, plugins, passwords, cancel,
@@ -2027,8 +2278,11 @@ mod tests {
         /// A `run` script containing the text sets the first flag, if any,
         /// then waits up to 5 s for the second.
         hold: Option<Hold>,
+        /// A `run` script containing the text calls this first, past any hold.
+        peek: Option<Peek>,
     }
 
+    type Peek = (&'static str, Arc<dyn Fn() + Send + Sync>);
     type Hold = (&'static str, Option<Arc<AtomicBool>>, Arc<AtomicBool>);
 
     impl Fake {
@@ -2049,6 +2303,7 @@ mod tests {
                 capture: "anvil-capture absent\n",
                 capture_code: Some(0),
                 hold: None,
+                peek: None,
             }
         }
 
@@ -2084,6 +2339,11 @@ mod tests {
                 while !release.load(Ordering::Relaxed) && since.elapsed() < Duration::from_secs(5) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
+            }
+            if let Some((needle, peek)) = &self.peek
+                && script.contains(needle)
+            {
+                peek();
             }
             let ran = {
                 let mut log = self.log.lock().unwrap();
@@ -2548,9 +2808,23 @@ mod tests {
             targets: vec![good, bad],
             ok: false,
             warnings: Vec::new(),
+            not_restored: Vec::new(),
+            save_error: None,
         };
         let value = json(&report);
         assert_eq!(keys(&value), ["ok", "targets"]);
+        let full = "apply: last-apply.json is full; /etc/a on web1 cannot be rolled back";
+        let warned = Report {
+            targets: Vec::new(),
+            ok: true,
+            warnings: vec![full.to_owned()],
+            not_restored: Vec::new(),
+            save_error: None,
+        };
+        assert_eq!(
+            json(&warned),
+            serde_json::json!({"targets": [], "ok": true, "warnings": [full]})
+        );
         assert_eq!(value["ok"], false);
         assert_eq!(value["targets"][0]["ok"], true);
         assert_eq!(value["targets"][1]["ok"], false);
@@ -2731,18 +3005,18 @@ mod tests {
             shown,
             "▶ box\n  $ one\n  one-out\n  $ fail\n  partial\n  boom\n  ✘ step 2 exited 3\n\n"
         );
-        assert_eq!(render_summary(0, 1, no_color), "0 ok, 1 failed\n");
+        assert_eq!(render_summary(0, 1, &[], no_color), "0 ok, 1 failed\n");
     }
 
     #[test]
     fn the_summary_counts_targets_and_reddens_failures_only() {
-        assert_eq!(render_summary(1, 1, piped()), "1 ok, 1 failed\n");
+        assert_eq!(render_summary(1, 1, &[], piped()), "1 ok, 1 failed\n");
         assert_eq!(
-            render_summary(1, 1, terminal()),
+            render_summary(1, 1, &[], terminal()),
             "1 ok, \x1b[31m1 failed\x1b[0m\n"
         );
-        assert_eq!(render_summary(1, 0, terminal()), "1 ok, 0 failed\n");
-        assert_eq!(render_summary(0, 0, piped()), "0 ok, 0 failed\n");
+        assert_eq!(render_summary(1, 0, &[], terminal()), "1 ok, 0 failed\n");
+        assert_eq!(render_summary(0, 0, &[], piped()), "0 ok, 0 failed\n");
     }
 
     #[test]
@@ -2868,8 +3142,7 @@ mod tests {
                 Progress::Done(_, report) => events.push(format!("done {}", report.target())),
                 Progress::Ordered(_) => {}
             },
-        )
-        .unwrap();
+        );
         let runs = log.lock().unwrap().clone();
         (report, runs, events)
     }
@@ -2906,6 +3179,7 @@ mod tests {
         assert_eq!(
             report.targets[1],
             TargetReport::Cancelled {
+                abort: AbortReason::Cancelled,
                 warnings: Vec::new(),
                 target: "b".to_owned(),
                 steps: vec![],
@@ -2948,6 +3222,8 @@ mod tests {
             targets: vec![good, bad],
             ok: false,
             warnings: Vec::new(),
+            not_restored: Vec::new(),
+            save_error: None,
         };
         assert_eq!(report.counts(), (1, 1));
     }
@@ -3221,8 +3497,7 @@ mod tests {
             &AtomicBool::new(cancelled),
             None,
             &mut |_| {},
-        )
-        .unwrap();
+        );
         let runs = log.lock().unwrap().clone();
         (report, runs)
     }
@@ -3282,6 +3557,7 @@ mod tests {
         assert_eq!(
             report,
             TargetReport::Cancelled {
+                abort: AbortReason::Cancelled,
                 warnings: Vec::new(),
                 target: "a".to_owned(),
                 steps: vec![],
@@ -3853,8 +4129,7 @@ mod tests {
             &AtomicBool::new(false),
             None,
             &mut |_| {},
-        )
-        .unwrap();
+        );
         let wrapped = crate::run::wrap("hostname");
         assert_eq!(
             *log.lock().unwrap(),
@@ -3903,6 +4178,7 @@ mod tests {
         assert_eq!(
             report,
             TargetReport::Cancelled {
+                abort: AbortReason::Cancelled,
                 warnings: Vec::new(),
                 target: "box".to_owned(),
                 steps: vec![],
@@ -4030,8 +4306,7 @@ mod tests {
             &AtomicBool::new(false),
             None,
             &mut |_| {},
-        )
-        .unwrap();
+        );
         assert_eq!(*typed.lock().unwrap(), [&b"pw-local"[..], b"pw-a"]);
         assert_eq!(report.counts(), (2, 1));
         assert_eq!(
@@ -4358,7 +4633,8 @@ mod tests {
         assert!(stage.contains(FILE_TEXT) && stage.contains(temp));
         assert!(install.starts_with("export TERM=dumb\n"), "{install}");
         assert!(
-            install.contains(&format!("sudo install -m 0644 '{temp}' '/etc/b.conf'")),
+            install.contains(&format!("anvil_bytes() {{ cat '{temp}'; }}"))
+                && install.contains("sudo mv -f '/etc/.anvil-"),
             "{install}"
         );
         assert!(
@@ -4474,6 +4750,7 @@ mod tests {
         assert_eq!(
             report,
             TargetReport::Cancelled {
+                abort: AbortReason::Cancelled,
                 warnings: Vec::new(),
                 target: "box".to_owned(),
                 steps: vec![step("one", Some(0), "one-out\n", "")],
@@ -4505,6 +4782,7 @@ mod tests {
         assert_eq!(
             report,
             TargetReport::Cancelled {
+                abort: AbortReason::Cancelled,
                 warnings: Vec::new(),
                 target: "box".to_owned(),
                 steps: vec![],
@@ -4600,8 +4878,7 @@ mod tests {
             &AtomicBool::new(false),
             None,
             &mut |_| {},
-        )
-        .unwrap();
+        );
         assert_eq!(report.counts(), (1, 1), "{report:?}");
         assert_eq!(
             report.targets[0].failure().unwrap(),
@@ -4825,8 +5102,7 @@ mod tests {
                 &AtomicBool::new(false),
                 None,
                 &mut |_| {},
-            )
-            .unwrap();
+            );
             assert_eq!(report.counts(), (1, 1), "{report:?}");
             assert_eq!(report.targets[0].failure().unwrap(), error);
             assert!(report.targets[0].steps().is_empty());
@@ -5103,8 +5379,7 @@ mod tests {
             cancel,
             None,
             on,
-        )
-        .unwrap();
+        );
         (report, built.into_inner())
     }
 
@@ -5182,6 +5457,7 @@ mod tests {
             let expected: Vec<TargetReport> = [("a", true), ("b", parallel == 2), ("c", false)]
                 .into_iter()
                 .map(|(name, started)| TargetReport::Cancelled {
+                    abort: AbortReason::Cancelled,
                     warnings: Vec::new(),
                     target: name.to_owned(),
                     steps: if started { vec![ran.clone()] } else { vec![] },
@@ -5465,9 +5741,9 @@ mod tests {
             .collect()
     }
 
-    /// A capture of a 0640 root file holding `v0\n`.
+    /// A capture of a world-readable root file holding `v0\n`.
     const CAPTURED_V0: &str = "sudo: a warning first\r\n\
-        anvil-capture file -rw-r----- 1 0 42 3 Jan 1 00:00 /etc/a.conf\n\
+        anvil-capture file -rw-r--r-- 1 0 42 3 Jan 1 00:00 /etc/a.conf\n\
         anvil-capture bytes\n 76 30 0a\nanvil-capture end\n";
 
     #[test]
@@ -5489,7 +5765,7 @@ mod tests {
         );
         assert_eq!(*typed, None, "a plain run");
         assert!(
-            runs[1].contains("! sudo -n test -e '/etc/a.conf' ||"),
+            runs[1].contains("sudo -n test ! -e '/etc/a.conf' ||"),
             "the write refuses a dest that appeared: {}",
             runs[1]
         );
@@ -5538,7 +5814,7 @@ mod tests {
             };
             assert_eq!(
                 (previous.mode.as_str(), previous.uid, previous.gid),
-                ("0640", 0, 42)
+                ("0644", 0, 42)
             );
             assert_eq!(previous.sha256, v0);
             match rollback {
@@ -5885,7 +6161,7 @@ mod tests {
     /// applied one at a time with a session on the record at `path`; `b`
     /// connects only once `a`'s end was handled. Returns what apply returned
     /// and each target's report as it ended.
-    fn apply_with_session(path: &std::path::Path) -> (Result<Report, String>, Vec<TargetReport>) {
+    fn apply_with_session(path: &std::path::Path) -> (Report, Vec<TargetReport>) {
         let config = with_files(
             Some(&packages(&["git"], false)),
             vec![file_entry("/etc/a.conf", &["web"], true)],
@@ -5932,7 +6208,7 @@ mod tests {
     fn each_target_is_saved_into_the_record_as_it_ends() {
         let root = crate::test_util::temp_dir("apply-record");
         let path = root.join("state/anvil/last-apply.json");
-        let report = apply_with_session(&path).0.unwrap();
+        let report = apply_with_session(&path).0;
         assert!(report.ok, "{report:?}");
         let record = record::load(&path).unwrap().unwrap();
         assert_eq!(record.targets["a"].files[0].dest, "/etc/a.conf");
@@ -5945,7 +6221,7 @@ mod tests {
         b.at = 1;
         b.files = record.targets["a"].files.clone();
         std::fs::write(&path, serde_json::to_vec(&edited).unwrap()).unwrap();
-        apply_with_session(&path).0.unwrap();
+        assert!(apply_with_session(&path).0.ok);
         let again = record::load(&path).unwrap().unwrap();
         assert!(again.targets["b"].at > 1);
         assert_eq!(again.targets["b"].files, record.targets["a"].files);
@@ -5955,49 +6231,87 @@ mod tests {
     #[test]
     fn saves_report_the_first_error_and_the_targets_still_unrecorded() {
         let cancel = AtomicBool::new(false);
+        let abort = Abort::new(&cancel);
         let err = || Err::<(), _>("cannot write last-apply.json: denied".to_owned());
-        let saves = Saves::default();
-        assert_eq!(saves.finish(Ok(7)), Ok(7));
+        assert_eq!(Saves::default().finish(&Ok(7)), None);
         assert!(!cancel.load(Ordering::Relaxed));
 
         let mut saves = Saves::default();
-        saves.note("a", err(), &cancel);
-        assert!(cancel.load(Ordering::Relaxed), "the first failure cancels");
-        saves.note("b", Err("second".to_owned()), &cancel);
+        saves.note("a", err(), &abort);
+        assert!(cancel.load(Ordering::Relaxed), "the first failure stops");
+        saves.note("b", Err("second".to_owned()), &abort);
         assert_eq!(
-            saves.finish(Err::<(), _>("third".to_owned())),
-            Err("cannot write last-apply.json: denied; not recorded: a, b".to_owned())
+            saves.finish(&Err::<(), _>("third".to_owned())).unwrap(),
+            "cannot write last-apply.json: denied; not recorded: a, b"
         );
 
         // A later save writes the whole record: a is in it after all.
         let mut saves = Saves::default();
-        saves.note("a", err(), &cancel);
-        saves.note("b", Ok(()), &cancel);
-        saves.note("c", Err("x".to_owned()), &cancel);
+        saves.note("a", err(), &abort);
+        saves.note("b", Ok(()), &abort);
+        saves.note("c", Err("x".to_owned()), &abort);
         assert_eq!(
-            saves.finish(Err::<(), _>("y".to_owned())),
-            Err("cannot write last-apply.json: denied; not recorded: c".to_owned())
+            saves.finish(&Err::<(), _>("y".to_owned())).unwrap(),
+            "cannot write last-apply.json: denied; not recorded: c"
         );
         let mut saves = Saves::default();
-        saves.note("a", err(), &cancel);
+        saves.note("a", err(), &abort);
         assert_eq!(
-            saves.finish(Ok(())),
-            Err("cannot write last-apply.json: denied".to_owned()),
+            saves.finish(&Ok(())).unwrap(),
+            "cannot write last-apply.json: denied",
             "the finish recorded a, but the run still fails"
         );
         assert_eq!(
-            Saves::default().finish(Err::<(), _>("only the finish".to_owned())),
-            Err("only the finish".to_owned())
+            (Saves::default().finish(&Err::<(), _>("only the finish".to_owned()))).unwrap(),
+            "only the finish"
         );
 
         // Without a last save, as rollback ends.
-        assert_eq!(Saves::default().result(), Ok(()));
+        assert_eq!(Saves::default().error(), None);
         let mut saves = Saves::default();
-        saves.note("a", err(), &cancel);
+        saves.note("a", err(), &abort);
         assert_eq!(
-            saves.result(),
-            Err("cannot write last-apply.json: denied; not recorded: a".to_owned())
+            saves.error().unwrap(),
+            "cannot write last-apply.json: denied; not recorded: a"
         );
+    }
+
+    #[test]
+    fn the_first_to_set_the_flag_names_the_abort_reason() {
+        let ended = || cancelled("apply", &target("a"), Vec::new());
+        let reason = |report: TargetReport| match report {
+            TargetReport::Cancelled { abort, .. } => abort,
+            other => panic!("{other:?}"),
+        };
+
+        // Ctrl-C alone, and Ctrl-C before the failed save.
+        let cancel = AtomicBool::new(false);
+        let abort = Abort::new(&cancel);
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(reason(abort.mark(ended())), AbortReason::Cancelled);
+        abort.stop(AbortReason::SaveFailed);
+        assert_eq!(reason(abort.mark(ended())), AbortReason::Cancelled);
+        assert_eq!(
+            serde_json::to_value(abort.mark(ended())).unwrap(),
+            serde_json::json!({"target": "a", "steps": [], "ok": false}),
+            "a user's cancel keeps its JSON"
+        );
+
+        // The failed save before Ctrl-C.
+        let cancel = AtomicBool::new(false);
+        let abort = Abort::new(&cancel);
+        abort.stop(AbortReason::SaveFailed);
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(reason(abort.mark(ended())), AbortReason::SaveFailed);
+
+        // Only a report the flag ended takes a reason.
+        let ran = TargetReport::Ran {
+            warnings: Vec::new(),
+            target: "a".to_owned(),
+            steps: Vec::new(),
+            ok: true,
+        };
+        assert_eq!(abort.mark(ran.clone()), ran);
     }
 
     #[test]
@@ -6010,7 +6324,6 @@ mod tests {
             let path = dir.join("last-apply.json");
             crate::private::ensure_dir(&dir).unwrap();
             let session = Session::open(&path).unwrap();
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
             let config = with_files(
                 None,
                 vec![
@@ -6022,11 +6335,15 @@ mod tests {
             let (mut a, mut b) = (target("a"), target("b"));
             a.tags = vec!["a".to_owned()];
             b.tags = vec!["b".to_owned()];
-            // a writes only once b is writing; b ends only once a's failed
-            // save was handled.
+            // a writes only once b is writing, and the save after its write
+            // fails; b ends only once that failure was handled.
+            let dir_ro = dir.clone();
+            let read_only: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                std::fs::set_permissions(&dir_ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+            });
             let (b_writing, a_handled) = (Arc::new(AtomicBool::new(false)), AtomicBool::new(false));
             let a_handled = Arc::new(a_handled);
-            let result = apply_targets(
+            let report = apply_targets(
                 &[a, b],
                 NonZeroU8::new(2).unwrap(),
                 |target| {
@@ -6041,6 +6358,7 @@ mod tests {
                     Ok(Box::new(Fake {
                         probe: ARCH_ROOT,
                         hold: Some(hold),
+                        peek: Some(("/etc/a.conf", Arc::clone(&read_only))),
                         ..Fake::new(&Arc::default())
                     }))
                 },
@@ -6061,7 +6379,7 @@ mod tests {
                 },
             );
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let err = result.unwrap_err();
+            let err = report.save_error.unwrap();
             assert!(err.starts_with("cannot write last-apply.json: "), "{err}");
             match writable_again {
                 true => {
@@ -6072,7 +6390,12 @@ mod tests {
                 }
                 false => {
                     assert!(err.ends_with("; not recorded: a, b"), "{err}");
-                    assert!(record::load(&path).unwrap().is_none());
+                    // What the saves before the writes left.
+                    let record = record::load(&path).unwrap().unwrap();
+                    for name in ["a", "b"] {
+                        let write = record.targets[name].files[0].write;
+                        assert_eq!(write, record::Write::FailedMidway, "{name}");
+                    }
                 }
             }
             std::fs::remove_dir_all(&root).unwrap();
@@ -6090,18 +6413,194 @@ mod tests {
         let session = Session::open(&path).unwrap();
         drop(session);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let (err, done) = apply_with_session(&path);
+        let (report, done) = apply_with_session(&path);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let err = err.unwrap_err();
+        assert!(!report.ok, "{report:?}");
+        let err = report.save_error.as_deref().unwrap();
         assert!(err.starts_with("cannot write last-apply.json: "), "{err}");
         assert!(err.ends_with("; not recorded: a"), "{err}");
-        assert!(done[0].ok(), "a ran: {:?}", done[0]);
-        assert_eq!(
-            done[1],
-            cancelled("apply", &target("b"), Vec::new()),
-            "b never started once a could not be saved"
-        );
+        let TargetReport::Cancelled { abort, steps, .. } = &done[0] else {
+            panic!("a stopped before its write: {:?}", done[0]);
+        };
+        assert_eq!(*abort, AbortReason::SaveFailed);
+        assert_eq!(steps.len(), 1, "only the packages ran: {steps:?}");
+        assert_eq!(report.targets, done, "the report names what ran");
+        let TargetReport::Cancelled { abort, steps, .. } = &done[1] else {
+            panic!("b never started once a could not be saved: {:?}", done[1]);
+        };
+        assert_eq!(*abort, AbortReason::SaveFailed);
+        assert!(steps.is_empty());
+        assert_eq!(done[1].failure().unwrap(), "aborted: a record save failed");
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["targets"][1]["abort"], "save_failed");
+        assert_eq!(value["save_error"], err);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// One target's apply over a private DEST, the record's directory going
+    /// read-only during the write, or `once_saved`, so that only the finish
+    /// fails.
+    fn apply_private_dest(root: &std::path::Path, once_saved: bool) -> Report {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = root.join("state/anvil");
+        let path = dir.join("last-apply.json");
+        crate::private::ensure_dir(&dir).unwrap();
+        let session = Session::open(&path).unwrap();
+        let dir_ro = dir.clone();
+        let read_only = Arc::new(move || {
+            std::fs::set_permissions(&dir_ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        });
+        let during_write = Arc::clone(&read_only);
+        let config = with_files(None, vec![file_entry("/etc/a.conf", &["web"], false)], &[]);
+        let mut a = target("a");
+        a.tags = vec!["web".to_owned()];
+        let report = apply_targets(
+            &[a],
+            ONE,
+            |_| {
+                Ok(Box::new(Fake {
+                    probe: ARCH_ROOT,
+                    capture: "anvil-capture file -rw------- 1 0 0 3 Jan 1 00:00 /etc/a.conf\n\
+                              anvil-capture sha256 \
+                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                    peek: (!once_saved).then(|| {
+                        let read_only = Arc::clone(&during_write);
+                        let read_only: Arc<dyn Fn() + Send + Sync> = read_only;
+                        ("/etc/a.conf", read_only)
+                    }),
+                    ..Fake::new(&Arc::default())
+                }))
+            },
+            &config,
+            &file_sources(&config),
+            &FakePlugins::none(),
+            &Passwords::new(),
+            &AtomicBool::new(false),
+            Some(session),
+            &mut |event| {
+                if let (Event::Done(..), true) = (event, once_saved) {
+                    read_only();
+                }
+            },
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        report
+    }
+
+    #[test]
+    fn the_intent_is_on_disk_when_the_write_runs_and_the_outcome_after_it() {
+        let root = crate::test_util::temp_dir("apply-record-intent");
+        let path = root.join("state/anvil/last-apply.json");
+        crate::private::ensure_dir(path.parent().unwrap()).unwrap();
+        let session = Session::open(&path).unwrap();
+        let config = with_files(
+            Some(&packages(&["git"], false)),
+            vec![file_entry("/etc/a.conf", &["web"], true)],
+            &[],
+        );
+        let mut a = target("a");
+        a.tags = vec!["web".to_owned()];
+        let seen: Arc<Mutex<Option<record::Record>>> = Arc::default();
+        let (peek_seen, peek_path) = (Arc::clone(&seen), path.clone());
+        let peek: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            *peek_seen.lock().unwrap() = record::load(&peek_path).unwrap();
+        });
+        let report = apply_targets(
+            &[a],
+            ONE,
+            |_| {
+                Ok(Box::new(Fake {
+                    probe: ARCH_ROOT,
+                    peek: Some(("/etc/a.conf", Arc::clone(&peek))),
+                    ..Fake::new(&Arc::default())
+                }))
+            },
+            &config,
+            &file_sources(&config),
+            &FakePlugins::none(),
+            &Passwords::new(),
+            &AtomicBool::new(false),
+            Some(session),
+            &mut |_| {},
+        );
+        assert!(report.ok, "{report:?}");
+        let seen = seen.lock().unwrap().take().expect("the write ran");
+        let entry = &seen.targets["a"];
+        assert!(!entry.ok, "not ended yet");
+        assert_eq!(entry.cannot_undo, ["packages"], "the reports so far");
+        assert_eq!(entry.files[0].dest, "/etc/a.conf");
+        assert_eq!(entry.files[0].write, record::Write::FailedMidway);
+        assert_eq!(entry.files[0].previous, record::Previous::Absent);
+        let saved = record::load(&path).unwrap().unwrap();
+        assert!(saved.targets["a"].ok);
+        assert_eq!(saved.targets["a"].files[0].write, record::Write::Written);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_intent_save_stops_the_target_before_its_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = crate::test_util::temp_dir("apply-record-intent-ro");
+        let dir = root.join("state/anvil");
+        crate::private::ensure_dir(&dir).unwrap();
+        let session = Session::open(&dir.join("last-apply.json")).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let config = with_files(None, vec![file_entry("/etc/a.conf", &["web"], true)], &[]);
+        let mut a = target("a");
+        a.tags = vec!["web".to_owned()];
+        let log = Arc::default();
+        let report = apply_targets(
+            &[a],
+            ONE,
+            |_| {
+                Ok(Box::new(Fake {
+                    probe: ARCH_ROOT,
+                    ..Fake::new(&log)
+                }))
+            },
+            &config,
+            &file_sources(&config),
+            &FakePlugins::none(),
+            &Passwords::new(),
+            &AtomicBool::new(false),
+            Some(session),
+            &mut |_| {},
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let wrote = log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.contains("/etc/a.conf"));
+        assert!(!wrote, "no write after a failed intent save");
+        let TargetReport::Cancelled { abort, .. } = &report.targets[0] else {
+            panic!("{report:?}");
+        };
+        assert_eq!(*abort, AbortReason::SaveFailed);
+        let err = report.save_error.unwrap();
+        assert!(err.ends_with("; not recorded: a"), "{err}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_or_finish_keeps_the_warnings_and_the_targets() {
+        for once_saved in [false, true] {
+            let root = crate::test_util::temp_dir("apply-record-warn");
+            let report = apply_private_dest(&root, once_saved);
+            assert!(!report.ok, "{report:?}");
+            assert!(report.targets[0].ok(), "{report:?}");
+            let err = report.save_error.as_deref().unwrap();
+            assert!(err.starts_with("cannot write last-apply.json: "), "{err}");
+            assert_eq!(report.warnings.len(), 1, "{report:?}");
+            assert!(
+                report.warnings[0].contains("not world-readable"),
+                "{report:?}"
+            );
+            std::fs::remove_dir_all(&root).unwrap();
+        }
     }
 
     /// `text` expanded; it has no includes, so the workspace is never read.
@@ -6151,6 +6650,7 @@ mod tests {
             &FakePlugins::new(|_, _| panic!("no plugin matches")),
             &Passwords::new(),
             &AtomicBool::new(false),
+            None,
         )
     }
 
@@ -6450,6 +6950,7 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &cancel,
+            None,
         )
     }
 

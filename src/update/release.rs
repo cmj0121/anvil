@@ -13,12 +13,12 @@ use std::io::{self, Read};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::paths;
+use crate::exec;
 use crate::plugin::last_line;
 use crate::secret::shown_name;
 use crate::transport::{TransportError, collect_capped};
@@ -288,19 +288,22 @@ fn curl(
     timeout: Duration,
     too_big: impl FnOnce() -> String,
 ) -> Result<Vec<u8>, String> {
-    let curl = paths::find_program(Path::new("curl"), std::env::var_os("PATH").as_deref())
-        .ok_or("curl not found on PATH")?;
+    let mut curl = exec::program("curl")?;
     if let Some(url) = args.last() {
-        log::debug!("spawn {} {}", curl.display(), url.to_string_lossy());
+        log::debug!(
+            "spawn {} {}",
+            curl.get_program().display(),
+            url.to_string_lossy()
+        );
     }
-    let child = Command::new(&curl)
+    let child = curl
         .args(args)
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| format!("cannot start {}: {err}", curl.display()))?;
+        .map_err(|err| format!("cannot start {}: {err}", curl.get_program().display()))?;
     let output =
         collect_capped(child, Some(timeout), [64, STDERR_LIMIT]).map_err(|err| match err {
             TransportError::Timeout { after, .. } => {

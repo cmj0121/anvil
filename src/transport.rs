@@ -20,6 +20,8 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, wa
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::exec;
+
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Most bytes kept per stream; the rest is read and discarded so the child never
 /// blocks on a full pipe.
@@ -138,7 +140,7 @@ impl Transport for Local {
     }
 
     fn run(&self, script: &str, timeout: Duration) -> Result<Output, TransportError> {
-        let mut command = Command::new("/bin/sh");
+        let mut command = exec::resolved("/bin/sh");
         command.arg("-s");
         run_with_script(&mut command, script, timeout)
     }
@@ -161,7 +163,7 @@ impl Transport for Local {
 /// form, or util-linux's on Linux, which runs the command with `$SHELL -c`.
 /// `script(1)` is run by its absolute path, never looked up in `PATH`.
 pub fn local_tty_command(script: &str) -> Command {
-    let mut command = Command::new(script_program());
+    let mut command = exec::resolved(script_program());
     command.env("SHELL", "/bin/sh");
     if cfg!(target_os = "linux") {
         command.args(["-qec", script, "/dev/null"]);

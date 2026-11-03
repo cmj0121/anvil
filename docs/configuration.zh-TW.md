@@ -424,9 +424,9 @@ fact 的鍵必須是探測會回報的鍵。比對是精確且區分大小寫的
 不用 `sudo`、不用暫存檔、不用終端機，也不用 secret。適合用於該使用者 home 底下的 dest。
 `user` fact 為 `root` 的登入不論 `sudo = false` 或 `sudo = true` 都以 root 寫入；以 root 登入時絕不走密碼路徑。
 
-`sudo = true` 且登入者不是 root 時，`nopasswd` 使用 `sudo -n tee`。
+`sudo = true` 且登入者不是 root 時，`nopasswd` 透過 `sudo -n` 寫入。
 `binary` 且有 sudo secret 時走密碼路徑：位元組經由 stdin 寫入一個新的、mode 0600、屬於連線使用者的 `/tmp/anvil-` 檔案
-（32 位十六進位數字），接著在終端機上執行的指令輸入 secret 並執行 `sudo install -m MODE`。
+（32 位十六進位數字），接著在終端機上執行的指令輸入 secret，並透過 `sudo` 從該檔案取代 dest。
 暫存檔在 step 結束後移除，不論成功、失敗或取消；連線中斷或 anvil 被終止（例如在暫存位元組時按下 Ctrl-C）時，
 它可能留下來，只有該使用者能讀取。
 secret 是 host 的 `sudo_secret`，有 `[packages]` 時 `local` 則用 `[packages].local_sudo_secret`；
@@ -444,14 +444,15 @@ secret 失敗與套件 step 相同，前綴改為 `files`：
 讓 [`anvil rollback`](cli.zh-TW.md#anvil-rollback) 能把它放回去。紀錄是明文，mode 0600，沒有加密。
 設定 `rollback = false` 時，它只保存原內容的 sha256，絕不保存文字，rollback 會把該 dest 顯示為 `cannot undo: DEST (rollback = false)`。
 dest 保存 secret（例如 token 或私鑰）的每個項目都請設定它。只有最多 256 KiB、不含 NUL 位元組的 UTF-8 先前文字才會保存；
-其他的只保存雜湊，寫入仍會進行。
+其他的只保存雜湊，寫入仍會進行。mode 不讓其他人讀取的先前檔案（0600、0640）不論此設定都只保存雜湊：除非位元組未變更或較早的項目仍保存先前狀態，
+apply 會警告，rollback 會以 `cannot undo: DEST (not world-readable)` 指名它，且不在那裡還原任何東西。
 
 **寫到 target 上的結果。** 位元組以 `cmp` 與 dest 比較。位元組相同時保留原檔，`chmod` 套用 `mode`，step 印出 `unchanged DEST`；
 否則印出 `wrote DEST`。兩者都以 0 結束。不存在或無法讀取的 dest 會被寫入。
 這項比較需要 target 上有 `cmp`（diffutils），且在寫入時使用的 `PATH` 上（透過 sudo 寫入時是 sudo 的 `PATH`）。
 沒有它時檔案一律重寫，step 一律印出 `wrote DEST`；有些精簡的容器映像檔沒有它。
-沒有擁有者寫入權限的 mode（例如 `0444`）仍可寫入：在 tee 路徑上，檔案寫入時為 mode 0600，寫完後再 `chmod` 成 `mode`。
-anvil 只設定 `mode`。它不設定擁有者或群組，也不建立不存在的上層目錄；此時 step 以 `tee` 或 `install` 自己的訊息失敗。
+沒有擁有者寫入權限的 mode（例如 `0444`）仍可寫入。
+anvil 設定 `mode`，並保留既有 dest 的擁有者與群組。它不建立不存在的上層目錄；此時 step 以 `tee` 自己的訊息失敗。
 
 以 root 寫入（透過 sudo，或以 root 登入）時，除非 dest 路徑上的每個目錄（從 `/` 到存放 dest 的那一層）都屬於 root，
 且其群組與其他人都不能寫入，否則拒絕該 dest。root 會在其他任何動作碰到 dest 之前逐一檢查；
@@ -459,22 +460,58 @@ anvil 只設定 `mode`。它不設定擁有者或群組，也不建立不存在�
 （`/home/u/.config/app.conf` 的 DIR 為 `/home/u`），且不寫入任何東西。
 路徑上本身是 symlink 的目錄也不符合。以 root 寫入也會拒絕本身是 symlink 的系統目錄：macOS 的 `/etc`、`/var` 與 `/tmp`（指向 `/private` 之下的連結），
 以及目前 Linux 發行版上合併 /usr 後的連結 `/bin`、`/sbin` 與 `/lib`；請改用實際路徑，例如 `/usr/bin/x`。
-路徑上不存在的目錄會通過檢查，接著寫入如上所述地失敗。因此位於使用者家目錄或 `/tmp` 之下的 dest 需要 `sudo = false`。
+路徑上不存在的目錄會通過檢查，接著寫入如上所述地失敗。因此位於使用者家目錄之下的 dest 需要 `sudo = false`。
 少了這條規則，能寫入路徑上某個目錄的人就能把該目錄或其中的東西換成指向其他檔案的 symlink 或 hard link，讓 root 寫入那個檔案。
+
+這些檢查在失敗時一律拒絕。透過 sudo 寫入時會先執行 `sudo true`；它失敗時 sudo 印出自己的訊息，
+step 失敗並顯示 `files: sudo failed; DEST is unchanged`。之後的檢查無法執行時（sudo 暫時失敗，或受限的規則不允許 `test`、`find` 或 `sh`），
+step 失敗並顯示 `files: sudo could not check PATH; nothing was changed`，且不寫入任何東西。
+
+以連線使用者身分寫入（非 root 登入且 `sudo = false`）時規則相同，只是擁有者較寬：路徑上每個目錄都必須屬於 root 或登入使用者，
+且其群組與其他人都不能寫入。第一個不符合的目錄會讓 step 失敗並顯示
+`files: DIR is not owned by root or the login user, or others can write it; anvil will not write under it`。
+因此位於 `/tmp` 之下的 dest 會被拒絕，不論是否有 sticky 位元（macOS 的 `/tmp` 同時也是連結），與群組共用的目錄也一樣。請改放到自己的目錄。
 
 接著 root 會拒絕本身是 symlink 的 dest：step 失敗並顯示 `files: DEST is a symlink; point dest at the real file`，
 連結與它指向的檔案都保持不動。請改讓 dest 指向實際的檔案。
 這項檢查與寫入是分開的指令，因此單靠它並非原子操作，擋不住在兩者之間放上的連結；
-真正擋住它的是上面的目錄規則，因為只有 root 能改變只有 root 能寫入的目錄裡的內容。以連線使用者身分寫入（非 root 登入且 `sudo = false`）時會跟隨連結，寫入它指向的檔案，
-因為它只能寫入該使用者本來就能寫的東西。
+真正擋住它的是上面的目錄規則，因為只有 root 能改變只有 root 能寫入的目錄裡的內容。以連線使用者身分寫入時同樣拒絕 symlink 的 dest，不論是否懸空，
+這樣換上連結的人就無法把寫入與 `chmod` 導向該使用者的其他檔案。
 dest 是目錄時 step 失敗並顯示 `files: DEST is a directory`（`/etc/a` 則為 `files: /etc/a is a directory`），目錄保持不動。
 
-`tee`（root、`sudo = false` 或 `nopasswd`）就地重寫既有檔案，因此它保留其擁有者、群組、ACL 與 SELinux 標籤。
-就地重寫也代表在寫入前就開啟該檔案的行程可能讀到新的位元組，甚至在最後的 `chmod` 套用 `mode` 之前。
+**檔案如何被取代。** 每次寫入，不論走哪條路徑，都把位元組放進 dest 所在目錄中一個 mode 0600 的暫存檔，
+其名稱在 controller 上產生：`.anvil-<dest 的 sha256 前 16 位十六進位>-<16 位隨機十六進位>`，再以 `mv -f` 改名蓋過 dest。
+因此被中斷的寫入會讓 dest 保持完整的舊內容或完整的新內容。暫存檔由 `install` 以 mode 0600 建立，因此目錄上的預設 ACL 無法開放它；它仍為空時，會取得 dest 的擁有者與群組、
+SELinux 標籤（`selinuxenabled` 成功時，以 `chcon --reference`）、ACL（有 GNU `getfacl` 與 `setfacl`，且 target 有 `sed` 時）；
+接著寫入位元組，最後在改名之前設定 `mode`，此時 ACL 的項目才生效。
+被終止的執行所留下的暫存檔，在超過一小時後由下一次寫入同一個 dest 時移除，因此同時進行的執行能保有自己的暫存檔；其他 dest 的暫存檔不受影響。
 以 root 寫入的新檔案屬於 root；其群組在 Linux 上是 root 的主要群組，在 macOS 與 BSD 上或位於設有 setgid 的上層目錄之下時，
 則是上層目錄的群組。`sudo = false` 時新檔案屬於連線使用者。
-`install`（密碼路徑）放上一個新檔案：它屬於 root、群組同上，舊檔案的 ACL 與 SELinux 標籤會被捨棄。
-`install` 會把 symlink 換成一般檔案；上面的 symlink 拒絕會先執行。
+
+改名會讓 dest 得到新的 inode。指向舊檔案的 hard link 保留舊的位元組，已開啟舊檔案的行程也會繼續讀到舊內容。
+SELinux 標籤以外的延伸屬性、`chattr +i` 之類的檔案旗標，以及在沒有 GNU 工具的 target 上的 ACL 都會遺失；ACL 遺失時會顯示警告
+`files: DEST: its ACL was not kept: no GNU getfacl and setfacl`。這項警告依據 `ls` 印出的 `+`，
+因此在 macOS 上同時有 ACL 與延伸屬性的檔案可能不會警告，因為 `ls` 此時顯示 `@`。
+若有人在檢查與改名之間放上目錄，`mv` 會把暫存檔移進該目錄；依上面的檢查，只有 root 或登入使用者能這麼做。
+
+**何時不是原子操作。** 有三種情況會改為就地寫入 dest，每種都在 stderr 顯示警告
+`files: DEST: not written atomically: REASON`，並以 0 結束：
+
+- dest 存在，但透過同一個 `sudo` 無法寫入其目錄（`its directory is not writable`）；
+- 以連線使用者寫入會改變 dest 的擁有者或群組，而它無法 `chown` 回去（`it is owned by UID:GID, which only root can keep`）。
+  屬於其他使用者的 dest 也無法設定新的 `mode`：mode 不同時，step 會在寫入任何位元組之前失敗，並顯示
+  `files: DEST cannot be given mode MODE: only its owner can chmod it`；
+- `mv` 失敗但暫存檔已完整寫入，例如 bind mount 的檔案（`mv failed`）。
+
+無法完整寫入暫存檔不在此列：step 會失敗並顯示 `files: cannot write a temp file beside DEST; DEST is unchanged`，
+因此磁碟已滿不會影響到 dest。每次就地寫入都先檢查來源的大小，寫入後再與 dest 比對；不符時 step 失敗並顯示
+`files: DEST does not hold the bytes written; re-run apply or anvil rollback`。就地寫入也需要 `wc`。
+
+**受限的 sudo 規則。** 從檔案就地寫入時會執行 `sh -c 'tee "$1" <"$2"'`，這樣來源不存在時 dest 保持不動；只允許 `tee` 而不允許 `sh` 的規則會讓它失敗。列出指令的 `NOPASSWD` 規則需要 `true`、`test`、`find`、`install`、`tee`、`cmp`、`mv`、`chown`、`chmod`、`rm`、`ls`、
+`getfacl`、`setfacl`、`chcon`、`od`、`sha256sum` 或 `shasum`，以及 `sh`（它以 `sh -c` 探測工具）。
+沒有 `getfacl` 與 `setfacl` 時 ACL 會遺失。沒有 `sh` 時 SELinux 標籤會遺失，比較也一律重寫，且已存在的 dest 會被拒絕，因為無法檢查它是否已變更。
+允許 `sh` 但不允許任一雜湊工具的規則，對其他人無法讀取的檔案同樣拒絕，並顯示 `files: sudo could not check DEST; nothing was changed`。
+root-squash 掛載點上 root 無法讀取的檔案也會同樣失敗；若登入使用者能寫入，請改用 `sudo = false`。
 
 ## Services
 

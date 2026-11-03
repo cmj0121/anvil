@@ -1,6 +1,8 @@
 //! Local inputs others can change stop every command that loads them, before
 //! anything is parsed or run.
 
+#![allow(clippy::disallowed_methods)]
+
 mod common;
 
 use std::fs;

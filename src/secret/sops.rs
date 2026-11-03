@@ -35,7 +35,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 
@@ -43,6 +43,7 @@ use zeroize::Zeroizing;
 
 use super::file_store::{Codec, FileBacked, open_key, too_large, untrusted};
 use super::{BackendKind, SecretError};
+use crate::exec;
 use crate::paths;
 use crate::transport::{TransportError, collect_capped};
 use crate::trust::{self, TrustError};
@@ -216,7 +217,7 @@ impl Runner<'_> {
             Op::Decrypt => None,
             Op::Encrypt(plaintext) => Some(plaintext),
         };
-        let mut command = Command::new(self.program);
+        let mut command = exec::resolved(self.program);
         command.arg("--config").arg(config);
         command.args([subcommand, "--input-type", "json", "--output-type", "json"]);
         if input.is_some() {

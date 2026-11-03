@@ -2,6 +2,7 @@
 //! sha256 in a tight directory, its script run over fake-ssh by `apply`
 //! and listed by `plan`; a broken pin stops before any target.
 
+#![allow(clippy::disallowed_methods)]
 // `--secret-store` and `--ssh-program` only exist in debug builds.
 #![cfg(debug_assertions)]
 

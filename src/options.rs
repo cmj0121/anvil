@@ -96,13 +96,20 @@ impl Options {
         Ok(secret::from_config(&backend)?)
     }
 
-    /// The ssh program: `ssh` on `PATH`, or the debug-only `--ssh-program`.
-    pub fn ssh_program(&self) -> PathBuf {
+    /// The ssh program as named: `ssh`, or the debug-only `--ssh-program`.
+    pub fn ssh_name(&self) -> PathBuf {
         #[cfg(debug_assertions)]
         if let Some(program) = &self.ssh_program {
             return program.clone();
         }
         PathBuf::from("ssh")
+    }
+
+    /// Where [`Options::ssh_name`] is, by [`paths::find_program`] on `PATH`.
+    fn ssh_program(&self) -> Result<PathBuf, TransportError> {
+        let name = self.ssh_name();
+        paths::find_program(&name, std::env::var_os("PATH").as_deref())
+            .ok_or_else(|| TransportError::Spawn(format!("{}: not found", name.display())))
     }
 
     /// Where `update` looks for releases: GitHub, or the debug-only
@@ -145,11 +152,11 @@ impl Options {
         }
     }
 
-    /// How ssh runs: [`Options::ssh_program`], a password prompt only when
+    /// How ssh runs: `program`, a password prompt only when
     /// [`Options::can_prompt`], and the production deadlines.
-    fn ssh_settings(&self) -> SshSettings {
+    fn ssh_settings(&self, program: PathBuf) -> SshSettings {
         SshSettings {
-            program: self.ssh_program(),
+            program,
             can_prompt: self.can_prompt,
             key_timeout: ssh::KEY_TIMEOUT,
             check_timeout: ssh::CHECK_TIMEOUT,
@@ -280,7 +287,7 @@ impl Options {
             TargetKind::Ssh { host, user, port } => {
                 #[cfg_attr(not(debug_assertions), expect(unused_mut, reason = "debug: ssh_home"))]
                 let mut ssh = Ssh::new(
-                    self.ssh_settings(),
+                    self.ssh_settings(self.ssh_program()?),
                     self.ssh_config()
                         .map_err(|failure| TransportError::Spawn(failure.message))?,
                     host,
@@ -505,16 +512,19 @@ mod tests {
     fn ssh_settings_follow_can_prompt() {
         let mut opts = parse(&["apply"]);
         opts.can_prompt = true;
-        assert!(opts.ssh_settings().can_prompt);
+        assert!(opts.ssh_settings(PathBuf::new()).can_prompt);
         opts.can_prompt = false;
-        assert!(!opts.ssh_settings().can_prompt);
+        assert!(!opts.ssh_settings(PathBuf::new()).can_prompt);
     }
 
     #[test]
     fn ssh_settings_share_the_cancel_flag() {
         let opts = parse(&["apply"]);
         assert!(!opts.cancel.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(Arc::ptr_eq(&opts.ssh_settings().cancel, &opts.cancel));
+        assert!(Arc::ptr_eq(
+            &opts.ssh_settings(PathBuf::new()).cancel,
+            &opts.cancel
+        ));
     }
 
     #[test]
@@ -528,6 +538,13 @@ mod tests {
             tags: Vec::new(),
         };
         assert_eq!(opts.transport(&local).unwrap().name(), "local");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn host_gets_the_ssh_transport_only_when_ssh_is_found() {
+        let found = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-ssh.sh");
+        let opts = parse(&["--ssh-program", found, "apply"]);
         let host = Target {
             name: "box".to_owned(),
             kind: TargetKind::Ssh {
@@ -540,14 +557,22 @@ mod tests {
             tags: Vec::new(),
         };
         assert_eq!(opts.transport(&host).unwrap().name(), "203.0.113.10");
+        let missing = parse(&["--ssh-program", "/nonexistent/anvil-ssh", "apply"]);
+        let Err(err) = missing.transport(&host) else {
+            panic!("a missing ssh was accepted");
+        };
+        assert_eq!(
+            err.to_string(),
+            "cannot start the transport: /nonexistent/anvil-ssh: not found"
+        );
     }
 
     #[cfg(debug_assertions)]
     #[test]
     fn hidden_ssh_program_overrides_ssh() {
-        assert_eq!(parse(&["doctor"]).ssh_program(), PathBuf::from("ssh"));
+        assert_eq!(parse(&["doctor"]).ssh_name(), PathBuf::from("ssh"));
         assert_eq!(
-            parse(&["doctor", "--ssh-program", "/x/fake-ssh"]).ssh_program(),
+            parse(&["doctor", "--ssh-program", "/x/fake-ssh"]).ssh_name(),
             PathBuf::from("/x/fake-ssh")
         );
     }

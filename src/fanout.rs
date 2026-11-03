@@ -5,7 +5,9 @@
 //! start `local` first, then by name; they end in any order, and the results
 //! come back in inventory order. Once `cancel` is set, every target not yet
 //! taken is reported as skipped without running its job. A job that panics is
-//! a failed target; the other targets go on.
+//! a failed target; the other targets go on. A worker takes its next target
+//! only once its last `Done` was handled, so what the caller does there (save
+//! the record, set `cancel`) comes before that worker's next target.
 
 use std::any::Any;
 use std::num::NonZeroU8;
@@ -29,7 +31,9 @@ pub enum Event<'a, R> {
 
 enum Msg<R> {
     Start(usize),
-    Done(usize, R),
+    /// The sender tells the worker this `Done` was handled; dropped unsent,
+    /// the caller is gone.
+    Done(usize, R, mpsc::Sender<()>),
 }
 
 /// Runs `one` on each of `targets`, `parallel` at a time, calling `on` with
@@ -71,7 +75,11 @@ pub fn fan_out<R: Send>(
                                 |payload| panicked(target, panic_message(payload.as_ref())),
                             )
                         };
-                        let _ = tx.send(Msg::Done(index, result));
+                        let (handled, wait) = mpsc::channel();
+                        let _ = tx.send(Msg::Done(index, result, handled));
+                        if wait.recv().is_err() {
+                            break;
+                        }
                     }
                 })
             })
@@ -82,8 +90,9 @@ pub fn fan_out<R: Send>(
         for msg in rx {
             match msg {
                 Msg::Start(index) => on(Event::Start(&targets[index])),
-                Msg::Done(index, result) => {
+                Msg::Done(index, result, handled) => {
                     on(Event::Done(index, results[index].insert(result)));
+                    let _ = handled.send(());
                     show_ordered(&results, &mut shown, on);
                 }
             }
@@ -143,6 +152,7 @@ mod tests {
     use super::*;
     use crate::inventory::TargetKind;
     use crate::test_util::{Gauge, Meet};
+    use std::time::{Duration, Instant};
 
     fn targets(names: &[&str]) -> Vec<Target> {
         names
@@ -318,6 +328,89 @@ mod tests {
             assert_eq!(results[2], "ran c");
             assert_eq!(events.len(), 7, "{events:?}");
         }
+    }
+
+    /// Spins until `flag` is set, or `limit` has passed; whether it was set.
+    fn wait_for_flag(flag: &AtomicBool, limit: Duration) -> bool {
+        let since = Instant::now();
+        while !flag.load(Ordering::Relaxed) && since.elapsed() < limit {
+            thread::yield_now();
+        }
+        flag.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn one_worker_takes_no_target_until_the_last_done_was_handled() {
+        let targets = targets(&["a", "b"]);
+        let cancel = AtomicBool::new(false);
+        let b_ran = AtomicBool::new(false);
+        let results = fan_out(
+            &targets,
+            n(1),
+            &cancel,
+            &mut |event| {
+                if let Event::Done(0, _) = event {
+                    // A worker that does not wait runs b within this time.
+                    wait_for_flag(&b_ran, Duration::from_millis(500));
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+            |target| {
+                b_ran.store(target.name == "b", Ordering::Relaxed);
+                ran(target)
+            },
+            |target| format!("skipped {}", target.name),
+            |target, message| format!("panicked {}: {message}", target.name),
+        );
+        assert_eq!(results, ["ran a", "skipped b"]);
+    }
+
+    #[test]
+    fn a_done_being_handled_holds_only_its_own_worker() {
+        let targets = targets(&["a", "b"]);
+        let b_ran = AtomicBool::new(false);
+        let mut seen = false;
+        fan_out(
+            &targets,
+            n(2),
+            &AtomicBool::new(false),
+            &mut |event| {
+                if let Event::Done(0, _) = event {
+                    seen = wait_for_flag(&b_ran, Duration::from_secs(5));
+                }
+            },
+            |target| {
+                if target.name == "b" {
+                    b_ran.store(true, Ordering::Relaxed);
+                }
+                ran(target)
+            },
+            |target| format!("skipped {}", target.name),
+            |target, message| format!("panicked {}: {message}", target.name),
+        );
+        assert!(seen, "b ran on the other worker while a's Done was handled");
+    }
+
+    #[test]
+    fn a_caller_that_panics_on_a_done_leaves_no_worker_waiting() {
+        let targets = targets(&["a", "b"]);
+        let b_ran = AtomicBool::new(false);
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            fan_out(
+                &targets,
+                n(1),
+                &AtomicBool::new(false),
+                &mut |event| assert!(!matches!(event, Event::Done(..)), "the caller blew up"),
+                |target| {
+                    b_ran.fetch_or(target.name == "b", Ordering::Relaxed);
+                    ran(target)
+                },
+                |target| format!("skipped {}", target.name),
+                |target, message| format!("panicked {}: {message}", target.name),
+            )
+        }));
+        assert!(outcome.is_err());
+        assert!(!b_ran.load(Ordering::Relaxed), "no target after the panic");
     }
 
     #[test]

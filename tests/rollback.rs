@@ -1,6 +1,7 @@
 //! `anvil rollback` on the built binary: an apply over the local target
 //! and a fake-ssh host, then putting back what it wrote.
 
+#![allow(clippy::disallowed_methods)]
 // `--secret-store` and `--ssh-program` only exist in debug builds.
 #![cfg(debug_assertions)]
 
@@ -22,7 +23,7 @@ fn mode(path: &str) -> u32 {
 
 /// The fake host tagged `web` and a config copying `motd.txt` to
 /// `<root>/out/web.conf` (absent before) on `web` and to
-/// `<root>/out/local.conf` ([`PREVIOUS`], 0600 before) on `local`, then
+/// `<root>/out/local.conf` ([`PREVIOUS`], 0644 before) on `local`, then
 /// `echo after`; applied once. Returns both dests.
 fn applied(sandbox: &Sandbox) -> (String, String) {
     sandbox.write_config(
@@ -34,7 +35,7 @@ fn applied(sandbox: &Sandbox) -> (String, String) {
     let dest = |name: &str| sandbox.root().join("out").join(name).display().to_string();
     let (web, local) = (dest("web.conf"), dest("local.conf"));
     std::fs::write(&local, PREVIOUS).unwrap();
-    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644)).unwrap();
     let entry = |dest: &str, tag: &str| {
         format!(
             "[[files]]\nsrc = \"motd.txt\"\ndest = \"{dest}\"\nmode = \"0640\"\n\
@@ -95,7 +96,7 @@ fn rollback_restores_and_removes_what_apply_wrote_and_twice_is_the_same() {
     );
     assert!(!text(&out.stdout).contains(PREVIOUS.trim_end()));
     assert_eq!(std::fs::read_to_string(&local).unwrap(), PREVIOUS);
-    assert_eq!(mode(&local), 0o600);
+    assert_eq!(mode(&local), 0o644);
     assert!(!Path::new(&web).exists());
     let record = sandbox.last_apply().unwrap();
     for (name, dest) in [("local", &local), ("fake", &web)] {
@@ -121,6 +122,123 @@ fn rollback_restores_and_removes_what_apply_wrote_and_twice_is_the_same() {
     );
     assert_eq!(std::fs::read_to_string(&local).unwrap(), PREVIOUS);
     assert!(!Path::new(&web).exists());
+}
+
+#[test]
+fn a_private_previous_cannot_be_restored_and_rollback_says_so_with_exit_zero() {
+    let sandbox = Sandbox::new("rb");
+    let (web, local) = applied(&sandbox);
+    // The fixture again, with a private previous on `local`.
+    std::fs::write(&local, PREVIOUS).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), FILE_TEXT);
+    let reason = "not world-readable";
+    let raw = std::fs::read_to_string(sandbox.state_home().join("anvil/last-apply.json"));
+    assert!(!raw.unwrap().contains(PREVIOUS.trim_end()));
+
+    // Twice: a repeat rollback says the same and still exits 0.
+    for _ in 0..2 {
+        let out = sandbox.anvil(&["rollback"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert_eq!(
+            text(&out.stdout),
+            format!(
+                "▶ local\n  ⚠ not restored: {local} ({reason})\n  ✔ ok · 2 steps\n\n\
+                 ▶ fake\n  ✔ ok · 2 steps\n\n\
+                 2 ok, 0 failed, 1 not restored\n  {local} on local ({reason})\n"
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), FILE_TEXT);
+    }
+    assert!(!Path::new(&web).exists());
+    let record = sandbox.last_apply().unwrap();
+    assert!(
+        record["targets"]["local"].get("rolled_back").is_none(),
+        "nothing was put back there"
+    );
+
+    let out = sandbox.anvil(&["--json", "rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(
+        value["not_restored"],
+        serde_json::json!([{"target": "local", "dest": local, "reason": reason}])
+    );
+    assert_eq!(
+        value["targets"][0]["warnings"],
+        serde_json::json!([format!("not restored: {local} ({reason})")])
+    );
+}
+
+#[test]
+fn a_failed_save_still_reports_the_targets_and_what_is_not_restored() {
+    let sandbox = Sandbox::new("rb");
+    let (web, local) = applied(&sandbox);
+    // `fake`'s previous is private, so its text is not kept.
+    std::fs::write(&web, PREVIOUS).unwrap();
+    std::fs::set_permissions(&web, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let dir = sandbox.state_home().join("anvil");
+    common::chmod(&dir, 0o500);
+    let out = sandbox.anvil(&["--json", "rollback"], &[]);
+    common::chmod(&dir, 0o700);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(value["ok"], false, "{value}");
+    let error = value["save_error"].as_str().unwrap();
+    assert!(
+        error.starts_with("cannot write last-apply.json: "),
+        "{value}"
+    );
+    assert!(error.ends_with("; not recorded: local"), "{value}");
+    assert!(
+        text(&out.stderr).contains(&format!("rollback: {error}")),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(value["targets"][0]["target"], "local", "{value}");
+    assert_eq!(value["targets"][0]["ok"], true, "{value}");
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), PREVIOUS);
+    assert_eq!(
+        value["targets"][1],
+        serde_json::json!({"target": "fake", "steps": [], "ok": false, "abort": "save_failed"}),
+        "fake never started"
+    );
+    assert_eq!(
+        value["not_restored"],
+        serde_json::json!([{"target": "fake", "dest": web, "reason": "not world-readable"}])
+    );
+}
+
+#[test]
+fn a_v1_record_holding_the_text_of_a_private_previous_still_restores_it_and_its_mode() {
+    for (mode_text, mode_bits) in [("0600", 0o600), ("0640", 0o640)] {
+        let sandbox = Sandbox::new("rb");
+        let (_, local) = applied(&sandbox);
+        let path = sandbox.state_home().join("anvil/last-apply.json");
+        let mut record = sandbox.last_apply().unwrap();
+        record["targets"]["local"]["files"][0]["previous"]["mode"] = mode_text.into();
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert!(!text(&out.stdout).contains("not restored"), "{mode_text}");
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), PREVIOUS);
+        assert_eq!(mode(&local), mode_bits, "{mode_text}");
+    }
+}
+
+#[test]
+fn a_cannot_undo_note_alone_leaves_the_summary_clean() {
+    let sandbox = Sandbox::new("rb");
+    applied(&sandbox);
+    let out = sandbox.anvil(&["--json", "rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert!(value.get("not_restored").is_none(), "{value}");
+    assert!(value["targets"][0].get("warnings").is_none(), "{value}");
 }
 
 #[test]
@@ -433,7 +551,8 @@ fn rollback_through_sudo_with_a_password_installs_the_previous_owner_and_mode() 
         sudo.lines().any(|line| line == "-v"),
         "the password was typed: {sudo}"
     );
-    assert!(sudo.contains("install -o "), "{sudo}");
+    assert!(sudo.contains("\nchown "), "{sudo}");
+    assert!(sudo.contains("\nmv -f "), "{sudo}");
 }
 
 #[test]
@@ -576,6 +695,114 @@ fn interleaved_tasks_restore_the_right_files_and_name_what_cannot_be_undone() {
     }
 }
 
+/// Waits until `path` exists, failing after 20 s, a fail-safe only.
+fn wait_for(path: &Path) {
+    common::until(|| path.exists(), &path.display().to_string());
+}
+
+#[test]
+fn an_apply_killed_partway_through_a_target_rolls_back_to_the_originals() {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    for signals in [
+        &[Signal::KILL][..],
+        &[Signal::TERM, Signal::TERM][..],
+        &[Signal::HUP, Signal::HUP][..],
+    ] {
+        let sandbox = Sandbox::new("rb");
+        let (one, two, three) = (
+            task_dest(&sandbox, "one"),
+            task_dest(&sandbox, "two"),
+            task_dest(&sandbox, "three"),
+        );
+        let (reached, go) = (sandbox.root().join("reached"), sandbox.root().join("go"));
+        sandbox.write_config(
+            "config.toml",
+            &format!(
+                "[[tasks]]\nrun = \"true\"\n\n{}{}[[tasks]]\nrun = '''touch {}; i=0; \
+                 until [ -e {} ]; do i=$((i+1)); [ $i -gt 600 ] && exit 1; sleep 0.05; done'''\n\n{}",
+                file_task("a.txt", &one),
+                file_task("b.txt", &two),
+                reached.display(),
+                go.display(),
+                file_task("a.txt", &three),
+            ),
+        );
+        let mut child = sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", "apply", "--target", "local"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn anvil");
+        wait_for(&reached);
+        assert_eq!(std::fs::read_to_string(&one).unwrap(), "bytes-a\n");
+        assert_eq!(std::fs::read_to_string(&two).unwrap(), "bytes-b\n");
+        for signal in signals {
+            kill_process(Pid::from_child(&child), *signal).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        child.wait().unwrap();
+        std::fs::write(&go, "").unwrap();
+
+        let record = sandbox.last_apply().expect("saved around each write");
+        let entry = &record["targets"]["local"];
+        assert_eq!(entry["ok"], false, "{signals:?}");
+        assert_eq!(entry["cannot_undo"], serde_json::json!(["tasks[0]"]));
+        let files = entry["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2, "{signals:?}: not the third");
+        assert_eq!(files[0]["dest"], one);
+        assert_eq!(files[0]["write"], "written");
+        assert_eq!(files[1]["dest"], two);
+        assert_eq!(files[1]["write"], "written");
+
+        let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert_eq!(std::fs::read_to_string(&one).unwrap(), PREVIOUS);
+        assert_eq!(std::fs::read_to_string(&two).unwrap(), PREVIOUS);
+        assert_eq!(std::fs::read_to_string(&three).unwrap(), PREVIOUS);
+    }
+}
+
+#[test]
+fn a_refused_write_after_its_intent_rolls_back_to_the_earlier_previous() {
+    let sandbox = Sandbox::new("rb");
+    let dest = task_dest(&sandbox, "dest");
+    sandbox.write_config("config.toml", &file_task("a.txt", &dest));
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+
+    // The next capture reads `found`; its `od` then puts back what the first
+    // apply wrote, so the write sees DEST changed since the read and refuses.
+    std::fs::write(&dest, "found\n").unwrap();
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(sandbox.config_dir().join("a.txt"), "bytes-new\n").unwrap();
+    let bin = sandbox.root().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let od = bin.join("od");
+    std::fs::write(
+        &od,
+        format!(
+            "#!/bin/sh\n/usr/bin/od \"$@\"\nanvil_od=$?\ncase \"$*\" in *{dest}*) \
+             printf 'bytes-a\\n' >{dest} ;; esac\nexit $anvil_od\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&od, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[("PATH", &path)]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+
+    let record = sandbox.last_apply().unwrap();
+    let file = &record["targets"]["local"]["files"][0];
+    assert_eq!(file["write"], "written", "the first apply's");
+    assert_eq!(file["previous"]["text"], PREVIOUS, "not the intent's");
+
+    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), PREVIOUS);
+}
+
 #[test]
 fn the_same_dest_twice_applied_twice_rolls_back_to_before_the_first_apply() {
     let sandbox = Sandbox::new("rb");
@@ -654,9 +881,10 @@ fn a_legacy_duplicate_dest_keeps_one_entry_per_write() {
     std::fs::write(sandbox.config_dir().join("b.txt"), "bytes-b\n").unwrap();
     let dest = out.join("dest");
     std::fs::write(&dest, PREVIOUS).unwrap();
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
     let dest = dest.display().to_string();
     let entry = |src: &str| {
-        format!("[[files]]\nsrc = \"{src}\"\ndest = \"{dest}\"\nmode = \"0640\"\nsudo = false\n\n")
+        format!("[[files]]\nsrc = \"{src}\"\ndest = \"{dest}\"\nmode = \"0644\"\nsudo = false\n\n")
     };
     sandbox.write_config(
         "config.toml",
@@ -726,4 +954,67 @@ fn a_cannot_undo_note_escapes_a_hostile_include_path_for_people() {
     let out = sandbox.anvil(&["-vv", "rollback"], &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(text(&out.stdout).contains(shown), "{}", text(&out.stdout));
+}
+
+/// Rewrites the record of `dest`'s entry into what an older anvil recorded
+/// for a write through a link there, then rolls back.
+fn rollback_of_a_v1_link(
+    sandbox: &Sandbox,
+    dest: &str,
+    previous: serde_json::Value,
+) -> std::process::Output {
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    let files = record["targets"]["local"]["files"].as_array_mut().unwrap();
+    let file = files.iter_mut().find(|file| file["dest"] == dest).unwrap();
+    file["previous"] = previous;
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    sandbox.anvil(&["rollback", "--target", "local"], &[])
+}
+
+#[test]
+fn a_v1_dangling_record_still_removes_the_link() {
+    let sandbox = Sandbox::new("rd");
+    let (_, local) = applied(&sandbox);
+    // What a v1 write through a dangling link left: the link and its new file.
+    let made = sandbox.root().join("out/made");
+    std::fs::rename(&local, &made).unwrap();
+    std::os::unix::fs::symlink(&made, &local).unwrap();
+    let out = rollback_of_a_v1_link(
+        &sandbox,
+        &local,
+        serde_json::json!({"state": "dangling", "target": made.display().to_string()}),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        std::fs::symlink_metadata(&local).is_err(),
+        "the link is gone"
+    );
+    assert_eq!(std::fs::read_to_string(&made).unwrap(), FILE_TEXT);
+}
+
+#[test]
+fn a_v1_file_record_written_through_a_link_refuses_rollback() {
+    let sandbox = Sandbox::new("rl");
+    let (_, local) = applied(&sandbox);
+    let real = sandbox.root().join("out/real");
+    std::fs::rename(&local, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &local).unwrap();
+    let record = sandbox.last_apply().unwrap();
+    let files = record["targets"]["local"]["files"].as_array().unwrap();
+    let previous = files
+        .iter()
+        .find(|file| file["dest"] == local.as_str())
+        .unwrap()["previous"]
+        .clone();
+    let out = rollback_of_a_v1_link(&sandbox, &local, previous);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains(&format!(
+            "files: {local} is a symlink; point dest at the real file"
+        )),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), FILE_TEXT);
 }

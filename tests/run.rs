@@ -1,6 +1,7 @@
 //! `anvil run FILE|-` on the built binary: one script on the local target
 //! and a fake-ssh host, from a file or stdin, human and `--json`.
 
+#![allow(clippy::disallowed_methods)]
 // `--secret-store` and `--ssh-program` only exist in debug builds.
 #![cfg(debug_assertions)]
 

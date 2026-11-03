@@ -291,7 +291,7 @@ pub fn check(
     let secrets = check_secrets(&names, store)?;
     let targets = targets?;
     let mut local = local_checks(
-        &opts.ssh_program(),
+        &opts.ssh_name(),
         Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict),
         secrets,
     );

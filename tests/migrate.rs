@@ -2,6 +2,8 @@
 //! moved to sops, also over a sops file that does not decrypt (both skipped
 //! without sops), the usage refusals, and `--json`.
 
+#![allow(clippy::disallowed_methods)]
+
 mod common;
 
 use std::fs;

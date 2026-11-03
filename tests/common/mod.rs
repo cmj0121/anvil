@@ -29,6 +29,18 @@ pub fn chmod(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// Waits until `done`, failing after 20 s, a fail-safe only.
+pub fn until(mut done: impl FnMut() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !done() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gave up waiting for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 pub fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -278,6 +290,7 @@ impl Sandbox {
             .env("HOME", self.root.join("h"))
             .env("TMPDIR", self.tmp_dir())
             .env("EDITOR", fixture("fake-editor.sh"))
+            .env("ANVIL_DEBUG_SAFE_TOP", &self.root)
             .env_remove("VISUAL");
         for (key, _) in std::env::vars() {
             if key.starts_with("FAKE_SSH_") || key.starts_with("FAKE_EDITOR_") {
@@ -464,7 +477,7 @@ impl FixtureServer {
 /// the probe reports `sudo=binary`; `-v` prints `$SUDO_PROMPT` on the
 /// terminal and accepts `$FAKE_SUDO_PW`; `find` prints its start path, so
 /// each directory of the sandbox passes as root-only; anything else runs as
-/// the user, `install` after the heartbeat of `tests/apply.rs`'s `heartbeat` in
+/// the user, `mv` after the heartbeat of `tests/apply.rs`'s `heartbeat` in
 /// `$FAKE_SUDO_BEAT` when set. Each call's argv is appended to
 /// `$FAKE_SUDO_LOG`.
 pub const FAKE_SUDO: &str = r#"#!/bin/sh
@@ -473,7 +486,7 @@ case "$1" in
   -n) echo 'sudo: a password is required' >&2; exit 1 ;;
   -k) exit 0 ;;
   find) printf '%s\n' "$2"; exit 0 ;;
-  install)
+  mv)
     D=$FAKE_SUDO_BEAT
     if [ -n "$D" ]; then
       i=0; until [ -e "$D/go" ]; do i=$((i+1)); echo $i >"$D/beat"; [ $i -gt 600 ] && exit 1; sleep 0.05; done

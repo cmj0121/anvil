@@ -15,10 +15,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::document;
+use crate::exec;
 use crate::paths::{self, PrivateDirError};
 use crate::term;
 
@@ -226,7 +226,7 @@ impl Editor {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
-            Command::new(&self.program).args(&args).status()
+            exec::resolved(&self.program).args(&args).status()
         })
         .map_err(|source| EditorError::Spawn {
             program: self.program.display().to_string(),

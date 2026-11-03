@@ -2,6 +2,8 @@
 //! server; nothing here contacts GitHub. Updates run on a copy of the debug
 //! binary in the sandbox, under `umask 077`.
 
+#![allow(clippy::disallowed_methods)]
+
 mod common;
 
 use std::fs;

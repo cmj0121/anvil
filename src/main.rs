@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 mod apply;
 mod cli;
@@ -9,6 +10,7 @@ mod document;
 mod editor;
 #[cfg(test)]
 mod examples;
+mod exec;
 mod facts;
 mod fanout;
 mod files;
@@ -25,6 +27,7 @@ mod plan;
 mod plugin;
 mod private;
 mod record;
+mod remote;
 mod rollback;
 mod run;
 mod secret;

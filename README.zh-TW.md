@@ -13,7 +13,8 @@ inventory 說明在哪裡（各 host），config 說明做什麼（套件、檔�
 
 - apply 預設在每個 target 上依固定順序進行：先套件，再檔案，再服務，最後步驟。
   有序的 [`[[tasks]]`](docs/configuration.zh-TW.md#tasks) 清單可巢狀並以 `$/` include，改依你寫的順序執行。
-- rollback 只還原檔案；套件、服務與步驟無法復原。
+- rollback 只還原檔案；套件、服務與步驟無法復原。其他人無法讀取的檔案在紀錄中只保存雜湊，因此 apply 會警告，
+  rollback 會指名它而不還原。
 - 還沒有任何檔案時，inventory 只有 `local`，config 執行 `hostname`，因此 `doctor` 與 `apply` 已可通過。
 
 ## 安裝與使用

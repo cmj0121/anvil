@@ -22,6 +22,9 @@
   `last-apply.json` 保存每次 `[[files]]` 寫入所取代的文字，讓 `anvil rollback` 能把它放回去
   （[apply 紀錄](cli.zh-TW.md#apply-紀錄)）。它沒有加密：保護它的是你擁有的 0700 目錄中的 mode 0600，
   每次執行都會檢查兩者，anvil 會拒絕對他人開放的紀錄或目錄。任何能以你的身分讀取你的檔案的人，或能讀取其備份的人，都能讀到它。
+  其他人無法讀取的先前檔案（mode 不含 `0o004`，例如 0440 的 `/etc/sudoers.d/*`）只保存 sha256，位元組也不會離開 target，
+  因此 rollback 無法把它放回去：apply 會警告，rollback 會指名它。舊版 anvil 記下的這類文字會留在紀錄中，
+  直到該 target 下一次寫入檔案的 apply 才捨棄並發出警告。0700 目錄中的 0644 檔案仍會保存，因為只看檔案自身的 mode。
   dest 保存 secret 的 `[[files]]` 項目請設定 `rollback = false`：紀錄就只保存它的 sha256（[Files](configuration.zh-TW.md#files)）。
   dest 的 symlink、hard link 或不分大小寫的別名在 controller 上看不出來，會算成不同的 dest，因此該檔案的每個項目都要設定。
   同一 dest 重複的舊式 `[[files]]` 項目，若第一個使用預設 rollback、後面的設定 `rollback = false`，第二次 apply 時仍會把後面項目的
@@ -129,9 +132,6 @@
 - **doctor plugin 沒有沙箱。** 請求是 anvil 給它的全部，但 plugin 在控制端以你的身分執行，因此能讀取任何你能讀的東西：
   `last-apply.json`（含明文的每份先前文字與每個 `written_sha256`）、你的設定、你的金鑰。
   只釘選你信任的 doctor plugin，信任程度要與信任設定本身相同。
-- **被替換的使用者路徑 dest 可能拖住 doctor。** 若僅 root 可寫路徑以外的 dest 位於他人可寫的目錄中，
-  有人可以在雜湊執行的 `test -f` 與雜湊之間把它換成 FIFO；讀取會因此阻塞到 30 秒逾時，該 target 的 plugin 都會失敗。
-  這是可接受的：它只會拖延 doctor，tag 也讓讀到的任何東西都不會外洩。
 - **doctor 從不輸入 sudo 密碼。** 在 `sudo -n` 被拒或需要密碼的 target 上，僅 root 可寫的 dest 不會被比對（`no_sudo`），
   即使該 target 有 `sudo_secret` 也一樣；doctor 每個 target 以一行警告說明。這些檔案中的漂移要等 doctor 能使用 `sudo -n` 才看得到。
 - **doctor 的輸出中沒有雜湊，只有一個例外。** doctor 不印出任何 sha256 或 tag。它拒絕在 `was`、`now` 或 `text` 中

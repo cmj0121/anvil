@@ -1,6 +1,8 @@
 //! anvil-audit on the built binary: a fixture request on stdin, the reply
 //! on stdout.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
