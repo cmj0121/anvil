@@ -794,12 +794,18 @@ fn up_to_date_prints_the_verdict_and_downloads_nothing() {
 }
 
 #[test]
-fn without_a_release_key_nothing_is_asked_or_downloaded() {
+fn without_a_release_key_the_compiled_keys_refuse_a_fixture_signature() {
     let install = Install::new();
     let server = serving_files(&release_files());
     let out = install.update(&server, &[], &[]);
-    assert_refused(&install, &out, "no release key compiled in");
-    assert!(server.requests().is_empty());
+    assert_refused(
+        &install,
+        &out,
+        &format!(
+            "signature check failed for {}: unknown key id",
+            tarball(TAG)
+        ),
+    );
 }
 
 #[test]

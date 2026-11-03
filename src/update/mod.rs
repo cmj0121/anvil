@@ -2,11 +2,6 @@
 //! replacing it with that release once it verifies.
 
 mod install;
-// Until #33 U2b compiles the owner's keys in, only debug builds parse a key.
-#[cfg_attr(
-    not(any(test, debug_assertions)),
-    expect(dead_code, reason = "parsed by the compiled keys of #33 U2b")
-)]
 pub mod keys;
 mod release;
 pub mod verify;
@@ -146,7 +141,7 @@ pub fn check(out: Output, opts: &Options) -> Result<(), Failure> {
 /// verifies. Up to date or ahead prints the verdict and changes nothing;
 /// any failure leaves the binary as it was.
 pub fn update(out: Output, opts: &Options) -> Result<(), Failure> {
-    let keys = trusted_keys(opts)?;
+    let keys = opts.trusted_keys()?;
     let source = opts.release_source();
     let latest = resolve(&source)?;
     if latest.check.status != Status::Available {
@@ -175,7 +170,7 @@ pub fn latest(opts: &Options) -> Result<Check, Failure> {
 /// The TUI's confirmed `u`: [`update`] to `version`, printing nothing.
 /// Refused when the latest release is no longer `version`.
 pub fn update_to(opts: &Options, version: &str) -> Result<Updated, Failure> {
-    let keys = trusted_keys(opts)?;
+    let keys = opts.trusted_keys()?;
     let source = opts.release_source();
     let latest = resolve(&source)?;
     if latest.check.status != Status::Available || latest.check.latest != version {
@@ -185,15 +180,6 @@ pub fn update_to(opts: &Options, version: &str) -> Result<Updated, Failure> {
         )));
     }
     replace(&source, latest, &keys)
-}
-
-/// The keys a release must verify with; none compiled in is refused.
-fn trusted_keys(opts: &Options) -> Result<keys::TrustedKeys, Failure> {
-    let keys = opts.trusted_keys()?;
-    if keys.is_empty() {
-        return Err(fail(keys::NO_RELEASE_KEY));
-    }
-    Ok(keys)
 }
 
 /// Replaces this binary with `latest`, an available update, once it
