@@ -30,7 +30,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use zeroize::Zeroizing;
 
-use crate::cancel::Cancel;
+use crate::cancel::{AbortReason, Cancel};
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::{Config, MAX_FILES, Plugin};
 use crate::editor::{Editor, EditorError, Fallback};
@@ -169,8 +169,10 @@ pub struct PluginReport {
 
 /// The notice of a plugin run with `last_apply` null.
 const NO_APPLY: &str = "no apply recorded";
-/// The error of a target or plugin a cancel skipped.
-const CANCELLED: &str = "cancelled";
+/// The error of a target or plugin `cancel` skipped: why it was stopped.
+fn skipped(cancel: &Cancel) -> &'static str {
+    cancel.reason().unwrap_or(AbortReason::Cancelled).text()
+}
 
 impl PluginReport {
     fn failed(plugin: &str, error: String) -> PluginReport {
@@ -231,9 +233,10 @@ pub struct Report {
     pub local: LocalReport,
     pub targets: Vec<TargetReport>,
     pub ok: bool,
-    /// Whether a cancel ended the run early.
+    /// Why the cancel token ended the run early, when it skipped a target or
+    /// a plugin.
     #[serde(skip)]
-    pub cancelled: bool,
+    pub abort: Option<AbortReason>,
 }
 
 impl Report {
@@ -257,7 +260,7 @@ impl Report {
             local,
             targets,
             ok,
-            cancelled: false,
+            abort: None,
         }
     }
 }
@@ -305,7 +308,7 @@ pub fn check(
             on(Progress::Start(target));
             cancelled = cancelled || cancel.is_set();
             let report = if cancelled {
-                cancelled_target(target)
+                cancelled_target(target, cancel)
             } else {
                 let transport = opts.transport(target, cancel);
                 let mut report = check_target(target, &transport);
@@ -334,23 +337,25 @@ pub fn check(
         })
         .collect();
     let mut report = Report::new(local, targets);
-    report.cancelled = cancelled
-        || report
-            .targets
-            .iter()
-            .flat_map(|target| &target.plugins)
-            .any(|plugin| plugin.error.as_deref() == Some(CANCELLED));
+    let skipped_plugin = || {
+        let text = skipped(cancel);
+        (report.targets.iter().flat_map(|target| &target.plugins))
+            .any(|plugin| plugin.error.as_deref() == Some(text))
+    };
+    if cancelled || cancel.is_set() && skipped_plugin() {
+        report.abort = cancel.reason();
+    }
     Ok(report)
 }
 
 /// A target a cancel skipped.
-fn cancelled_target(target: &Target) -> TargetReport {
+fn cancelled_target(target: &Target, cancel: &Cancel) -> TargetReport {
     log::info!("doctor {}: cancelled", target.name);
     TargetReport {
         target: target.name.clone(),
         connectable: false,
         facts: None,
-        error: Some(CANCELLED.to_owned()),
+        error: Some(skipped(cancel).to_owned()),
         manager: None,
         packages: None,
         manager_error: None,
@@ -431,7 +436,7 @@ impl DoctorRun {
         let name = &target.name;
         if cancel.is_set() {
             log::info!("doctor {name}: plugins cancelled");
-            let cancelled = |pin: &Pin| PluginReport::failed(&pin.name, CANCELLED.to_owned());
+            let cancelled = |pin: &Pin| PluginReport::failed(&pin.name, skipped(cancel).to_owned());
             return (self.pins.iter().map(cancelled).collect(), None);
         }
         let entry = self.record.as_ref().and_then(|r| r.targets.get(name));
@@ -469,7 +474,7 @@ impl DoctorRun {
             .map(|pin| {
                 if cancel.is_set() {
                     log::info!("doctor {name}: plugin {}: cancelled", pin.name);
-                    return PluginReport::failed(&pin.name, CANCELLED.to_owned());
+                    return PluginReport::failed(&pin.name, skipped(cancel).to_owned());
                 }
                 let current = match &current {
                     Ok(current) => current,
@@ -642,9 +647,11 @@ pub fn run(
     } else {
         let _ = status::write_stdout(&render(&report));
     }
-    match () {
+    match report.abort {
         _ if report.ok => Ok(()),
-        _ if report.cancelled => Err(Failure::failed("doctor: cancelled")),
+        Some(abort) => {
+            Err(Failure::failed(format!("doctor: {}", abort.text())).ended_by(Some(abort)))
+        }
         _ if report.drift_only() => Err(Failure::failed("doctor: drift since the last apply")),
         _ => Err(Failure::failed("doctor: a check or a target failed")),
     }
@@ -2170,7 +2177,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn a_cancel_skips_the_remaining_targets() {
+    fn a_cancel_skips_the_remaining_targets_naming_why() {
         let inventory = crate::test_util::fixture("inventory.toml");
         let cli = <Cli as clap::Parser>::try_parse_from([
             "anvil",
@@ -2185,31 +2192,47 @@ mod tests {
             "doctor",
         ])
         .unwrap();
-        let cancel = Arc::new(Cancel::new());
-        let mut started = 0;
-        let report = check(
-            &Options::from_cli(&cli),
-            &Config::default(),
-            &Memory::default(),
-            &cancel,
-            &mut |progress| {
-                if let Progress::Start(_) = progress {
-                    started += 1;
-                    if started == 2 {
-                        cancel.stop(AbortReason::Cancelled);
+        for (reason, text) in [
+            (AbortReason::Cancelled, "cancelled"),
+            (AbortReason::Terminated, "terminated"),
+            (AbortReason::HungUp, "hung up"),
+        ] {
+            let cancel = Arc::new(Cancel::new());
+            let mut started = 0;
+            let report = check(
+                &Options::from_cli(&cli),
+                &Config::default(),
+                &Memory::default(),
+                &cancel,
+                &mut |progress| {
+                    if let Progress::Start(_) = progress {
+                        started += 1;
+                        if started == 2 {
+                            cancel.stop(reason);
+                        }
                     }
-                }
-            },
-        )
-        .unwrap();
-        assert!(report.cancelled && !report.ok);
-        assert_eq!(report.targets.len(), 2);
-        assert_ne!(report.targets[0].error.as_deref(), Some("cancelled"));
-        assert_eq!(report.targets[1].error.as_deref(), Some("cancelled"));
-        assert_eq!(
-            keys(&json(&report.targets[1])),
-            ["connectable", "error", "target"]
-        );
+                },
+            )
+            .unwrap();
+            assert!(report.abort == Some(reason) && !report.ok);
+            assert_eq!(report.targets.len(), 2);
+            assert_ne!(report.targets[0].error.as_deref(), Some(text));
+            assert_eq!(report.targets[1].error.as_deref(), Some(text));
+            assert_eq!(
+                keys(&json(&report.targets[1])),
+                ["connectable", "error", "target"]
+            );
+        }
+    }
+
+    #[test]
+    fn a_skipped_plugin_names_the_signal() {
+        let (dir, run) = doctor_run("doctor-terminated", EMPTY, None);
+        let cancel = Cancel::new();
+        cancel.stop(AbortReason::Terminated);
+        let (reports, _) = run.target(&host("box"), &facts("user=cmj\n"), &Never, &cancel);
+        assert_eq!(reports[0].error.as_deref(), Some("terminated"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn finding(

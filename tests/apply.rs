@@ -544,6 +544,9 @@ fn heartbeat(dir: &Path) -> String {
 #[derive(Clone, Copy, Debug)]
 enum Kind {
     Plain,
+    /// [`Kind::Plain`] after a `[[files]]` step on facts no host has, so
+    /// apply probes and keeps a record.
+    Recorded,
     Tty,
     /// [`Kind::Tty`] over a dest holding [`PREVIOUS`], 0644.
     TtyOver,
@@ -576,7 +579,7 @@ fn beating(kind: Kind) -> Running {
 /// then hears nothing.
 fn beating_into(kind: Kind, stderr: Option<Stdio>) -> Running {
     let (sandbox, secrets, mut command) = match kind {
-        Kind::Plain | Kind::Run | Kind::Paused => {
+        Kind::Plain | Kind::Recorded | Kind::Run | Kind::Paused => {
             let sandbox = Sandbox::new("ai");
             sandbox.with_fake_host();
             let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
@@ -607,6 +610,18 @@ fn beating_into(kind: Kind, stderr: Option<Stdio>) -> Running {
             sandbox.write_config(
                 "config.toml",
                 &format!("[[steps]]\nrun = '{first}'\n{touch}"),
+            );
+            command.args(["--json", "apply"]);
+        }
+        Kind::Recorded => {
+            std::fs::write(sandbox.config_dir().join("motd.txt"), "motd\n").unwrap();
+            sandbox.write_config(
+                "config.toml",
+                &format!(
+                    "[[files]]\nsrc = \"motd.txt\"\ndest = \"{}\"\nmode = \"0644\"\nfacts = {{ distro = \"none\" }}\n\n\
+                     [[steps]]\nrun = '{first}'\n{touch}",
+                    sandbox.root().join("motd").display()
+                ),
             );
             command.args(["--json", "apply"]);
         }
@@ -765,9 +780,12 @@ fn one_ctrl_c_lets_the_running_step_end_and_cancels_the_rest() {
 }
 
 #[test]
-fn sigterm_and_sighup_cancel_like_a_first_ctrl_c_and_do_not_mention_it() {
-    for (signal, word) in [(Signal::TERM, "terminated"), (Signal::HUP, "hung up")] {
-        let mut running = beating(Kind::Plain);
+fn sigterm_and_sighup_end_the_run_and_exit_by_the_signal() {
+    for (signal, word, code, abort) in [
+        (Signal::TERM, "terminated", 143, "terminated"),
+        (Signal::HUP, "hung up", 129, "hung_up"),
+    ] {
+        let mut running = beating(Kind::Recorded);
         running.signal(signal);
         let line = running.notice_of(word);
         assert!(!line.contains("Ctrl-C"), "{line}");
@@ -775,17 +793,56 @@ fn sigterm_and_sighup_cancel_like_a_first_ctrl_c_and_do_not_mention_it() {
         let mut stdout = String::new();
         std::io::Read::read_to_string(running.child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
         let status = running.child.wait().unwrap();
-        assert_eq!(status.code(), Some(1), "{word}");
+        assert_eq!(status.code(), Some(code), "{word}");
         let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
         let targets = value["targets"].as_array().unwrap();
         assert_eq!(targets[0]["ok"], false, "{word}");
+        assert_eq!(targets[0]["abort"], abort, "{word}");
+        // The skipped file, then the running step.
+        assert_eq!(targets[0]["steps"].as_array().unwrap().len(), 2, "{word}");
         assert_eq!(
             targets[1],
-            serde_json::json!({"target": "fake", "steps": [], "ok": false}),
-            "{word}: fake never started, and the reason reads as cancelled"
+            serde_json::json!({"target": "fake", "steps": [], "ok": false, "abort": abort}),
+            "{word}: fake never started"
         );
         assert!(!running.second.exists(), "{word}: no later step ran");
+        let record = running.sandbox.last_apply().expect("the record is saved");
+        let entry = &record["targets"]["local"];
+        assert_eq!(entry["ok"], false, "{word}");
+        assert_eq!(
+            entry["cannot_undo"],
+            serde_json::json!(["step 1"]),
+            "{word}"
+        );
     }
+}
+
+#[test]
+fn a_ctrl_c_exits_1_with_no_abort_in_the_json() {
+    let mut running = beating(Kind::Plain);
+    running.interrupt();
+    running.notice();
+    std::fs::write(running.beat.with_file_name("go"), "").unwrap();
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(running.child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+    assert_eq!(running.child.wait().unwrap().code(), Some(1));
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    for target in value["targets"].as_array().unwrap() {
+        assert!(target.get("abort").is_none(), "{target}");
+    }
+}
+
+#[test]
+fn a_sigterm_ends_an_anvil_run_with_143() {
+    let mut running = beating(Kind::Run);
+    running.signal(Signal::TERM);
+    running.notice_of("terminated");
+    std::fs::write(running.beat.with_file_name("go"), "").unwrap();
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(running.child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+    assert_eq!(running.child.wait().unwrap().code(), Some(143));
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["targets"][1]["abort"], "terminated", "{value}");
 }
 
 #[test]
@@ -948,7 +1005,7 @@ fn a_kill_function_in_the_environment_does_not_fool_the_probe_for_the_ignore() {
         "SIGHUP was caught: {:?}",
         out.status
     );
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(out.status.code(), Some(129), "{}", text(&out.stderr));
     assert!(
         text(&out.stderr).contains("hung up"),
         "{}",

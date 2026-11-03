@@ -1014,3 +1014,25 @@ fn a_v1_file_record_written_through_a_link_refuses_rollback() {
     );
     assert_eq!(std::fs::read_to_string(&real).unwrap(), FILE_TEXT);
 }
+
+#[test]
+fn a_rollback_ended_by_sigterm_exits_143_and_names_why() {
+    let sandbox = Sandbox::new("rb");
+    sandbox.with_two_fake_hosts();
+    let dest = task_dest(&sandbox, "one");
+    sandbox.write_config("config.toml", &file_task("a.txt", &dest));
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let signal = rustix::process::Signal::TERM;
+    let out = sandbox.signalled_at_the_gate(&["--json", "rollback"], signal);
+    assert_eq!(out.status.code(), Some(143), "{}", text(&out.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["targets"][2]["target"], "beta", "{value}");
+    assert_eq!(value["targets"][2]["abort"], "terminated", "{value}");
+    assert!(
+        sandbox.last_apply().unwrap()["targets"]
+            .get("beta")
+            .is_some(),
+        "beta is still to roll back"
+    );
+}

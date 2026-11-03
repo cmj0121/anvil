@@ -80,7 +80,8 @@ anvil run --parallel 4 fix.sh
   naming its target (at `-vv`, `apply linode1: start`), so they show what is running while blocks are held.
 - **Ctrl-C** works as for one target: the first press lets the running steps finish and starts no other target, the
   second stops everything at once ([Ctrl-C](#ctrl-c)).
-- **Exit codes** are unchanged: 1 when any target failed or was cancelled; a failing target never stops the others.
+- **Exit codes** are unchanged: 1 when any target failed or was cancelled; a failing target never stops the others. A
+  run ended by SIGTERM or SIGHUP exits 143 or 129 ([Exit codes](#exit-codes)).
 
 Limitations:
 
@@ -591,7 +592,9 @@ drift the only failure the message is `doctor: drift since the last apply`. Noti
 and files not compared exit 0.
 
 **Cancel and time.** The first Ctrl-C (or Esc in the TUI) lets the running probe, hash run or plugin finish, then the
-rest of that target's plugins and every later target end `cancelled`: `doctor: cancelled`, exit 1. A second Ctrl-C
+rest of that target's plugins and every later target end `cancelled`: `doctor: cancelled`, exit 1. A first SIGTERM or
+SIGHUP does the same, but (a breaking change) their `error` reads `terminated` or `hung up`, the message `doctor: terminated` or
+`doctor: hung up`, and the exit is 143 or 129 ([Ctrl-C](#ctrl-c)). A second Ctrl-C
 kills them and anvil dies by SIGINT. doctor runs one target at a time: in the worst case a target takes, on ssh, up to
 40 s to connect and open its master (the 10 s `ssh -O check`, then the 30 s key attempt, whose connect is capped by
 `ConnectTimeout=10`), then 30 s for the probe, 30 s for the hash run and 30 s for each doctor plugin.
@@ -767,7 +770,9 @@ has the same shape and adds `not_restored` ([`anvil rollback`](#anvil-rollback))
 
 A record that could not be saved adds a top-level `save_error` string, omitted otherwise, and makes the top-level `ok`
 false even when every target's is true; `targets` still names what ran ([Save errors](#the-apply-record)). A target
-that never finished because of it has `"abort": "save_failed"`. A target cancelled by Ctrl-C has no `abort`.
+that never finished because of it has `"abort": "save_failed"`. A target ended by a first SIGTERM has
+`"abort": "terminated"`, by a first SIGHUP `"abort": "hung_up"`. A target cancelled by Ctrl-C has no `abort`. Only the
+first reason counts: a SIGTERM after a failed save leaves `save_failed`.
 
 #### Tasks in a run
 
@@ -877,11 +882,16 @@ targets and its doctor plugins ([Doctor plugins](#doctor-plugins-drift-since-the
   left behind ([Running in parallel](#running-in-parallel)).
 - **A fast double press may count as one.** Two presses very close together can reach anvil as one signal and then
   count as the first; press again.
-- **SIGTERM and SIGHUP count as presses.** The first prints
-  `terminated: running targets stop after their current step; the same signal again stops now` (`hung up: …` for
-  SIGHUP) and cancels: its targets read `⊘ cancelled`, exit 1. The second signal of any of the three kills every step and
-  anvil dies by that signal, logging `terminated`, `hung up` or `interrupted`. The TUI handles only SIGINT
-  ([Signals](tui.md)).
+- **SIGTERM and SIGHUP count as presses, and set the exit status.** **Breaking change:** a run ended by a first
+  SIGTERM exits 143 and one ended by a first SIGHUP exits 129, where both used to exit 1 (Ctrl-C still exits 1). The
+  first prints `terminated: running targets stop after their current step; the same signal again stops now`
+  (`hung up: …` for SIGHUP) and cancels as Ctrl-C does, but its targets read `✘ terminated` or `✘ hung up` (plan:
+  `⊘ terminated`, `⊘ hung up`), and in `--json` carry `"abort": "terminated"` or `"hung_up"`. The first signal decides:
+  one that comes after a failed record save keeps that reason and exit 1. A signal that arrives after every target
+  ended cancels nothing, so the command exits as it would have, 0 or 1. Also breaking: after a first SIGTERM or SIGHUP,
+  doctor's skipped target or plugin `error` reads `terminated` or `hung up` where it used to read `cancelled`. The
+  second signal of any of the three kills every step and anvil dies by that signal, logging `terminated`, `hung up` or
+  `interrupted`. The TUI handles only SIGINT ([Signals](tui.md)).
 - **A first SIGTERM can outlast a service manager's window.** It only lets the current step finish: up to 30 s for a
   `[[steps]]` or `[[files]]` step, 120 s for a service step, and `[packages].timeout`, 300 s by default, for the package
   step. A manager's SIGKILL then gives anvil no chance to kill the steps, so they go on. Send a second SIGTERM before
@@ -1117,7 +1127,11 @@ password, its `sudo_secret`, plus `task` and `name` on a tasks config, but never
 }
 ```
 
-Exit 0 when every selected target resolves, 1 when any cannot be reached or resolved, 2 for usage or config.
+A target a cancel skipped is `{"target": "pi", "ok": false}`, with `"abort": "terminated"` or `"hung_up"` when a first
+SIGTERM or SIGHUP did it ([Ctrl-C](#ctrl-c)).
+
+Exit 0 when every selected target resolves, 1 when any cannot be reached or resolved, 2 for usage or config; 143 or
+129 when a first SIGTERM or SIGHUP ended the plan.
 
 ### Plugin steps
 
@@ -1853,11 +1867,17 @@ that exits non-zero aborts the command: nothing is written, exit 1.
 
 ## Exit codes
 
+> **Breaking change:** `apply`, `plan`, `run`, `rollback` and `doctor` ended by a first SIGTERM or SIGHUP exit 143 or
+> 129, not 1 ([Ctrl-C](#ctrl-c)). After a first SIGTERM or SIGHUP, doctor's skipped target or plugin `error` reads
+> `terminated` or `hung up` where it used to read `cancelled`.
+
 | Exit | Meaning                                                         |
 | ---- | --------------------------------------------------------------- |
 | 0    | everything ok                                                   |
 | 1    | a target or a check failed; for target-less commands, see below |
 | 2    | usage or configuration error; the full list is below            |
+| 129  | a first SIGHUP ended the run                                    |
+| 143  | a first SIGTERM ended the run                                   |
 
 - **0**: for `doctor`, a `missing` secret or an unresolved editor is only a warning.
 - **1**: `doctor`/`apply`: a target or a check failed (including a `locked` or `error` secret, and, with `[packages]`, a
@@ -1869,8 +1889,8 @@ that exits non-zero aborts the command: nothing is written, exit 1.
   `run`: a target failed or could not be reached.
   `rollback`: see [anvil rollback](#anvil-rollback); `apply` also when the record cannot be read, locked or saved, or
   there is no state directory ([The apply record](#the-apply-record)).
-  `apply`/`plan`/`run`/`rollback`/`doctor`: a first Ctrl-C, SIGTERM or SIGHUP cancelled the run ([Ctrl-C](#ctrl-c)); a
-  second one kills anvil by that signal instead, which a shell reports as 130 for SIGINT.
+  `apply`/`plan`/`run`/`rollback`/`doctor`: a first Ctrl-C cancelled the run ([Ctrl-C](#ctrl-c)); a second one of
+  any signal kills anvil by that signal instead, which a shell reports as 130 for SIGINT.
   `inventory`/`config`/`secret`: the editor exited non-zero (aborted), a file write failed, or the secret store failed,
   is locked or its passphrase prompt was cancelled.
 - **2**: a bad flag or argument (including an `--inventory` or `--config` path not ending in `.toml`), an unknown
@@ -1897,6 +1917,8 @@ that exits non-zero aborts the command: nothing is written, exit 1.
   `--inventory` path not ending in `.toml`) is shown in the header, the status bar and the `t` overlay instead. 1 when
   the terminal cannot be set up (`cannot handle SIGINT: …`, `cannot enter the terminal: …`) or fails while the TUI runs
   (`terminal: …`).
+- **129**, **143**: `apply`/`plan`/`run`/`rollback`/`doctor`: a first SIGHUP or SIGTERM ended the run, cancelling at
+  least one target or doctor plugin ([Ctrl-C](#ctrl-c)). One that arrives after every target ended changes nothing.
 
 ## SSH behaviour
 

@@ -962,7 +962,9 @@ fn plan_block(report: &PlanReport) -> Vec<Line<'static>> {
         PlanReport::Failed { error, .. } => {
             Line::from(format!("  ✘ {}", text(error))).style(Color::Red)
         }
-        PlanReport::Cancelled { .. } => Line::from("  ⊘ cancelled").style(Color::Red),
+        PlanReport::Cancelled { abort, .. } => {
+            Line::from(format!("  ⊘ {}", abort.text())).style(Color::Red)
+        }
     };
     lines.extend([end, Line::default()]);
     lines
@@ -2715,6 +2717,7 @@ mod tests {
                     PlanReport::Cancelled {
                         target: "mac".to_owned(),
                         ok: false,
+                        abort: apply::AbortReason::Cancelled,
                     },
                 ]),
                 ok: Some(false),
@@ -3345,7 +3348,7 @@ mod tests {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", Some("down"))],
             ok: false,
-            cancelled: false,
+            abort: None,
         }));
         let rows = results(&shown, 12);
         assert_eq!(rows[0], "✔ local checks  ✔ pi  [✘ mac]");
@@ -3364,7 +3367,7 @@ mod tests {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", None)],
             ok: true,
-            cancelled: false,
+            abort: None,
         }));
         assert_eq!((older.shown, older.tab), (Some(0), 0));
         let rows = results(&older, 10);

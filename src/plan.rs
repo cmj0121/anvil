@@ -16,7 +16,7 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::apply::{self, Escape, Line, PlannedRun, Style, Unresolved, print_lines};
-use crate::cancel::Cancel;
+use crate::cancel::{AbortReason, Cancel};
 use crate::cli::{Cli, Failure, print_json};
 use crate::config::Config;
 use crate::fanout::{self, Event};
@@ -46,7 +46,14 @@ pub enum PlanReport {
         ok: bool,
     },
     /// The cancel token was set before the target. `ok` is always false.
-    Cancelled { target: String, ok: bool },
+    /// `abort` says why the token was set, in the JSON only when that was not
+    /// the user.
+    Cancelled {
+        target: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "AbortReason::is_cancelled")]
+        abort: AbortReason,
+    },
 }
 
 impl PlanReport {
@@ -78,6 +85,17 @@ pub struct Plan {
 /// What [`plan_targets`] reports as it goes: the targets, a target about to
 /// be planned, and its report once it ends.
 pub type Progress<'a> = Event<'a, PlanReport>;
+
+impl Plan {
+    /// Why the token ended the plan: the first Cancelled target's reason, or
+    /// none when no target was cancelled.
+    pub fn abort(&self) -> Option<AbortReason> {
+        self.targets.iter().find_map(|target| match target {
+            PlanReport::Cancelled { abort, .. } => Some(*abort),
+            _ => None,
+        })
+    }
+}
 
 /// Plans `prepared.config` for each of its targets, as [`plan_targets`].
 pub fn run_targets(prepared: &Prepared, on: &mut dyn FnMut(Progress<'_>)) -> Plan {
@@ -128,7 +146,7 @@ pub fn plan_targets(
                 cancel,
             )
         },
-        cancelled,
+        |target| cancelled(target, cancel),
         |target, message| failed(target, format!("internal error: {message}")),
     );
     let ok = reports.iter().all(PlanReport::ok);
@@ -147,11 +165,14 @@ fn failed(target: &Target, error: String) -> PlanReport {
     }
 }
 
-fn cancelled(target: &Target) -> PlanReport {
+/// `target` skipped by `cancel`, for the reason it was stopped (the user's
+/// when unset: a transport refused).
+fn cancelled(target: &Target, cancel: &Cancel) -> PlanReport {
     log::info!("plan {}: cancelled", target.name);
     PlanReport::Cancelled {
         target: target.name.clone(),
         ok: false,
+        abort: cancel.reason().unwrap_or(AbortReason::Cancelled),
     }
 }
 
@@ -191,7 +212,7 @@ fn plan_target(
                 ok: true,
             }
         }
-        Err(Unresolved::Cancelled) => cancelled(target),
+        Err(Unresolved::Cancelled) => cancelled(target, cancel),
         Err(Unresolved::Failed(error)) => {
             log::info!("plan {}: failed: {error}", target.name);
             failed(target, error)
@@ -228,12 +249,14 @@ pub fn run(cli: &Cli, opts: &Options) -> Result<(), Failure> {
         Err(Failure::failed(format!(
             "plan: {failed} of {} targets failed",
             plan.targets.len()
-        )))
+        ))
+        .ended_by(plan.abort()))
     }
 }
 
 /// One target's block: a `▶ target` header, a `PATH  NAME` line per task and a
-/// `would $ command` line per step, then `✔ N steps`, `✘ reason` or `⊘ cancelled`, then a blank line.
+/// `would $ command` line per step, then `✔ N steps`, `✘ reason` or `⊘ cancelled` (or its abort
+/// reason), then a blank line.
 pub fn render(report: &PlanReport) -> Vec<Line> {
     let mut lines = vec![Line::header(report.target())];
     let end = match report {
@@ -254,8 +277,8 @@ pub fn render(report: &PlanReport) -> Vec<Line> {
         PlanReport::Failed { error, .. } => {
             Line::out(format!("✘ {error}"), Escape::Always, Some(RED))
         }
-        PlanReport::Cancelled { .. } => {
-            Line::out("⊘ cancelled".to_owned(), Escape::Never, Some(YELLOW))
+        PlanReport::Cancelled { abort, .. } => {
+            Line::out(format!("⊘ {}", abort.text()), Escape::Never, Some(YELLOW))
         }
     };
     lines.push(end.last());
@@ -995,7 +1018,8 @@ mod tests {
             plan.targets[2],
             PlanReport::Cancelled {
                 target: "c".to_owned(),
-                ok: false
+                ok: false,
+                abort: AbortReason::Cancelled,
             }
         );
         assert_eq!(built, 2, "no transport after cancel");
@@ -1036,5 +1060,36 @@ mod tests {
             "2 targets, nothing executed\n"
         );
         assert!(render_summary(2, 1, terminal).contains("\x1b[31m1 failed"));
+    }
+
+    #[test]
+    fn a_cancelled_plan_names_a_signal_in_its_json_and_end_line() {
+        for (reason, json, end) in [
+            (AbortReason::Cancelled, None, "⊘ cancelled"),
+            (AbortReason::Terminated, Some("terminated"), "⊘ terminated"),
+            (AbortReason::HungUp, Some("hung_up"), "⊘ hung up"),
+        ] {
+            let cancel = Cancel::new();
+            cancel.stop(reason);
+            let report = cancelled(&target("c"), &cancel);
+            let mut expected = serde_json::json!({"target": "c", "ok": false});
+            if let Some(json) = json {
+                expected["abort"] = json.into();
+            }
+            assert_eq!(serde_json::to_value(&report).unwrap(), expected);
+            assert_eq!(screen(&report), format!("▶ c\n  {end}\n\n"));
+            let plan = Plan {
+                executed: false,
+                targets: vec![report],
+                ok: false,
+            };
+            assert_eq!(plan.abort(), Some(reason));
+        }
+        let plan = Plan {
+            executed: false,
+            targets: Vec::new(),
+            ok: true,
+        };
+        assert_eq!(plan.abort(), None);
     }
 }

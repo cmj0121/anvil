@@ -2249,6 +2249,7 @@ pub mod tests {
             plan::PlanReport::Cancelled {
                 target: "pi".to_owned(),
                 ok: false,
+                abort: apply::AbortReason::Cancelled,
             },
         ));
         app.on_msg(Msg::Finished(Ok(())));
@@ -2292,7 +2293,7 @@ pub mod tests {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", Some("timeout"))],
             ok: false,
-            cancelled: false,
+            abort: None,
         }));
         app.on_msg(Msg::Finished(Ok(())));
         assert!(app.running.is_none());
@@ -3205,7 +3206,7 @@ pub mod tests {
             local: local_report(),
             targets,
             ok: true,
-            cancelled: false,
+            abort: None,
         }));
     }
 
@@ -3307,6 +3308,7 @@ pub mod tests {
                         plan::PlanReport::Cancelled {
                             target: name.to_owned(),
                             ok: false,
+                            abort: apply::AbortReason::Cancelled,
                         },
                     )
                 });
@@ -3368,7 +3370,7 @@ pub mod tests {
                 probed("extra", None),
             ],
             ok: false,
-            cancelled: false,
+            abort: None,
         }));
         assert_eq!(shown.tab, 2, "mac stays on screen; checks is tab 0");
         assert!(matches!(
@@ -3383,7 +3385,7 @@ pub mod tests {
             local: local_report(),
             targets: vec![probed("mac", None)],
             ok: true,
-            cancelled: false,
+            abort: None,
         }));
         assert_eq!(
             gone.tab, 0,
@@ -3409,7 +3411,7 @@ pub mod tests {
             local: local_report(),
             targets: vec![probed("pi", None), probed("mac", None)],
             ok: true,
-            cancelled: false,
+            abort: None,
         }));
         assert_eq!((app.shown, app.tab), (Some(0), 0));
         assert!(matches!(

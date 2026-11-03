@@ -511,7 +511,7 @@ mod tests {
                 _ => None,
             })
             .expect("doctor ends with its report");
-        assert!(report.cancelled && !report.ok);
+        assert!(report.abort == Some(AbortReason::Cancelled) && !report.ok);
         assert_eq!(report.targets[0].error.as_deref(), Some("cancelled"));
     }
 

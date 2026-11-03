@@ -12,6 +12,10 @@
 //! together can reach anvil as one signal (the kernel merges a pending one),
 //! which then counts as the first.
 //!
+//! The first signal is the token's reason unless one was set before it (a
+//! failed save, say). A run that ended by SIGTERM or SIGHUP exits 143 or 129;
+//! by Ctrl-C, 1. A signal that comes after every target ended changes nothing.
+//!
 //! Nothing here flushes the record: any thread may hold its lock, and the
 //! main thread may be blocked on a full pipe. The saves around each write are
 //! its only durability.
@@ -61,9 +65,14 @@ fn word(signal: i32) -> &'static str {
     }
 }
 
-/// The reason the first `signal` stops the run for: every one is the user's.
-fn reason_of(_signal: i32) -> AbortReason {
-    AbortReason::Cancelled
+/// The reason the first `signal` stops the run for: Ctrl-C is the user's,
+/// SIGTERM and SIGHUP their own, which set the exit status.
+fn reason_of(signal: i32) -> AbortReason {
+    match signal {
+        SIGTERM => AbortReason::Terminated,
+        SIGHUP => AbortReason::HungUp,
+        _ => AbortReason::Cancelled,
+    }
 }
 
 /// How long the second signal waits for its line before anvil dies.
@@ -172,6 +181,29 @@ impl Drop for Interrupt {
         self.handle.close();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_signal_stops_the_run_for_its_own_reason() {
+        assert_eq!(reason_of(SIGINT), AbortReason::Cancelled);
+        assert_eq!(reason_of(SIGTERM), AbortReason::Terminated);
+        assert_eq!(reason_of(SIGHUP), AbortReason::HungUp);
+    }
+
+    #[test]
+    fn the_notice_names_the_signal_and_ctrl_c_only_for_sigint() {
+        assert!(notice(SIGINT).starts_with("interrupted: "));
+        assert!(notice(SIGINT).contains("Ctrl-C again"));
+        for (signal, word) in [(SIGTERM, "terminated: "), (SIGHUP, "hung up: ")] {
+            let text = notice(signal);
+            assert!(text.starts_with(word), "{text}");
+            assert!(!text.contains("Ctrl-C"), "{text}");
         }
     }
 }

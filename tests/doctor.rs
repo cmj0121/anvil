@@ -789,3 +789,27 @@ fn doctor_ignores_an_ssh_planted_in_the_current_directory() {
     let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
     assert!(shown.contains("ssh: not found"), "{shown}");
 }
+
+#[test]
+fn a_doctor_ended_by_sigterm_exits_143_and_names_why() {
+    let sandbox = Sandbox::new("ad");
+    sandbox.with_two_fake_hosts();
+    sandbox.write_config("config.toml", "");
+    let out = sandbox.signalled_at_the_gate(&["--json", "doctor"], rustix::process::Signal::TERM);
+    assert_eq!(out.status.code(), Some(143), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("doctor: terminated"),
+        "{}",
+        text(&out.stderr)
+    );
+    let value = json(&out);
+    let beta = value["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["target"] == "beta");
+    assert_eq!(
+        beta.unwrap(),
+        &serde_json::json!({"target": "beta", "connectable": false, "error": "terminated"})
+    );
+}

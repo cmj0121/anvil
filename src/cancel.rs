@@ -10,11 +10,15 @@ use serde::Serialize;
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum AbortReason {
-    /// The user: Ctrl-C, SIGTERM or SIGHUP, or Esc in the TUI.
+    /// The user: Ctrl-C (SIGINT), or Esc or `q` in the TUI.
     Cancelled = 1,
     /// A record save failed, so the run stopped before writing more it could
     /// not record.
     SaveFailed = 2,
+    /// The first signal was SIGTERM.
+    Terminated = 3,
+    /// The first signal was SIGHUP.
+    HungUp = 4,
 }
 
 impl AbortReason {
@@ -27,6 +31,18 @@ impl AbortReason {
         match self {
             AbortReason::Cancelled => "cancelled",
             AbortReason::SaveFailed => "aborted: a record save failed",
+            AbortReason::Terminated => "terminated",
+            AbortReason::HungUp => "hung up",
+        }
+    }
+
+    /// The exit status of a run this ended: 128 plus the signal's number for
+    /// SIGTERM and SIGHUP, else none (the failure's own).
+    pub fn exit_code(self) -> Option<u8> {
+        match self {
+            AbortReason::Cancelled | AbortReason::SaveFailed => None,
+            AbortReason::Terminated => Some(143),
+            AbortReason::HungUp => Some(129),
         }
     }
 }
@@ -59,6 +75,8 @@ impl Cancel {
             0 => None,
             1 => Some(AbortReason::Cancelled),
             2 => Some(AbortReason::SaveFailed),
+            3 => Some(AbortReason::Terminated),
+            4 => Some(AbortReason::HungUp),
             other => unreachable!("cancel reason {other}"),
         }
     }
@@ -85,6 +103,43 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    #[test]
+    fn only_a_signal_has_an_exit_code() {
+        assert_eq!(AbortReason::Cancelled.exit_code(), None);
+        assert_eq!(AbortReason::SaveFailed.exit_code(), None);
+        assert_eq!(AbortReason::Terminated.exit_code(), Some(143));
+        assert_eq!(AbortReason::HungUp.exit_code(), Some(129));
+    }
+
+    #[test]
+    fn every_reason_reads_back_as_stored() {
+        for reason in [
+            AbortReason::Cancelled,
+            AbortReason::SaveFailed,
+            AbortReason::Terminated,
+            AbortReason::HungUp,
+        ] {
+            let cancel = Cancel::new();
+            cancel.stop(reason);
+            assert_eq!(cancel.reason(), Some(reason));
+        }
+    }
+
+    #[test]
+    fn reasons_serialize_in_snake_case() {
+        let json = serde_json::to_string(&[AbortReason::Terminated, AbortReason::HungUp]).unwrap();
+        assert_eq!(json, r#"["terminated","hung_up"]"#);
+    }
+
+    #[test]
+    fn a_save_failure_then_sigterm_keeps_the_save_failure() {
+        let cancel = Cancel::new();
+        cancel.stop(AbortReason::SaveFailed);
+        assert!(!cancel.stop(AbortReason::Terminated));
+        assert_eq!(cancel.reason(), Some(AbortReason::SaveFailed));
+        assert_eq!(cancel.reason().and_then(AbortReason::exit_code), None);
+    }
 
     #[test]
     fn a_new_token_is_unset() {

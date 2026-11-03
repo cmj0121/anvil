@@ -585,6 +585,15 @@ impl Report {
         (ok, self.targets.len() - ok)
     }
 
+    /// Why the token ended the run: the first Cancelled target's reason, or
+    /// none when no target was cancelled.
+    pub fn abort(&self) -> Option<AbortReason> {
+        self.targets.iter().find_map(|target| match target {
+            TargetReport::Cancelled { abort, .. } => Some(*abort),
+            _ => None,
+        })
+    }
+
     /// The failure of `command` when a record save failed.
     pub(crate) fn saved(&self, command: &str) -> Result<(), Failure> {
         match &self.save_error {
@@ -1019,14 +1028,17 @@ pub(crate) fn print_report(
         let summary = render_summary(ok, failed, &report.not_restored, style);
         let _ = status::write_stdout(&summary);
     }
-    report.saved(command)?;
+    report
+        .saved(command)
+        .map_err(|f| f.ended_by(report.abort()))?;
     if failed == 0 {
         Ok(())
     } else {
         Err(Failure::failed(format!(
             "{command}: {failed} of {} targets failed",
             report.targets.len()
-        )))
+        ))
+        .ended_by(report.abort()))
     }
 }
 
@@ -6307,6 +6319,87 @@ mod tests {
                 "{target:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_signal_reason_names_itself_in_the_json_and_the_end_line() {
+        for (reason, json, text) in [
+            (AbortReason::Terminated, "terminated", "terminated"),
+            (AbortReason::HungUp, "hung_up", "hung up"),
+        ] {
+            let cancel = Cancel::new();
+            cancel.stop(reason);
+            let report = cancelled("apply", &target("a"), Vec::new(), &cancel);
+            assert_eq!(
+                serde_json::to_value(&report).unwrap(),
+                serde_json::json!({"target": "a", "steps": [], "ok": false, "abort": json}),
+            );
+            assert_eq!(report.failure().as_deref(), Some(text));
+        }
+    }
+
+    #[test]
+    fn a_report_with_no_cancelled_target_has_no_abort() {
+        let targets = [target("a"), target("b")];
+        let report = for_each_target(
+            "run",
+            &targets,
+            NonZeroU8::MIN,
+            &Cancel::new(),
+            &mut |_| {},
+            |t| failed("run", t, Vec::new(), "down".to_owned()),
+        );
+        assert_eq!(report.abort(), None);
+    }
+
+    /// The exit status `print_report` gives `report`.
+    fn exit_code(report: Report) -> u8 {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["anvil", "--json", "--no-progress", "apply"]).unwrap();
+        print_report(&cli, "apply", |_| Ok(report))
+            .unwrap_err()
+            .code
+    }
+
+    #[test]
+    fn a_run_ended_by_sigterm_or_sighup_exits_by_it_and_ctrl_c_exits_1() {
+        let targets = [target("a"), target("b")];
+        for (reason, code) in [
+            (AbortReason::Terminated, 143),
+            (AbortReason::HungUp, 129),
+            (AbortReason::Cancelled, 1),
+        ] {
+            let cancel = Cancel::new();
+            cancel.stop(reason);
+            let report = for_each_target(
+                "apply",
+                &targets,
+                NonZeroU8::MIN,
+                &cancel,
+                &mut |_| {},
+                |t| panic!("{} ran", t.name),
+            );
+            assert_eq!(report.abort(), Some(reason));
+            assert_eq!(exit_code(report), code, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn a_save_failure_then_sigterm_exits_1() {
+        let cancel = Cancel::new();
+        Saves::default().note("a", Err("denied".to_owned()), &cancel);
+        cancel.stop(AbortReason::Terminated);
+        let mut report = for_each_target(
+            "apply",
+            &[target("a")],
+            NonZeroU8::MIN,
+            &cancel,
+            &mut |_| {},
+            |t| panic!("{} ran", t.name),
+        );
+        report.save_error = Some("cannot write last-apply.json: denied".to_owned());
+        assert_eq!(report.abort(), Some(AbortReason::SaveFailed));
+        assert_eq!(exit_code(report), 1);
     }
 
     #[test]

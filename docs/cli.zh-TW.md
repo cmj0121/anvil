@@ -80,6 +80,7 @@ anvil run --parallel 4 fix.sh
   （`-vv` 時如 `apply linode1: start`），因此區塊被壓住時仍看得出什麼正在執行。
 - **Ctrl-C** 與單一 target 時相同：第一次按下讓執行中的 step 跑完且不再啟動其他 target，第二次立刻停止一切（[Ctrl-C](#ctrl-c)）。
 - **結束碼**不變：任一 target 失敗或被取消時為 1；失敗的 target 絕不會中止其他 target。
+  被 SIGTERM 或 SIGHUP 結束的執行以 143 或 129 結束（[結束碼](#結束碼)）。
 
 限制：
 
@@ -572,6 +573,8 @@ tag 讓所有雜湊都不出現在請求與 doctor 的輸出中：任何雜湊�
 
 **取消與時間。** 第一次 Ctrl-C（或 TUI 中的 Esc）讓正在執行的探測、雜湊執行或 plugin 跑完，
 之後該 target 其餘的 plugin 與之後的每個 target 都以 `cancelled` 結束：`doctor: cancelled`，結束碼 1。
+第一個 SIGTERM 或 SIGHUP 也一樣，但（不相容變更）`error` 為 `terminated` 或 `hung up`，訊息為 `doctor: terminated` 或
+`doctor: hung up`，結束碼為 143 或 129（[Ctrl-C](#ctrl-c)）。
 第二次 Ctrl-C 會殺掉它們，anvil 因 SIGINT 結束。doctor 一次處理一個 target：最壞情況下，每個 target 在 ssh 上
 需要最多 40 秒連線並開啟 master（10 秒的 `ssh -O check`，接著 30 秒的金鑰嘗試，其連線受 `ConnectTimeout=10` 限制），
 接著探測 30 秒、雜湊執行 30 秒，以及每個 doctor plugin 各 30 秒。
@@ -736,7 +739,8 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 
 紀錄無法儲存時，文件多一個最上層的 `save_error` 字串（否則省略），且即使每個 target 的 `ok` 都是 true，最上層的 `ok`
 也是 false；`targets` 仍列出執行過的內容（[儲存錯誤](#apply-紀錄)）。因此而沒有完成的 target 帶有
-`"abort": "save_failed"`。被 Ctrl-C 取消的 target 沒有 `abort`。
+`"abort": "save_failed"`。被第一個 SIGTERM 結束的 target 帶有 `"abort": "terminated"`，被第一個 SIGHUP 結束的帶有
+`"abort": "hung_up"`。被 Ctrl-C 取消的 target 沒有 `abort`。只有第一個原因算數：儲存失敗後的 SIGTERM 仍是 `save_failed`。
 
 #### 執行中的 task
 
@@ -841,9 +845,14 @@ what it names, then run rollback again
   並因 SIGINT 結束（shell 顯示 130），不印摘要也不印 JSON。
   遠端指令稍後會在 host 上終止（[SSH 行為](#ssh-行為)），也可能留下 `[[files]]` 暫存檔（[平行執行](#平行執行)）。
 - **快速連按兩次可能只算一次。** 兩次按得非常接近時，可能只以一個訊號送達 anvil，此時算作第一次；請再按一次。
-- **SIGTERM 與 SIGHUP 視同按下 Ctrl-C。** 第一個訊號印出
+- **SIGTERM 與 SIGHUP 視同按下 Ctrl-C，並決定結束碼。** **不相容變更：** 被第一個 SIGTERM 結束的執行以 143 結束，
+  被第一個 SIGHUP 結束的以 129 結束，以前兩者都是 1（Ctrl-C 仍為 1）。第一個訊號印出
   `terminated: running targets stop after their current step; the same signal again stops now`
-  （SIGHUP 為 `hung up: …`）並取消執行：target 顯示 `⊘ cancelled`，以 1 結束。三者中任何第二個訊號都會終止所有 step，
+  （SIGHUP 為 `hung up: …`）並如 Ctrl-C 般取消執行，但 target 顯示 `✘ terminated` 或 `✘ hung up`
+  （plan 為 `⊘ terminated`、`⊘ hung up`），`--json` 中帶有 `"abort": "terminated"` 或 `"hung_up"`。
+  由第一個訊號決定：在紀錄儲存失敗之後才來的訊號保留原因，以 1 結束。所有 target 都結束後才到的訊號不會取消任何東西，
+  指令照原本的結果以 0 或 1 結束。同屬不相容變更：第一個 SIGTERM 或 SIGHUP 之後，doctor 略過的 target 或 plugin 的
+  `error` 為 `terminated` 或 `hung up`，以前為 `cancelled`。三者中任何第二個訊號都會終止所有 step，
   anvil 因該訊號結束，並記錄 `terminated`、`hung up` 或 `interrupted`。TUI 只處理 SIGINT（[Signals](tui.zh-TW.md)）。
 - **第一個 SIGTERM 可能超過服務管理員的期限。** 它只讓目前的 step 跑完：`[[steps]]` 或 `[[files]]` step 最多 30 秒、
   service step 120 秒、套件 step 為 `[packages].timeout`，預設 300 秒。管理員隨後的 SIGKILL 讓 anvil 沒有機會終止這些 step，
@@ -1054,7 +1063,11 @@ step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`，以及 tas
 }
 ```
 
-每個選定的 target 都解析成功時以 0 結束，任一個無法連線或解析時為 1，用法或設定錯誤為 2。
+被取消而略過的 target 為 `{"target": "pi", "ok": false}`，由第一個 SIGTERM 或 SIGHUP 造成時另帶
+`"abort": "terminated"` 或 `"hung_up"`（[Ctrl-C](#ctrl-c)）。
+
+每個選定的 target 都解析成功時以 0 結束，任一個無法連線或解析時為 1，用法或設定錯誤為 2；
+第一個 SIGTERM 或 SIGHUP 結束 plan 時為 143 或 129。
 
 ### Plugin steps
 
@@ -1749,11 +1762,17 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
 
 ## 結束碼
 
+> **不相容變更：** 被第一個 SIGTERM 或 SIGHUP 結束的 `apply`、`plan`、`run`、`rollback` 與 `doctor`
+> 以 143 或 129 結束，而非 1（[Ctrl-C](#ctrl-c)）。第一個 SIGTERM 或 SIGHUP 之後，doctor 略過的 target 或 plugin
+> 的 `error` 為 `terminated` 或 `hung up`，以前為 `cancelled`。
+
 | 結束碼 | 意義                                           |
 | ------ | ---------------------------------------------- |
 | 0      | 一切正常                                       |
 | 1      | 某個 target 或檢查失敗；無 target 的指令見下方 |
 | 2      | 用法或設定錯誤；完整清單見下方                 |
+| 129    | 第一個 SIGHUP 結束了執行                       |
+| 143    | 第一個 SIGTERM 結束了執行                      |
 
 - **0**：對 `doctor` 而言，`missing` 的 secret 或無法解析的編輯器只是警告。
 - **1**：`doctor`/`apply`：某個 target 或檢查失敗（包括 `locked` 或 `error` 的 secret，以及有 `[packages]` 時無法解析的套件管理器）。
@@ -1763,8 +1782,8 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
   `apply`/`plan`：某個 plugin step 的 plugin 在某個 target 上失敗（[Plugin steps](#plugin-steps)）。
   `run`：某個 target 失敗或無法連線。
   `rollback`：見 [anvil rollback](#anvil-rollback)；`apply` 還有紀錄無法讀取、被鎖住或無法儲存，或找不到狀態目錄時（[apply 紀錄](#apply-紀錄)）。
-  `apply`/`plan`/`run`/`rollback`/`doctor`：第一次 Ctrl-C、SIGTERM 或 SIGHUP 取消了執行（[Ctrl-C](#ctrl-c)）；
-  第二次則讓 anvil 因該訊號結束，SIGINT 時 shell 回報為 130。
+  `apply`/`plan`/`run`/`rollback`/`doctor`：第一次 Ctrl-C 取消了執行（[Ctrl-C](#ctrl-c)）；
+  任何訊號的第二次則讓 anvil 因該訊號結束，SIGINT 時 shell 回報為 130。
   `inventory`/`config`/`secret`：編輯器以非零結束（中止）、檔案寫入失敗，或 secret store 失敗、被鎖住或其密語提示被取消。
 - **2**：錯誤的旗標或引數（包括不以 `.toml` 結尾的 `--inventory` 或 `--config` 路徑）、未知的 `--target`、
   無效、無法讀取或模稜兩可的檔案、沒有 `$HOME`（`apply` 與 `rollback` 的狀態目錄除外，為 1：[apply 紀錄](#apply-紀錄)）、找不到編輯器、三次嘗試後仍無效的緩衝區，或大於 1 MiB 的 secret。
@@ -1786,6 +1805,8 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
   stdin 或 stdout 不是終端機、使用 `--json`，或未知的 `--target`（只在 inventory 載入成功時檢查）時為 2；
   無法載入的 inventory（任何載入錯誤，包括不以 `.toml` 結尾的 `--inventory` 路徑）改為顯示在標頭、狀態列與 `t` overlay 中。
   終端機無法設定（`cannot handle SIGINT: …`、`cannot enter the terminal: …`）或 TUI 執行中失敗（`terminal: …`）時為 1。
+- **129**、**143**：`apply`/`plan`/`run`/`rollback`/`doctor`：第一個 SIGHUP 或 SIGTERM 結束了執行，
+  取消了至少一個 target 或 doctor plugin（[Ctrl-C](#ctrl-c)）。所有 target 都結束後才到的訊號不改變任何事。
 
 ## SSH 行為
 

@@ -271,6 +271,43 @@ impl Sandbox {
         }
     }
 
+    /// Runs anvil with `args` over [`Sandbox::with_two_fake_hosts`]'s
+    /// `alpha` then `beta`, one at a time, whose key master attempts wait on a
+    /// gate. Once `alpha`'s waits, sends `signal`, waits for the line it
+    /// prints, then opens the gate; returns anvil's output.
+    pub fn signalled_at_the_gate(&self, args: &[&str], signal: rustix::process::Signal) -> Output {
+        self.close_masters();
+        let gate = self.root.join("gate");
+        let _ = fs::remove_file(&gate);
+        let wait = self.root.join("gate.wait");
+        let _ = fs::remove_file(&wait);
+        let stderr = self.root.join("signalled.stderr");
+        let mut command = self.command(env!("CARGO_BIN_EXE_anvil"));
+        command
+            .args(["--secret-store", "memory", "--ssh-program"])
+            .arg(fixture("fake-ssh.sh"))
+            .args(["--parallel", "1"])
+            .args(args)
+            .env("FAKE_SSH_GATE", &gate)
+            .stdout(std::process::Stdio::piped())
+            .stderr(fs::File::create(&stderr).unwrap());
+        let child = command.spawn().expect("spawn anvil");
+        until(|| wait.exists(), "alpha's master attempt");
+        let pid = rustix::process::Pid::from_child(&child);
+        rustix::process::kill_process(pid, signal).unwrap();
+        until(
+            || {
+                fs::read_to_string(&stderr)
+                    .is_ok_and(|text| text.contains(": running targets stop after"))
+            },
+            "the signal's notice",
+        );
+        fs::write(&gate, "").unwrap();
+        let mut out = child.wait_with_output().unwrap();
+        out.stderr = fs::read(&stderr).unwrap();
+        out
+    }
+
     /// One inventory host, `fake`, reached through `fake-ssh.sh`.
     pub fn with_fake_host(&self) {
         self.write_config("inventory.toml", "[hosts.fake]\nhost = \"fakehost\"\n");
