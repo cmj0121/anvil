@@ -173,6 +173,47 @@ fn a_private_previous_cannot_be_restored_and_rollback_says_so_with_exit_zero() {
 }
 
 #[test]
+fn a_failed_save_still_reports_the_targets_and_what_is_not_restored() {
+    let sandbox = Sandbox::new("rb");
+    let (web, local) = applied(&sandbox);
+    // `fake`'s previous is private, so its text is not kept.
+    std::fs::write(&web, PREVIOUS).unwrap();
+    std::fs::set_permissions(&web, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let dir = sandbox.state_home().join("anvil");
+    common::chmod(&dir, 0o500);
+    let out = sandbox.anvil(&["--json", "rollback"], &[]);
+    common::chmod(&dir, 0o700);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(value["ok"], false, "{value}");
+    let error = value["save_error"].as_str().unwrap();
+    assert!(
+        error.starts_with("cannot write last-apply.json: "),
+        "{value}"
+    );
+    assert!(error.ends_with("; not recorded: local"), "{value}");
+    assert!(
+        text(&out.stderr).contains(&format!("rollback: {error}")),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(value["targets"][0]["target"], "local", "{value}");
+    assert_eq!(value["targets"][0]["ok"], true, "{value}");
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), PREVIOUS);
+    assert_eq!(
+        value["targets"][1],
+        serde_json::json!({"target": "fake", "steps": [], "ok": false, "abort": "save_failed"}),
+        "fake never started"
+    );
+    assert_eq!(
+        value["not_restored"],
+        serde_json::json!([{"target": "fake", "dest": web, "reason": "not world-readable"}])
+    );
+}
+
+#[test]
 fn a_v1_record_holding_the_text_of_a_private_previous_still_restores_it_and_its_mode() {
     for (mode_text, mode_bits) in [("0600", 0o600), ("0640", 0o640)] {
         let sandbox = Sandbox::new("rb");

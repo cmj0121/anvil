@@ -1738,6 +1738,7 @@ pub mod tests {
 
     pub fn cancelled(target: &str) -> apply::TargetReport {
         apply::TargetReport::Cancelled {
+            abort: apply::AbortReason::Cancelled,
             warnings: Vec::new(),
             target: target.to_owned(),
             steps: Vec::new(),

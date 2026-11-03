@@ -934,8 +934,8 @@ fn apply_lines(report: &TargetReport) -> (Vec<Line<'static>>, Vec<usize>) {
     }
     starts.push(lines.len());
     lines.extend(report.ended_title().map(task_line));
-    let end = if let TargetReport::Cancelled { .. } = report {
-        Line::from("  ⊘ cancelled").style(Color::Red)
+    let end = if let TargetReport::Cancelled { abort, .. } = report {
+        Line::from(format!("  ⊘ {}", abort.text())).style(Color::Red)
     } else {
         match report.failure() {
             Some(reason) => Line::from(format!("  ✘ {}", text(&reason))).style(Color::Red),
@@ -1492,6 +1492,26 @@ mod tests {
     }
 
     #[test]
+    fn a_target_stopped_by_a_failed_save_says_so() {
+        let report = TargetReport::Cancelled {
+            abort: apply::AbortReason::SaveFailed,
+            warnings: Vec::new(),
+            target: "pi".to_owned(),
+            steps: Vec::new(),
+            ok: false,
+            task: None,
+            name: None,
+        };
+        let block = apply_block(&report);
+        let end = block.iter().map(ToString::to_string);
+        assert!(
+            end.clone()
+                .any(|line| line == "  ⊘ aborted: a record save failed")
+        );
+        assert!(!end.clone().any(|line| line.contains("cancelled")));
+    }
+
+    #[test]
     fn step_marks_follow_the_report_of_the_shown_tab() {
         let ok = step("true", Some(0), "", "");
         let failed = Some(&ran("pi", vec![ok.clone(), step("false", Some(1), "", "")]));
@@ -1500,6 +1520,7 @@ mod tests {
         let mut killed = ran("pi", vec![step("sleep 9", None, "", "")]);
         assert_eq!(marks(Some(&killed), 2), "✘⊘", "no code is a failure");
         killed = TargetReport::Cancelled {
+            abort: apply::AbortReason::Cancelled,
             warnings: Vec::new(),
             target: "pi".to_owned(),
             steps: vec![ok.clone()],

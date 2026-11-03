@@ -131,8 +131,7 @@ fn run_apply(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
     let (config, expanded) = opts.load_expanded()?;
     let _ = tx.send(Msg::Steps(app::step_rows(&expanded)));
     let report = apply::run_targets(opts, &config, &expanded, &mut send_progress(tx))?;
-    send_warnings(tx, report.warnings);
-    Ok(())
+    report_done(tx, "apply", report)
 }
 
 /// As `anvil rollback` with no force and no host change allowed, the
@@ -149,14 +148,16 @@ fn run_rollback(opts: &Options, tx: &Sender<Msg>) -> Result<(), Failure> {
         Wording::Tui,
         &mut send_progress(tx),
     )?;
-    send_warnings(tx, report.warnings);
-    Ok(())
+    report_done(tx, "rollback", report)
 }
 
-fn send_warnings(tx: &Sender<Msg>, warnings: Vec<String>) {
-    if !warnings.is_empty() {
-        let _ = tx.send(Msg::Warnings(warnings));
+/// Sends `report`'s warnings; `command` fails when a record save did.
+fn report_done(tx: &Sender<Msg>, command: &str, report: apply::Report) -> Result<(), Failure> {
+    let saved = report.saved(command);
+    if !report.warnings.is_empty() {
+        let _ = tx.send(Msg::Warnings(report.warnings));
     }
+    saved
 }
 
 /// Sends each of apply's (or run's) progress events to the main loop.
@@ -229,6 +230,27 @@ mod tests {
                 return msgs;
             }
         }
+    }
+
+    #[test]
+    fn a_failed_save_sends_the_warnings_and_finishes_with_its_error() {
+        let (tx, rx) = mpsc::channel();
+        let worker = spawn_job(tx, |tx| {
+            let report = apply::Report {
+                targets: Vec::new(),
+                ok: false,
+                warnings: vec!["careful".to_owned()],
+                not_restored: Vec::new(),
+                save_error: Some("cannot write last-apply.json: denied".to_owned()),
+            };
+            report_done(tx, "rollback", report)
+        });
+        let msgs = collect(worker, &rx);
+        assert!(matches!(&msgs[0], Msg::Warnings(lines) if lines == &["careful"]));
+        assert!(matches!(
+            &msgs[1],
+            Msg::Finished(Err(err)) if err == "rollback: cannot write last-apply.json: denied"
+        ));
     }
 
     /// Options for an inventory with no hosts and a config whose steps are

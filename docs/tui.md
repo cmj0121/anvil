@@ -198,7 +198,8 @@ again. Copying files in or out, moving and creating folders stay with [`anvil fi
   the status bar; for an update, which Esc cannot cancel, it is `busy: <run> is running`. A run keeps the selection and
   paths it started with.
 - **Esc cancels between steps.** apply checks before each target and each step: the running step finishes, and the rest
-  of that target and every later target end as `⊘ cancelled`. A rollback (`b`) cancels as apply does. A run (`x`)
+  of that target and every later target end as `⊘ cancelled`. A failed record save stops them the same way, ending them
+  as `⊘ aborted: a record save failed`, and the run ends with its error. A rollback (`b`) cancels as apply does. A run (`x`)
   cancels the same way: its script is its one step, so the running script finishes first and every later target ends
   as `⊘ cancelled`. plan checks before each
   target: the running probe finishes and every later target ends as `⊘ cancelled`. With `--parallel`, every running

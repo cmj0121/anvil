@@ -1000,6 +1000,83 @@ fn a_private_previous_with_rollback_false_says_so_and_does_not_warn() {
     );
 }
 
+/// A sandbox whose record can be locked but not written: `local` runs, its
+/// save fails, and `fake` should never start. `local`'s dest is private, so
+/// its merge warns. Returns the warning and the two dests.
+fn with_an_unwritable_state_dir(sandbox: &Sandbox) -> (String, String, String) {
+    let (web, local) = with_files(sandbox);
+    std::fs::write(&local, PREVIOUS).unwrap();
+    common::chmod(Path::new(&local), 0o600);
+    let dir = sandbox.state_home().join("anvil");
+    std::fs::create_dir_all(&dir).unwrap();
+    common::chmod(&dir, 0o700);
+    std::fs::write(dir.join("last-apply.json.lock"), "").unwrap();
+    common::chmod(&dir.join("last-apply.json.lock"), 0o600);
+    common::chmod(&dir, 0o500);
+    let warning = format!(
+        "apply: {local} on local was not world-readable: its previous text is not kept, \
+         so rollback cannot restore it"
+    );
+    (warning, web, local)
+}
+
+#[test]
+fn json_with_an_unwritable_state_dir_still_reports_what_changed() {
+    let sandbox = Sandbox::new("aa");
+    let (warning, web, local) = with_an_unwritable_state_dir(&sandbox);
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    common::chmod(&sandbox.state_home().join("anvil"), 0o700);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(value["ok"], false, "{value}");
+    assert_eq!(value["warnings"], serde_json::json!([warning]), "{value}");
+    let error = value["save_error"].as_str().unwrap();
+    assert!(
+        error.starts_with("cannot write last-apply.json: "),
+        "{value}"
+    );
+    assert!(error.ends_with("; not recorded: local"), "{value}");
+    assert!(
+        text(&out.stderr).contains(&format!("apply: {error}")),
+        "{}",
+        text(&out.stderr)
+    );
+
+    let local_report = &value["targets"][0];
+    assert_eq!(local_report["target"], "local", "{value}");
+    assert_eq!(local_report["ok"], true, "{value}");
+    assert!(!local_report["steps"].as_array().unwrap().is_empty());
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), FILE_TEXT);
+
+    assert_eq!(
+        value["targets"][1],
+        serde_json::json!({"target": "fake", "steps": [], "ok": false, "abort": "save_failed"}),
+        "fake never started"
+    );
+    assert!(!Path::new(&web).exists(), "no write once a save failed");
+}
+
+#[test]
+fn human_output_with_an_unwritable_state_dir_shows_the_summary_and_the_error() {
+    let sandbox = Sandbox::new("aa");
+    with_an_unwritable_state_dir(&sandbox);
+    let out = sandbox.anvil(&["apply"], &[]);
+    common::chmod(&sandbox.state_home().join("anvil"), 0o700);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("✘ aborted: a record save failed"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("cancelled"), "{stdout}");
+    assert!(stdout.ends_with("1 ok, 1 failed\n"), "{stdout}");
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("apply: cannot write last-apply.json: "),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn a_failed_step_still_records_the_files_written_before_it() {
     let sandbox = Sandbox::new("aa");

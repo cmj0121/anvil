@@ -157,7 +157,7 @@ pub fn run_targets(
     let cancel = &opts.cancel;
     let entries: Vec<Option<TargetRecord>> =
         entries.into_iter().map(Option::<&_>::cloned).collect();
-    let reports = roll_back_each(
+    let (reports, save_error) = roll_back_each(
         &targets,
         &entries,
         opts.parallel,
@@ -181,9 +181,8 @@ pub fn run_targets(
                 cancel,
             )
         },
-    )
-    .map_err(|err| Failure::failed(format!("rollback: {err}")))?;
-    let ok = reports.iter().all(TargetReport::ok);
+    );
+    let ok = save_error.is_none() && reports.iter().all(TargetReport::ok);
     let not_restored = targets
         .iter()
         .zip(&entries)
@@ -203,16 +202,18 @@ pub fn run_targets(
         ok,
         warnings: Vec::new(),
         not_restored,
+        save_error,
     })
 }
 
 /// Runs `roll` on each of `targets` with its entry of `entries` (a target
 /// without one is `nothing recorded`), `parallel` at a time, and saves each
 /// target's `rolled_back` into `session` as it ends. Once a save fails,
-/// `cancel` is set, so no further target starts, but every target that ends
+/// `cancel` is set, so no further target starts and those left end as
+/// [`apply::AbortReason::SaveFailed`], but every target that ends
 /// is still marked and saved: a later save that succeeds records the earlier
-/// ones too. The error is then the first save's, followed by every target
-/// the record still lacks ([`apply::Saves`]).
+/// ones too. The reports come back with the first save's error, followed by
+/// every target the record still lacks ([`apply::Saves`]), if one failed.
 fn roll_back_each(
     targets: &[Target],
     entries: &[Option<TargetRecord>],
@@ -221,7 +222,8 @@ fn roll_back_each(
     session: &mut Session,
     on: &mut dyn FnMut(Progress<'_>),
     roll: impl Fn(&Target, &TargetRecord) -> RolledTarget + Sync,
-) -> Result<Vec<TargetReport>, String> {
+) -> (Vec<TargetReport>, Option<String>) {
+    let abort = apply::Abort::new(cancel);
     let mut saves = apply::Saves::default();
     let results = fanout::fan_out(
         targets,
@@ -234,7 +236,7 @@ fn roll_back_each(
                 if let Some(rolled_back) = &rolled.rolled_back {
                     let name = &targets[index].name;
                     session.mark_rolled_back(name, rolled_back.clone());
-                    saves.note(name, session.save().map(drop), cancel);
+                    saves.note(name, session.save().map(drop), &abort);
                 }
                 on(Event::Done(index, &rolled.report));
             }
@@ -242,19 +244,23 @@ fn roll_back_each(
         },
         |target| {
             let index = targets.iter().position(|t| t.name == target.name);
-            match index.and_then(|i| entries[i].as_ref()) {
+            let rolled = match index.and_then(|i| entries[i].as_ref()) {
                 Some(entry) => roll(target, entry),
                 None => RolledTarget::report(nothing_recorded(target)),
+            };
+            RolledTarget {
+                report: abort.mark(rolled.report),
+                ..rolled
             }
         },
-        |target| RolledTarget::report(apply::cancelled("rollback", target, Vec::new())),
+        |target| RolledTarget::report(abort.mark(apply::cancelled("rollback", target, Vec::new()))),
         |target, message| {
             let error = format!("internal error: {message}");
             RolledTarget::report(apply::failed("rollback", target, Vec::new(), error))
         },
     );
-    saves.result()?;
-    Ok(results.into_iter().map(|r| r.report).collect())
+    let reports = results.into_iter().map(|r| r.report).collect();
+    (reports, saves.error())
 }
 
 /// One target's report, and the dests it put back, if any.
@@ -765,7 +771,7 @@ mod tests {
             let a_handled = Arc::new(AtomicBool::new(false));
             let b_started = AtomicBool::new(false);
             let b_saw_cancel = AtomicBool::new(false);
-            let result = roll_back_each(
+            let (_, error) = roll_back_each(
                 &[target("a"), target("b")],
                 &[Some(entry()), Some(entry())],
                 NonZeroU8::new(2).unwrap(),
@@ -817,7 +823,7 @@ mod tests {
                 b_saw_cancel.load(Ordering::Relaxed),
                 "the failed save set cancel, so no further target starts"
             );
-            let err = result.unwrap_err();
+            let err = error.unwrap();
             assert!(err.starts_with("cannot write last-apply.json: "), "{err}");
             let record = record::load(&path).unwrap().unwrap();
             match writable_again {
@@ -838,6 +844,71 @@ mod tests {
             drop(session);
             std::fs::remove_dir_all(&root).unwrap();
         }
+    }
+
+    #[test]
+    fn a_save_that_fails_keeps_the_reports_and_aborts_the_targets_left() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let target = |name: &str| Target {
+            name: name.to_owned(),
+            kind: crate::inventory::TargetKind::Local,
+            pkg: None,
+            sudo_secret: None,
+            tags: Vec::new(),
+        };
+        let root = crate::test_util::temp_dir("rollback-record-abort");
+        let dir = root.join("state/anvil");
+        crate::private::ensure_dir(&dir).unwrap();
+        let mut session = Session::open(&dir.join("last-apply.json")).unwrap();
+        session.merge("a", entry());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let cancel = AtomicBool::new(false);
+        let a_handled = AtomicBool::new(false);
+        let (reports, error) = roll_back_each(
+            &[target("a"), target("b")],
+            &[Some(entry()), Some(entry())],
+            NonZeroU8::new(1).unwrap(),
+            &cancel,
+            &mut session,
+            &mut |event| {
+                if let Event::Done(0, _) = event {
+                    a_handled.store(true, Ordering::Relaxed);
+                }
+            },
+            |target, _| {
+                if target.name == "a" {
+                    return RolledTarget {
+                        report: nothing_recorded(target),
+                        rolled_back: Some(RolledBack {
+                            at: 2,
+                            dests: vec!["/etc/a".to_owned()],
+                        }),
+                    };
+                }
+                // b finds the flag set, as `roll_back` does once a's save failed.
+                while !a_handled.load(Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
+                RolledTarget::report(apply::cancelled("rollback", target, Vec::new()))
+            },
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(error.unwrap().ends_with("; not recorded: a"));
+        assert!(reports[0].ok(), "{:?}", reports[0]);
+        assert!(
+            matches!(
+                reports[1],
+                TargetReport::Cancelled {
+                    abort: apply::AbortReason::SaveFailed,
+                    ..
+                }
+            ),
+            "{:?}",
+            reports[1]
+        );
+        drop(session);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

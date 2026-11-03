@@ -730,6 +730,10 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 也就是放不下或不保存的先前文字（[apply 紀錄](#apply-紀錄)）。它們同時印在 stderr，只指名 dest 與 target，絕不含文字，
 也不改變 `ok` 或結束碼。rollback 的形狀相同，另外多了 `not_restored`（[`anvil rollback`](#anvil-rollback)）。
 
+紀錄無法儲存時，文件多一個最上層的 `save_error` 字串（否則省略），且即使每個 target 的 `ok` 都是 true，最上層的 `ok`
+也是 false；`targets` 仍列出執行過的內容（[儲存錯誤](#apply-紀錄)）。因此而沒有完成的 target 帶有
+`"abort": "save_failed"`。被 Ctrl-C 取消的 target 沒有 `abort`。
+
 #### 執行中的 task
 
 [`[[tasks]]`](configuration.zh-TW.md#tasks) config 依所寫的順序執行，而非上述的固定順序：
@@ -939,9 +943,11 @@ anvil 把它寫成一行。`previous` 對先前不存在的 dest 為 `{"state": 
 `apply: PATH is in use by another anvil`（PATH 是紀錄的路徑；rollback 為 `rollback: …`）。不支援 `flock` 的檔案系統
 （NFS 可能如此）會以 `apply: PATH: the filesystem does not support locking (NFS?); set $XDG_STATE_HOME to a local disk` 失敗。
 
-**儲存錯誤。** 儲存失敗會讓 apply 不再啟動其他 target；已經在執行的每個 target 仍會結束，並且也會嘗試儲存它。
-接著指令在各區塊印出後以 1 結束失敗，訊息為第一個錯誤加上紀錄仍缺少的 target：
-`apply: cannot write last-apply.json: REASON; not recorded: web1, web2`。無法讀取的紀錄會讓 apply 在任何 target 之前以
+**儲存錯誤。** 儲存失敗會讓 apply 不再啟動其他 target，剩下的每個 target 以 `✘ aborted: a record save failed` 結束，
+而不是 `cancelled`；已經在執行的每個 target 跑完目前的 step 後停止，並且也會嘗試儲存它。各區塊、警告與摘要仍會印出，
+`--json` 文件也會帶著 `save_error` 印出，因此報告會說明哪些 target 有變更。接著指令以 1 結束失敗，訊息為第一個錯誤加上
+紀錄仍缺少的 target：`apply: cannot write last-apply.json: REASON; not recorded: web1, web2`。
+無法取得鎖的紀錄目錄會在任何 target 之前失敗，沒有報告，因為什麼都還沒變更。無法讀取的紀錄會讓 apply 在任何 target 之前以
 `apply: PATH: REASON` 失敗：`a symlink, refused`、`not a regular file`、`mode 640 lets others in; run chmod 600 on it`、
 `not owned by the current user; run chown on it, or do not run anvil through sudo`、
 `larger than the 16777216 byte limit`、`version N is not supported` 或 `cannot parse`。訊息絕不引用它的內容。
@@ -1454,6 +1460,7 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 - **Target。** 紀錄中沒有項目的選定 target 顯示 `nothing recorded`，並算作成功。已不在 inventory 中的 target 的項目不會被 rollback。
 - **鎖。** rollback 在整個執行期間持有紀錄的鎖，與 apply 相同（[apply 紀錄](#apply-紀錄)）；儲存失敗為
   `rollback: cannot write last-apply.json: REASON`，並以 `; not recorded: …` 列出 `rolled_back` 沒有儲存的 target。
+  與 apply 相同，報告仍會印出並帶有 `save_error`，剩下的 target 以 `aborted: a record save failed` 結束。
 
 `--dry-run` 不取得鎖就讀取紀錄，也不連線到任何地方。它為每個 target 印出 `would restore DEST`、`would remove DEST`、
 `cannot undo: …` 與 `nothing recorded`，最後印出 `N targets, nothing executed`。它做與 rollback 相同的 `[[files]]` 檢查，

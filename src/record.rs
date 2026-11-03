@@ -541,15 +541,17 @@ impl Session {
                 }
             }
         }
-        let mut dropped = Vec::new();
+        let mut newly = Vec::new();
+        let mut warnings = Vec::new();
         for name in self.merged.iter().rev() {
             for (dest, warning) in shed(&mut copy, name, self.limit) {
-                self.dropped.insert((name.clone(), dest));
-                dropped.push(warning);
+                newly.push((name.clone(), dest));
+                warnings.push(warning);
             }
         }
         self.write(&copy)?;
-        Ok(dropped)
+        self.dropped.extend(newly);
+        Ok(warnings)
     }
 
     /// The last save, after every target: the budget left by the entries of
@@ -1524,6 +1526,28 @@ mod tests {
         assert_eq!(
             session.merge("web1", rerun),
             [dropped("/etc/same"), dropped("/etc/left")]
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_text_a_failed_save_would_have_dropped_warns_on_the_next_save() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let web1 = target(2, true, texts_of(3, 2000, 'w'));
+        let mut all = Record::default();
+        all.targets.insert("web1".to_owned(), web1.clone());
+        let (mut session, root) = session_with("record-failed-shed", Vec::new());
+        session.limit = encoded_len(&all) - 1000;
+        session.merge("web1", web1);
+        let dir = session.path.parent().unwrap().to_path_buf();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(session.save().is_err());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            session.save().unwrap(),
+            ["apply: last-apply.json is full; /etc/w0 on web1 cannot be rolled back"],
+            "the failed save wrote nothing, so this one is the first to drop it"
         );
         fs::remove_dir_all(&root).unwrap();
     }

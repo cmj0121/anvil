@@ -191,6 +191,7 @@ curl、tar 與新執行檔的 `--version` 執行時輸出都會被擷取，不�
   `busy: <run> is running`。執行會保留它開始時的選擇與路徑。
 - **Esc 在 step 之間取消。** apply 在每個 target 與每個 step（步驟）之前檢查：正在執行的 step 會跑完，
   該 target 剩下的部分以及之後的每個 target 都以 `⊘ cancelled` 結束。
+  紀錄儲存失敗會以相同方式停止它們，並以 `⊘ aborted: a record save failed` 結束，該次執行以它的錯誤收尾。
   rollback（`b`）與 apply 一樣取消。run（`x`）以相同方式取消：它的腳本是唯一的 step，因此正在執行的腳本會先跑完，之後的每個 target 都以 `⊘ cancelled` 結束。
   plan 在每個 target 之前檢查：正在執行的探測會跑完，之後的每個 target 都以 `⊘ cancelled` 結束。
   使用 `--parallel` 時，每個執行中的 target 都這樣跑完它的 step 或探測，且不再啟動其他 target。

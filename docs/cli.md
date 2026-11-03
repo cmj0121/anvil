@@ -761,6 +761,10 @@ record lost on this run, a previous text it had no room for or does not keep ([T
 They are on stderr too, name dests and targets but never a text, and do not change `ok` or the exit code. A rollback
 has the same shape and adds `not_restored` ([`anvil rollback`](#anvil-rollback)).
 
+A record that could not be saved adds a top-level `save_error` string, omitted otherwise, and makes the top-level `ok`
+false even when every target's is true; `targets` still names what ran ([Save errors](#the-apply-record)). A target
+that never finished because of it has `"abort": "save_failed"`. A target cancelled by Ctrl-C has no `abort`.
+
 #### Tasks in a run
 
 A [`[[tasks]]`](configuration.md#tasks) config runs in the order written, not the fixed order above: a `packages`, `file`,
@@ -988,9 +992,13 @@ anvil fails at once, exit 1, with `apply: PATH is in use by another anvil` (PATH
 for a rollback). A filesystem without `flock`, as NFS can be, fails with
 `apply: PATH: the filesystem does not support locking (NFS?); set $XDG_STATE_HOME to a local disk`.
 
-**Save errors.** A save that fails stops the apply from starting further targets; every target already running still
-ends, and its save is tried too. The command then fails, exit 1, after the blocks print, with the first error and the targets
-the record still lacks: `apply: cannot write last-apply.json: REASON; not recorded: web1, web2`. A record that cannot
+**Save errors.** A save that fails stops the apply from starting further targets, and each one left ends as
+`✘ aborted: a record save failed`, not as `cancelled`; every target already running stops after its current step, and
+its save is tried too. The blocks, the warnings and the summary still print, or the `--json` document with
+`save_error`, so the report says which targets changed. The command then fails, exit 1, with the first error and the
+targets the record still lacks: `apply: cannot write last-apply.json: REASON; not recorded: web1, web2`. A record
+directory where the lock cannot be taken fails before any target, with no report, since nothing has changed. A record
+that cannot
 be read fails apply before any target, with `apply: PATH: REASON`: `a symlink, refused`, `not a regular file`,
 `mode 640 lets others in; run chmod 600 on it`,
 `not owned by the current user; run chown on it, or do not run anvil through sudo`,
@@ -1537,7 +1545,8 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   no longer in the inventory is not rolled back.
 - **The lock.** Rollback holds the record's lock for its whole run, as apply does
   ([The apply record](#the-apply-record)); a save that fails is `rollback: cannot write last-apply.json: REASON`, with
-  `; not recorded: …` for the targets whose `rolled_back` was not saved.
+  `; not recorded: …` for the targets whose `rolled_back` was not saved. As for apply, the report still prints, with
+  `save_error`, and the targets left end as `aborted: a record save failed`.
 
 `--dry-run` reads the record without the lock and connects to nothing. It prints `would restore DEST`,
 `would remove DEST`, `cannot undo: …` and `nothing recorded` per target, then `N targets, nothing executed`. It makes
