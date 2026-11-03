@@ -12,8 +12,9 @@
 //! together can reach anvil as one signal (the kernel merges a pending one),
 //! which then counts as the first.
 //!
-//! Nothing here flushes the record: the main thread may hold its lock or be
-//! blocked on a full pipe. The saves around each write are its only durability.
+//! Nothing here flushes the record: any thread may hold its lock, and the
+//! main thread may be blocked on a full pipe. The saves around each write are
+//! its only durability.
 
 use std::io::IsTerminal;
 use std::process::Stdio;

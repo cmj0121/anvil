@@ -29,6 +29,18 @@ pub fn chmod(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// Waits until `done`, failing after 20 s, a fail-safe only.
+pub fn until(mut done: impl FnMut() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !done() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gave up waiting for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 pub fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")

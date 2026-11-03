@@ -18,7 +18,7 @@ use rustix::process::Signal;
 
 use common::{
     AUTH_DENIED, AUTH_DENIED_MESSAGE, CONNECT_REFUSED, CONNECT_REFUSED_MESSAGE, Sandbox, json,
-    keys, text,
+    keys, text, until,
 };
 
 fn local_hostname() -> String {
@@ -689,15 +689,6 @@ fn beating_into(kind: Kind, stderr: Option<Stdio>) -> Running {
         beat,
         second,
         sandbox,
-    }
-}
-
-/// Waits until `done`, failing after 20 s, a fail-safe only.
-fn until(mut done: impl FnMut() -> bool, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !done() {
-        assert!(Instant::now() < deadline, "gave up waiting for {what}");
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

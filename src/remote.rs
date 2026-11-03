@@ -38,10 +38,7 @@ pub(crate) struct Heredoc<'a> {
 impl<'a> Heredoc<'a> {
     /// The delimiter is `ANVIL_EOF_` and 32 hex digits of the text's sha256.
     pub(crate) fn new(text: &'a str) -> Result<Self, String> {
-        let hex: String = Sha256::digest(text.as_bytes())[..16]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let hex = hex(&Sha256::digest(text.as_bytes())[..16]);
         Self::with_delimiter(text, format!("ANVIL_EOF_{hex}"))
     }
 
@@ -235,18 +232,13 @@ pub(crate) fn login_top() -> PathBuf {
     PathBuf::from("/")
 }
 
-/// Whether `tool` is on the PATH that `sudo` (`""`, `"sudo -n "` or
-/// `"sudo "`) runs it with, quietly.
-pub(crate) fn has_tool(sudo: &str, tool: &str) -> String {
-    match sudo {
-        "" => format!("command -v {tool} >/dev/null 2>&1"),
-        _ => format!("{sudo}sh -c 'command -v {tool}' >/dev/null 2>&1"),
-    }
-}
-
-/// Whether `cmp` is on `sudo`'s PATH; without it every run rewrites DEST.
+/// Whether `cmp` is on the PATH that `sudo` (`""`, `"sudo -n "` or
+/// `"sudo "`) runs it with, quietly; without it every run rewrites DEST.
 pub(crate) fn has_cmp(sudo: &str) -> String {
-    has_tool(sudo, "cmp")
+    match sudo {
+        "" => "command -v cmp >/dev/null 2>&1".to_owned(),
+        _ => format!("{sudo}sh -c 'command -v cmp' >/dev/null 2>&1"),
+    }
 }
 
 /// `args` written into a [`Zeroizing`] string sized to fit first, so a
@@ -410,11 +402,6 @@ impl Replacement<'_> {
             has_cmp = has_cmp(sudo),
             compare = self.compare(),
         ))
-    }
-
-    /// After the checks pass: [`sweep`].
-    pub(crate) fn sweep(&self) -> String {
-        sweep(self.sudo, self.dest)
     }
 
     /// The condition that DEST already holds the bytes.

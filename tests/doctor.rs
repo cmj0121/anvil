@@ -13,7 +13,7 @@ use std::io::Write;
 
 use common::{
     AUTH_DENIED, AUTH_DENIED_MESSAGE, CONNECT_REFUSED, CONNECT_REFUSED_MESSAGE, Sandbox, fixture,
-    json, keys, text,
+    json, keys, text, until,
 };
 
 #[test]
@@ -605,18 +605,6 @@ fn gated_doctor(sandbox: &Sandbox) -> (std::process::Child, std::sync::mpsc::Rec
     let beat = sandbox.plugin_dir().join("a.beat");
     until(|| beat.exists(), "plugin a to start");
     (child, lines)
-}
-
-/// Waits until `done`, failing after 20 s, a fail-safe only.
-fn until(mut done: impl FnMut() -> bool, what: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !done() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "gave up waiting for {what}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
 }
 
 fn interrupt(child: &std::process::Child) {

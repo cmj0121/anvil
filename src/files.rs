@@ -500,7 +500,7 @@ fn replace_script(write: &Replacement<'_>, checks: &str, expected: &Expected) ->
          else {replace}fi\n\
          }}\n",
         open = *write.open(),
-        sweep = write.sweep(),
+        sweep = sweep(sudo, dest),
         same = write.same(),
         replace = write.replace(&format!("echo {wrote}")),
     ))
@@ -1257,14 +1257,12 @@ fn restore_runs_from(
     for file in files.iter().rev() {
         let dest = file.dest.as_str();
         let skip = |reason: &str| skip_run(dest, format!("cannot undo: {dest} ({reason})"));
+        if let Some(reason) = file.not_kept() {
+            runs.push(skip(reason));
+            continue;
+        }
         let previous = match &file.previous {
-            Previous::File(previous) => match previous.text.as_deref() {
-                Some(text) if previous.kept => Some((previous, text)),
-                _ => {
-                    runs.push(skip(previous.reason.as_deref().unwrap_or("not kept")));
-                    continue;
-                }
-            },
+            Previous::File(previous) => previous.text.as_deref().map(|text| (previous, text)),
             _ => None,
         };
         if let Some((previous, _)) = previous
@@ -1408,7 +1406,8 @@ struct Restore<'a> {
 }
 
 impl Restore<'_> {
-    /// The checks, the directory refusal and the guard, after `open`.
+    /// After `open`: the sudo-ready line, the checks, the directory refusal,
+    /// the guard and the sweep.
     fn head(&self, open: &str) -> Zeroizing<String> {
         let d = quote(self.dest);
         let ready = match self.sudo {
@@ -3167,10 +3166,7 @@ mod tests {
                 &Expected::Unchecked,
             );
             let case = format!("{sudo:?} run {run}");
-            let mut command = std::process::Command::new("/bin/sh");
-            command.arg("-s").env("PATH", &bin);
-            let out =
-                crate::transport::run_with_script(&mut command, &script, RUN_TIMEOUT).unwrap();
+            let out = sh_only(&bin, &script);
             assert_eq!(String::from_utf8(out.stderr).unwrap(), "", "{case}");
             assert_eq!(out.code, Some(0), "{case}");
             assert_eq!(

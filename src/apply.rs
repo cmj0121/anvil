@@ -665,8 +665,8 @@ pub type Progress<'a> = Event<'a, TargetReport>;
 ///
 /// When apply probes, the record ([`record::path`]) is locked and loaded
 /// before any target, and each target the probe reached is saved into it
-/// around each file write and as it ends. A record that cannot be opened fails the command; one that
-/// cannot be saved is the report's `save_error`.
+/// around each file write and as it ends. A record that cannot be opened
+/// fails the command; one that cannot be saved is the report's `save_error`.
 pub fn run_targets(
     opts: &Options,
     config: &Config,
@@ -939,29 +939,21 @@ impl<'a> Journal<'a> {
     /// failed, which has stopped the run: no write may follow.
     fn snapshot(&self, name: &str, record: TargetRecord) -> bool {
         let mut books = self.lock();
-        let Books { session, shed, .. } = &mut *books;
-        session.merge(name, record);
-        let saved = save(session, shed);
-        let ok = saved.is_ok();
-        books.saves.note(name, saved, self.abort);
-        ok
+        books.session.merge(name, record);
+        books.save(name, self.abort)
     }
 
     /// Merges and saves `reached`, the entry of a target that ended.
     fn ended(&self, name: &str, reached: Reached) {
         let mut books = self.lock();
-        let Books {
-            session,
-            warnings,
-            shed,
-            ..
-        } = &mut *books;
+        let books = &mut *books;
         match reached.wrote {
-            true => warnings.extend(session.merge(name, reached.record)),
-            false => session.refresh(name, reached.record),
+            true => books
+                .warnings
+                .extend(books.session.merge(name, reached.record)),
+            false => books.session.refresh(name, reached.record),
         }
-        let saved = save(session, shed);
-        books.saves.note(name, saved, self.abort);
+        books.save(name, self.abort);
     }
 
     /// The last save: the run's warnings and its `save_error`.
@@ -982,10 +974,15 @@ impl<'a> Journal<'a> {
     }
 }
 
-/// Saves the record, adding what the save warns of to `shed`.
-fn save(session: &mut Session, shed: &mut Vec<String>) -> Result<(), String> {
-    shed.extend(session.save()?);
-    Ok(())
+impl Books {
+    /// Saves the record, noting the outcome for `name` and adding what the
+    /// save warns of to `shed`. False when it failed.
+    fn save(&mut self, name: &str, abort: &Abort<'_>) -> bool {
+        let saved = self.session.save().map(|shed| self.shed.extend(shed));
+        let ok = saved.is_ok();
+        self.saves.note(name, saved, abort);
+        ok
+    }
 }
 
 /// One target's report, and what the record keeps of it.
@@ -1193,10 +1190,7 @@ fn apply_target(
         Err(Unresolved::Failed(error)) => failed("apply", target, Vec::new(), error),
         Err(Unresolved::Cancelled) => cancelled("apply", target, Vec::new()),
     };
-    let reached = facts.as_ref().map(|facts| {
-        let cannot_undo = cannot_undo(report.steps());
-        recorder.finish(facts.clone(), report.ok(), cannot_undo)
-    });
+    let reached = recorder.finish(report.ok(), cannot_undo(report.steps()));
     Applied { report, reached }
 }
 
@@ -1253,24 +1247,24 @@ impl<'a> Recorder<'a> {
     /// Saves what the target did so far, with `intent`, a write about to
     /// start, as though it failed midway; `steps` are the steps that ended.
     /// False when the save failed, which has stopped the run.
-    fn snapshot(&self, intent: Option<FileRecord>, steps: &[StepReport]) -> bool {
+    fn snapshot(&self, intent: Option<&FileRecord>, steps: &[StepReport]) -> bool {
         let (Some(journal), Some(facts)) = (self.journal, self.facts) else {
             return true;
         };
         let mut files = self.files.clone();
         if let Some(intent) = intent {
-            keep(self.expanded, &mut files, intent);
+            keep(self.expanded, &mut files, intent.clone());
         }
         let record = stamped(facts.clone(), false, files, cannot_undo(steps));
         journal.snapshot(self.target, record)
     }
 
-    /// The target's record, stamped now.
-    fn finish(self, facts: Facts, ok: bool, cannot_undo: Vec<String>) -> Reached {
-        Reached {
-            record: stamped(facts, ok, self.files, cannot_undo),
+    /// The target's record, stamped now; `None` when the probe did not run.
+    fn finish(self, ok: bool, cannot_undo: Vec<String>) -> Option<Reached> {
+        Some(Reached {
+            record: stamped(self.facts?.clone(), ok, self.files, cannot_undo),
             wrote: self.wrote,
-        }
+        })
     }
 }
 
@@ -1451,14 +1445,14 @@ fn execute_inner(
             let intent = write.record(
                 recorder.expanded,
                 recorder.sources,
-                found.clone(),
+                found,
                 record::Write::FailedMidway,
                 hash_only,
             );
-            if !recorder.snapshot(Some(intent), &reports) {
+            if !recorder.snapshot(Some(&intent), &reports) {
                 return cancelled(command, target, reports).at(planned);
             }
-            captured = Some(found);
+            captured = Some(intent);
         }
         let mut staged = true;
         let output = match (password, upload) {
@@ -1483,15 +1477,13 @@ fn execute_inner(
                 }
             }
         };
-        if let (Some(recorder), Some(write), Some(found)) =
-            (recorder.as_deref_mut(), write, captured)
-        {
+        if let (Some(recorder), Some(mut file)) = (recorder.as_deref_mut(), captured) {
             // Only a write that may have changed DEST failed midway: a
             // failed stage, a refusal (root checks, hash guard), a password
             // sudo -v rejected, and a run that never reached the target (no
             // master: cancelled, refused, an unknown host key, a denied key,
             // ssh not spawned) all left it as it was.
-            let ended = match &output {
+            file.write = match &output {
                 _ if !staged => record::Write::Refused,
                 Ok(output) if output.code == Some(0) => record::Write::Written,
                 Ok(output) if output.code == Some(files::REFUSED) => record::Write::Refused,
@@ -1509,8 +1501,6 @@ fn execute_inner(
                 // the running ssh (Wait) may have cut it.
                 _ => record::Write::FailedMidway,
             };
-            let hash_only = recorder.is_hash_only(&write.dest);
-            let file = write.record(recorder.expanded, recorder.sources, found, ended, hash_only);
             keep(recorder.expanded, &mut recorder.files, file);
             // A failure has set the cancel flag: the next step does not start.
             recorder.snapshot(None, &reports);

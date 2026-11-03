@@ -697,15 +697,7 @@ fn interleaved_tasks_restore_the_right_files_and_name_what_cannot_be_undone() {
 
 /// Waits until `path` exists, failing after 20 s, a fail-safe only.
 fn wait_for(path: &Path) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !path.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no {}",
-            path.display()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    common::until(|| path.exists(), &path.display().to_string());
 }
 
 #[test]
