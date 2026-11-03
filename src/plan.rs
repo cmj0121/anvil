@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::apply::{self, Escape, Line, Style, print_lines};
+use crate::apply;
 use crate::cancel::{AbortReason, Cancel};
 use crate::cli::Cli;
 use crate::config::Config;
@@ -29,6 +29,7 @@ use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
 use crate::options::Options;
 use crate::plugin::Plugins;
 use crate::prepared::Prepared;
+use crate::report::{self, Escape, Line, Style, print_lines};
 use crate::status;
 use crate::step::PlannedRun;
 use crate::tasks::Expanded;
@@ -272,7 +273,7 @@ pub fn render(report: &PlanReport) -> Vec<Line> {
                 lines.push(Line::out(would_text(step), Escape::Always, Some(DIM)));
             }
             Line::out(
-                format!("✔ {}", apply::steps_text(steps.len())),
+                format!("✔ {}", report::steps_text(steps.len())),
                 Escape::Never,
                 Some(GREEN),
             )
@@ -301,7 +302,7 @@ pub fn would_text(step: &PlannedRun) -> String {
         .plugin()
         .map(|name| format!(" (from plugin {name})"))
         .unwrap_or_default();
-    let text = format!("would $ {}{secret}{from}", apply::command(step.shown()));
+    let text = format!("would $ {}{secret}{from}", report::command(step.shown()));
     match step.task {
         Some(_) => escape_invisible(&text),
         None => text,

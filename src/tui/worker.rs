@@ -17,7 +17,7 @@ use crate::files::{Force, Wording};
 use crate::inventory::Target;
 use crate::options::Options;
 use crate::prepared::Prepared;
-use crate::{apply, doctor, fanout, plan, rollback, run, update};
+use crate::{apply, doctor, fanout, plan, report, rollback, run, update};
 
 /// A run in progress; [`Worker::join`] waits for it, which is quick once
 /// `Finished` or `Panicked` has arrived.
@@ -147,7 +147,7 @@ fn run_rollback(opts: &Options, cancel: Arc<Cancel>, tx: &Sender<Msg>) -> Result
 }
 
 /// Sends `report`'s warnings; `command` fails when a record save did.
-fn report_done(tx: &Sender<Msg>, command: &str, report: apply::Report) -> Result<(), Failure> {
+fn report_done(tx: &Sender<Msg>, command: &str, report: report::Report) -> Result<(), Failure> {
     let saved = report.saved(command);
     if !report.warnings.is_empty() {
         let _ = tx.send(Msg::Warnings(report.warnings));
@@ -156,14 +156,14 @@ fn report_done(tx: &Sender<Msg>, command: &str, report: apply::Report) -> Result
 }
 
 /// Sends each of apply's (or run's) progress events to the main loop.
-fn send_progress(tx: &Sender<Msg>) -> impl FnMut(apply::Progress<'_>) + '_ {
+fn send_progress(tx: &Sender<Msg>) -> impl FnMut(report::Progress<'_>) + '_ {
     |progress| {
         let msg = match progress {
-            apply::Progress::Begin(targets) => Msg::Begin(names(targets)),
-            apply::Progress::Start(target) => Msg::Start(target.name.clone()),
-            apply::Progress::Done(index, report) => Msg::TargetDone(index, report.clone()),
+            report::Progress::Begin(targets) => Msg::Begin(names(targets)),
+            report::Progress::Start(target) => Msg::Start(target.name.clone()),
+            report::Progress::Done(index, report) => Msg::TargetDone(index, report.clone()),
             // The fixed slots place each report by its index.
-            apply::Progress::Ordered(_) => return,
+            report::Progress::Ordered(_) => return,
         };
         let _ = tx.send(msg);
     }
@@ -181,7 +181,7 @@ fn run_script(
     script: String,
     tx: &Sender<Msg>,
 ) -> Result<(), Failure> {
-    let label = apply::command(&script);
+    let label = report::command(&script);
     let _ = tx.send(Msg::Steps(vec![app::StepRow { label }]));
     let timeout = Duration::from_secs(run::DEFAULT_TIMEOUT);
     let prepared = Prepared::run(opts, cancel)?;
@@ -239,7 +239,7 @@ mod tests {
     fn a_failed_save_sends_the_warnings_and_finishes_with_its_error() {
         let (tx, rx) = mpsc::channel();
         let worker = spawn_job(tx, |tx| {
-            let report = apply::Report {
+            let report = report::Report {
                 targets: Vec::new(),
                 ok: false,
                 warnings: vec!["careful".to_owned()],
@@ -369,7 +369,7 @@ mod tests {
         match &msgs[3] {
             Msg::TargetDone(
                 _,
-                apply::TargetReport::Failed {
+                report::TargetReport::Failed {
                     target,
                     steps,
                     error,
@@ -386,7 +386,7 @@ mod tests {
         match &msgs[5] {
             Msg::TargetDone(
                 _,
-                apply::TargetReport::Ran {
+                report::TargetReport::Ran {
                     target, steps, ok, ..
                 },
             ) => {
@@ -443,7 +443,7 @@ mod tests {
         match &msgs[3] {
             Msg::TargetDone(
                 _,
-                apply::TargetReport::Ran {
+                report::TargetReport::Ran {
                     target, steps, ok, ..
                 },
             ) => {
@@ -474,7 +474,7 @@ mod tests {
         match &msgs[3] {
             Msg::TargetDone(
                 _,
-                apply::TargetReport::Ran {
+                report::TargetReport::Ran {
                     target, steps, ok, ..
                 },
             ) => {
@@ -494,7 +494,7 @@ mod tests {
         let worker = spawn(Job::Run("true".to_owned()), opts, cancel, tx);
         assert!(matches!(
             &collect(worker, &rx)[3],
-            Msg::TargetDone(_, apply::TargetReport::Cancelled { .. })
+            Msg::TargetDone(_, report::TargetReport::Cancelled { .. })
         ));
     }
 
@@ -559,7 +559,7 @@ mod tests {
         let msgs = collect(worker, &rx);
         assert!(matches!(
             &msgs[3],
-            Msg::TargetDone(_, apply::TargetReport::Cancelled { steps, .. }) if steps.is_empty()
+            Msg::TargetDone(_, report::TargetReport::Cancelled { steps, .. }) if steps.is_empty()
         ));
     }
 
@@ -588,7 +588,7 @@ mod tests {
         assert!(
             matches!(
                 &msgs[3],
-                Msg::TargetDone(_, apply::TargetReport::Cancelled { target, steps, .. })
+                Msg::TargetDone(_, report::TargetReport::Cancelled { target, steps, .. })
                     if target == "down" && steps.is_empty()
             ),
             "the refused master is cancelled, not a failure"

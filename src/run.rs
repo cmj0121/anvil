@@ -13,7 +13,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::apply::{self, Report, TargetReport};
 use crate::cancel::Cancel;
 use crate::cli::Cli;
 use crate::document::{MAX_BYTES, read_capped_from};
@@ -25,6 +24,7 @@ use crate::logger::escape_controls;
 use crate::options::Options;
 use crate::packages::MAX_TIMEOUT;
 use crate::prepared::Prepared;
+use crate::report::{self, Report, TargetReport};
 use crate::step::{PlannedRun, RunKind};
 use crate::transport::{Transport, TransportError};
 use crate::trust::{self, TrustError};
@@ -39,7 +39,7 @@ pub fn run_targets(
     prepared: &Prepared,
     script: String,
     timeout: Duration,
-    on: &mut dyn FnMut(apply::Progress<'_>),
+    on: &mut dyn FnMut(report::Progress<'_>),
 ) -> Report {
     let runs = [PlannedRun {
         run: wrap(&script).into(),
@@ -87,7 +87,7 @@ fn run_target(
                 None,
             )
         }
-        Err(err) => apply::failed("run", target, Vec::new(), err.to_string()),
+        Err(err) => report::failed("run", target, Vec::new(), err.to_string()),
     }
 }
 
@@ -103,7 +103,7 @@ pub fn run(cli: &Cli, opts: &Options, source: &Path, timeout: u64) -> Result<(),
     let timeout = Duration::from_secs(timeout);
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
-    apply::print_report(cli, "run", |on| {
+    report::print_report(cli, "run", |on| {
         Ok(run_targets(
             &Prepared::run(opts, cancel)?,
             script,

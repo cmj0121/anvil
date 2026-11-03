@@ -33,6 +33,7 @@ mod prepared;
 mod private;
 mod record;
 mod remote;
+mod report;
 mod rollback;
 mod run;
 mod secret;

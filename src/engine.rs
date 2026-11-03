@@ -6,9 +6,7 @@ use std::num::NonZeroU8;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use crate::apply::{
-    Progress, Report, StepReport, TargetReport, cancelled, failed, package_run, step_run,
-};
+use crate::apply::{package_run, step_run};
 use crate::cancel::{AbortReason, Cancel};
 use crate::config::Config;
 use crate::error::Failure;
@@ -19,6 +17,7 @@ use crate::inventory::Target;
 use crate::packages;
 use crate::plugin::Plugins;
 use crate::record::{self, FileRecord, Session, TargetRecord};
+use crate::report::{Progress, Report, StepReport, TargetReport, cancelled, failed};
 use crate::secret::Store;
 use crate::services;
 use crate::status;

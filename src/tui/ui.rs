@@ -20,7 +20,7 @@ use crate::logger::escape_controls;
 use crate::plan::{self, PlanReport};
 use crate::secret;
 use crate::status::SPINNER;
-use crate::{apply, apply::TargetReport};
+use crate::{report, report::TargetReport};
 
 const LEFT_WIDTH: u16 = 28;
 const LOG_ROWS: u16 = 8;
@@ -939,7 +939,7 @@ fn apply_lines(report: &TargetReport) -> (Vec<Line<'static>>, Vec<usize>) {
     } else {
         match report.failure() {
             Some(reason) => Line::from(format!("  ✘ {}", text(&reason))).style(Color::Red),
-            None => Line::from(format!("  ✔ {}", apply::ok_text(steps.len()))).style(Color::Green),
+            None => Line::from(format!("  ✔ {}", report::ok_text(steps.len()))).style(Color::Green),
         }
     };
     lines.extend([end, Line::default()]);
@@ -957,7 +957,7 @@ fn plan_block(report: &PlanReport) -> Vec<Line<'static>> {
                 let command = format!("  {}", text(&plan::would_text(step)));
                 lines.push(Line::from(command).style(Modifier::DIM));
             }
-            Line::from(format!("  ✔ {}", apply::steps_text(steps.len()))).style(Color::Green)
+            Line::from(format!("  ✔ {}", report::steps_text(steps.len()))).style(Color::Green)
         }
         PlanReport::Failed { error, .. } => {
             Line::from(format!("  ✘ {}", text(error))).style(Color::Red)
@@ -1497,7 +1497,7 @@ mod tests {
     #[test]
     fn a_target_stopped_by_a_failed_save_says_so() {
         let report = TargetReport::Cancelled {
-            abort: apply::AbortReason::SaveFailed,
+            abort: report::AbortReason::SaveFailed,
             warnings: Vec::new(),
             target: "pi".to_owned(),
             steps: Vec::new(),
@@ -1523,7 +1523,7 @@ mod tests {
         let mut killed = ran("pi", vec![step("sleep 9", None, "", "")]);
         assert_eq!(marks(Some(&killed), 2), "✘⊘", "no code is a failure");
         killed = TargetReport::Cancelled {
-            abort: apply::AbortReason::Cancelled,
+            abort: report::AbortReason::Cancelled,
             warnings: Vec::new(),
             target: "pi".to_owned(),
             steps: vec![ok.clone()],
@@ -1533,7 +1533,7 @@ mod tests {
         };
         assert_eq!(marks(Some(&killed), 3), "✔⊘⊘");
         assert_eq!(marks(Some(&cancelled("pi")), 2), "⊘⊘");
-        let transport = |steps: Vec<apply::StepReport>| TargetReport::Failed {
+        let transport = |steps: Vec<report::StepReport>| TargetReport::Failed {
             warnings: Vec::new(),
             target: "pi".to_owned(),
             steps,
@@ -1595,7 +1595,7 @@ mod tests {
                 step_row("false"),
             ]
         );
-        let skip = |dest: &str| apply::StepReport {
+        let skip = |dest: &str| report::StepReport {
             skipped: true,
             ..step(&format!("skipped file {dest}: no match"), Some(0), "", "")
         };
@@ -1665,12 +1665,12 @@ mod tests {
         let local = ran(
             "local",
             vec![
-                apply::StepReport {
+                report::StepReport {
                     skipped: true,
                     ..step("skipped file /etc/a.conf: no match", Some(0), "", "")
                 },
                 step("service sshd", Some(0), "started service sshd\n", ""),
-                apply::StepReport {
+                report::StepReport {
                     skipped: true,
                     ..step("skipped service cron: no match", Some(0), "", "")
                 },
@@ -2553,7 +2553,7 @@ mod tests {
         let run = "true \u{202e}x";
         let (apply, _) = apply_lines(&ran(
             "local",
-            vec![apply::StepReport {
+            vec![report::StepReport {
                 task: Some("tasks[0]".to_owned()),
                 ..step(run, Some(0), "", "")
             }],
@@ -2585,12 +2585,12 @@ mod tests {
         let title = "tasks[0]/role\u{202e}.toml:tasks[0]  Inst\u{1b}]0;x\u{7}\n\u{200b}all";
         let shown = "tasks[0]/role\\u{202e}.toml:tasks[0]  Inst\\x1b]0;x\\x07\\n\\u{200b}all";
         let (path, name) = title.split_once("  ").unwrap();
-        let report = apply::StepReport {
+        let report = report::StepReport {
             task: Some(path.to_owned()),
             name: Some(name.to_owned()),
             ..step("true", Some(0), "", "")
         };
-        let label = apply::task_title(Some(path), Some(name)).unwrap();
+        let label = crate::step::task_title(Some(path), Some(name)).unwrap();
         assert_eq!(label, shown);
         let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(vec![step_row(&label)]));
         show(
@@ -2717,7 +2717,7 @@ mod tests {
                     PlanReport::Cancelled {
                         target: "mac".to_owned(),
                         ok: false,
-                        abort: apply::AbortReason::Cancelled,
+                        abort: report::AbortReason::Cancelled,
                     },
                 ]),
                 ok: Some(false),
@@ -2757,7 +2757,7 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: done(vec![crate::apply::TargetReport::Failed {
+                targets: done(vec![crate::report::TargetReport::Failed {
                     warnings: Vec::new(),
                     target: "pi".to_owned(),
                     steps: Vec::new(),
@@ -2791,7 +2791,7 @@ mod tests {
             RunResult::Apply {
                 kind: RunKind::Apply,
                 steps: Vec::new(),
-                targets: done(vec![crate::apply::TargetReport::Failed {
+                targets: done(vec![crate::report::TargetReport::Failed {
                     warnings: Vec::new(),
                     target: "pi".to_owned(),
                     steps: vec![step("sleep 40", None, "start\n", "warn\n")],

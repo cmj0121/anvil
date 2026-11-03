@@ -20,7 +20,7 @@ use crate::options::Options;
 use crate::secret::{self, BackendKind};
 use crate::tasks::{Expanded, ItemKind};
 use crate::update::{Check, Status};
-use crate::{apply, doctor, plan};
+use crate::{doctor, plan, report};
 
 use super::ui;
 
@@ -399,7 +399,7 @@ pub enum RunResult {
         /// differ per target and are not listed.
         kind: RunKind,
         steps: Vec<StepRow>,
-        targets: Vec<Slot<apply::TargetReport>>,
+        targets: Vec<Slot<report::TargetReport>>,
         ok: Option<bool>,
         error: Option<String>,
         /// What the run warns about once it ended, such as a full record.
@@ -427,7 +427,9 @@ impl RunResult {
                 let ok = targets.iter().filter(|t| t.ok()).count();
                 Some((ok, targets.len() - ok))
             }
-            RunResult::Apply { targets, .. } => Some(slot_counts(targets, apply::TargetReport::ok)),
+            RunResult::Apply { targets, .. } => {
+                Some(slot_counts(targets, report::TargetReport::ok))
+            }
             RunResult::Plan { targets, .. } => Some(slot_counts(targets, plan::PlanReport::ok)),
             RunResult::Edit { .. } => None,
         }
@@ -504,7 +506,7 @@ pub enum Msg {
     Start(String),
     DoctorDone(doctor::Report),
     /// Target `index`'s report, in the order the targets end.
-    TargetDone(usize, apply::TargetReport),
+    TargetDone(usize, report::TargetReport),
     PlanDone(usize, plan::PlanReport),
     DoctorTarget(doctor::TargetReport),
     Finished(Result<(), String>),
@@ -576,7 +578,7 @@ pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
                 ItemKind::Service(entry) => format!("service {}", entry.name),
                 ItemKind::Step(step) => match step.kind() {
                     StepKind::Plugin(name) => format!("plugin {name}"),
-                    StepKind::Run(run) => apply::command(run),
+                    StepKind::Run(run) => report::command(run),
                 },
             };
             let Some(path) = &item.path else {
@@ -586,8 +588,8 @@ pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
             StepRow {
                 label: format!(
                     "{}  {}",
-                    apply::shown_text(name.unwrap_or(&label).trim()),
-                    apply::shown_text(path)
+                    crate::step::shown_text(name.unwrap_or(&label).trim()),
+                    crate::step::shown_text(path)
                 ),
             }
         })
@@ -1367,7 +1369,7 @@ impl App {
                 ..
             }) => {
                 not_run(targets);
-                *ok = Some(error.is_none() && all_ok(targets, apply::TargetReport::ok));
+                *ok = Some(error.is_none() && all_ok(targets, report::TargetReport::ok));
                 *slot = error;
             }
             Some(RunResult::Plan {
@@ -1712,8 +1714,8 @@ pub mod tests {
         }
     }
 
-    pub fn step(run: &str, code: Option<i32>, stdout: &str, stderr: &str) -> apply::StepReport {
-        apply::StepReport {
+    pub fn step(run: &str, code: Option<i32>, stdout: &str, stderr: &str) -> report::StepReport {
+        report::StepReport {
             run: run.to_owned(),
             code,
             stdout: stdout.to_owned(),
@@ -1725,9 +1727,9 @@ pub mod tests {
         }
     }
 
-    pub fn ran(target: &str, steps: Vec<apply::StepReport>) -> apply::TargetReport {
+    pub fn ran(target: &str, steps: Vec<report::StepReport>) -> report::TargetReport {
         let ok = steps.iter().all(|s| s.code == Some(0));
-        apply::TargetReport::Ran {
+        report::TargetReport::Ran {
             warnings: Vec::new(),
             target: target.to_owned(),
             steps,
@@ -1735,9 +1737,9 @@ pub mod tests {
         }
     }
 
-    pub fn cancelled(target: &str) -> apply::TargetReport {
-        apply::TargetReport::Cancelled {
-            abort: apply::AbortReason::Cancelled,
+    pub fn cancelled(target: &str) -> report::TargetReport {
+        report::TargetReport::Cancelled {
+            abort: report::AbortReason::Cancelled,
             warnings: Vec::new(),
             target: target.to_owned(),
             steps: Vec::new(),
@@ -2249,7 +2251,7 @@ pub mod tests {
             plan::PlanReport::Cancelled {
                 target: "pi".to_owned(),
                 ok: false,
-                abort: apply::AbortReason::Cancelled,
+                abort: report::AbortReason::Cancelled,
             },
         ));
         app.on_msg(Msg::Finished(Ok(())));
@@ -3308,7 +3310,7 @@ pub mod tests {
                         plan::PlanReport::Cancelled {
                             target: name.to_owned(),
                             ok: false,
-                            abort: apply::AbortReason::Cancelled,
+                            abort: report::AbortReason::Cancelled,
                         },
                     )
                 });

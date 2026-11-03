@@ -24,9 +24,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::apply::{
-    self, Escape, Line, NotRestored, Progress, Report, StepReport, Style, TargetReport, print_lines,
-};
+use crate::apply;
 use crate::cancel::Cancel;
 use crate::cli::Cli;
 use crate::config::Config;
@@ -41,6 +39,9 @@ use crate::logger::{DIM, GREEN, RED, escape_invisible};
 use crate::options::Options;
 use crate::prepared::Prepared;
 use crate::record::{self, Previous, Record, RolledBack, Session, TargetRecord};
+use crate::report::{
+    self, Escape, Line, NotRestored, Progress, Report, StepReport, Style, TargetReport, print_lines,
+};
 use crate::status;
 use crate::step::{Entry, PlannedRun};
 use crate::tasks::{Expanded, Item};
@@ -71,7 +72,7 @@ pub fn run(
     }
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
-    apply::print_report(cli, "rollback", |on| {
+    report::print_report(cli, "rollback", |on| {
         run_targets(
             opts,
             config,
@@ -214,7 +215,7 @@ pub fn run_targets(
 /// without one is `nothing recorded`), `parallel` at a time, and saves each
 /// target's `rolled_back` into `session` as it ends. Once a save fails,
 /// `cancel` is stopped, so no further target starts and those left end as
-/// [`apply::AbortReason::SaveFailed`], but every target that ends
+/// [`report::AbortReason::SaveFailed`], but every target that ends
 /// is still marked and saved: a later save that succeeds records the earlier
 /// ones too. The reports come back with the first save's error, followed by
 /// every target the record still lacks ([`engine::Saves`]), if one failed.
@@ -252,10 +253,10 @@ fn roll_back_each(
                 None => RolledTarget::report(nothing_recorded(target)),
             }
         },
-        |target| RolledTarget::report(apply::cancelled("rollback", target, Vec::new(), cancel)),
+        |target| RolledTarget::report(report::cancelled("rollback", target, Vec::new(), cancel)),
         |target, message| {
             let error = format!("internal error: {message}");
-            RolledTarget::report(apply::failed("rollback", target, Vec::new(), error))
+            RolledTarget::report(report::failed("rollback", target, Vec::new(), error))
         },
     );
     let reports = results.into_iter().map(|r| r.report).collect();
@@ -290,7 +291,7 @@ fn nothing_recorded(target: &Target) -> TargetReport {
     TargetReport::Ran {
         warnings: Vec::new(),
         target: target.name.clone(),
-        steps: vec![apply::StepReport::skipped(NOTHING, Entry::Script)],
+        steps: vec![report::StepReport::skipped(NOTHING, Entry::Script)],
         ok: true,
     }
 }
@@ -315,7 +316,7 @@ fn roll_back(
 ) -> RolledTarget {
     log::info!("rollback {}: start", target.name);
     let failed =
-        |error: String| RolledTarget::report(apply::failed("rollback", target, Vec::new(), error));
+        |error: String| RolledTarget::report(report::failed("rollback", target, Vec::new(), error));
     if let Err(error) = check_files(expanded, target, None, entry) {
         return failed(error);
     }
@@ -324,14 +325,14 @@ fn roll_back(
         Err(err) => return failed(err.to_string()),
     };
     if cancel.is_set() {
-        return RolledTarget::report(apply::cancelled("rollback", target, Vec::new(), cancel));
+        return RolledTarget::report(report::cancelled("rollback", target, Vec::new(), cancel));
     }
     status::phase(&target.name, status::Phase::Probe);
     let facts = match apply::probe(transport.as_ref(), &Expanded::default()) {
         Ok(facts) => facts,
         Err(Unresolved::Failed(error)) => return failed(error),
         Err(Unresolved::Cancelled) => {
-            return RolledTarget::report(apply::cancelled("rollback", target, Vec::new(), cancel));
+            return RolledTarget::report(report::cancelled("rollback", target, Vec::new(), cancel));
         }
     };
     if !host.allow_change
@@ -588,7 +589,7 @@ fn print_dry_run(
                         let run = escape_invisible(&step.run);
                         lines.push(Line::out(run, Escape::Always, Some(DIM)));
                     }
-                    let end = format!("✔ {}", apply::steps_text(steps.len()));
+                    let end = format!("✔ {}", report::steps_text(steps.len()));
                     Line::out(end, Escape::Never, Some(GREEN))
                 }
                 (None, error) => {
@@ -890,7 +891,7 @@ mod tests {
                 while !a_handled.load(Ordering::Relaxed) {
                     std::thread::yield_now();
                 }
-                RolledTarget::report(apply::cancelled("rollback", target, Vec::new(), &cancel))
+                RolledTarget::report(report::cancelled("rollback", target, Vec::new(), &cancel))
             },
         );
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -900,7 +901,7 @@ mod tests {
             matches!(
                 reports[1],
                 TargetReport::Cancelled {
-                    abort: apply::AbortReason::SaveFailed,
+                    abort: report::AbortReason::SaveFailed,
                     ..
                 }
             ),

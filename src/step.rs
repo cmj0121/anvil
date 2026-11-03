@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::apply::task_title;
 use crate::files;
+use crate::logger::{escape_invisible, escape_line};
 use crate::packages;
 use zeroize::Zeroizing;
 
@@ -197,4 +197,21 @@ impl Serialize for PlannedRun {
         }
         .serialize(serializer)
     }
+}
+
+/// A task's line in human output, `PATH  NAME` or `PATH`; `None` without a path.
+/// See [`shown_text`]: neither is trusted.
+pub fn task_title(path: Option<&str>, name: Option<&str>) -> Option<String> {
+    let path = shown_text(path?);
+    Some(match name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("{path}  {}", shown_text(name)),
+        None => path,
+    })
+}
+
+/// Config text on one line, with every control, bidi and invisible character
+/// shown as a visible escape, so it can neither drive the terminal nor pass
+/// for other output.
+pub fn shown_text(text: &str) -> String {
+    escape_invisible(&escape_line(text))
 }
