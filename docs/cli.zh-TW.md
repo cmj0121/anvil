@@ -95,6 +95,8 @@ anvil run --parallel 4 fix.sh
 - **第二次 Ctrl-C 只停止本機上執行的東西。** 它會終止 anvil 的本機行程，包括 ssh 用戶端。
   沒有終端機而啟動的遠端指令，在其 ssh 用戶端死亡後仍會在 host 上繼續執行。
   以這種方式停止的 `[[files]]` step 可能在 target 上留下其 `/tmp/anvil-` 暫存檔（[File steps](#file-steps)）。
+  這樣的寫入在 anvil 死亡後仍可能完成它的 `mv`，甚至在 rollback 回報成功之後，把新位元組放回去：
+  請等遠端 step 結束再 rollback，或再執行一次 rollback。
 
 ## 指令
 
@@ -837,6 +839,14 @@ what it names, then run rollback again
   並因 SIGINT 結束（shell 顯示 130），不印摘要也不印 JSON。
   沒有終端機的遠端指令會在 host 上繼續執行，也可能留下 `[[files]]` 暫存檔（[平行執行](#平行執行)）。
 - **快速連按兩次可能只算一次。** 兩次按得非常接近時，可能只以一個訊號送達 anvil，此時算作第一次；請再按一次。
+- **SIGTERM 與 SIGHUP 視同按下 Ctrl-C。** 第一個訊號印出
+  `terminated: running targets stop after their current step; the same signal again stops now`
+  （SIGHUP 為 `hung up: …`）並取消執行：target 顯示 `⊘ cancelled`，以 1 結束。三者中任何第二個訊號都會終止所有 step，
+  anvil 因該訊號結束，並記錄 `terminated`、`hung up` 或 `interrupted`。TUI 只處理 SIGINT（[Signals](tui.zh-TW.md)）。
+- **第一個 SIGTERM 可能超過服務管理員的期限。** 它只讓目前的 step 跑完：`[[steps]]` 或 `[[files]]` step 最多 30 秒、
+  service step 120 秒、套件 step 為 `[packages].timeout`，預設 300 秒。管理員隨後的 SIGKILL 讓 anvil 沒有機會終止這些 step，
+  它們會繼續執行。請在期限之前送出第二個 SIGTERM。
+- **`nohup` 能讓執行繼續。** 繼承而來就被忽略的 SIGHUP 會維持忽略，anvil 與它的 step 都一樣；掛斷不會造成任何改變。
 
 #### apply 紀錄
 
@@ -905,7 +915,7 @@ what it names, then run rollback again
 
 anvil 把它寫成一行。`previous` 對先前不存在的 dest 為 `{"state": "absent"}`；對指向不存在檔案之 symlink 的
 `sudo = false` dest 為 `{"state": "dangling", "target": "…"}`（只有舊版 anvil 會寫入）；否則為 `file`，帶有它的 mode、owner、sha256，
-以及 `kept` 為 true 時的 `text`。`write` 為 `written`（step 以 0 結束）或 `failed_midway`（開始後失敗、逾時或失去連線；
+以及 `kept` 為 true 時的 `text`。`write` 為 `written`（step 以 0 結束）或 `failed_midway`（開始後失敗、逾時或失去連線，或 anvil 在寫入中結束；
 只有在就地寫入之後 DEST 才可能只有部分位元組，[此時會有警告](configuration.zh-TW.md#files)）。
 寫入任何東西之前就被拒絕（`refused`：root 檢查、DEST 是目錄、DEST 在讀取後被改過，或無法設定 mode 的他人 DEST，
 都以 4 結束）的寫入絕不保存：該 dest 保留前一次 apply 的項目（若有）。
@@ -952,9 +962,17 @@ anvil 把它寫成一行。`previous` 對先前不存在的 dest 為 `{"state": 
 `not owned by the current user; run chown on it, or do not run anvil through sudo`、
 `larger than the 16777216 byte limit`、`version N is not supported` 或 `cannot parse`。訊息絕不引用它的內容。
 
-**會遺失什麼。** 以 `internal error: …`（anvil 的 bug）失敗的 target 不會被記錄，並保留它先前的項目。第一次 Ctrl-C
-讓執行中的 target 結束，它們會被儲存。第二次 Ctrl-C 或 anvil 被終止時，已經結束的每個 target 都會保留；
-仍在執行的 target 不會被記錄，即使它的檔案可能已經寫入。
+**會遺失什麼。** 第一次 Ctrl-C 讓執行中的 target 結束，它們會被儲存。每次 `[[files]]` 寫入前後也都會儲存紀錄，
+因此第二次 Ctrl-C 或 anvil 以任何方式被終止（包括 SIGKILL 或 OOM）時，target 可能變更過的每個檔案都會保留，
+`anvil rollback` 可以還原它們。當下進行中的寫入標示為 `failed_midway`，即使它尚未開始。這個部分項目的 `ok` 為 false，
+保留它未碰觸的先前 dest，並在 `cannot_undo` 列出最後一次儲存之前結束的 step；之後的 step 不會列出。訊號處理程式本身不做儲存。
+以 `internal error: …`（anvil 的 bug）失敗的 target 保留它最後一次儲存的內容。每次儲存都會重寫整份紀錄，因此每次寫入要付出兩次儲存的成本。
+
+被終止之後，仍在執行的遠端寫入可能在 rollback 回報成功後才完成，把新位元組放回去：請等遠端 step 結束，或再執行一次 rollback。
+在儲存之後、寫入開始之前被終止時，未碰觸的檔案也標示為 `failed_midway`，而此狀態沒有防護：
+終止之後對該檔案的編輯會被 rollback 覆寫，不需要 `--force`。這樣未碰觸的檔案若先前的文字未保留，即使沒有任何變更也會印出 `cannot undo`。
+
+寫入前的儲存失敗時，執行會停止且該檔案不會寫入：target 以 `aborted: a record save failed` 結束。
 
 **先讀取 DEST。** 每次 `[[files]]` 寫入之前，會另外執行一次，經由與寫入相同的路徑讀取 DEST（`ls -lLdn` 與 `od`）。
 它的輸出絕不會印出或記錄。不是一般檔案的 dest 會以 `files: DEST is not a regular file` 讓 step 失敗，讀回不完整時則以
@@ -1445,7 +1463,10 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   `files: DEST changed since the last apply; anvil rollback --force DEST restores it anyway`。target 上既沒有
   `sha256sum` 也沒有 `shasum` 時無法判斷，會以 `files: no sha256 tool on the target to check DEST; anvil rollback --force DEST restores it`
   失敗。`--force DEST` 取消該 dest 的防護，`--force-all` 取消每個 dest 的防護。寫入中途失敗的檔案會在沒有防護的情況下還原：
-  DEST 可能只有部分位元組。被拒絕的檔案會結束它的 target，因此 apply 在它之前寫入的檔案也不會還原；
+  DEST 可能只有部分位元組。
+  在寫入之前被終止時，這也可能是你之後的編輯，它會被覆寫，不需要 `--force`。請先等被終止的 apply 的遠端 step 結束：
+  它的 `mv` 若在 rollback 之後才完成，新位元組會回來，必須再執行一次 rollback。
+  被拒絕的檔案會結束它的 target，因此 apply 在它之前寫入的檔案也不會還原；
   請強制它，或修正 DEST 後再執行一次 rollback。沒有任何選定 target 的紀錄列出的 `--force DEST` 會以 2 結束，訊息為
   `rollback: --force DEST: not in the record`。
 - **host 檢查。** 每個 target 會先被探測。當它已不是紀錄所來自的 host 時，它會失敗且不執行任何東西：
@@ -1738,7 +1759,8 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
   `apply`/`plan`：某個 plugin step 的 plugin 在某個 target 上失敗（[Plugin steps](#plugin-steps)）。
   `run`：某個 target 失敗或無法連線。
   `rollback`：見 [anvil rollback](#anvil-rollback)；`apply` 還有紀錄無法讀取、被鎖住或無法儲存，或找不到狀態目錄時（[apply 紀錄](#apply-紀錄)）。
-  `apply`/`plan`/`run`/`rollback`/`doctor`：第一次 Ctrl-C 取消了執行（[Ctrl-C](#ctrl-c)）；第二次則讓 anvil 因 SIGINT 結束，shell 回報為 130。
+  `apply`/`plan`/`run`/`rollback`/`doctor`：第一次 Ctrl-C、SIGTERM 或 SIGHUP 取消了執行（[Ctrl-C](#ctrl-c)）；
+  第二次則讓 anvil 因該訊號結束，SIGINT 時 shell 回報為 130。
   `inventory`/`config`/`secret`：編輯器以非零結束（中止）、檔案寫入失敗，或 secret store 失敗、被鎖住或其密語提示被取消。
 - **2**：錯誤的旗標或引數（包括不以 `.toml` 結尾的 `--inventory` 或 `--config` 路徑）、未知的 `--target`、
   無效、無法讀取或模稜兩可的檔案、沒有 `$HOME`（`apply` 與 `rollback` 的狀態目錄除外，為 1：[apply 紀錄](#apply-紀錄)）、找不到編輯器、三次嘗試後仍無效的緩衝區，或大於 1 MiB 的 secret。

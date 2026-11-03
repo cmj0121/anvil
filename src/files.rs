@@ -640,6 +640,7 @@ pub(crate) fn capture_script(dest: &str, sudo: &str, checks: &str) -> String {
 }
 
 /// What [`capture_script`] found at DEST.
+#[derive(Clone)]
 pub(crate) enum Captured {
     Absent,
     /// `sha256` is from `bytes` when read, else the target's own hash, else

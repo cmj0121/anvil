@@ -95,7 +95,9 @@ Limitations:
   plugin must be safe to run several times concurrently ([Plugin steps](#plugin-steps)).
 - **A second Ctrl-C stops only what runs here.** It kills anvil's local processes, ssh clients included. A remote
   command started without a terminal keeps running on its host after its ssh client dies. A `[[files]]` step stopped
-  this way can leave its `/tmp/anvil-` temp file on the target ([File steps](#file-steps)).
+  this way can leave its `/tmp/anvil-` temp file on the target ([File steps](#file-steps)). Such a write can still
+  finish its `mv` after anvil died, even after a rollback that reported success, putting the new bytes back: wait for
+  the remote step to end before rolling back, or run rollback again.
 
 ## Commands
 
@@ -873,6 +875,17 @@ targets and its doctor plugins ([Doctor plugins](#doctor-plugins-drift-since-the
   ([Running in parallel](#running-in-parallel)).
 - **A fast double press may count as one.** Two presses very close together can reach anvil as one signal and then
   count as the first; press again.
+- **SIGTERM and SIGHUP count as presses.** The first prints
+  `terminated: running targets stop after their current step; the same signal again stops now` (`hung up: …` for
+  SIGHUP) and cancels: its targets read `⊘ cancelled`, exit 1. The second signal of any of the three kills every step and
+  anvil dies by that signal, logging `terminated`, `hung up` or `interrupted`. The TUI handles only SIGINT
+  ([Signals](tui.md)).
+- **A first SIGTERM can outlast a service manager's window.** It only lets the current step finish: up to 30 s for a
+  `[[steps]]` or `[[files]]` step, 120 s for a service step, and `[packages].timeout`, 300 s by default, for the package
+  step. A manager's SIGKILL then gives anvil no chance to kill the steps, so they go on. Send a second SIGTERM before
+  the deadline.
+- **`nohup` keeps a run going.** A SIGHUP that came in ignored stays ignored, for anvil and for its steps; a hangup then
+  changes nothing.
 
 #### The apply record
 
@@ -947,8 +960,8 @@ anvil writes it on one line. `previous` is `{"state": "absent"}` for a dest that
 `{"state": "dangling", "target": "…"}`, which only an older anvil wrote, for a `sudo = false` dest that was a symlink
 to a missing file, or a `file`
 with its mode, owner, sha256 and, when `kept` is true, its `text`. `write` is `written` (the step exited 0) or
-`failed_midway` (it started, then failed, timed out or lost the connection; DEST holds part of the bytes only after an
-in-place write, [which warns](configuration.md#files)). A
+`failed_midway` (it started, then failed, timed out or lost the connection, or anvil died during it; DEST holds part of
+the bytes only after an in-place write, [which warns](configuration.md#files)). A
 write `refused` before it wrote anything (a root check, a directory DEST, a DEST changed since the read, or another
 user's DEST whose mode it cannot set, all exit 4)
 is never stored: the dest keeps its entry from the apply before, if any.
@@ -1005,9 +1018,22 @@ be read fails apply before any target, with `apply: PATH: REASON`: `a symlink, r
 `larger than the 16777216 byte limit`, `version N is not supported` or
 `cannot parse`. Its content is never quoted.
 
-**What is lost.** A target that fails with `internal error: …` (a bug in anvil) is not recorded and keeps its earlier
-entry. A first Ctrl-C lets the running targets end, and they are saved. A second Ctrl-C, or anvil killed, keeps every
-target that had ended; a target still running is not recorded, though its files may have been written.
+**What is lost.** A first Ctrl-C lets the running targets end, and they are saved. The record is also saved before and
+after each `[[files]]` write, so a second Ctrl-C or anvil killed in any way, SIGKILL or an OOM kill included, keeps every
+file a target may have changed: `anvil rollback` restores them. The write under way at that moment reads
+`failed_midway`, even when it had not started. That partial entry has `ok: false`, keeps the earlier dests it did not
+touch, and lists in `cannot_undo` the steps that ended before its last save; a later step is not listed. The signal
+handler saves nothing itself. A target that fails with `internal error: …` (a bug in anvil) keeps what its last save
+held. Each save rewrites the whole record, so each write costs two saves.
+
+After a kill, a remote write still running can finish after a rollback that reported success and put the new bytes back:
+wait for the remote step to end, or run rollback again. A kill between the save and the start of the write reads
+`failed_midway` for a file it never touched, and that state has no guard: an edit made to the file after the kill is
+overwritten by rollback without `--force`. Such an untouched file whose previous text was not kept prints
+`cannot undo` though nothing changed.
+
+A save that fails before a write stops the run with that file unwritten: the target ends
+`aborted: a record save failed`.
 
 **Reading DEST first.** Before each `[[files]]` write, a separate run reads DEST through the same path as the write
 (`ls -lLdn` and `od`). Its output is never printed or logged. A dest that is not a regular file fails the step with
@@ -1526,7 +1552,10 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   `sha256sum` nor `shasum` on the target it cannot tell, and fails with
   `files: no sha256 tool on the target to check DEST; anvil rollback --force DEST restores it`. `--force DEST` drops the
   guard for that dest and `--force-all` for every dest. A file whose write failed midway is restored without the
-  guard: DEST may hold part of the bytes. A refused file ends its target, so the files apply wrote before it are not
+  guard: DEST may hold part of the bytes, or, after a kill just before the write, a later edit of yours, which is
+  overwritten without `--force`. Wait for a killed apply's remote step to end first: if its `mv` finishes after the
+  rollback, the new bytes are back and rollback must run again. A refused file ends its target, so the files apply
+  wrote before it are not
   restored either; force it or fix DEST and run rollback again. A `--force DEST` that no selected target's record lists
   is exit 2 with `rollback: --force DEST: not in the record`.
 - **The host check.** Each target is probed first. When it is no longer the host the record is from, it fails and
@@ -1836,8 +1865,8 @@ that exits non-zero aborts the command: nothing is written, exit 1.
   `run`: a target failed or could not be reached.
   `rollback`: see [anvil rollback](#anvil-rollback); `apply` also when the record cannot be read, locked or saved, or
   there is no state directory ([The apply record](#the-apply-record)).
-  `apply`/`plan`/`run`/`rollback`/`doctor`: a first Ctrl-C cancelled the run ([Ctrl-C](#ctrl-c)); a second one kills
-  anvil by SIGINT instead, which a shell reports as 130.
+  `apply`/`plan`/`run`/`rollback`/`doctor`: a first Ctrl-C, SIGTERM or SIGHUP cancelled the run ([Ctrl-C](#ctrl-c)); a
+  second one kills anvil by that signal instead, which a shell reports as 130 for SIGINT.
   `inventory`/`config`/`secret`: the editor exited non-zero (aborted), a file write failed, or the secret store failed,
   is locked or its passphrase prompt was cancelled.
 - **2**: a bad flag or argument (including an `--inventory` or `--config` path not ending in `.toml`), an unknown

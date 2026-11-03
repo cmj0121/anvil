@@ -695,6 +695,122 @@ fn interleaved_tasks_restore_the_right_files_and_name_what_cannot_be_undone() {
     }
 }
 
+/// Waits until `path` exists, failing after 20 s, a fail-safe only.
+fn wait_for(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn an_apply_killed_partway_through_a_target_rolls_back_to_the_originals() {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    for signals in [
+        &[Signal::KILL][..],
+        &[Signal::TERM, Signal::TERM][..],
+        &[Signal::HUP, Signal::HUP][..],
+    ] {
+        let sandbox = Sandbox::new("rb");
+        let (one, two, three) = (
+            task_dest(&sandbox, "one"),
+            task_dest(&sandbox, "two"),
+            task_dest(&sandbox, "three"),
+        );
+        let (reached, go) = (sandbox.root().join("reached"), sandbox.root().join("go"));
+        sandbox.write_config(
+            "config.toml",
+            &format!(
+                "[[tasks]]\nrun = \"true\"\n\n{}{}[[tasks]]\nrun = '''touch {}; i=0; \
+                 until [ -e {} ]; do i=$((i+1)); [ $i -gt 600 ] && exit 1; sleep 0.05; done'''\n\n{}",
+                file_task("a.txt", &one),
+                file_task("b.txt", &two),
+                reached.display(),
+                go.display(),
+                file_task("a.txt", &three),
+            ),
+        );
+        let mut child = sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", "apply", "--target", "local"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn anvil");
+        wait_for(&reached);
+        assert_eq!(std::fs::read_to_string(&one).unwrap(), "bytes-a\n");
+        assert_eq!(std::fs::read_to_string(&two).unwrap(), "bytes-b\n");
+        for signal in signals {
+            kill_process(Pid::from_child(&child), *signal).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        child.wait().unwrap();
+        std::fs::write(&go, "").unwrap();
+
+        let record = sandbox.last_apply().expect("saved around each write");
+        let entry = &record["targets"]["local"];
+        assert_eq!(entry["ok"], false, "{signals:?}");
+        assert_eq!(entry["cannot_undo"], serde_json::json!(["tasks[0]"]));
+        let files = entry["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2, "{signals:?}: not the third");
+        assert_eq!(files[0]["dest"], one);
+        assert_eq!(files[0]["write"], "written");
+        assert_eq!(files[1]["dest"], two);
+        assert_eq!(files[1]["write"], "written");
+
+        let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert_eq!(std::fs::read_to_string(&one).unwrap(), PREVIOUS);
+        assert_eq!(std::fs::read_to_string(&two).unwrap(), PREVIOUS);
+        assert_eq!(std::fs::read_to_string(&three).unwrap(), PREVIOUS);
+    }
+}
+
+#[test]
+fn a_refused_write_after_its_intent_rolls_back_to_the_earlier_previous() {
+    let sandbox = Sandbox::new("rb");
+    let dest = task_dest(&sandbox, "dest");
+    sandbox.write_config("config.toml", &file_task("a.txt", &dest));
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+
+    // The next capture reads `found`; its `od` then puts back what the first
+    // apply wrote, so the write sees DEST changed since the read and refuses.
+    std::fs::write(&dest, "found\n").unwrap();
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(sandbox.config_dir().join("a.txt"), "bytes-new\n").unwrap();
+    let bin = sandbox.root().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let od = bin.join("od");
+    std::fs::write(
+        &od,
+        format!(
+            "#!/bin/sh\n/usr/bin/od \"$@\"\nanvil_od=$?\ncase \"$*\" in *{dest}*) \
+             printf 'bytes-a\\n' >{dest} ;; esac\nexit $anvil_od\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&od, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[("PATH", &path)]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+
+    let record = sandbox.last_apply().unwrap();
+    let file = &record["targets"]["local"]["files"][0];
+    assert_eq!(file["write"], "written", "the first apply's");
+    assert_eq!(file["previous"]["text"], PREVIOUS, "not the intent's");
+
+    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), PREVIOUS);
+}
+
 #[test]
 fn the_same_dest_twice_applied_twice_rolls_back_to_before_the_first_apply() {
     let sandbox = Sandbox::new("rb");

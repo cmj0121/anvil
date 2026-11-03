@@ -11,8 +11,10 @@
 //! owner, hash and text), the hash of the bytes written and how the write ended.
 //!
 //! An apply holds a [`Session`] (the lock on `<record>.lock`, then the
-//! loaded record) and merges each target as it ends, saving after each, so
-//! a killed apply keeps every target that had ended. Only the saved copy is
+//! loaded record) and merges a target's snapshot before and after each file
+//! write and as the target ends, saving after each, so a killed apply keeps
+//! every file it may have changed, `failed_midway` if its write had not ended,
+//! and a target with no write yet keeps its old entry. Only the saved copy is
 //! trimmed to [`MAX_RECORD`]; the texts stay in memory until
 //! [`Session::finish`] shares the budget out once more.
 
@@ -372,6 +374,9 @@ pub struct Session {
     record: Record,
     /// The targets merged by this session, in order.
     merged: Vec<String>,
+    /// Each merged target's entry as loaded: every snapshot of one apply
+    /// merges against this, so one snapshot is never another's earlier apply.
+    base: BTreeMap<String, Option<TargetRecord>>,
     /// The texts a save dropped, as (target, dest): every later save drops
     /// them too, so a text dropped once never comes back but in [`finish`].
     ///
@@ -403,13 +408,15 @@ impl Session {
             _lock: lock,
             record,
             merged: Vec::new(),
+            base: BTreeMap::new(),
             dropped: BTreeSet::new(),
             limit: MAX_RECORD,
         })
     }
 
-    /// Replaces `name`'s entry with `target`, which wrote files, keeping
-    /// what an earlier apply knew that this one cannot:
+    /// Replaces `name`'s entry with `target`, what this apply has written
+    /// there so far, keeping what an earlier apply knew that this one cannot;
+    /// a later call for `name` replaces this one, against the same entry:
     ///
     /// - a dest whose write was refused keeps its earlier entry, or has
     ///   none;
@@ -431,7 +438,10 @@ impl Session {
     /// The warnings name each dest whose previous text this merge lost: only
     /// the merge knows, as a kept earlier entry may still hold it.
     pub fn merge(&mut self, name: &str, mut target: TargetRecord) -> Vec<String> {
-        let old = self.record.targets.remove(name);
+        let current = self.record.targets.get(name);
+        let old = (self.base.entry(name.to_owned()))
+            .or_insert_with(|| current.cloned())
+            .clone();
         let mut earlier: BTreeMap<String, FileRecord> = old
             .map(|old| old.files.into_iter().map(|f| (f.dest.clone(), f)).collect())
             .unwrap_or_default();
@@ -485,7 +495,6 @@ impl Session {
             }
         }
         self.record.targets.insert(name.to_owned(), target);
-        self.dropped.retain(|(target, _)| target != name);
         if !self.merged.iter().any(|merged| merged == name) {
             self.merged.push(name.to_owned());
         }
@@ -1694,6 +1703,52 @@ mod tests {
         assert_eq!(kept(&saved, "local"), [true, true, true]);
         assert_eq!(kept(&saved, "web1"), [true, true, false]);
         assert_eq!(kept(&saved, "zz-old"), [true]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_later_snapshot_merges_against_the_entry_the_session_loaded() {
+        let previous = |text: &str| {
+            Previous::File(PreviousFile {
+                mode: "0644".to_owned(),
+                uid: 0,
+                gid: 0,
+                sha256: sha('e'),
+                kept: true,
+                text: Some(Zeroizing::new(text.to_owned())),
+                reason: None,
+            })
+        };
+        let earlier = file("/etc/a", &sha('a'), Write::Written, previous("real"));
+        let (mut session, root) = session_with(
+            "record-base",
+            vec![("web1", target(1, true, vec![earlier.clone()]))],
+        );
+        let snapshot = |write| vec![file("/etc/a", &sha('b'), write, previous("snapshot"))];
+        session.merge("web1", target(2, false, snapshot(Write::FailedMidway)));
+        let entry = &session.record.targets["web1"];
+        assert_eq!(entry.files[0].write, Write::FailedMidway, "the intent");
+        session.merge("web1", target(3, false, snapshot(Write::Refused)));
+        assert_eq!(session.record.targets["web1"].files, [earlier]);
+        session.merge("db1", target(4, false, snapshot(Write::FailedMidway)));
+        session.merge("db1", target(5, false, snapshot(Write::Refused)));
+        assert!(session.record.targets["db1"].files.is_empty(), "no earlier");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_text_a_save_dropped_stays_dropped_in_later_snapshots_of_its_target() {
+        let snapshot = target(2, false, texts_of(2, 2000, 'a'));
+        let (mut session, root) = session_with("record-budget-snapshot", vec![]);
+        let mut alone = Record::default();
+        alone.targets.insert("a".to_owned(), snapshot.clone());
+        session.limit = encoded_len(&alone) - 1000;
+        session.merge("a", snapshot.clone());
+        assert_eq!(session.save().unwrap().len(), 1);
+        session.merge("a", snapshot);
+        assert!(session.save().unwrap().is_empty(), "warned once");
+        let saved = load(&session.path).unwrap().unwrap();
+        assert_eq!(kept(&saved, "a"), [false, true]);
         fs::remove_dir_all(&root).unwrap();
     }
 
