@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::apply;
 use crate::cancel::{AbortReason, Cancel};
 use crate::cli::Cli;
 use crate::config::Config;
@@ -195,7 +194,7 @@ fn plan_target(
     status::phase(&target.name, status::Phase::Probe);
     let runs = transport
         .map_err(|err| Unresolved::Failed(err.to_string()))
-        .and_then(|transport| apply::probe(transport.as_ref(), expanded))
+        .and_then(|transport| engine::probe(transport.as_ref(), expanded))
         .and_then(|facts| {
             engine::resolve(
                 target,

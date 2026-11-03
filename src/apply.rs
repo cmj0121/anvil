@@ -42,27 +42,24 @@ use std::sync::Arc;
 
 use crate::cancel::Cancel;
 use crate::cli::Cli;
-use crate::config::{Config, Plugin, Step, StepKind};
+use crate::config::{Config, Plugin};
 use crate::engine::{
-    Journal, Passwords, Reached, Recorder, Unresolved, cannot_undo, execute, open_record, resolve,
+    Journal, Passwords, Reached, Recorder, Unresolved, cannot_undo, execute, open_record, probe,
+    resolve,
 };
 use crate::error::Failure;
-use crate::facts::{self, Facts};
 use crate::fanout::{self, Event};
-use crate::files::{self, Sources};
+use crate::files::Sources;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::options::Options;
-use crate::packages::{self, Packages};
-use crate::plugin::{Plugins, Request};
+use crate::plugin::Plugins;
 use crate::prepared::Prepared;
 use crate::record::Session;
 use crate::report::{Progress, Report, TargetReport, cancelled, failed, print_report};
 use crate::status;
-use crate::step::{PlannedRun, RunKind};
-use crate::tasks::{Expanded, Item, ItemKind};
-use crate::transport::{RUN_TIMEOUT, Transport, TransportError};
-use zeroize::Zeroizing;
+use crate::tasks::{Expanded, ItemKind};
+use crate::transport::{Transport, TransportError};
 
 /// Applies `prepared.config` to each of its targets, `opts.parallel` at a
 /// time. Before each target and each step, `prepared.cancel` is checked; once
@@ -285,150 +282,8 @@ fn apply_target(
     Applied { report, reached }
 }
 
-/// Whether the list has a package item; one exists only when it has work.
-fn package_work(expanded: &Expanded) -> bool {
-    expanded
-        .items
-        .iter()
-        .any(|item| matches!(item.kind, ItemKind::Packages(_)))
-}
-
-/// Runs the probe over `transport`. The error is the target's failure: a
-/// transport error as is, anything else as `packages: <reason>` when
-/// `expanded` has a package item, else as `probe: <reason>`; or Cancelled
-/// when the transport was.
-pub fn probe(transport: &dyn Transport, expanded: &Expanded) -> Result<Facts, Unresolved> {
-    let output = transport.run(facts::PROBE, RUN_TIMEOUT)?;
-    let (prefix, probe) = if package_work(expanded) {
-        ("packages", "probe ")
-    } else {
-        ("probe", "")
-    };
-    let reason = |why: String| format!("{prefix}: {why}");
-    match output.code {
-        Some(0) => {}
-        Some(code) => return Err(reason(format!("{probe}exited {code}")).into()),
-        None => return Err(reason(format!("{probe}was killed by a signal")).into()),
-    }
-    Facts::parse(&output.stdout).map_err(|err| reason(err.to_string()).into())
-}
-
-/// Whether `target` matches `item`, whose selector needs `facts` only when it
-/// has facts.
-fn selected(item: &Item, target: &Target, facts: Option<&Facts>) -> Result<bool, String> {
-    match facts {
-        Some(facts) => Ok(item.matches(target, facts)),
-        None if item.facts.is_empty() => Ok(files::has_tags(&item.tags, target)),
-        None => Err("tasks: the probe has not run".to_owned()),
-    }
-}
-
-/// A step that runs nothing and only shows `label`.
-fn skip_run(label: String) -> PlannedRun {
-    PlannedRun {
-        run: Zeroizing::default(),
-        label: Some(label),
-        sudo_secret: None,
-        timeout: RUN_TIMEOUT,
-        kind: RunKind::Skip,
-        task: None,
-        name: None,
-    }
-}
-
-/// The step of package `item`; `None` when its script has nothing to do.
-pub(crate) fn package_run(
-    target: &Target,
-    facts: Option<&Facts>,
-    item: &Item,
-    packages: &Packages,
-) -> Result<Option<PlannedRun>, String> {
-    if !selected(item, target, facts)? {
-        log::info!("{}: packages: no match", target.name);
-        return Ok(Some(skip_run("skipped packages: no match".to_owned())));
-    }
-    let facts = facts.ok_or("packages: the probe has not run")?;
-    let reason = |why: String| format!("packages: {why}");
-    let sudo = packages.sudo_secret_for(target);
-    let manager =
-        packages::resolve(packages.choice_for(target), facts, sudo.is_some()).map_err(reason)?;
-    packages::check_pin(manager, packages).map_err(reason)?;
-    let Some(run) = packages::script(manager, packages, facts.is_root()) else {
-        return Ok(None);
-    };
-    let sudo_secret = sudo.filter(|_| packages::uses_password(manager, facts));
-    match sudo_secret {
-        Some(name) => log::info!(
-            "{}: packages with {manager}, sudo password from secret {name}",
-            target.name
-        ),
-        None => log::info!("{}: packages with {manager}", target.name),
-    }
-    Ok(Some(PlannedRun {
-        run: run.into(),
-        label: None,
-        sudo_secret: sudo_secret.map(str::to_owned),
-        timeout: packages.timeout(),
-        kind: RunKind::Packages { manager },
-        task: None,
-        name: None,
-    }))
-}
-
-/// The step of `item`, the `number`th step, its plugin run on the controller.
-pub(crate) fn step_run(
-    target: &Target,
-    facts: Option<&Facts>,
-    item: &Item,
-    step: &Step,
-    number: usize,
-    plugins: &dyn Plugins,
-    cancel: &Cancel,
-) -> Result<PlannedRun, Unresolved> {
-    if !selected(item, target, facts)? {
-        log::info!("{}: step {number}: no match", target.name);
-        let label = match step.kind() {
-            StepKind::Plugin(name) => format!("skipped plugin {name}: no match"),
-            StepKind::Run(_) => "skipped run: no match".to_owned(),
-        };
-        return Ok(skip_run(label));
-    }
-    let planned = |run: String, label, plugin| PlannedRun {
-        run: run.into(),
-        label,
-        sudo_secret: None,
-        timeout: RUN_TIMEOUT,
-        kind: RunKind::Step { number, plugin },
-        task: None,
-        name: None,
-    };
-    Ok(match step.kind() {
-        StepKind::Plugin(name) => {
-            if cancel.is_set() {
-                return Err(Unresolved::Cancelled);
-            }
-            let facts = facts.ok_or_else(|| format!("plugin {name}: the probe has not run"))?;
-            let no_args = serde_json::Map::new();
-            let request = Request {
-                target: &target.name,
-                facts,
-                tags: &target.tags,
-                args: step.args.as_ref().unwrap_or(&no_args),
-            };
-            let script = plugins.script(name, &request)?;
-            log::info!("{}: step from plugin {name}", target.name);
-            planned(
-                crate::run::wrap(&script),
-                Some(script),
-                Some(name.to_owned()),
-            )
-        }
-        StepKind::Run(run) => planned(run.to_owned(), None, None),
-    })
-}
-
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use crate::tasks::legacy;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -440,13 +295,17 @@ pub(crate) mod tests {
     use super::*;
     use crate::config::{FileEntry, ModeValue, ServiceEntry, Step};
     use crate::engine::{Saves, Sent, for_each_target, send_file};
+    use crate::facts::{self, Facts};
+    use crate::files;
+    use crate::packages::{self, Packages};
     use crate::record::{self, FileRecord};
     use crate::report::tests::{brief, piped, screen, step, streams, terminal};
     use crate::report::{AbortReason, StepReport, Style, render_summary};
     use crate::secret::Store;
     use crate::services;
-    use crate::step::{Entry, FileRun, ServiceRun, Upload};
-    use crate::transport::Output;
+    use crate::step::{Entry, FileRun, PlannedRun, RunKind, ServiceRun, Upload};
+    use crate::transport::{Output, RUN_TIMEOUT};
+    use zeroize::Zeroizing;
 
     /// [`super::apply_target`] on a legacy config's list.
     fn apply_target(
@@ -527,7 +386,7 @@ pub(crate) mod tests {
 
     const ONE: NonZeroU8 = NonZeroU8::MIN;
     use crate::inventory::TargetKind;
-    use crate::test_util::{FakePlugins, Meet, json, keys};
+    use crate::test_util::{FakePlugins, Meet, json, keys, target};
 
     /// Each `[[files]]` capture script, and the password typed for it.
     type Captures = Vec<(String, Option<Vec<u8>>)>;
@@ -721,16 +580,6 @@ pub(crate) mod tests {
                     ..Output::default()
                 }),
             }
-        }
-    }
-
-    pub(crate) fn target(name: &str) -> Target {
-        Target {
-            name: name.to_owned(),
-            kind: TargetKind::Local,
-            pkg: None,
-            sudo_secret: None,
-            tags: Vec::new(),
         }
     }
 

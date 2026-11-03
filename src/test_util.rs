@@ -14,6 +14,7 @@ use crate::cli::Cli;
 use crate::config::Config;
 use crate::document::{self, Format};
 use crate::editor::random;
+use crate::inventory::{Target, TargetKind};
 use crate::options::Options;
 use crate::paths::DocPath;
 use crate::plugin::{Plugins, Request};
@@ -302,4 +303,14 @@ pub fn logged<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
     log::set_max_level(before);
     let lines = std::mem::take(&mut *lines.0.lock().unwrap());
     (out, lines)
+}
+
+pub(crate) fn target(name: &str) -> Target {
+    Target {
+        name: name.to_owned(),
+        kind: TargetKind::Local,
+        pkg: None,
+        sudo_secret: None,
+        tags: Vec::new(),
+    }
 }

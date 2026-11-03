@@ -6,23 +6,22 @@ use std::num::NonZeroU8;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use crate::apply::{package_run, step_run};
 use crate::cancel::{AbortReason, Cancel};
-use crate::config::Config;
+use crate::config::{Config, Step, StepKind};
 use crate::error::Failure;
-use crate::facts::Facts;
+use crate::facts::{self, Facts};
 use crate::fanout;
 use crate::files::{self, Sources};
 use crate::inventory::Target;
-use crate::packages;
-use crate::plugin::Plugins;
+use crate::packages::{self, Packages};
+use crate::plugin::{Plugins, Request};
 use crate::record::{self, FileRecord, Session, TargetRecord};
 use crate::report::{Progress, Report, StepReport, TargetReport, cancelled, failed};
 use crate::secret::Store;
 use crate::services;
 use crate::status;
 use crate::step::{Entry, PlannedRun, RunKind, Upload};
-use crate::tasks::{Expanded, ItemKind};
+use crate::tasks::{Expanded, Item, ItemKind};
 use crate::transport::{
     Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
 };
@@ -866,10 +865,152 @@ pub fn resolve(
     }
     Ok(runs)
 }
+/// Whether the list has a package item; one exists only when it has work.
+fn package_work(expanded: &Expanded) -> bool {
+    expanded
+        .items
+        .iter()
+        .any(|item| matches!(item.kind, ItemKind::Packages(_)))
+}
+
+/// Runs the probe over `transport`. The error is the target's failure: a
+/// transport error as is, anything else as `packages: <reason>` when
+/// `expanded` has a package item, else as `probe: <reason>`; or Cancelled
+/// when the transport was.
+pub fn probe(transport: &dyn Transport, expanded: &Expanded) -> Result<Facts, Unresolved> {
+    let output = transport.run(facts::PROBE, RUN_TIMEOUT)?;
+    let (prefix, probe) = if package_work(expanded) {
+        ("packages", "probe ")
+    } else {
+        ("probe", "")
+    };
+    let reason = |why: String| format!("{prefix}: {why}");
+    match output.code {
+        Some(0) => {}
+        Some(code) => return Err(reason(format!("{probe}exited {code}")).into()),
+        None => return Err(reason(format!("{probe}was killed by a signal")).into()),
+    }
+    Facts::parse(&output.stdout).map_err(|err| reason(err.to_string()).into())
+}
+
+/// Whether `target` matches `item`, whose selector needs `facts` only when it
+/// has facts.
+fn selected(item: &Item, target: &Target, facts: Option<&Facts>) -> Result<bool, String> {
+    match facts {
+        Some(facts) => Ok(item.matches(target, facts)),
+        None if item.facts.is_empty() => Ok(files::has_tags(&item.tags, target)),
+        None => Err("tasks: the probe has not run".to_owned()),
+    }
+}
+
+/// A step that runs nothing and only shows `label`.
+fn skip_run(label: String) -> PlannedRun {
+    PlannedRun {
+        run: Zeroizing::default(),
+        label: Some(label),
+        sudo_secret: None,
+        timeout: RUN_TIMEOUT,
+        kind: RunKind::Skip,
+        task: None,
+        name: None,
+    }
+}
+
+/// The step of package `item`; `None` when its script has nothing to do.
+fn package_run(
+    target: &Target,
+    facts: Option<&Facts>,
+    item: &Item,
+    packages: &Packages,
+) -> Result<Option<PlannedRun>, String> {
+    if !selected(item, target, facts)? {
+        log::info!("{}: packages: no match", target.name);
+        return Ok(Some(skip_run("skipped packages: no match".to_owned())));
+    }
+    let facts = facts.ok_or("packages: the probe has not run")?;
+    let reason = |why: String| format!("packages: {why}");
+    let sudo = packages.sudo_secret_for(target);
+    let manager =
+        packages::resolve(packages.choice_for(target), facts, sudo.is_some()).map_err(reason)?;
+    packages::check_pin(manager, packages).map_err(reason)?;
+    let Some(run) = packages::script(manager, packages, facts.is_root()) else {
+        return Ok(None);
+    };
+    let sudo_secret = sudo.filter(|_| packages::uses_password(manager, facts));
+    match sudo_secret {
+        Some(name) => log::info!(
+            "{}: packages with {manager}, sudo password from secret {name}",
+            target.name
+        ),
+        None => log::info!("{}: packages with {manager}", target.name),
+    }
+    Ok(Some(PlannedRun {
+        run: run.into(),
+        label: None,
+        sudo_secret: sudo_secret.map(str::to_owned),
+        timeout: packages.timeout(),
+        kind: RunKind::Packages { manager },
+        task: None,
+        name: None,
+    }))
+}
+
+/// The step of `item`, the `number`th step, its plugin run on the controller.
+fn step_run(
+    target: &Target,
+    facts: Option<&Facts>,
+    item: &Item,
+    step: &Step,
+    number: usize,
+    plugins: &dyn Plugins,
+    cancel: &Cancel,
+) -> Result<PlannedRun, Unresolved> {
+    if !selected(item, target, facts)? {
+        log::info!("{}: step {number}: no match", target.name);
+        let label = match step.kind() {
+            StepKind::Plugin(name) => format!("skipped plugin {name}: no match"),
+            StepKind::Run(_) => "skipped run: no match".to_owned(),
+        };
+        return Ok(skip_run(label));
+    }
+    let planned = |run: String, label, plugin| PlannedRun {
+        run: run.into(),
+        label,
+        sudo_secret: None,
+        timeout: RUN_TIMEOUT,
+        kind: RunKind::Step { number, plugin },
+        task: None,
+        name: None,
+    };
+    Ok(match step.kind() {
+        StepKind::Plugin(name) => {
+            if cancel.is_set() {
+                return Err(Unresolved::Cancelled);
+            }
+            let facts = facts.ok_or_else(|| format!("plugin {name}: the probe has not run"))?;
+            let no_args = serde_json::Map::new();
+            let request = Request {
+                target: &target.name,
+                facts,
+                tags: &target.tags,
+                args: step.args.as_ref().unwrap_or(&no_args),
+            };
+            let script = plugins.script(name, &request)?;
+            log::info!("{}: step from plugin {name}", target.name);
+            planned(
+                crate::run::wrap(&script),
+                Some(script),
+                Some(name.to_owned()),
+            )
+        }
+        StepKind::Run(run) => planned(run.to_owned(), None, None),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apply::tests::target;
+    use crate::test_util::target;
 
     #[test]
     fn saves_report_the_first_error_and_the_targets_still_unrecorded() {

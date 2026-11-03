@@ -24,7 +24,6 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::apply;
 use crate::cancel::Cancel;
 use crate::cli::Cli;
 use crate::config::Config;
@@ -328,7 +327,7 @@ fn roll_back(
         return RolledTarget::report(report::cancelled("rollback", target, Vec::new(), cancel));
     }
     status::phase(&target.name, status::Phase::Probe);
-    let facts = match apply::probe(transport.as_ref(), &Expanded::default()) {
+    let facts = match engine::probe(transport.as_ref(), &Expanded::default()) {
         Ok(facts) => facts,
         Err(Unresolved::Failed(error)) => return failed(error),
         Err(Unresolved::Cancelled) => {

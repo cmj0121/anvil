@@ -655,8 +655,8 @@ pub(crate) fn render_summary(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::apply::tests::target;
     use crate::test_util::json;
+    use crate::test_util::target;
     use crate::transport::TransportError;
 
     /// Neither stream is a terminal, as under a pipe or in CI.
