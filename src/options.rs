@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::cancel::Cancel;
-use crate::cli::{Cli, Failure};
+use crate::cli::Cli;
 use crate::config::Config;
+use crate::error::Failure;
 use crate::files::{self, Sources};
 use crate::inventory::{Inventory, Sel, Target, TargetKind};
 use crate::paths::{self, DocPath};

@@ -32,7 +32,7 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle, Signals};
 
 use crate::cancel::{AbortReason, Cancel};
-use crate::cli::Failure;
+use crate::error::Failure;
 use crate::exec;
 use crate::logger::format_line;
 use crate::status;

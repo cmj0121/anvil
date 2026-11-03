@@ -22,9 +22,9 @@ use signal_hook::SigId;
 use signal_hook::consts::SIGINT;
 
 use crate::cancel::{AbortReason, Cancel};
-use crate::cli::Failure;
 use crate::commands;
 use crate::editor::{Buffer, Editor, Fallback};
+use crate::error::Failure;
 use crate::files_cmd;
 use crate::filestore::{self, Root};
 use crate::logger::{self, Sink};

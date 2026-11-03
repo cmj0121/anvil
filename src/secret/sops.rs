@@ -786,7 +786,7 @@ mod tests {
             let message = err.to_string();
             assert!(matches!(err, SecretError::Refused { .. }), "{err:?}");
             assert!(message.starts_with(holder.to_str().unwrap()), "{message}");
-            assert_eq!(crate::cli::Failure::from(err).code, 2);
+            assert_eq!(crate::error::Failure::from(err).code, 2);
             assert_eq!(fake.record("argv"), "", "sops never ran");
         };
         refused(&fake, &dir);

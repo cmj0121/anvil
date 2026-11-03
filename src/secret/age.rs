@@ -333,7 +333,7 @@ mod tests {
             let shown = err.to_string();
             assert!(matches!(err, SecretError::Refused { .. }), "{err:?}");
             assert!(shown.starts_with(loose.to_str().unwrap()), "{shown}");
-            assert_eq!(crate::cli::Failure::from(err).code, 2);
+            assert_eq!(crate::error::Failure::from(err).code, 2);
             chmod(loose, 0o755);
         }
         fs::remove_dir_all(&root).unwrap();

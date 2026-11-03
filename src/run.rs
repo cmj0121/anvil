@@ -15,8 +15,9 @@ use std::time::Duration;
 
 use crate::apply::{self, PlannedRun, Report, RunKind, TargetReport};
 use crate::cancel::Cancel;
-use crate::cli::{Cli, Failure};
+use crate::cli::Cli;
 use crate::document::{MAX_BYTES, read_capped_from};
+use crate::error::Failure;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::escape_controls;

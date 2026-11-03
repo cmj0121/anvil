@@ -24,9 +24,9 @@ use zeroize::Zeroizing;
 
 use crate::apply::{FileRun, PlannedRun, RunKind, Upload};
 use crate::bytes::hex;
-use crate::cli::Failure;
 use crate::config::{Config, FileEntry, ModeValue, is_mode, is_sha256};
 use crate::document;
+use crate::error::Failure;
 use crate::facts::Facts;
 use crate::filestore::{self, StoreError};
 use crate::inventory::{self, Target, TargetKind};

@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crate::apply::{self, Passwords};
 use crate::cancel::Cancel;
-use crate::cli::Failure;
 use crate::config::{Config, Plugin};
+use crate::error::Failure;
 use crate::files::{self, Sources};
 use crate::inventory::Target;
 use crate::options::Options;

@@ -392,7 +392,7 @@ mod tests {
                 panic!("mode {mode:o} opened");
             };
             assert!(matches!(err, SecretError::Refused { .. }), "{err:?}");
-            assert_eq!(crate::cli::Failure::from(err).code, 2);
+            assert_eq!(crate::error::Failure::from(err).code, 2);
         }
 
         // Read bits are fine: only writing can forge a value.

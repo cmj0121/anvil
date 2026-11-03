@@ -49,8 +49,9 @@ use serde::Serialize;
 
 pub use crate::cancel::AbortReason;
 use crate::cancel::Cancel;
-use crate::cli::{Cli, Failure, print_json};
+use crate::cli::Cli;
 use crate::config::{Config, Plugin, Step, StepKind};
+use crate::error::{Failure, print_json};
 use crate::facts::{self, Facts};
 use crate::fanout::{self, Event};
 use crate::files::{self, Sources};

@@ -3,22 +3,13 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::cli::{Cli, Failure, FilesAction, print_json};
+use crate::cli::{Cli, FilesAction};
 use crate::config::Config;
 use crate::editor::{Buffer, Editor, Fallback};
+use crate::error::{Failure, print_json};
 use crate::filestore::{self, Kind, Root, StoreError, shown};
 use crate::options::Options;
 use crate::tasks;
-
-impl From<StoreError> for Failure {
-    fn from(err: StoreError) -> Self {
-        Self {
-            code: err.exit_code(),
-            message: err.to_string(),
-            refused: false,
-        }
-    }
-}
 
 /// Runs a local store operation.
 pub fn run(cli: &Cli, opts: &Options, action: &FilesAction) -> Result<(), Failure> {
@@ -181,18 +172,5 @@ fn warn_orphans(config: &Config, root: &Root, path: &str) {
                 log::warn!("{}", crate::logger::escape_invisible(&warning));
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn store_failures_preserve_exit_codes() {
-        assert_eq!(Failure::from(StoreError::BadPath("../x".into())).code, 2);
-        assert_eq!(Failure::from(StoreError::Symlink("x".into())).code, 2);
-        assert_eq!(Failure::from(StoreError::NotFound("x".into())).code, 1);
-        assert_eq!(Failure::from(StoreError::Exists("x".into())).code, 1);
     }
 }

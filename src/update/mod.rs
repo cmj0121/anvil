@@ -18,8 +18,9 @@ use minisign_verify::PublicKey;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::cli::{Cli, Failure, print_json};
+use crate::cli::Cli;
 use crate::commands::warn_target;
+use crate::error::{Failure, print_json};
 use crate::options::Options;
 use install::Installed;
 pub use release::Source;

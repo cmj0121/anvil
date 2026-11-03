@@ -28,10 +28,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use zeroize::Zeroizing;
 
-use crate::cli::{Cli, Failure, print_json};
+use crate::cli::Cli;
 use crate::config::Config;
 use crate::document::{self, DocumentError, Format, MAX_BYTES};
 use crate::editor::{Buffer, Editor, Fallback};
+use crate::error::{Failure, print_json};
 use crate::filestore;
 use crate::harden;
 use crate::inventory::Inventory;

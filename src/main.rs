@@ -10,6 +10,7 @@ mod config;
 mod doctor;
 mod document;
 mod editor;
+mod error;
 #[cfg(test)]
 mod examples;
 mod exec;

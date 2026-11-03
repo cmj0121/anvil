@@ -11,9 +11,9 @@ use std::sync::mpsc::Sender;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::cancel::{AbortReason, Cancel};
-use crate::cli::Failure;
 use crate::config::{Config, StepKind};
 use crate::document::{Format, MAX_BYTES};
+use crate::error::Failure;
 use crate::filestore::{self, Entry, Kind, Root};
 use crate::inventory::{Inventory, LOCAL, Sel, Target, UnknownSel};
 use crate::options::Options;
@@ -1007,7 +1007,7 @@ impl App {
             return Err(self.inventory_error.clone().unwrap_or_default());
         };
         let targets = select(inventory, &self.opts.target)
-            .map_err(|err| crate::cli::Failure::from(err).message)?;
+            .map_err(|err| crate::error::Failure::from(err).message)?;
         Ok(targets.into_iter().map(|target| target.name).collect())
     }
 
@@ -1858,7 +1858,7 @@ pub mod tests {
         );
         let err = check_targets(&inventory, &names(&["pi", "nosuch"])).unwrap_err();
         assert_eq!(
-            crate::cli::Failure::from(err).message,
+            crate::error::Failure::from(err).message,
             "unknown target `nosuch`: not `local`, a host name or a tag"
         );
     }

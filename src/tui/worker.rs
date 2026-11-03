@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use super::app::{self, Job, Msg};
 use crate::cancel::Cancel;
-use crate::cli::Failure;
+use crate::error::Failure;
 use crate::files::{Force, Wording};
 use crate::inventory::Target;
 use crate::options::Options;

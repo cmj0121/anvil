@@ -17,8 +17,9 @@ use serde::Serialize;
 
 use crate::apply::{self, Escape, Line, PlannedRun, Style, Unresolved, print_lines};
 use crate::cancel::{AbortReason, Cancel};
-use crate::cli::{Cli, Failure, print_json};
+use crate::cli::Cli;
 use crate::config::Config;
+use crate::error::{Failure, print_json};
 use crate::fanout::{self, Event};
 use crate::files::Sources;
 use crate::interrupt::Interrupt;

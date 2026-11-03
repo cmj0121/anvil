@@ -31,9 +31,10 @@ use serde_json::{Map, Value};
 use zeroize::Zeroizing;
 
 use crate::cancel::{AbortReason, Cancel};
-use crate::cli::{Cli, Failure, print_json};
+use crate::cli::Cli;
 use crate::config::{Config, MAX_FILES, Plugin};
 use crate::editor::{Editor, EditorError, Fallback};
+use crate::error::{Failure, print_json};
 use crate::facts::{self, Facts, PROBE};
 use crate::files::{self, FileState, HashDest};
 use crate::interrupt::Interrupt;
