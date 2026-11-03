@@ -1010,7 +1010,7 @@ fn step_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::target;
+    use crate::test_util::{FakePlugins, target};
 
     #[test]
     fn saves_report_the_first_error_and_the_targets_still_unrecorded() {
@@ -1082,6 +1082,215 @@ mod tests {
                 ),
                 "{target:?}"
             );
+        }
+    }
+
+    const MAC: &str = "distro=macos\nuser=cmj\nsudo=binary\npkg=brew\nanvil-probe-end=1\n";
+
+    fn mac() -> Facts {
+        Facts::parse(MAC.as_bytes()).unwrap()
+    }
+
+    /// An item of `kind` selecting on `tags` and `facts`.
+    fn item(kind: ItemKind, tags: &[&str], facts: &[(&str, &str)]) -> Item {
+        Item {
+            path: None,
+            name: None,
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            facts: (facts.iter())
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+            kind,
+        }
+    }
+
+    fn packages(install: &[&str]) -> Packages {
+        Packages {
+            install: install.iter().map(|name| (*name).to_owned()).collect(),
+            ..Packages::default()
+        }
+    }
+
+    fn plugin(name: &str) -> Step {
+        Step {
+            plugin: Some(name.to_owned()),
+            ..Step::default()
+        }
+    }
+
+    #[test]
+    fn a_skip_runs_nothing_and_shows_only_its_label() {
+        let run = skip_run("skipped run: no match".to_owned());
+        assert!(run.run.is_empty());
+        assert_eq!(run.shown(), "skipped run: no match");
+        assert_eq!(run.kind, RunKind::Skip);
+        assert_eq!(run.kind.entry(), Entry::Script);
+        assert_eq!((run.sudo_secret, run.timeout), (None, RUN_TIMEOUT));
+    }
+
+    #[test]
+    fn before_the_probe_an_item_is_selected_by_its_tags() {
+        let web = item(ItemKind::Step(Step::script("true")), &["web"], &[]);
+        let mut host = target("a");
+        assert_eq!(selected(&web, &host, None), Ok(false));
+        host.tags.push("web".to_owned());
+        assert_eq!(selected(&web, &host, None), Ok(true));
+    }
+
+    #[test]
+    fn an_item_selecting_on_facts_needs_the_probe() {
+        let mac_only = item(
+            ItemKind::Step(Step::script("true")),
+            &[],
+            &[("distro", "macos")],
+        );
+        assert_eq!(
+            selected(&mac_only, &target("a"), None),
+            Err("tasks: the probe has not run".to_owned())
+        );
+        assert_eq!(selected(&mac_only, &target("a"), Some(&mac())), Ok(true));
+        let arch_only = item(
+            ItemKind::Step(Step::script("true")),
+            &[],
+            &[("distro", "arch")],
+        );
+        assert_eq!(selected(&arch_only, &target("a"), Some(&mac())), Ok(false));
+    }
+
+    #[test]
+    fn a_package_item_the_target_does_not_match_is_a_skip() {
+        let pkgs = packages(&["git"]);
+        let web = item(ItemKind::Packages(pkgs.clone()), &["web"], &[]);
+        let run = package_run(&target("a"), Some(&mac()), &web, &pkgs).unwrap();
+        assert_eq!(run, Some(skip_run("skipped packages: no match".to_owned())));
+    }
+
+    #[test]
+    fn a_package_item_installs_with_the_targets_manager() {
+        let pkgs = packages(&["git"]);
+        let all = item(ItemKind::Packages(pkgs.clone()), &[], &[]);
+        let run = package_run(&target("a"), Some(&mac()), &all, &pkgs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.kind,
+            RunKind::Packages {
+                manager: packages::Manager::Brew
+            }
+        );
+        assert_eq!(run.kind.entry(), Entry::Packages);
+        assert!(run.run.contains("git"), "{}", *run.run);
+        assert_eq!((run.label, run.sudo_secret), (None, None));
+        assert_eq!(run.timeout, pkgs.timeout());
+    }
+
+    #[test]
+    fn a_package_item_with_nothing_to_do_builds_no_step() {
+        let pkgs = packages(&[]);
+        let all = item(ItemKind::Packages(pkgs.clone()), &[], &[]);
+        assert_eq!(
+            package_run(&target("a"), Some(&mac()), &all, &pkgs),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_matched_package_item_needs_the_probe() {
+        let pkgs = packages(&["git"]);
+        let all = item(ItemKind::Packages(pkgs.clone()), &[], &[]);
+        assert_eq!(
+            package_run(&target("a"), None, &all, &pkgs),
+            Err("packages: the probe has not run".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_run_step_is_its_command_numbered_among_the_steps() {
+        let step = Step::script("echo hi");
+        let run_item = item(ItemKind::Step(step.clone()), &[], &[]);
+        let run = step_run(
+            &target("a"),
+            None,
+            &run_item,
+            &step,
+            2,
+            &FakePlugins::none(),
+            &Cancel::new(),
+        )
+        .unwrap();
+        assert_eq!(&*run.run, "echo hi");
+        assert_eq!(
+            run.kind,
+            RunKind::Step {
+                number: 2,
+                plugin: None
+            }
+        );
+        assert_eq!(run.kind.entry(), Entry::Step { number: 2 });
+        assert_eq!((run.label, run.timeout), (None, RUN_TIMEOUT));
+    }
+
+    #[test]
+    fn a_plugin_step_is_its_reply_wrapped_and_shown_as_the_reply() {
+        let step = plugin("p");
+        let plugin_item = item(ItemKind::Step(step.clone()), &[], &[]);
+        let plugins = FakePlugins::new(|_, _| Ok("echo from-plugin".to_owned()));
+        let run = step_run(
+            &target("a"),
+            Some(&mac()),
+            &plugin_item,
+            &step,
+            1,
+            &plugins,
+            &Cancel::new(),
+        )
+        .unwrap();
+        assert_eq!(*run.run, crate::run::wrap("echo from-plugin"));
+        assert_eq!(run.shown(), "echo from-plugin");
+        assert_eq!(run.plugin(), Some("p"));
+        assert_eq!(
+            run.kind,
+            RunKind::Step {
+                number: 1,
+                plugin: Some("p".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn a_cancelled_token_stops_a_plugin_step_before_its_plugin_runs() {
+        let step = plugin("p");
+        let plugin_item = item(ItemKind::Step(step.clone()), &[], &[]);
+        let result = step_run(
+            &target("a"),
+            Some(&mac()),
+            &plugin_item,
+            &step,
+            1,
+            &FakePlugins::none(),
+            &Cancel::cancelled(),
+        );
+        assert_eq!(result, Err(Unresolved::Cancelled));
+    }
+
+    #[test]
+    fn an_unmatched_step_is_a_skip_naming_its_kind() {
+        let host = target("a");
+        for (step, label) in [
+            (plugin("p"), "skipped plugin p: no match"),
+            (Step::script("true"), "skipped run: no match"),
+        ] {
+            let web = item(ItemKind::Step(step.clone()), &["web"], &[]);
+            let run = step_run(
+                &host,
+                None,
+                &web,
+                &step,
+                1,
+                &FakePlugins::none(),
+                &Cancel::new(),
+            );
+            assert_eq!(run, Ok(skip_run(label.to_owned())));
         }
     }
 }

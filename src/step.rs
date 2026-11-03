@@ -215,3 +215,82 @@ pub fn task_title(path: Option<&str>, name: Option<&str>) -> Option<String> {
 pub fn shown_text(text: &str) -> String {
     escape_invisible(&escape_line(text))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn script(task: Option<&str>, name: Option<&str>) -> PlannedRun {
+        PlannedRun {
+            run: Zeroizing::new("true".to_owned()),
+            label: None,
+            sudo_secret: None,
+            timeout: Duration::from_secs(1),
+            kind: RunKind::Script,
+            task: task.map(str::to_owned),
+            name: name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_task_step_is_titled_by_its_path_and_name() {
+        assert_eq!(
+            script(Some("tasks[0]"), Some("Boom")).title().as_deref(),
+            Some("tasks[0]  Boom")
+        );
+        assert_eq!(
+            script(Some("tasks[1]"), None).title().as_deref(),
+            Some("tasks[1]")
+        );
+        assert_eq!(script(None, Some("Boom")).title(), None, "a legacy entry");
+    }
+
+    #[test]
+    fn a_blank_task_name_leaves_only_the_path() {
+        assert_eq!(
+            task_title(Some("tasks[2]"), Some("  ")).as_deref(),
+            Some("tasks[2]")
+        );
+    }
+
+    #[test]
+    fn each_kind_of_run_belongs_to_its_entry() {
+        let file = RunKind::File {
+            dest: "/etc/a".to_owned(),
+            run: FileRun {
+                upload: None,
+                skip: true,
+                write: None,
+            },
+        };
+        assert_eq!(
+            file.entry(),
+            Entry::File {
+                dest: "/etc/a".to_owned()
+            }
+        );
+        let service = RunKind::Service {
+            name: "sshd".to_owned(),
+            run: ServiceRun { skip: false },
+        };
+        assert_eq!(
+            service.entry(),
+            Entry::Service {
+                name: "sshd".to_owned()
+            }
+        );
+        assert_eq!(RunKind::Skip.entry(), Entry::Script);
+        assert_eq!(RunKind::Script.entry(), Entry::Script);
+    }
+
+    #[test]
+    fn an_uploads_debug_hides_its_staged_bytes() {
+        let upload = Upload {
+            stage: Zeroizing::new("secret-bytes".to_owned()),
+            cleanup: "rm -f t".to_owned(),
+        };
+        let shown = format!("{upload:?}");
+        assert!(!shown.contains("secret-bytes"), "{shown}");
+        assert!(shown.contains("<12 bytes redacted>"), "{shown}");
+    }
+}
