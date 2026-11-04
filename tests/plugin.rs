@@ -75,6 +75,25 @@ fn apply_runs_the_returned_script_on_the_target() {
 }
 
 #[test]
+fn the_returned_script_sees_the_targets_env() {
+    let (sandbox, _) = pinned(None);
+    sandbox.write_config(
+        "inventory.toml",
+        "[hosts.fake]\nhost = \"fakehost\"\n[hosts.fake.env]\nAPP = \"it's $HOME\"\n",
+    );
+    fs::write(
+        sandbox.plugin_dir().join("fake-plugin.env"),
+        "FAKE_PLUGIN_REPLY='{\"script\":\"printf %s \\\"$APP\\\"\"}'\n",
+    )
+    .unwrap();
+    let out = sandbox.anvil(&["--json", "apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let step = &json(&out)["targets"][0]["steps"][0];
+    assert_eq!(step["run"], "printf %s \"$APP\"", "{step}");
+    assert_eq!(step["stdout"], "it's $HOME", "{step}");
+}
+
+#[test]
 fn plan_lists_the_returned_script_from_the_plugin() {
     let (sandbox, _) = pinned(None);
     let out = sandbox.anvil(&["plan", "--target", "fake"], &[]);

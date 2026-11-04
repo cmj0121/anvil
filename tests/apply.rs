@@ -182,6 +182,49 @@ fn step_output_is_not_logged_above_debug() {
 }
 
 #[test]
+fn a_step_sees_the_targets_env_and_reports_what_was_written() {
+    let sandbox = Sandbox::new("aa");
+    sandbox.write_config(
+        "inventory.toml",
+        "[env]\nAPP = \"it's $HOME a\\\\b\"\n\n[hosts.fake]\nhost = \"fakehost\"\n",
+    );
+    let step = "printf '%s\\n' \"$APP\"";
+    sandbox.write_config(
+        "config.toml",
+        "[[steps]]\nrun = \"printf '%s\\\\n' \\\"$APP\\\"\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let targets = json(&out)["targets"].clone();
+    assert_eq!(targets.as_array().unwrap().len(), 2, "{targets}");
+    for target in targets.as_array().unwrap() {
+        let steps = target["steps"].as_array().unwrap();
+        let run = steps.last().unwrap();
+        assert_eq!(run["run"], step, "{target}");
+        assert_eq!(run["stdout"], "it's $HOME a\\b\n", "{target}");
+    }
+}
+
+#[test]
+fn a_task_run_sees_the_targets_env() {
+    let sandbox = Sandbox::new("aa");
+    sandbox.write_config(
+        "inventory.toml",
+        "[hosts.fake]\nhost = \"fakehost\"\n[hosts.fake.env]\nAPP = \"task $x 'q'\"\n",
+    );
+    sandbox.write_config(
+        "config.toml",
+        "[[tasks]]\nrun = \"printf '%s\\\\n' \\\"$APP\\\"\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let target = &json(&out)["targets"][0];
+    let run = target["steps"].as_array().unwrap().last().unwrap();
+    assert_eq!(run["run"], "printf '%s\\n' \"$APP\"", "{target}");
+    assert_eq!(run["stdout"], "task $x 'q'\n", "{target}");
+}
+
+#[test]
 fn unknown_target_exits_two() {
     let sandbox = Sandbox::new("aa");
     let out = sandbox.anvil(&["apply", "--target", "nope"], &[]);

@@ -16,6 +16,7 @@ use crate::inventory::Target;
 use crate::packages::{self, Packages};
 use crate::plugin::{Plugins, Request};
 use crate::record::{self, FileRecord, Session, TargetRecord};
+use crate::remote::env_prefix;
 use crate::report::{Progress, Report, StepReport, TargetReport, cancelled, failed};
 use crate::secret::Store;
 use crate::services;
@@ -955,7 +956,8 @@ fn package_run(
     }))
 }
 
-/// The step of `item`, the `number`th step, its plugin run on the controller.
+/// The step of `item`, the `number`th step, its plugin run on the controller;
+/// its script starts with the target's env, shown as written.
 fn step_run(
     target: &Target,
     facts: Option<&Facts>,
@@ -998,12 +1000,15 @@ fn step_run(
             let script = plugins.script(name, &request)?;
             log::info!("{}: step from plugin {name}", target.name);
             planned(
-                crate::run::wrap(&script),
+                crate::run::wrap_for(target, &script),
                 Some(script),
                 Some(name.to_owned()),
             )
         }
-        StepKind::Run(run) => planned(run.to_owned(), None, None),
+        StepKind::Run(run) => match env_prefix(&target.env) {
+            prefix if prefix.is_empty() => planned(run.to_owned(), None, None),
+            prefix => planned(prefix + run, Some(run.to_owned()), None),
+        },
     })
 }
 
@@ -1255,6 +1260,56 @@ mod tests {
                 plugin: Some("p".to_owned())
             }
         );
+    }
+
+    /// `target("a")` carrying env `APP=it's`.
+    fn with_env() -> Target {
+        let mut host = target("a");
+        host.env.insert(
+            "APP".to_owned(),
+            ("it's".to_owned(), crate::inventory::Level::Global),
+        );
+        host
+    }
+
+    const APP: &str = "APP='it'\\''s'\nexport APP\n";
+
+    #[test]
+    fn a_run_step_carries_the_targets_env_and_shows_as_written() {
+        let step = Step::script("echo \"$APP\"");
+        let run_item = item(ItemKind::Step(step.clone()), &[], &[]);
+        let run = step_run(
+            &with_env(),
+            None,
+            &run_item,
+            &step,
+            1,
+            &FakePlugins::none(),
+            &Cancel::new(),
+        )
+        .unwrap();
+        assert_eq!(*run.run, format!("{APP}echo \"$APP\""));
+        assert_eq!(run.shown(), "echo \"$APP\"");
+    }
+
+    #[test]
+    fn a_plugin_step_carries_the_targets_env_and_shows_its_reply() {
+        let step = plugin("p");
+        let plugin_item = item(ItemKind::Step(step.clone()), &[], &[]);
+        let plugins = FakePlugins::new(|_, _| Ok("echo \"$APP\"".to_owned()));
+        let run = step_run(
+            &with_env(),
+            Some(&mac()),
+            &plugin_item,
+            &step,
+            1,
+            &plugins,
+            &Cancel::new(),
+        )
+        .unwrap();
+        let wrapped = crate::run::wrap("echo \"$APP\"");
+        assert_eq!(*run.run, format!("{APP}{wrapped}"));
+        assert_eq!(run.shown(), "echo \"$APP\"");
     }
 
     #[test]

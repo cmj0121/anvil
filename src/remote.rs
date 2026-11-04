@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 
 use crate::bytes::{fill_random, hex};
 use crate::config::is_mode;
+use crate::inventory::Resolved;
 
 /// The `find` test for a directory root owns.
 pub(crate) const ROOT_OWNED: &str = "-user 0";
@@ -79,6 +80,15 @@ impl fmt::Display for Body<'_> {
 /// `s` in single quotes for `sh`.
 pub(crate) fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// `env` as `KEY='value'` and `export KEY` lines, to run before a step's
+/// script on the same stdin; empty when `env` is. Keys are checked shell
+/// names, so only the values need quoting.
+pub(crate) fn env_prefix(env: &Resolved<String>) -> String {
+    env.iter()
+        .map(|(key, (value, _))| format!("{key}={}\nexport {key}\n", quote(value)))
+        .collect()
 }
 
 /// What a refusal says when `sudo` could not run a check on `path`.
@@ -567,4 +577,66 @@ pub(crate) fn sweep(sudo: &str, dest: &str) -> String {
     format!(
         "{sudo}find {dir} ! -name . -prune -type f -name {name} -mmin +60 -exec rm -f {{}} + >/dev/null 2>&1\n"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inventory::Level;
+
+    #[test]
+    fn no_env_is_no_prefix() {
+        assert_eq!(env_prefix(&Resolved::new()), "");
+    }
+
+    #[test]
+    fn env_values_are_single_quoted_and_exported() {
+        let env: Resolved<String> = [("A", "it's"), ("B", "$HOME `id` a b \\n"), ("C", "")]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), (value.to_owned(), Level::Global)))
+            .collect();
+        assert_eq!(
+            env_prefix(&env),
+            "A='it'\\''s'\nexport A\n\
+             B='$HOME `id` a b \\n'\nexport B\n\
+             C=''\nexport C\n"
+        );
+    }
+
+    #[test]
+    fn sh_reads_each_env_value_back_literally() {
+        let values = [
+            "it's",
+            "'",
+            "$HOME",
+            "`id`",
+            "$(id)",
+            "a  b",
+            "back\\slash",
+            "\"q\"",
+            "*;|&<>",
+        ];
+        let env: Resolved<String> = (values.iter().enumerate())
+            .map(|(i, value)| (format!("V{i}"), ((*value).to_owned(), Level::Host)))
+            .collect();
+        let mut script = env_prefix(&env);
+        for i in 0..values.len() {
+            script.push_str(&format!("printf '%s\\0' \"$V{i}\"\n"));
+        }
+        let out = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let seen: Vec<&str> = std::str::from_utf8(&out.stdout)
+            .unwrap()
+            .split_terminator('\0')
+            .collect();
+        assert_eq!(seen, values);
+    }
 }

@@ -6,7 +6,7 @@
 //! typed. The script travels on the transport's stdin, never on an argv,
 //! wrapped in `{ : }` so sh parses all of it before a command in it can read
 //! the rest from that same stdin; the `:` keeps a comment-only script a
-//! valid group.
+//! valid group. The target's env, as `KEY='value'` lines, comes first.
 
 use std::fs;
 use std::path::Path;
@@ -23,6 +23,7 @@ use crate::logger::escape_controls;
 use crate::options::{Options, Output};
 use crate::packages::MAX_TIMEOUT;
 use crate::prepared::Prepared;
+use crate::remote::env_prefix;
 use crate::report::{self, Report, TargetReport};
 use crate::step::{PlannedRun, RunKind};
 use crate::transport::{Transport, TransportError};
@@ -40,15 +41,6 @@ pub fn run_targets(
     timeout: Duration,
     on: &mut dyn FnMut(report::Progress<'_>),
 ) -> Report {
-    let runs = [PlannedRun {
-        run: wrap(&script).into(),
-        label: Some(script),
-        sudo_secret: None,
-        timeout,
-        kind: RunKind::Script,
-        task: None,
-        name: None,
-    }];
     let cancel = &prepared.cancel;
     engine::for_each_target(
         "run",
@@ -56,14 +48,36 @@ pub fn run_targets(
         prepared.opts.parallel,
         cancel,
         on,
-        |target| run_target(target, prepared.transport(target), &runs, cancel),
+        |target| {
+            let runs = [script_run(target, &script, timeout)];
+            run_target(target, prepared.transport(target), &runs, cancel)
+        },
     )
+}
+
+/// The one step of `script` on `target`, shown as written.
+fn script_run(target: &Target, script: &str, timeout: Duration) -> PlannedRun {
+    PlannedRun {
+        run: wrap_for(target, script).into(),
+        label: Some(script.to_owned()),
+        sudo_secret: None,
+        timeout,
+        kind: RunKind::Script,
+        task: None,
+        name: None,
+    }
 }
 
 /// `script` as it travels on the transport's stdin; see the module
 /// documentation.
 pub fn wrap(script: &str) -> String {
     format!("{{ :\n{script}\n}}\n")
+}
+
+/// `script` [`wrap`]ped after `target`'s env, as an `anvil run` script and a
+/// plugin step travel.
+pub(crate) fn wrap_for(target: &Target, script: &str) -> String {
+    env_prefix(&target.env) + &wrap(script)
 }
 
 fn run_target(
@@ -163,4 +177,27 @@ fn read_script(source: &Path) -> Result<String, Failure> {
         return Err(Failure::usage("run: the script is empty"));
     }
     Ok(script)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inventory::Level;
+    use crate::test_util::target;
+
+    #[test]
+    fn the_script_carries_each_targets_env_and_shows_as_written() {
+        let script = "echo \"$APP\"";
+        let wrapped = wrap(script);
+        let timeout = Duration::from_secs(1);
+        let mut web = target("web");
+        web.env
+            .insert("APP".to_owned(), ("it's".to_owned(), Level::Host));
+        let run = script_run(&web, script, timeout);
+        assert_eq!(*run.run, format!("APP='it'\\''s'\nexport APP\n{wrapped}"));
+        assert_eq!(run.shown(), script);
+        let bare = script_run(&target("db"), script, timeout);
+        assert_eq!(*bare.run, wrapped);
+        assert_eq!(bare.shown(), script);
+    }
 }
