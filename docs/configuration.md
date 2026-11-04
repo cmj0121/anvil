@@ -336,6 +336,13 @@ facts = { distro = "arch" } # optional; each value equals that fact
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
 
+[[steps]]
+run = "x migrate"          # run and plugin steps take guards; see Guards below
+creates = "/usr/local/bin/x" # optional: skip when this path exists
+removes = "/var/lib/x/old" # optional: run only when this path exists
+onlyif = "test -d /var/lib/x" # optional: run only when this exits 0
+unless = "x migrate --status | grep -q up-to-date" # optional: skip when this exits 0
+
 [plugins.harden]           # optional; see Plugins below
 path = "~/.config/anvil/plugins/harden"
 sha256 = "…"               # the sha256 of the file's bytes
@@ -359,6 +366,52 @@ round trip, or at its timeout plus 10 s when the network is lost. Root processes
 where `sudo -n kill` works (NOPASSWD); elsewhere they run to their end. Inside a step script, `$$`, `$0`, `$PPID`,
 `LINENO` and the text of sh's error messages differ from `sh -s`, as the script runs through `eval` in the wrapper. A
 login shell that is neither POSIX sh, csh nor fish (nushell, say) may reject the command.
+
+**Guards.** A `run` or plugin step runs again on every apply. Guards skip it when the target is already in the
+wanted state, so a step that installs or migrates something is safe to repeat:
+
+```toml
+[[steps]]
+run = "curl -fsSL https://example.com/install.sh | sh"
+creates = "/usr/local/bin/x"                         # skip when the path exists
+
+[[steps]]
+run = "x migrate"
+unless = "x migrate --status | grep -q up-to-date"   # skip when it exits 0
+```
+
+| Guard            | The step runs only when | Otherwise it reports           |
+| ---------------- | ----------------------- | ------------------------------ |
+| `creates = PATH` | `PATH` does not exist   | `skipped run: PATH exists`     |
+| `removes = PATH` | `PATH` exists           | `skipped run: PATH is absent`  |
+| `onlyif = CMD`   | `CMD` exits 0           | `skipped run: onlyif exited N` |
+| `unless = CMD`   | `CMD` exits non-zero    | `skipped run: unless exited 0` |
+
+A symlink counts as existing, even a dangling one. A step may set several guards; it runs only when every one allows
+it. They are checked in the order `creates`, `removes`, `onlyif`, `unless`, and the first that skips ends the check, so
+the guard commands after it do not run. A plugin step's message starts with `skipped plugin NAME:` instead
+(`skipped plugin harden: /etc/x exists`). A skipped step does not fail the target, and the next step runs; its output
+is in [Guarded steps](cli.md#guarded-steps).
+
+Guards go on `[[steps]]` entries and on `run` and `plugin` [tasks](#tasks). `[[files]]`, `[[services]]` and
+`[packages]` have no such keys and refuse them with the parser's `unknown field` message; a guard on any other task is
+exit 2 too ([Tasks](#tasks)). Those kinds already converge, or have no single command to guard.
+
+`creates` and `removes` follow the [`dest` rules](#files): absolute, every character in `[A-Za-z0-9._/@+-]`, no `.` or
+`..` component, not ending with `/`, at most 4096 bytes. A violation is exit 2 naming the step, such as
+``steps[0].creates `usr/local/bin/x`: must be an absolute path``. `onlyif` and `unless` follow the `run` rules: not
+blank, at most 4 KiB, no NUL; else exit 2 with `steps[0].onlyif: is empty or blank`,
+`steps[0].unless: 4097 bytes exceeds the 4096 byte limit` or `steps[0].onlyif: contains NUL`.
+
+The guards travel in the step's own script, so a guarded step is still one round trip. A guard command runs in sh on
+the target as the connecting user, never through sudo (call `sudo -n` in it), and sees the target's
+[`env`](#vars-and-env) as the step does. Its stdin is `/dev/null`, its stdout is dropped and its stderr shows as the
+step's stderr. Its exit status only decides whether the step runs; it never fails the step. A guard command killed by
+a signal (an exit status above 128, as sh reports it) fails the step, with `onlyif was killed by signal N` (or
+`unless`) on stderr and the step exiting with that status; one that hangs runs into the step's time limit, which
+fails the step as a timeout. A plugin step's plugin still runs on the controller, before the guards are checked on the
+target. `anvil plan` lists each step's guards and never runs them ([`anvil plan`](cli.md#anvil-plan)). A step without
+guards runs and prints exactly as before.
 
 The sections above run in a fixed order: packages, files, services, steps. To choose the order, use [`[[tasks]]`](#tasks)
 instead of `[[files]]`, `[[services]]`, `[[steps]]` and the lists in `[packages]`.
@@ -901,6 +954,11 @@ failed task ends that target; the other targets go on. A `packages` task that as
 include with no tasks add no step. Every file and service task is its own step, and repeats are allowed: the
 [`[[services]]` duplicate rule](#services) does not apply, because stop, migrate, start is how a migration is written.
 A config with `[[tasks]]` has no default `hostname` step.
+
+**Guards.** A `run` or `plugin` task may also set the [guards](#config) `creates`, `removes`, `onlyif` and `unless`,
+with the same rules as on `[[steps]]`. On a `packages`, `file`, `service`, `include` or `tasks` task a guard is exit 2
+naming the first one set, in that order, at any depth: `tasks[0].creates: only on a run or plugin task`,
+`tasks[0].tasks[0].onlyif: only on a run or plugin task`.
 
 **Nesting.** Children inherit `tags` and `facts`, and every level must match: a target must carry every tag along the chain,
 facts are ANDed. The same

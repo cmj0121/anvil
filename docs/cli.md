@@ -698,6 +698,9 @@ In a legacy config, each `[[services]]` entry is one step on every target, after
 service to its state under the target's init when the target's tags and facts match, and shows as skipped when they
 do not ([Service steps](#service-steps)).
 
+A `run` or plugin step with guards (`creates`, `removes`, `onlyif`, `unless`) checks them on the target first and shows
+as skipped when one says so, with its reason ([Guarded steps](#guarded-steps)).
+
 Each `install` name goes into the script as the resolved manager's `[packages.alias]` entry, else as is
 ([Aliases](packages.md#aliases)). With this config apt and dnf install `fd-find`, and brew, pacman and apk `fd`; `anvil
 plan` shows the same script:
@@ -1146,12 +1149,16 @@ secret is set and free of control characters is not checked, so plan can pass wh
 - A [templated](configuration.md#templating) file step adds `rendered N bytes, sha256 HEX` under its `would $ file DEST`
   line: the size and the full sha256 of that target's rendered text, the bytes apply would write. A target whose render
   fails ends in `✘` with the template message ([Templating](configuration.md#templating)).
+- A step with guards adds one line per guard under its `would $` line, in the order they are checked: `creates PATH`,
+  `removes PATH`, `onlyif CMD`, `unless CMD` ([Guarded steps](#guarded-steps)). plan never runs them, so it cannot
+  tell whether apply would skip the step.
 - The block ends with `✔ N steps`, or `✘ REASON` for a target that failed. The summary is `N targets, nothing executed`,
   with `M failed` before `nothing executed` when any target failed (`2 targets, 1 failed, nothing executed`).
 - Colour and escaping follow apply's rules.
 
 `--json` is apply's document with `"executed": false` first; a step has its `run` and, when apply would type a sudo
-password, its `sudo_secret`, plus `task` and `name` on a tasks config, but never `code`, `stdout` or `stderr`. A
+password, its `sudo_secret`, plus `task` and `name` on a tasks config and `guards` on a guarded step, but never
+`code`, `stdout` or `stderr`. A
 target with vars or env also has `vars` and `env`, as in doctor's `--json`
 (`"vars": {"port": {"value": 8080, "level": "tag:web"}}`), and a step's `run` is the script as written, without the
 env lines:
@@ -1386,6 +1393,85 @@ A probe that exits non-zero or prints bad output fails the target with `probe: R
 can list the script; only the script is not run. A plugin must therefore have no side effects. It also runs again
 under apply, so a plugin that does not always give the same reply to the same request (one that reads the clock, a
 random number or a remote API) can make plan show a script that apply then does not run.
+
+### Guarded steps
+
+A `run` or plugin step can carry [guards](configuration.md#config): `creates`, `removes`, `onlyif` and `unless`. They
+are checked on the target, in that order, in the same round trip as the step, and when one says skip the script does
+not run. With this config:
+
+```toml
+[[steps]]
+run = "curl -fsSL https://example.com/install.sh | sh"
+creates = "/usr/local/bin/x"
+
+[[steps]]
+run = "x migrate"
+unless = "x migrate --status | grep -q up-to-date"
+```
+
+`anvil apply` on a target that already has both prints, at every `-v` level:
+
+```text
+▶ local
+  $ skipped run: /usr/local/bin/x exists
+  $ skipped run: unless exited 0
+  ✔ ok · 2 steps
+
+1 ok, 0 failed
+```
+
+- **Skip lines.** `skipped run: PATH exists` (`creates`), `skipped run: PATH is absent` (`removes`),
+  `skipped run: onlyif exited N` and `skipped run: unless exited 0`. A plugin step's line starts with
+  `skipped plugin NAME:` instead, as in `skipped plugin harden: /etc/x exists`. The line shows in place of `$ RUN`.
+- **Counted, not failed.** A skipped step counts in `✔ ok · N steps` and in `✘ step N`, and the target's next step
+  runs. It changed nothing, so [`anvil rollback`](#anvil-rollback) does not list it under `cannot undo`.
+- **A step that runs** shows as any step does, with its `run` text alone: the guards are not part of `$ RUN` or of the
+  JSON `run`. A guard's stderr shows as the step's stderr; its stdout is dropped.
+- **Guard failures.** A guard's exit status only decides whether the step runs. A guard command killed by a signal
+  fails the step: stderr has `onlyif was killed by signal 9` (or `unless`) and the target ends with
+  `✘ step 2 exited 137`. A guard that hangs runs into the step's time limit and ends with `✘ timed out after 30 s`.
+- **Plugins.** A plugin step's plugin still runs on the controller before the target's first step, whatever its guards
+  then decide on the target.
+
+`--json` marks a skipped step with `skipped: true` and a `reason`, the skip line without its `skipped run:` (or
+`skipped plugin NAME:`) prefix. `reason` is omitted on every other step. A skipped step's `stdout` and `stderr` keep
+any other output of the round trip, such as login-shell or motd noise and the guard command's stderr; only the skip
+line is removed, and the guard command's own stdout is dropped:
+
+```json
+{
+  "run": "skipped run: /usr/local/bin/x exists",
+  "code": 0,
+  "stdout": "",
+  "stderr": "",
+  "skipped": true,
+  "reason": "/usr/local/bin/x exists"
+}
+```
+
+`anvil plan` shows the guards under each step and runs none of them, so plan still runs nothing on the target:
+
+```text
+▶ local
+  would $ curl -fsSL https://example.com/install.sh | sh
+    creates /usr/local/bin/x
+  would $ x migrate
+    unless x migrate --status | grep -q up-to-date
+  ✔ 2 steps
+
+1 target, nothing executed
+```
+
+A multi-line `onlyif` or `unless` shows its first line and `…`. In `plan --json` a guarded step has `guards`, holding
+only the keys that are set:
+
+```json
+{
+  "run": "x migrate",
+  "guards": { "unless": "x migrate --status | grep -q up-to-date" }
+}
+```
 
 ### File steps
 

@@ -324,6 +324,13 @@ facts = { distro = "arch" } # optional; each value equals that fact
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
 
+[[steps]]
+run = "x migrate"          # run and plugin steps take guards; see Guards below
+creates = "/usr/local/bin/x" # optional: skip when this path exists
+removes = "/var/lib/x/old" # optional: run only when this path exists
+onlyif = "test -d /var/lib/x" # optional: run only when this exits 0
+unless = "x migrate --status | grep -q up-to-date" # optional: skip when this exits 0
+
 [plugins.harden]           # optional; see Plugins below
 path = "~/.config/anvil/plugins/harden"
 sha256 = "…"               # the sha256 of the file's bytes
@@ -345,6 +352,50 @@ stdin 為 `/dev/null`，因此 step 中的 `cat` 或 `read` 會立刻得到 EOF�
 10 秒時終止。它經 `sudo` 啟動的 root 行程只在 `sudo -n kill` 可用（NOPASSWD）時才會終止；其他情況下會執行到結束。
 在 step 腳本中，`$$`、`$0`、`$PPID`、`LINENO` 與 sh 錯誤訊息的文字都與 `sh -s` 不同，因為腳本在包裝中經
 `eval` 執行。既非 POSIX sh、也非 csh 或 fish 的登入 shell（例如 nushell）可能拒絕這個指令。
+
+**Guard（守衛）。** `run` 或 plugin step 每次 apply 都會再執行。guard 在 target 已處於想要的狀態時略過它，
+因此安裝或遷移東西的 step 可以安全地重複執行：
+
+```toml
+[[steps]]
+run = "curl -fsSL https://example.com/install.sh | sh"
+creates = "/usr/local/bin/x"                         # skip when the path exists
+
+[[steps]]
+run = "x migrate"
+unless = "x migrate --status | grep -q up-to-date"   # skip when it exits 0
+```
+
+| Guard            | step 只在下列情況執行 | 否則回報                       |
+| ---------------- | --------------------- | ------------------------------ |
+| `creates = PATH` | `PATH` 不存在         | `skipped run: PATH exists`     |
+| `removes = PATH` | `PATH` 存在           | `skipped run: PATH is absent`  |
+| `onlyif = CMD`   | `CMD` 以 0 結束       | `skipped run: onlyif exited N` |
+| `unless = CMD`   | `CMD` 以非 0 結束     | `skipped run: unless exited 0` |
+
+symlink 視為存在，即使是懸空的。一個 step 可設定多個 guard；只有每個都允許時才執行。
+檢查順序為 `creates`、`removes`、`onlyif`、`unless`，第一個決定略過的 guard 即結束檢查，其後的 guard 指令不會執行。
+plugin step 的訊息改以 `skipped plugin NAME:` 開頭（`skipped plugin harden: /etc/x exists`）。
+被略過的 step 不會讓 target 失敗，下一個 step 照常執行；其輸出見 [Guarded steps](cli.zh-TW.md#guarded-steps)。
+
+guard 可寫在 `[[steps]]` 項目以及 `run` 與 `plugin` [task](#tasks) 上。`[[files]]`、`[[services]]` 與 `[packages]`
+沒有這些鍵，會以解析器的 `unknown field` 訊息拒絕；其他 task 上的 guard 也以 2 結束（[Tasks](#tasks)）。
+這些種類本身已會收斂，或沒有單一指令可守衛。
+
+`creates` 與 `removes` 遵循 [`dest` 規則](#files)：絕對路徑、每個字元都屬於 `[A-Za-z0-9._/@+-]`、沒有 `.` 或 `..`
+組成部分、不以 `/` 結尾、至多 4096 位元組。違規時以 2 結束並指名該 step，例如
+``steps[0].creates `usr/local/bin/x`: must be an absolute path``。`onlyif` 與 `unless` 遵循 `run` 的規則：
+不可空白、至多 4 KiB、不含 NUL；否則以 2 結束並顯示 `steps[0].onlyif: is empty or blank`、
+`steps[0].unless: 4097 bytes exceeds the 4096 byte limit` 或 `steps[0].onlyif: contains NUL`。
+
+guard 隨 step 自己的腳本送出，因此有 guard 的 step 仍只需一次往返。guard 指令在 target 上以 sh、以連線使用者的身分執行，
+從不經過 sudo（需要時在其中呼叫 `sudo -n`），並與 step 一樣看得到 target 的 [`env`](#vars-與-env)。
+它的 stdin 為 `/dev/null`，stdout 會被丟棄，stderr 顯示為該 step 的 stderr。它的結束碼只決定 step 是否執行，
+從不讓 step 失敗。被訊號終止的 guard 指令（結束碼大於 128，sh 以此回報）會讓 step 失敗：stderr 顯示
+`onlyif was killed by signal N`（或 `unless`），step 以該結束碼結束；卡住的 guard 會用完 step 的時間限制，
+以逾時讓 step 失敗。plugin step 的 plugin 仍會先在控制端執行，之後才在 target 上檢查 guard。
+`anvil plan` 列出每個 step 的 guard，且從不執行它們（[`anvil plan`](cli.zh-TW.md#anvil-plan)）。
+沒有 guard 的 step 的執行與輸出都與以前完全相同。
 
 上述區段依固定順序執行：套件、檔案、服務、step。要自行決定順序，請改用 [`[[tasks]]`](#tasks)，
 取代 `[[files]]`、`[[services]]`、`[[steps]]` 與 `[packages]` 中的清單。
@@ -842,6 +893,11 @@ selector 不符合的 task 仍是一個 step，回報為略過（`skipped run: n
 沒有要做任何事的 `packages` task、空的 `tasks` 與沒有 task 的 include 都不產生 step。
 每個 file 與 service task 都是自己的 step，可以重複：[`[[services]]` 的重複規則](#services)不適用，
 因為停止、migration、啟動就是這樣寫的。含 `[[tasks]]` 的 config 沒有預設的 `hostname` step。
+
+**Guard。** `run` 或 `plugin` task 也可設定 [guard](#config) `creates`、`removes`、`onlyif` 與 `unless`，
+規則與 `[[steps]]` 相同。在 `packages`、`file`、`service`、`include` 或 `tasks` task 上，guard 在任何深度都以 2 結束，
+並依上述順序指名第一個設定的 guard：`tasks[0].creates: only on a run or plugin task`、
+`tasks[0].tasks[0].onlyif: only on a run or plugin task`。
 
 **巢狀。** 子 task 繼承 `tags` 與 `facts`，每一層都必須符合：target 必須帶有鏈上的每個 tag，fact 以 AND 結合。
 同一條鏈上同一個 fact 鍵有兩個不同的值永遠不會符合，因此以 2 結束並顯示

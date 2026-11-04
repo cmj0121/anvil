@@ -672,6 +672,9 @@ target 的 tag 與 fact 符合時複製檔案，不符合時顯示為略過（[F
 在舊版 config 中，每個 `[[services]]` 項目在每個 target 上都是一個 step，排在 file step 之後、`[[steps]]` 之前：
 target 的 tag 與 fact 符合時以 target 的 init 把服務帶到其狀態，不符合時顯示為略過（[Service steps](#service-steps)）。
 
+帶有 guard（`creates`、`removes`、`onlyif`、`unless`）的 `run` 或 plugin step 會先在 target 上檢查它們，
+有 guard 決定略過時顯示為略過並附上原因（[Guarded steps](#guarded-steps)）。
+
 每個 `install` 名稱在腳本中會換成解析出的管理器的 `[packages.alias]` 項目，沒有則原樣使用（[別名](packages.zh-TW.md#別名)）。
 以下面的 config 而言，apt 與 dnf 安裝 `fd-find`，brew、pacman 與 apk 安裝 `fd`；`anvil plan` 顯示相同的腳本：
 
@@ -1080,12 +1083,15 @@ secret 由 `anvil doctor` 檢查。
 - [範本](configuration.zh-TW.md#templating)檔案 step 在其 `would $ file DEST` 行下方多一行 `rendered N bytes, sha256 HEX`：
   該 target 算繪文字的大小與完整 sha256，也就是 apply 會寫入的位元組。算繪失敗的 target 以 `✘` 加上範本訊息結束
   （[Templating](configuration.zh-TW.md#templating)）。
+- 帶有 guard 的 step 在其 `would $` 行下方每個 guard 多一行，依檢查順序：`creates PATH`、`removes PATH`、
+  `onlyif CMD`、`unless CMD`（[Guarded steps](#guarded-steps)）。plan 從不執行它們，因此無法得知 apply 是否會略過該 step。
 - 區塊以 `✔ N steps` 結尾，失敗的 target 則為 `✘ REASON`。
   摘要為 `N targets, nothing executed`，有 target 失敗時在 `nothing executed` 前加上 `M failed`（`2 targets, 1 failed, nothing executed`）。
 - 顏色與跳脫規則與 apply 相同。
 
 `--json` 是 apply 的文件，最前面加上 `"executed": false`；
-step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`，以及 tasks config 上的 `task` 與 `name`，絕不會有 `code`、`stdout` 或 `stderr`。
+step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`、tasks config 上的 `task` 與 `name`，以及有 guard 的 step 的
+`guards`，絕不會有 `code`、`stdout` 或 `stderr`。
 有 vars 或 env 的 target 另有 `vars` 與 `env`，與 doctor 的 `--json` 相同
 （`"vars": {"port": {"value": 8080, "level": "tag:web"}}`），而 step 的 `run` 是照寫的腳本，不含 env 行：
 
@@ -1313,6 +1319,82 @@ plan 顯示 `would $ SCRIPT (from plugin NAME)`，其 `--json` 的 step 帶有 `
 **plan 也會執行 plugin。** `anvil plan` 會像 apply 一樣在控制端執行每個 plugin step 的 plugin，才能列出腳本；只是不執行腳本。
 因此 plugin 不可以有副作用。它在 apply 時會再執行一次，所以對相同請求不一定給出相同回覆的 plugin
 （讀取時鐘、亂數或遠端 API 的 plugin）可能讓 plan 顯示的腳本與 apply 接著執行的不同。
+
+### Guarded steps
+
+`run` 或 plugin step 可以帶有 [guard](configuration.zh-TW.md#config)：`creates`、`removes`、`onlyif` 與 `unless`。
+它們依此順序在 target 上檢查，與 step 在同一次往返中，有 guard 決定略過時腳本就不執行。以下面的 config 而言：
+
+```toml
+[[steps]]
+run = "curl -fsSL https://example.com/install.sh | sh"
+creates = "/usr/local/bin/x"
+
+[[steps]]
+run = "x migrate"
+unless = "x migrate --status | grep -q up-to-date"
+```
+
+在兩者都已具備的 target 上，`anvil apply` 在每個 `-v` 等級都印出：
+
+```text
+▶ local
+  $ skipped run: /usr/local/bin/x exists
+  $ skipped run: unless exited 0
+  ✔ ok · 2 steps
+
+1 ok, 0 failed
+```
+
+- **略過行。** `skipped run: PATH exists`（`creates`）、`skipped run: PATH is absent`（`removes`）、
+  `skipped run: onlyif exited N` 與 `skipped run: unless exited 0`。plugin step 的行改以 `skipped plugin NAME:` 開頭，
+  例如 `skipped plugin harden: /etc/x exists`。這一行顯示在 `$ RUN` 的位置。
+- **計入，不算失敗。** 被略過的 step 計入 `✔ ok · N steps` 與 `✘ step N`，該 target 的下一個 step 照常執行。
+  它沒有改變任何東西，因此 [`anvil rollback`](#anvil-rollback) 不會把它列在 `cannot undo` 之下。
+- **執行了的 step** 與其他 step 顯示方式相同，只有它的 `run` 文字：guard 不屬於 `$ RUN`，也不屬於 JSON 的 `run`。
+  guard 的 stderr 顯示為該 step 的 stderr；其 stdout 會被丟棄。
+- **guard 失敗。** guard 的結束碼只決定 step 是否執行。被訊號終止的 guard 指令會讓 step 失敗：stderr 出現
+  `onlyif was killed by signal 9`（或 `unless`），target 以 `✘ step 2 exited 137` 結束。
+  卡住的 guard 會用完 step 的時間限制，以 `✘ timed out after 30 s` 結束。
+- **Plugin。** plugin step 的 plugin 仍會在 target 的第一個 step 之前於控制端執行，不論其 guard 之後在 target 上如何決定。
+
+`--json` 以 `skipped: true` 與 `reason` 標示被略過的 step，`reason` 是略過行去掉 `skipped run:`
+（或 `skipped plugin NAME:`）前綴後的部分。其他 step 都省略 `reason`。被略過的 step 的 `stdout` 與 `stderr`
+保留該次往返的其他輸出，例如登入 shell 或 motd 的雜訊以及 guard 指令的 stderr；只移除略過行，
+guard 指令自己的 stdout 則被丟棄：
+
+```json
+{
+  "run": "skipped run: /usr/local/bin/x exists",
+  "code": 0,
+  "stdout": "",
+  "stderr": "",
+  "skipped": true,
+  "reason": "/usr/local/bin/x exists"
+}
+```
+
+`anvil plan` 在每個 step 下方顯示其 guard，且一個都不執行，因此 plan 仍然不在 target 上執行任何東西：
+
+```text
+▶ local
+  would $ curl -fsSL https://example.com/install.sh | sh
+    creates /usr/local/bin/x
+  would $ x migrate
+    unless x migrate --status | grep -q up-to-date
+  ✔ 2 steps
+
+1 target, nothing executed
+```
+
+多行的 `onlyif` 或 `unless` 顯示第一行加上 `…`。在 `plan --json` 中，有 guard 的 step 帶有 `guards`，只包含有設定的鍵：
+
+```json
+{
+  "run": "x migrate",
+  "guards": { "unless": "x migrate --status | grep -q up-to-date" }
+}
+```
 
 ### File steps
 
