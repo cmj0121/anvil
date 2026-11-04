@@ -1,0 +1,4 @@
+tasks:
+  - name: nginx
+    service: { name: nginx, state: started }
+    unless: "pgrep nginx"

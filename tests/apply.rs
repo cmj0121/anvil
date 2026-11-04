@@ -96,7 +96,7 @@ fn json_has_the_d5_shape() {
         assert_eq!(target["ok"], true);
         assert_eq!(
             target["steps"],
-            serde_json::json!([{"run": "hostname", "code": 0, "stdout": name, "stderr": ""}])
+            serde_json::json!([{"run": "hostname", "code": 0, "stdout": name, "stderr": "", "changed": true}])
         );
     }
 }
@@ -159,7 +159,7 @@ fn a_failing_step_stops_its_target_and_exits_one() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         json(&out)["targets"][0]["steps"],
-        serde_json::json!([{"run": "echo before; echo oops >&2; exit 4", "code": 4, "stdout": "before\n", "stderr": "oops\n"}])
+        serde_json::json!([{"run": "echo before; echo oops >&2; exit 4", "code": 4, "stdout": "before\n", "stderr": "oops\n", "changed": false}])
     );
 }
 
@@ -222,6 +222,288 @@ fn a_task_run_sees_the_targets_env() {
     let run = target["steps"].as_array().unwrap().last().unwrap();
     assert_eq!(run["run"], "printf '%s\\n' \"$APP\"", "{target}");
     assert_eq!(run["stdout"], "task $x 'q'\n", "{target}");
+}
+
+/// A sandbox with the fake host, a file `made` and no `absent` beside it,
+/// and `config` with `MADE` and `ABSENT` replaced by their paths. Returns
+/// the sandbox and both paths.
+fn guarded(config: &str) -> (Sandbox, String, String) {
+    let sandbox = Sandbox::new("ag");
+    sandbox.with_fake_host();
+    let made = sandbox.root().join("made");
+    std::fs::write(&made, "").unwrap();
+    let made = made.to_str().unwrap().to_owned();
+    let absent = sandbox.root().join("absent").to_str().unwrap().to_owned();
+    sandbox.write_config(
+        "config.toml",
+        &config.replace("MADE", &made).replace("ABSENT", &absent),
+    );
+    (sandbox, made, absent)
+}
+
+/// Each step's `run`, `skipped` and `reason` in `target`'s JSON report.
+fn skips(target: &serde_json::Value) -> Vec<(String, bool, Option<String>)> {
+    target["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| {
+            (
+                step["run"].as_str().unwrap().to_owned(),
+                step["skipped"].as_bool().unwrap_or(false),
+                step["reason"].as_str().map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+const EACH_GUARD: &str = "\
+[[steps]]\nrun = \"echo creates-ran\"\ncreates = \"MADE\"\n\n\
+[[steps]]\nrun = \"echo creates-absent-ran\"\ncreates = \"ABSENT\"\n\n\
+[[steps]]\nrun = \"echo removes-ran\"\nremoves = \"ABSENT\"\n\n\
+[[steps]]\nrun = \"echo removes-made-ran\"\nremoves = \"MADE\"\n\n\
+[[steps]]\nrun = \"echo onlyif-ran\"\nonlyif = \"exit 3\"\n\n\
+[[steps]]\nrun = \"echo onlyif-true-ran\"\nonlyif = \"true\"\n\n\
+[[steps]]\nrun = \"echo unless-ran\"\nunless = \"true\"\n\n\
+[[steps]]\nrun = \"echo unless-false-ran\"\nunless = \"false\"\n";
+
+#[test]
+fn each_guard_skips_or_runs_on_local_and_the_fake_host() {
+    let (sandbox, made, absent) = guarded(EACH_GUARD);
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let skipped = |line: String, reason: String| (line, true, Some(reason));
+    let ran = |run: &str| (run.to_owned(), false, None);
+    let expected = vec![
+        skipped(
+            format!("skipped run: {made} exists"),
+            format!("{made} exists"),
+        ),
+        ran("echo creates-absent-ran"),
+        skipped(
+            format!("skipped run: {absent} is absent"),
+            format!("{absent} is absent"),
+        ),
+        ran("echo removes-made-ran"),
+        skipped(
+            "skipped run: onlyif exited 3".to_owned(),
+            "onlyif exited 3".to_owned(),
+        ),
+        ran("echo onlyif-true-ran"),
+        skipped(
+            "skipped run: unless exited 0".to_owned(),
+            "unless exited 0".to_owned(),
+        ),
+        ran("echo unless-false-ran"),
+    ];
+    for target in value["targets"].as_array().unwrap() {
+        assert_eq!(skips(target), expected, "{target}");
+        let steps = target["steps"].as_array().unwrap();
+        assert_eq!(
+            steps[0],
+            serde_json::json!({
+                "run": format!("skipped run: {made} exists"), "code": 0, "stdout": "",
+                "stderr": "", "skipped": true, "reason": format!("{made} exists"),
+                "changed": false
+            })
+        );
+        assert_eq!(steps[1]["stdout"], "creates-absent-ran\n");
+    }
+    assert_eq!(value["targets"].as_array().unwrap().len(), 2);
+
+    let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ fake\n  $ skipped run: {made} exists\n  $ skipped run: {absent} is absent\n  \
+             $ skipped run: onlyif exited 3\n  $ skipped run: unless exited 0\n  \
+             ✔ ok · 8 steps\n\n1 ok, 0 failed\n"
+        )
+    );
+}
+
+#[test]
+fn several_guards_combine_with_and_in_order() {
+    let (sandbox, made, _) = guarded(
+        "[[steps]]\nrun = \"echo ran\"\ncreates = \"ABSENT\"\nremoves = \"MADE\"\n\
+         onlyif = \"true\"\nunless = \"true\"\n\n\
+         [[steps]]\nrun = \"echo ran\"\ncreates = \"MADE\"\nonlyif = \"exit 2\"\n\n\
+         [[steps]]\nrun = \"echo ran\"\nonlyif = \"exit 2\"\nunless = \"true\"\n\n\
+         [[steps]]\nrun = \"echo all-allow\"\ncreates = \"ABSENT\"\nremoves = \"MADE\"\n\
+         onlyif = \"true\"\nunless = \"false\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for target in json(&out)["targets"].as_array().unwrap() {
+        let reasons: Vec<_> = skips(target).into_iter().map(|(_, _, r)| r).collect();
+        assert_eq!(
+            reasons,
+            [
+                Some("unless exited 0".to_owned()),
+                Some(format!("{made} exists")),
+                Some("onlyif exited 2".to_owned()),
+                None,
+            ],
+            "{target}"
+        );
+        assert_eq!(target["steps"][3]["stdout"], "all-allow\n");
+    }
+}
+
+#[test]
+fn guard_commands_see_the_targets_env() {
+    let (sandbox, _, _) = guarded(
+        "[[steps]]\nrun = \"echo ran\"\nonlyif = \"[ \\\"$APP\\\" = 'it s' ]\"\n\n\
+         [[steps]]\nrun = \"echo ran\"\nunless = \"[ \\\"$APP\\\" = 'it s' ]\"\n",
+    );
+    sandbox.write_config(
+        "inventory.toml",
+        "[env]\nAPP = \"it s\"\n\n[hosts.fake]\nhost = \"fakehost\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for target in json(&out)["targets"].as_array().unwrap() {
+        assert_eq!(
+            skips(target),
+            [
+                ("echo ran".to_owned(), false, None),
+                (
+                    "skipped run: unless exited 0".to_owned(),
+                    true,
+                    Some("unless exited 0".to_owned())
+                ),
+            ],
+            "{target}"
+        );
+    }
+}
+
+#[test]
+fn a_noisy_login_shell_does_not_hide_or_fake_a_skip() {
+    let (sandbox, made, _) = guarded(
+        "[[steps]]\nrun = \"echo ran\"\ncreates = \"MADE\"\n\n\
+         [[steps]]\nrun = \"echo ran\"\nunless = \"false\"\n",
+    );
+    let noise = format!(
+        "motd anvil-guard-{} skipped run: unless exited 0",
+        "0".repeat(32)
+    );
+    let out = sandbox.anvil(
+        &["--json", "apply", "--target", "fake"],
+        &[("FAKE_SSH_CLIENT_STDOUT", &noise)],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let target = &json(&out)["targets"][0];
+    assert_eq!(
+        skips(target),
+        [
+            (
+                format!("skipped run: {made} exists"),
+                true,
+                Some(format!("{made} exists"))
+            ),
+            ("echo ran".to_owned(), false, None),
+        ],
+        "{target}"
+    );
+    assert_eq!(target["steps"][0]["stdout"], format!("{noise}\n"), "kept");
+    assert_eq!(target["steps"][1]["stdout"], format!("{noise}\nran\n"));
+}
+
+#[test]
+fn a_step_printing_a_look_alike_skip_line_still_ran() {
+    let line = format!(
+        "anvil-guard-{} skipped run: unless exited 0",
+        "a".repeat(32)
+    );
+    let (sandbox, _, _) = guarded(&format!(
+        "[[steps]]\nrun = \"echo '{line}'\"\nunless = \"false\"\n\n\
+         [[steps]]\nrun = \"echo 'skipped run: unless exited 0'\"\nunless = \"false\"\n"
+    ));
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for target in json(&out)["targets"].as_array().unwrap() {
+        for (step, stdout) in target["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip([line.as_str(), "skipped run: unless exited 0"])
+        {
+            assert_eq!(step.get("skipped"), None, "{target}");
+            assert_eq!(step.get("reason"), None, "{target}");
+            assert_eq!(step["stdout"], format!("{stdout}\n"), "{target}");
+        }
+    }
+}
+
+#[test]
+fn a_killed_guard_fails_the_step() {
+    let (sandbox, _, _) = guarded(
+        "[[steps]]\nrun = \"echo never\"\nonlyif = \"sh -c 'kill -9 $$'\"\n\n\
+         [[steps]]\nrun = \"echo never-either\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    for target in json(&out)["targets"].as_array().unwrap() {
+        assert_eq!(target["ok"], false, "{target}");
+        let steps = target["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 1, "the target stopped: {target}");
+        assert_eq!(steps[0]["run"], "echo never");
+        assert_eq!(steps[0]["code"], 137);
+        assert_eq!(steps[0]["stdout"], "");
+        let stderr = steps[0]["stderr"].as_str().unwrap();
+        assert!(
+            stderr.ends_with("onlyif was killed by signal 9\n"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_guarded_task_reports_its_skip_under_its_title() {
+    let (sandbox, made, _) =
+        guarded("[[tasks]]\nname = \"Install x\"\nrun = \"echo ran\"\ncreates = \"MADE\"\n");
+    let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ fake\n  tasks[0]  Install x\n  $ skipped run: {made} exists\n  \
+             ✔ ok · 1 step\n\n1 ok, 0 failed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "fake"], &[]);
+    let step = &json(&out)["targets"][0]["steps"][0];
+    assert_eq!(step["task"], "tasks[0]", "{step}");
+    assert_eq!(step["reason"], format!("{made} exists"), "{step}");
+}
+
+#[test]
+fn no_output_or_log_shows_the_guarded_script_or_its_nonce() {
+    let (sandbox, _, _) = guarded(
+        "[[steps]]\nrun = \"echo ran\"\ncreates = \"MADE\"\n\n\
+         [[steps]]\nrun = \"echo ran; exit 3\"\nunless = \"false\"\n",
+    );
+    let log = sandbox.root().join("ssh.log");
+    for args in [
+        &["-vvv", "--json", "apply"][..],
+        &["-vvv", "apply"],
+        &["-vvv", "--json", "plan"],
+        &["-vvv", "plan"],
+    ] {
+        let out = sandbox.anvil(args, &[("FAKE_SSH_LOG", log.to_str().unwrap())]);
+        for (what, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+            let shown = text(bytes);
+            assert!(!shown.contains("anvil-guard-"), "{args:?} {what}: {shown}");
+            assert!(!shown.contains("anvil_guard"), "{args:?} {what}: {shown}");
+        }
+    }
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert!(!log.contains("anvil-guard-"), "{log}");
+    let record = serde_json::to_string(&sandbox.last_apply()).unwrap();
+    assert!(!record.contains("anvil-guard-"), "{record}");
 }
 
 #[test]
@@ -326,9 +608,9 @@ fn file_bytes_never_show_in_json_logs_or_argv() {
     assert_eq!(
         value["targets"][1]["steps"],
         serde_json::json!([
-            {"run": format!("file {web}"), "code": 0, "stdout": format!("wrote {web}\n"), "stderr": ""},
-            {"run": format!("skipped file {local}: no match"), "code": 0, "stdout": "", "stderr": "", "skipped": true},
-            {"run": "echo after", "code": 0, "stdout": "after\n", "stderr": ""},
+            {"run": format!("file {web}"), "code": 0, "stdout": format!("wrote {web}\n"), "stderr": "", "changed": true},
+            {"run": format!("skipped file {local}: no match"), "code": 0, "stdout": "", "stderr": "", "skipped": true, "changed": false},
+            {"run": "echo after", "code": 0, "stdout": "after\n", "stderr": "", "changed": true},
         ])
     );
     assert_no_file_text("stdout", &text(&out.stdout));
@@ -483,7 +765,7 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(
         json(&out)["targets"][0]["steps"][0],
-        serde_json::json!({"run": format!("file {dest}"), "code": 0, "stdout": format!("unchanged {dest}\n"), "stderr": ""})
+        serde_json::json!({"run": format!("file {dest}"), "code": 0, "stdout": format!("unchanged {dest}\n"), "stderr": "", "changed": false})
     );
     assert_clean(&out);
 
@@ -560,7 +842,9 @@ fn parallel_one_prints_exactly_what_the_default_prints() {
         )
     );
     let out = sandbox.anvil(&["--json", "--parallel", "1", "apply"], &[]);
-    let step = format!(r#"[{{"run":"hostname","code":0,"stdout":"{name}\n","stderr":""}}]"#);
+    let step = format!(
+        r#"[{{"run":"hostname","code":0,"stdout":"{name}\n","stderr":"","changed":true}}]"#
+    );
     assert_eq!(
         text(&out.stdout),
         format!(
@@ -1842,7 +2126,9 @@ fn a_legacy_config_has_no_task_or_name_in_json() {
     sandbox.write_config("config.toml", "[[steps]]\nrun = \"true\"\n");
     let out = sandbox.anvil(&["--json", "apply"], &[]);
     assert!(
-        text(&out.stdout).contains(r#""steps":[{"run":"true","code":0,"stdout":"","stderr":""}]"#),
+        text(&out.stdout).contains(
+            r#""steps":[{"run":"true","code":0,"stdout":"","stderr":"","changed":true}]"#
+        ),
         "{}",
         text(&out.stdout)
     );
@@ -2153,4 +2439,552 @@ fn a_render_over_one_mib_fails_its_target() {
         "files[0].src `site.j2`: template: rendered output exceeds the 1 MiB limit"
     );
     assert!(!std::path::Path::new(&web).exists());
+}
+
+/// The fake host tagged `web`, each target's env `WHO` its name, and a
+/// config: `motd.txt` copied to `<root>/out/<name>.conf` on each target,
+/// notifying `flush`, and to a dest no target matches, notifying `never`;
+/// then `steps` (TOML, `ROOT` standing for the root); then the handlers
+/// `bad` (exits 3 unless `<root>/fixed` exists), `log`, `never` and
+/// `flush`, each appending its name to `<root>/<name>.log` when it runs.
+fn with_handlers(sandbox: &Sandbox, steps: &str) {
+    let root = sandbox.root().display().to_string();
+    sandbox.write_config(
+        "inventory.toml",
+        "[env]\nWHO = \"local\"\n\n[hosts.fake]\nhost = \"fakehost\"\ntags = [\"web\"]\n\
+         [hosts.fake.env]\nWHO = \"fake\"\n",
+    );
+    std::fs::create_dir(sandbox.root().join("out")).unwrap();
+    std::fs::write(sandbox.config_dir().join("motd.txt"), FILE_TEXT).unwrap();
+    let file = |name: &str, tag: &str, notify: &str| {
+        format!(
+            "[[files]]\nsrc = \"motd.txt\"\ndest = \"{root}/out/{name}.conf\"\nmode = \"0644\"\n\
+             tags = [\"{tag}\"]\nsudo = false\nnotify = [\"{notify}\"]\n\n"
+        )
+    };
+    let handler = |name: &str, first: &str| {
+        format!(
+            "[[handlers]]\nname = \"{name}\"\nrun = '{first}echo {name} >> {root}/\"$WHO\".log'\n\n"
+        )
+    };
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}{}{}{}\n{}{}{}{}",
+            file("fake", "web", "flush"),
+            file("local", "local", "flush"),
+            file("nobody", "nobody", "never"),
+            steps.replace("ROOT", &root),
+            handler("bad", &format!("test -f {root}/fixed || exit 3; ")),
+            handler("log", ""),
+            handler("never", ""),
+            handler("flush", ""),
+        ),
+    );
+}
+
+/// What the handlers (and steps) appended to `<root>/<who>.log`.
+fn handled(sandbox: &Sandbox, who: &str) -> Vec<String> {
+    let log = std::fs::read_to_string(sandbox.root().join(format!("{who}.log")));
+    log.unwrap_or_default().lines().map(str::to_owned).collect()
+}
+
+/// `who`'s pending handlers in the record; `Null` when none.
+fn pending(sandbox: &Sandbox, who: &str) -> serde_json::Value {
+    sandbox.last_apply().unwrap()["targets"][who]["pending_handlers"].clone()
+}
+
+/// Each step's `run`, `changed` and `handler` in a target's JSON report.
+fn changes(target: &serde_json::Value) -> Vec<(String, serde_json::Value, serde_json::Value)> {
+    let steps = target["steps"].as_array().unwrap();
+    (steps.iter())
+        .map(|step| {
+            let run = step["run"].as_str().unwrap().to_owned();
+            (run, step["changed"].clone(), step["handler"].clone())
+        })
+        .collect()
+}
+
+#[test]
+fn changed_steps_notify_and_each_handler_runs_once_after_the_last_step_in_order() {
+    let sandbox = Sandbox::new("ah");
+    let root = sandbox.root().display().to_string();
+    with_handlers(
+        &sandbox,
+        "[[steps]]\nrun = \"echo one\"\nnotify = [\"log\"]\n\n\
+         [[steps]]\nrun = \"echo guarded\"\ncreates = \"ROOT\"\nnotify = [\"never\"]\n\n\
+         [[steps]]\nrun = 'echo two >> ROOT/\"$WHO\".log'\nnotify = [\"log\"]\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let null = serde_json::Value::Null;
+    for (target, who) in value["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(["local", "fake"])
+    {
+        let other = if who == "local" { "fake" } else { "local" };
+        let mut files = vec![
+            (
+                format!("file {root}/out/{who}.conf"),
+                true.into(),
+                null.clone(),
+            ),
+            (
+                format!("skipped file {root}/out/{other}.conf: no match"),
+                false.into(),
+                null.clone(),
+            ),
+        ];
+        if who == "local" {
+            files.swap(0, 1);
+        }
+        let mut expected = files;
+        expected.extend([
+            (
+                format!("skipped file {root}/out/nobody.conf: no match"),
+                false.into(),
+                null.clone(),
+            ),
+            ("echo one".to_owned(), true.into(), null.clone()),
+            (
+                format!("skipped run: {root} exists"),
+                false.into(),
+                null.clone(),
+            ),
+            (
+                format!("echo two >> {root}/\"$WHO\".log"),
+                true.into(),
+                null.clone(),
+            ),
+            (
+                format!("echo log >> {root}/\"$WHO\".log"),
+                true.into(),
+                "log".into(),
+            ),
+            (
+                format!("echo flush >> {root}/\"$WHO\".log"),
+                true.into(),
+                "flush".into(),
+            ),
+        ]);
+        assert_eq!(changes(target), expected, "{target}");
+        assert_eq!(
+            handled(&sandbox, who),
+            ["two", "log", "flush"],
+            "{who}: once each, last, in order"
+        );
+        assert_eq!(pending(&sandbox, who), null, "{who}");
+    }
+
+    // The files are unchanged now: only the run steps notify.
+    let out = sandbox.anvil(&["-vv", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "  handler log\n  $ echo log >> {root}/\"$WHO\".log\n"
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("handler flush"), "{stdout}");
+    assert!(!stdout.contains("handler never"), "{stdout}");
+    for who in ["local", "fake"] {
+        assert_eq!(
+            handled(&sandbox, who),
+            ["two", "log", "flush", "two", "log"],
+            "{who}"
+        );
+    }
+}
+
+#[test]
+fn a_later_failing_step_leaves_the_notify_pending_and_the_next_apply_runs_it() {
+    let sandbox = Sandbox::new("ah");
+    with_handlers(&sandbox, "[[steps]]\nrun = \"test -f ROOT/ok\"\n");
+    for _ in 0..2 {
+        let out = sandbox.anvil(&["apply"], &[]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+        for who in ["local", "fake"] {
+            assert!(handled(&sandbox, who).is_empty(), "no handler phase");
+            assert_eq!(
+                pending(&sandbox, who),
+                serde_json::json!(["flush"]),
+                "a new apply's entry keeps it"
+            );
+        }
+    }
+    std::fs::write(sandbox.root().join("ok"), "").unwrap();
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for target in json(&out)["targets"].as_array().unwrap() {
+        let changes = changes(target);
+        assert!(
+            changes[..3].iter().all(|(_, changed, _)| changed != true),
+            "{target}"
+        );
+        assert_eq!(
+            changes[4].2, "flush",
+            "pending from the last apply: {target}"
+        );
+    }
+    for who in ["local", "fake"] {
+        assert_eq!(handled(&sandbox, who), ["flush"]);
+        assert_eq!(pending(&sandbox, who), serde_json::Value::Null);
+    }
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        handled(&sandbox, "local"),
+        ["flush"],
+        "nothing pending, nothing new"
+    );
+}
+
+#[test]
+fn a_failing_handler_fails_the_target_and_stays_pending_while_the_others_run() {
+    let sandbox = Sandbox::new("ah");
+    with_handlers(
+        &sandbox,
+        "[[steps]]\nrun = \"true\"\nnotify = [\"log\", \"bad\"]\n",
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("  handler bad\n  $ test -f "), "{stdout}");
+    assert!(stdout.contains("  ✘ handler bad exited 3\n"), "{stdout}");
+    assert_eq!(
+        handled(&sandbox, "local"),
+        ["log", "flush"],
+        "the others ran"
+    );
+    assert_eq!(pending(&sandbox, "local"), serde_json::json!(["bad"]));
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["targets"]["local"]["ok"], false);
+
+    std::fs::write(sandbox.root().join("fixed"), "").unwrap();
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(handled(&sandbox, "local"), ["log", "flush", "bad", "log"]);
+    assert_eq!(pending(&sandbox, "local"), serde_json::Value::Null);
+}
+
+#[test]
+fn an_interrupted_or_killed_apply_keeps_the_notify_pending() {
+    let sandbox = Sandbox::new("ah");
+    with_handlers(
+        &sandbox,
+        "[[steps]]\nrun = 'touch ROOT/started; i=0; \
+         while [ ! -f ROOT/go ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done'\n",
+    );
+    let (started, go) = (sandbox.root().join("started"), sandbox.root().join("go"));
+    for signal in [Signal::INT, Signal::KILL] {
+        for path in [&started, &go, &sandbox.root().join("out/local.conf")] {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_file(sandbox.state_home().join("anvil/last-apply.json"));
+        let mut child = sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", "--ssh-program"])
+            .arg(common::fixture("fake-ssh.sh"))
+            .args(["apply", "--target", "local"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn anvil");
+        until(|| started.exists(), "the step to start");
+        let pid = rustix::process::Pid::from_child(&child);
+        rustix::process::kill_process(pid, signal).unwrap();
+        std::fs::write(&go, "").unwrap();
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "{signal:?}");
+        assert_eq!(
+            pending(&sandbox, "local"),
+            serde_json::json!(["flush"]),
+            "{signal:?}"
+        );
+        assert!(handled(&sandbox, "local").is_empty(), "{signal:?}");
+    }
+    std::fs::write(&go, "").unwrap();
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(handled(&sandbox, "local"), ["flush"]);
+}
+
+#[test]
+fn stale_and_bad_pending_names_are_dropped_with_a_warning() {
+    let sandbox = Sandbox::new("ah");
+    with_handlers(&sandbox, "");
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    record["targets"]["local"]["pending_handlers"] =
+        serde_json::json!(["gone", "bad/name", "log", "log"]);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    let dropped = format!(
+        "{}: local: dropped 2 bad pending_handlers entries",
+        path.display()
+    );
+    assert_eq!(stderr, format!("{dropped}\n"), "shown without -v");
+    let stale = "pending handler `gone` is not in [[handlers]]; dropped";
+    let value = json(&out);
+    assert_eq!(value["warnings"], serde_json::json!([dropped]));
+    assert_eq!(value["targets"][0]["warnings"], serde_json::json!([stale]));
+    assert_eq!(
+        handled(&sandbox, "local"),
+        ["flush", "log"],
+        "the valid name still runs"
+    );
+    assert_eq!(pending(&sandbox, "local"), serde_json::Value::Null);
+
+    record["targets"]["local"]["pending_handlers"] = serde_json::json!(["gone"]);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains(&format!("  ⚠ {stale}\n")),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn tasks_notify_handlers_after_the_last_task() {
+    let sandbox = Sandbox::new("ah");
+    let root = sandbox.root().display().to_string();
+    std::fs::write(sandbox.config_dir().join("motd.txt"), FILE_TEXT).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[tasks]]\nname = \"write\"\nfile = {{ src = \"motd.txt\", dest = \"{root}/motd\", \
+             mode = \"0644\", sudo = false }}\nnotify = [\"flush\"]\n\n\
+             [[tasks]]\nrun = \"echo last >> {root}/log\"\n\n\
+             [[handlers]]\nname = \"flush\"\nrun = \"echo flush >> {root}/log\"\n"
+        ),
+    );
+    for expected in ["last\nflush\n", "last\nflush\nlast\n"] {
+        let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        let log = std::fs::read_to_string(sandbox.root().join("log")).unwrap();
+        assert_eq!(log, expected, "an unchanged file notifies nothing");
+    }
+}
+
+#[test]
+fn a_lost_connection_in_the_steps_or_the_handler_phase_keeps_the_handlers_pending() {
+    // The step drops fake's connection: every later client exits 255.
+    let drop_step = "if [ -f ROOT/drop ]; then rm ROOT/drop; \
+                     echo FAKE_SSH_CLIENT_EXIT=255 > ROOT/h/fake-ssh.env; fi";
+    let knobs = |sandbox: &Sandbox| sandbox.root().join("h/fake-ssh.env");
+    for (steps, left) in [
+        (
+            format!("[[steps]]\nrun = '{drop_step}'\n\n[[steps]]\nrun = \"true\"\n"),
+            serde_json::json!(["flush"]),
+        ),
+        (
+            format!("[[steps]]\nrun = '{drop_step}'\nnotify = [\"log\"]\n"),
+            serde_json::json!(["flush", "log"]),
+        ),
+    ] {
+        let sandbox = Sandbox::new("ah");
+        with_handlers(&sandbox, &steps);
+        std::fs::write(sandbox.root().join("drop"), "").unwrap();
+        let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+        assert!(knobs(&sandbox).exists(), "{steps}: the step dropped it");
+        assert!(handled(&sandbox, "fake").is_empty(), "{steps}");
+        assert_eq!(pending(&sandbox, "fake"), left, "{steps}");
+
+        std::fs::remove_file(knobs(&sandbox)).unwrap();
+        let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        let ran: Vec<&str> = ["log", "flush"]
+            .into_iter()
+            .filter(|name| left.as_array().unwrap().iter().any(|n| n == name))
+            .collect();
+        assert_eq!(handled(&sandbox, "fake"), ran, "{steps}");
+        assert_eq!(pending(&sandbox, "fake"), serde_json::Value::Null);
+    }
+}
+
+#[test]
+fn a_ctrl_c_in_the_handler_phase_keeps_the_handlers_not_run_pending() {
+    let sandbox = Sandbox::new("ah");
+    let root = sandbox.root().display().to_string();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[steps]]\nrun = \"true\"\nnotify = [\"after\", \"slow\"]\n\n\
+             [[handlers]]\nname = \"slow\"\nrun = 'touch {root}/started; i=0; \
+             while [ ! -f {root}/go ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; \
+             echo slow >> {root}/local.log'\n\n\
+             [[handlers]]\nname = \"after\"\nrun = 'echo after >> {root}/local.log'\n"
+        ),
+    );
+    let child = sandbox
+        .command(env!("CARGO_BIN_EXE_anvil"))
+        .args(["--secret-store", "memory", "--ssh-program"])
+        .arg(common::fixture("fake-ssh.sh"))
+        .args(["apply", "--target", "local"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn anvil");
+    until(
+        || sandbox.root().join("started").exists(),
+        "the handler to start",
+    );
+    let pid = rustix::process::Pid::from_child(&child);
+    rustix::process::kill_process(pid, Signal::INT).unwrap();
+    std::fs::write(sandbox.root().join("go"), "").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("  handler slow\n  ✘ cancelled\n"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(handled(&sandbox, "local"), ["slow"], "the running one ends");
+    assert_eq!(pending(&sandbox, "local"), serde_json::json!(["after"]));
+}
+
+#[test]
+fn drop_pending_takes_a_handler_off_each_selected_target_without_running_it() {
+    let sandbox = Sandbox::new("ah");
+    with_handlers(&sandbox, "[[steps]]\nrun = \"test -f ROOT/ok\"\n");
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    std::fs::write(sandbox.root().join("ok"), "").unwrap();
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    record["targets"]["local"]["pending_handlers"] = serde_json::json!(["flush", "bad/"]);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    let out = sandbox.anvil(
+        &[
+            "apply",
+            "--target",
+            "local",
+            "--drop-pending",
+            "flush",
+            "--drop-pending",
+            "log",
+            "--drop-pending",
+            "flush",
+        ],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.starts_with("dropped pending handler flush on local\n▶ local\n"),
+        "once, though named twice: {stdout}"
+    );
+    assert_eq!(
+        text(&out.stderr),
+        format!(
+            "{}: local: dropped 1 bad pending_handlers entries\n\
+             --drop-pending log: not pending on local\n",
+            path.display()
+        ),
+        "the load's warning first, no warning for the repeat"
+    );
+    assert!(handled(&sandbox, "local").is_empty(), "dropped, never run");
+    assert_eq!(pending(&sandbox, "local"), serde_json::Value::Null);
+    assert_eq!(
+        pending(&sandbox, "fake"),
+        serde_json::json!(["flush"]),
+        "not selected"
+    );
+
+    let out = sandbox.anvil(
+        &[
+            "--json",
+            "apply",
+            "--target",
+            "fake",
+            "--drop-pending",
+            "flush",
+        ],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(
+        value["dropped_pending"],
+        serde_json::json!([{"target": "fake", "handler": "flush"}])
+    );
+    assert_eq!(value.get("warnings"), None);
+    assert!(handled(&sandbox, "fake").is_empty());
+    assert_eq!(pending(&sandbox, "fake"), serde_json::Value::Null);
+}
+
+#[test]
+fn drop_pending_without_handlers_warns_and_a_bad_name_is_exit_2() {
+    let sandbox = Sandbox::new("ah");
+    sandbox.write_config("config.toml", "[[steps]]\nrun = \"true\"\n");
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).starts_with("▶ local\n"));
+    assert_eq!(text(&out.stderr), "");
+
+    let out = sandbox.anvil(
+        &[
+            "--json",
+            "apply",
+            "--target",
+            "local",
+            "--drop-pending",
+            "all",
+        ],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(
+        value["warnings"],
+        serde_json::json!(["--drop-pending all: not pending on local"])
+    );
+    assert_eq!(value.get("dropped_pending"), None);
+
+    let out = sandbox.anvil(&["apply", "--drop-pending", "a/b"], &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr)
+            .contains("--drop-pending `a/b`: must match [A-Za-z0-9 ._-]+, at most 64 bytes"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn drop_pending_whose_save_fails_is_exit_1_before_any_target() {
+    let sandbox = Sandbox::new("ah");
+    with_handlers(&sandbox, "[[steps]]\nrun = \"test -f ROOT/ok\"\n");
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    std::fs::write(sandbox.root().join("ok"), "").unwrap();
+    let dir = sandbox.state_home().join("anvil");
+    common::chmod(&dir, 0o500);
+    let out = sandbox.anvil(
+        &["apply", "--target", "local", "--drop-pending", "flush"],
+        &[],
+    );
+    common::chmod(&dir, 0o700);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "", "no drop line, no target");
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("apply: cannot write last-apply.json: "),
+        "{stderr}"
+    );
+    assert!(handled(&sandbox, "local").is_empty());
+    assert_eq!(pending(&sandbox, "local"), serde_json::json!(["flush"]));
 }

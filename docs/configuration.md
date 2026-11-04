@@ -325,16 +325,30 @@ mode = "0644"              # required: a quoted string of 3 or 4 octal digits
 tags = ["linode"]          # optional; every tag must be on the target
 facts = { distro = "arch" } # optional; each value equals that fact
 sudo = true                # optional; default true. false writes as the connecting user
+notify = ["reload sshd"]   # optional; [[handlers]] to run when this step changes the file; see Handlers
 
 [[services]]               # optional; one service brought to a state per matching target; see Services
 name = "sshd"              # required: [A-Za-z0-9:_@.-]+, at most 255 bytes
-state = "started"          # required: "started" | "stopped"
+state = "started"          # required: "started" | "stopped" ("restarted" | "reloaded" only in a handler)
 enabled = true             # optional; true enables, false disables, omitted leaves enablement alone
 tags = ["linode"]          # optional; every tag must be on the target
 facts = { distro = "arch" } # optional; each value equals that fact
+notify = ["reload sshd"]   # optional; [[handlers]] to run when this step changes the service
 
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
+
+[[steps]]
+run = "x migrate"          # run and plugin steps take guards; see Guards below
+creates = "/usr/local/bin/x" # optional: skip when this path exists
+removes = "/var/lib/x/old" # optional: run only when this path exists
+onlyif = "test -d /var/lib/x" # optional: run only when this exits 0
+unless = "x migrate --status | grep -q up-to-date" # optional: skip when this exits 0
+notify = ["reload sshd"]   # optional; [[handlers]] to run when the step runs and exits 0
+
+[[handlers]]               # optional; runs once per target after its steps, only when notified; see Handlers
+name = "reload sshd"       # required: [A-Za-z0-9 ._-]+, at most 64 bytes, unique
+service = { name = "sshd", state = "reloaded" } # or run = "…"; exactly one of the two
 
 [plugins.harden]           # optional; see Plugins below
 path = "~/.config/anvil/plugins/harden"
@@ -359,6 +373,56 @@ round trip, or at its timeout plus 10 s when the network is lost. Root processes
 where `sudo -n kill` works (NOPASSWD); elsewhere they run to their end. Inside a step script, `$$`, `$0`, `$PPID`,
 `LINENO` and the text of sh's error messages differ from `sh -s`, as the script runs through `eval` in the wrapper. A
 login shell that is neither POSIX sh, csh nor fish (nushell, say) may reject the command.
+
+**Guards.** A `run` or plugin step runs again on every apply. Guards skip it when the target is already in the
+wanted state, so a step that installs or migrates something is safe to repeat:
+
+```toml
+[[steps]]
+run = "curl -fsSL https://example.com/install.sh | sh"
+creates = "/usr/local/bin/x"                         # skip when the path exists
+
+[[steps]]
+run = "x migrate"
+unless = "x migrate --status | grep -q up-to-date"   # skip when it exits 0
+```
+
+| Guard            | The step runs only when | Otherwise it reports           |
+| ---------------- | ----------------------- | ------------------------------ |
+| `creates = PATH` | `PATH` does not exist   | `skipped run: PATH exists`     |
+| `removes = PATH` | `PATH` exists           | `skipped run: PATH is absent`  |
+| `onlyif = CMD`   | `CMD` exits 0           | `skipped run: onlyif exited N` |
+| `unless = CMD`   | `CMD` exits non-zero    | `skipped run: unless exited 0` |
+
+A symlink counts as existing, even a dangling one. A step may set several guards; it runs only when every one allows
+it. They are checked in the order `creates`, `removes`, `onlyif`, `unless`, and the first that skips ends the check, so
+the guard commands after it do not run. A plugin step's message starts with `skipped plugin NAME:` instead
+(`skipped plugin harden: /etc/x exists`). A skipped step does not fail the target, and the next step runs; its output
+is in [Guarded steps](cli.md#guarded-steps).
+
+Guards go on `[[steps]]` entries and on `run` and `plugin` [tasks](#tasks). `[[files]]`, `[[services]]` and
+`[packages]` have no such keys and refuse them with the parser's `unknown field` message; a guard on any other task is
+exit 2 too ([Tasks](#tasks)). Those kinds already converge, or have no single command to guard.
+
+`creates` and `removes` follow the [`dest` rules](#files): absolute, every character in `[A-Za-z0-9._/@+-]`, no `.` or
+`..` component, not ending with `/`, at most 4096 bytes. A violation is exit 2 naming the step, such as
+``steps[0].creates `usr/local/bin/x`: must be an absolute path``. `onlyif` and `unless` follow the `run` rules: not
+blank, at most 4 KiB, no NUL; else exit 2 with `steps[0].onlyif: is empty or blank`,
+`steps[0].unless: 4097 bytes exceeds the 4096 byte limit` or `steps[0].onlyif: contains NUL`.
+
+The guards travel in the step's own script, so a guarded step is still one round trip. A guard command runs in sh on
+the target as the connecting user, never through sudo (call `sudo -n` in it), and sees the target's
+[`env`](#vars-and-env) as the step does. Its stdin is `/dev/null`, its stdout is dropped and its stderr shows as the
+step's stderr. Its exit status only decides whether the step runs; it never fails the step. A guard command killed by
+a signal (an exit status above 128, as sh reports it) fails the step, with `onlyif was killed by signal N` (or
+`unless`) on stderr and the step exiting with that status; one that hangs runs into the step's time limit, which
+fails the step as a timeout. A plugin step's plugin still runs on the controller, before the guards are checked on the
+target. `anvil plan` lists each step's guards and never runs them ([`anvil plan`](cli.md#anvil-plan)). A step without
+guards runs and prints exactly as before.
+
+**`notify`.** A `run` or plugin step may list [handlers](#handlers) to run once it ran and exited 0; a guard that
+skipped it notifies nothing. Each name must be a `[[handlers]]` entry's, else exit 2 with
+``steps[0].notify[0] `reload ssh`: names no [[handlers]] entry``.
 
 The sections above run in a fixed order: packages, files, services, steps. To choose the order, use [`[[tasks]]`](#tasks)
 instead of `[[files]]`, `[[services]]`, `[[steps]]` and the lists in `[packages]`.
@@ -423,6 +487,7 @@ facts = { distro = "arch" }      # optional; a probe key, equal to that fact
 sudo = false                     # optional; default true. false: write as the connecting user
 rollback = false                 # optional; default true. false: the apply record keeps the hash only
 template = true                  # optional; default false. true: render src per target (see Templating)
+notify = ["reload sshd"]         # optional; the [[handlers]] to run when the step writes (see Handlers)
 ```
 
 **`mode`.** Required, and a quoted string. Three or four octal digits, at most `0777` plus the sticky bit, so `644`,
@@ -554,6 +619,10 @@ unreadable dest is written. The comparison needs `cmp` (diffutils) on the target
 `wrote DEST`; some minimal container images lack it. A mode without owner write, such as `0444`, still writes. anvil
 sets `mode`, and keeps an existing dest's owner and group. It does not create a missing parent directory; the step
 fails with `tee`'s own message.
+
+**`notify`.** Optional: the [handlers](#handlers) to run when the step prints `wrote DEST`. `unchanged DEST` notifies
+nothing, even when `chmod` fixed the mode, and a target without `cmp` rewrites, and so notifies, on every apply. Each
+name must be a `[[handlers]]` entry's, else exit 2 with ``files[0].notify[0] `reload ssh`: names no [[handlers]] entry``.
 
 A write as root (through sudo, or on a root login) refuses a dest unless every directory on its path, from `/` to the
 one that holds dest, is owned by root and writable by neither its group nor others. Root checks each one in turn,
@@ -763,9 +832,14 @@ service, or a launchd job label ([Inits](#inits)). At most 255 bytes, systemd's 
 
 - `services[0].state: required`
 - ``services[0].state `running`: must be started or stopped`` (`Started` too)
+- ``services[0].state `restarted`: only in a [[handlers]] service; it would restart on every apply`` (or `reloaded`):
+  the two actions run on every apply, so they belong in a [handler](#handlers), which runs only when notified
 
 **`enabled`.** Optional. `true` enables the service at boot and `false` disables it. Left out, the entry leaves the
 enablement as it is, on every init, and asks only for the state.
+
+**`notify`.** Optional: the [handlers](#handlers) to run when this step changed the service. Each name must be a
+`[[handlers]]` entry's, else exit 2 with ``services[0].notify[0] `reload ssh`: names no [[handlers]] entry``.
 
 **`tags` and `facts`.** The [Files](#files) rules and messages, with the prefix `services[I]`: every listed tag must be
 on the target, the `local` target carries `local`, every listed fact must equal the probe's value, and `pkg` matches
@@ -902,6 +976,18 @@ include with no tasks add no step. Every file and service task is its own step, 
 [`[[services]]` duplicate rule](#services) does not apply, because stop, migrate, start is how a migration is written.
 A config with `[[tasks]]` has no default `hostname` step.
 
+**Guards.** A `run` or `plugin` task may also set the [guards](#config) `creates`, `removes`, `onlyif` and `unless`,
+with the same rules as on `[[steps]]`. On a `packages`, `file`, `service`, `include` or `tasks` task a guard is exit 2
+naming the first one set, in that order, at any depth: `tasks[0].creates: only on a run or plugin task`,
+`tasks[0].tasks[0].onlyif: only on a run or plugin task`.
+
+**`notify`.** A `run`, `plugin`, `file` or `service` task may set [`notify`](#handlers), on the task, not inside `file`
+or `service`. Exit 2: `tasks[0].notify: not on a packages task; packages give no change signal`,
+`tasks[0].notify: only on a run, plugin, file or service task` (an `include` or `tasks` group),
+`tasks[0].file: notify belongs on the task, not the file` and
+`tasks[0].service: notify belongs on the task, not the service`. `[[handlers]]` stays in the main file: an include
+with it is exit 2 with the parser's message.
+
 **Nesting.** Children inherit `tags` and `facts`, and every level must match: a target must carry every tag along the chain,
 facts are ANDed. The same
 fact key with two different values along one chain can never match, so it is exit 2 with
@@ -940,7 +1026,7 @@ Including one file from two places, with no cycle, is allowed.
 **Mixing.** `[[tasks]]` with `[[files]]`, `[[services]]`, `[[steps]]`, or `[packages]` `install`, `pin`, `remove` or
 `upgrade` is exit 2 with `[[tasks]] cannot be mixed with [[steps]]; move it into a task`. There is no automatic
 migration. `[packages.alias]` and the other `[packages]` settings (`manager`, `local`, `local_sudo_secret`, `timeout`)
-stay global and work with `[[tasks]]`, as do `[plugins]`, `[secrets]`, `[harden]` and `[anvil]`.
+stay global and work with `[[tasks]]`, as do `[[handlers]]`, `[plugins]`, `[secrets]`, `[harden]` and `[anvil]`.
 
 **`packages` tasks.** Each one is its own step, under the global `[packages]` settings, and does not merge its lists
 with another task's: two tasks can each `pin` a different name. A `manager` or `alias` inside the task is exit 2 with the
@@ -956,6 +1042,128 @@ a package manager therefore cannot serve a later `packages` task on the same run
 change what later tasks match. Apply again to use the new state.
 
 Output, the record and rollback are in [Tasks in a run](cli.md#tasks-in-a-run).
+
+## Handlers
+
+A handler runs only when a step changed something: reload sshd after its config changed, rebuild a cache after new
+fonts landed. Each `[[handlers]]` entry has a name, and a step lists the names it notifies in `notify`. After a
+target's last step, each handler notified there runs once, in `[[handlers]]` order. A step that changed nothing
+notifies nothing, so a rerun on a converged target runs no handler.
+
+```toml
+[[files]]
+src = "files/sshd_config"
+dest = "/etc/ssh/sshd_config"
+mode = "0644"
+notify = ["reload sshd"]
+
+[[steps]]
+run = "cp fonts/*.ttf ~/.local/share/fonts/"
+notify = ["rebuild font cache"]
+
+[[handlers]]
+name = "reload sshd"
+service = { name = "sshd", state = "reloaded" }
+
+[[handlers]]
+name = "rebuild font cache"
+run = "fc-cache -f"
+```
+
+Output, `--json` and the record are in [Handlers in a run](cli.md#handlers-in-a-run).
+
+**Entries.** A handler has a `name` and exactly one of `run` or `service`. `run` is a POSIX sh script with the
+[`[[steps]]`](#config) rules; it runs as a step does, as the connecting user with the target's [`env`](#vars-and-env)
+and a 30 s limit. `service` takes `name` and `state`, and `enabled` with `started` or `stopped`, as in
+[`[[services]]`](#services), and runs as a service step does (root, the init, a 120 s limit). The name is
+`[A-Za-z0-9 ._-]+`, spaces allowed, at most 64 bytes, and unique; at most 64 handlers. Handlers go in the main config
+only, never in an [include](#tasks), and work with the legacy sections and with `[[tasks]]` alike. Exit 2:
+
+- `handlers: 65 entries exceeds the 64 entry limit`
+- ``handlers[0].name `a/b`: must match [A-Za-z0-9 ._-]+, at most 64 bytes`` (an empty or longer name too)
+- ``handlers[2].name `reload sshd`: same name as handlers[0]``
+- `handlers[0]: needs run or service` and `handlers[0]: has both run and service; keep one`
+- `handlers[0].run: is empty or blank` and `handlers[0].run: 4097 bytes exceeds the 4096 byte limit`
+- `handlers[0].service.state: required`,
+  ``handlers[0].service.state `bounced`: must be started, stopped, restarted or reloaded`` and
+  `handlers[0].service.enabled: not with restarted or reloaded`; the service name gets the [Services](#services) rules,
+  as ``handlers[0].service.name `-x`: must not start with - or .``
+- `handlers[0].service: tags, facts and notify do not apply to a handler`
+- `tags`, `facts`, `notify`, a guard, `plugin` or any other key on the handler itself: the parser's `unknown field`
+  message. A handler runs only where it was notified, and handlers do not notify handlers.
+
+**`notify`.** A list of handler names, on `[[files]]`, `[[services]]` and `[[steps]]` entries and on `run`, `plugin`,
+`file` and `service` [tasks](#tasks). A name listed twice counts once. A name no handler has is exit 2, naming the
+entry: ``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry`` (or `files[I]`, `services[I]`, `tasks[I]`).
+
+**When a step notifies.** Only a step that ran on the target, exited 0 and changed something:
+
+| Step          | Notifies when it       | Not when it                      |
+| ------------- | ---------------------- | -------------------------------- |
+| file          | prints `wrote DEST`    | prints `unchanged DEST`          |
+| service       | prints any change line | prints `unchanged service NAME`  |
+| run or plugin | runs and exits 0       | is skipped by a [guard](#config) |
+| any           |                        | is skipped as no match, or fails |
+
+A change line is `started service NAME`, `stopped service NAME`, `enabled service NAME` or `disabled service NAME`.
+The package step never notifies, nor can it ask to. A file whose bytes are already right and whose mode alone anvil
+fixed prints `unchanged DEST` and does not notify: by design, a handler follows a change of content. A target without
+`cmp` rewrites the file on every apply ([`[[files]]`](#files)), so its `notify` fires every time.
+
+**Order.** After the target's last step, and only when every step passed, its handlers run in `[[handlers]]` order,
+not in the order they were notified. Each runs once however many steps notified it. With the legacy sections that is
+after the `[[steps]]`; with `[[tasks]]`, after the last task. Handlers are per target: a notify on `web1` runs the
+handler on `web1` only. A failing handler fails the target (exit 1, as a failing step does) and the other handlers due
+there still run.
+
+**Resolved when due.** A handler is resolved on a target only when it is due there: notified on this apply, or pending
+from an earlier one. Until then its service needs no init and no way to root, and its sudo secret is not needed, so
+a `service` handler cannot fail a target that lacks those until a step there notifies it. When it is due and cannot be
+resolved (``services: no init known for distro `gentoo` ``, `services: secret NAME is not set`, …), that handler fails
+the target with that reason and stays pending; the other handlers still run.
+
+**Pending across applies.** Every notify is saved at once to the target's entry in the
+[apply record](cli.md#the-apply-record), in `pending_handlers`, and a handler leaves that list only once it ran and
+exited 0. A later step that fails (the handlers then do not run), Ctrl-C, a kill, a lost connection or a failing
+handler leave it pending, and the next apply on that target runs it even when nothing notifies it again. A config with
+`[[handlers]]` therefore probes its targets and keeps the record on every apply. A new apply's entry and
+`anvil rollback` keep the list. To clear a name without running it, use
+[`anvil apply --drop-pending NAME`](cli.md#handlers-in-a-run).
+
+**Stale names and bad entries.** A pending name no longer in `[[handlers]]` is dropped with a target warning,
+``pending handler `NAME` is not in [[handlers]]; dropped``, and does not fail the apply. The record is a file you can
+edit, so loading it drops pending names that are not valid handler names, repeats (the first is kept) and names past
+64, with one warning per target, `PATH: TARGET: dropped N bad pending_handlers entries`, instead of refusing the record.
+
+**At least once.** A handler leaves `pending_handlers` only after its exit 0 is saved, so a crash between its end and
+that save runs it again on the next apply: write a handler that can run twice. A notify is saved right after its step
+ends, so a crash between that end and the save can lose the notify; on the next apply a file or service step finds
+nothing to change and does not notify again. After such a crash, run the handler's command yourself.
+
+**Rollback.** [`anvil rollback`](cli.md#anvil-rollback) never runs a handler. For each file it put back (restored,
+removed or found unchanged), it adds the `notify` names of the file entries for that dest that apply to the target,
+matched with the facts the record saved, to the target's pending list, in `[[handlers]]` order, so the next apply
+reloads the service that reads the restored file.
+
+**`restarted` and `reloaded`.** Two service states for handlers only; a `[[services]]` entry or `service` task with
+either is exit 2, since it would act on every apply. Both print one line: `restarted service NAME` or
+`reloaded service NAME`. `reloaded` on a service that is not running does nothing and succeeds, printing
+`service NAME is not running; not reloaded`; `restarted` on a stopped service starts it. A service the init does not
+know fails the step, as for `started` ([Service steps](cli.md#service-steps)).
+
+| Init    | `restarted`                                                   | `reloaded`             |
+| ------- | ------------------------------------------------------------- | ---------------------- |
+| systemd | `restart` (starts a stopped unit; a masked one is refused)    | active: `reload`       |
+| OpenRC  | running: `restart`; stopped: `start`; crashed: `zap`, `start` | running: `reload`      |
+| launchd | loaded: `kickstart -k`; not loaded: `bootstrap`               | loaded: `kickstart -k` |
+
+Otherwise (not active, not running, not loaded) `reloaded` leaves the service alone and prints the no-op line.
+
+An OpenRC service in the crashed state (`rc-service NAME status` exits 32) counts as not running, so `reloaded` is a
+no-op on it. An OpenRC script without a `reload` command fails the step with rc-service's own message. launchd has no
+reload: `reloaded` restarts a loaded job with `launchctl kickstart -k`, just as `restarted` does. `restarted` on a job
+that is disabled and not loaded fails with `services: NAME is disabled; enable it to restart it`; a handler cannot
+change enablement, so enable it with a `[[services]]` entry or a task.
 
 ## Plugins
 
@@ -1115,4 +1323,6 @@ and `anvil config` open the parsed document, not the file's text, so comments ar
 fits), and when a YAML edit's TOML form would be over 1 MiB, nothing is written and the exit is 2.
 
 The apply record has its own limits: a previous text is kept only up to 256 KiB, and the record up to 16 MiB, past which
-the largest texts are dropped with a warning ([The apply record](cli.md#the-apply-record)).
+the largest texts are dropped with a warning ([The apply record](cli.md#the-apply-record)). Its pending handler list
+holds at most 64 valid, distinct names per target; anything else is dropped on load with a warning
+([Handlers](#handlers)).

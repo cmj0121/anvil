@@ -1014,6 +1014,9 @@ fn local_block(local: &doctor::LocalReport) -> Vec<Line<'static>> {
             row("record", record)
         });
     }
+    for warning in &local.record_warnings {
+        lines.push(row("record", &format!("WARNING: {warning}")).style(Color::Yellow));
+    }
     if let Some(error) = &local.tag_key {
         lines.push(row("tag key", &format!("error: {error}")).style(Color::Red));
     }
@@ -1579,6 +1582,7 @@ mod tests {
             sudo: false,
             rollback: true,
             template: false,
+            notify: Vec::new(),
         };
         let config = Config {
             packages: Some(Packages {
@@ -1602,6 +1606,7 @@ mod tests {
         );
         let skip = |dest: &str| report::StepReport {
             skipped: true,
+            reason: None,
             ..step(&format!("skipped file {dest}: no match"), Some(0), "", "")
         };
         let ok = |run: &str| step(run, Some(0), "", "");
@@ -1642,6 +1647,7 @@ mod tests {
             enabled: None,
             tags: vec![tag.to_owned()],
             facts: Default::default(),
+            notify: Vec::new(),
         };
         let config = Config {
             files: vec![FileEntry {
@@ -1653,6 +1659,7 @@ mod tests {
                 sudo: false,
                 rollback: true,
                 template: false,
+                notify: Vec::new(),
             }],
             services: vec![service("sshd", "local"), service("cron", "web")],
             steps: vec![Step::script("hostname")],
@@ -1673,11 +1680,13 @@ mod tests {
             vec![
                 report::StepReport {
                     skipped: true,
+                    reason: None,
                     ..step("skipped file /etc/a.conf: no match", Some(0), "", "")
                 },
                 step("service sshd", Some(0), "started service sshd\n", ""),
                 report::StepReport {
                     skipped: true,
+                    reason: None,
                     ..step("skipped service cron: no match", Some(0), "", "")
                 },
                 step("hostname", Some(1), "", ""),
@@ -2576,7 +2585,9 @@ mod tests {
                 kind: anvil::step::RunKind::Script,
                 task: Some("tasks[0]".to_owned()),
                 name: None,
+                notify: Vec::new(),
             }],
+            pending_handlers: Vec::new(),
             ok: true,
         });
         for (lines, wanted) in [
@@ -2619,6 +2630,7 @@ mod tests {
             },
             task: None,
             name: None,
+            notify: Vec::new(),
         };
         let rendered = Rendered {
             text: "rendered-bytes".to_owned().into(),
@@ -2629,6 +2641,7 @@ mod tests {
             vars: Default::default(),
             env: Default::default(),
             steps: vec![file(Some(rendered)), file(None)],
+            pending_handlers: Vec::new(),
             ok: true,
         });
         let shown: Vec<String> = plan.iter().map(ToString::to_string).collect();
@@ -2728,7 +2741,9 @@ mod tests {
                         kind: anvil::step::RunKind::Script,
                         task: Some("tasks[0]".to_owned()),
                         name: Some("First\u{2066}".to_owned()),
+                        notify: Vec::new(),
                     }],
+                    pending_handlers: Vec::new(),
                     ok: true,
                 }]),
                 ok: Some(true),
@@ -2766,6 +2781,7 @@ mod tests {
                                 kind: anvil::step::RunKind::Script,
                                 task: None,
                                 name: None,
+                                notify: Vec::new(),
                             },
                             PlannedRun {
                                 run: "hostname".to_owned().into(),
@@ -2775,8 +2791,10 @@ mod tests {
                                 kind: anvil::step::RunKind::Script,
                                 task: None,
                                 name: None,
+                                notify: Vec::new(),
                             },
                         ],
+                        pending_handlers: Vec::new(),
                         ok: true,
                     },
                     PlanReport::Failed {

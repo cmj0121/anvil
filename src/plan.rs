@@ -11,6 +11,7 @@
 //! shown, except a templated src's rendered text under `--show-rendered`.
 //! A `[[services]]` step shows as `service NAME`, never its script.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU8;
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
 use crate::options::{Options, Output};
 use crate::plugin::Plugins;
 use crate::prepared::Prepared;
+use crate::record;
 use crate::report::{self, Escape, Line, Shown, Style, print_lines};
 use crate::status;
 use crate::step::{PlannedRun, RunKind};
@@ -47,6 +49,10 @@ pub enum PlanReport {
         #[serde(skip_serializing_if = "Shown::is_empty")]
         env: Shown,
         steps: Vec<PlannedRun>,
+        /// The `[[handlers]]` the local record lists pending on the target,
+        /// in config order.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pending_handlers: Vec<String>,
         ok: bool,
     },
     /// The target could not be reached, probed or resolved.
@@ -110,6 +116,10 @@ pub struct Plan {
     /// Each templated file's rendered text, per target, under `--show-rendered`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rendered: Vec<RenderedText>,
+    /// What loading the record warned of: the targets whose bad pending
+    /// handlers it dropped.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// One target's rendered text of one templated file; `step` indexes that
@@ -175,9 +185,11 @@ impl Plan {
     }
 }
 
-/// Plans `prepared.config` for each of its targets, as [`plan_targets`].
+/// Plans `prepared.config` for each of its targets, as [`plan_targets`],
+/// with each target's [`pending_handlers`].
 pub fn run_targets(prepared: &Prepared, on: &mut dyn FnMut(Progress<'_>)) -> Plan {
-    plan_targets(
+    let (pending, warnings) = pending_handlers(&prepared.config, &prepared.targets);
+    let mut plan = plan_targets(
         &prepared.targets,
         prepared.opts.parallel,
         |target| prepared.transport(target),
@@ -185,10 +197,57 @@ pub fn run_targets(prepared: &Prepared, on: &mut dyn FnMut(Progress<'_>)) -> Pla
         &prepared.expanded,
         &prepared.sources,
         &prepared.pins,
+        &pending,
         &prepared.cancel,
         on,
-    )
+    );
+    plan.warnings = warnings;
+    plan
 }
+
+/// Each of `targets`' handlers pending from the last apply, by target, as
+/// the local record lists them, read once and without its lock, and what
+/// loading it warned of. Only the names `[[handlers]]` has, in config
+/// order; the rest are logged. Nothing is read without `[[handlers]]`, and
+/// a record that cannot be read is only logged.
+fn pending_handlers(config: &Config, targets: &[Target]) -> (Pending, Vec<String>) {
+    let mut pending = Pending::new();
+    if config.handlers.is_empty() {
+        return (pending, Vec::new());
+    }
+    let loaded = record::path()
+        .map_err(|err| format!("the record: {err}"))
+        .and_then(|path| record::load_warned(&path));
+    let (record, warnings) = match loaded {
+        Ok((Some(record), warnings)) => (record, warnings),
+        Ok((None, warnings)) => return (pending, warnings),
+        Err(err) => {
+            log::warn!("plan: {err}");
+            return (pending, Vec::new());
+        }
+    };
+    for target in targets {
+        let Some(entry) = record.targets.get(&target.name) else {
+            continue;
+        };
+        for name in &entry.pending_handlers {
+            if !config.handlers.iter().any(|handler| &handler.name == name) {
+                log::warn!(
+                    "plan {}: pending handler `{name}` is not in [[handlers]]; not shown",
+                    target.name
+                );
+            }
+        }
+        let names = entry.pending_in(&config.handlers);
+        if !names.is_empty() {
+            pending.insert(target.name.clone(), names);
+        }
+    }
+    (pending, warnings)
+}
+
+/// The handlers pending from the last apply, by target.
+pub type Pending = BTreeMap<String, Vec<String>>;
 
 /// Plans `config` for each of `targets`, `parallel` at a time. Once
 /// `cancel` is set, every target not started is Cancelled; one whose plan
@@ -205,6 +264,7 @@ pub fn plan_targets(
     expanded: &Expanded,
     sources: &Sources,
     plugins: &dyn Plugins,
+    pending: &Pending,
     cancel: &Cancel,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Plan {
@@ -221,6 +281,7 @@ pub fn plan_targets(
                 expanded,
                 sources,
                 plugins,
+                pending.get(&target.name).cloned().unwrap_or_default(),
                 cancel,
             )
         },
@@ -233,6 +294,7 @@ pub fn plan_targets(
         targets: reports,
         ok,
         rendered: Vec::new(),
+        warnings: Vec::new(),
     }
 }
 
@@ -260,7 +322,11 @@ fn cancelled(target: &Target, cancel: &Cancel) -> PlanReport {
 }
 
 /// Probes `target`, then lists the steps apply would run on it, running
-/// its plugins; `cancel` is checked before each.
+/// its plugins, with `pending_handlers`; `cancel` is checked before each.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one input of the target's plan, passed through"
+)]
 fn plan_target(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
@@ -268,6 +334,7 @@ fn plan_target(
     expanded: &Expanded,
     sources: &Sources,
     plugins: &dyn Plugins,
+    pending_handlers: Vec<String>,
     cancel: &Cancel,
 ) -> PlanReport {
     log::info!("plan {}: start", target.name);
@@ -294,6 +361,7 @@ fn plan_target(
                 vars: report::shown_vars(target),
                 env: report::shown_env(target),
                 steps,
+                pending_handlers,
                 ok: true,
             }
         }
@@ -326,6 +394,11 @@ pub fn run(out: Output, opts: &Options, show_rendered: bool) -> Result<(), Failu
         plan.rendered = rendered_texts(&plan.targets);
     }
     let failed = plan.targets.iter().filter(|t| !t.ok()).count();
+    if !out.json {
+        for warning in &plan.warnings {
+            let _ = status::write_stderr(&format!("WARNING: {warning}\n"));
+        }
+    }
     if out.json {
         print_json(&plan, Failure::failed)?;
     } else {
@@ -344,7 +417,7 @@ pub fn run(out: Output, opts: &Options, show_rendered: bool) -> Result<(), Failu
 
 /// One target's block: a `▶ target` header, a `vars.KEY = VALUE (LEVEL)` line
 /// per resolved var and env value, a `PATH  NAME` line per task and a
-/// `would $ command` line per step, then `✔ N steps`, `✘ reason` or `⊘ cancelled` (or its abort
+/// `would $ command` line per step and a line per guard ([`guard_texts`]), then `✔ N steps`, `✘ reason` or `⊘ cancelled` (or its abort
 /// reason), then a blank line. A templated file step's would line is followed
 /// by its [`rendered_text`] and, with `show_rendered`, the text itself.
 pub fn render(report: &PlanReport, show_rendered: bool) -> Vec<Line> {
@@ -354,19 +427,34 @@ pub fn render(report: &PlanReport, show_rendered: bool) -> Vec<Line> {
         lines.push(Line::out(format!("{key} = {value}"), Escape::Always, None));
     }
     let end = match report {
-        PlanReport::Planned { steps, .. } => {
+        PlanReport::Planned {
+            steps,
+            pending_handlers,
+            ..
+        } => {
             for step in steps {
                 lines.extend(
                     step.title()
                         .map(|title| Line::out(title, Escape::Always, None)),
                 );
                 lines.push(Line::out(would_text(step), Escape::Always, Some(DIM)));
+                for text in guard_texts(step) {
+                    lines.push(Line::out(format!("  {text}"), Escape::Always, Some(DIM)));
+                }
+                if !step.notify.is_empty() {
+                    let text = format!("  notifies {}", step.notify.join(", "));
+                    lines.push(Line::out(text, Escape::Always, Some(DIM)));
+                }
                 if let Some(text) = rendered_text(step) {
                     lines.push(Line::out(format!("  {text}"), Escape::Never, Some(DIM)));
                 }
                 if show_rendered && let Some(rendered) = step.rendered() {
                     lines.extend(text_lines(&rendered.text));
                 }
+            }
+            if !pending_handlers.is_empty() {
+                let text = format!("pending from last apply: {}", pending_handlers.join(", "));
+                lines.push(Line::out(text, Escape::Always, None));
             }
             Line::out(
                 format!("✔ {}", report::steps_text(steps.len())),
@@ -403,6 +491,24 @@ pub fn would_text(step: &PlannedRun) -> String {
         Some(_) => escape_invisible(&text),
         None => text,
     }
+}
+
+/// A guarded step's guards, one line each in the order they are checked:
+/// `creates P`, `removes P`, `onlyif CMD`, `unless CMD`, a command shown as
+/// a `$` line shows it. Config text, so invisible characters are escaped.
+pub fn guard_texts(step: &PlannedRun) -> Vec<String> {
+    let Some(guards) = step.guards() else {
+        return Vec::new();
+    };
+    [
+        ("creates", guards.creates.as_deref().map(str::to_owned)),
+        ("removes", guards.removes.as_deref().map(str::to_owned)),
+        ("onlyif", guards.onlyif.as_deref().map(report::command)),
+        ("unless", guards.unless.as_deref().map(report::command)),
+    ]
+    .into_iter()
+    .filter_map(|(key, text)| Some(escape_invisible(&format!("{key} {}", text?))))
+    .collect()
 }
 
 /// `rendered N bytes, sha256 HEX` for a templated file step; `None` for a
@@ -483,6 +589,7 @@ mod tests {
             kind: RunKind::Script,
             task: task.map(str::to_owned),
             name: None,
+            notify: Vec::new(),
         };
         let task = step(Some("tasks[0]"));
         assert_eq!(would_text(&task), "would $ true \\u{202e}x");
@@ -536,6 +643,7 @@ mod tests {
             &legacy(config),
             sources,
             plugins,
+            &Pending::new(),
             cancel,
             on,
         )
@@ -725,6 +833,7 @@ mod tests {
             sudo: true,
             rollback: true,
             template: false,
+            notify: Vec::new(),
         };
         let config = Config {
             files: vec![file("/etc/a.conf", &[]), file("/etc/b.conf", &["web"])],
@@ -766,6 +875,7 @@ mod tests {
             enabled: Some(true),
             tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
             facts: Default::default(),
+            notify: Vec::new(),
         };
         let config = Config {
             packages: Some(Packages {
@@ -826,6 +936,7 @@ mod tests {
                     },
                     task: None,
                     name: None,
+                    notify: Vec::new(),
                 },
                 PlannedRun {
                     run: "one".to_owned().into(),
@@ -835,9 +946,12 @@ mod tests {
                     kind: RunKind::Step {
                         number: 1,
                         plugin: None,
+                        guards: Default::default(),
+                        nonce: None,
                     },
                     task: None,
                     name: None,
+                    notify: Vec::new(),
                 },
                 PlannedRun {
                     run: "two".to_owned().into(),
@@ -847,11 +961,15 @@ mod tests {
                     kind: RunKind::Step {
                         number: 2,
                         plugin: None,
+                        guards: Default::default(),
+                        nonce: None,
                     },
                     task: None,
                     name: None,
+                    notify: Vec::new(),
                 },
             ],
+            pending_handlers: Vec::new(),
             ok: true,
         };
         assert_eq!(plan.targets[0], local);
@@ -1295,6 +1413,7 @@ mod tests {
                 targets: vec![report],
                 ok: false,
                 rendered: Vec::new(),
+                warnings: Vec::new(),
             };
             assert_eq!(plan.abort(), Some(reason));
         }
@@ -1303,6 +1422,7 @@ mod tests {
             targets: Vec::new(),
             ok: true,
             rendered: Vec::new(),
+            warnings: Vec::new(),
         };
         assert_eq!(plan.abort(), None);
     }

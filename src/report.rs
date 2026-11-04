@@ -33,6 +33,10 @@ pub struct StepReport {
     /// nothing ran.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skipped: bool,
+    /// Why a guard skipped the step: `run` is then `skipped run: REASON`;
+    /// or why a handler could not run, `run` being the reason too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(skip)]
     pub entry: Entry,
     /// The path of the task this step comes from; `None` for a legacy entry.
@@ -41,6 +45,13 @@ pub struct StepReport {
     /// That task's `name`, if it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Whether the step changed something, so its `notify` fired: `None` for
+    /// the package step and `anvil run`, false for every skip and failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed: Option<bool>,
+    /// The `[[handlers]]` entry this step is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handler: Option<String>,
 }
 
 impl StepReport {
@@ -53,9 +64,13 @@ impl StepReport {
         }
     }
 
-    /// This step's task line in human output; `None` for a legacy entry.
+    /// This step's task line in human output, or `handler NAME`; `None`
+    /// for a legacy entry.
     pub fn title(&self) -> Option<String> {
-        task_title(self.task.as_deref(), self.name.as_deref())
+        match &self.handler {
+            Some(name) => Some(format!("handler {name}")),
+            None => task_title(self.task.as_deref(), self.name.as_deref()),
+        }
     }
 
     /// The step's `$` line text, unescaped but for a rollback note, which names
@@ -78,9 +93,12 @@ impl StepReport {
             stdout: into_string(output.stdout),
             stderr: into_string(output.stderr),
             skipped: false,
+            reason: None,
             entry,
             task: None,
             name: None,
+            changed: None,
+            handler: None,
         }
     }
 
@@ -92,9 +110,22 @@ impl StepReport {
             stdout: String::new(),
             stderr: String::new(),
             skipped: true,
+            reason: None,
             entry,
             task: None,
             name: None,
+            changed: None,
+            handler: None,
+        }
+    }
+
+    /// A step a guard skipped for `reason`, `run` being its `skipped …`
+    /// line: what its guards and the shell printed besides is kept.
+    pub(crate) fn guarded(run: &str, reason: String, output: Output, entry: Entry) -> StepReport {
+        StepReport {
+            reason: Some(reason),
+            skipped: true,
+            ..StepReport::from_output(run, output, entry)
         }
     }
 }
@@ -255,6 +286,15 @@ impl TargetReport {
             .iter()
             .enumerate()
             .rfind(|(_, step)| step.code != Some(0))?;
+        if let Some(name) = &step.handler {
+            if let Some(reason) = &step.reason {
+                return Some(format!("handler {name}: {reason}"));
+            }
+            return Some(match step.code {
+                Some(code) => format!("handler {name} exited {code}"),
+                None => format!("handler {name} was killed by a signal"),
+            });
+        }
         let number = index + 1;
         Some(match step.code {
             Some(code) => format!("step {number} exited {code}"),
@@ -343,6 +383,16 @@ pub struct Report {
     /// still lacks. `targets` still says what changed; `ok` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub save_error: Option<String>,
+    /// The pending handlers `apply --drop-pending` took off, before the run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dropped_pending: Vec<DroppedPending>,
+}
+
+/// A handler `apply --drop-pending` took off a target's pending list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DroppedPending {
+    pub target: String,
+    pub handler: String,
 }
 
 /// A recorded file a rollback cannot put back, and why.
@@ -627,7 +677,7 @@ fn render(report: &TargetReport, style: Style, verbose: bool) -> Vec<Line> {
     for step in steps {
         let show_stdout = verbose || step.code != Some(0);
         let title = step.title();
-        let skipped_task = step.skipped && title.is_some();
+        let skipped_task = step.skipped && title.is_some() || step.reason.is_some();
         lines.extend(title.map(|title| Line::out(title, Escape::Always, None)));
         if show_stdout || skipped_task || !step.stderr.is_empty() {
             lines.push(Line::out(
@@ -758,9 +808,12 @@ pub(crate) mod tests {
             stdout: stdout.to_owned(),
             stderr: stderr.to_owned(),
             skipped: false,
+            reason: None,
             entry: Entry::Script,
             task: None,
             name: None,
+            changed: None,
+            handler: None,
         }
     }
 

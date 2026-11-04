@@ -50,6 +50,8 @@ pub struct Item {
     pub tags: Vec<String>,
     /// Every level, ANDed; only `pkg` may repeat a key.
     pub facts: Vec<(String, String)>,
+    /// The handlers it notifies, deduplicated, in written order.
+    pub notify: Vec<String>,
     pub kind: ItemKind,
 }
 
@@ -112,7 +114,10 @@ impl Expanded {
     }
 
     /// The sudo secrets a step may type on a target its tags reach: for a
-    /// package item, a `sudo = true` file item or a service item.
+    /// package item, a `sudo = true` file item or a service item; and on
+    /// any target for a service handler, deliberately broad: which handlers
+    /// are due is known only after the steps. A secret that is not set
+    /// fails a target only once one of its service handlers is due.
     pub fn sudo_secrets<'a>(
         &'a self,
         config: &'a Config,
@@ -134,6 +139,15 @@ impl Expanded {
                 }
                 ItemKind::Step(_) => {}
             }
+        }
+        if config
+            .handlers
+            .iter()
+            .any(|handler| handler.service.is_some())
+        {
+            names.extend(
+                (targets.iter()).filter_map(|target| files::sudo_secret_for(config, target)),
+            );
         }
         names
     }
@@ -186,12 +200,18 @@ struct IncludeFile {
 
 /// Legacy sections in today's fixed order. Touches no filesystem.
 pub fn legacy(config: &Config) -> Expanded {
-    fn item(tags: &[String], facts: &BTreeMap<String, String>, kind: ItemKind) -> Item {
+    fn item(
+        tags: &[String],
+        facts: &BTreeMap<String, String>,
+        notify: &[String],
+        kind: ItemKind,
+    ) -> Item {
         Item {
             path: None,
             name: None,
             tags: tags.to_vec(),
             facts: facts.clone().into_iter().collect(),
+            notify: deduplicated(notify),
             kind,
         }
     }
@@ -200,21 +220,35 @@ pub fn legacy(config: &Config) -> Expanded {
         .packages
         .iter()
         .filter(|p| p.has_work())
-        .map(|p| item(&[], &none, ItemKind::Packages(p.clone())));
+        .map(|p| item(&[], &none, &[], ItemKind::Packages(p.clone())));
     let files = config.files.iter().enumerate().map(|(ordinal, entry)| {
         let kind = ItemKind::File {
             entry: entry.clone(),
             ordinal,
         };
-        item(&entry.tags, &entry.facts, kind)
+        item(&entry.tags, &entry.facts, &entry.notify, kind)
     });
-    let services = (config.services.iter())
-        .map(|entry| item(&entry.tags, &entry.facts, ItemKind::Service(entry.clone())));
-    let steps = (config.steps.iter()).map(|step| item(&[], &none, ItemKind::Step(step.clone())));
+    let services = config.services.iter().map(|entry| {
+        let kind = ItemKind::Service(entry.clone());
+        item(&entry.tags, &entry.facts, &entry.notify, kind)
+    });
+    let steps = (config.steps.iter())
+        .map(|step| item(&[], &none, &step.notify, ItemKind::Step(step.clone())));
     Expanded {
         items: packages.chain(files).chain(services).chain(steps).collect(),
         from_tasks: false,
     }
+}
+
+/// `names` without repeats, each kept where it first appears.
+pub(crate) fn deduplicated(names: &[String]) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::with_capacity(names.len());
+    for name in names {
+        if !kept.contains(name) {
+            kept.push(name.clone());
+        }
+    }
+    kept
 }
 
 /// [`legacy`] when there are no tasks, without calling `workspace`; else the
@@ -226,7 +260,7 @@ pub fn expand(
     if config.tasks.is_empty() {
         return Ok(legacy(config));
     }
-    check_tasks(&config.tasks, "tasks").map_err(Failure::usage)?;
+    check_tasks(&config.tasks, "tasks", &config.handlers).map_err(Failure::usage)?;
     let mut walk = Walk {
         config,
         root: Root::in_workspace(&workspace()?),
@@ -420,7 +454,7 @@ impl Walk<'_> {
                 ordinal: self.files - 1,
             }
         } else if let Some(entry) = &task.service {
-            check_service(&format!("{path}.service"), entry)?;
+            check_service(&format!("{path}.service"), entry, false)?;
             self.services += 1;
             if self.services > MAX_SERVICES {
                 return Err(format!(
@@ -433,6 +467,11 @@ impl Walk<'_> {
                 run: task.run.clone(),
                 plugin: task.plugin.clone(),
                 args: task.args.clone(),
+                creates: task.creates.clone(),
+                removes: task.removes.clone(),
+                onlyif: task.onlyif.clone(),
+                unless: task.unless.clone(),
+                notify: Vec::new(),
             };
             self.config.check_step(&path, &step)?;
             ItemKind::Step(step)
@@ -447,6 +486,7 @@ impl Walk<'_> {
             name: task.name.clone(),
             tags: selector.tags,
             facts: selector.facts,
+            notify: deduplicated(&task.notify),
             kind,
         });
         Ok(())
@@ -493,7 +533,7 @@ impl Walk<'_> {
         };
         let file: IncludeFile = document::from_str(&text, Format::Toml).map_err(refused)?;
         let prefix = format!("{path}/{}:tasks", segment(&rel));
-        check_tasks(&file.tasks, &prefix)?;
+        check_tasks(&file.tasks, &prefix, &self.config.handlers)?;
         self.chain.push(rel);
         let expanded = self.tasks(&file.tasks, &prefix, depth + 1, selector);
         self.chain.pop();
@@ -514,6 +554,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+    use crate::config::Guards;
     use crate::test_util::temp_dir;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1247,7 +1288,88 @@ mod tests {
             r#"packages = { install = ["-x"] }"#,
             ".packages.install[0] `-x`",
         ),
+        (
+            r#"run = "x"
+            creates = "rel""#,
+            ".creates `rel`: must be an absolute path",
+        ),
+        (
+            r#"plugin = "step"
+            removes = "/a/../b""#,
+            ".removes `/a/../b`: must not contain a . or .. component",
+        ),
+        (
+            r#"run = "x"
+            onlyif = " ""#,
+            ".onlyif: is empty or blank",
+        ),
+        (
+            r#"plugin = "step"
+            unless = "a\u0000b""#,
+            ".unless: contains NUL",
+        ),
+        (
+            r#"packages = { install = ["git"] }
+            creates = "/a""#,
+            ".creates: only on a run or plugin task",
+        ),
+        (
+            r#"file = { src = "s", dest = "/d", mode = "0644" }
+            removes = "/a""#,
+            ".removes: only on a run or plugin task",
+        ),
+        (
+            r#"service = { name = "a", state = "started" }
+            onlyif = "a""#,
+            ".onlyif: only on a run or plugin task",
+        ),
+        (
+            r#"include = "$/other.toml"
+            unless = "a""#,
+            ".unless: only on a run or plugin task",
+        ),
+        (
+            r#"tasks = []
+            unless = "a"
+            creates = "/a""#,
+            ".creates: only on a run or plugin task",
+        ),
     ];
+
+    #[test]
+    fn guards_reach_the_built_step_from_the_main_file_and_an_include() {
+        let ws = Workspace::new();
+        let body = "[[tasks]]\nrun = \"a\"\ncreates = \"/a\"\nremoves = \"/b\"\n\
+                    onlyif = \"c\"\nunless = \"d\"\n\n\
+                    [[tasks]]\nplugin = \"step\"\nunless = \"e\"\n";
+        ws.include("guarded.toml", body);
+        let wanted = Guards {
+            creates: Some("/a".into()),
+            removes: Some("/b".into()),
+            onlyif: Some("c".into()),
+            unless: Some("d".into()),
+        };
+        for config in [body.to_string(), include("guarded.toml")] {
+            let items = ws.items(&format!("{}{config}", plugins()));
+            let steps: Vec<Guards> = items
+                .iter()
+                .map(|item| match &item.kind {
+                    ItemKind::Step(step) => step.guards(),
+                    _ => panic!("not a step"),
+                })
+                .collect();
+            assert_eq!(
+                steps,
+                [
+                    wanted.clone(),
+                    Guards {
+                        unless: Some("e".into()),
+                        ..Guards::default()
+                    }
+                ]
+            );
+        }
+    }
 
     fn plugins() -> String {
         format!(
@@ -1377,5 +1499,125 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    const HANDLERS: &str =
+        "[[handlers]]\nname = \"a\"\nrun = \"x\"\n\n[[handlers]]\nname = \"b\"\nrun = \"y\"\n";
+
+    #[test]
+    fn legacy_items_carry_each_entrys_notify_deduplicated_in_order() {
+        let config: Config = toml::from_str(&format!(
+            "[packages]\ninstall = [\"git\"]\n\n\
+             [[files]]\nsrc = \"a\"\ndest = \"/a\"\nmode = \"0644\"\nnotify = [\"b\", \"a\", \"b\"]\n\n\
+             [[services]]\nname = \"sshd\"\nstate = \"started\"\nnotify = [\"a\"]\n\n\
+             [[steps]]\nrun = \"s\"\nnotify = [\"b\"]\n\n[[steps]]\nrun = \"t\"\n\n{HANDLERS}"
+        ))
+        .unwrap();
+        let items = legacy(&config).items;
+        let notify: Vec<Vec<&str>> = items
+            .iter()
+            .map(|item| item.notify.iter().map(String::as_str).collect())
+            .collect();
+        assert_eq!(
+            notify,
+            [vec![], vec!["b", "a"], vec!["a"], vec!["b"], vec![]]
+        );
+    }
+
+    #[test]
+    fn task_items_carry_the_tasks_notify_from_the_main_file_and_an_include() {
+        let ws = Workspace::new();
+        let body = "[[tasks]]\nrun = \"r\"\nnotify = [\"b\", \"a\", \"b\"]\n\n\
+                    [[tasks]]\nfile = { src = \"f\", dest = \"/f\", mode = \"0644\" }\nnotify = [\"a\"]\n\n\
+                    [[tasks]]\nservice = { name = \"sshd\", state = \"started\" }\nnotify = [\"b\"]\n\n\
+                    [[tasks]]\npackages = { install = [\"git\"] }\n\n\
+                    [[tasks]]\n[[tasks.tasks]]\nplugin = \"step\"\nnotify = [\"a\"]\n";
+        ws.include("notify.toml", body);
+        for config in [body.to_string(), include("notify.toml")] {
+            let items = ws.items(&format!("{}{config}\n{HANDLERS}", plugins()));
+            let notify: Vec<Vec<&str>> = items
+                .iter()
+                .map(|item| item.notify.iter().map(String::as_str).collect())
+                .collect();
+            assert_eq!(
+                notify,
+                [vec!["b", "a"], vec!["a"], vec!["b"], vec![], vec!["a"]]
+            );
+            for item in &items {
+                if let ItemKind::Step(step) = &item.kind {
+                    assert_eq!(step.notify, Vec::<String>::new());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn notify_rules_hold_in_the_main_file_and_in_an_include() {
+        let ws = Workspace::new();
+        for (task, wanted) in [
+            (
+                "run = \"r\"\nnotify = [\"a\", \"gone\"]",
+                ".notify[1] `gone`: names no [[handlers]] entry",
+            ),
+            (
+                "packages = { install = [\"git\"] }\nnotify = [\"a\"]",
+                ".notify: not on a packages task; packages give no change signal",
+            ),
+            (
+                "tasks = []\nnotify = [\"a\"]",
+                ".notify: only on a run, plugin, file or service task",
+            ),
+            (
+                "include = \"$/other.toml\"\nnotify = [\"a\"]",
+                ".notify: only on a run, plugin, file or service task",
+            ),
+            (
+                "file = { src = \"f\", dest = \"/f\", mode = \"0644\", notify = [\"a\"] }",
+                ".file: notify belongs on the task, not the file",
+            ),
+            (
+                "service = { name = \"x\", state = \"started\", notify = [\"a\"] }",
+                ".service: notify belongs on the task, not the service",
+            ),
+        ] {
+            let body = format!("[[tasks]]\n{task}\n");
+            assert_eq!(
+                ws.refusal(&format!("{body}\n{HANDLERS}")),
+                format!("tasks[0]{wanted}"),
+                "{task}"
+            );
+            ws.include("bad.toml", &body);
+            assert_eq!(
+                ws.refusal(&format!("{}\n{HANDLERS}", include("bad.toml"))),
+                format!("tasks[0]/bad.toml:tasks[0]{wanted}"),
+                "{task}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_service_action_task_is_refused_in_the_main_file_and_in_an_include() {
+        let ws = Workspace::new();
+        for state in ["restarted", "reloaded"] {
+            let body = format!("[[tasks]]\nservice = {{ name = \"x\", state = \"{state}\" }}\n");
+            let wanted = format!(
+                "service.state `{state}`: only in a [[handlers]] service; it would restart on every apply"
+            );
+            assert_eq!(ws.refusal(&body), format!("tasks[0].{wanted}"));
+            ws.include("action.toml", &body);
+            assert_eq!(
+                ws.refusal(&include("action.toml")),
+                format!("tasks[0]/action.toml:tasks[0].{wanted}")
+            );
+        }
+    }
+
+    #[test]
+    fn an_include_cannot_declare_handlers() {
+        let ws = Workspace::new();
+        ws.include("handlers.toml", HANDLERS);
+        let refusal = ws.refusal(&include("handlers.toml"));
+        assert_refused(&refusal, "tasks[0].include `$/handlers.toml`");
+        assert_refused(&refusal, "handlers");
     }
 }

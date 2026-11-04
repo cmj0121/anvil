@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::config::Guards;
 use crate::files;
 use crate::logger::{escape_invisible, escape_line};
 use crate::packages;
@@ -28,6 +29,8 @@ pub struct PlannedRun {
     pub task: Option<String>,
     /// That task's `name`, if it has one.
     pub name: Option<String>,
+    /// The handlers this step notifies when it changes something.
+    pub notify: Vec<String>,
 }
 
 /// What a run does.
@@ -41,16 +44,36 @@ pub enum RunKind {
     File { dest: String, run: FileRun },
     /// A `[[services]]` step.
     Service { name: String, run: ServiceRun },
-    /// A `[[steps]]` entry, 1-based among them, and the plugin that returned it.
+    /// A `[[steps]]` entry, 1-based among them, the plugin that returned it,
+    /// its guards and, when any is set, the nonce of their skip line, which
+    /// is never shown.
     Step {
         number: usize,
         plugin: Option<String>,
+        guards: Guards,
+        nonce: Option<GuardNonce>,
     },
     /// A `run`, `plugin` or `packages` task the target does not match:
     /// nothing runs, and no manager was resolved for it.
     Skip,
     /// `anvil run`: no config entry.
     Script,
+}
+
+/// The nonce of a guarded step's skip line; its `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GuardNonce(pub(crate) String);
+
+impl GuardNonce {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for GuardNonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GuardNonce(<redacted>)")
+    }
 }
 
 impl RunKind {
@@ -70,27 +93,41 @@ impl RunKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
     Packages,
-    File { dest: String },
-    Service { name: String },
-    Step { number: usize },
+    File {
+        dest: String,
+    },
+    Service {
+        name: String,
+    },
+    Step {
+        number: usize,
+    },
+    /// A `[[handlers]]` entry, run in the handler phase.
+    Handler {
+        name: String,
+    },
     Script,
 }
 
-/// By hand: a `[[files]]` step's `run` is shown only by its length.
+/// By hand: a `[[files]]` step's `run` is shown only by its length, as is a
+/// guarded step's, which carries the guards' nonce.
 impl std::fmt::Debug for PlannedRun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = f.debug_struct("PlannedRun");
-        match self.file() {
-            Some(_) => debug.field("run", &Redacted(self.run.len())),
-            None => debug.field("run", &*self.run),
-        };
+        if self.file().is_some() || self.guards().is_some() {
+            debug.field("run", &Redacted(self.run.len()));
+        } else {
+            debug.field("run", &*self.run);
+        }
         debug
             .field("label", &self.label)
             .field("sudo_secret", &self.sudo_secret)
             .field("plugin", &self.plugin())
+            .field("guards", &self.guards())
             .field("timeout", &self.timeout)
             .field("file", &self.file())
             .field("service", &self.service())
+            .field("notify", &self.notify)
             .finish()
     }
 }
@@ -159,6 +196,14 @@ impl PlannedRun {
         }
     }
 
+    /// This step's guards; `None` when it has none.
+    pub fn guards(&self) -> Option<&Guards> {
+        match &self.kind {
+            RunKind::Step { guards, .. } if !guards.is_empty() => Some(guards),
+            _ => None,
+        }
+    }
+
     pub(crate) fn file(&self) -> Option<&FileRun> {
         match &self.kind {
             RunKind::File { run, .. } => Some(run),
@@ -194,6 +239,10 @@ impl Serialize for PlannedRun {
             name: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             rendered: Option<RenderedShown<'a>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            guards: Option<&'a Guards>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            notify: &'a [String],
         }
         /// A templated file's rendered size and hash, never its text.
         #[derive(Serialize)]
@@ -212,6 +261,8 @@ impl Serialize for PlannedRun {
             task: self.task.as_deref(),
             name: self.name.as_deref(),
             rendered,
+            guards: self.guards(),
+            notify: &self.notify,
         }
         .serialize(serializer)
     }
@@ -247,7 +298,63 @@ mod tests {
             kind: RunKind::Script,
             task: task.map(str::to_owned),
             name: name.map(str::to_owned),
+            notify: Vec::new(),
         }
+    }
+
+    fn guarded() -> PlannedRun {
+        PlannedRun {
+            run: Zeroizing::new("{ :\necho anvil-guard-0123 skipped\n}\n".to_owned()),
+            label: Some("true".to_owned()),
+            kind: RunKind::Step {
+                number: 1,
+                plugin: None,
+                guards: Guards {
+                    creates: Some("/usr/local/bin/x".to_owned()),
+                    ..Guards::default()
+                },
+                nonce: Some(GuardNonce("0123".to_owned())),
+            },
+            ..script(None, None)
+        }
+    }
+
+    #[test]
+    fn a_guarded_steps_debug_hides_its_script_and_nonce() {
+        let shown = format!("{:?}", guarded());
+        assert!(!shown.contains("anvil-guard-"), "{shown}");
+        assert!(!shown.contains("0123"), "{shown}");
+        assert!(shown.contains("bytes redacted>"), "{shown}");
+        assert!(shown.contains("/usr/local/bin/x"), "{shown}");
+        let kind = format!("{:?}", guarded().kind);
+        assert!(!kind.contains("0123"), "{kind}");
+        assert!(kind.contains("GuardNonce(<redacted>)"), "{kind}");
+    }
+
+    #[test]
+    fn a_guarded_step_serializes_its_guards_and_label_only() {
+        assert_eq!(
+            serde_json::to_value(guarded()).unwrap(),
+            serde_json::json!({"run": "true", "guards": {"creates": "/usr/local/bin/x"}})
+        );
+        assert_eq!(
+            guarded().guards().unwrap().creates.as_deref(),
+            Some("/usr/local/bin/x")
+        );
+        let plain = PlannedRun {
+            kind: RunKind::Step {
+                number: 1,
+                plugin: None,
+                guards: Guards::default(),
+                nonce: None,
+            },
+            ..script(None, None)
+        };
+        assert_eq!(plain.guards(), None);
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({"run": "true"})
+        );
     }
 
     #[test]

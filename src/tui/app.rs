@@ -1724,9 +1724,12 @@ pub mod tests {
             stdout: stdout.to_owned(),
             stderr: stderr.to_owned(),
             skipped: false,
+            reason: None,
             entry: anvil::step::Entry::Script,
             task: None,
             name: None,
+            changed: None,
+            handler: None,
         }
     }
 
@@ -1772,6 +1775,7 @@ pub mod tests {
             transport: format!("ssh {target}"),
             plugins: Vec::new(),
             drift: None,
+            pending_handlers: Vec::new(),
         }
     }
 
@@ -1783,6 +1787,7 @@ pub mod tests {
             secrets: [("API".to_owned(), doctor::SecretStatus::Missing)].into(),
             plugins: Default::default(),
             record: None,
+            record_warnings: Vec::new(),
             tag_key: None,
             unused_tags: Vec::new(),
         }
@@ -2250,6 +2255,7 @@ pub mod tests {
                 vars: Default::default(),
                 env: Default::default(),
                 steps: Vec::new(),
+                pending_handlers: Vec::new(),
                 ok: true,
             },
         ));

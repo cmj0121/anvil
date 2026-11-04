@@ -419,6 +419,11 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
 - `vars` 與 `env`：每個 target 解析後的 [vars 與 env](configuration.zh-TW.md#vars-與-env)，接在 facts 之後，
   每個鍵一列，並附上設定它的層級（`global`、`tag:NAME` 或 `host`）。var 以 JSON 文字顯示，因此看得出型別；env 值照寫的顯示。
   不可見字元與 bidi 字元會被跳脫。值原樣顯示：它們不是機密。沒有 vars 或 env 的 target 沒有這些列。
+- `handlers`：在 [apply 紀錄](#apply-紀錄)中的項目列有待執行 handler 的 target 會多一列
+  `handlers        WARNING: pending from last apply: a, b`，也就是下一次 apply 會執行的（或由
+  [`apply --drop-pending`](#執行中的-handler) 清除）。不論有哪些 doctor plugin，紀錄都只讀取一次；
+  它在載入時捨棄的錯誤名稱會在本機檢查中顯示為一列 `record          WARNING: PATH: TARGET: dropped N bad pending_handlers entries`。
+  兩者都不改變結束碼。
 - `tag NAME`：沒有任何 host 帶有的 `[tags.NAME]` table（`local` 除外），會在本機檢查中顯示為一列 `tag NAME`，
   內容為 `WARNING: no host carries this tag`，並記一則日誌警告 `tag NAME: no host carries this tag`。它不改變結束碼。
 
@@ -486,6 +491,7 @@ web1
 `manager`（解析出的套件管理器）或 `manager_error`（原因，不含 `error:` 前綴）只在有 `[packages]` 且 target 可連線時出現。
 `vars` 與 `env` 把每個鍵對應到它的 `value`（var 保留其 JSON 型別，env 值是字串）與 `level`，
 出現在每個 target 上，無論可否連線；為空時省略。`local.unused_tags` 列出未使用的 tag，沒有時省略。
+有待執行 handler 的 target 有 `pending_handlers`，紀錄的載入警告則在 `local.record_warnings`，各自空時省略。
 
 有 `[packages]` 且 manager 解析成功時，target 另有 `packages` 字串：`"ok"` 或
 `"WARNING: not found by MANAGER: a, b"`，也會顯示為 `packages` 列。
@@ -672,6 +678,12 @@ target 的 tag 與 fact 符合時複製檔案，不符合時顯示為略過（[F
 在舊版 config 中，每個 `[[services]]` 項目在每個 target 上都是一個 step，排在 file step 之後、`[[steps]]` 之前：
 target 的 tag 與 fact 符合時以 target 的 init 把服務帶到其狀態，不符合時顯示為略過（[Service steps](#service-steps)）。
 
+帶有 guard（`creates`、`removes`、`onlyif`、`unless`）的 `run` 或 plugin step 會先在 target 上檢查它們，
+有 guard 決定略過時顯示為略過並附上原因（[Guarded steps](#guarded-steps)）。
+
+帶有 `notify` 且改變了東西的 step 會把它的 [handler](configuration.zh-TW.md#handlers) 排入佇列，
+它們在 target 的最後一個 step 之後各執行一次（[執行中的 handler](#執行中的-handler)）。
+
 每個 `install` 名稱在腳本中會換成解析出的管理器的 `[packages.alias]` 項目，沒有則原樣使用（[別名](packages.zh-TW.md#別名)）。
 以下面的 config 而言，apt 與 dnf 安裝 `fd-find`，brew、pacman 與 apk 安裝 `fd`；`anvil plan` 顯示相同的腳本：
 
@@ -757,7 +769,13 @@ upgrade = true
     {
       "target": "local",
       "steps": [
-        { "run": "hostname", "code": 0, "stdout": "mac.local\n", "stderr": "" }
+        {
+          "run": "hostname",
+          "code": 0,
+          "stdout": "mac.local\n",
+          "stderr": "",
+          "changed": true
+        }
       ],
       "ok": true
     },
@@ -774,6 +792,8 @@ upgrade = true
 target 要嘛執行了它的 step（`steps` 與 `ok`；失敗的 step 會顯示其 `code`，且 `ok` 為 false），
 要嘛在傳輸中失敗（`error`、`ok: false`，只有在錯誤前已完成某些 step 時才有 `steps`）。
 step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 的最後一項，與 `error` 並列。
+`changed` 表示 step 是否改變了東西，因而觸發了它的 `notify`：出現在 file、service、`run` 與 plugin step 上（包括略過的，為 `false`），
+以及 handler 上；套件 step 沒有它（[執行中的 handler](#執行中的-handler)）。
 
 套件 step 的未知名稱會從輸出取出，放入 target 的 `warnings: Vec<String>`（JSON 為字串陣列，空時省略）。
 例如 `"warnings": ["packages: not found by pacman: nvim, watch (add [packages.alias.NAME])"]`。
@@ -781,8 +801,9 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 已知名稱仍會安裝，後續 step 照常執行，target 的 `ok`、摘要與 exit code 不因這些警告改變。
 所有 target 成功時仍以 0 結束；實際安裝失敗仍會使 target 失敗。
 
-文件本身也可能有最上層的 `warnings`（字串陣列，空時省略）：這次執行中 apply 紀錄失去的內容，
-也就是放不下或不保存的先前文字（[apply 紀錄](#apply-紀錄)）。它們同時印在 stderr，只指名 dest 與 target，絕不含文字，
+文件本身也可能有最上層的 `warnings`（字串陣列，空時省略）：先是載入紀錄時捨棄的內容
+（`PATH: TARGET: dropped N bad pending_handlers entries`），接著是每個 `--drop-pending NAME: not pending on TARGET`，
+然後是這次執行中 apply 紀錄失去的內容，也就是放不下或不保存的先前文字（[apply 紀錄](#apply-紀錄)、[執行中的 handler](#執行中的-handler)）。它們同時印在 stderr，只指名 dest 與 target，絕不含文字，
 也不改變 `ok` 或結束碼。rollback 的形狀相同，另外多了 `not_restored`（[`anvil rollback`](#anvil-rollback)）。
 
 紀錄無法儲存時，文件多一個最上層的 `save_error` 字串（否則省略），且即使每個 target 的 `ok` 都是 true，最上層的 `ok`
@@ -841,7 +862,8 @@ include = "$/roles/web.toml"   # Validate config, then Start nginx with tags = [
   "stderr": "",
   "skipped": true,
   "task": "tasks[2]/roles/web.toml:tasks[1]",
-  "name": "Start nginx"
+  "name": "Start nginx",
+  "changed": false
 }
 ```
 
@@ -874,6 +896,101 @@ what it names, then run rollback again
 - **doctor。** doctor 會展開清單（被拒絕的 include 以 2 結束），檢查 selector 符合每個 target 的 `packages` task
   與這些 task 需要的 sudo secret，並比對 file task 寫入的 dest。
 - **TUI。** Steps 窗格列出展開後的 task；apply 與 plan 區塊顯示相同的 `PATH  NAME` 行（[終端介面](tui.zh-TW.md)）。
+
+#### 執行中的 handler
+
+帶有 `notify` 且改變了東西的 step，會把它指名的 [handler](configuration.zh-TW.md#handlers) 排入佇列。
+target 的最後一個 step 之後，且每個 step 都通過時，在那裡到期的每個 handler 依 `[[handlers]]` 順序各執行一次：
+本次 apply 被通知的，以及先前的 apply 仍待執行的。以下面的 config 而言：
+
+```toml
+[[files]]
+src = "files/sshd_config"
+dest = "/etc/ssh/sshd_config"
+mode = "0644"
+notify = ["reload sshd"]
+
+[[steps]]
+run = "hostname"
+
+[[handlers]]
+name = "reload sshd"
+service = { name = "sshd", state = "reloaded" }
+```
+
+在檔案有變更的 target 上，`anvil -vv apply` 印出：
+
+```text
+▶ web1
+  $ file /etc/ssh/sshd_config
+  wrote /etc/ssh/sshd_config
+  $ hostname
+  web1
+  handler reload sshd
+  $ service sshd
+  reloaded service sshd
+  ✔ ok · 3 steps
+
+1 ok, 0 failed
+```
+
+- **`handler NAME`。** 每個執行的 handler 都有這一行，在每個 `-v` 等級都顯示，位於它的 `$` 行上方；`$` 行依任何 step 的
+  `-v` 規則顯示：`run` handler 為 `$ RUN`，`service` handler 為 `$ service NAME`。它計入 `✔ ok · N steps`。
+  未到期的 handler 什麼都不印。
+- **失敗。** 以非零結束的 handler 會讓 target 失敗（以 1 結束），區塊以 `✘ handler NAME exited N`
+  （`✘ handler NAME was killed by a signal`）結尾；其他到期的 handler 仍會執行。到期卻無法執行的 handler
+  （無法解析，或缺少它的 sudo 密碼）以原因作為它的 `$` 行，區塊以 `✘ handler NAME: REASON` 結尾。
+  兩種情況它都保持待執行。失敗的 step，或在 step 之前就失敗的 target，不執行任何 handler。
+- **Ctrl-C 與連線中斷。** 在某個 handler 之前的第一次 Ctrl-C 會讓 target 以 `⊘ cancelled` 結束，該 handler 與其後的都保持待執行。
+  handler 階段的傳輸錯誤以該錯誤結束 target，尚未執行的 handler 仍待執行。
+- **待執行。** 下一次在該 target 上的 apply 會執行仍待執行的 handler，即使沒有 step 再次通知它。
+  `[[handlers]]` 已不再有的待執行名稱會被捨棄，並在 target 的區塊與其 `warnings` 中顯示
+  ``⚠ pending handler `NAME` is not in [[handlers]]; dropped``。紀錄中的錯誤名稱（無效、重複或超過 64 個）在載入時捨棄，
+  並在 stderr（任何 `-v` 等級）與最上層的 `warnings` 顯示 `PATH: TARGET: dropped N bad pending_handlers entries`。
+  兩者都不會讓 apply 失敗。傳遞是至少一次（[Handlers](configuration.zh-TW.md#handlers)）。
+- **Rollback。** 執行過的 handler 無法復原：rollback 把它列為 `cannot undo: handler NAME`，
+  並把它放回的檔案的 handler 排入佇列（[`anvil rollback`](#anvil-rollback)）。
+
+`--json` 以 `handler`（handler 的名稱）標示每個 handler 的報告，並給每個 step `changed`：印出 `wrote DEST` 的 file step、
+改變了東西的 service step，以及執行並以 0 結束的 `run` 或 plugin step 為 `true`；未變更、略過或失敗的 step 為 `false`；
+在 handler 上則表示它是否以 0 結束。套件 step 與 `anvil run` 沒有 `changed`。執行過的 handler：
+
+```json
+{
+  "run": "service sshd",
+  "code": 0,
+  "stdout": "reloaded service sshd\n",
+  "stderr": "",
+  "changed": true,
+  "handler": "reload sshd"
+}
+```
+
+無法執行的 handler 其 `code` 為 `null`、沒有輸出，`run` 與 `reason` 都是它的原因：
+
+```json
+{
+  "run": "services: secret WEB1_SUDO is not set",
+  "code": null,
+  "stdout": "",
+  "stderr": "",
+  "reason": "services: secret WEB1_SUDO is not set",
+  "changed": false,
+  "handler": "reload sshd"
+}
+```
+
+**捨棄待執行的 handler。** `anvil apply --drop-pending NAME` 在任何 step 執行之前，從每個選定 target 的待執行清單移除 NAME，
+且不執行它；重複這個旗標可指定更多名稱。同一個名稱給兩次只捨棄一次，也不會多一則警告。每個被捨棄的都會在 stdout、target 區塊之前印出
+`dropped pending handler NAME on TARGET`，並在 `--json` 中列於最上層的
+`"dropped_pending": [{"target": "web1", "handler": "reload sshd"}]`。NAME 在某個選定 target 上不是待執行，或該 target 沒有項目時，
+會在 stderr 與最上層的 `warnings`（排在紀錄載入警告之後）發出警告 `--drop-pending NAME: not pending on TARGET`；它不改變結束碼。
+不是有效 handler 名稱的 NAME 以 2 結束並顯示 ``--drop-pending `NAME`: must match [A-Za-z0-9 ._-]+, at most 64 bytes``；
+`all` 只是一個名稱。即使 config 沒有 `[[handlers]]`，這個旗標也會開啟紀錄。TUI 的 apply 不捨棄任何東西。
+
+```sh
+anvil apply --target web1 --drop-pending "reload sshd"
+```
 
 #### Ctrl-C
 
@@ -909,7 +1026,7 @@ what it names, then run rollback again
 
 #### apply 紀錄
 
-會探測 target 的 apply（有工作的 `[packages]`、plugin step、`[[files]]` 或 `[[services]]`，
+會探測 target 的 apply（有工作的 `[packages]`、plugin step、`[[files]]`、`[[services]]` 或 `[[handlers]]`，
 或在 tasks config 上[如執行中的 task 所述](#執行中的-task)）會保存
 `last-apply.json`，供 [`anvil rollback`](#anvil-rollback) 讀取。只有一般 `[[steps]]` 的 apply 不會開啟它。
 
@@ -923,7 +1040,8 @@ what it names, then run rollback again
   `[[files]]` 寫入時，才會取代該 target 的項目。apply 有連到但沒有寫入檔案的 target 會保留它的檔案，並更新為新的 facts。
   這次 apply 沒有選到的 target 保留各自的項目。
 - **保存的內容。** 每個 target：時間（`at`）、anvil 版本、每個 step 是否都通過（`ok`）、探測得到的 facts、寫入的每個檔案、
-  無法復原的 step（`cannot_undo`），以及 rollback 之後的 `rolled_back`。每個檔案：dest、寫入時的 mode 與 `sudo`、
+  無法復原的 step（`cannot_undo`，執行過的 handler 記為 `handler NAME`）、仍待執行的 handler
+  （`pending_handlers`，以名稱記錄，空時省略），以及 rollback 之後的 `rolled_back`。每個檔案：dest、寫入時的 mode 與 `sudo`、
   寫入位元組的 sha256、寫入如何結束（`write`），以及先前的狀態（`previous`）。它絕不保存 secret 的值、step 的腳本或套件清單。
 - **tasks config 上每個 dest 一筆。** 同一次 apply 中兩個 file task 寫入的 dest（拼法相同或只差重複的斜線）只有一筆檔案項目，
   以第一個拼法記錄：`previous` 取自第一次寫入之前，
@@ -966,7 +1084,8 @@ what it names, then run rollback again
           "previous": { "state": "absent" }
         }
       ],
-      "cannot_undo": ["packages", "service nginx", "step 1"]
+      "cannot_undo": ["packages", "service nginx", "step 1"],
+      "pending_handlers": ["reload nginx"]
     }
   }
 }
@@ -978,6 +1097,10 @@ anvil 把它寫成一行。`previous` 對先前不存在的 dest 為 `{"state": 
 只有在就地寫入之後 DEST 才可能只有部分位元組，[此時會有警告](configuration.zh-TW.md#files)）。
 寫入任何東西之前就被拒絕（`refused`：root 檢查、DEST 是目錄、DEST 在讀取後被改過，或無法設定 mode 的他人 DEST，
 都以 4 結束）的寫入絕不保存：該 dest 保留前一次 apply 的項目（若有）。
+
+**待執行的 handler。** `pending_handlers` 在每次通知發生時與每個 handler 成功時儲存，因此在失敗、取消或被終止的 apply 之後仍然存在。
+新的 apply 項目與 rollback 都保留它，項目被取代的 target 也會沿用它。沒有這個欄位的紀錄照舊載入。
+其中的錯誤名稱在載入時捨棄並發出警告（[執行中的 handler](#執行中的-handler)）。
 
 **保存或不保存。** 只有在先前的檔案是所有人可讀（mode 含 `0o004`）、文字是不含 NUL 位元組的 UTF-8、最多 256 KiB，
 且項目沒有設定 `rollback = false` 時，才會保存它。否則 `kept` 為 false，`reason` 說明原因：`rollback = false`、
@@ -1080,12 +1203,22 @@ secret 由 `anvil doctor` 檢查。
 - [範本](configuration.zh-TW.md#templating)檔案 step 在其 `would $ file DEST` 行下方多一行 `rendered N bytes, sha256 HEX`：
   該 target 算繪文字的大小與完整 sha256，也就是 apply 會寫入的位元組。算繪失敗的 target 以 `✘` 加上範本訊息結束
   （[Templating](configuration.zh-TW.md#templating)）。
+- 帶有 guard 的 step 在其 `would $` 行下方每個 guard 多一行，依檢查順序：`creates PATH`、`removes PATH`、
+  `onlyif CMD`、`unless CMD`（[Guarded steps](#guarded-steps)）。plan 從不執行它們，因此無法得知 apply 是否會略過該 step。
+- 帶有 `notify` 的 step 在其 `would $` 與 guard 行之後多一行 `notifies NAME, NAME`：它可能通知的 handler。
+  handler 從不是 `would $` 行，因為它們只在被通知時執行。step 之後，若 target 在本機 [apply 紀錄](#apply-紀錄)中的項目列有待執行的
+  handler，會顯示 `pending from last apply: NAME, …`，也就是下一次 apply 會執行的。紀錄只讀取一次且不上鎖；plan 不會為此多連線，
+  無法讀取的紀錄只記入日誌，不會致命。config 已不再有的待執行名稱會略去並記入日誌。
+  紀錄在載入時捨棄的錯誤名稱，各在 stderr 印出一行 `WARNING: PATH: TARGET: dropped N bad pending_handlers entries`
+  （[執行中的 handler](#執行中的-handler)）。
 - 區塊以 `✔ N steps` 結尾，失敗的 target 則為 `✘ REASON`。
   摘要為 `N targets, nothing executed`，有 target 失敗時在 `nothing executed` 前加上 `M failed`（`2 targets, 1 failed, nothing executed`）。
 - 顏色與跳脫規則與 apply 相同。
 
 `--json` 是 apply 的文件，最前面加上 `"executed": false`；
-step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`，以及 tasks config 上的 `task` 與 `name`，絕不會有 `code`、`stdout` 或 `stderr`。
+step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`、tasks config 上的 `task` 與 `name`、有 guard 的 step 的
+`guards`，以及帶有 `notify` 的 step 的 `notify`（名稱），絕不會有 `code`、`stdout` 或 `stderr`。
+有待執行 handler 的已規劃 target 另有 `pending_handlers`，空時省略；紀錄的載入警告則是最上層的 `warnings` 陣列，文字相同但不含 `WARNING:` 前綴，空時省略。
 有 vars 或 env 的 target 另有 `vars` 與 `env`，與 doctor 的 `--json` 相同
 （`"vars": {"port": {"value": 8080, "level": "tag:web"}}`），而 step 的 `run` 是照寫的腳本，不含 env 行：
 
@@ -1314,6 +1447,83 @@ plan 顯示 `would $ SCRIPT (from plugin NAME)`，其 `--json` 的 step 帶有 `
 因此 plugin 不可以有副作用。它在 apply 時會再執行一次，所以對相同請求不一定給出相同回覆的 plugin
 （讀取時鐘、亂數或遠端 API 的 plugin）可能讓 plan 顯示的腳本與 apply 接著執行的不同。
 
+### Guarded steps
+
+`run` 或 plugin step 可以帶有 [guard](configuration.zh-TW.md#config)：`creates`、`removes`、`onlyif` 與 `unless`。
+它們依此順序在 target 上檢查，與 step 在同一次往返中，有 guard 決定略過時腳本就不執行。以下面的 config 而言：
+
+```toml
+[[steps]]
+run = "curl -fsSL https://example.com/install.sh | sh"
+creates = "/usr/local/bin/x"
+
+[[steps]]
+run = "x migrate"
+unless = "x migrate --status | grep -q up-to-date"
+```
+
+在兩者都已具備的 target 上，`anvil apply` 在每個 `-v` 等級都印出：
+
+```text
+▶ local
+  $ skipped run: /usr/local/bin/x exists
+  $ skipped run: unless exited 0
+  ✔ ok · 2 steps
+
+1 ok, 0 failed
+```
+
+- **略過行。** `skipped run: PATH exists`（`creates`）、`skipped run: PATH is absent`（`removes`）、
+  `skipped run: onlyif exited N` 與 `skipped run: unless exited 0`。plugin step 的行改以 `skipped plugin NAME:` 開頭，
+  例如 `skipped plugin harden: /etc/x exists`。這一行顯示在 `$ RUN` 的位置。
+- **計入，不算失敗。** 被略過的 step 計入 `✔ ok · N steps` 與 `✘ step N`，該 target 的下一個 step 照常執行。
+  它沒有改變任何東西，因此 [`anvil rollback`](#anvil-rollback) 不會把它列在 `cannot undo` 之下。
+- **執行了的 step** 與其他 step 顯示方式相同，只有它的 `run` 文字：guard 不屬於 `$ RUN`，也不屬於 JSON 的 `run`。
+  guard 的 stderr 顯示為該 step 的 stderr；其 stdout 會被丟棄。
+- **guard 失敗。** guard 的結束碼只決定 step 是否執行。被訊號終止的 guard 指令會讓 step 失敗：stderr 出現
+  `onlyif was killed by signal 9`（或 `unless`），target 以 `✘ step 2 exited 137` 結束。
+  卡住的 guard 會用完 step 的時間限制，以 `✘ timed out after 30 s` 結束。
+- **Plugin。** plugin step 的 plugin 仍會在 target 的第一個 step 之前於控制端執行，不論其 guard 之後在 target 上如何決定。
+
+`--json` 以 `skipped: true` 與 `reason` 標示被略過的 step，`reason` 是略過行去掉 `skipped run:`
+（或 `skipped plugin NAME:`）前綴後的部分。其他 step 都省略 `reason`。被略過的 step 的 `stdout` 與 `stderr`
+保留該次往返的其他輸出，例如登入 shell 或 motd 的雜訊以及 guard 指令的 stderr；只移除略過行，
+guard 指令自己的 stdout 則被丟棄：
+
+```json
+{
+  "run": "skipped run: /usr/local/bin/x exists",
+  "code": 0,
+  "stdout": "",
+  "stderr": "",
+  "skipped": true,
+  "reason": "/usr/local/bin/x exists",
+  "changed": false
+}
+```
+
+`anvil plan` 在每個 step 下方顯示其 guard，且一個都不執行，因此 plan 仍然不在 target 上執行任何東西：
+
+```text
+▶ local
+  would $ curl -fsSL https://example.com/install.sh | sh
+    creates /usr/local/bin/x
+  would $ x migrate
+    unless x migrate --status | grep -q up-to-date
+  ✔ 2 steps
+
+1 target, nothing executed
+```
+
+多行的 `onlyif` 或 `unless` 顯示第一行加上 `…`。在 `plan --json` 中，有 guard 的 step 帶有 `guards`，只包含有設定的鍵：
+
+```json
+{
+  "run": "x migrate",
+  "guards": { "unless": "x migrate --status | grep -q up-to-date" }
+}
+```
+
 ### File steps
 
 `[[files]]` 項目或 `file` [task](#執行中的-task) 把工作區或檔案儲存區中的一份文字檔複製到每個 tag 與 fact 都符合的選定 target
@@ -1347,8 +1557,8 @@ facts = { distro = "arch" }
 在 `--json` 中，file step 的 `run` 就是該標籤。略過的 step 帶有 `"skipped": true`、`code` 為 0 且輸出為空：
 
 ```json
-{ "run": "file /etc/ssh/sshd_config", "code": 0, "stdout": "wrote /etc/ssh/sshd_config\n", "stderr": "" }
-{ "run": "skipped file /etc/motd: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true }
+{ "run": "file /etc/ssh/sshd_config", "code": 0, "stdout": "wrote /etc/ssh/sshd_config\n", "stderr": "", "changed": true }
+{ "run": "skipped file /etc/motd: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true, "changed": false }
 ```
 
 `anvil plan` 顯示 `would $ file DEST`（apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
@@ -1445,8 +1655,8 @@ target 以 `✘ timed out after 120 s` 結束。120 s 涵蓋 systemd 預設 90 s
 在 `--json` 中，service step 的 `run` 就是該標籤。略過的 step 帶有 `"skipped": true`、`code` 為 0 且輸出為空：
 
 ```json
-{ "run": "service sshd", "code": 0, "stdout": "unchanged service sshd\n", "stderr": "" }
-{ "run": "skipped service cron: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true }
+{ "run": "service sshd", "code": 0, "stdout": "unchanged service sshd\n", "stderr": "", "changed": false }
+{ "run": "skipped service cron: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true, "changed": false }
 ```
 
 `anvil plan` 顯示 `would $ service NAME`（apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
@@ -1537,6 +1747,25 @@ target 以 `✘ timed out after 120 s` 結束。120 s 涵蓋 systemd 預設 90 s
 plist 本身的 `Disabled` 鍵為 true 時不會被偵測到（anvil 不讀取 plist）；預期 bootstrap 會以 launchctl 自己的錯誤失敗。
 這些 launchd 的變更是以替身工具測試的，而非實際的 launchd；只有 `print-disabled` 的格式在 macOS 26 上以唯讀方式確認過。
 
+**Handler 動作。** [handler](configuration.zh-TW.md#handlers) 的服務也可以是 `restarted` 或 `reloaded`。
+它顯示為 `$ service NAME`，先做相同的找不到檢查（systemd 上的 `restarted` 還有 masked 檢查），
+在動作取決於服務是否執行時詢問它，然後依下列方式動作。它印出 `restarted service NAME` 或 `reloaded service NAME`；在未執行的服務上，`reloaded` 不發出呼叫，
+印出 `service NAME is not running; not reloaded` 並以 0 結束，這不算變更。登入不是 root 時，每個指令都加上 `sudo -n` 前綴。
+
+- **systemd。** `restarted`：在找不到與 masked 檢查之後，直接執行 `systemctl --no-ask-password restart -- NAME`，
+  它會啟動已停止的 unit；不執行 `is-active`。`reloaded`：在找不到檢查之後執行
+  `systemctl --no-ask-password is-active --quiet -- NAME`，成功時再執行 `systemctl --no-ask-password reload -- NAME`。
+- **OpenRC。** 在 `rc-service --exists NAME` 之後執行 `rc-service NAME status`：以 0 結束為執行中；以 32 結束（crashed）算作未執行。
+  `restarted`：執行中時為 `rc-service NAME restart`；crashed 的服務先 `rc-service NAME zap` 再 `rc-service NAME start`；
+  其他已停止的服務為 `rc-service NAME start`。`reloaded`：執行中時為 `rc-service NAME reload`。
+- **launchd。** `launchctl print system/NAME` 判斷 job 是否已載入。`restarted` 也會像 `started` 一樣讀取
+  `launchctl print-disabled system`，然後在已載入時執行 `launchctl kickstart -k system/NAME`，否則執行
+  `launchctl bootstrap system /Library/LaunchDaemons/NAME.plist`。`reloaded`：已載入時為
+  `launchctl kickstart -k system/NAME`，因為 launchd 沒有 reload。
+
+launchd 的 bootstrap 在 job 已停用時被拒絕，訊息為 `services: NAME is disabled; enable it to restart it`；
+`reloaded` handler 從不讀取停用覆寫。launchd 與 crashed OpenRC 的路徑是以替身工具測試的。
+
 ### `anvil rollback`
 
 ```text
@@ -1589,8 +1818,12 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   下面那些沒有指名檔案的註記不影響摘要。
 - **無法復原的部分。** 在檔案之後，apply 中有執行但無法復原的 step 會顯示為略過的 step：`cannot undo: packages`、
   `cannot undo: service NAME` 與 `cannot undo: step N`（第 N 個 `[[steps]]` 項目），在 tasks config 上則為 `cannot undo: PATH`
-  （[執行中的 task](#執行中的-task)）。rollback 絕不執行套件管理器、
-  service 指令或 step。
+  （[執行中的 task](#執行中的-task)），執行過的 handler 則為 `cannot undo: handler NAME`。
+  rollback 絕不執行套件管理器、service 指令、step 或 handler。
+- **排入的 handler。** 對它放回的每個檔案，rollback 把該 dest 的 file 項目中適用於該 target 者（以紀錄保存的 fact 比對，而不是探測的 fact）
+  的 `notify` 名稱，依 `[[handlers]]` 順序、各一次地加入該 target 的 `pending_handlers`，讓下一次 apply 執行它們。
+  每個排入的 handler 都是 target 區塊中的一則警告 `⚠ pending handler NAME queued for the next apply`，也在它的 `warnings` 中。
+  紀錄中的錯誤待執行名稱在載入時捨棄，並在 stderr 與最上層的 `warnings` 發出警告，與 apply 相同。
 - **與寫入相同的路徑。** 每個檔案都依 apply 寫入的方式還原，依據記錄的 `sudo` 與 target 目前的 facts：透過 `sudo -n`、
   以 root、以連線使用者，或走密碼路徑：把文字暫存在 0600 的 `/tmp/anvil-` 檔案，再透過 `sudo` 從該檔案取代 DEST，並套用記錄的擁有者與 mode。
   只要 target 的項目中有 `sudo = true` 的檔案，sudo 密碼就取自該 target 的 sudo secret。
@@ -1624,7 +1857,7 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 - **懸空的連結。** 舊版 anvil 會透過連結寫入原本是指向不存在檔案之 symlink 的 `sudo = false` dest，因而建立了那個檔案；
   現在這樣的 dest 會被拒絕。當時的紀錄仍可 rollback，因為 `rm` 不會跟隨連結。rollback 只移除連結，它所建立的檔案會留下：`removed link DEST; the file it pointed to was kept`。
 - **`rolled_back`。** 每個 target 結束後，它還原、移除或發現未變更的 dest 會以 `rolled_back`（`at` 與 `dests`）存進它的項目。
-  這是 rollback 對紀錄唯一的變更，所以第二次 rollback 會再次還原相同的位元組，或印出 `unchanged DEST`。
+  這與排入的 handler 是 rollback 對紀錄僅有的變更，所以第二次 rollback 會再次還原相同的位元組，或印出 `unchanged DEST`。
   下一次在該 target 上寫入檔案的 apply 會取代這個項目。
 - **Target。** 紀錄中沒有項目的選定 target 顯示 `nothing recorded`，並算作成功。已不在 inventory 中的 target 的項目不會被 rollback。
 - **鎖。** rollback 在整個執行期間持有紀錄的鎖，與 apply 相同（[apply 紀錄](#apply-紀錄)）；儲存失敗為

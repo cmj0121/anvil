@@ -2,13 +2,19 @@
 
 English | [繁體中文](README.zh-TW.md)
 
-A remote host kept in shape: upgrade, pin, remove, a root-owned file under `/etc` and a running service.
+A remote host kept in shape: upgrade, pin, remove, a root-owned file under `/etc`, a running service, guarded steps and
+a handler.
 
 - `[packages]`: `upgrade = true` upgrades every installed package first, `pin = ["vim"]` installs vim when missing and
   skips it in that upgrade, `remove = ["nano"]` removes nano when installed. Pin works only on pacman and dnf; on brew,
   apt or apk any `pin` fails that target ([Pin and remove](../../docs/packages.md#pin-and-remove)).
 - `[[files]]` writes `files/motd` to `/etc/motd` through sudo, and `[[services]]` keeps `sshd` started and enabled.
   Both carry `tags = ["linode"]`, the tag of the host `linode1` in `inventory.toml`, so they skip every other target.
+- Two `[[steps]]` carry [guards](../../docs/configuration.md#config), so a rerun leaves them alone: `creates` skips the
+  first once `/var/tmp/anvil-provisioned` exists, and `unless` skips the second while
+  `grep -qx 'managed by anvil' /var/tmp/anvil-note` exits 0. `[[steps]]` take no tags, so both run on every target.
+- The motd file has `notify = ["log motd change"]`: when it prints `wrote /etc/motd`, the `run` handler of that name runs
+  once after the target's last step; `unchanged /etc/motd` runs nothing ([Handlers](../../docs/configuration.md#handlers)).
 
 ## Try it
 

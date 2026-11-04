@@ -153,7 +153,11 @@ pub enum Command {
     /// Local checks plus every target's facts and reachability
     Doctor,
     /// Run the config's steps on every target
-    Apply,
+    Apply {
+        /// Take NAME off each selected target's pending handlers without running it (repeatable)
+        #[arg(long = "drop-pending", value_name = "NAME")]
+        drop_pending: Vec<String>,
+    },
     /// Show the steps apply would run on every target, running none
     Plan {
         /// Also print each templated file's rendered text, per target
@@ -269,7 +273,7 @@ impl Command {
             Command::Config { .. } => "config",
             Command::Files { .. } => "files",
             Command::Doctor => "doctor",
-            Command::Apply => "apply",
+            Command::Apply { .. } => "apply",
             Command::Plan { .. } => "plan",
             Command::Rollback { .. } => "rollback",
             Command::Run { .. } => "run",
@@ -316,7 +320,7 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
             let store = opts.secret_store(&config)?;
             anvil::doctor::run(out, &opts, &config, &expanded, store.as_ref())
         }
-        Command::Apply => anvil::apply::run(out, &opts),
+        Command::Apply { drop_pending } => anvil::apply::run(out, &opts, drop_pending),
         Command::Plan { show_rendered } => anvil::plan::run(out, &opts, *show_rendered),
         Command::Rollback {
             force,
@@ -526,7 +530,15 @@ mod tests {
             assert!(Cli::try_parse_from(std::iter::once("anvil").chain(args)).is_err());
         }
         assert!(matches!(command(&["doctor"]), Command::Doctor));
-        assert!(matches!(command(&["apply"]), Command::Apply));
+        assert!(matches!(
+            command(&["apply"]),
+            Command::Apply { drop_pending } if drop_pending.is_empty()
+        ));
+        assert!(matches!(
+            command(&["apply", "--drop-pending", "reload sshd", "--drop-pending", "all"]),
+            Command::Apply { drop_pending } if drop_pending == ["reload sshd", "all"]
+        ));
+        assert!(Cli::try_parse_from(["anvil", "apply", "--drop-pending"]).is_err());
         assert!(matches!(
             command(&["plan"]),
             Command::Plan {

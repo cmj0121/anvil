@@ -245,6 +245,7 @@ mod tests {
                 warnings: vec!["careful".to_owned()],
                 not_restored: Vec::new(),
                 save_error: Some("cannot write last-apply.json: denied".to_owned()),
+                dropped_pending: Vec::new(),
             };
             report_done(tx, "rollback", report)
         });

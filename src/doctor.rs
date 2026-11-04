@@ -89,6 +89,10 @@ pub struct LocalReport {
     /// cannot be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record: Option<String>,
+    /// What loading the record warned of (bad pending handlers dropped): a
+    /// warning that does not affect exit.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub record_warnings: Vec<String>,
     /// With doctor plugins: why no tag key could be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag_key: Option<String>,
@@ -165,6 +169,10 @@ pub struct TargetReport {
     /// The recorded files no plugin could compare.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drift: Option<DriftSummary>,
+    /// The `[[handlers]]` the record lists pending on the target, in
+    /// config order: a warning that does not affect exit.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pending_handlers: Vec<String>,
 }
 
 /// One doctor plugin's run on one target.
@@ -325,7 +333,8 @@ pub fn check(
         log::warn!("tag {tag}: {UNUSED_TAG}");
     }
     local.unused_tags = unused_tags;
-    let doctor = DoctorRun::prepare(config, &mut local);
+    let record = load_record(config, &mut local);
+    let doctor = DoctorRun::prepare(config, &mut local, record.as_ref());
     let mut cancelled = false;
     on(Progress::Begin(&targets));
     let targets = targets
@@ -333,7 +342,7 @@ pub fn check(
         .map(|target| {
             on(Progress::Start(target));
             cancelled = cancelled || cancel.is_set();
-            let report = if cancelled {
+            let mut report = if cancelled {
                 cancelled_target(target, cancel)
             } else {
                 let transport = opts.transport(target, cancel);
@@ -358,6 +367,7 @@ pub fn check(
                 }
                 report
             };
+            report.pending_handlers = pending_handlers(config, record.as_ref(), &target.name);
             on(Progress::Done(&report));
             report
         })
@@ -372,6 +382,52 @@ pub fn check(
         report.abort = cancel.reason();
     }
     Ok(report)
+}
+
+/// The record, loaded once with doctor plugins or `[[handlers]]`, its
+/// warnings into `local`; `None` when neither needs it. Without doctor
+/// plugins, an error is only logged.
+fn load_record(config: &Config, local: &mut LocalReport) -> Option<Result<Option<Record>, String>> {
+    let plugins = config.plugins.values().any(Plugin::is_doctor);
+    if !plugins && config.handlers.is_empty() {
+        return None;
+    }
+    let record = record::path()
+        .map_err(|err| format!("the record: {err}"))
+        .and_then(|path| record::load_warned(&path))
+        .map(|(record, warnings)| {
+            local.record_warnings = warnings;
+            record
+        });
+    if let (false, Err(err)) = (plugins, &record) {
+        log::warn!("{err}");
+    }
+    Some(record)
+}
+
+/// The handlers `record` lists pending on `target` that `[[handlers]]`
+/// has, in config order; each is a log warning too.
+fn pending_handlers(
+    config: &Config,
+    record: Option<&Result<Option<Record>, String>>,
+    target: &str,
+) -> Vec<String> {
+    let Some(Ok(Some(record))) = record else {
+        return Vec::new();
+    };
+    let Some(entry) = record.targets.get(target) else {
+        return Vec::new();
+    };
+    let pending = entry.pending_in(&config.handlers);
+    if !pending.is_empty() {
+        log::warn!("doctor {target}: {}", pending_row(&pending));
+    }
+    pending
+}
+
+/// `WARNING: pending from last apply: a, b`, the `handlers` row.
+fn pending_row(pending: &[String]) -> String {
+    format!("WARNING: pending from last apply: {}", pending.join(", "))
 }
 
 /// A target a cancel skipped.
@@ -390,6 +446,7 @@ fn cancelled_target(target: &Target, cancel: &Cancel) -> TargetReport {
         transport: describe(target),
         plugins: Vec::new(),
         drift: None,
+        pending_handlers: Vec::new(),
     }
 }
 
@@ -404,13 +461,16 @@ struct DoctorRun {
 }
 
 impl DoctorRun {
-    /// With `on = "doctor"` plugins: verifies each, loads the record and
-    /// reads the tag key, into `local`. `None` without doctor plugins, or
-    /// when the record or the key cannot be read, so none runs.
-    fn prepare(config: &Config, local: &mut LocalReport) -> Option<DoctorRun> {
-        if !config.plugins.values().any(Plugin::is_doctor) {
-            return None;
-        }
+    /// With `on = "doctor"` plugins: verifies each, notes `record` (as
+    /// [`load_record`] read it) and reads the tag key, into `local`. `None`
+    /// without doctor plugins, or when the record or the key cannot be
+    /// read, so none runs.
+    fn prepare(
+        config: &Config,
+        local: &mut LocalReport,
+        record: Option<&Result<Option<Record>, String>>,
+    ) -> Option<DoctorRun> {
+        let record = (record.filter(|_| config.plugins.values().any(Plugin::is_doctor))?).clone();
         let mut pins = Vec::new();
         for (name, pin) in plugin::verify_each(config, Plugin::is_doctor) {
             let error = pin.map(|pin| pins.push(pin)).err();
@@ -419,9 +479,6 @@ impl DoctorRun {
             }
             local.plugins.insert(name, error);
         }
-        let record = record::path()
-            .map_err(|err| format!("the record: {err}"))
-            .and_then(|path| record::load(&path));
         local.record = Some(match &record {
             Ok(None) => NO_RECORD.to_owned(),
             Ok(Some(_)) => FOUND_RECORD.to_owned(),
@@ -712,6 +769,7 @@ fn local_checks(
         secrets,
         plugins: BTreeMap::new(),
         record: None,
+        record_warnings: Vec::new(),
         tag_key: None,
         unused_tags: Vec::new(),
     }
@@ -812,6 +870,7 @@ fn check_target(
         transport: describe(target),
         plugins: Vec::new(),
         drift: None,
+        pending_handlers: Vec::new(),
     }
 }
 
@@ -989,6 +1048,9 @@ fn render(report: &Report) -> String {
             writeln!(out, "  {:<15} {record}", "record")
         };
     }
+    for warning in &local.record_warnings {
+        let _ = writeln!(out, "  {:<15} WARNING: {warning}", "record");
+    }
     if let Some(error) = &local.tag_key {
         let _ = writeln!(out, "  {:<15} error: {error}", "tag key");
     }
@@ -1025,6 +1087,10 @@ fn render(report: &Report) -> String {
             for (label, row) in drift_rows(drift) {
                 let _ = writeln!(out, "  {label:<15} {row}");
             }
+        }
+        if !target.pending_handlers.is_empty() {
+            let row = pending_row(&target.pending_handlers);
+            let _ = writeln!(out, "  {:<15} {row}", "handlers");
         }
     }
     escape_controls(&out).into_owned()
@@ -1904,6 +1970,7 @@ mod tests {
                     files,
                     cannot_undo: Vec::new(),
                     rolled_back: None,
+                    pending_handlers: Vec::new(),
                 },
             )]),
             ..Record::default()
@@ -2374,6 +2441,27 @@ mod tests {
         let text = render(&Report::new(healthy_local(&store, &[]), vec![report]));
         assert!(
             text.contains("  audit           error: bad\\x1b[2J\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn bad_pending_handlers_the_record_dropped_are_a_warning_row_that_keeps_the_exit() {
+        let store = Memory::default();
+        let mut local = healthy_local(&store, &[]);
+        local.record = Some(FOUND_RECORD.to_owned());
+        let warning = "/s/last-apply.json: web1: dropped 2 bad pending_handlers entries";
+        local.record_warnings = vec![warning.to_owned()];
+        assert!(local.ok());
+        assert_eq!(
+            json(&local)["record_warnings"],
+            serde_json::json!([warning])
+        );
+        let text = render(&Report::new(local, vec![]));
+        assert!(
+            text.ends_with(&format!(
+                "  record          found\n  record          WARNING: {warning}\n"
+            )),
             "{text}"
         );
     }

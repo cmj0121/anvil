@@ -57,6 +57,125 @@ fn json_is_the_plan_document_with_executed_false() {
 }
 
 #[test]
+fn guards_are_shown_under_their_step_and_none_runs() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.with_fake_host();
+    let ran = sandbox.root().join("ran");
+    let touch = format!("touch {}", ran.display());
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[steps]]\nrun = \"echo hi\"\ncreates = \"/usr/local/bin/x\"\n\
+             removes = \"/etc/x\"\nonlyif = \"{touch}\"\nunless = \"{touch}\\nmore\"\n\n\
+             [[steps]]\nrun = \"echo plain\"\n"
+        ),
+    );
+    let out = sandbox.anvil(&["plan", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ fake\n  would $ echo hi\n    creates /usr/local/bin/x\n    removes /etc/x\n    \
+             onlyif {touch}\n    unless {touch} …\n  would $ echo plain\n  ✔ 2 steps\n\n\
+             1 target, nothing executed\n"
+        )
+    );
+
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for target in json(&out)["targets"].as_array().unwrap() {
+        assert_eq!(
+            target["steps"],
+            serde_json::json!([
+                {"run": "echo hi", "guards": {
+                    "creates": "/usr/local/bin/x", "removes": "/etc/x",
+                    "onlyif": touch, "unless": format!("{touch}\nmore"),
+                }},
+                {"run": "echo plain"},
+            ]),
+            "{target}"
+        );
+    }
+    assert!(!ran.exists(), "no guard ran");
+}
+
+#[test]
+fn notifies_and_handlers_pending_from_the_last_apply_are_shown() {
+    let sandbox = Sandbox::new("pl");
+    let ran = sandbox.root().join("ran");
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[steps]]\nrun = \"true\"\nnotify = [\"b\", \"a\"]\n\n\
+             [[steps]]\nrun = \"test -f {ok}\"\n\n\
+             [[handlers]]\nname = \"a\"\nrun = \"touch {ran}\"\n\n\
+             [[handlers]]\nname = \"b\"\nrun = \"touch {ran}\"\n",
+            ok = sandbox.root().join("ok").display(),
+            ran = ran.display(),
+        ),
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let steps = format!(
+        "▶ local\n  would $ true\n    notifies b, a\n  would $ test -f {}\n",
+        sandbox.root().join("ok").display()
+    );
+    assert_eq!(
+        text(&out.stdout),
+        format!("{steps}  ✔ 2 steps\n\n1 target, nothing executed\n"),
+        "no record yet"
+    );
+
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["pending_handlers"],
+        serde_json::json!(["b", "a"])
+    );
+    record["targets"]["local"]["pending_handlers"] = serde_json::json!(["b", "gone", "a", "a/"]);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "{steps}  pending from last apply: a, b\n  ✔ 2 steps\n\n\
+             1 target, nothing executed\n"
+        ),
+        "config order, `gone` left out"
+    );
+    let dropped = format!(
+        "{}: local: dropped 1 bad pending_handlers entries",
+        path.display()
+    );
+    assert_eq!(text(&out.stderr), format!("WARNING: {dropped}\n"));
+
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(value["warnings"], serde_json::json!([dropped]));
+    assert_eq!(
+        value["targets"][0]["pending_handlers"],
+        serde_json::json!(["a", "b"])
+    );
+    assert_eq!(
+        value["targets"][0]["steps"][0],
+        serde_json::json!({"run": "true", "notify": ["b", "a"]})
+    );
+    assert_eq!(value["targets"][0]["steps"][1].get("notify"), None);
+    assert!(!ran.exists(), "no handler ran");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the record is only read"
+    );
+}
+
+#[test]
 fn an_unreachable_host_exits_one_without_package_work() {
     let sandbox = Sandbox::new("pl");
     sandbox.with_fake_host();

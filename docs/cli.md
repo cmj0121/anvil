@@ -435,6 +435,11 @@ Local checks, then every selected target's facts:
   per key with the level that set it (`global`, `tag:NAME` or `host`). A var shows as JSON text, so its type shows; an
   env value shows as written. Invisible and bidi characters are escaped. Values are shown as is: they are not secrets.
   A target without vars or env gets no such rows.
+- `handlers`: a target whose entry in the [apply record](#the-apply-record) lists pending handlers gets a row
+  `handlers        WARNING: pending from last apply: a, b`, which the next apply runs (or
+  [`apply --drop-pending`](#handlers-in-a-run) clears). The record is read once, whatever doctor plugins there are;
+  bad names it drops on load are a `record          WARNING: PATH: TARGET: dropped N bad pending_handlers entries` row
+  in the local checks. Neither changes the exit.
 - `tag NAME`: a `[tags.NAME]` table no host carries, `local` aside, is a `tag NAME` row in the local checks reading
   `WARNING: no host carries this tag`, and a log warning `tag NAME: no host carries this tag`. It does not change the
   exit.
@@ -502,7 +507,9 @@ manager cannot be resolved also makes the exit 1; without `[packages]` nothing i
 the probe reported (abridged above). `manager` (the resolved manager) or `manager_error` (the reason, without the
 `error:` prefix) appears only with `[packages]` and only on a connectable target. `vars` and `env` map each key to its
 `value` (a var keeps its JSON type, an env value is a string) and its `level`, on every target, reachable or not; each
-is left out when empty. `local.unused_tags` lists the unused tags and is left out when there are none.
+is left out when empty. `local.unused_tags` lists the unused tags and is left out when there are none. A target with
+pending handlers has `pending_handlers`, and the record's load warnings are `local.record_warnings`, each left out when
+empty.
 
 With `[packages]` and a resolved manager, each target also has a `packages` string: `"ok"` or
 `"WARNING: not found by MANAGER: a, b"`, shown as a `packages` row in human output.
@@ -698,6 +705,12 @@ In a legacy config, each `[[services]]` entry is one step on every target, after
 service to its state under the target's init when the target's tags and facts match, and shows as skipped when they
 do not ([Service steps](#service-steps)).
 
+A `run` or plugin step with guards (`creates`, `removes`, `onlyif`, `unless`) checks them on the target first and shows
+as skipped when one says so, with its reason ([Guarded steps](#guarded-steps)).
+
+A step with `notify` that changed something queues its [handlers](configuration.md#handlers), which run once each after
+the target's last step ([Handlers in a run](#handlers-in-a-run)).
+
 Each `install` name goes into the script as the resolved manager's `[packages.alias]` entry, else as is
 ([Aliases](packages.md#aliases)). With this config apt and dnf install `fd-find`, and brew, pacman and apk `fd`; `anvil
 plan` shows the same script:
@@ -788,7 +801,13 @@ The default, below `-vv`, shows only the steps that need a look:
     {
       "target": "local",
       "steps": [
-        { "run": "hostname", "code": 0, "stdout": "mac.local\n", "stderr": "" }
+        {
+          "run": "hostname",
+          "code": 0,
+          "stdout": "mac.local\n",
+          "stderr": "",
+          "changed": true
+        }
       ],
       "ok": true
     },
@@ -804,7 +823,9 @@ The default, below `-vv`, shows only the steps that need a look:
 
 A target either ran its steps (`steps` and `ok`; a failed step shows its `code`, and `ok` is false) or failed in the
 transport (`error`, `ok: false`, and `steps` only when some steps completed before the error). `code` is `null` when
-the step was killed by a signal or timed out; a timed-out step is the last `steps` entry, next to `error`.
+the step was killed by a signal or timed out; a timed-out step is the last `steps` entry, next to `error`. `changed`
+says whether the step changed something, and so fired its `notify`: on file, service, `run` and plugin steps, skipped
+ones (`false`) included, and on handlers; the package step has none ([Handlers in a run](#handlers-in-a-run)).
 
 Unknown names from the package step are removed from captured output and collected in each target's
 `warnings: Vec<String>` (a JSON array of strings, omitted when empty). For example:
@@ -813,8 +834,10 @@ Human output and the TUI show a yellow `⚠ packages: not found by MANAGER: a, b
 before the target's end line. Known names still install and later steps continue. These warnings do not change the
 target's `ok`, summary or exit code: all targets ok still exits 0. Actual install failures still fail the target.
 
-The document itself may also have a top-level `warnings`, a JSON array of strings, omitted when empty: what the apply
-record lost on this run, a previous text it had no room for or does not keep ([The apply record](#the-apply-record)).
+The document itself may also have a top-level `warnings`, a JSON array of strings, omitted when empty: first what
+loading the record dropped (`PATH: TARGET: dropped N bad pending_handlers entries`), then each
+`--drop-pending NAME: not pending on TARGET`, then what the apply record lost on this run, a previous text it had no
+room for or does not keep ([The apply record](#the-apply-record), [Handlers in a run](#handlers-in-a-run)).
 They are on stderr too, name dests and targets but never a text, and do not change `ok` or the exit code. A rollback
 has the same shape and adds `not_restored` ([`anvil rollback`](#anvil-rollback)).
 
@@ -876,7 +899,8 @@ include = "$/roles/web.toml"   # Validate config, then Start nginx with tags = [
   "stderr": "",
   "skipped": true,
   "task": "tasks[2]/roles/web.toml:tasks[1]",
-  "name": "Start nginx"
+  "name": "Start nginx",
+  "changed": false
 }
 ```
 
@@ -911,6 +935,106 @@ A recorded dest no file task names now fails the target with
   each target, checks the sudo secrets those tasks need, and compares the dests file tasks wrote.
 - **TUI.** The Steps pane lists the expanded tasks; apply and plan sections show the same `PATH  NAME` lines
   ([Terminal UI](tui.md)).
+
+#### Handlers in a run
+
+A step with `notify` that changed something queues the [handlers](configuration.md#handlers) it names. After the
+target's last step, when every step passed, each handler due there runs once, in `[[handlers]]` order: those notified
+on this apply and those still pending from an earlier one. With this config:
+
+```toml
+[[files]]
+src = "files/sshd_config"
+dest = "/etc/ssh/sshd_config"
+mode = "0644"
+notify = ["reload sshd"]
+
+[[steps]]
+run = "hostname"
+
+[[handlers]]
+name = "reload sshd"
+service = { name = "sshd", state = "reloaded" }
+```
+
+`anvil -vv apply` on a target whose file changed prints:
+
+```text
+▶ web1
+  $ file /etc/ssh/sshd_config
+  wrote /etc/ssh/sshd_config
+  $ hostname
+  web1
+  handler reload sshd
+  $ service sshd
+  reloaded service sshd
+  ✔ ok · 3 steps
+
+1 ok, 0 failed
+```
+
+- **`handler NAME`.** Each handler that runs has this line, at every `-v` level, above its `$` line, which follows the
+  `-v` rules of any step: `$ RUN` for a `run` handler, `$ service NAME` for a `service` one. It counts in
+  `✔ ok · N steps`. A handler not due prints nothing.
+- **Failure.** A handler that exits non-zero fails the target, exit 1, and ends its block with
+  `✘ handler NAME exited N` (`✘ handler NAME was killed by a signal`); the other due handlers still run. A due handler
+  that cannot run, as it does not resolve or its sudo password is missing, shows its reason as its `$` line and ends the
+  block with `✘ handler NAME: REASON`. Either way it stays pending. A failing step, or a target that failed before its
+  steps, runs no handler.
+- **Ctrl-C and a lost connection.** A first Ctrl-C before a handler ends the target as `⊘ cancelled`, and that handler
+  and the ones after it stay pending. A transport error in the handler phase ends the target with that error, the
+  handlers not yet run still pending.
+- **Pending.** The next apply on the target runs what is still pending even when no step notifies it again. A pending
+  name `[[handlers]]` no longer has is dropped with ``⚠ pending handler `NAME` is not in [[handlers]]; dropped`` in the
+  target's block and its `warnings`. Bad names in the record (not valid, repeated or past 64) are dropped on load with
+  `PATH: TARGET: dropped N bad pending_handlers entries` on stderr, at any `-v`, and in the top-level `warnings`.
+  Neither fails the apply. Delivery is at least once ([Handlers](configuration.md#handlers)).
+- **Rollback.** A handler that ran cannot be undone: rollback lists it as `cannot undo: handler NAME`, and queues the
+  handlers of the files it puts back ([`anvil rollback`](#anvil-rollback)).
+
+`--json` marks each handler's report with `handler`, the handler's name, and gives every step `changed`: `true` for a
+file step that printed `wrote DEST`, a service step that changed something and a `run` or plugin step that ran and
+exited 0, `false` for an unchanged, skipped or failed step; on a handler it is whether the handler exited 0. The
+package step and `anvil run` have no `changed`. A handler that ran:
+
+```json
+{
+  "run": "service sshd",
+  "code": 0,
+  "stdout": "reloaded service sshd\n",
+  "stderr": "",
+  "changed": true,
+  "handler": "reload sshd"
+}
+```
+
+A handler that could not run has `code` `null`, no output, and its reason as both `run` and `reason`:
+
+```json
+{
+  "run": "services: secret WEB1_SUDO is not set",
+  "code": null,
+  "stdout": "",
+  "stderr": "",
+  "reason": "services: secret WEB1_SUDO is not set",
+  "changed": false,
+  "handler": "reload sshd"
+}
+```
+
+**Dropping a pending handler.** `anvil apply --drop-pending NAME` removes NAME from each selected target's pending list
+before any step runs, without running it; repeat the flag for more names. A name given twice
+is dropped once, with no extra warning. Each one dropped prints `dropped pending handler NAME on TARGET` on stdout,
+before the target blocks, and is listed in `--json` as a top-level
+`"dropped_pending": [{"target": "web1", "handler": "reload sshd"}]`. A NAME not pending on a selected target, or a
+target with no entry, is a warning, `--drop-pending NAME: not pending on TARGET`, on stderr and in the top-level
+`warnings`, after the record-load warnings; it does not change the exit. A NAME that is not a valid handler name is exit 2 with
+``--drop-pending `NAME`: must match [A-Za-z0-9 ._-]+, at most 64 bytes``; `all` is just a name. The flag opens the
+record even when the config has no `[[handlers]]`. The TUI's apply drops nothing.
+
+```sh
+anvil apply --target web1 --drop-pending "reload sshd"
+```
 
 #### Ctrl-C
 
@@ -951,8 +1075,8 @@ targets and its doctor plugins ([Doctor plugins](#doctor-plugins-drift-since-the
 
 #### The apply record
 
-An apply that probes its targets (`[packages]` with work, a plugin step, `[[files]]` or `[[services]]`, or on a tasks
-config [as in Tasks in a run](#tasks-in-a-run)) keeps
+An apply that probes its targets (`[packages]` with work, a plugin step, `[[files]]`, `[[services]]` or `[[handlers]]`,
+or on a tasks config [as in Tasks in a run](#tasks-in-a-run)) keeps
 `last-apply.json`, which [`anvil rollback`](#anvil-rollback) reads. An apply of plain `[[steps]]` only does not open
 it.
 
@@ -967,9 +1091,10 @@ it.
   target's entry is replaced only when a `[[files]]` write started there. A target the apply reached without writing a
   file keeps its files and gets the new facts. Targets this apply did not select keep their entries.
 - **What it keeps.** Per target: when (`at`), the anvil version, whether every step passed (`ok`), the probe's facts,
-  each file written, the steps that cannot be undone (`cannot_undo`) and, after a rollback, `rolled_back`. Per file:
-  the dest, the mode and `sudo` it was written with, the sha256 of the bytes written, how the write ended (`write`) and
-  what was there before (`previous`). It never keeps a secret value, a step's script or a package list.
+  each file written, the steps that cannot be undone (`cannot_undo`, a handler that ran as `handler NAME`), the
+  handlers still pending (`pending_handlers`, by name, left out when empty) and, after a rollback, `rolled_back`.
+  Per file: the dest, the mode and `sudo` it was written with, the sha256 of the bytes written, how the write ended
+  (`write`) and what was there before (`previous`). It never keeps a secret value, a step's script or a package list.
 - **One entry per dest on a tasks config.** A dest two file tasks write in one apply, spelled the same or differing only
   by repeated slashes, has one file entry under its first spelling: `previous` from
   before the first write, and the mode, sha256 and `write` of the last, so doctor compares against the final bytes and
@@ -1012,7 +1137,8 @@ it.
           "previous": { "state": "absent" }
         }
       ],
-      "cannot_undo": ["packages", "service nginx", "step 1"]
+      "cannot_undo": ["packages", "service nginx", "step 1"],
+      "pending_handlers": ["reload nginx"]
     }
   }
 }
@@ -1027,6 +1153,11 @@ the bytes only after an in-place write, [which warns](configuration.md#files)). 
 write `refused` before it wrote anything (a root check, a directory DEST, a DEST changed since the read, or another
 user's DEST whose mode it cannot set, all exit 4)
 is never stored: the dest keeps its entry from the apply before, if any.
+
+**Pending handlers.** `pending_handlers` is saved as each notify happens and as each handler succeeds, so it outlives a
+failed, cancelled or killed apply. A new apply's entry and a rollback keep it, and a target whose entry is replaced
+carries it over. A record without the field loads as before. Bad names in it are dropped on load, with a warning
+([Handlers in a run](#handlers-in-a-run)).
 
 **Kept or not.** The previous text is kept only when the previous file is world-readable (its mode has `0o004`), the
 text is UTF-8 with no NUL byte and at most 256 KiB, and the entry does not set `rollback = false`. Otherwise `kept` is
@@ -1146,13 +1277,25 @@ secret is set and free of control characters is not checked, so plan can pass wh
 - A [templated](configuration.md#templating) file step adds `rendered N bytes, sha256 HEX` under its `would $ file DEST`
   line: the size and the full sha256 of that target's rendered text, the bytes apply would write. A target whose render
   fails ends in `✘` with the template message ([Templating](configuration.md#templating)).
+- A step with guards adds one line per guard under its `would $` line, in the order they are checked: `creates PATH`,
+  `removes PATH`, `onlyif CMD`, `unless CMD` ([Guarded steps](#guarded-steps)). plan never runs them, so it cannot
+  tell whether apply would skip the step.
+- A step with `notify` adds `notifies NAME, NAME` after its `would $` and guard lines: the handlers it may notify.
+  Handlers are never `would $` lines, since they run only when notified. After the steps, a target whose entry in the
+  local [apply record](#the-apply-record) lists pending handlers shows `pending from last apply: NAME, …`, which the
+  next apply runs. The record is read once, without the lock; plan contacts nothing more for it, and a record that
+  cannot be read is logged, not fatal. A pending name the config no longer has is left out and logged. Bad names the
+  record drops on load are each a `WARNING: PATH: TARGET: dropped N bad pending_handlers entries` line on stderr
+  ([Handlers in a run](#handlers-in-a-run)).
 - The block ends with `✔ N steps`, or `✘ REASON` for a target that failed. The summary is `N targets, nothing executed`,
   with `M failed` before `nothing executed` when any target failed (`2 targets, 1 failed, nothing executed`).
 - Colour and escaping follow apply's rules.
 
 `--json` is apply's document with `"executed": false` first; a step has its `run` and, when apply would type a sudo
-password, its `sudo_secret`, plus `task` and `name` on a tasks config, but never `code`, `stdout` or `stderr`. A
-target with vars or env also has `vars` and `env`, as in doctor's `--json`
+password, its `sudo_secret`, plus `task` and `name` on a tasks config, `guards` on a guarded step and `notify` (the
+names) on a step with `notify`, but never `code`, `stdout` or `stderr`. A planned target with pending handlers has
+`pending_handlers`, left out when empty, and the record's load warnings are a top-level `warnings` array, the same
+text without the `WARNING:` prefix, left out when empty. A target with vars or env also has `vars` and `env`, as in doctor's `--json`
 (`"vars": {"port": {"value": 8080, "level": "tag:web"}}`), and a step's `run` is the script as written, without the
 env lines:
 
@@ -1387,6 +1530,86 @@ can list the script; only the script is not run. A plugin must therefore have no
 under apply, so a plugin that does not always give the same reply to the same request (one that reads the clock, a
 random number or a remote API) can make plan show a script that apply then does not run.
 
+### Guarded steps
+
+A `run` or plugin step can carry [guards](configuration.md#config): `creates`, `removes`, `onlyif` and `unless`. They
+are checked on the target, in that order, in the same round trip as the step, and when one says skip the script does
+not run. With this config:
+
+```toml
+[[steps]]
+run = "curl -fsSL https://example.com/install.sh | sh"
+creates = "/usr/local/bin/x"
+
+[[steps]]
+run = "x migrate"
+unless = "x migrate --status | grep -q up-to-date"
+```
+
+`anvil apply` on a target that already has both prints, at every `-v` level:
+
+```text
+▶ local
+  $ skipped run: /usr/local/bin/x exists
+  $ skipped run: unless exited 0
+  ✔ ok · 2 steps
+
+1 ok, 0 failed
+```
+
+- **Skip lines.** `skipped run: PATH exists` (`creates`), `skipped run: PATH is absent` (`removes`),
+  `skipped run: onlyif exited N` and `skipped run: unless exited 0`. A plugin step's line starts with
+  `skipped plugin NAME:` instead, as in `skipped plugin harden: /etc/x exists`. The line shows in place of `$ RUN`.
+- **Counted, not failed.** A skipped step counts in `✔ ok · N steps` and in `✘ step N`, and the target's next step
+  runs. It changed nothing, so [`anvil rollback`](#anvil-rollback) does not list it under `cannot undo`.
+- **A step that runs** shows as any step does, with its `run` text alone: the guards are not part of `$ RUN` or of the
+  JSON `run`. A guard's stderr shows as the step's stderr; its stdout is dropped.
+- **Guard failures.** A guard's exit status only decides whether the step runs. A guard command killed by a signal
+  fails the step: stderr has `onlyif was killed by signal 9` (or `unless`) and the target ends with
+  `✘ step 2 exited 137`. A guard that hangs runs into the step's time limit and ends with `✘ timed out after 30 s`.
+- **Plugins.** A plugin step's plugin still runs on the controller before the target's first step, whatever its guards
+  then decide on the target.
+
+`--json` marks a skipped step with `skipped: true` and a `reason`, the skip line without its `skipped run:` (or
+`skipped plugin NAME:`) prefix. `reason` is omitted on every other step. A skipped step's `stdout` and `stderr` keep
+any other output of the round trip, such as login-shell or motd noise and the guard command's stderr; only the skip
+line is removed, and the guard command's own stdout is dropped:
+
+```json
+{
+  "run": "skipped run: /usr/local/bin/x exists",
+  "code": 0,
+  "stdout": "",
+  "stderr": "",
+  "skipped": true,
+  "reason": "/usr/local/bin/x exists",
+  "changed": false
+}
+```
+
+`anvil plan` shows the guards under each step and runs none of them, so plan still runs nothing on the target:
+
+```text
+▶ local
+  would $ curl -fsSL https://example.com/install.sh | sh
+    creates /usr/local/bin/x
+  would $ x migrate
+    unless x migrate --status | grep -q up-to-date
+  ✔ 2 steps
+
+1 target, nothing executed
+```
+
+A multi-line `onlyif` or `unless` shows its first line and `…`. In `plan --json` a guarded step has `guards`, holding
+only the keys that are set:
+
+```json
+{
+  "run": "x migrate",
+  "guards": { "unless": "x migrate --status | grep -q up-to-date" }
+}
+```
+
 ### File steps
 
 A `[[files]]` entry, or a `file` [task](#tasks-in-a-run), copies one text file from the workspace or file store onto each
@@ -1422,8 +1645,8 @@ steps still run. A step whose write fails ends the target like any step. With `-
 In `--json` a file step's `run` is that label. A skipped step has `"skipped": true`, `code` 0 and empty output:
 
 ```json
-{ "run": "file /etc/ssh/sshd_config", "code": 0, "stdout": "wrote /etc/ssh/sshd_config\n", "stderr": "" }
-{ "run": "skipped file /etc/motd: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true }
+{ "run": "file /etc/ssh/sshd_config", "code": 0, "stdout": "wrote /etc/ssh/sshd_config\n", "stderr": "", "changed": true }
+{ "run": "skipped file /etc/motd: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true, "changed": false }
 ```
 
 `anvil plan` shows `would $ file DEST`, with `(sudo password from secret NAME)` when apply would take the password path,
@@ -1527,8 +1750,8 @@ exchange. A skipped step runs nothing.
 In `--json` a service step's `run` is that label. A skipped step has `"skipped": true`, `code` 0 and empty output:
 
 ```json
-{ "run": "service sshd", "code": 0, "stdout": "unchanged service sshd\n", "stderr": "" }
-{ "run": "skipped service cron: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true }
+{ "run": "service sshd", "code": 0, "stdout": "unchanged service sshd\n", "stderr": "", "changed": false }
+{ "run": "skipped service cron: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true, "changed": false }
 ```
 
 `anvil plan` shows `would $ service NAME`, with `(sudo password from secret NAME)` when apply would take the password
@@ -1626,6 +1849,30 @@ A plist whose own `Disabled` key is true is not detected (anvil does not read th
 with launchctl's own error. These launchd changes are tested against stand-in tools, not a live launchd; only the
 `print-disabled` format was checked, read-only, on macOS 26.
 
+**Handler actions.** A [handler](configuration.md#handlers)'s service may also be `restarted` or `reloaded`. It shows
+as `$ service NAME`, makes the same not-found check first (and, for `restarted` on systemd, the masked check), asks
+whether the service runs where the action depends on it, then acts as listed below. It prints `restarted service NAME` or
+`reloaded service NAME`; `reloaded` on a service that is not running makes no call and prints
+`service NAME is not running; not reloaded`, exit 0, which is not a change. Each command is prefixed with
+`sudo -n` when the login is not root.
+
+- **systemd.** `restarted`: after the not-found and masked checks, straight to
+  `systemctl --no-ask-password restart -- NAME`, which starts a stopped unit; no `is-active`. `reloaded`: after the
+  not-found check, `systemctl --no-ask-password is-active --quiet -- NAME`, then
+  `systemctl --no-ask-password reload -- NAME` when it succeeds.
+- **OpenRC.** After `rc-service --exists NAME`, `rc-service NAME status`: exit 0 is running; exit 32, crashed, counts as
+  not running. `restarted`: `rc-service NAME restart` when running; on a crashed service `rc-service NAME zap` then
+  `rc-service NAME start`; on any other stopped one `rc-service NAME start`. `reloaded`: `rc-service NAME reload` when
+  running.
+- **launchd.** `launchctl print system/NAME` tells whether the job is loaded. `restarted` also reads
+  `launchctl print-disabled system`, as `started` does, then runs `launchctl kickstart -k system/NAME` when loaded, else
+  `launchctl bootstrap system /Library/LaunchDaemons/NAME.plist`. `reloaded`: `launchctl kickstart -k system/NAME` when
+  loaded, since launchd has no reload.
+
+The launchd bootstrap is refused for a disabled job with
+`services: NAME is disabled; enable it to restart it`; a `reloaded` handler never reads the disabled overrides. The
+launchd and crashed OpenRC paths are tested against stand-in tools.
+
 ### `anvil rollback`
 
 ```text
@@ -1681,8 +1928,13 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   the summary clean.
 - **What cannot be undone.** After the files, the steps of the apply that ran but cannot be undone show as skipped
   steps: `cannot undo: packages`, `cannot undo: service NAME` and `cannot undo: step N` (the Nth `[[steps]]` entry), or
-  on a tasks config `cannot undo: PATH` ([Tasks in a run](#tasks-in-a-run)).
-  Rollback never runs a package manager, a service command or a step.
+  on a tasks config `cannot undo: PATH` ([Tasks in a run](#tasks-in-a-run)), and `cannot undo: handler NAME` for a
+  handler that ran. Rollback never runs a package manager, a service command, a step or a handler.
+- **Handlers queued.** For each file it put back, rollback adds the `notify` names of the file entries for that dest
+  that apply to the target, matched with the facts the record saved, not the probe's, to the target's
+  `pending_handlers`, in `[[handlers]]` order and once each, so the next apply runs them. Each one queued is a
+  warning in the target's block, `⚠ pending handler NAME queued for the next apply`, and in its `warnings`. Bad pending
+  names in the record are dropped on load with a warning on stderr and in the top-level `warnings`, as for apply.
 - **The same path as the write.** Each file is restored as apply wrote it, from the recorded `sudo` and the target's
   current facts: through `sudo -n`, as root, as the connecting user, or on the password path, which stages the text in
   a 0600 `/tmp/anvil-` file and replaces DEST from it through `sudo`, with the recorded owner and mode. The sudo
@@ -1723,8 +1975,9 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   follow the link. Rollback removes the link only, and the file it created stays:
   `removed link DEST; the file it pointed to was kept`.
 - **`rolled_back`.** After each target, the dests it restored, removed or found unchanged are saved in its entry as
-  `rolled_back` (`at` and `dests`). That is the only change rollback makes to the record, so a second rollback restores
-  the same bytes again, or prints `unchanged DEST`. The next apply that writes a file on the target replaces the entry.
+  `rolled_back` (`at` and `dests`). That and the queued handlers are the only changes rollback makes to the record, so
+  a second rollback restores the same bytes again, or prints `unchanged DEST`. The next apply that writes a file on the
+  target replaces the entry.
 - **Targets.** A selected target with no entry in the record shows `nothing recorded` and is ok. An entry for a target
   no longer in the inventory is not rolled back.
 - **The lock.** Rollback holds the record's lock for its whole run, as apply does

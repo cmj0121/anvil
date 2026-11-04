@@ -7,11 +7,12 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::cancel::{AbortReason, Cancel};
-use crate::config::{Config, Step, StepKind};
+use crate::config::{Config, Handler, Step, StepKind};
 use crate::error::Failure;
 use crate::facts::{self, Facts};
 use crate::fanout;
 use crate::files::{self, Sources};
+use crate::guard;
 use crate::inventory::Target;
 use crate::packages::{self, Packages};
 use crate::plugin::{Plugins, Request};
@@ -21,7 +22,7 @@ use crate::report::{Progress, Report, StepReport, TargetReport, cancelled, faile
 use crate::secret::Store;
 use crate::services;
 use crate::status;
-use crate::step::{Entry, PlannedRun, RunKind, Upload};
+use crate::step::{Entry, GuardNonce, PlannedRun, RunKind, Upload};
 use crate::tasks::{Expanded, Item, ItemKind};
 use crate::transport::{
     Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
@@ -188,12 +189,14 @@ struct Books {
 }
 
 impl<'a> Journal<'a> {
-    pub(crate) fn new(session: Session, cancel: &'a Cancel) -> Journal<'a> {
+    /// The journal of `session`, whose load warnings lead the run's.
+    pub(crate) fn new(mut session: Session, cancel: &'a Cancel) -> Journal<'a> {
+        let warnings = session.take_warnings();
         Journal {
             books: Mutex::new(Books {
                 session,
                 saves: Saves::default(),
-                warnings: Vec::new(),
+                warnings,
                 shed: Vec::new(),
             }),
             cancel,
@@ -212,6 +215,27 @@ impl<'a> Journal<'a> {
         let mut books = self.lock();
         books.session.merge(name, record);
         books.save(name, self.cancel)
+    }
+
+    /// The handlers `name`'s entry has pending, as loaded or set since.
+    fn pending_of(&self, name: &str) -> Vec<String> {
+        let books = self.lock();
+        (books.session.record().targets.get(name))
+            .map(|target| target.pending_handlers.clone())
+            .unwrap_or_default()
+    }
+
+    /// Saves `pending` as `name`'s pending handlers, `fallback` being its
+    /// entry when it has none. A failed save stops the run.
+    fn set_pending(
+        &self,
+        name: &str,
+        pending: Vec<String>,
+        fallback: impl FnOnce() -> TargetRecord,
+    ) {
+        let mut books = self.lock();
+        books.session.set_pending(name, pending, fallback);
+        books.save(name, self.cancel);
     }
 
     /// Merges and saves `reached`, the entry of a target that ended.
@@ -300,6 +324,7 @@ pub(crate) fn for_each_target(
         warnings: Vec::new(),
         not_restored: Vec::new(),
         save_error: None,
+        dropped_pending: Vec::new(),
     }
 }
 
@@ -318,6 +343,12 @@ pub(crate) struct Recorder<'a> {
     target: &'a str,
     facts: Option<&'a Facts>,
     journal: Option<&'a Journal<'a>>,
+    /// The handlers to run in this target's handler phase: those pending
+    /// from earlier applies, then those notified now, each once.
+    pub(crate) pending: Vec<String>,
+    /// The names pending from earlier that `[[handlers]]` no longer has,
+    /// dropped from `pending`.
+    pub(crate) stale: Vec<String>,
 }
 
 impl<'a> Recorder<'a> {
@@ -325,9 +356,13 @@ impl<'a> Recorder<'a> {
         expanded: &'a Expanded,
         sources: &'a Sources,
         target: &'a Target,
+        handlers: &[Handler],
         facts: Option<&'a Facts>,
         journal: Option<&'a Journal<'a>>,
     ) -> Recorder<'a> {
+        let earlier = journal.map(|journal| journal.pending_of(&target.name));
+        let (pending, stale) = (earlier.unwrap_or_default().into_iter())
+            .partition(|name| handlers.iter().any(|handler| &handler.name == name));
         let hash_only = match facts.filter(|_| expanded.from_tasks) {
             Some(facts) => expanded
                 .files()
@@ -345,6 +380,53 @@ impl<'a> Recorder<'a> {
             target: &target.name,
             facts,
             journal,
+            pending,
+            stale,
+        }
+    }
+
+    /// Adds each of `names` not pending yet, saving the list at once when it
+    /// grew; `steps` are the steps that ended. A failed save has stopped the
+    /// run.
+    fn notify(&mut self, names: &[String], steps: &[StepReport]) {
+        if record::push_unique(&mut self.pending, names) {
+            self.save_pending(steps);
+        }
+    }
+
+    /// Takes `name`, which ran and exited 0, off the pending list and saves
+    /// it; `steps` are the steps that ended.
+    fn handled(&mut self, name: &str, steps: &[StepReport]) {
+        self.pending.retain(|pending| pending != name);
+        self.save_pending(steps);
+    }
+
+    fn save_pending(&self, steps: &[StepReport]) {
+        let (Some(journal), Some(facts)) = (self.journal, self.facts) else {
+            return;
+        };
+        journal.set_pending(self.target, self.pending.clone(), || {
+            self.stamped(facts, false, self.files.clone(), cannot_undo(steps))
+        })
+    }
+
+    /// A record of this target, stamped now, with the pending list.
+    fn stamped(
+        &self,
+        facts: &Facts,
+        ok: bool,
+        files: Vec<FileRecord>,
+        cannot_undo: Vec<String>,
+    ) -> TargetRecord {
+        TargetRecord {
+            at: record::now(),
+            anvil: env!("CARGO_PKG_VERSION").to_owned(),
+            ok,
+            facts: facts.clone(),
+            files,
+            cannot_undo,
+            rolled_back: None,
+            pending_handlers: self.pending.clone(),
         }
     }
 
@@ -364,14 +446,16 @@ impl<'a> Recorder<'a> {
         if let Some(intent) = intent {
             keep(self.expanded, &mut files, intent.clone());
         }
-        let record = stamped(facts.clone(), false, files, cannot_undo(steps));
+        let record = self.stamped(facts, false, files, cannot_undo(steps));
         journal.snapshot(self.target, record)
     }
 
     /// The target's record, stamped now; `None` when the probe did not run.
     pub(crate) fn finish(self, ok: bool, cannot_undo: Vec<String>) -> Option<Reached> {
+        let mut record = self.stamped(self.facts?, ok, Vec::new(), cannot_undo);
+        record.files = self.files;
         Some(Reached {
-            record: stamped(self.facts?.clone(), ok, self.files, cannot_undo),
+            record,
             wrote: self.wrote,
         })
     }
@@ -388,37 +472,20 @@ fn keep(expanded: &Expanded, files: &mut Vec<FileRecord>, file: FileRecord) {
     }
 }
 
-/// A target's record, stamped now.
-fn stamped(
-    facts: Facts,
-    ok: bool,
-    files: Vec<FileRecord>,
-    cannot_undo: Vec<String>,
-) -> TargetRecord {
-    TargetRecord {
-        at: record::now(),
-        anvil: env!("CARGO_PKG_VERSION").to_owned(),
-        ok,
-        facts,
-        files,
-        cannot_undo,
-        rolled_back: None,
-    }
-}
-
 /// The steps that ran and that a rollback cannot undo: `packages`,
-/// `service NAME` and `step N` (1-based among `[[steps]]`), or a task's path;
-/// never a skip.
+/// `service NAME`, `step N` (1-based among `[[steps]]`) and `handler NAME`,
+/// or a task's path; never a skip.
 pub(crate) fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
     steps
         .iter()
-        .filter(|step| !step.skipped)
+        .filter(|step| !step.skipped && step.reason.is_none())
         .filter_map(|step| match (&step.entry, &step.task) {
             (Entry::File { .. } | Entry::Script, _) => None,
             (_, Some(path)) => Some(path.clone()),
             (Entry::Packages, None) => Some("packages".to_owned()),
             (Entry::Service { name }, None) => Some(format!("service {name}")),
             (Entry::Step { number }, None) => Some(format!("step {number}")),
+            (Entry::Handler { name }, None) => Some(format!("handler {name}")),
         })
         .collect()
 }
@@ -431,7 +498,9 @@ pub(crate) fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
 /// ([`capture`]), then saves an intent entry (`FailedMidway`), so that a kill
 /// during the write keeps what it captured, then writes only if DEST still
 /// holds that, then saves how the write ended. A failed intent save writes
-/// nothing: the target ends as cancelled, with the run stopped.
+/// nothing: the target ends as cancelled, with the run stopped. With a
+/// `recorder`, a step that changed something ([`changed`]) adds its
+/// `notify` names to the target's pending handlers, saved at once.
 pub(crate) fn execute(
     command: &str,
     target: &Target,
@@ -460,6 +529,8 @@ fn execute_inner(
     let mut reports = Vec::with_capacity(runs.len());
     let mut ok = true;
     let of = runs.len();
+    // Only an apply, which records, says whether a step changed anything.
+    let apply = recorder.is_some();
     for (n, planned) in runs.iter().enumerate() {
         if cancel.is_set() {
             return cancelled(command, target, reports, cancel);
@@ -478,7 +549,8 @@ fn execute_inner(
             || planned.service().is_some_and(|service| service.skip)
             || matches!(planned.kind, RunKind::Skip)
         {
-            reports.push(StepReport::skipped(label, entry).of(planned));
+            let report = StepReport::skipped(label, entry).of(planned);
+            reports.push(noted(report, apply, false));
             continue;
         }
         let password = match planned.sudo_secret.as_deref() {
@@ -497,19 +569,24 @@ fn execute_inner(
             let found = match capture(target, transport, write, password.map(|(_, p)| p)) {
                 Ok(found) => found,
                 Err(Uncaptured::Step { code, stderr }) => {
-                    reports.push(
+                    reports.push(noted(
                         StepReport {
                             run: label.to_owned(),
                             code,
                             stdout: String::new(),
                             stderr,
                             skipped: false,
+                            reason: None,
                             entry,
                             task: None,
                             name: None,
+                            changed: None,
+                            handler: None,
                         }
                         .of(planned),
-                    );
+                        apply,
+                        false,
+                    ));
                     ok = false;
                     break;
                 }
@@ -596,7 +673,7 @@ fn execute_inner(
             // A failure has set the cancel token: the next step does not start.
             recorder.snapshot(None, &reports);
         }
-        let output = match output {
+        let mut output = match output {
             Ok(output) => output,
             // ssh would have had to open a master after cancel.
             Err(TransportError::Cancelled) => {
@@ -610,7 +687,8 @@ fn execute_inner(
                     ..
                 } = err
                 {
-                    reports.push(StepReport::from_output(label, *output, entry).of(planned));
+                    let report = StepReport::from_output(label, *output, entry).of(planned);
+                    reports.push(noted(report, apply, false));
                 }
                 return failed(command, target, reports, error).at(planned);
             }
@@ -619,10 +697,23 @@ fn execute_inner(
         if succeeded && output.truncated {
             log::warn!("{command} {}: step output cut at 1 MiB", target.name);
         }
-        reports.push(StepReport::from_output(label, output, entry).of(planned));
+        if let Some((label, reason)) = guard_skip(planned, &mut output) {
+            log::info!("{command} {}: {label}", target.name);
+            let report = StepReport::guarded(&label, reason, output, entry).of(planned);
+            reports.push(noted(report, apply, false));
+            continue;
+        }
+        let changed = changed(planned, &output);
+        let report = StepReport::from_output(label, output, entry).of(planned);
+        reports.push(noted(report, apply, changed));
         if !succeeded {
             ok = false;
             break;
+        }
+        if let Some(recorder) = recorder.as_deref_mut()
+            && changed
+        {
+            recorder.notify(&planned.notify, &reports);
         }
     }
     log::info!(
@@ -636,6 +727,200 @@ fn execute_inner(
         steps: reports,
         ok,
     }
+}
+
+/// The step of `handler`, the `i`th `[[handlers]]` entry, on `target`: a
+/// `run` with the target's env before it, shown as written, or a `service`
+/// brought to its state as a `[[services]]` entry is, through `services`.
+/// Runs nothing; a service handler needs the facts `services` was built on.
+fn resolve_handler(
+    target: &Target,
+    services: &mut services::Builder<'_>,
+    i: usize,
+    handler: &Handler,
+) -> Result<PlannedRun, String> {
+    match (&handler.run, &handler.service) {
+        (Some(run), _) => Ok(PlannedRun {
+            run: (env_prefix(&target.env) + run).into(),
+            label: Some(run.clone()),
+            sudo_secret: None,
+            timeout: RUN_TIMEOUT,
+            kind: RunKind::Script,
+            task: None,
+            name: None,
+            notify: Vec::new(),
+        }),
+        (None, Some(entry)) => {
+            let item = Item {
+                path: Some(format!("handlers[{i}]")),
+                name: None,
+                tags: Vec::new(),
+                facts: Vec::new(),
+                notify: Vec::new(),
+                kind: ItemKind::Service(entry.clone()),
+            };
+            services.run(&item, entry)
+        }
+        (None, None) => Err(format!(
+            "handlers[{i}]: internal error: needs run or service"
+        )),
+    }
+}
+
+/// The handler phase of `target`, after `report`, its steps' report: only
+/// when every step passed, each `[[handlers]]` entry of `config` that
+/// `recorder` has pending is resolved ([`resolve_handler`], with `facts`)
+/// and runs once, in config order, as a step runs, `cancel` checked before
+/// each; a handler not due is never resolved. One that exits 0 leaves the
+/// pending list, saved at once; one that does not stays there and fails the
+/// target, and the rest still run; so does one that cannot run, as it did
+/// not resolve or its sudo password is not set. A transport error ends the
+/// target, the handlers left still pending.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one input of the handler phase, passed through"
+)]
+pub(crate) fn run_handlers(
+    command: &str,
+    target: &Target,
+    transport: &dyn Transport,
+    config: &Config,
+    facts: Option<&Facts>,
+    passwords: &Passwords,
+    cancel: &Cancel,
+    recorder: &mut Recorder<'_>,
+    report: TargetReport,
+) -> TargetReport {
+    let TargetReport::Ran {
+        warnings,
+        steps: mut reports,
+        ok: true,
+        ..
+    } = report
+    else {
+        return report;
+    };
+    let due: Vec<(usize, &Handler)> = (config.handlers.iter().enumerate())
+        .filter(|(_, handler)| recorder.pending.contains(&handler.name))
+        .collect();
+    let mut services = services::Builder::new(config, target, facts);
+    let mut ok = true;
+    for (n, &(i, handler)) in due.iter().enumerate() {
+        if cancel.is_set() {
+            return with_warnings(cancelled(command, target, reports, cancel), warnings);
+        }
+        status::phase(
+            &target.name,
+            status::Phase::Run {
+                kind: "handler",
+                n: n + 1,
+                of: due.len(),
+            },
+        );
+        let planned = match resolve_handler(target, &mut services, i, handler) {
+            Ok(planned) => planned,
+            Err(error) => {
+                reports.push(unrun(&handler.name, error));
+                ok = false;
+                continue;
+            }
+        };
+        let label = planned.shown();
+        let entry = Entry::Handler {
+            name: handler.name.clone(),
+        };
+        let as_handler = |report: StepReport, passed: bool| StepReport {
+            changed: Some(passed),
+            handler: Some(handler.name.clone()),
+            ..report
+        };
+        let prefix = match planned.kind {
+            RunKind::Service { .. } => "services",
+            _ => "handlers",
+        };
+        let password = match planned.sudo_secret.as_deref() {
+            None => None,
+            Some(name) => match sudo_password(passwords, name, prefix) {
+                Ok(password) => Some((name, password)),
+                Err(error) => {
+                    reports.push(unrun(&handler.name, error));
+                    ok = false;
+                    continue;
+                }
+            },
+        };
+        let output = match password {
+            None => transport.run(&planned.run, planned.timeout),
+            Some((_, password)) => transport.run_tty(
+                &packages::with_password(&planned.run),
+                password,
+                planned.timeout,
+            ),
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(TransportError::Cancelled) => {
+                return with_warnings(cancelled(command, target, reports, cancel), warnings);
+            }
+            Err(err) => {
+                let error = step_error(&err, password.map(|(name, _)| name), prefix);
+                if let TransportError::Timeout {
+                    output: Some(output),
+                    ..
+                } = err
+                {
+                    let report = StepReport::from_output(label, *output, entry);
+                    reports.push(as_handler(report, false));
+                }
+                return with_warnings(failed(command, target, reports, error), warnings);
+            }
+        };
+        let passed = output.code == Some(0);
+        let report = StepReport::from_output(label, output, entry);
+        reports.push(as_handler(report, passed));
+        if passed {
+            log::info!("{command} {}: handler {} done", target.name, handler.name);
+            recorder.handled(&handler.name, &reports);
+        } else {
+            log::info!("{command} {}: handler {} failed", target.name, handler.name);
+            ok = false;
+        }
+    }
+    TargetReport::Ran {
+        warnings,
+        target: target.name.clone(),
+        steps: reports,
+        ok,
+    }
+}
+
+/// The report of handler `name`, which could not run for `error` (it did
+/// not resolve, or its sudo password is not set): nothing ran, `run` and
+/// `reason` are the error.
+fn unrun(name: &str, error: String) -> StepReport {
+    StepReport {
+        run: error.clone(),
+        code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        skipped: false,
+        reason: Some(error),
+        entry: Entry::Handler {
+            name: name.to_owned(),
+        },
+        task: None,
+        name: None,
+        changed: Some(false),
+        handler: Some(name.to_owned()),
+    }
+}
+
+/// `report` carrying `warnings`, those of the steps before it.
+fn with_warnings(mut report: TargetReport, warnings: Vec<String>) -> TargetReport {
+    for warning in warnings {
+        report.warn(warning);
+    }
+    report
 }
 
 /// Why [`capture`] found nothing: how the step failed, without what the
@@ -778,6 +1063,67 @@ pub(crate) enum Sent {
     Cancelled,
 }
 
+/// Whether `planned`, which ended with `output` and was not skipped by a
+/// guard, changed something, so that its `notify` fires: a file step that
+/// wrote (a mode-only fix prints `unchanged` too), a service step that
+/// printed neither `unchanged service NAME` nor the `reloaded` no-op line, a
+/// run or plugin step that exited 0. Never the package step, a skip or a
+/// failure.
+fn changed(planned: &PlannedRun, output: &Output) -> bool {
+    if output.code != Some(0) {
+        return false;
+    }
+    let mut lines = (output.stdout.split(|&byte| byte == b'\n'))
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
+    match &planned.kind {
+        RunKind::File { dest, .. } => {
+            let wrote = format!("wrote {dest}");
+            lines.any(|line| line == wrote.as_bytes())
+        }
+        RunKind::Service { name, .. } => {
+            let unchanged = format!("unchanged service {name}");
+            let not_running = format!("service {name} is not running; not reloaded");
+            !lines.any(|line| line == unchanged.as_bytes() || line == not_running.as_bytes())
+        }
+        RunKind::Step { .. } => true,
+        RunKind::Packages { .. } | RunKind::Skip | RunKind::Script => false,
+    }
+}
+
+/// `report` with its `changed` set when the run is an apply and the step
+/// is not the package step, which gives no change signal.
+fn noted(report: StepReport, apply: bool, changed: bool) -> StepReport {
+    StepReport {
+        changed: (apply && report.entry != Entry::Packages).then_some(changed),
+        ..report
+    }
+}
+
+/// What a guarded step's skip line names it: `run` or `plugin NAME`.
+fn guard_label(plugin: Option<&str>) -> String {
+    match plugin {
+        Some(name) => format!("plugin {name}"),
+        None => "run".to_owned(),
+    }
+}
+
+/// The `skipped …` line and reason of a guarded step whose guard skipped it,
+/// its skip line taken out of `output`.
+fn guard_skip(planned: &PlannedRun, output: &mut Output) -> Option<(String, String)> {
+    let RunKind::Step {
+        plugin,
+        guards,
+        nonce: Some(nonce),
+        ..
+    } = &planned.kind
+    else {
+        return None;
+    };
+    let label = guard_label(plugin.as_deref());
+    let reason = guard::skip_reason(guards, &label, nonce.as_str(), output)?;
+    Some((format!("skipped {label}: {reason}"), reason))
+}
+
 /// The failure of a step: for a step run on a terminal with the password
 /// from secret `secret`, sudo's refusals name the secret, never its value,
 /// after `prefix`, the step's kind.
@@ -861,6 +1207,7 @@ pub fn resolve(
         runs.extend(run.map(|run| PlannedRun {
             task: item.path.clone(),
             name: item.name.clone(),
+            notify: item.notify.clone(),
             ..run
         }));
     }
@@ -914,6 +1261,7 @@ fn skip_run(label: String) -> PlannedRun {
         kind: RunKind::Skip,
         task: None,
         name: None,
+        notify: Vec::new(),
     }
 }
 
@@ -953,6 +1301,7 @@ fn package_run(
         kind: RunKind::Packages { manager },
         task: None,
         name: None,
+        notify: Vec::new(),
     }))
 }
 
@@ -975,14 +1324,32 @@ fn step_run(
         };
         return Ok(skip_run(label));
     }
+    let guards = step.guards();
+    let label = guard_label(match step.kind() {
+        StepKind::Plugin(name) => Some(name),
+        StepKind::Run(_) => None,
+    });
+    let nonce = if guards.is_empty() {
+        None
+    } else {
+        Some(GuardNonce(
+            guard::nonce().map_err(|err| format!("{label}: {err}"))?,
+        ))
+    };
     let planned = |run: String, label, plugin| PlannedRun {
         run: run.into(),
         label,
         sudo_secret: None,
         timeout: RUN_TIMEOUT,
-        kind: RunKind::Step { number, plugin },
+        kind: RunKind::Step {
+            number,
+            plugin,
+            guards: guards.clone(),
+            nonce: nonce.clone(),
+        },
         task: None,
         name: None,
+        notify: Vec::new(),
     };
     Ok(match step.kind() {
         StepKind::Plugin(name) => {
@@ -999,15 +1366,23 @@ fn step_run(
             };
             let script = plugins.script(name, &request)?;
             log::info!("{}: step from plugin {name}", target.name);
-            planned(
-                crate::run::wrap_for(target, &script),
-                Some(script),
-                Some(name.to_owned()),
-            )
+            let run = match &nonce {
+                None => crate::run::wrap_for(target, &script),
+                Some(nonce) => {
+                    let body = crate::run::wrap(&script);
+                    env_prefix(&target.env) + &guard::wrap(&guards, &label, nonce.as_str(), &body)
+                }
+            };
+            planned(run, Some(script), Some(name.to_owned()))
         }
-        StepKind::Run(run) => match env_prefix(&target.env) {
-            prefix if prefix.is_empty() => planned(run.to_owned(), None, None),
-            prefix => planned(prefix + run, Some(run.to_owned()), None),
+        StepKind::Run(run) => match (env_prefix(&target.env), &nonce) {
+            (prefix, Some(nonce)) => planned(
+                prefix + &guard::wrap(&guards, &label, nonce.as_str(), run),
+                Some(run.to_owned()),
+                None,
+            ),
+            (prefix, None) if prefix.is_empty() => planned(run.to_owned(), None, None),
+            (prefix, None) => planned(prefix + run, Some(run.to_owned()), None),
         },
     })
 }
@@ -1106,6 +1481,7 @@ mod tests {
                 .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
                 .collect(),
             kind,
+            notify: Vec::new(),
         }
     }
 
@@ -1121,6 +1497,112 @@ mod tests {
             plugin: Some(name.to_owned()),
             ..Step::default()
         }
+    }
+
+    #[test]
+    fn resolve_carries_each_items_notify_onto_its_step() {
+        let mut notified = item(ItemKind::Step(Step::script("a")), &[], &[]);
+        notified.notify = vec!["reload sshd".to_owned()];
+        let skipped = Item {
+            notify: vec!["x".to_owned()],
+            ..item(ItemKind::Step(Step::script("b")), &["web"], &[])
+        };
+        let plain = item(ItemKind::Step(Step::script("c")), &[], &[]);
+        let expanded = Expanded {
+            items: vec![notified, skipped, plain],
+            from_tasks: false,
+        };
+        let runs = resolve(
+            &target("a"),
+            None,
+            &Config::default(),
+            &expanded,
+            &Sources::default(),
+            &FakePlugins::none(),
+            &Cancel::new(),
+        )
+        .unwrap();
+        let notify: Vec<&[String]> = runs.iter().map(|run| run.notify.as_slice()).collect();
+        assert_eq!(
+            notify,
+            [&["reload sshd".to_owned()][..], &["x".to_owned()], &[]]
+        );
+    }
+
+    /// A run of `kind` that ended with `code` and printed `stdout`.
+    fn ended(kind: RunKind, code: Option<i32>, stdout: &str) -> bool {
+        let planned = PlannedRun {
+            kind,
+            ..skip_run(String::new())
+        };
+        let output = Output {
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            code,
+            truncated: false,
+            abandoned: false,
+        };
+        changed(&planned, &output)
+    }
+
+    #[test]
+    fn a_step_changed_something_only_by_what_its_kind_prints() {
+        use crate::step::{FileRun, ServiceRun};
+        let file = || RunKind::File {
+            dest: "/etc/a".to_owned(),
+            run: FileRun {
+                upload: None,
+                skip: false,
+                write: None,
+            },
+        };
+        assert!(ended(file(), Some(0), "wrote /etc/a\n"));
+        assert!(
+            ended(file(), Some(0), "[sudo] x\r\nwrote /etc/a\r\n"),
+            "a terminal"
+        );
+        assert!(
+            !ended(file(), Some(0), "unchanged /etc/a\n"),
+            "a mode-only fix too"
+        );
+        assert!(!ended(file(), Some(0), "wrote /etc/ab\n"));
+        assert!(!ended(file(), Some(1), "wrote /etc/a\n"), "a failure");
+
+        let service = || RunKind::Service {
+            name: "sshd".to_owned(),
+            run: ServiceRun { skip: false },
+        };
+        for line in [
+            "started service sshd\n",
+            "restarted service sshd\n",
+            "reloaded service sshd\n",
+        ] {
+            assert!(ended(service(), Some(0), line), "{line}");
+        }
+        for line in [
+            "unchanged service sshd\n",
+            "service sshd is not running; not reloaded\n",
+        ] {
+            assert!(!ended(service(), Some(0), line), "{line}");
+        }
+        assert!(!ended(service(), Some(1), "started service sshd\n"));
+        assert!(!ended(service(), None, ""), "killed");
+
+        let step = RunKind::Step {
+            number: 1,
+            plugin: None,
+            guards: Default::default(),
+            nonce: None,
+        };
+        assert!(ended(step.clone(), Some(0), ""));
+        assert!(!ended(step, Some(2), ""));
+        let manager = packages::Manager::Brew;
+        assert!(!ended(
+            RunKind::Packages { manager },
+            Some(0),
+            "installed\n"
+        ));
+        assert!(!ended(RunKind::Skip, Some(0), ""));
     }
 
     #[test]
@@ -1228,7 +1710,9 @@ mod tests {
             run.kind,
             RunKind::Step {
                 number: 2,
-                plugin: None
+                plugin: None,
+                guards: Default::default(),
+                nonce: None
             }
         );
         assert_eq!(run.kind.entry(), Entry::Step { number: 2 });
@@ -1257,7 +1741,9 @@ mod tests {
             run.kind,
             RunKind::Step {
                 number: 1,
-                plugin: Some("p".to_owned())
+                plugin: Some("p".to_owned()),
+                guards: Default::default(),
+                nonce: None
             }
         );
     }
@@ -1310,6 +1796,87 @@ mod tests {
         let wrapped = crate::run::wrap("echo \"$APP\"");
         assert_eq!(*run.run, format!("{APP}{wrapped}"));
         assert_eq!(run.shown(), "echo \"$APP\"");
+    }
+
+    #[test]
+    fn a_guarded_step_wraps_its_script_after_the_env_with_a_fresh_nonce() {
+        let mut step = Step::script("echo \"$APP\"");
+        step.unless = Some("true".to_owned());
+        let run_item = item(ItemKind::Step(step.clone()), &[], &[]);
+        let resolve = || {
+            step_run(
+                &with_env(),
+                None,
+                &run_item,
+                &step,
+                1,
+                &FakePlugins::none(),
+                &Cancel::new(),
+            )
+            .unwrap()
+        };
+        let (run, again) = (resolve(), resolve());
+        let RunKind::Step {
+            guards,
+            nonce: Some(nonce),
+            ..
+        } = &run.kind
+        else {
+            panic!("{:?}", run.kind);
+        };
+        assert_eq!(guards, &step.guards());
+        let nonce = nonce.as_str();
+        let body = guard::wrap(guards, "run", nonce, "echo \"$APP\"");
+        assert_eq!(*run.run, format!("{APP}{body}"));
+        assert_eq!(run.shown(), "echo \"$APP\"", "the nonce is never shown");
+        assert_ne!(run.kind, again.kind, "each resolve has its own nonce");
+
+        let mut output = Output {
+            stdout: format!("{}{nonce} skipped run: unless exited 0\n", guard::MARK).into_bytes(),
+            stderr: Vec::new(),
+            code: Some(0),
+            truncated: false,
+            abandoned: false,
+        };
+        assert_eq!(
+            guard_skip(&run, &mut output),
+            Some((
+                "skipped run: unless exited 0".to_owned(),
+                "unless exited 0".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_guarded_plugin_step_wraps_its_wrapped_reply() {
+        let mut step = plugin("p");
+        step.creates = Some("/x".to_owned());
+        let plugin_item = item(ItemKind::Step(step.clone()), &[], &[]);
+        let plugins = FakePlugins::new(|_, _| Ok("echo hi".to_owned()));
+        let run = step_run(
+            &with_env(),
+            Some(&mac()),
+            &plugin_item,
+            &step,
+            1,
+            &plugins,
+            &Cancel::new(),
+        )
+        .unwrap();
+        let RunKind::Step {
+            nonce: Some(nonce), ..
+        } = &run.kind
+        else {
+            panic!("{:?}", run.kind);
+        };
+        let body = guard::wrap(
+            &step.guards(),
+            "plugin p",
+            nonce.as_str(),
+            &crate::run::wrap("echo hi"),
+        );
+        assert_eq!(*run.run, format!("{APP}{body}"));
+        assert_eq!(run.shown(), "echo hi");
     }
 
     #[test]

@@ -1,0 +1,3 @@
+[[steps]]
+run = "install.sh"
+creates = "usr/local/bin/x"

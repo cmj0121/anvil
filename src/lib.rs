@@ -19,6 +19,7 @@ pub mod facts;
 pub mod fanout;
 pub mod files;
 pub mod filestore;
+mod guard;
 pub mod harden;
 mod interrupt;
 pub mod inventory;

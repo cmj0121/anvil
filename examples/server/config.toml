@@ -10,6 +10,7 @@ src = "files/motd"
 dest = "/etc/motd"
 mode = "0644"
 tags = ["linode"]
+notify = ["log motd change"] # only when the bytes change
 
 [[services]]
 name = "sshd"
@@ -19,3 +20,18 @@ tags = ["linode"]
 
 [[steps]]
 run = "uptime"
+
+# Guards make a run step safe to repeat. This one runs on the first apply only.
+[[steps]]
+run = "date -u > /var/tmp/anvil-provisioned"
+creates = "/var/tmp/anvil-provisioned"
+
+# Skipped while the note already holds this line.
+[[steps]]
+run = "echo 'managed by anvil' > /var/tmp/anvil-note"
+unless = "grep -qx 'managed by anvil' /var/tmp/anvil-note"
+
+# Runs once, after the target's last step, when the motd file above changed.
+[[handlers]]
+name = "log motd change"
+run = "logger -t anvil 'motd updated'"
