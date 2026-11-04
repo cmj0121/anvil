@@ -127,6 +127,7 @@ impl std::fmt::Debug for PlannedRun {
             .field("timeout", &self.timeout)
             .field("file", &self.file())
             .field("service", &self.service())
+            .field("notify", &self.notify)
             .finish()
     }
 }
@@ -240,6 +241,8 @@ impl Serialize for PlannedRun {
             rendered: Option<RenderedShown<'a>>,
             #[serde(skip_serializing_if = "Option::is_none")]
             guards: Option<&'a Guards>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            notify: &'a [String],
         }
         /// A templated file's rendered size and hash, never its text.
         #[derive(Serialize)]
@@ -259,6 +262,7 @@ impl Serialize for PlannedRun {
             name: self.name.as_deref(),
             rendered,
             guards: self.guards(),
+            notify: &self.notify,
         }
         .serialize(serializer)
     }

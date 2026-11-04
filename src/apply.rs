@@ -47,7 +47,7 @@ use std::num::NonZeroU8;
 use std::sync::Arc;
 
 use crate::cancel::Cancel;
-use crate::config::{Config, Plugin};
+use crate::config::{Config, MAX_HANDLER_NAME_BYTES, Plugin, is_handler_name};
 use crate::engine::{
     Journal, Passwords, Reached, Recorder, Unresolved, cannot_undo, execute, open_record, probe,
     resolve, run_handlers,
@@ -61,9 +61,12 @@ use crate::options::{Options, Output};
 use crate::plugin::Plugins;
 use crate::prepared::Prepared;
 use crate::record::Session;
-use crate::report::{Progress, Report, TargetReport, cancelled, failed, print_report};
+use crate::report::{
+    DroppedPending, Progress, Report, TargetReport, cancelled, failed, print_report,
+};
+use crate::secret;
 use crate::status;
-use crate::tasks::{Expanded, ItemKind};
+use crate::tasks::{self, Expanded, ItemKind};
 use crate::transport::{Transport, TransportError};
 
 /// Applies `prepared.config` to each of its targets, `opts.parallel` at a
@@ -80,12 +83,33 @@ pub fn run_targets(
     prepared: &Prepared,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
-    let session = if needs_facts(&prepared.config, &prepared.expanded) {
-        Some(open_record("apply")?)
-    } else {
-        None
+    run_dropping(prepared, &[], &mut |_| {}, on)
+}
+
+/// [`run_targets`], first taking each of `drop_pending` off each selected
+/// target's pending handlers in the record, saved before any target, without
+/// running it; `dropped` hears of each as it goes. With any, the record is
+/// opened even when apply does not probe. A name not pending on a target is
+/// a warning; a save that fails fails the command.
+fn run_dropping(
+    prepared: &Prepared,
+    drop_pending: &[String],
+    dropped: &mut dyn FnMut(&DroppedPending),
+    on: &mut dyn FnMut(Progress<'_>),
+) -> Result<Report, Failure> {
+    let mut session =
+        if !drop_pending.is_empty() || needs_facts(&prepared.config, &prepared.expanded) {
+            Some(open_record("apply")?)
+        } else {
+            None
+        };
+    let (drops, mut warnings) = match &mut session {
+        Some(session) if !drop_pending.is_empty() => {
+            drop_each(session, &prepared.targets, drop_pending, dropped)?
+        }
+        _ => Default::default(),
     };
-    Ok(apply_targets(
+    let mut report = apply_targets(
         &prepared.targets,
         prepared.opts.parallel,
         |target| prepared.transport(target),
@@ -97,7 +121,49 @@ pub fn run_targets(
         &prepared.cancel,
         session,
         on,
-    ))
+    );
+    warnings.append(&mut report.warnings);
+    report.warnings = warnings;
+    report.dropped_pending = drops;
+    Ok(report)
+}
+
+/// Takes each of `names`, once each, off each of `targets`' pending
+/// handlers in `session`, then saves it once anything went, and only then
+/// tells `dropped` of each. Returns those dropped and the warnings: the
+/// record load's first, as every apply shows them, then one per name not
+/// pending on a target.
+fn drop_each(
+    session: &mut Session,
+    targets: &[Target],
+    names: &[String],
+    dropped: &mut dyn FnMut(&DroppedPending),
+) -> Result<(Vec<DroppedPending>, Vec<String>), Failure> {
+    let unique = tasks::deduplicated(names);
+    let mut drops = Vec::new();
+    let mut warnings = session.take_warnings();
+    for target in targets {
+        for handler in &unique {
+            if session.drop_pending(&target.name, handler) {
+                log::info!("apply {}: dropped pending handler {handler}", target.name);
+                drops.push(DroppedPending {
+                    target: target.name.clone(),
+                    handler: handler.clone(),
+                });
+            } else {
+                let warning = format!("--drop-pending {handler}: not pending on {}", target.name);
+                log::warn!("{warning}");
+                warnings.push(warning);
+            }
+        }
+    }
+    if !drops.is_empty() {
+        session
+            .save()
+            .map_err(|err| Failure::failed(format!("apply: {err}")))?;
+    }
+    drops.iter().for_each(dropped);
+    Ok((drops, warnings))
 }
 
 /// Applies to each of `targets`, as [`for_each_target`] runs them. With a
@@ -172,6 +238,7 @@ fn apply_targets(
         warnings,
         not_restored: Vec::new(),
         save_error,
+        dropped_pending: Vec::new(),
     }
 }
 
@@ -191,14 +258,32 @@ impl Applied {
     }
 }
 
-/// `anvil apply`: prints each target's block in order (or one JSON
-/// document), then the summary.
-pub fn run(out: Output, opts: &Options) -> Result<(), Failure> {
+/// `anvil apply`: prints a `dropped pending handler NAME on TARGET` line
+/// per handler `drop_pending` took off, then each target's block in order
+/// (or one JSON document), then the summary. A name that cannot be a
+/// handler's is exit 2.
+pub fn run(out: Output, opts: &Options, drop_pending: &[String]) -> Result<(), Failure> {
+    if let Some(name) = drop_pending.iter().find(|name| !is_handler_name(name)) {
+        return Err(Failure::usage(format!(
+            "--drop-pending `{}`: must match [A-Za-z0-9 ._-]+, at most {MAX_HANDLER_NAME_BYTES} bytes",
+            secret::shown_name(name)
+        )));
+    }
     let (config, expanded) = opts.load_expanded()?;
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
     print_report(out, "apply", |on| {
-        run_targets(&Prepared::apply(opts, config, expanded, cancel)?, on)
+        let prepared = Prepared::apply(opts, config, expanded, cancel)?;
+        let mut dropped = |drop: &DroppedPending| {
+            if !out.json {
+                let line = format!(
+                    "dropped pending handler {} on {}\n",
+                    drop.handler, drop.target
+                );
+                let _ = status::write_stdout(&line);
+            }
+        };
+        run_dropping(&prepared, drop_pending, &mut dropped, on)
     })
 }
 
@@ -270,7 +355,7 @@ fn apply_target(
         target,
         &config.handlers,
         facts.as_ref(),
-        journal,
+        journal.filter(|_| facts.is_some()),
     );
     let resolved = resolve(
         target,
@@ -928,6 +1013,7 @@ mod tests {
             warnings: Vec::new(),
             not_restored: Vec::new(),
             save_error: None,
+            dropped_pending: Vec::new(),
         };
         let value = json(&report);
         assert_eq!(keys(&value), ["ok", "targets"]);
@@ -938,6 +1024,7 @@ mod tests {
             warnings: vec![full.to_owned()],
             not_restored: Vec::new(),
             save_error: None,
+            dropped_pending: Vec::new(),
         };
         assert_eq!(
             json(&warned),
@@ -1185,6 +1272,7 @@ mod tests {
             warnings: Vec::new(),
             not_restored: Vec::new(),
             save_error: None,
+            dropped_pending: Vec::new(),
         };
         assert_eq!(report.counts(), (1, 1));
     }

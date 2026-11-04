@@ -2587,6 +2587,7 @@ mod tests {
                 name: None,
                 notify: Vec::new(),
             }],
+            pending_handlers: Vec::new(),
             ok: true,
         });
         for (lines, wanted) in [
@@ -2640,6 +2641,7 @@ mod tests {
             vars: Default::default(),
             env: Default::default(),
             steps: vec![file(Some(rendered)), file(None)],
+            pending_handlers: Vec::new(),
             ok: true,
         });
         let shown: Vec<String> = plan.iter().map(ToString::to_string).collect();
@@ -2741,6 +2743,7 @@ mod tests {
                         name: Some("First\u{2066}".to_owned()),
                         notify: Vec::new(),
                     }],
+                    pending_handlers: Vec::new(),
                     ok: true,
                 }]),
                 ok: Some(true),
@@ -2791,6 +2794,7 @@ mod tests {
                                 notify: Vec::new(),
                             },
                         ],
+                        pending_handlers: Vec::new(),
                         ok: true,
                     },
                     PlanReport::Failed {

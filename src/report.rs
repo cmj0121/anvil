@@ -383,6 +383,16 @@ pub struct Report {
     /// still lacks. `targets` still says what changed; `ok` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub save_error: Option<String>,
+    /// The pending handlers `apply --drop-pending` took off, before the run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dropped_pending: Vec<DroppedPending>,
+}
+
+/// A handler `apply --drop-pending` took off a target's pending list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DroppedPending {
+    pub target: String,
+    pub handler: String,
 }
 
 /// A recorded file a rollback cannot put back, and why.

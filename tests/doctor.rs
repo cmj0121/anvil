@@ -890,3 +890,68 @@ fn a_tag_no_host_carries_is_a_warning_that_exits_zero() {
     assert!(!stdout.contains("tag web"), "{stdout}");
     assert!(!stdout.contains("tag local"), "{stdout}");
 }
+
+#[test]
+fn pending_handlers_are_a_warning_row_and_keep_exit_zero() {
+    let sandbox = Sandbox::new("ad");
+    sandbox.with_fake_host();
+    let ok = sandbox.root().join("ok");
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[steps]]\nrun = \"true\"\nnotify = [\"b\", \"a\"]\n\n\
+             [[steps]]\nrun = \"test -f {}\"\n\n\
+             [[handlers]]\nname = \"a\"\nrun = \"true\"\n\n\
+             [[handlers]]\nname = \"b\"\nrun = \"true\"\n",
+            ok.display()
+        ),
+    );
+    let out = sandbox.anvil(&["doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(!text(&out.stdout).contains("WARNING"), "no record yet");
+
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let out = sandbox.anvil(&["doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    let row = "  handlers        WARNING: pending from last apply: a, b\n";
+    assert_eq!(
+        stdout.matches("handlers ").count(),
+        1,
+        "fake has none: {stdout}"
+    );
+    assert!(
+        stdout.split("\nfake\n").next().unwrap().ends_with(row),
+        "on local, last: {stdout}"
+    );
+
+    let out = sandbox.anvil(&["--json", "doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(value["ok"], true);
+    assert_eq!(
+        value["targets"][0]["pending_handlers"],
+        serde_json::json!(["a", "b"])
+    );
+    assert_eq!(value["targets"][1].get("pending_handlers"), None);
+
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    record["targets"]["local"]["pending_handlers"] = serde_json::json!(["a", "a", "gone"]);
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let out = sandbox.anvil(&["doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "  record          WARNING: {}: local: dropped 1 bad pending_handlers entries\n",
+            path.display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  handlers        WARNING: pending from last apply: a\n"),
+        "`gone` is not in [[handlers]]: {stdout}"
+    );
+}

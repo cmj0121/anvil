@@ -209,6 +209,7 @@ pub fn run_targets(
         warnings,
         not_restored,
         save_error,
+        dropped_pending: Vec::new(),
     })
 }
 

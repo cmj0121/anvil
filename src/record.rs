@@ -30,7 +30,7 @@ use serde_json::json;
 use zeroize::Zeroizing;
 
 use crate::bytes::{self, CappedError};
-use crate::config::{MAX_HANDLERS, check_dest, is_handler_name, is_mode, is_sha256};
+use crate::config::{Handler, MAX_HANDLERS, check_dest, is_handler_name, is_mode, is_sha256};
 use crate::facts::Facts;
 use crate::logger::escape_invisible;
 use crate::paths::{self, PathsError};
@@ -94,6 +94,15 @@ pub struct TargetRecord {
 }
 
 impl TargetRecord {
+    /// The names of `handlers` this entry has pending, in config order;
+    /// a pending name `handlers` lacks is left out.
+    pub fn pending_in(&self, handlers: &[Handler]) -> Vec<String> {
+        (handlers.iter())
+            .filter(|handler| self.pending_handlers.contains(&handler.name))
+            .map(|handler| handler.name.clone())
+            .collect()
+    }
+
     /// Drops the pending handlers apply could not have saved: invalid names,
     /// then repeats (the first kept), then all past [`MAX_HANDLERS`]; how
     /// many it dropped.
@@ -621,6 +630,27 @@ impl Session {
                 self.record.targets.insert(name.to_owned(), target);
             }
         }
+    }
+
+    /// Takes `handler` off `name`'s pending handlers, as
+    /// `apply --drop-pending` does, as [`set_pending`] would; false when it
+    /// was not pending there.
+    ///
+    /// [`set_pending`]: Session::set_pending
+    pub fn drop_pending(&mut self, name: &str, handler: &str) -> bool {
+        let Some(target) = self.record.targets.get_mut(name) else {
+            return false;
+        };
+        if !target
+            .pending_handlers
+            .iter()
+            .any(|pending| pending == handler)
+        {
+            return false;
+        }
+        (self.base.entry(name.to_owned())).or_insert_with(|| Some(target.clone()));
+        target.pending_handlers.retain(|pending| pending != handler);
+        true
     }
 
     /// Adds each of `names` not pending yet to `name`'s pending handlers,

@@ -324,6 +324,7 @@ pub(crate) fn for_each_target(
         warnings: Vec::new(),
         not_restored: Vec::new(),
         save_error: None,
+        dropped_pending: Vec::new(),
     }
 }
 

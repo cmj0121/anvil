@@ -241,7 +241,7 @@ pub fn legacy(config: &Config) -> Expanded {
 }
 
 /// `names` without repeats, each kept where it first appears.
-fn deduplicated(names: &[String]) -> Vec<String> {
+pub(crate) fn deduplicated(names: &[String]) -> Vec<String> {
     let mut kept: Vec<String> = Vec::with_capacity(names.len());
     for name in names {
         if !kept.contains(name) {

@@ -1775,6 +1775,7 @@ pub mod tests {
             transport: format!("ssh {target}"),
             plugins: Vec::new(),
             drift: None,
+            pending_handlers: Vec::new(),
         }
     }
 
@@ -2254,6 +2255,7 @@ pub mod tests {
                 vars: Default::default(),
                 env: Default::default(),
                 steps: Vec::new(),
+                pending_handlers: Vec::new(),
                 ok: true,
             },
         ));

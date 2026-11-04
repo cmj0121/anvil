@@ -2854,3 +2854,137 @@ fn a_ctrl_c_in_the_handler_phase_keeps_the_handlers_not_run_pending() {
     assert_eq!(handled(&sandbox, "local"), ["slow"], "the running one ends");
     assert_eq!(pending(&sandbox, "local"), serde_json::json!(["after"]));
 }
+
+#[test]
+fn drop_pending_takes_a_handler_off_each_selected_target_without_running_it() {
+    let sandbox = Sandbox::new("ah");
+    with_handlers(&sandbox, "[[steps]]\nrun = \"test -f ROOT/ok\"\n");
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    std::fs::write(sandbox.root().join("ok"), "").unwrap();
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    record["targets"]["local"]["pending_handlers"] = serde_json::json!(["flush", "bad/"]);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    let out = sandbox.anvil(
+        &[
+            "apply",
+            "--target",
+            "local",
+            "--drop-pending",
+            "flush",
+            "--drop-pending",
+            "log",
+            "--drop-pending",
+            "flush",
+        ],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.starts_with("dropped pending handler flush on local\n▶ local\n"),
+        "once, though named twice: {stdout}"
+    );
+    assert_eq!(
+        text(&out.stderr),
+        format!(
+            "{}: local: dropped 1 bad pending_handlers entries\n\
+             --drop-pending log: not pending on local\n",
+            path.display()
+        ),
+        "the load's warning first, no warning for the repeat"
+    );
+    assert!(handled(&sandbox, "local").is_empty(), "dropped, never run");
+    assert_eq!(pending(&sandbox, "local"), serde_json::Value::Null);
+    assert_eq!(
+        pending(&sandbox, "fake"),
+        serde_json::json!(["flush"]),
+        "not selected"
+    );
+
+    let out = sandbox.anvil(
+        &[
+            "--json",
+            "apply",
+            "--target",
+            "fake",
+            "--drop-pending",
+            "flush",
+        ],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(
+        value["dropped_pending"],
+        serde_json::json!([{"target": "fake", "handler": "flush"}])
+    );
+    assert_eq!(value.get("warnings"), None);
+    assert!(handled(&sandbox, "fake").is_empty());
+    assert_eq!(pending(&sandbox, "fake"), serde_json::Value::Null);
+}
+
+#[test]
+fn drop_pending_without_handlers_warns_and_a_bad_name_is_exit_2() {
+    let sandbox = Sandbox::new("ah");
+    sandbox.write_config("config.toml", "[[steps]]\nrun = \"true\"\n");
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).starts_with("▶ local\n"));
+    assert_eq!(text(&out.stderr), "");
+
+    let out = sandbox.anvil(
+        &[
+            "--json",
+            "apply",
+            "--target",
+            "local",
+            "--drop-pending",
+            "all",
+        ],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(
+        value["warnings"],
+        serde_json::json!(["--drop-pending all: not pending on local"])
+    );
+    assert_eq!(value.get("dropped_pending"), None);
+
+    let out = sandbox.anvil(&["apply", "--drop-pending", "a/b"], &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr)
+            .contains("--drop-pending `a/b`: must match [A-Za-z0-9 ._-]+, at most 64 bytes"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn drop_pending_whose_save_fails_is_exit_1_before_any_target() {
+    let sandbox = Sandbox::new("ah");
+    with_handlers(&sandbox, "[[steps]]\nrun = \"test -f ROOT/ok\"\n");
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    std::fs::write(sandbox.root().join("ok"), "").unwrap();
+    let dir = sandbox.state_home().join("anvil");
+    common::chmod(&dir, 0o500);
+    let out = sandbox.anvil(
+        &["apply", "--target", "local", "--drop-pending", "flush"],
+        &[],
+    );
+    common::chmod(&dir, 0o700);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "", "no drop line, no target");
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("apply: cannot write last-apply.json: "),
+        "{stderr}"
+    );
+    assert!(handled(&sandbox, "local").is_empty());
+    assert_eq!(pending(&sandbox, "local"), serde_json::json!(["flush"]));
+}
