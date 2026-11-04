@@ -2,7 +2,7 @@
 
 [English](cli.md) | 繁體中文
 
-完整的指令規範，依循 [#2](https://github.com/mini-poc/anvil/issues/2) 的 CLI 設計。
+完整的指令規範，依循 [#2](https://github.com/cmj0121/anvil/issues/2) 的 CLI 設計。
 入門介紹請見 [README](../README.zh-TW.md)。
 
 主題指南：[入門](getting-started.zh-TW.md)、[設定](configuration.zh-TW.md)、
@@ -1696,7 +1696,7 @@ TUI 的 `u` 鍵執行相同的檢查與更新（[終端機介面](tui.zh-TW.md)�
 **最新的 release。** anvil 執行系統的 `curl`（否則為 `curl not found on PATH`），第一個引數是 `-q`，因此不讀取 `~/.curlrc`，
 且不帶 token：設定了 `GITHUB_TOKEN` 也會被忽略。curl 仍會繼承環境變數，因此
 `https_proxy`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 與 CA 設定（`CURL_CA_BUNDLE`、`SSL_CERT_FILE`、`SSL_CERT_DIR`）都會生效。
-它查詢 `https://api.github.com/repos/mini-poc/anvil/releases/latest`，此端點會略過草稿與 prerelease；
+它查詢 `https://api.github.com/repos/cmj0121/anvil/releases/latest`，此端點會略過草稿與 prerelease；
 回應最多 1 MiB（`GitHub API answer over 1 MiB`）。沒有 token 時，API 每個 IP 每小時允許 60 次請求；
 超過後為 `GitHub API rate limit reached (60 requests an hour without a token); try again after HH:MM UTC`。
 其他回應：`no release published`（404）與 `GitHub API answered HTTP N`。
@@ -1705,7 +1705,7 @@ TUI 的 `u` 鍵執行相同的檢查與更新（[終端機介面](tui.zh-TW.md)�
 或任何 x86_64 Linux 都用 `x86_64-unknown-linux-musl`），release 必須包含 `anvil-vX.Y.Z-<target>.tar.gz`、
 它的 `.tar.gz.sha256` 與 `.tar.gz.minisig`（否則為 `release vX.Y.Z has no asset NAME`）；
 其他作業系統或架構為 `no release asset for <os>-<arch>`。每個 URL 都必須恰好是
-`https://github.com/mini-poc/anvil/releases/download/vX.Y.Z/NAME`（否則為 `unexpected download URL for NAME`）。
+`https://github.com/cmj0121/anvil/releases/download/vX.Y.Z/NAME`（否則為 `unexpected download URL for NAME`）。
 下載只用 https，且不重試；tarball 最多 64 MiB（`NAME is N bytes, over the 64 MiB limit`）、300 秒，
 兩個小檔案各最多 4 KiB、30 秒，且每個檔案都必須是 release 列出的大小；
 release 列為空的檔案會被拒絕（`release vX.Y.Z lists NAME as 0 bytes`）。

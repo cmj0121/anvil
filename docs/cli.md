@@ -2,7 +2,7 @@
 
 English | [繁體中文](cli.zh-TW.md)
 
-The full command contract, following the CLI design in [#2](https://github.com/mini-poc/anvil/issues/2). For an
+The full command contract, following the CLI design in [#2](https://github.com/cmj0121/anvil/issues/2). For an
 introduction see the [README](../README.md).
 
 Topic guides: [Getting started](getting-started.md), [Configuration](configuration.md),
@@ -1797,7 +1797,7 @@ ignored with a warning.
 **The latest release.** anvil runs the system `curl` (`curl not found on PATH` otherwise) with `-q` first, so
 `~/.curlrc` is not read, and with no token: a set `GITHUB_TOKEN` is ignored. curl still inherits the environment, so
 `https_proxy`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and the CA settings (`CURL_CA_BUNDLE`, `SSL_CERT_FILE`,
-`SSL_CERT_DIR`) apply. It asks `https://api.github.com/repos/mini-poc/anvil/releases/latest`, which skips drafts and
+`SSL_CERT_DIR`) apply. It asks `https://api.github.com/repos/cmj0121/anvil/releases/latest`, which skips drafts and
 prereleases; the answer must be at most 1 MiB (`GitHub API answer over 1 MiB`). The API allows 60 requests an hour
 per IP without a token; past that, `GitHub API rate limit reached (60 requests an hour without a token); try again
 after HH:MM UTC`. Other answers: `no release published` (404) and `GitHub API answered HTTP N`.
@@ -1806,7 +1806,7 @@ after HH:MM UTC`. Other answers: `no release published` (404) and `GitHub API an
 or `x86_64-unknown-linux-musl` for any x86_64 Linux) the release must hold `anvil-vX.Y.Z-<target>.tar.gz`, its
 `.tar.gz.sha256` and its `.tar.gz.minisig` (else `release vX.Y.Z has no asset NAME`); another OS or architecture is
 `no release asset for <os>-<arch>`. Each URL must be
-`https://github.com/mini-poc/anvil/releases/download/vX.Y.Z/NAME` exactly (else `unexpected download URL for NAME`).
+`https://github.com/cmj0121/anvil/releases/download/vX.Y.Z/NAME` exactly (else `unexpected download URL for NAME`).
 Downloads are https only, with no retries; the tarball may be at most 64 MiB (`NAME is N bytes, over the 64 MiB
 limit`) and take 300 s, the two small files 4 KiB and 30 s each, and each must be the size the release lists; a file
 the release lists as empty is refused (`release vX.Y.Z lists NAME as 0 bytes`). curl before 8.4 may not enforce

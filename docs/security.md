@@ -177,7 +177,7 @@ signature by a key compiled into the running binary.
   with `-q`, so `~/.curlrc` is ignored, but it inherits the environment: a proxy (`https_proxy`, `ALL_PROXY`) or a CA
   bundle (`CURL_CA_BUNDLE`, `SSL_CERT_FILE`) you set applies. Whoever controls those can withhold the newest release
   or fail the download, but cannot make anvil install a file the release keys did not sign. The GitHub API answer
-  only names the tag and the files; each download URL must be the fixed `github.com/mini-poc/anvil` one.
+  only names the tag and the files; each download URL must be the fixed `github.com/cmj0121/anvil` one.
 - **Key rotation.** The workflow signs with the current key. To rotate, the owner moves the signing secret to the next
   key and ships a release that embeds that key as current and a new next key. A binary one rotation behind trusts the
   new signer (it was its next key) and updates as usual. A binary two rotations behind trusts neither key: its update
@@ -188,10 +188,10 @@ signature by a key compiled into the running binary.
   still installs on it until then. If the next key leaks, the owner never rotates to it: a fresh next pair replaces
   it, the current key keeps signing, and binaries stop trusting the leaked key once they update.
 - **Reinstalling by hand.** Take the key from the second line of
-  [`keys/minisign.pub` on `main`](https://github.com/mini-poc/anvil/blob/main/keys/minisign.pub), then:
+  [`keys/minisign.pub` on `main`](https://github.com/cmj0121/anvil/blob/main/keys/minisign.pub), then:
 
   ```sh
-  base=https://github.com/mini-poc/anvil/releases/download/vX.Y.Z
+  base=https://github.com/cmj0121/anvil/releases/download/vX.Y.Z
   curl -fLO "$base/anvil-vX.Y.Z-<target>.tar.gz" -fLO "$base/anvil-vX.Y.Z-<target>.tar.gz.minisig"
   minisign -Vm anvil-vX.Y.Z-<target>.tar.gz -P <key>   # must print: Trusted comment: anvil vX.Y.Z <target>
   tar -xzf anvil-vX.Y.Z-<target>.tar.gz

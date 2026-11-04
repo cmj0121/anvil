@@ -4,7 +4,7 @@ English | [繁體中文](deviations.zh-TW.md)
 
 ## Deviations from #2/#3
 
-- The inventory and config are stored as TOML only ([#4](https://github.com/mini-poc/anvil/issues/4)); YAML is an
+- The inventory and config are stored as TOML only ([#4](https://github.com/cmj0121/anvil/issues/4)); YAML is an
   editing view. The config key is `format` (`[anvil].format`), not `inventory_format`: it picks the format
   `anvil inventory` and `anvil config` open in, and `--format` overrides it for one edit; neither changes how anything
   is stored. Legacy YAML files are still read and are migrated to TOML by the next edit.

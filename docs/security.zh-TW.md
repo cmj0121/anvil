@@ -154,7 +154,7 @@
   因此會忽略 `~/.curlrc`，但它會繼承環境變數：你設定的 proxy（`https_proxy`、`ALL_PROXY`）或 CA bundle
   （`CURL_CA_BUNDLE`、`SSL_CERT_FILE`）都會生效。控制這些設定的人可以扣住最新的 release 或讓下載失敗，
   但無法讓 anvil 安裝 release 金鑰沒有簽署的檔案。GitHub API 的回應只指出 tag 與檔案；
-  每個下載 URL 都必須是固定的 `github.com/mini-poc/anvil` URL。
+  每個下載 URL 都必須是固定的 `github.com/cmj0121/anvil` URL。
 - **金鑰輪替。** workflow 以目前的金鑰簽署。輪替時，owner 把簽署用的 secret 換成下一把金鑰，
   並發布一個以該金鑰為目前金鑰、另帶一把新的下一把金鑰的 release。落後一次輪替的執行檔信任新的簽署者（它原本就是其下一把金鑰），
   照常更新。落後兩次輪替的執行檔兩把金鑰都不信任：它的更新會以 `signature check failed for NAME: unknown key id` 停止，
@@ -163,11 +163,11 @@
   它碰不到已安裝的執行檔：每個執行檔在更新之前都繼續信任建置時帶的金鑰，包括已外洩的那把，
   因此在那之前，以外洩金鑰簽署的 release 仍能安裝到它上面。若下一把金鑰外洩，owner 絕不輪替到它：
   改以一組新的下一把金鑰對取代它，目前的金鑰繼續簽署，執行檔更新後就不再信任外洩的金鑰。
-- **手動重新安裝。** 從 [`main` 上的 `keys/minisign.pub`](https://github.com/mini-poc/anvil/blob/main/keys/minisign.pub)
+- **手動重新安裝。** 從 [`main` 上的 `keys/minisign.pub`](https://github.com/cmj0121/anvil/blob/main/keys/minisign.pub)
   第二行取得金鑰，然後：
 
   ```sh
-  base=https://github.com/mini-poc/anvil/releases/download/vX.Y.Z
+  base=https://github.com/cmj0121/anvil/releases/download/vX.Y.Z
   curl -fLO "$base/anvil-vX.Y.Z-<target>.tar.gz" -fLO "$base/anvil-vX.Y.Z-<target>.tar.gz.minisig"
   minisign -Vm anvil-vX.Y.Z-<target>.tar.gz -P <key>   # must print: Trusted comment: anvil vX.Y.Z <target>
   tar -xzf anvil-vX.Y.Z-<target>.tar.gz
