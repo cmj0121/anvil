@@ -198,6 +198,75 @@ Host 名稱須符合 `[A-Za-z0-9_-]+`。`local` 是保留名稱：它永遠存�
 不是 secret 名稱的 `sudo_secret` 以 2 結束並顯示 ``host `linode1`: sudo_secret `VALUE`: must match [A-Z][A-Z0-9_]*``；
 `local` 的對應設定是 `[packages].local_sudo_secret`。
 
+### Vars 與 env
+
+inventory 可在三個層級為每個 target 提供 `vars` 與 `env` 值：全域、每個 tag、每個 host。
+step 會以環境變數讀取其 target 的 `env`：
+
+```toml
+[vars]                      # global
+port = 80
+ntp = "pool.ntp.org"
+
+[env]                       # global; a step reads $HTTP_PROXY
+HTTP_PROXY = "http://proxy:3128"
+
+[tags.web.vars]             # every host tagged web
+port = 8080
+[tags.web.env]
+APP_ENV = "prod"
+
+[tags.local.vars]           # the local target
+editor = "nvim"
+
+[hosts.web1]
+host = "203.0.113.10"
+tags = ["web"]
+[hosts.web1.vars]           # this host only
+port = 9090
+[hosts.web1.env]
+APP_ENV = "staging"
+```
+
+```toml
+[[steps]]
+run = 'echo "deploying to $APP_ENV"'   # web1: staging; another web host: prod
+```
+
+**`vars` 與 `env` 不可用於機密。** `anvil doctor`、`anvil plan` 及其 `--json` 會原樣印出每個值，
+每個 `env` 值也會以明文出現在它所交給的每個 step 腳本中。密碼與 token 請放在 [secret store](secrets.zh-TW.md)。
+
+- **優先順序。** target 依序取全域、它的每個 tag，最後是其 host 自身的值。
+  較後層級設定的鍵會取代整個值：table 或 array 不會合併，因此 tag 上的 `list = [3]` 會取代全域的 `list = [1, 2]`。
+- **Tag 衝突。** 同一 host 的兩個 tag 把某個鍵設為不同的值，而 host 本身未設定該鍵時，會在任何 target 開始前以 2 結束並顯示
+  ``host `NAME`: vars.KEY is set by tags `A` and `B` with different values; set it in [hosts.NAME.vars]``
+  （env 則為 `env.KEY` 與 `[hosts.NAME.env]`）。相同的值不算衝突；在 host 上設定該鍵即可解除衝突。
+- **`local`。** 本機 target 依序取全域與 `[tags.local]`；它仍然沒有 `[hosts.local]` 項目。
+- **Tags。** `[tags.NAME]` 的名稱須符合 `[A-Za-z0-9_-]+` 且不能是 host 名稱
+  （以 2 結束並顯示 ``tag `NAME`: name must match [A-Za-z0-9_-]+`` 或 ``tag `NAME`: name is a host name``），
+  且只能包含 `vars` 與 `env`。沒有任何 host 帶有的 tag（`local` 除外）是 doctor 的警告（[`anvil doctor`](cli.zh-TW.md#anvil-doctor)）。
+- **`vars` 值**可以是字串、整數、布林、array 與 table。浮點數、TOML datetime 或 YAML null 以 2 結束並指出層級與鍵，
+  例如 `vars.ratio: must be a string, integer, boolean, array or table, not a float` 或 `tags.web.vars.list[1]: ..., not null`。
+  鍵（包括巢狀 table 的鍵）須符合 `[A-Za-z_][A-Za-z0-9_]*`（``vars `a-b`: must match [A-Za-z_][A-Za-z0-9_]*``）。
+  上限：每個層級與每個 table 256 個鍵、值的巢狀深度（含自身）至多 8 層、字串至多 64 KiB、整數在 64 位元範圍內。
+  超過時以 2 結束並顯示 `vars: has more than 256 keys`、`vars.KEY: nests deeper than 8 levels`、
+  `vars.KEY: is longer than 65536 bytes` 或 `vars.KEY: is outside the 64-bit integer range`。目前還沒有 step 讀取 `vars`。
+- **`env` 鍵**須符合 `[A-Za-z_][A-Za-z0-9_]*`。`PATH`、`HOME`、`USER`、`LOGNAME`、`SHELL`、`IFS`、`ENV`、
+  `BASH_ENV`、`CDPATH`、`PS4`、`TMPDIR`、`SHELLOPTS`、`BASHOPTS`、`UID`、`EUID`、`PPID` 與 `GROUPS`，
+  以及任何以 `ANVIL_`、`LD_`、`DYLD_`、`LC_`、`SUDO_` 或 `SSH_` 開頭的鍵，都會被拒絕並顯示 ``env `PATH`: is reserved``。值必須是字串（`env.KEY: must be a string`），
+  不含任何控制字元，tab 與換行也算在內（`env.KEY: contains a control character`），至多 4 KiB
+  （`env.KEY: is longer than 4096 bytes`），每個層級至多 64 個鍵（`env: has more than 64 keys`）。
+- **`env` 的去處。** `[[steps]]` 或 task 的 `run`、plugin step 與 `anvil run` 腳本，開頭會是 target 的 env，
+  以 `KEY='value'` 與 `export KEY` 行寫在經由傳輸 stdin 送出的腳本內，絕不放在 argv 上。
+  值以單引號包住，因此引號、`$`、反引號與反斜線都會原樣抵達。套件、檔案與服務不會取得 env。
+  報告、plan 與 `--json` 顯示的是你寫的腳本，不含這些行。
+- **sudo。** `sudo` 會重設環境（`env_reset`），因此經由它執行的指令看不到 `env`。請以名稱傳遞值：
+  `sudo APP_ENV="$APP_ENV" cmd`。
+
+每則 `vars` 與 `env` 值或鍵的訊息都以其層級開頭：`vars`、`tags.NAME.vars` 或 `hosts.NAME.vars`，以及 `env`、`tags.NAME.env` 或 `hosts.NAME.env`。
+沒有 `vars`、`env` 或 `tags` 的 inventory 載入與儲存都與以前相同。
+YAML 檢視與 TOML 對應（`vars:`、`env:`、`tags: {web: {vars: …}}`，以及 host 底下的 `vars:` / `env:`）。
+
 ## Config
 
 ```toml

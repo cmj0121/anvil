@@ -398,6 +398,26 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
   無法解析時則為 `manager         error: REASON`（例如 `` `pacman` needs root and sudo is not installed ``，
   或 [Root 與 sudo](packages.zh-TW.md#root-與-sudo) 中的 sudo 密碼拒絕訊息）。
   有 sudo secret 的 target 以 apply 的方式解析，因此對它而言 sudo `binary` 是可接受的。無法連線的 target 沒有 `manager` 列。
+- `vars` 與 `env`：每個 target 解析後的 [vars 與 env](configuration.zh-TW.md#vars-與-env)，接在 facts 之後，
+  每個鍵一列，並附上設定它的層級（`global`、`tag:NAME` 或 `host`）。var 以 JSON 文字顯示，因此看得出型別；env 值照寫的顯示。
+  不可見字元與 bidi 字元會被跳脫。值原樣顯示：它們不是機密。沒有 vars 或 env 的 target 沒有這些列。
+- `tag NAME`：沒有任何 host 帶有的 `[tags.NAME]` table（`local` 除外），會在本機檢查中顯示為一列 `tag NAME`，
+  內容為 `WARNING: no host carries this tag`，並記一則日誌警告 `tag NAME: no host carries this tag`。它不改變結束碼。
+
+```text
+local checks
+  …
+  tag db          WARNING: no host carries this tag
+
+web1
+  transport       ssh 203.0.113.10
+  hostname        web1
+  …
+  vars.list       [1,"a"] (global)
+  vars.port       9090 (host)
+  env.APP_ENV     it's $HOME (host)
+  env.HTTP_PROXY  http://proxy:3128 (global)
+```
 
 每項檢查都通過且每個 target 都可連線時以 0 結束，否則為 1。
 有 `[packages]` 時，套件管理器無法解析的 target 也會讓結束碼為 1；沒有 `[packages]` 時不做任何解析，結束碼照舊。
@@ -409,11 +429,19 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
     "ssh": true,
     "sh": true,
     "editor": "/opt/homebrew/bin/nvim",
-    "secrets": { "HOST_SUDO": "ok" }
+    "secrets": { "HOST_SUDO": "ok" },
+    "unused_tags": ["db"]
   },
   "targets": [
     {
       "target": "local",
+      "vars": {
+        "editor": { "value": "nvim", "level": "tag:local" },
+        "port": { "value": 80, "level": "global" }
+      },
+      "env": {
+        "HTTP_PROXY": { "value": "http://proxy:3128", "level": "global" }
+      },
       "connectable": true,
       "facts": {
         "arch": "arm64",
@@ -438,6 +466,8 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
 `editor` 是字串或 `null`；每個 secret 是 `"ok"`、`"missing"`、`"locked"` 或 `"error"`；
 `facts` 含探測回報的每個鍵（上例有刪節）。
 `manager`（解析出的套件管理器）或 `manager_error`（原因，不含 `error:` 前綴）只在有 `[packages]` 且 target 可連線時出現。
+`vars` 與 `env` 把每個鍵對應到它的 `value`（var 保留其 JSON 型別，env 值是字串）與 `level`，
+出現在每個 target 上，無論可否連線；為空時省略。`local.unused_tags` 列出未使用的 tag，沒有時省略。
 
 有 `[packages]` 且 manager 解析成功時，target 另有 `packages` 字串：`"ok"` 或
 `"WARNING: not found by MANAGER: a, b"`，也會顯示為 `packages` 列。
@@ -1023,6 +1053,9 @@ secret 由 `anvil doctor` 檢查。
 2 targets, nothing executed
 ```
 
+- 有 [vars 或 env](configuration.zh-TW.md#vars-與-env) 的 target，區塊開頭每個 var 一行 `vars.KEY = VALUE (LEVEL)`，
+  接著每個 env 值一行 `env.KEY = VALUE (LEVEL)`，顯示方式與 doctor 相同，planned、failed 或 cancelled 的 target 皆然：
+  `vars.port = 8080 (tag:web)`、`env.APP_ENV = prod (host)`。值原樣顯示。
 - [`[[tasks]]`](#執行中的-task) config 在每個 step 上方多一行 `PATH  NAME`。
 - 每個 step 是一行 `would $ RUN`（多行的 `run` 顯示第一行加上 `…`）；
   apply 會在 sudo 的提示輸入某個 secret 的值時，後面再加上 `(sudo password from secret NAME)`。
@@ -1031,7 +1064,9 @@ secret 由 `anvil doctor` 檢查。
 - 顏色與跳脫規則與 apply 相同。
 
 `--json` 是 apply 的文件，最前面加上 `"executed": false`；
-step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`，以及 tasks config 上的 `task` 與 `name`，絕不會有 `code`、`stdout` 或 `stderr`：
+step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`，以及 tasks config 上的 `task` 與 `name`，絕不會有 `code`、`stdout` 或 `stderr`。
+有 vars 或 env 的 target 另有 `vars` 與 `env`，與 doctor 的 `--json` 相同
+（`"vars": {"port": {"value": 8080, "level": "tag:web"}}`），而 step 的 `run` 是照寫的腳本，不含 env 行：
 
 ```json
 {
@@ -1567,7 +1602,8 @@ target 的選法與 apply 相同（`--target`；未指定表示 `local` 加上�
   | 無法讀取的 `FILE`（或 stdin） | `run: cannot read FILE: REASON`（`-` 時為 `stdin`） |
 
 給人看的輸出（含其 `-v` 層級）、`--json` 與結束碼都與 apply 相同：每個 target 一個區塊，腳本是其唯一的 `$` 行
-（有多行時顯示第一行與 `…`），接著是摘要。`--json` 中 step 的 `run` 是原本給的腳本，不含外層包裝。
+（有多行時顯示第一行與 `…`），接著是摘要。`--json` 中 step 的 `run` 是原本給的腳本，不含外層包裝，也不含 target 的 [env](configuration.zh-TW.md#vars-與-env)；
+腳本會在同一個 stdin 上，於其前方以匯出的變數收到 env。
 腳本在每個 target 上都以 0 結束時以 0 結束，任一 target 失敗時為 1，用法錯誤為 2。
 在 Mac 上執行 `printf 'hostname\nuname -s\n' | anvil -vv run --target local -`，stdout 印出：
 

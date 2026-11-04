@@ -205,6 +205,80 @@ tag `local`; defining it is an error, as is a host name equal to a tag. Its pack
 with ``host `linode1`: sudo_secret `VALUE`: must match [A-Z][A-Z0-9_]*``; `local`'s is
 `[packages].local_sudo_secret`.
 
+### Vars and env
+
+The inventory can give every target `vars` and `env` values, at three levels: global, per tag and per host. A step
+reads its target's `env` as environment variables:
+
+```toml
+[vars]                      # global
+port = 80
+ntp = "pool.ntp.org"
+
+[env]                       # global; a step reads $HTTP_PROXY
+HTTP_PROXY = "http://proxy:3128"
+
+[tags.web.vars]             # every host tagged web
+port = 8080
+[tags.web.env]
+APP_ENV = "prod"
+
+[tags.local.vars]           # the local target
+editor = "nvim"
+
+[hosts.web1]
+host = "203.0.113.10"
+tags = ["web"]
+[hosts.web1.vars]           # this host only
+port = 9090
+[hosts.web1.env]
+APP_ENV = "staging"
+```
+
+```toml
+[[steps]]
+run = 'echo "deploying to $APP_ENV"'   # web1: staging; another web host: prod
+```
+
+**`vars` and `env` are not for secrets.** `anvil doctor`, `anvil plan` and their `--json` print every value as is,
+and each `env` value travels in clear inside every step script it is given to. Keep passwords and tokens in the
+[secret store](secrets.md).
+
+- **Precedence.** A target takes global, then each of its tags, then its host's own values. A key
+  set at a later level replaces the whole value: a table or an array is not merged, so `list = [3]` on a tag replaces a
+  global `list = [1, 2]`.
+- **Tag conflicts.** Two tags of one host setting a key to different values, with no value for it on the host, is exit
+  2 before any target starts, with
+  ``host `NAME`: vars.KEY is set by tags `A` and `B` with different values; set it in [hosts.NAME.vars]`` (`env.KEY` and
+  `[hosts.NAME.env]` for env). Equal values are not a conflict, and setting the key on the host resolves one.
+- **`local`.** The local target takes global, then `[tags.local]`; it still has no `[hosts.local]` entry.
+- **Tags.** A `[tags.NAME]` name matches `[A-Za-z0-9_-]+` and is not a host name (exit 2 with
+  ``tag `NAME`: name must match [A-Za-z0-9_-]+`` or ``tag `NAME`: name is a host name``), and holds only `vars` and
+  `env`. A tag no host carries, `local` aside, is a doctor warning ([`anvil doctor`](cli.md#anvil-doctor)).
+- **`vars` values** are strings, integers, booleans, arrays and tables. A float, a TOML datetime or a YAML null is exit 2
+  naming the level and key, such as `vars.ratio: must be a string, integer, boolean, array or table, not a float` or
+  `tags.web.vars.list[1]: ..., not null`. Keys, nested table keys included, match `[A-Za-z_][A-Za-z0-9_]*`
+  (``vars `a-b`: must match [A-Za-z_][A-Za-z0-9_]*``). Limits: 256 keys per level and per table, a value nested at most
+  8 levels deep counting itself, a string at most 64 KiB, an integer within 64 bits. Past one, the exit is 2 with
+  `vars: has more than 256 keys`, `vars.KEY: nests deeper than 8 levels`, `vars.KEY: is longer than 65536 bytes` or
+  `vars.KEY: is outside the 64-bit integer range`. No step reads `vars` yet.
+- **`env` keys** match `[A-Za-z_][A-Za-z0-9_]*`. `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `IFS`, `ENV`,
+  `BASH_ENV`, `CDPATH`, `PS4`, `TMPDIR`, `SHELLOPTS`, `BASHOPTS`, `UID`, `EUID`, `PPID` and `GROUPS`, and any key
+  starting with `ANVIL_`, `LD_`, `DYLD_`, `LC_`, `SUDO_` or `SSH_`, are refused with ``env `PATH`: is reserved``. A
+  value is a string (`env.KEY: must be a string`) with no control character, tab and newline included
+  (`env.KEY: contains a control character`), at most 4 KiB (`env.KEY: is longer than 4096 bytes`), with at most 64
+  keys per level (`env: has more than 64 keys`).
+- **Where `env` goes.** A `[[steps]]` or task `run`, a plugin step and an `anvil run` script start with the target's
+  env as `KEY='value'` and `export KEY` lines, inside the script on the transport's stdin, never on an argv. Values are
+  single-quoted, so quotes, `$`, backticks and backslashes arrive literally. Packages, files and services get no env.
+  The report, plan and `--json` show the script as you wrote it, without these lines.
+- **sudo.** `sudo` resets the environment (`env_reset`), so a command run through it does not see `env`. Pass a value
+  on by name: `sudo APP_ENV="$APP_ENV" cmd`.
+
+Each `vars` and `env` value or key message starts with its level: `vars`, `tags.NAME.vars` or `hosts.NAME.vars`,
+and `env`, `tags.NAME.env` or `hosts.NAME.env`. An inventory without `vars`, `env` or `tags` loads and saves as
+before. The YAML view mirrors the TOML (`vars:`, `env:`, `tags: {web: {vars: …}}` and `vars:` / `env:` under a host).
+
 ## Config
 
 ```toml
