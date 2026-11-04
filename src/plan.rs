@@ -504,6 +504,7 @@ mod tests {
             kind: RunKind::Script,
             task: task.map(str::to_owned),
             name: None,
+            notify: Vec::new(),
         };
         let task = step(Some("tasks[0]"));
         assert_eq!(would_text(&task), "would $ true \\u{202e}x");
@@ -746,6 +747,7 @@ mod tests {
             sudo: true,
             rollback: true,
             template: false,
+            notify: Vec::new(),
         };
         let config = Config {
             files: vec![file("/etc/a.conf", &[]), file("/etc/b.conf", &["web"])],
@@ -787,6 +789,7 @@ mod tests {
             enabled: Some(true),
             tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
             facts: Default::default(),
+            notify: Vec::new(),
         };
         let config = Config {
             packages: Some(Packages {
@@ -847,6 +850,7 @@ mod tests {
                     },
                     task: None,
                     name: None,
+                    notify: Vec::new(),
                 },
                 PlannedRun {
                     run: "one".to_owned().into(),
@@ -861,6 +865,7 @@ mod tests {
                     },
                     task: None,
                     name: None,
+                    notify: Vec::new(),
                 },
                 PlannedRun {
                     run: "two".to_owned().into(),
@@ -875,6 +880,7 @@ mod tests {
                     },
                     task: None,
                     name: None,
+                    notify: Vec::new(),
                 },
             ],
             ok: true,

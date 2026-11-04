@@ -893,6 +893,7 @@ pub fn resolve(
         runs.extend(run.map(|run| PlannedRun {
             task: item.path.clone(),
             name: item.name.clone(),
+            notify: item.notify.clone(),
             ..run
         }));
     }
@@ -946,6 +947,7 @@ fn skip_run(label: String) -> PlannedRun {
         kind: RunKind::Skip,
         task: None,
         name: None,
+        notify: Vec::new(),
     }
 }
 
@@ -985,6 +987,7 @@ fn package_run(
         kind: RunKind::Packages { manager },
         task: None,
         name: None,
+        notify: Vec::new(),
     }))
 }
 
@@ -1032,6 +1035,7 @@ fn step_run(
         },
         task: None,
         name: None,
+        notify: Vec::new(),
     };
     Ok(match step.kind() {
         StepKind::Plugin(name) => {
@@ -1163,6 +1167,7 @@ mod tests {
                 .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
                 .collect(),
             kind,
+            notify: Vec::new(),
         }
     }
 
@@ -1178,6 +1183,36 @@ mod tests {
             plugin: Some(name.to_owned()),
             ..Step::default()
         }
+    }
+
+    #[test]
+    fn resolve_carries_each_items_notify_onto_its_step() {
+        let mut notified = item(ItemKind::Step(Step::script("a")), &[], &[]);
+        notified.notify = vec!["reload sshd".to_owned()];
+        let skipped = Item {
+            notify: vec!["x".to_owned()],
+            ..item(ItemKind::Step(Step::script("b")), &["web"], &[])
+        };
+        let plain = item(ItemKind::Step(Step::script("c")), &[], &[]);
+        let expanded = Expanded {
+            items: vec![notified, skipped, plain],
+            from_tasks: false,
+        };
+        let runs = resolve(
+            &target("a"),
+            None,
+            &Config::default(),
+            &expanded,
+            &Sources::default(),
+            &FakePlugins::none(),
+            &Cancel::new(),
+        )
+        .unwrap();
+        let notify: Vec<&[String]> = runs.iter().map(|run| run.notify.as_slice()).collect();
+        assert_eq!(
+            notify,
+            [&["reload sshd".to_owned()][..], &["x".to_owned()], &[]]
+        );
     }
 
     #[test]

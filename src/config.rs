@@ -40,6 +40,12 @@ pub const MAX_SERVICES: usize = 64;
 /// Longest service name, in bytes: systemd's unit name limit.
 const MAX_SERVICE_NAME_BYTES: usize = 255;
 
+/// Most `[[handlers]]` entries in one config.
+pub const MAX_HANDLERS: usize = 64;
+
+/// Longest handler name, in bytes.
+pub const MAX_HANDLER_NAME_BYTES: usize = 64;
+
 /// Whether this build can use the keychain.
 const MACOS: bool = cfg!(target_os = "macos");
 
@@ -63,6 +69,8 @@ pub struct Config {
     pub path: Option<PathBuf>,
     pub steps: Vec<Step>,
     pub tasks: Vec<Task>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub handlers: Vec<Handler>,
 }
 
 /// [`Config`] as written, so parsing can tell an absent `steps` from a written
@@ -90,6 +98,8 @@ struct RawConfig {
     steps: Option<Vec<Step>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tasks: Vec<Task>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    handlers: Vec<Handler>,
 }
 
 /// A written `steps`, where a YAML null is the empty list a plain `Vec` reads
@@ -144,6 +154,7 @@ impl TryFrom<RawConfig> for Config {
             path: None,
             steps,
             tasks: raw.tasks,
+            handlers: raw.handlers,
         })
     }
 }
@@ -160,6 +171,7 @@ impl From<Config> for RawConfig {
             harden: config.harden,
             steps: config.tasks.is_empty().then_some(config.steps),
             tasks: config.tasks,
+            handlers: config.handlers,
         }
     }
 }
@@ -177,6 +189,7 @@ impl Default for Config {
             path: None,
             steps: vec![Step::script("hostname")],
             tasks: Vec::new(),
+            handlers: Vec::new(),
         }
     }
 }
@@ -376,6 +389,8 @@ pub struct Step {
     pub onlyif: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unless: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<String>,
 }
 
 /// A run or plugin step's guards, checked in this order on the target.
@@ -426,6 +441,8 @@ pub struct Task {
     pub onlyif: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unless: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub packages: Option<TaskPackages>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -479,6 +496,8 @@ pub struct FileEntry {
     /// `vars` and `facts`; `false` copies it byte for byte.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub template: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<String>,
 }
 
 /// By hand, so a field added later must be chosen for `Debug` rather than
@@ -494,6 +513,7 @@ impl std::fmt::Debug for FileEntry {
             .field("sudo", &self.sudo)
             .field("rollback", &self.rollback)
             .field("template", &self.template)
+            .field("notify", &self.notify)
             .finish()
     }
 }
@@ -515,13 +535,25 @@ pub struct ServiceEntry {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub facts: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<String>,
 }
 
-/// The state a `[[services]]` entry asks for.
+/// The state a service entry asks for; `Restarted` and `Reloaded` are
+/// actions, valid only in a `[[handlers]]` service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
     Started,
     Stopped,
+    Restarted,
+    Reloaded,
+}
+
+impl ServiceState {
+    /// Whether this is an action run each time rather than a state reached once.
+    pub fn is_action(self) -> bool {
+        matches!(self, ServiceState::Restarted | ServiceState::Reloaded)
+    }
 }
 
 impl ServiceEntry {
@@ -530,9 +562,31 @@ impl ServiceEntry {
         match self.state.as_deref()? {
             "started" => Some(ServiceState::Started),
             "stopped" => Some(ServiceState::Stopped),
+            "restarted" => Some(ServiceState::Restarted),
+            "reloaded" => Some(ServiceState::Reloaded),
             _ => None,
         }
     }
+}
+
+/// A `[[handlers]]` entry: run once per target after its steps, only when notified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Handler {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<ServiceEntry>,
+}
+
+/// `[A-Za-z0-9 ._-]+`, at most [`MAX_HANDLER_NAME_BYTES`]: the rule for a
+/// `[[handlers]]` name.
+pub(crate) fn is_handler_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_HANDLER_NAME_BYTES
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || " ._-".contains(c))
 }
 
 /// A `[[files]]` mode as written: a quoted string, or the number an unquoted
@@ -634,6 +688,9 @@ mode = "0644"
 [[services]]
 name = "sshd"
 state = "started"
+[[handlers]]
+name = "reload sshd"
+service = { name = "sshd", state = "reloaded" }
 [plugins.NAME]
 path = "/path/to/plugin"
 sha256 = "REPLACE_WITH_SHA256"
@@ -824,6 +881,8 @@ impl Config {
         }
         self.check_plugins(std::env::var_os("HOME").as_deref())
             .map_err(|message| DocumentError::invalid(path, message))?;
+        self.check_handlers()
+            .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_files()
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_services()
@@ -832,7 +891,8 @@ impl Config {
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_steps()
             .map_err(|message| DocumentError::invalid(path, message))?;
-        check_tasks(&self.tasks, "tasks").map_err(|message| DocumentError::invalid(path, message))
+        check_tasks(&self.tasks, "tasks", &self.handlers)
+            .map_err(|message| DocumentError::invalid(path, message))
     }
 
     /// Resolves `[anvil].workspace` against `base`, expanding `~/` using `$HOME`.
@@ -864,7 +924,59 @@ impl Config {
             ));
         }
         for (i, entry) in self.files.iter().enumerate() {
-            check_file(&format!("files[{i}]"), entry)?;
+            let prefix = format!("files[{i}]");
+            check_file(&prefix, entry)?;
+            check_notify(&prefix, &entry.notify, &self.handlers)?;
+        }
+        Ok(())
+    }
+
+    /// The `[[handlers]]` rules: unique valid names and exactly one of `run`
+    /// or an action-capable `service`.
+    fn check_handlers(&self) -> Result<(), String> {
+        if self.handlers.len() > MAX_HANDLERS {
+            return Err(format!(
+                "handlers: {} entries exceeds the {MAX_HANDLERS} entry limit",
+                self.handlers.len()
+            ));
+        }
+        for (i, handler) in self.handlers.iter().enumerate() {
+            let prefix = format!("handlers[{i}]");
+            if !is_handler_name(&handler.name) {
+                return Err(format!(
+                    "{prefix}.name `{}`: must match [A-Za-z0-9 ._-]+, at most \
+                     {MAX_HANDLER_NAME_BYTES} bytes",
+                    secret::shown_name(&handler.name)
+                ));
+            }
+            if let Some(j) = self.handlers[..i]
+                .iter()
+                .position(|other| other.name == handler.name)
+            {
+                return Err(format!(
+                    "{prefix}.name `{}`: same name as handlers[{j}]",
+                    handler.name
+                ));
+            }
+            match (&handler.run, &handler.service) {
+                (Some(_), Some(_)) => {
+                    return Err(format!("{prefix}: has both run and service; keep one"));
+                }
+                (None, None) => return Err(format!("{prefix}: needs run or service")),
+                (Some(run), None) => check_run(&prefix, run)?,
+                (None, Some(service)) => {
+                    let prefix = format!("{prefix}.service");
+                    if !service.tags.is_empty()
+                        || !service.facts.is_empty()
+                        || !service.notify.is_empty()
+                    {
+                        return Err(format!(
+                            "{prefix}: tags, facts and notify do not apply to a handler"
+                        ));
+                    }
+                    check_service(&prefix, service, true)?;
+                }
+            }
         }
         Ok(())
     }
@@ -880,7 +992,9 @@ impl Config {
         }
         let mut seen: Vec<(&str, BTreeSet<&String>, &BTreeMap<String, String>)> = Vec::new();
         for (i, entry) in self.services.iter().enumerate() {
-            check_service(&format!("services[{i}]"), entry)?;
+            let prefix = format!("services[{i}]");
+            check_service(&prefix, entry, false)?;
+            check_notify(&prefix, &entry.notify, &self.handlers)?;
             let key = (
                 entry.name.as_str(),
                 entry.tags.iter().collect(),
@@ -942,7 +1056,9 @@ impl Config {
     /// The `[[steps]]` rules: `run` or `plugin`, and the limits on each.
     fn check_steps(&self) -> Result<(), String> {
         for (i, step) in self.steps.iter().enumerate() {
-            self.check_step(&format!("steps[{i}]"), step)?;
+            let prefix = format!("steps[{i}]");
+            self.check_step(&prefix, step)?;
+            check_notify(&prefix, &step.notify, &self.handlers)?;
         }
         Ok(())
     }
@@ -985,15 +1101,7 @@ impl Config {
             }
         }
         if let Some(run) = &step.run {
-            if run.trim().is_empty() {
-                return Err(format!("{prefix}.run: is empty or blank"));
-            }
-            if run.len() > MAX_RUN_BYTES {
-                return Err(format!(
-                    "{prefix}.run: {} bytes exceeds the {MAX_RUN_BYTES} byte limit",
-                    run.len()
-                ));
-            }
+            check_run(prefix, run)?;
         }
         for (key, path) in [("creates", &step.creates), ("removes", &step.removes)] {
             if let Some(path) = path {
@@ -1097,17 +1205,44 @@ impl Config {
     }
 }
 
-/// An `onlyif` or `unless` command, held to the `run` limits; `key` names it.
-fn check_guard_command(key: &str, command: &str) -> Result<(), String> {
-    if command.trim().is_empty() {
+/// A `run` script's rules; `prefix` names its owner, as `steps[0]`.
+fn check_run(prefix: &str, run: &str) -> Result<(), String> {
+    check_script(&format!("{prefix}.run"), run)
+}
+
+/// A shell script's rules, not blank and within [`MAX_RUN_BYTES`]; `key`
+/// names it.
+fn check_script(key: &str, script: &str) -> Result<(), String> {
+    if script.trim().is_empty() {
         return Err(format!("{key}: is empty or blank"));
     }
-    if command.len() > MAX_RUN_BYTES {
+    if script.len() > MAX_RUN_BYTES {
         return Err(format!(
             "{key}: {} bytes exceeds the {MAX_RUN_BYTES} byte limit",
-            command.len()
+            script.len()
         ));
     }
+    Ok(())
+}
+
+/// Every `notify` name names a `[[handlers]]` entry; `prefix` names the owner.
+fn check_notify(prefix: &str, notify: &[String], handlers: &[Handler]) -> Result<(), String> {
+    match notify
+        .iter()
+        .enumerate()
+        .find(|(_, name)| !handlers.iter().any(|handler| &handler.name == *name))
+    {
+        Some((k, name)) => Err(format!(
+            "{prefix}.notify[{k}] `{}`: names no [[handlers]] entry",
+            secret::shown_name(name)
+        )),
+        None => Ok(()),
+    }
+}
+
+/// An `onlyif` or `unless` command, held to the `run` limits; `key` names it.
+fn check_guard_command(key: &str, command: &str) -> Result<(), String> {
+    check_script(key, command)?;
     if command.contains('\0') {
         return Err(format!("{key}: contains NUL"));
     }
@@ -1175,17 +1310,36 @@ pub(crate) fn check_file(prefix: &str, entry: &FileEntry) -> Result<(), String> 
     check_selector(prefix, &entry.tags, &entry.facts)
 }
 
-/// One service entry's rules; `prefix` names it, as `services[0]`.
-pub(crate) fn check_service(prefix: &str, entry: &ServiceEntry) -> Result<(), String> {
+/// One service entry's rules; `prefix` names it, as `services[0]`. Only a
+/// handler's service (`in_handler`) may ask for `restarted` or `reloaded`.
+pub(crate) fn check_service(
+    prefix: &str,
+    entry: &ServiceEntry,
+    in_handler: bool,
+) -> Result<(), String> {
     check_service_name(&entry.name)
         .map_err(|why| format!("{prefix}.name `{}`: {why}", secret::shown_name(&entry.name)))?;
+    let known = if in_handler {
+        "started, stopped, restarted or reloaded"
+    } else {
+        "started or stopped"
+    };
     match (&entry.state, entry.state()) {
         (None, _) => return Err(format!("{prefix}.state: required")),
         (Some(state), None) => {
             return Err(format!(
-                "{prefix}.state `{}`: must be started or stopped",
+                "{prefix}.state `{}`: must be {known}",
                 secret::shown_name(state)
             ));
+        }
+        (Some(state), Some(parsed)) if parsed.is_action() && !in_handler => {
+            return Err(format!(
+                "{prefix}.state `{state}`: only in a [[handlers]] service; \
+                 it would restart on every apply"
+            ));
+        }
+        (Some(_), Some(parsed)) if parsed.is_action() && entry.enabled.is_some() => {
+            return Err(format!("{prefix}.enabled: not with restarted or reloaded"));
         }
         (Some(_), Some(_)) => {}
     }
@@ -1457,7 +1611,11 @@ fn expand(key: &str, value: &str, home: Option<&OsStr>) -> Result<PathBuf, Strin
 
 /// The rules on one document's tasks, each named by its path under `prefix`;
 /// what a task refers to is checked when it is expanded.
-pub(crate) fn check_tasks(tasks: &[Task], prefix: &str) -> Result<(), String> {
+pub(crate) fn check_tasks(
+    tasks: &[Task],
+    prefix: &str,
+    handlers: &[Handler],
+) -> Result<(), String> {
     for (i, task) in tasks.iter().enumerate() {
         let path = format!("{prefix}[{i}]");
         if task.args.is_some() && task.plugin.is_none() {
@@ -1496,6 +1654,37 @@ pub(crate) fn check_tasks(tasks: &[Task], prefix: &str) -> Result<(), String> {
         {
             return Err(format!("{path}.{key}: only on a run or plugin task"));
         }
+        if !task.notify.is_empty() {
+            if task.packages.is_some() {
+                return Err(format!(
+                    "{path}.notify: not on a packages task; packages give no change signal"
+                ));
+            }
+            if task.include.is_some() || task.tasks.is_some() {
+                return Err(format!(
+                    "{path}.notify: only on a run, plugin, file or service task"
+                ));
+            }
+            check_notify(&path, &task.notify, handlers)?;
+        }
+        if task
+            .file
+            .as_ref()
+            .is_some_and(|file| !file.notify.is_empty())
+        {
+            return Err(format!(
+                "{path}.file: notify belongs on the task, not the file"
+            ));
+        }
+        if task
+            .service
+            .as_ref()
+            .is_some_and(|service| !service.notify.is_empty())
+        {
+            return Err(format!(
+                "{path}.service: notify belongs on the task, not the service"
+            ));
+        }
         if let Some(file) = &task.file
             && (!file.tags.is_empty() || !file.facts.is_empty())
         {
@@ -1519,7 +1708,7 @@ pub(crate) fn check_tasks(tasks: &[Task], prefix: &str) -> Result<(), String> {
             ));
         }
         if let Some(children) = &task.tasks {
-            check_tasks(children, &format!("{path}.tasks"))?;
+            check_tasks(children, &format!("{path}.tasks"), handlers)?;
         }
     }
     Ok(())
@@ -3033,7 +3222,7 @@ facts = { os = "Linux" }
 
     fn validated(text: &str) -> Result<Config, String> {
         let config: Config = document::from_str(text, Format::Toml)?;
-        check_tasks(&config.tasks, "tasks")?;
+        check_tasks(&config.tasks, "tasks", &config.handlers)?;
         Ok(config)
     }
 
@@ -3057,7 +3246,7 @@ facts = { os = "Linux" }
         let children = config.tasks[5].tasks.as_ref().unwrap();
         assert_eq!(children[0].service.as_ref().unwrap().name, "nginx");
         config.validate(Path::new("config.toml")).unwrap();
-        check_tasks(&config.tasks, "tasks").unwrap();
+        check_tasks(&config.tasks, "tasks", &config.handlers).unwrap();
     }
 
     #[test]
@@ -3244,7 +3433,7 @@ facts = { os = "Linux" }
     #[test]
     fn a_yaml_null_nested_tasks_is_no_kind() {
         let err = document::from_str::<Config>("tasks:\n  - tasks:\n", Format::Yaml)
-            .and_then(|config| check_tasks(&config.tasks, "tasks"))
+            .and_then(|config| check_tasks(&config.tasks, "tasks", &config.handlers))
             .unwrap_err();
         assert!(err.starts_with("tasks[0]: needs one of"), "{err}");
     }
@@ -3294,7 +3483,7 @@ removes = "/tmp/stale"
         let yaml = "tasks:\n  - run: a\n    creates: /a\n    removes: /b\n    onlyif: c\n    unless: d\n  \
                     - plugin: harden\n    args: { level: 2 }\n    unless: e\n";
         let config: Config = document::from_str(yaml, Format::Yaml).unwrap();
-        check_tasks(&config.tasks, "tasks").unwrap();
+        check_tasks(&config.tasks, "tasks", &config.handlers).unwrap();
         assert_eq!(config.tasks[0].creates.as_deref(), Some("/a"));
         assert_eq!(config.tasks[0].removes.as_deref(), Some("/b"));
         assert_eq!(config.tasks[0].onlyif.as_deref(), Some("c"));
@@ -3515,6 +3704,361 @@ removes = "/tmp/stale"
             assert!(text.contains("updates.auto"), "{text}");
         }
     }
+
+    const HANDLERS: &str = "[[handlers]]\nname = \"reload sshd\"\nservice = { name = \"sshd\", state = \"reloaded\" }\n\n\
+                            [[handlers]]\nname = \"rebuild-cache_1.0\"\nrun = \"fc-cache\"\n";
+
+    /// The checks [`Config::validate`] runs on handlers and notify, without the backend.
+    fn checked(text: &str) -> Result<Config, String> {
+        let config: Config = document::from_str(text, Format::Toml)?;
+        config.check_handlers()?;
+        config.check_files()?;
+        config.check_services()?;
+        config.check_steps()?;
+        check_tasks(&config.tasks, "tasks", &config.handlers)?;
+        Ok(config)
+    }
+
+    fn assert_round_trips(config: &Config) {
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(config, format).unwrap();
+            let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(&back, config, "{text}");
+        }
+    }
+
+    #[test]
+    fn handlers_and_notify_load_and_round_trip_with_legacy_sections() {
+        let config = checked(&format!(
+            "[[files]]\nsrc = \"a\"\ndest = \"/etc/ssh/sshd_config\"\nmode = \"0600\"\n\
+             notify = [\"reload sshd\", \"rebuild-cache_1.0\", \"reload sshd\"]\n\n\
+             [[services]]\nname = \"cron\"\nstate = \"started\"\nnotify = [\"reload sshd\"]\n\n\
+             [[steps]]\nrun = \"make\"\nnotify = [\"rebuild-cache_1.0\"]\n\n{HANDLERS}"
+        ))
+        .unwrap();
+        assert_eq!(config.handlers.len(), 2);
+        assert_eq!(config.handlers[0].name, "reload sshd");
+        let service = config.handlers[0].service.as_ref().unwrap();
+        assert_eq!(service.state(), Some(ServiceState::Reloaded));
+        assert_eq!(config.handlers[1].run.as_deref(), Some("fc-cache"));
+        assert_eq!(config.files[0].notify.len(), 3);
+        assert_eq!(config.services[0].notify, ["reload sshd"]);
+        assert_eq!(config.steps[0].notify, ["rebuild-cache_1.0"]);
+        assert!(format!("{:?}", config.files[0]).contains("notify"));
+        assert_round_trips(&config);
+        let yaml = "handlers:\n  - name: r\n    service: { name: sshd, state: restarted }\n\
+                    steps:\n  - run: a\n    notify: [r]\n";
+        let config: Config = document::from_str(yaml, Format::Yaml).unwrap();
+        config.check_handlers().unwrap();
+        config.check_steps().unwrap();
+        assert_eq!(config.steps[0].notify, ["r"]);
+        assert_round_trips(&config);
+    }
+
+    #[test]
+    fn handlers_and_notify_load_and_round_trip_with_tasks() {
+        let config = checked(&format!(
+            "[[tasks]]\nrun = \"a\"\nnotify = [\"reload sshd\"]\n\n\
+             [[tasks]]\nplugin = \"p\"\nnotify = [\"rebuild-cache_1.0\"]\n\n\
+             [[tasks]]\nfile = {{ src = \"a\", dest = \"/a\", mode = \"0644\" }}\nnotify = [\"reload sshd\"]\n\n\
+             [[tasks]]\nservice = {{ name = \"cron\", state = \"stopped\" }}\nnotify = [\"reload sshd\"]\n\n\
+             [[tasks]]\n[[tasks.tasks]]\nrun = \"b\"\nnotify = [\"rebuild-cache_1.0\"]\n\n{HANDLERS}"
+        ))
+        .unwrap();
+        assert_eq!(config.handlers.len(), 2);
+        assert_eq!(config.tasks[2].notify, ["reload sshd"]);
+        assert_round_trips(&config);
+    }
+
+    #[test]
+    fn a_config_without_handlers_or_notify_serializes_as_before() {
+        for text in [
+            "[[steps]]\nrun = \"a\"\n",
+            "[[services]]\nname = \"a\"\nstate = \"started\"\n\n[[steps]]\nrun = \"a\"\n",
+            "[[tasks]]\nservice = { name = \"a\", state = \"stopped\" }\n",
+        ] {
+            let config = parse(text);
+            assert_eq!(config.handlers, []);
+            let toml = document::to_string(&config, Format::Toml).unwrap();
+            assert_eq!(
+                toml,
+                document::to_string(&parse(&toml), Format::Toml).unwrap()
+            );
+            for format in [Format::Toml, Format::Yaml] {
+                let shown = document::to_string(&config, format).unwrap();
+                assert!(!shown.contains("notify"), "{shown}");
+                assert!(!shown.contains("handlers"), "{shown}");
+            }
+        }
+        assert_eq!(
+            document::to_string(&parse("[[steps]]\nrun = \"a\"\n"), Format::Toml).unwrap(),
+            "[anvil]\nformat = \"toml\"\n\n[[steps]]\nrun = \"a\"\n"
+        );
+    }
+
+    fn handler_refusal(handler: &str) -> String {
+        checked(&format!("[[handlers]]\n{handler}\n")).unwrap_err()
+    }
+
+    #[test]
+    fn handler_names_follow_the_rule_and_are_unique() {
+        let long = "a".repeat(MAX_HANDLER_NAME_BYTES + 1);
+        for name in ["", "a/b", "tab\\there", long.as_str(), "naïve"] {
+            let toml_name = name.replace('\t', "\\t");
+            let shown = secret::shown_name(&name.replace("\\t", "\t"));
+            assert_eq!(
+                handler_refusal(&format!("name = \"{toml_name}\"\nrun = \"a\"")),
+                format!(
+                    "handlers[0].name `{shown}`: must match [A-Za-z0-9 ._-]+, at most 64 bytes"
+                ),
+                "{name}"
+            );
+        }
+        let fits = format!("A z.{}", "_-9".repeat(20));
+        assert_eq!(fits.len(), MAX_HANDLER_NAME_BYTES);
+        checked(&format!("[[handlers]]\nname = \"{fits}\"\nrun = \"a\"\n")).unwrap();
+        assert_eq!(
+            checked(
+                "[[handlers]]\nname = \"a\"\nrun = \"x\"\n\n[[handlers]]\nname = \"b\"\nrun = \"x\"\n\n\
+                 [[handlers]]\nname = \"a\"\nrun = \"y\"\n"
+            )
+            .unwrap_err(),
+            "handlers[2].name `a`: same name as handlers[0]"
+        );
+        assert!(is_handler_name("reload sshd") && !is_handler_name(""));
+    }
+
+    #[test]
+    fn at_most_64_handlers() {
+        let handlers = |n: usize| {
+            (0..n)
+                .map(|i| format!("[[handlers]]\nname = \"h{i}\"\nrun = \"a\"\n"))
+                .collect::<String>()
+        };
+        checked(&handlers(MAX_HANDLERS)).unwrap();
+        assert_eq!(
+            checked(&handlers(MAX_HANDLERS + 1)).unwrap_err(),
+            "handlers: 65 entries exceeds the 64 entry limit"
+        );
+    }
+
+    #[test]
+    fn a_handler_needs_exactly_one_of_run_or_service_held_to_their_rules() {
+        assert_eq!(
+            handler_refusal("name = \"h\""),
+            "handlers[0]: needs run or service"
+        );
+        assert_eq!(
+            handler_refusal(
+                "name = \"h\"\nrun = \"a\"\nservice = { name = \"x\", state = \"reloaded\" }"
+            ),
+            "handlers[0]: has both run and service; keep one"
+        );
+        assert_eq!(
+            handler_refusal("name = \"h\"\nrun = \" \""),
+            "handlers[0].run: is empty or blank"
+        );
+        let over = "x".repeat(MAX_RUN_BYTES + 1);
+        assert_eq!(
+            handler_refusal(&format!("name = \"h\"\nrun = \"{over}\"")),
+            "handlers[0].run: 4097 bytes exceeds the 4096 byte limit"
+        );
+        let service =
+            |keys: &str| handler_refusal(&format!("name = \"h\"\nservice = {{ {keys} }}"));
+        assert_eq!(
+            service("name = \"-x\", state = \"reloaded\""),
+            "handlers[0].service.name `-x`: must not start with - or ."
+        );
+        assert_eq!(
+            service("name = \"x\""),
+            "handlers[0].service.state: required"
+        );
+        assert_eq!(
+            service("name = \"x\", state = \"bounced\""),
+            "handlers[0].service.state `bounced`: must be started, stopped, restarted or reloaded"
+        );
+        for state in ["restarted", "reloaded"] {
+            assert_eq!(
+                service(&format!(
+                    "name = \"x\", state = \"{state}\", enabled = true"
+                )),
+                "handlers[0].service.enabled: not with restarted or reloaded"
+            );
+        }
+        for keys in [
+            "tags = [\"web\"]",
+            "facts = { os = \"Linux\" }",
+            "notify = [\"h\"]",
+        ] {
+            assert_eq!(
+                service(&format!("name = \"x\", state = \"reloaded\", {keys}")),
+                "handlers[0].service: tags, facts and notify do not apply to a handler"
+            );
+        }
+        for state in ["started", "stopped", "restarted", "reloaded"] {
+            checked(&format!(
+                "[[handlers]]\nname = \"h\"\nservice = {{ name = \"x\", state = \"{state}\" }}\n"
+            ))
+            .unwrap();
+        }
+        checked(
+            "[[handlers]]\nname = \"h\"\nservice = { name = \"x\", state = \"started\", enabled = true }\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn selectors_notify_guards_and_other_kinds_on_a_handler_are_unknown_fields() {
+        for key in [
+            "tags = [\"web\"]",
+            "facts = { os = \"Linux\" }",
+            "notify = [\"h\"]",
+            "creates = \"/a\"",
+            "removes = \"/a\"",
+            "onlyif = \"a\"",
+            "unless = \"a\"",
+            "plugin = \"p\"",
+            "args = { a = 1 }",
+            "file = { src = \"a\", dest = \"/a\", mode = \"0644\" }",
+            "packages = { install = [\"git\"] }",
+            "include = \"$/a.toml\"",
+            "tasks = []",
+        ] {
+            let err = document::from_str::<Config>(
+                &format!("[[handlers]]\nname = \"h\"\nrun = \"a\"\n{key}\n"),
+                Format::Toml,
+            )
+            .unwrap_err();
+            assert!(err.contains("unknown field"), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn service_actions_are_refused_outside_a_handler() {
+        for state in ["restarted", "reloaded"] {
+            assert_eq!(
+                service_entry(&format!("name = \"sshd\"\nstate = \"{state}\""))
+                    .check_services()
+                    .unwrap_err(),
+                format!(
+                    "services[0].state `{state}`: only in a [[handlers]] service; \
+                     it would restart on every apply"
+                )
+            );
+        }
+        assert_eq!(
+            service_entry("name = \"sshd\"\nstate = \"bounced\"")
+                .check_services()
+                .unwrap_err(),
+            "services[0].state `bounced`: must be started or stopped"
+        );
+        let entry = |state: &str| ServiceEntry {
+            name: "x".into(),
+            state: Some(state.into()),
+            enabled: None,
+            tags: Vec::new(),
+            facts: BTreeMap::new(),
+            notify: Vec::new(),
+        };
+        for (state, parsed, action) in [
+            ("started", ServiceState::Started, false),
+            ("stopped", ServiceState::Stopped, false),
+            ("restarted", ServiceState::Restarted, true),
+            ("reloaded", ServiceState::Reloaded, true),
+        ] {
+            assert_eq!(entry(state).state(), Some(parsed));
+            assert_eq!(parsed.is_action(), action);
+            assert_eq!(check_service("s", &entry(state), true), Ok(()));
+            assert_eq!(check_service("s", &entry(state), false).is_ok(), !action);
+        }
+    }
+
+    #[test]
+    fn unknown_notify_names_are_refused_in_every_legacy_section() {
+        for (section, entry) in [
+            ("files", "src = \"a\"\ndest = \"/a\"\nmode = \"0644\""),
+            ("services", "name = \"x\"\nstate = \"started\""),
+            ("steps", "run = \"a\""),
+        ] {
+            assert_eq!(
+                checked(&format!(
+                    "[[{section}]]\n{entry}\nnotify = [\"reload sshd\", \"gone\\u001b\"]\n\n{HANDLERS}"
+                ))
+                .unwrap_err(),
+                format!(
+                    "{section}[0].notify[1] `{}`: names no [[handlers]] entry",
+                    secret::shown_name("gone\u{1b}")
+                )
+            );
+            assert_eq!(
+                checked(&format!("[[{section}]]\n{entry}\nnotify = [\"h\"]\n")).unwrap_err(),
+                format!("{section}[0].notify[0] `h`: names no [[handlers]] entry")
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_notify_names_are_refused_on_every_notifying_task_kind() {
+        for kind in [
+            "run = \"a\"",
+            "plugin = \"p\"",
+            "file = { src = \"a\", dest = \"/a\", mode = \"0644\" }",
+            "service = { name = \"x\", state = \"started\" }",
+        ] {
+            assert_eq!(
+                checked(&format!(
+                    "[[tasks]]\n{kind}\nnotify = [\"rebuild-cache_1.0\", \"nope\"]\n\n{HANDLERS}"
+                ))
+                .unwrap_err(),
+                "tasks[0].notify[1] `nope`: names no [[handlers]] entry",
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            checked("[[tasks]]\n[[tasks.tasks]]\nrun = \"a\"\nnotify = [\"x\"]\n").unwrap_err(),
+            "tasks[0].tasks[0].notify[0] `x`: names no [[handlers]] entry"
+        );
+    }
+
+    #[test]
+    fn notify_on_packages_include_tasks_or_the_inner_table_is_refused() {
+        let refused =
+            |task: &str| checked(&format!("[[tasks]]\n{task}\n\n{HANDLERS}")).unwrap_err();
+        assert_eq!(
+            refused("packages = { install = [\"git\"] }\nnotify = [\"reload sshd\"]"),
+            "tasks[0].notify: not on a packages task; packages give no change signal"
+        );
+        for kind in ["include = \"$/a.toml\"", "tasks = []"] {
+            assert_eq!(
+                refused(&format!("{kind}\nnotify = [\"reload sshd\"]")),
+                "tasks[0].notify: only on a run, plugin, file or service task"
+            );
+        }
+        assert_eq!(
+            refused(
+                "file = { src = \"a\", dest = \"/a\", mode = \"0644\", notify = [\"reload sshd\"] }"
+            ),
+            "tasks[0].file: notify belongs on the task, not the file"
+        );
+        assert_eq!(
+            refused("service = { name = \"x\", state = \"started\", notify = [\"reload sshd\"] }"),
+            "tasks[0].service: notify belongs on the task, not the service"
+        );
+        let err = document::from_str::<Config>(
+            "[packages]\ninstall = [\"git\"]\nnotify = [\"h\"]\n",
+            Format::Toml,
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn handlers_go_with_legacy_sections_and_tasks_alike() {
+        checked(&format!("[[steps]]\nrun = \"a\"\n\n{HANDLERS}")).unwrap();
+        let config = checked(&format!("[[tasks]]\nrun = \"a\"\n\n{HANDLERS}")).unwrap();
+        assert_eq!(config.steps, []);
+        assert_eq!(config.handlers.len(), 2);
+    }
 }
 
 #[cfg(test)]
@@ -3676,6 +4220,7 @@ mod full_tests {
             "[harden]\nskip = []",
             "# [secrets]",
             "# [[services]]",
+            "# [[handlers]]",
             "# editor =",
         ] {
             assert!(view.contains(expected), "missing {expected}: {view}");
@@ -3688,6 +4233,7 @@ mod full_tests {
             "# secrets:",
             "# files:",
             "# services:",
+            "# handlers:",
             "# plugins:",
             "  # editor:",
             "harden:\n  skip: []",

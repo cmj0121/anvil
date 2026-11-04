@@ -180,6 +180,7 @@ fn service_run(
         },
         task: None,
         name: None,
+        notify: Vec::new(),
     }
 }
 
@@ -201,6 +202,12 @@ pub fn script(
     plists: &str,
 ) -> String {
     debug_assert!(check_service_name(name).is_ok(), "{name}");
+    if state.is_action() {
+        let refusal = fail(&format!(
+            "services: {name}: restarted and reloaded are not supported yet"
+        ));
+        return format!("{{ {refusal}\n}}\n");
+    }
     if init == Init::Launchd && state == ServiceState::Started && enabled == Some(false) {
         let refusal = fail(&format!(
             "services: {name}: started with enabled = false cannot last on launchd"
@@ -245,6 +252,7 @@ fn lines(name: &str, state: ServiceState, enabled: Option<bool>) -> (String, Str
     let state = match state {
         ServiceState::Started => "started",
         ServiceState::Stopped => "stopped",
+        ServiceState::Restarted | ServiceState::Reloaded => unreachable!("script refuses actions"),
     };
     (
         format!("{enablement} service {name}"),
@@ -257,6 +265,7 @@ fn state_differs(state: ServiceState) -> &'static str {
     match state {
         ServiceState::Started => "[ -n \"$up\" ] || s=1\n",
         ServiceState::Stopped => "[ -z \"$up\" ] || s=1\n",
+        ServiceState::Restarted | ServiceState::Reloaded => unreachable!("script refuses actions"),
     }
 }
 
@@ -325,6 +334,7 @@ fn systemd(name: &str, state: ServiceState, enabled: Option<bool>, sudo: &str) -
     let verb = match state {
         ServiceState::Started => "start",
         ServiceState::Stopped => "stop",
+        ServiceState::Restarted | ServiceState::Reloaded => unreachable!("script refuses actions"),
     };
     let verb_of = |on: bool| if on { "enable" } else { "disable" };
     let enablement = enabled.map(|on| {
@@ -386,6 +396,7 @@ fn openrc(name: &str, state: ServiceState, enabled: Option<bool>, sudo: &str) ->
             rc("start")
         ),
         ServiceState::Stopped => rc("stop"),
+        ServiceState::Restarted | ServiceState::Reloaded => unreachable!("script refuses actions"),
     };
     let enablement = enabled.map(|on| {
         let verb = if on { "add" } else { "del" };
@@ -464,6 +475,7 @@ fn launchd(
                 )
             );
         }
+        ServiceState::Restarted | ServiceState::Reloaded => unreachable!("script refuses actions"),
     }
     s
 }
@@ -1024,6 +1036,27 @@ mod tests {
                         assert_eq!(stubs.has("off"), enabled.map_or(off, |on| !on));
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn actions_are_refused_before_any_command_until_they_have_scripts() {
+        let stubs = Stubs::new("svc-actions");
+        let plists = stubs.plists();
+        for init in [Init::Systemd, Init::OpenRc, Init::Launchd] {
+            for (state, word) in [
+                (ServiceState::Restarted, "restarted"),
+                (ServiceState::Reloaded, "reloaded"),
+            ] {
+                let (code, out, err, log) =
+                    stubs.run(&script(init, AGENT, state, None, "", &plists));
+                assert_eq!((code, out.as_str()), (Some(1), ""), "{init} {word}");
+                assert_eq!(
+                    err,
+                    format!("services: {AGENT}: restarted and reloaded are not supported yet\n")
+                );
+                assert_eq!(log, Vec::<String>::new());
             }
         }
     }

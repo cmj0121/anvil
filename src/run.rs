@@ -65,6 +65,7 @@ fn script_run(target: &Target, script: &str, timeout: Duration) -> PlannedRun {
         kind: RunKind::Script,
         task: None,
         name: None,
+        notify: Vec::new(),
     }
 }
 

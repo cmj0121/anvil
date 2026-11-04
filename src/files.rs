@@ -539,6 +539,7 @@ fn file_run(
         },
         task: None,
         name: None,
+        notify: Vec::new(),
     }
 }
 
@@ -1678,6 +1679,7 @@ mod tests {
             sudo: true,
             rollback: true,
             template: false,
+            notify: Vec::new(),
         }
     }
 

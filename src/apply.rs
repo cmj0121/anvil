@@ -1812,6 +1812,7 @@ mod tests {
             kind: RunKind::Script,
             task: None,
             name: None,
+            notify: Vec::new(),
         }
     }
 
@@ -1933,6 +1934,7 @@ mod tests {
             },
             task: None,
             name: None,
+            notify: Vec::new(),
         }
     }
 
@@ -2343,6 +2345,7 @@ mod tests {
             sudo,
             rollback: true,
             template: false,
+            notify: Vec::new(),
         }
     }
 
@@ -2867,6 +2870,7 @@ mod tests {
             enabled,
             tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
             facts: BTreeMap::new(),
+            notify: Vec::new(),
         }
     }
 

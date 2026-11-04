@@ -29,6 +29,8 @@ pub struct PlannedRun {
     pub task: Option<String>,
     /// That task's `name`, if it has one.
     pub name: Option<String>,
+    /// The handlers this step notifies when it changes something.
+    pub notify: Vec<String>,
 }
 
 /// What a run does.
@@ -282,6 +284,7 @@ mod tests {
             kind: RunKind::Script,
             task: task.map(str::to_owned),
             name: name.map(str::to_owned),
+            notify: Vec::new(),
         }
     }
 

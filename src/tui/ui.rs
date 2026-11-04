@@ -1579,6 +1579,7 @@ mod tests {
             sudo: false,
             rollback: true,
             template: false,
+            notify: Vec::new(),
         };
         let config = Config {
             packages: Some(Packages {
@@ -1643,6 +1644,7 @@ mod tests {
             enabled: None,
             tags: vec![tag.to_owned()],
             facts: Default::default(),
+            notify: Vec::new(),
         };
         let config = Config {
             files: vec![FileEntry {
@@ -1654,6 +1656,7 @@ mod tests {
                 sudo: false,
                 rollback: true,
                 template: false,
+                notify: Vec::new(),
             }],
             services: vec![service("sshd", "local"), service("cron", "web")],
             steps: vec![Step::script("hostname")],
@@ -2579,6 +2582,7 @@ mod tests {
                 kind: anvil::step::RunKind::Script,
                 task: Some("tasks[0]".to_owned()),
                 name: None,
+                notify: Vec::new(),
             }],
             ok: true,
         });
@@ -2622,6 +2626,7 @@ mod tests {
             },
             task: None,
             name: None,
+            notify: Vec::new(),
         };
         let rendered = Rendered {
             text: "rendered-bytes".to_owned().into(),
@@ -2731,6 +2736,7 @@ mod tests {
                         kind: anvil::step::RunKind::Script,
                         task: Some("tasks[0]".to_owned()),
                         name: Some("First\u{2066}".to_owned()),
+                        notify: Vec::new(),
                     }],
                     ok: true,
                 }]),
@@ -2769,6 +2775,7 @@ mod tests {
                                 kind: anvil::step::RunKind::Script,
                                 task: None,
                                 name: None,
+                                notify: Vec::new(),
                             },
                             PlannedRun {
                                 run: "hostname".to_owned().into(),
@@ -2778,6 +2785,7 @@ mod tests {
                                 kind: anvil::step::RunKind::Script,
                                 task: None,
                                 name: None,
+                                notify: Vec::new(),
                             },
                         ],
                         ok: true,

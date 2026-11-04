@@ -1010,6 +1010,7 @@ mod tests {
             sudo,
             rollback: true,
             template: false,
+            notify: Vec::new(),
         }
     }
 
