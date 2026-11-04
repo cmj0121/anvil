@@ -604,6 +604,7 @@ mod tests {
             facts: Default::default(),
             sudo: true,
             rollback: true,
+            template: false,
         };
         let config = Config {
             files: vec![file("/etc/a.conf", &[]), file("/etc/b.conf", &["web"])],

@@ -160,6 +160,39 @@ fn a_changed_fact_and_file_are_drift_until_a_re_apply() {
 }
 
 #[test]
+fn a_templated_file_is_clean_after_apply_and_drift_after_a_change() {
+    let (sandbox, dest) = applied();
+    sandbox.write_config("inventory.toml", "[vars]\nname = \"rendered\"\n");
+    fs::write(
+        sandbox.config_dir().join("app.conf"),
+        "name = {{ vars.name }} on {{ facts.os }}\n",
+    )
+    .unwrap();
+    let config = fs::read_to_string(sandbox.config_dir().join("config.toml")).unwrap();
+    sandbox.write_config("config.toml", &format!("{config}template = true\n"));
+    apply(&sandbox);
+    assert!(
+        fs::read_to_string(&dest)
+            .unwrap()
+            .starts_with("name = rendered on ")
+    );
+    let (code, value) = doctor(&sandbox);
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(
+        value["targets"][0]["plugins"],
+        json!([{"plugin": "audit", "ok": true}])
+    );
+    fs::write(&dest, "edited by hand\n").unwrap();
+    let (code, value) = doctor(&sandbox);
+    assert_eq!(code, Some(1), "{value}");
+    assert_eq!(
+        value["targets"][0]["plugins"][0]["findings"],
+        json!([{"target": "local", "item": dest, "was": "written", "now": "changed",
+                "severity": "drift", "text": null}])
+    );
+}
+
+#[test]
 fn a_removed_file_is_absent_and_a_rolled_back_one_is_not_compared() {
     let (sandbox, dest) = applied();
     fs::remove_file(&dest).unwrap();

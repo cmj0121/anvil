@@ -1036,3 +1036,55 @@ fn a_rollback_ended_by_sigterm_exits_143_and_names_why() {
         "beta is still to roll back"
     );
 }
+
+#[test]
+fn a_templated_file_records_its_rendered_hash_and_rolls_back_per_target() {
+    let sandbox = Sandbox::new("rb");
+    sandbox.write_config(
+        "inventory.toml",
+        "[tags.local.vars]\nname = \"local\"\n\n\
+         [hosts.fake]\nhost = \"fakehost\"\ntags = [\"web\"]\n[hosts.fake.vars]\nname = \"fake\"\n",
+    );
+    std::fs::create_dir(sandbox.root().join("out")).unwrap();
+    std::fs::write(
+        sandbox.config_dir().join("site.j2"),
+        "name = {{ vars.name }} on {{ facts.os }}\n",
+    )
+    .unwrap();
+    let dest = |name: &str| sandbox.root().join("out").join(name).display().to_string();
+    let (web, local) = (dest("web.conf"), dest("local.conf"));
+    std::fs::write(&local, PREVIOUS).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let entry = |dest: &str, tag: &str| {
+        format!(
+            "[[files]]\nsrc = \"site.j2\"\ndest = \"{dest}\"\nmode = \"0640\"\n\
+             tags = [\"{tag}\"]\nsudo = false\ntemplate = true\n\n"
+        )
+    };
+    sandbox.write_config(
+        "config.toml",
+        &format!("{}{}", entry(&web, "web"), entry(&local, "local")),
+    );
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let os = std::fs::read_to_string(&local).unwrap();
+    let os = os.strip_prefix("name = local on ").unwrap().to_owned();
+    assert_eq!(
+        std::fs::read_to_string(&web).unwrap(),
+        format!("name = fake on {os}")
+    );
+    let record = sandbox.last_apply().unwrap();
+    for (name, dest) in [("local", &local), ("fake", &web)] {
+        assert_eq!(
+            record["targets"][name]["files"][0]["written_sha256"],
+            common::sha256_hex(std::fs::read(dest).unwrap()),
+            "{name}"
+        );
+    }
+
+    let out = sandbox.anvil(&["rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), PREVIOUS);
+    assert_eq!(mode(&local), 0o644);
+    assert!(!Path::new(&web).exists());
+}

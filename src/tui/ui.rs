@@ -1574,6 +1574,7 @@ mod tests {
             facts: Default::default(),
             sudo: false,
             rollback: true,
+            template: false,
         };
         let config = Config {
             packages: Some(Packages {
@@ -1647,6 +1648,7 @@ mod tests {
                 facts: Default::default(),
                 sudo: false,
                 rollback: true,
+                template: false,
             }],
             services: vec![service("sshd", "local"), service("cron", "web")],
             steps: vec![Step::script("hostname")],

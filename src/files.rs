@@ -41,6 +41,7 @@ pub(crate) use crate::remote::{REFUSED, quote};
 use crate::secret;
 use crate::step::{FileRun, PlannedRun, RunKind, Upload};
 use crate::tasks::{Expanded, Item};
+use crate::template;
 use crate::transport::RUN_TIMEOUT;
 use crate::trust::{self, TrustError};
 
@@ -101,7 +102,13 @@ pub fn load(
                 .map_err(|err| Failure::usage(err.clone()))
                 .and_then(|dir| read_src(dir, &entry.src))
         };
-        text.map(|text| Source { text }).map_err(|err| Failure {
+        text.and_then(|text| {
+            if entry.template {
+                template::check(&text).map_err(|why| Failure::usage(format!("template: {why}")))?;
+            }
+            Ok(Source { text })
+        })
+        .map_err(|err| Failure {
             message: src_message(item, i, &entry.src, &err.message),
             ..err
         })
@@ -230,6 +237,7 @@ pub fn run(
             secret::shown_name(mode)
         ));
     }
+    let rendered = render_entry(item, entry, &label, sources, i, target, facts)?;
     let secret =
         sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
     let write = match secret {
@@ -246,6 +254,7 @@ pub fn run(
                 checks: root_checks("sudo ", dest),
                 as_root: true,
                 password: true,
+                rendered,
             }
         }
         None => {
@@ -265,6 +274,7 @@ pub fn run(
                 checks,
                 as_root,
                 password: false,
+                rendered,
             }
         }
     };
@@ -280,6 +290,58 @@ pub fn run(
             write: Some(write),
         },
     ))
+}
+
+/// `target`'s render of the templated `entry`, or `None` when it is not
+/// templated. The error names the entry, line and variable, never a value.
+fn render_entry(
+    item: &Item,
+    entry: &FileEntry,
+    label: &str,
+    sources: &Sources,
+    i: usize,
+    target: &Target,
+    facts: &Facts,
+) -> Result<Option<Box<Rendered>>, String> {
+    if !entry.template {
+        return Ok(None);
+    }
+    let Some(Source { text }) = sources.0.get(i) else {
+        return Err(format!("files[{i}]: src was not loaded"));
+    };
+    let rendered = template::render(text, &target.vars, facts).and_then(|text| {
+        if text.contains('\0') {
+            return Err("rendered output contains a NUL byte".to_owned());
+        }
+        let sha256 = hex(&Sha256::digest(text.as_bytes()));
+        Ok(Box::new(Rendered { text, sha256 }))
+    });
+    rendered.map(Some).map_err(|why| {
+        log::info!("{}: {label}: template failed", target.name);
+        item.shown_message(format!(
+            "{label}.src `{}`: template: {why}",
+            secret::shown_name(&entry.src)
+        ))
+    })
+}
+
+/// One target's rendered text of a templated entry, and its sha256 in hex.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Rendered {
+    pub text: Zeroizing<String>,
+    pub sha256: String,
+}
+
+/// By hand: the length and hash, never the text.
+impl fmt::Debug for Rendered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Rendered(<{} bytes>, sha256 {})",
+            self.text.len(),
+            self.sha256
+        )
+    }
 }
 
 /// How one `[[files]]` entry is written on one target, so that the write
@@ -300,9 +362,25 @@ pub struct FileWrite {
     /// Whether the bytes are staged in a temp file and installed by a
     /// terminal run that types the sudo password.
     pub password: bool,
+    /// The target's rendered text when the entry has `template = true`;
+    /// `None` writes the src from [`Sources`] as is.
+    pub rendered: Option<Box<Rendered>>,
 }
 
 impl FileWrite {
+    /// The bytes this write puts at DEST: `rendered`, else the src.
+    /// The only place a write reads its bytes.
+    pub(crate) fn text<'a>(&'a self, sources: &'a Sources) -> Result<&'a str, String> {
+        match &self.rendered {
+            Some(rendered) => Ok(rendered.text.as_str()),
+            None => sources
+                .0
+                .get(self.ordinal)
+                .map(|source| source.text.as_str())
+                .ok_or_else(|| format!("files[{}]: src was not loaded", self.ordinal)),
+        }
+    }
+
     /// The run before the write that reports what DEST holds.
     pub(crate) fn capture(&self) -> String {
         capture_script(&self.dest, &self.sudo, &self.checks)
@@ -323,7 +401,7 @@ impl FileWrite {
         let entry = expanded
             .file(self.ordinal)
             .expect("a write comes from the list it is recorded against");
-        let written = sources.0.get(self.ordinal).map_or("", |s| s.text.as_str());
+        let written = self.text(sources).unwrap_or("");
         let previous = match captured {
             Captured::Absent => Previous::Absent,
             Captured::File {
@@ -377,7 +455,8 @@ pub(crate) enum Expected {
     Sha256(String),
 }
 
-/// The write script of `step` from its src in `sources`, refusing to write
+/// The write script of `step` from its bytes ([`FileWrite::text`]: the rendered
+/// text of a templated entry, else its src in `sources`), refusing to write
 /// when DEST no longer holds what `expected` says; with the password path's
 /// stage and cleanup around it, under a fresh temp name.
 pub(crate) fn write_script(
@@ -386,9 +465,7 @@ pub(crate) fn write_script(
     expected: &Expected,
 ) -> Result<(Zeroizing<String>, Option<Upload>), String> {
     let i = step.ordinal;
-    let Some(Source { text }) = sources.0.get(i) else {
-        return Err(format!("files[{i}]: src was not loaded"));
-    };
+    let text = step.text(sources)?;
     let heredoc = Heredoc::new(text).map_err(|why| format!("files[{i}].src: {why}"))?;
     let (dest, mode) = (step.dest.as_str(), step.mode.as_str());
     if !step.password {
@@ -1600,6 +1677,7 @@ mod tests {
             facts: BTreeMap::new(),
             sudo: true,
             rollback: true,
+            template: false,
         }
     }
 
@@ -5878,5 +5956,192 @@ mod tests {
         }
         assert!(parse_hashes(1, b"anvil-hash 0 absent\xff\n").is_err());
         assert_eq!(parse_hashes(0, b"").unwrap(), vec![]);
+    }
+
+    /// `entry` with `template = true`.
+    fn templated(src: &str, dest: &str) -> FileEntry {
+        FileEntry {
+            template: true,
+            ..entry(src, dest)
+        }
+    }
+
+    /// [`host`] named `name` with `vars` set at host level.
+    fn host_with(name: &str, vars: &[(&str, &str)]) -> Target {
+        Target {
+            name: name.to_owned(),
+            vars: vars
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        (*k).to_owned(),
+                        (
+                            crate::inventory::VarValue::String((*v).to_owned()),
+                            crate::inventory::Level::Host,
+                        ),
+                    )
+                })
+                .collect(),
+            ..host(&[], None)
+        }
+    }
+
+    fn written(run: &PlannedRun) -> FileWrite {
+        run.file().unwrap().write.clone().unwrap()
+    }
+
+    #[test]
+    fn load_checks_a_templated_src_and_leaves_others_verbatim() {
+        let dir = dir("files-template-load");
+        fs::write(dir.join("ok.j2"), "port {{ vars.port }}\n").unwrap();
+        fs::write(dir.join("bad.j2"), "a\n{% if %}\n").unwrap();
+        let config = config_in(
+            &dir,
+            vec![entry("bad.j2", "/etc/plain"), templated("ok.j2", "/etc/ok")],
+        );
+        let Sources(loaded) = load(&config, || Ok(dir.clone())).unwrap();
+        assert_eq!(loaded[0].text, "a\n{% if %}\n", "a plain src is not parsed");
+        let config = config_in(&dir, vec![templated("bad.j2", "/etc/x")]);
+        let err = super::load(&legacy(&config), || Ok(dir.clone())).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(
+            err.message
+                .starts_with("files[0].src `bad.j2`: template: line 2"),
+            "{}",
+            err.message
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_templated_file_renders_per_target_from_vars_and_facts() {
+        let src = "port {{ vars.port }} on {{ facts.distro }} {{ facts.pkg }}\n";
+        let config = config_in(Path::new("/c"), vec![templated("a.j2", "/etc/a")]);
+        let sources = Sources::of(&[src]);
+        let one = runs(
+            &config,
+            &sources,
+            &host_with("web1", &[("port", "80")]),
+            Some(&facts(&[
+                ("user", "root"),
+                ("distro", "arch"),
+                ("pkg", "pacman yay"),
+            ])),
+        )
+        .unwrap();
+        let two = runs(
+            &config,
+            &sources,
+            &host_with("web2", &[("port", "8080")]),
+            Some(&facts(&[
+                ("user", "root"),
+                ("distro", "debian"),
+                ("pkg", "apt"),
+            ])),
+        )
+        .unwrap();
+        let (one, two) = (written(&one[0]), written(&two[0]));
+        for (write, text) in [
+            (&one, "port 80 on arch pacman yay\n"),
+            (&two, "port 8080 on debian apt\n"),
+        ] {
+            let rendered = write.rendered.as_ref().unwrap();
+            assert_eq!(rendered.text.as_str(), text);
+            assert_eq!(rendered.sha256, hex(&Sha256::digest(text.as_bytes())));
+            assert_eq!(write.text(&sources).unwrap(), text);
+            let (script, _) = write_script(write, &sources, &Expected::Unchecked).unwrap();
+            assert!(
+                script.contains(text) && !script.contains("{{"),
+                "{}",
+                &*script
+            );
+            let debug = format!("{write:?}");
+            assert!(!debug.contains("port"), "{debug}");
+            assert!(debug.contains(&format!("sha256 {}", rendered.sha256)));
+        }
+        let staged = FileWrite {
+            password: true,
+            ..one.clone()
+        };
+        let (script, upload) = write_script(&staged, &sources, &Expected::Unchecked).unwrap();
+        let stage = upload.unwrap().stage;
+        assert!(stage.contains("port 80 on arch") && !stage.contains("{{"));
+        assert!(
+            !script.contains("port 80"),
+            "the bytes ride only in the stage"
+        );
+        let expanded = legacy(&config);
+        let record = one.record(&expanded, &sources, Captured::Absent, Write::Written, false);
+        assert_eq!(record.written_sha256, one.rendered.as_ref().unwrap().sha256);
+    }
+
+    #[test]
+    fn a_plain_file_keeps_braces_verbatim() {
+        let src = "x {{ vars.port }} {% if %}\n";
+        let config = config_in(Path::new("/c"), vec![entry("a", "/etc/a")]);
+        let sources = Sources::of(&[src]);
+        let run = runs(
+            &config,
+            &sources,
+            &host_with("web1", &[("port", "80")]),
+            Some(&user_facts("nopasswd")),
+        )
+        .unwrap();
+        let write = written(&run[0]);
+        assert_eq!(write.rendered, None);
+        assert_eq!(write.text(&sources).unwrap(), src);
+        let (script, _) = write_script(&write, &sources, &Expected::Unchecked).unwrap();
+        assert!(script.contains(src), "{}", &*script);
+    }
+
+    #[test]
+    fn a_render_error_names_the_entry_and_line_never_a_value() {
+        let config = config_in(
+            Path::new("/c"),
+            vec![
+                FileEntry {
+                    tags: vec!["db".to_owned()],
+                    ..templated("skip.j2", "/etc/skip")
+                },
+                templated("a.j2", "/etc/a"),
+            ],
+        );
+        let target = host_with("web1", &[("secretish", "hunter2")]);
+        let facts = user_facts("nopasswd");
+        let err = runs(
+            &config,
+            &Sources::of(&["{{ vars.nope }}", "{{ vars.secretish }}\n{{ vars.port }}\n"]),
+            &target,
+            Some(&facts),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("files[1].src `a.j2`: template: line 2")
+                && err.contains("vars.port")
+                && !err.contains("hunter2"),
+            "{err}"
+        );
+        let err = runs(
+            &config,
+            &Sources::of(&["", "a{{ '\\0' }}b"]),
+            &target,
+            Some(&facts),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "files[1].src `a.j2`: template: rendered output contains a NUL byte"
+        );
+        let err = runs(
+            &config,
+            &Sources::of(&["", "{% for i in range(2000) %}{{ 'x' * 1000 }}{% endfor %}"]),
+            &target,
+            Some(&facts),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "files[1].src `a.j2`: template: rendered output exceeds the 1 MiB limit"
+        );
     }
 }

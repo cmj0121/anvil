@@ -1349,4 +1349,33 @@ mod tests {
         assert!(matches!(&items[0].kind, ItemKind::Step(s)
             if s.run.as_deref() == Some("echo 0")));
     }
+
+    #[test]
+    fn a_task_file_can_be_templated_and_its_syntax_is_checked_at_load() {
+        let ws = Workspace::new();
+        ws.include("ok.j2", "{{ vars.port }}\n")
+            .include("bad.j2", "{% endif %}\n");
+        let config = r#"
+            [[tasks]]
+            file = { src = "$/ok.j2", dest = "/ok", mode = "0644", template = true }
+
+            [[tasks]]
+            file = { src = "$/bad.j2", dest = "/plain", mode = "0644" }
+            "#;
+        let expanded = ws.expand(config).unwrap();
+        let templated: Vec<bool> = expanded.files().map(|(_, e, _)| e.template).collect();
+        assert_eq!(templated, [true, false]);
+        crate::files::load(&expanded, || Ok(ws.0.clone())).unwrap();
+        let expanded = ws
+            .expand(&config.replace("\"0644\" }", "\"0644\", template = true }"))
+            .unwrap();
+        let err = crate::files::load(&expanded, || Ok(ws.0.clone())).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(
+            err.message
+                .starts_with("tasks[1].file.src `$/bad.j2`: template: line 1"),
+            "{}",
+            err.message
+        );
+    }
 }
