@@ -54,6 +54,8 @@ anvil update               # replace the binary with the latest signed release
 
 - 支援 brew、pacman、apt、dnf 與 apk 的套件，含各管理器別名、pin 與 remove（[套件](docs/packages.zh-TW.md)）。
 - 檔案、服務與步驟，各自依 tags 與 facts 比對每個 target（[設定](docs/configuration.zh-TW.md)）。
+- 全域、每個 tag 或每個 host 的 vars 與 env；步驟取得 env，設定 `template = true` 的檔案以 MiniJinja 為每個 target 算繪
+  （[Vars 與 env](docs/configuration.zh-TW.md#vars-與-env)、[Templating](docs/configuration.zh-TW.md#templating)）。
 - plugin 產生步驟的腳本；drift 是 doctor plugin，而非指令
   （[Doctor plugins](docs/cli.zh-TW.md#doctor-plugins-drift-since-the-last-apply)）。
 - 以 config 項目建議 Linux 強化設定，並防止把自己鎖在外面：`anvil config --harden` 預覽，`--write` 加入

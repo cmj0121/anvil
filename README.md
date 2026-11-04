@@ -54,6 +54,8 @@ works on up to N targets at once ([Running in parallel](docs/cli.md#running-in-p
 
 - Packages on brew, pacman, apt, dnf and apk, with per-manager aliases, pin and remove ([Packages](docs/packages.md)).
 - Files, services and steps, each matched per target by tags and facts ([Configuration](docs/configuration.md)).
+- Vars and env per host, tag or globally; steps get the env, and a file with `template = true` is rendered per target
+  with MiniJinja ([Vars and env](docs/configuration.md#vars-and-env), [Templating](docs/configuration.md#templating)).
 - Plugins write a step's script; drift is a doctor plugin, not a command
   ([Doctor plugins](docs/cli.md#doctor-plugins-drift-since-the-last-apply)).
 - Linux hardening suggested as config entries, with lockout guards: `anvil config --harden` previews, `--write` adds
