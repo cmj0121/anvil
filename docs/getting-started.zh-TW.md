@@ -162,7 +162,8 @@ linode1
           "run": "hostname",
           "code": 0,
           "stdout": "mac.local\n",
-          "stderr": ""
+          "stderr": "",
+          "changed": true
         }
       ],
       "ok": true

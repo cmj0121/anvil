@@ -313,13 +313,15 @@ mode = "0644"              # required: a quoted string of 3 or 4 octal digits
 tags = ["linode"]          # optional; every tag must be on the target
 facts = { distro = "arch" } # optional; each value equals that fact
 sudo = true                # optional; default true. false writes as the connecting user
+notify = ["reload sshd"]   # optional; [[handlers]] to run when this step changes the file; see Handlers
 
 [[services]]               # optional; one service brought to a state per matching target; see Services
 name = "sshd"              # required: [A-Za-z0-9:_@.-]+, at most 255 bytes
-state = "started"          # required: "started" | "stopped"
+state = "started"          # required: "started" | "stopped" ("restarted" | "reloaded" only in a handler)
 enabled = true             # optional; true enables, false disables, omitted leaves enablement alone
 tags = ["linode"]          # optional; every tag must be on the target
 facts = { distro = "arch" } # optional; each value equals that fact
+notify = ["reload sshd"]   # optional; [[handlers]] to run when this step changes the service
 
 [[steps]]
 run = "hostname"           # a POSIX sh script, non-empty, at most 4 KiB
@@ -330,6 +332,11 @@ creates = "/usr/local/bin/x" # optional: skip when this path exists
 removes = "/var/lib/x/old" # optional: run only when this path exists
 onlyif = "test -d /var/lib/x" # optional: run only when this exits 0
 unless = "x migrate --status | grep -q up-to-date" # optional: skip when this exits 0
+notify = ["reload sshd"]   # optional; [[handlers]] to run when the step runs and exits 0
+
+[[handlers]]               # optional; runs once per target after its steps, only when notified; see Handlers
+name = "reload sshd"       # required: [A-Za-z0-9 ._-]+, at most 64 bytes, unique
+service = { name = "sshd", state = "reloaded" } # or run = "…"; exactly one of the two
 
 [plugins.harden]           # optional; see Plugins below
 path = "~/.config/anvil/plugins/harden"
@@ -397,6 +404,10 @@ guard 隨 step 自己的腳本送出，因此有 guard 的 step 仍只需一次�
 `anvil plan` 列出每個 step 的 guard，且從不執行它們（[`anvil plan`](cli.zh-TW.md#anvil-plan)）。
 沒有 guard 的 step 的執行與輸出都與以前完全相同。
 
+**`notify`。** `run` 或 plugin step 可以列出在它執行並以 0 結束後要執行的 [handler](#handlers)；被 guard 略過時不通知任何 handler。
+每個名稱都必須是某個 `[[handlers]]` 項目的名稱，否則以 2 結束並顯示
+``steps[0].notify[0] `reload ssh`: names no [[handlers]] entry``。
+
 上述區段依固定順序執行：套件、檔案、服務、step。要自行決定順序，請改用 [`[[tasks]]`](#tasks)，
 取代 `[[files]]`、`[[services]]`、`[[steps]]` 與 `[packages]` 中的清單。
 
@@ -458,6 +469,7 @@ facts = { distro = "arch" }      # optional; a probe key, equal to that fact
 sudo = false                     # optional; default true. false: write as the connecting user
 rollback = false                 # optional; default true. false: the apply record keeps the hash only
 template = true                  # optional; default false. true: render src per target (see Templating)
+notify = ["reload sshd"]         # optional; the [[handlers]] to run when the step writes (see Handlers)
 ```
 
 **`mode`。** 必填，且必須是加引號的字串。三或四位八進位數字，最大為 `0777` 加上 sticky bit，
@@ -581,6 +593,11 @@ apply 會警告，rollback 會以 `cannot undo: DEST (not world-readable)` 指�
 沒有它時檔案一律重寫，step 一律印出 `wrote DEST`；有些精簡的容器映像檔沒有它。
 沒有擁有者寫入權限的 mode（例如 `0444`）仍可寫入。
 anvil 設定 `mode`，並保留既有 dest 的擁有者與群組。它不建立不存在的上層目錄；此時 step 以 `tee` 自己的訊息失敗。
+
+**`notify`。** 選填：step 印出 `wrote DEST` 時要執行的 [handler](#handlers)。`unchanged DEST` 不通知任何 handler，
+即使 `chmod` 修正了 mode 也一樣；沒有 `cmp` 的 target 每次 apply 都會重寫，因此每次都會通知。
+每個名稱都必須是某個 `[[handlers]]` 項目的名稱，否則以 2 結束並顯示
+``files[0].notify[0] `reload ssh`: names no [[handlers]] entry``。
 
 以 root 寫入（透過 sudo，或以 root 登入）時，除非 dest 路徑上的每個目錄（從 `/` 到存放 dest 的那一層）都屬於 root，
 且其群組與其他人都不能寫入，否則拒絕該 dest。root 會在其他任何動作碰到 dest 之前逐一檢查；
@@ -761,8 +778,13 @@ config 依此順序檢查，第一個失敗就以 2 結束。最多 64 個項目
 
 - `services[0].state: required`
 - ``services[0].state `running`: must be started or stopped``（`Started` 也是）
+- ``services[0].state `restarted`: only in a [[handlers]] service; it would restart on every apply``（或 `reloaded`）：
+  這兩個動作每次 apply 都會執行，因此屬於只在被通知時才執行的 [handler](#handlers)
 
 **`enabled`。** 選填。`true` 讓服務開機時啟動，`false` 則停用。省略時，該項目在每個 init 上都不更動啟用狀態，只處理狀態。
+
+**`notify`。** 選填：這個 step 改變了服務時要執行的 [handler](#handlers)。每個名稱都必須是某個 `[[handlers]]` 項目的名稱，
+否則以 2 結束並顯示 ``services[0].notify[0] `reload ssh`: names no [[handlers]] entry``。
 
 **`tags` 與 `facts`。** 規則與訊息同 [Files](#files)，前綴改為 `services[I]`：列出的每個 tag 都必須在 target 上，
 `local` target 帶有 `local`，列出的每個 fact 都必須等於探測的值，`pkg` 則依成員關係比對。
@@ -899,6 +921,13 @@ selector 不符合的 task 仍是一個 step，回報為略過（`skipped run: n
 並依上述順序指名第一個設定的 guard：`tasks[0].creates: only on a run or plugin task`、
 `tasks[0].tasks[0].onlyif: only on a run or plugin task`。
 
+**`notify`。** `run`、`plugin`、`file` 或 `service` task 可以設定 [`notify`](#handlers)，寫在 task 上，而不是 `file` 或 `service` 裡面。
+以 2 結束：`tasks[0].notify: not on a packages task; packages give no change signal`、
+`tasks[0].notify: only on a run, plugin, file or service task`（`include` 或 `tasks` 群組）、
+`tasks[0].file: notify belongs on the task, not the file` 與
+`tasks[0].service: notify belongs on the task, not the service`。`[[handlers]]` 留在主檔案中：含有它的 include
+以 2 結束並顯示解析器的訊息。
+
 **巢狀。** 子 task 繼承 `tags` 與 `facts`，每一層都必須符合：target 必須帶有鏈上的每個 tag，fact 以 AND 結合。
 同一條鏈上同一個 fact 鍵有兩個不同的值永遠不會符合，因此以 2 結束並顯示
 ``tasks[0].tasks[0].facts.os `Darwin`: conflicts with `Linux` inherited from a parent``。
@@ -935,7 +964,7 @@ include 受儲存區的限制（不含 NUL 的一般 UTF-8 文字檔，最多 1 
 **混用。** `[[tasks]]` 與 `[[files]]`、`[[services]]`、`[[steps]]`，或 `[packages]` 的 `install`、`pin`、`remove`、`upgrade` 並用時，
 以 2 結束並顯示 `[[tasks]] cannot be mixed with [[steps]]; move it into a task`。沒有自動遷移。
 `[packages.alias]` 與其他 `[packages]` 設定（`manager`、`local`、`local_sudo_secret`、`timeout`）維持全域，可與 `[[tasks]]` 並用，
-`[plugins]`、`[secrets]`、`[harden]` 與 `[anvil]` 也一樣。
+`[[handlers]]`、`[plugins]`、`[secrets]`、`[harden]` 與 `[anvil]` 也一樣。
 
 **`packages` task。** 每個都是自己的 step，套用全域的 `[packages]` 設定，清單不會與其他 task 合併：
 兩個 task 可以各自 `pin` 不同的名稱。task 內的 `manager` 或 `alias` 以 2 結束並顯示解析器的訊息。請見[套件](packages.zh-TW.md)。
@@ -949,6 +978,121 @@ include 受儲存區的限制（不含 NUL 的一般 UTF-8 文字檔，最多 1 
 變更 fact 的 step 也不會改變後面的 task 符合與否。要使用新狀態，請再 apply 一次。
 
 輸出、紀錄與 rollback 請見[執行中的 task](cli.zh-TW.md#執行中的-task)。
+
+## Handlers
+
+handler 只在某個 step 改變了東西時執行：sshd 的設定變了就 reload sshd，放入新字型後就重建快取。
+每個 `[[handlers]]` 項目有一個名稱，step 在 `notify` 中列出它要通知的名稱。
+target 的最後一個 step 之後，在那裡被通知的每個 handler 依 `[[handlers]]` 順序各執行一次。
+什麼都沒改變的 step 不通知任何 handler，因此在已收斂的 target 上再次執行不會跑任何 handler。
+
+```toml
+[[files]]
+src = "files/sshd_config"
+dest = "/etc/ssh/sshd_config"
+mode = "0644"
+notify = ["reload sshd"]
+
+[[steps]]
+run = "cp fonts/*.ttf ~/.local/share/fonts/"
+notify = ["rebuild font cache"]
+
+[[handlers]]
+name = "reload sshd"
+service = { name = "sshd", state = "reloaded" }
+
+[[handlers]]
+name = "rebuild font cache"
+run = "fc-cache -f"
+```
+
+輸出、`--json` 與紀錄見[執行中的 handler](cli.zh-TW.md#執行中的-handler)。
+
+**項目。** handler 有一個 `name`，以及 `run` 或 `service` 兩者恰好其一。`run` 是 POSIX sh 腳本，規則同
+[`[[steps]]`](#config)；它像 step 一樣執行：以連線使用者的身分、帶 target 的 [`env`](#vars-與-env)、時限 30 秒。
+`service` 接受 `name` 與 `state`，以及搭配 `started` 或 `stopped` 的 `enabled`，同 [`[[services]]`](#services)，
+並像 service step 一樣執行（root、init、時限 120 秒）。名稱為 `[A-Za-z0-9 ._-]+`（可含空白），至多 64 位元組，且不得重複；
+最多 64 個 handler。handler 只能寫在主 config 中，不能寫在 [include](#tasks) 裡，且舊版區段與 `[[tasks]]` 都能使用。以 2 結束：
+
+- `handlers: 65 entries exceeds the 64 entry limit`
+- ``handlers[0].name `a/b`: must match [A-Za-z0-9 ._-]+, at most 64 bytes``（空名稱或過長的名稱也是）
+- ``handlers[2].name `reload sshd`: same name as handlers[0]``
+- `handlers[0]: needs run or service` 與 `handlers[0]: has both run and service; keep one`
+- `handlers[0].run: is empty or blank` 與 `handlers[0].run: 4097 bytes exceeds the 4096 byte limit`
+- `handlers[0].service.state: required`、
+  ``handlers[0].service.state `bounced`: must be started, stopped, restarted or reloaded`` 與
+  `handlers[0].service.enabled: not with restarted or reloaded`；服務名稱套用 [Services](#services) 的規則，
+  例如 ``handlers[0].service.name `-x`: must not start with - or .``
+- `handlers[0].service: tags, facts and notify do not apply to a handler`
+- handler 本身的 `tags`、`facts`、`notify`、guard、`plugin` 或任何其他鍵：解析器的 `unknown field` 訊息。
+  handler 只在被通知的地方執行，且 handler 不會通知 handler。
+
+**`notify`。** 一串 handler 名稱，可寫在 `[[files]]`、`[[services]]` 與 `[[steps]]` 項目上，以及 `run`、`plugin`、
+`file` 與 `service` [task](#tasks) 上。列出兩次的名稱只算一次。沒有對應 handler 的名稱以 2 結束並指名該項目：
+``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry``（或 `files[I]`、`services[I]`、`tasks[I]`）。
+
+**step 何時通知。** 只有在 target 上執行、以 0 結束且改變了東西的 step：
+
+| Step          | 在下列情況通知    | 下列情況不通知                |
+| ------------- | ----------------- | ----------------------------- |
+| file          | 印出 `wrote DEST` | 印出 `unchanged DEST`         |
+| service       | 印出任何變更行    | 印出 `unchanged service NAME` |
+| run 或 plugin | 執行且以 0 結束   | 被 [guard](#config) 略過      |
+| 任何          |                   | 以 no match 略過，或失敗      |
+
+變更行是 `started service NAME`、`stopped service NAME`、`enabled service NAME` 或 `disabled service NAME`。
+套件 step 從不通知，也無法要求通知。位元組已正確、anvil 只修正了 mode 的檔案會印出 `unchanged DEST`，不會通知：
+這是刻意的設計，handler 跟隨的是內容的變更。沒有 `cmp` 的 target 每次 apply 都會重寫檔案（[`[[files]]`](#files)），
+因此它的 `notify` 每次都會觸發。
+
+**順序。** target 的最後一個 step 之後，且只在每個 step 都通過時，它的 handler 依 `[[handlers]]` 順序執行，
+而不是依被通知的順序。不論被多少個 step 通知，每個都只執行一次。舊版區段是在 `[[steps]]` 之後；`[[tasks]]` 則在最後一個 task 之後。
+handler 以 target 為單位：在 `web1` 上的通知只在 `web1` 上執行該 handler。
+失敗的 handler 會讓 target 失敗（以 1 結束，與失敗的 step 相同），該 target 其他應執行的 handler 仍會執行。
+
+**到期時才解析。** handler 只在某個 target 上到期時才在那裡解析：本次 apply 被通知，或從先前的 apply 待執行（pending）。
+在那之前，它的服務不需要 init 也不需要取得 root 的方式，也不需要它的 sudo secret，
+因此 `service` handler 在缺少這些的 target 上，直到那裡有 step 通知它之前，都不會讓該 target 失敗。
+到期卻無法解析時（``services: no init known for distro `gentoo` ``、`services: secret NAME is not set`……），
+該 handler 以該原因讓 target 失敗並保持待執行；其他 handler 仍會執行。
+
+**跨 apply 的待執行。** 每個通知都會立即存入 [apply 紀錄](cli.zh-TW.md#apply-紀錄)中該 target 項目的 `pending_handlers`，
+handler 只有在執行並以 0 結束後才會離開該清單。後面的 step 失敗（此時 handler 不執行）、Ctrl-C、被終止、連線中斷或 handler 失敗，
+都讓它保持待執行，下一次在該 target 上的 apply 即使沒有新的通知也會執行它。
+因此含 `[[handlers]]` 的 config 每次 apply 都會探測 target 並保存紀錄。新的 apply 項目與 `anvil rollback` 都保留這份清單。
+要清除某個名稱而不執行它，請用 [`anvil apply --drop-pending NAME`](cli.zh-TW.md#執行中的-handler)。
+
+**過期名稱與錯誤項目。** 不再存在於 `[[handlers]]` 的待執行名稱會被捨棄，並發出 target 警告
+``pending handler `NAME` is not in [[handlers]]; dropped``，不會讓 apply 失敗。紀錄是你可以編輯的檔案，
+因此載入時會捨棄不是有效 handler 名稱的待執行名稱、重複的名稱（保留第一個）與超過 64 個之後的名稱，
+每個 target 發出一個警告 `PATH: TARGET: dropped N bad pending_handlers entries`，而不是拒絕整份紀錄。
+
+**至少一次。** handler 只在它的 exit 0 存檔之後才離開 `pending_handlers`，因此在它結束與存檔之間當機，
+下一次 apply 會再執行它：請把 handler 寫成可以執行兩次。通知在 step 結束後立即存檔，因此在結束與存檔之間當機會遺失該通知；
+下一次 apply 時，file 或 service step 找不到要變更的東西，不會再次通知。發生這種當機後，請自行執行 handler 的指令。
+
+**Rollback。** [`anvil rollback`](cli.zh-TW.md#anvil-rollback) 從不執行 handler。對它放回的每個檔案（還原、移除或發現未變更），
+它把該 dest 的 file 項目中適用於該 target 者（以紀錄保存的 fact 比對）的 `notify` 名稱，依 `[[handlers]]` 順序加入該 target 的待執行清單，
+讓下一次 apply 重新載入讀取那個還原檔案的服務。
+
+**`restarted` 與 `reloaded`。** 兩個只用於 handler 的服務狀態；`[[services]]` 項目或 `service` task 使用其中之一會以 2 結束，
+因為它每次 apply 都會動作。兩者都印出一行：`restarted service NAME` 或 `reloaded service NAME`。
+在未執行的服務上，`reloaded` 什麼都不做並成功，印出 `service NAME is not running; not reloaded`；
+`restarted` 會啟動已停止的服務。init 不認得的服務會讓 step 失敗，與 `started` 相同（[Service steps](cli.zh-TW.md#service-steps)）。
+
+| Init    | `restarted`                                                 | `reloaded`             |
+| ------- | ----------------------------------------------------------- | ---------------------- |
+| systemd | `restart`（會啟動已停止的 unit；masked 的會被拒絕）         | active 時：`reload`    |
+| OpenRC  | 執行中：`restart`；已停止：`start`；crashed：`zap`、`start` | 執行中：`reload`       |
+| launchd | 已載入：`kickstart -k`；未載入：`bootstrap`                 | 已載入：`kickstart -k` |
+
+其他情況（非 active、未執行、未載入）下，`reloaded` 不更動服務，並印出這行 no-op 訊息。
+
+處於 crashed 狀態（`rc-service NAME status` 以 32 結束）的 OpenRC 服務算作未執行，因此 `reloaded` 在它上面是 no-op。
+沒有 `reload` 指令的 OpenRC 腳本會讓 step 以 rc-service 自己的訊息失敗。launchd 沒有 reload：
+`reloaded` 以 `launchctl kickstart -k` 重新啟動已載入的 job，與 `restarted` 相同。
+在已停用且未載入的 job 上，`restarted` 以 `services: NAME is disabled; enable it to restart it` 失敗；
+handler 無法變更啟用狀態，因此請用 `[[services]]` 項目或 task 啟用它。
 
 ## Plugins
 
@@ -1100,4 +1244,5 @@ YAML 會拒絕 anchor 與 alias、merge key（`<<`）、重複的鍵、不支援
 當 YAML 編輯的 TOML 形式會超過 1 MiB 時，不會寫入任何東西，並以 2 結束。
 
 apply 紀錄有自己的上限：先前的文字最多保存 256 KiB，紀錄最多 16 MiB，超過時會捨棄最大的文字並發出警告
-（[apply 紀錄](cli.zh-TW.md#apply-紀錄)）。
+（[apply 紀錄](cli.zh-TW.md#apply-紀錄)）。它的待執行 handler 清單每個 target 最多保存 64 個有效且不重複的名稱；
+其他的會在載入時捨棄並發出警告（[Handlers](#handlers)）。

@@ -164,7 +164,8 @@ On a terminal the blocks are coloured (set `NO_COLOR` to turn that off).
           "run": "hostname",
           "code": 0,
           "stdout": "mac.local\n",
-          "stderr": ""
+          "stderr": "",
+          "changed": true
         }
       ],
       "ok": true
