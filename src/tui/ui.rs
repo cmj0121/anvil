@@ -1602,6 +1602,7 @@ mod tests {
         );
         let skip = |dest: &str| report::StepReport {
             skipped: true,
+            reason: None,
             ..step(&format!("skipped file {dest}: no match"), Some(0), "", "")
         };
         let ok = |run: &str| step(run, Some(0), "", "");
@@ -1673,11 +1674,13 @@ mod tests {
             vec![
                 report::StepReport {
                     skipped: true,
+                    reason: None,
                     ..step("skipped file /etc/a.conf: no match", Some(0), "", "")
                 },
                 step("service sshd", Some(0), "started service sshd\n", ""),
                 report::StepReport {
                     skipped: true,
+                    reason: None,
                     ..step("skipped service cron: no match", Some(0), "", "")
                 },
                 step("hostname", Some(1), "", ""),

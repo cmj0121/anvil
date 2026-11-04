@@ -224,6 +224,287 @@ fn a_task_run_sees_the_targets_env() {
     assert_eq!(run["stdout"], "task $x 'q'\n", "{target}");
 }
 
+/// A sandbox with the fake host, a file `made` and no `absent` beside it,
+/// and `config` with `MADE` and `ABSENT` replaced by their paths. Returns
+/// the sandbox and both paths.
+fn guarded(config: &str) -> (Sandbox, String, String) {
+    let sandbox = Sandbox::new("ag");
+    sandbox.with_fake_host();
+    let made = sandbox.root().join("made");
+    std::fs::write(&made, "").unwrap();
+    let made = made.to_str().unwrap().to_owned();
+    let absent = sandbox.root().join("absent").to_str().unwrap().to_owned();
+    sandbox.write_config(
+        "config.toml",
+        &config.replace("MADE", &made).replace("ABSENT", &absent),
+    );
+    (sandbox, made, absent)
+}
+
+/// Each step's `run`, `skipped` and `reason` in `target`'s JSON report.
+fn skips(target: &serde_json::Value) -> Vec<(String, bool, Option<String>)> {
+    target["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| {
+            (
+                step["run"].as_str().unwrap().to_owned(),
+                step["skipped"].as_bool().unwrap_or(false),
+                step["reason"].as_str().map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+const EACH_GUARD: &str = "\
+[[steps]]\nrun = \"echo creates-ran\"\ncreates = \"MADE\"\n\n\
+[[steps]]\nrun = \"echo creates-absent-ran\"\ncreates = \"ABSENT\"\n\n\
+[[steps]]\nrun = \"echo removes-ran\"\nremoves = \"ABSENT\"\n\n\
+[[steps]]\nrun = \"echo removes-made-ran\"\nremoves = \"MADE\"\n\n\
+[[steps]]\nrun = \"echo onlyif-ran\"\nonlyif = \"exit 3\"\n\n\
+[[steps]]\nrun = \"echo onlyif-true-ran\"\nonlyif = \"true\"\n\n\
+[[steps]]\nrun = \"echo unless-ran\"\nunless = \"true\"\n\n\
+[[steps]]\nrun = \"echo unless-false-ran\"\nunless = \"false\"\n";
+
+#[test]
+fn each_guard_skips_or_runs_on_local_and_the_fake_host() {
+    let (sandbox, made, absent) = guarded(EACH_GUARD);
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let skipped = |line: String, reason: String| (line, true, Some(reason));
+    let ran = |run: &str| (run.to_owned(), false, None);
+    let expected = vec![
+        skipped(
+            format!("skipped run: {made} exists"),
+            format!("{made} exists"),
+        ),
+        ran("echo creates-absent-ran"),
+        skipped(
+            format!("skipped run: {absent} is absent"),
+            format!("{absent} is absent"),
+        ),
+        ran("echo removes-made-ran"),
+        skipped(
+            "skipped run: onlyif exited 3".to_owned(),
+            "onlyif exited 3".to_owned(),
+        ),
+        ran("echo onlyif-true-ran"),
+        skipped(
+            "skipped run: unless exited 0".to_owned(),
+            "unless exited 0".to_owned(),
+        ),
+        ran("echo unless-false-ran"),
+    ];
+    for target in value["targets"].as_array().unwrap() {
+        assert_eq!(skips(target), expected, "{target}");
+        let steps = target["steps"].as_array().unwrap();
+        assert_eq!(
+            steps[0],
+            serde_json::json!({
+                "run": format!("skipped run: {made} exists"), "code": 0, "stdout": "",
+                "stderr": "", "skipped": true, "reason": format!("{made} exists")
+            })
+        );
+        assert_eq!(steps[1]["stdout"], "creates-absent-ran\n");
+    }
+    assert_eq!(value["targets"].as_array().unwrap().len(), 2);
+
+    let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ fake\n  $ skipped run: {made} exists\n  $ skipped run: {absent} is absent\n  \
+             $ skipped run: onlyif exited 3\n  $ skipped run: unless exited 0\n  \
+             ✔ ok · 8 steps\n\n1 ok, 0 failed\n"
+        )
+    );
+}
+
+#[test]
+fn several_guards_combine_with_and_in_order() {
+    let (sandbox, made, _) = guarded(
+        "[[steps]]\nrun = \"echo ran\"\ncreates = \"ABSENT\"\nremoves = \"MADE\"\n\
+         onlyif = \"true\"\nunless = \"true\"\n\n\
+         [[steps]]\nrun = \"echo ran\"\ncreates = \"MADE\"\nonlyif = \"exit 2\"\n\n\
+         [[steps]]\nrun = \"echo ran\"\nonlyif = \"exit 2\"\nunless = \"true\"\n\n\
+         [[steps]]\nrun = \"echo all-allow\"\ncreates = \"ABSENT\"\nremoves = \"MADE\"\n\
+         onlyif = \"true\"\nunless = \"false\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for target in json(&out)["targets"].as_array().unwrap() {
+        let reasons: Vec<_> = skips(target).into_iter().map(|(_, _, r)| r).collect();
+        assert_eq!(
+            reasons,
+            [
+                Some("unless exited 0".to_owned()),
+                Some(format!("{made} exists")),
+                Some("onlyif exited 2".to_owned()),
+                None,
+            ],
+            "{target}"
+        );
+        assert_eq!(target["steps"][3]["stdout"], "all-allow\n");
+    }
+}
+
+#[test]
+fn guard_commands_see_the_targets_env() {
+    let (sandbox, _, _) = guarded(
+        "[[steps]]\nrun = \"echo ran\"\nonlyif = \"[ \\\"$APP\\\" = 'it s' ]\"\n\n\
+         [[steps]]\nrun = \"echo ran\"\nunless = \"[ \\\"$APP\\\" = 'it s' ]\"\n",
+    );
+    sandbox.write_config(
+        "inventory.toml",
+        "[env]\nAPP = \"it s\"\n\n[hosts.fake]\nhost = \"fakehost\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for target in json(&out)["targets"].as_array().unwrap() {
+        assert_eq!(
+            skips(target),
+            [
+                ("echo ran".to_owned(), false, None),
+                (
+                    "skipped run: unless exited 0".to_owned(),
+                    true,
+                    Some("unless exited 0".to_owned())
+                ),
+            ],
+            "{target}"
+        );
+    }
+}
+
+#[test]
+fn a_noisy_login_shell_does_not_hide_or_fake_a_skip() {
+    let (sandbox, made, _) = guarded(
+        "[[steps]]\nrun = \"echo ran\"\ncreates = \"MADE\"\n\n\
+         [[steps]]\nrun = \"echo ran\"\nunless = \"false\"\n",
+    );
+    let noise = format!(
+        "motd anvil-guard-{} skipped run: unless exited 0",
+        "0".repeat(32)
+    );
+    let out = sandbox.anvil(
+        &["--json", "apply", "--target", "fake"],
+        &[("FAKE_SSH_CLIENT_STDOUT", &noise)],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let target = &json(&out)["targets"][0];
+    assert_eq!(
+        skips(target),
+        [
+            (
+                format!("skipped run: {made} exists"),
+                true,
+                Some(format!("{made} exists"))
+            ),
+            ("echo ran".to_owned(), false, None),
+        ],
+        "{target}"
+    );
+    assert_eq!(target["steps"][0]["stdout"], format!("{noise}\n"), "kept");
+    assert_eq!(target["steps"][1]["stdout"], format!("{noise}\nran\n"));
+}
+
+#[test]
+fn a_step_printing_a_look_alike_skip_line_still_ran() {
+    let line = format!(
+        "anvil-guard-{} skipped run: unless exited 0",
+        "a".repeat(32)
+    );
+    let (sandbox, _, _) = guarded(&format!(
+        "[[steps]]\nrun = \"echo '{line}'\"\nunless = \"false\"\n\n\
+         [[steps]]\nrun = \"echo 'skipped run: unless exited 0'\"\nunless = \"false\"\n"
+    ));
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for target in json(&out)["targets"].as_array().unwrap() {
+        for (step, stdout) in target["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip([line.as_str(), "skipped run: unless exited 0"])
+        {
+            assert_eq!(step.get("skipped"), None, "{target}");
+            assert_eq!(step.get("reason"), None, "{target}");
+            assert_eq!(step["stdout"], format!("{stdout}\n"), "{target}");
+        }
+    }
+}
+
+#[test]
+fn a_killed_guard_fails_the_step() {
+    let (sandbox, _, _) = guarded(
+        "[[steps]]\nrun = \"echo never\"\nonlyif = \"sh -c 'kill -9 $$'\"\n\n\
+         [[steps]]\nrun = \"echo never-either\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    for target in json(&out)["targets"].as_array().unwrap() {
+        assert_eq!(target["ok"], false, "{target}");
+        let steps = target["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 1, "the target stopped: {target}");
+        assert_eq!(steps[0]["run"], "echo never");
+        assert_eq!(steps[0]["code"], 137);
+        assert_eq!(steps[0]["stdout"], "");
+        let stderr = steps[0]["stderr"].as_str().unwrap();
+        assert!(
+            stderr.ends_with("onlyif was killed by signal 9\n"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_guarded_task_reports_its_skip_under_its_title() {
+    let (sandbox, made, _) =
+        guarded("[[tasks]]\nname = \"Install x\"\nrun = \"echo ran\"\ncreates = \"MADE\"\n");
+    let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ fake\n  tasks[0]  Install x\n  $ skipped run: {made} exists\n  \
+             ✔ ok · 1 step\n\n1 ok, 0 failed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "fake"], &[]);
+    let step = &json(&out)["targets"][0]["steps"][0];
+    assert_eq!(step["task"], "tasks[0]", "{step}");
+    assert_eq!(step["reason"], format!("{made} exists"), "{step}");
+}
+
+#[test]
+fn no_output_or_log_shows_the_guarded_script_or_its_nonce() {
+    let (sandbox, _, _) = guarded(
+        "[[steps]]\nrun = \"echo ran\"\ncreates = \"MADE\"\n\n\
+         [[steps]]\nrun = \"echo ran; exit 3\"\nunless = \"false\"\n",
+    );
+    let log = sandbox.root().join("ssh.log");
+    for args in [
+        &["-vvv", "--json", "apply"][..],
+        &["-vvv", "apply"],
+        &["-vvv", "--json", "plan"],
+        &["-vvv", "plan"],
+    ] {
+        let out = sandbox.anvil(args, &[("FAKE_SSH_LOG", log.to_str().unwrap())]);
+        for (what, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+            let shown = text(bytes);
+            assert!(!shown.contains("anvil-guard-"), "{args:?} {what}: {shown}");
+            assert!(!shown.contains("anvil_guard"), "{args:?} {what}: {shown}");
+        }
+    }
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert!(!log.contains("anvil-guard-"), "{log}");
+    let record = serde_json::to_string(&sandbox.last_apply()).unwrap();
+    assert!(!record.contains("anvil-guard-"), "{record}");
+}
+
 #[test]
 fn unknown_target_exits_two() {
     let sandbox = Sandbox::new("aa");

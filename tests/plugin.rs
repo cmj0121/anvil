@@ -94,6 +94,49 @@ fn the_returned_script_sees_the_targets_env() {
 }
 
 #[test]
+fn a_guard_skips_a_plugin_step_naming_the_plugin() {
+    let (sandbox, path) = pinned(None);
+    let own = common::sha256_hex(fs::read(&path).unwrap());
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[plugins.harden]\npath = \"{}\"\nsha256 = \"{own}\"\n\n\
+             [[steps]]\nplugin = \"harden\"\nunless = \"true\"\n\n\
+             [[steps]]\nplugin = \"harden\"\nonlyif = \"true\"\n",
+            path.display()
+        ),
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let steps = &json(&out)["targets"][0]["steps"];
+    assert_eq!(
+        steps,
+        &serde_json::json!([
+            {"run": "skipped plugin harden: unless exited 0", "code": 0, "stdout": "",
+             "stderr": "", "skipped": true, "reason": "unless exited 0"},
+            {"run": SCRIPT, "code": 0, "stdout": "plugin-ran\n", "stderr": ""},
+        ])
+    );
+
+    let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "▶ fake\n  $ skipped plugin harden: unless exited 0\n  ✔ ok · 2 steps\n\n1 ok, 0 failed\n"
+    );
+
+    let out = sandbox.anvil(&["plan", "--target", "fake"], &[]);
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ fake\n  would $ {SCRIPT} (from plugin harden)\n    unless true\n  \
+             would $ {SCRIPT} (from plugin harden)\n    onlyif true\n  ✔ 2 steps\n\n\
+             1 target, nothing executed\n"
+        )
+    );
+}
+
+#[test]
 fn plan_lists_the_returned_script_from_the_plugin() {
     let (sandbox, _) = pinned(None);
     let out = sandbox.anvil(&["plan", "--target", "fake"], &[]);

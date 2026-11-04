@@ -33,6 +33,9 @@ pub struct StepReport {
     /// nothing ran.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skipped: bool,
+    /// Why a guard skipped the step: `run` is then `skipped run: REASON`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(skip)]
     pub entry: Entry,
     /// The path of the task this step comes from; `None` for a legacy entry.
@@ -78,6 +81,7 @@ impl StepReport {
             stdout: into_string(output.stdout),
             stderr: into_string(output.stderr),
             skipped: false,
+            reason: None,
             entry,
             task: None,
             name: None,
@@ -92,9 +96,20 @@ impl StepReport {
             stdout: String::new(),
             stderr: String::new(),
             skipped: true,
+            reason: None,
             entry,
             task: None,
             name: None,
+        }
+    }
+
+    /// A step a guard skipped for `reason`, `run` being its `skipped …`
+    /// line: what its guards and the shell printed besides is kept.
+    pub(crate) fn guarded(run: &str, reason: String, output: Output, entry: Entry) -> StepReport {
+        StepReport {
+            reason: Some(reason),
+            skipped: true,
+            ..StepReport::from_output(run, output, entry)
         }
     }
 }
@@ -627,7 +642,7 @@ fn render(report: &TargetReport, style: Style, verbose: bool) -> Vec<Line> {
     for step in steps {
         let show_stdout = verbose || step.code != Some(0);
         let title = step.title();
-        let skipped_task = step.skipped && title.is_some();
+        let skipped_task = step.skipped && title.is_some() || step.reason.is_some();
         lines.extend(title.map(|title| Line::out(title, Escape::Always, None)));
         if show_stdout || skipped_task || !step.stderr.is_empty() {
             lines.push(Line::out(
@@ -758,6 +773,7 @@ pub(crate) mod tests {
             stdout: stdout.to_owned(),
             stderr: stderr.to_owned(),
             skipped: false,
+            reason: None,
             entry: Entry::Script,
             task: None,
             name: None,

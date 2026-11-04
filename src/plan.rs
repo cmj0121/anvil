@@ -344,7 +344,7 @@ pub fn run(out: Output, opts: &Options, show_rendered: bool) -> Result<(), Failu
 
 /// One target's block: a `▶ target` header, a `vars.KEY = VALUE (LEVEL)` line
 /// per resolved var and env value, a `PATH  NAME` line per task and a
-/// `would $ command` line per step, then `✔ N steps`, `✘ reason` or `⊘ cancelled` (or its abort
+/// `would $ command` line per step and a line per guard ([`guard_texts`]), then `✔ N steps`, `✘ reason` or `⊘ cancelled` (or its abort
 /// reason), then a blank line. A templated file step's would line is followed
 /// by its [`rendered_text`] and, with `show_rendered`, the text itself.
 pub fn render(report: &PlanReport, show_rendered: bool) -> Vec<Line> {
@@ -361,6 +361,9 @@ pub fn render(report: &PlanReport, show_rendered: bool) -> Vec<Line> {
                         .map(|title| Line::out(title, Escape::Always, None)),
                 );
                 lines.push(Line::out(would_text(step), Escape::Always, Some(DIM)));
+                for text in guard_texts(step) {
+                    lines.push(Line::out(format!("  {text}"), Escape::Always, Some(DIM)));
+                }
                 if let Some(text) = rendered_text(step) {
                     lines.push(Line::out(format!("  {text}"), Escape::Never, Some(DIM)));
                 }
@@ -403,6 +406,24 @@ pub fn would_text(step: &PlannedRun) -> String {
         Some(_) => escape_invisible(&text),
         None => text,
     }
+}
+
+/// A guarded step's guards, one line each in the order they are checked:
+/// `creates P`, `removes P`, `onlyif CMD`, `unless CMD`, a command shown as
+/// a `$` line shows it. Config text, so invisible characters are escaped.
+pub fn guard_texts(step: &PlannedRun) -> Vec<String> {
+    let Some(guards) = step.guards() else {
+        return Vec::new();
+    };
+    [
+        ("creates", guards.creates.as_deref().map(str::to_owned)),
+        ("removes", guards.removes.as_deref().map(str::to_owned)),
+        ("onlyif", guards.onlyif.as_deref().map(report::command)),
+        ("unless", guards.unless.as_deref().map(report::command)),
+    ]
+    .into_iter()
+    .filter_map(|(key, text)| Some(escape_invisible(&format!("{key} {}", text?))))
+    .collect()
 }
 
 /// `rendered N bytes, sha256 HEX` for a templated file step; `None` for a
@@ -835,6 +856,8 @@ mod tests {
                     kind: RunKind::Step {
                         number: 1,
                         plugin: None,
+                        guards: Default::default(),
+                        nonce: None,
                     },
                     task: None,
                     name: None,
@@ -847,6 +870,8 @@ mod tests {
                     kind: RunKind::Step {
                         number: 2,
                         plugin: None,
+                        guards: Default::default(),
+                        nonce: None,
                     },
                     task: None,
                     name: None,

@@ -57,6 +57,49 @@ fn json_is_the_plan_document_with_executed_false() {
 }
 
 #[test]
+fn guards_are_shown_under_their_step_and_none_runs() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.with_fake_host();
+    let ran = sandbox.root().join("ran");
+    let touch = format!("touch {}", ran.display());
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[steps]]\nrun = \"echo hi\"\ncreates = \"/usr/local/bin/x\"\n\
+             removes = \"/etc/x\"\nonlyif = \"{touch}\"\nunless = \"{touch}\\nmore\"\n\n\
+             [[steps]]\nrun = \"echo plain\"\n"
+        ),
+    );
+    let out = sandbox.anvil(&["plan", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ fake\n  would $ echo hi\n    creates /usr/local/bin/x\n    removes /etc/x\n    \
+             onlyif {touch}\n    unless {touch} …\n  would $ echo plain\n  ✔ 2 steps\n\n\
+             1 target, nothing executed\n"
+        )
+    );
+
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    for target in json(&out)["targets"].as_array().unwrap() {
+        assert_eq!(
+            target["steps"],
+            serde_json::json!([
+                {"run": "echo hi", "guards": {
+                    "creates": "/usr/local/bin/x", "removes": "/etc/x",
+                    "onlyif": touch, "unless": format!("{touch}\nmore"),
+                }},
+                {"run": "echo plain"},
+            ]),
+            "{target}"
+        );
+    }
+    assert!(!ran.exists(), "no guard ran");
+}
+
+#[test]
 fn an_unreachable_host_exits_one_without_package_work() {
     let sandbox = Sandbox::new("pl");
     sandbox.with_fake_host();

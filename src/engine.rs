@@ -12,6 +12,7 @@ use crate::error::Failure;
 use crate::facts::{self, Facts};
 use crate::fanout;
 use crate::files::{self, Sources};
+use crate::guard;
 use crate::inventory::Target;
 use crate::packages::{self, Packages};
 use crate::plugin::{Plugins, Request};
@@ -21,7 +22,7 @@ use crate::report::{Progress, Report, StepReport, TargetReport, cancelled, faile
 use crate::secret::Store;
 use crate::services;
 use crate::status;
-use crate::step::{Entry, PlannedRun, RunKind, Upload};
+use crate::step::{Entry, GuardNonce, PlannedRun, RunKind, Upload};
 use crate::tasks::{Expanded, Item, ItemKind};
 use crate::transport::{
     Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
@@ -504,6 +505,7 @@ fn execute_inner(
                             stdout: String::new(),
                             stderr,
                             skipped: false,
+                            reason: None,
                             entry,
                             task: None,
                             name: None,
@@ -596,7 +598,7 @@ fn execute_inner(
             // A failure has set the cancel token: the next step does not start.
             recorder.snapshot(None, &reports);
         }
-        let output = match output {
+        let mut output = match output {
             Ok(output) => output,
             // ssh would have had to open a master after cancel.
             Err(TransportError::Cancelled) => {
@@ -618,6 +620,11 @@ fn execute_inner(
         let succeeded = output.code == Some(0);
         if succeeded && output.truncated {
             log::warn!("{command} {}: step output cut at 1 MiB", target.name);
+        }
+        if let Some((label, reason)) = guard_skip(planned, &mut output) {
+            log::info!("{command} {}: {label}", target.name);
+            reports.push(StepReport::guarded(&label, reason, output, entry).of(planned));
+            continue;
         }
         reports.push(StepReport::from_output(label, output, entry).of(planned));
         if !succeeded {
@@ -776,6 +783,31 @@ pub(crate) enum Sent {
     Unstaged(Result<Output, TransportError>),
     /// Cancelled after the stage, before the install.
     Cancelled,
+}
+
+/// What a guarded step's skip line names it: `run` or `plugin NAME`.
+fn guard_label(plugin: Option<&str>) -> String {
+    match plugin {
+        Some(name) => format!("plugin {name}"),
+        None => "run".to_owned(),
+    }
+}
+
+/// The `skipped …` line and reason of a guarded step whose guard skipped it,
+/// its skip line taken out of `output`.
+fn guard_skip(planned: &PlannedRun, output: &mut Output) -> Option<(String, String)> {
+    let RunKind::Step {
+        plugin,
+        guards,
+        nonce: Some(nonce),
+        ..
+    } = &planned.kind
+    else {
+        return None;
+    };
+    let label = guard_label(plugin.as_deref());
+    let reason = guard::skip_reason(guards, &label, nonce.as_str(), output)?;
+    Some((format!("skipped {label}: {reason}"), reason))
 }
 
 /// The failure of a step: for a step run on a terminal with the password
@@ -975,12 +1007,29 @@ fn step_run(
         };
         return Ok(skip_run(label));
     }
+    let guards = step.guards();
+    let label = guard_label(match step.kind() {
+        StepKind::Plugin(name) => Some(name),
+        StepKind::Run(_) => None,
+    });
+    let nonce = if guards.is_empty() {
+        None
+    } else {
+        Some(GuardNonce(
+            guard::nonce().map_err(|err| format!("{label}: {err}"))?,
+        ))
+    };
     let planned = |run: String, label, plugin| PlannedRun {
         run: run.into(),
         label,
         sudo_secret: None,
         timeout: RUN_TIMEOUT,
-        kind: RunKind::Step { number, plugin },
+        kind: RunKind::Step {
+            number,
+            plugin,
+            guards: guards.clone(),
+            nonce: nonce.clone(),
+        },
         task: None,
         name: None,
     };
@@ -999,15 +1048,23 @@ fn step_run(
             };
             let script = plugins.script(name, &request)?;
             log::info!("{}: step from plugin {name}", target.name);
-            planned(
-                crate::run::wrap_for(target, &script),
-                Some(script),
-                Some(name.to_owned()),
-            )
+            let run = match &nonce {
+                None => crate::run::wrap_for(target, &script),
+                Some(nonce) => {
+                    let body = crate::run::wrap(&script);
+                    env_prefix(&target.env) + &guard::wrap(&guards, &label, nonce.as_str(), &body)
+                }
+            };
+            planned(run, Some(script), Some(name.to_owned()))
         }
-        StepKind::Run(run) => match env_prefix(&target.env) {
-            prefix if prefix.is_empty() => planned(run.to_owned(), None, None),
-            prefix => planned(prefix + run, Some(run.to_owned()), None),
+        StepKind::Run(run) => match (env_prefix(&target.env), &nonce) {
+            (prefix, Some(nonce)) => planned(
+                prefix + &guard::wrap(&guards, &label, nonce.as_str(), run),
+                Some(run.to_owned()),
+                None,
+            ),
+            (prefix, None) if prefix.is_empty() => planned(run.to_owned(), None, None),
+            (prefix, None) => planned(prefix + run, Some(run.to_owned()), None),
         },
     })
 }
@@ -1228,7 +1285,9 @@ mod tests {
             run.kind,
             RunKind::Step {
                 number: 2,
-                plugin: None
+                plugin: None,
+                guards: Default::default(),
+                nonce: None
             }
         );
         assert_eq!(run.kind.entry(), Entry::Step { number: 2 });
@@ -1257,7 +1316,9 @@ mod tests {
             run.kind,
             RunKind::Step {
                 number: 1,
-                plugin: Some("p".to_owned())
+                plugin: Some("p".to_owned()),
+                guards: Default::default(),
+                nonce: None
             }
         );
     }
@@ -1310,6 +1371,87 @@ mod tests {
         let wrapped = crate::run::wrap("echo \"$APP\"");
         assert_eq!(*run.run, format!("{APP}{wrapped}"));
         assert_eq!(run.shown(), "echo \"$APP\"");
+    }
+
+    #[test]
+    fn a_guarded_step_wraps_its_script_after_the_env_with_a_fresh_nonce() {
+        let mut step = Step::script("echo \"$APP\"");
+        step.unless = Some("true".to_owned());
+        let run_item = item(ItemKind::Step(step.clone()), &[], &[]);
+        let resolve = || {
+            step_run(
+                &with_env(),
+                None,
+                &run_item,
+                &step,
+                1,
+                &FakePlugins::none(),
+                &Cancel::new(),
+            )
+            .unwrap()
+        };
+        let (run, again) = (resolve(), resolve());
+        let RunKind::Step {
+            guards,
+            nonce: Some(nonce),
+            ..
+        } = &run.kind
+        else {
+            panic!("{:?}", run.kind);
+        };
+        assert_eq!(guards, &step.guards());
+        let nonce = nonce.as_str();
+        let body = guard::wrap(guards, "run", nonce, "echo \"$APP\"");
+        assert_eq!(*run.run, format!("{APP}{body}"));
+        assert_eq!(run.shown(), "echo \"$APP\"", "the nonce is never shown");
+        assert_ne!(run.kind, again.kind, "each resolve has its own nonce");
+
+        let mut output = Output {
+            stdout: format!("{}{nonce} skipped run: unless exited 0\n", guard::MARK).into_bytes(),
+            stderr: Vec::new(),
+            code: Some(0),
+            truncated: false,
+            abandoned: false,
+        };
+        assert_eq!(
+            guard_skip(&run, &mut output),
+            Some((
+                "skipped run: unless exited 0".to_owned(),
+                "unless exited 0".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_guarded_plugin_step_wraps_its_wrapped_reply() {
+        let mut step = plugin("p");
+        step.creates = Some("/x".to_owned());
+        let plugin_item = item(ItemKind::Step(step.clone()), &[], &[]);
+        let plugins = FakePlugins::new(|_, _| Ok("echo hi".to_owned()));
+        let run = step_run(
+            &with_env(),
+            Some(&mac()),
+            &plugin_item,
+            &step,
+            1,
+            &plugins,
+            &Cancel::new(),
+        )
+        .unwrap();
+        let RunKind::Step {
+            nonce: Some(nonce), ..
+        } = &run.kind
+        else {
+            panic!("{:?}", run.kind);
+        };
+        let body = guard::wrap(
+            &step.guards(),
+            "plugin p",
+            nonce.as_str(),
+            &crate::run::wrap("echo hi"),
+        );
+        assert_eq!(*run.run, format!("{APP}{body}"));
+        assert_eq!(run.shown(), "echo hi");
     }
 
     #[test]

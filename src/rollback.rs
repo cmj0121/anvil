@@ -675,6 +675,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             skipped,
+            reason: None,
             entry: dest.map_or(Entry::Script, |dest| Entry::File {
                 dest: dest.to_owned(),
             }),

@@ -18,6 +18,8 @@
 #   FAKE_SSH_RETRY_LOG      append `enter` and `leave` around the interactive attempt
 #   FAKE_SSH_CLIENT_EXIT    exit code of the client; unset runs the remote command
 #   FAKE_SSH_CLIENT_STDERR  stderr text of the client when FAKE_SSH_CLIENT_EXIT is set
+#   FAKE_SSH_CLIENT_STDOUT  stdout line the client prints before the remote command,
+#                           as a noisy login shell does
 # A master attempt that exits 0 writes the marker `<control dir>/<host>.master`;
 # `-O check` exits 0 while it exists, as with a live master.
 # A client runs its last argument (the remote command) with /bin/sh -c, in a
@@ -104,6 +106,7 @@ case "$kind" in
       exit "$FAKE_SSH_CLIENT_EXIT"
     fi
     for remote in "$@"; do :; done
+    [ -n "${FAKE_SSH_CLIENT_STDOUT-}" ] && printf '%s\n' "$FAKE_SSH_CLIENT_STDOUT"
     if [ "$tty" = yes ]; then
       export SHELL=/bin/sh
       script=/usr/bin/script

@@ -1796,6 +1796,8 @@ mod tests {
             kind: RunKind::Step {
                 number,
                 plugin: None,
+                guards: Default::default(),
+                nonce: None,
             },
             ..planned(run, None, RUN_TIMEOUT)
         }
@@ -1926,6 +1928,8 @@ mod tests {
             kind: RunKind::Step {
                 number,
                 plugin: Some(name.to_owned()),
+                guards: Default::default(),
+                nonce: None,
             },
             task: None,
             name: None,
@@ -2434,6 +2438,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
                 skipped: true,
+                reason: None,
                 entry: Entry::File {
                     dest: "/etc/b.conf".to_owned(),
                 },
@@ -3406,6 +3411,8 @@ mod tests {
         let step_kind = |number| RunKind::Step {
             number,
             plugin: None,
+            guards: Default::default(),
+            nonce: None,
         };
         let service = |name: &str, skip| RunKind::Service {
             name: name.to_owned(),
@@ -3976,6 +3983,7 @@ mod tests {
                     stdout: String::new(),
                     stderr: stderr.to_owned(),
                     skipped: false,
+                    reason: None,
                     entry: Entry::File {
                         dest: "/etc/a.conf".to_owned(),
                     },
