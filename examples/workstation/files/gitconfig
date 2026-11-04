@@ -1,0 +1,11 @@
+{# Rendered per target from vars and facts; this line is not written. #}
+[user]
+    name = {{ vars.git_name }}
+    email = {{ vars.git_email }}
+[core]
+    editor = {{ vars.editor | default("vi") }}
+    excludesFile = ~/.config/git/ignore
+{% if facts.os == "Darwin" %}
+[credential]
+    helper = osxkeychain
+{% endif %}

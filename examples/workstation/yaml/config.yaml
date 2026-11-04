@@ -17,5 +17,12 @@ files:
     tags:
       - local
     sudo: false
+  # No tags: rendered for every target from its own vars and facts (see inventory.yaml).
+  - src: files/gitconfig
+    dest: /home/dev/.config/git/config
+    mode: "0644"
+    sudo: false
+    template: true
+# GIT_PAGER comes from env in inventory.yaml.
 steps:
-  - run: git --version
+  - run: 'git --version && echo "pager: $GIT_PAGER"'

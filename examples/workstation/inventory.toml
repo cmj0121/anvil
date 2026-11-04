@@ -1,5 +1,19 @@
 # `local` (this machine) is always present and is not an entry here.
+
+[vars]                      # every target; files/gitconfig reads {{ vars.git_name }}
+git_name = "Dev"
+git_email = "dev@example.com"
+
+[env]                       # every target; steps read $GIT_PAGER
+GIT_PAGER = "less -FRX"
+
+[tags.local.vars]           # this machine only: replaces the global value
+git_email = "dev@home.example"
+
 [hosts.laptop]
 host = "203.0.113.20"
 user = "dev"
 tags = ["workstation"]
+
+[hosts.laptop.vars]         # this host only
+editor = "nvim"
