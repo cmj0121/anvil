@@ -63,6 +63,35 @@ pub enum Level {
     Host,
 }
 
+impl VarValue {
+    /// The value as JSON, shown as is.
+    pub fn to_json(&self) -> Value {
+        match self {
+            VarValue::Bool(b) => Value::Bool(*b),
+            VarValue::Int(n) => Value::from(*n),
+            VarValue::String(s) => Value::String(s.clone()),
+            VarValue::Array(items) => items.iter().map(VarValue::to_json).collect(),
+            VarValue::Table(table) => Value::Object(
+                table
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.to_json()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// `global`, `tag:NAME` or `host`.
+impl fmt::Display for Level {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Level::Global => f.write_str("global"),
+            Level::Tag(tag) => write!(f, "tag:{tag}"),
+            Level::Host => f.write_str("host"),
+        }
+    }
+}
+
 /// A target's values by key, each with the level that set it.
 pub type Resolved<T> = BTreeMap<String, (T, Level)>;
 
@@ -184,6 +213,15 @@ impl Inventory {
     /// Loads and validates the inventory; `None` is the empty document.
     pub fn load(doc: Option<&DocPath>) -> Result<Inventory, DocumentError> {
         document::load_or_default(doc, Inventory::validate)
+    }
+
+    /// The `[tags.NAME]` tables no host carries, `local` aside.
+    pub fn unused_tags(&self) -> Vec<&str> {
+        self.tags
+            .keys()
+            .filter(|tag| *tag != LOCAL && !self.hosts.values().any(|h| h.tags.contains(tag)))
+            .map(String::as_str)
+            .collect()
     }
 
     /// Checks every schema rule; the error names the host and the field.

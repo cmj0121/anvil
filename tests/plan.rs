@@ -512,3 +512,48 @@ fn a_plan_ended_by_sigterm_exits_143_and_names_why() {
         text(&out.stdout)
     );
 }
+
+#[test]
+fn each_target_shows_its_vars_and_env_with_their_level() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.write_config(
+        "inventory.toml",
+        "[vars]\nport = 80\n[env]\nAPP_ENV = \"dev\"\n[tags.web.vars]\nport = 8080\n\
+         [hosts.fake]\nhost = \"fakehost\"\ntags = [\"web\"]\n[hosts.fake.env]\nAPP_ENV = \"prod\"\n",
+    );
+    sandbox.write_config("config.toml", "[[steps]]\nrun = \"true\"\n");
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "▶ local\n  vars.port = 80 (global)\n  env.APP_ENV = dev (global)\n  \
+         would $ true\n  ✔ 1 step\n\n\
+         ▶ fake\n  vars.port = 8080 (tag:web)\n  env.APP_ENV = prod (host)\n  \
+         would $ true\n  ✔ 1 step\n\n\
+         2 targets, nothing executed\n"
+    );
+
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let levelled =
+        |value: serde_json::Value, level: &str| serde_json::json!({"value": value, "level": level});
+    assert_eq!(
+        json(&out)["targets"],
+        serde_json::json!([
+            {
+                "target": "local",
+                "vars": {"port": levelled(80.into(), "global")},
+                "env": {"APP_ENV": levelled("dev".into(), "global")},
+                "steps": [{"run": "true"}],
+                "ok": true,
+            },
+            {
+                "target": "fake",
+                "vars": {"port": levelled(8080.into(), "tag:web")},
+                "env": {"APP_ENV": levelled("prod".into(), "host")},
+                "steps": [{"run": "true"}],
+                "ok": true,
+            },
+        ])
+    );
+}

@@ -813,3 +813,80 @@ fn a_doctor_ended_by_sigterm_exits_143_and_names_why() {
         &serde_json::json!({"target": "beta", "connectable": false, "error": "terminated"})
     );
 }
+
+/// An inventory with vars and env at every level and an unused tag `db`.
+const LEVELLED: &str = "[vars]\nport = 80\nlist = [1, \"a\"]\n[env]\nAPP_ENV = \"dev\"\n\
+     [tags.web.vars]\nport = 8080\n[tags.db.vars]\nx = 1\n[tags.local.vars]\neditor = \"nvim\"\n\
+     [hosts.fake]\nhost = \"fakehost\"\ntags = [\"web\"]\n[hosts.fake.env]\nAPP_ENV = \"it's $HOME\"\n";
+
+fn levelled(value: serde_json::Value, level: &str) -> serde_json::Value {
+    serde_json::json!({"value": value, "level": level})
+}
+
+#[test]
+fn each_target_shows_its_vars_and_env_with_their_level() {
+    let sandbox = Sandbox::new("ad");
+    sandbox.write_config("inventory.toml", LEVELLED);
+    let out = sandbox.anvil(&["--json", "doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(
+        value["targets"][0]["vars"],
+        serde_json::json!({
+            "editor": levelled("nvim".into(), "tag:local"),
+            "list": levelled(serde_json::json!([1, "a"]), "global"),
+            "port": levelled(80.into(), "global"),
+        })
+    );
+    assert_eq!(
+        value["targets"][0]["env"],
+        serde_json::json!({"APP_ENV": levelled("dev".into(), "global")})
+    );
+    assert_eq!(value["targets"][1]["target"], "fake");
+    assert_eq!(
+        value["targets"][1]["vars"]["port"],
+        levelled(8080.into(), "tag:web")
+    );
+    assert_eq!(
+        value["targets"][1]["env"],
+        serde_json::json!({"APP_ENV": levelled("it's $HOME".into(), "host")})
+    );
+
+    let out = sandbox.anvil(&["doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    for row in [
+        "  vars.editor     \"nvim\" (tag:local)\n",
+        "  vars.list       [1,\"a\"] (global)\n",
+        "  vars.port       80 (global)\n  env.APP_ENV     dev (global)\n",
+        "  vars.port       8080 (tag:web)\n  env.APP_ENV     it's $HOME (host)\n",
+    ] {
+        assert!(stdout.contains(row), "{row:?} in {stdout}");
+    }
+}
+
+#[test]
+fn a_tag_no_host_carries_is_a_warning_that_exits_zero() {
+    let sandbox = Sandbox::new("ad");
+    sandbox.write_config("inventory.toml", LEVELLED);
+    let out = sandbox.anvil(&["--json", "-v", "doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    assert_eq!(value["local"]["unused_tags"], serde_json::json!(["db"]));
+    assert_eq!(value["ok"], true);
+    assert!(
+        text(&out.stderr).contains("WARN anvil::doctor: tag db: no host carries this tag"),
+        "{}",
+        text(&out.stderr)
+    );
+
+    let out = sandbox.anvil(&["doctor"], &[]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("  tag db          WARNING: no host carries this tag\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("tag web"), "{stdout}");
+    assert!(!stdout.contains("tag local"), "{stdout}");
+}

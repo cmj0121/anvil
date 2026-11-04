@@ -277,7 +277,7 @@ impl Options {
     }
 
     /// Selects this run's targets from an already loaded inventory.
-    fn select_targets(&self, inventory: Inventory) -> Result<Vec<Target>, Failure> {
+    pub(crate) fn select_targets(&self, inventory: Inventory) -> Result<Vec<Target>, Failure> {
         let sels: Vec<Sel> = self.target.iter().map(|sel| Sel::parse(sel)).collect();
         Ok(inventory.select(&sels)?)
     }

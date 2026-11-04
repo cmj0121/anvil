@@ -27,7 +27,7 @@ use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
 use crate::options::{Options, Output};
 use crate::plugin::Plugins;
 use crate::prepared::Prepared;
-use crate::report::{self, Escape, Line, Style, print_lines};
+use crate::report::{self, Escape, Line, Shown, Style, print_lines};
 use crate::status;
 use crate::step::PlannedRun;
 use crate::tasks::Expanded;
@@ -38,12 +38,22 @@ use crate::transport::{Transport, TransportError};
 pub enum PlanReport {
     Planned {
         target: String,
+        /// The target's resolved `vars`, each with its level.
+        #[serde(skip_serializing_if = "Shown::is_empty")]
+        vars: Shown,
+        /// The target's resolved `env`, each with its level.
+        #[serde(skip_serializing_if = "Shown::is_empty")]
+        env: Shown,
         steps: Vec<PlannedRun>,
         ok: bool,
     },
     /// The target could not be reached, probed or resolved.
     Failed {
         target: String,
+        #[serde(skip_serializing_if = "Shown::is_empty")]
+        vars: Shown,
+        #[serde(skip_serializing_if = "Shown::is_empty")]
+        env: Shown,
         error: String,
         ok: bool,
     },
@@ -52,6 +62,10 @@ pub enum PlanReport {
     /// the user.
     Cancelled {
         target: String,
+        #[serde(skip_serializing_if = "Shown::is_empty")]
+        vars: Shown,
+        #[serde(skip_serializing_if = "Shown::is_empty")]
+        env: Shown,
         ok: bool,
         #[serde(skip_serializing_if = "AbortReason::is_cancelled")]
         abort: AbortReason,
@@ -72,6 +86,15 @@ impl PlanReport {
             PlanReport::Planned { target, .. }
             | PlanReport::Failed { target, .. }
             | PlanReport::Cancelled { target, .. } => target,
+        }
+    }
+
+    /// The target's resolved `vars` and `env`.
+    pub fn values(&self) -> (&Shown, &Shown) {
+        match self {
+            PlanReport::Planned { vars, env, .. }
+            | PlanReport::Failed { vars, env, .. }
+            | PlanReport::Cancelled { vars, env, .. } => (vars, env),
         }
     }
 }
@@ -162,6 +185,8 @@ pub fn plan_targets(
 fn failed(target: &Target, error: String) -> PlanReport {
     PlanReport::Failed {
         target: target.name.clone(),
+        vars: report::shown_vars(target),
+        env: report::shown_env(target),
         error,
         ok: false,
     }
@@ -173,6 +198,8 @@ fn cancelled(target: &Target, cancel: &Cancel) -> PlanReport {
     log::info!("plan {}: cancelled", target.name);
     PlanReport::Cancelled {
         target: target.name.clone(),
+        vars: report::shown_vars(target),
+        env: report::shown_env(target),
         ok: false,
         abort: cancel.reason().unwrap_or(AbortReason::Cancelled),
     }
@@ -210,6 +237,8 @@ fn plan_target(
             log::info!("plan {}: {} steps", target.name, steps.len());
             PlanReport::Planned {
                 target: target.name.clone(),
+                vars: report::shown_vars(target),
+                env: report::shown_env(target),
                 steps,
                 ok: true,
             }
@@ -256,11 +285,16 @@ pub fn run(out: Output, opts: &Options) -> Result<(), Failure> {
     }
 }
 
-/// One target's block: a `▶ target` header, a `PATH  NAME` line per task and a
+/// One target's block: a `▶ target` header, a `vars.KEY = VALUE (LEVEL)` line
+/// per resolved var and env value, a `PATH  NAME` line per task and a
 /// `would $ command` line per step, then `✔ N steps`, `✘ reason` or `⊘ cancelled` (or its abort
 /// reason), then a blank line.
 pub fn render(report: &PlanReport) -> Vec<Line> {
     let mut lines = vec![Line::header(report.target())];
+    let (vars, env) = report.values();
+    for (key, value) in report::value_rows(vars, env) {
+        lines.push(Line::out(format!("{key} = {value}"), Escape::Always, None));
+    }
     let end = match report {
         PlanReport::Planned { steps, .. } => {
             for step in steps {
@@ -658,6 +692,8 @@ mod tests {
                  -z \"$a\" ] || sudo -n pacman -S --noconfirm --needed $a; }";
         let local = PlanReport::Planned {
             target: "local".to_owned(),
+            vars: Default::default(),
+            env: Default::default(),
             steps: vec![
                 PlannedRun {
                     run: one_liner.to_owned().into(),
@@ -726,6 +762,8 @@ mod tests {
             plan.targets[0],
             PlanReport::Failed {
                 target: "a".to_owned(),
+                vars: Default::default(),
+                env: Default::default(),
                 error: error.clone(),
                 ok: false,
             }
@@ -865,6 +903,51 @@ mod tests {
             serde_json::json!({"target": "a", "ok": false})
         );
         assert_eq!(screen(&plan.targets[0]), "▶ a\n  ⊘ cancelled\n\n");
+    }
+
+    /// `name` with a var from tag `web` and an env value from the host, each
+    /// carrying an invisible character.
+    fn valued(name: &str) -> Target {
+        use crate::inventory::{Level, VarValue};
+        Target {
+            vars: [(
+                "motd".to_owned(),
+                (
+                    VarValue::String("a\u{202e}b".to_owned()),
+                    Level::Tag("web".to_owned()),
+                ),
+            )]
+            .into(),
+            env: [("APP".to_owned(), ("x\u{200b}y".to_owned(), Level::Host))].into(),
+            ..target(name)
+        }
+    }
+
+    #[test]
+    fn failed_and_cancelled_targets_show_their_vars_and_env_escaped() {
+        let rows = "  vars.motd = \"a\\u{202e}b\" (tag:web)\n  env.APP = x\\u{200b}y (host)\n";
+        let failed = failed(&valued("a"), "probe: refused".to_owned());
+        assert_eq!(
+            screen(&failed),
+            format!("▶ a\n{rows}  ✘ probe: refused\n\n")
+        );
+        let cancelled = cancelled(&valued("b"), &Cancel::new());
+        assert_eq!(screen(&cancelled), format!("▶ b\n{rows}  ⊘ cancelled\n\n"));
+        let values = serde_json::json!({
+            "vars": {"motd": {"value": "a\u{202e}b", "level": "tag:web"}},
+            "env": {"APP": {"value": "x\u{200b}y", "level": "host"}},
+        });
+        for (report, rest) in [
+            (&failed, serde_json::json!({"error": "probe: refused"})),
+            (&cancelled, serde_json::json!({})),
+        ] {
+            let value = json(report);
+            assert_eq!(value["vars"], values["vars"]);
+            assert_eq!(value["env"], values["env"]);
+            for (key, expected) in rest.as_object().unwrap() {
+                assert_eq!(&value[key], expected);
+            }
+        }
     }
 
     #[test]
@@ -1022,6 +1105,8 @@ mod tests {
             plan.targets[2],
             PlanReport::Cancelled {
                 target: "c".to_owned(),
+                vars: Default::default(),
+                env: Default::default(),
                 ok: false,
                 abort: AbortReason::Cancelled,
             }
@@ -1040,7 +1125,9 @@ mod tests {
         );
         assert!(plan.targets[0].ok() && plan.targets[2].ok(), "{plan:?}");
         match &plan.targets[1] {
-            PlanReport::Failed { target, error, ok } => {
+            PlanReport::Failed {
+                target, error, ok, ..
+            } => {
                 assert_eq!((target.as_str(), *ok), ("b", false));
                 assert!(error.starts_with("internal error: "), "{error}");
                 assert!(error.contains("b blew up"), "{error}");

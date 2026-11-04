@@ -2,6 +2,7 @@
 //! report is shown, as blocks on the terminal or one JSON document.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::IsTerminal;
 
@@ -11,7 +12,7 @@ pub use crate::cancel::AbortReason;
 use crate::cancel::Cancel;
 use crate::error::{Failure, print_json};
 use crate::fanout::{self, Event};
-use crate::inventory::Target;
+use crate::inventory::{Resolved, Target, VarValue};
 use crate::logger::{
     BOLD_CYAN, DIM, GREEN, RED, YELLOW, escape_controls, escape_invisible, is_escaped, paint,
 };
@@ -271,6 +272,58 @@ pub fn ok_text(steps: usize) -> String {
 pub fn steps_text(steps: usize) -> String {
     let plural = if steps == 1 { "" } else { "s" };
     format!("{steps} step{plural}")
+}
+
+/// One resolved `vars` or `env` value as doctor and plan show it: as is,
+/// with the level that set it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShownValue {
+    pub value: serde_json::Value,
+    pub level: String,
+}
+
+/// A target's resolved `vars` or `env`, by key.
+pub type Shown = BTreeMap<String, ShownValue>;
+
+fn shown<T>(values: &Resolved<T>, to_json: impl Fn(&T) -> serde_json::Value) -> Shown {
+    values
+        .iter()
+        .map(|(key, (value, level))| {
+            let value = ShownValue {
+                value: to_json(value),
+                level: level.to_string(),
+            };
+            (key.clone(), value)
+        })
+        .collect()
+}
+
+/// `target`'s resolved `vars`.
+pub fn shown_vars(target: &Target) -> Shown {
+    shown(&target.vars, VarValue::to_json)
+}
+
+/// `target`'s resolved `env`.
+pub fn shown_env(target: &Target) -> Shown {
+    shown(&target.env, |value| value.clone().into())
+}
+
+/// `(vars.KEY, VALUE (LEVEL))` per var, then `(env.KEY, ...)` per env
+/// value: a var as JSON text, so its type shows, an env value as written;
+/// either with its invisible characters escaped.
+pub fn value_rows<'a>(
+    vars: &'a Shown,
+    env: &'a Shown,
+) -> impl Iterator<Item = (String, String)> + 'a {
+    let vars = vars.iter().map(|(key, shown)| {
+        let value = escape_invisible(&shown.value.to_string());
+        (format!("vars.{key}"), format!("{value} ({})", shown.level))
+    });
+    let env = env.iter().map(|(key, shown)| {
+        let value = escape_invisible(shown.value.as_str().unwrap_or_default());
+        (format!("env.{key}"), format!("{value} ({})", shown.level))
+    });
+    vars.chain(env)
 }
 
 #[derive(Debug, Serialize)]

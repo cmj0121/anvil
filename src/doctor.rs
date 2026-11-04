@@ -44,6 +44,7 @@ use crate::packages::{self, Choice};
 use crate::paths;
 use crate::plugin::{self, CurrentFile, DoctorRequest, Finding, Pin, Severity};
 use crate::record::{self, Record, TargetRecord};
+use crate::report::{self, Shown};
 use crate::secret::{self, SecretError, Store};
 use crate::status::{self, Phase};
 use crate::tasks::{Expanded, ItemKind};
@@ -91,7 +92,14 @@ pub struct LocalReport {
     /// With doctor plugins: why no tag key could be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag_key: Option<String>,
+    /// The `[tags.NAME]` tables no host carries, `local` aside: a warning
+    /// that does not affect exit.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unused_tags: Vec<String>,
 }
+
+/// Why an unused `[tags.NAME]` is a warning.
+const UNUSED_TAG: &str = "no host carries this tag";
 
 /// [`LocalReport::record`] for a record that does not exist, or does.
 const NO_RECORD: &str = "none";
@@ -128,6 +136,12 @@ impl LocalReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct TargetReport {
     pub target: String,
+    /// The target's resolved `vars`, each with its level.
+    #[serde(skip_serializing_if = "Shown::is_empty")]
+    pub vars: Shown,
+    /// The target's resolved `env`, each with its level.
+    #[serde(skip_serializing_if = "Shown::is_empty")]
+    pub env: Shown,
     pub connectable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facts: Option<Facts>,
@@ -287,9 +301,17 @@ pub fn check(
 ) -> Result<Report, Failure> {
     // Lenient on purpose: an unresolvable workspace falls back with a warning.
     // A refusal is not looked past, not even for the secret checks.
-    let targets = match opts.targets() {
+    let (targets, unused_tags) = match opts.inventory() {
         Err(failure) if failure.refused => return Err(failure),
-        targets => targets,
+        Err(failure) => (Err(failure), Vec::new()),
+        Ok(inventory) => {
+            let unused: Vec<String> = inventory
+                .unused_tags()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            (opts.select_targets(inventory), unused)
+        }
     };
     let names = required_names(config, expanded, targets.as_deref().unwrap_or_default());
     let secrets = check_secrets(&names, store)?;
@@ -299,6 +321,10 @@ pub fn check(
         Editor::resolve(config.anvil.editor.as_deref(), Fallback::Strict),
         secrets,
     );
+    for tag in &unused_tags {
+        log::warn!("tag {tag}: {UNUSED_TAG}");
+    }
+    local.unused_tags = unused_tags;
     let doctor = DoctorRun::prepare(config, &mut local);
     let mut cancelled = false;
     on(Progress::Begin(&targets));
@@ -353,6 +379,8 @@ fn cancelled_target(target: &Target, cancel: &Cancel) -> TargetReport {
     log::info!("doctor {}: cancelled", target.name);
     TargetReport {
         target: target.name.clone(),
+        vars: report::shown_vars(target),
+        env: report::shown_env(target),
         connectable: false,
         facts: None,
         error: Some(skipped(cancel).to_owned()),
@@ -685,6 +713,7 @@ fn local_checks(
         plugins: BTreeMap::new(),
         record: None,
         tag_key: None,
+        unused_tags: Vec::new(),
     }
 }
 
@@ -772,6 +801,8 @@ fn check_target(
     };
     TargetReport {
         target: target.name.clone(),
+        vars: report::shown_vars(target),
+        env: report::shown_env(target),
         connectable: facts.is_some(),
         facts,
         error,
@@ -961,10 +992,16 @@ fn render(report: &Report) -> String {
     if let Some(error) = &local.tag_key {
         let _ = writeln!(out, "  {:<15} error: {error}", "tag key");
     }
+    for tag in &local.unused_tags {
+        let _ = writeln!(out, "  {:<15} WARNING: {UNUSED_TAG}", format!("tag {tag}"));
+    }
     for target in &report.targets {
         let _ = writeln!(out, "\n{}", target.target);
         let _ = writeln!(out, "  {:<15} {}", "transport", target.transport);
         for (key, value) in target.facts.iter().flat_map(fact_rows) {
+            let _ = writeln!(out, "  {key:<15} {value}");
+        }
+        for (key, value) in report::value_rows(&target.vars, &target.env) {
             let _ = writeln!(out, "  {key:<15} {value}");
         }
         if let Some(manager) = &target.manager {

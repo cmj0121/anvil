@@ -2560,6 +2560,8 @@ mod tests {
         ));
         let plan = plan_block(&PlanReport::Planned {
             target: "local".to_owned(),
+            vars: Default::default(),
+            env: Default::default(),
             steps: vec![PlannedRun {
                 run: run.to_owned().into(),
                 label: None,
@@ -2652,6 +2654,8 @@ mod tests {
             RunResult::Plan {
                 targets: done(vec![PlanReport::Planned {
                     target: "local".to_owned(),
+                    vars: Default::default(),
+                    env: Default::default(),
                     steps: vec![PlannedRun {
                         run: "true".to_owned().into(),
                         label: None,
@@ -2687,6 +2691,8 @@ mod tests {
                 targets: done(vec![
                     PlanReport::Planned {
                         target: "local".to_owned(),
+                        vars: Default::default(),
+                        env: Default::default(),
                         steps: vec![
                             PlannedRun {
                                 run: "pacman -S git".to_owned().into(),
@@ -2711,11 +2717,15 @@ mod tests {
                     },
                     PlanReport::Failed {
                         target: "pi".to_owned(),
+                        vars: Default::default(),
+                        env: Default::default(),
                         error: "packages: probe exited 2".to_owned(),
                         ok: false,
                     },
                     PlanReport::Cancelled {
                         target: "mac".to_owned(),
+                        vars: Default::default(),
+                        env: Default::default(),
                         ok: false,
                         abort: report::AbortReason::Cancelled,
                     },
