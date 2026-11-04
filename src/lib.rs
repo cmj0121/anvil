@@ -41,6 +41,7 @@ mod ssh;
 pub mod status;
 pub mod step;
 pub mod tasks;
+pub mod template;
 pub mod term;
 #[cfg(any(test, feature = "test-util"))]
 #[cfg_attr(feature = "test-util", allow(clippy::disallowed_methods))]
