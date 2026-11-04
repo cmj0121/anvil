@@ -33,7 +33,8 @@ pub struct StepReport {
     /// nothing ran.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skipped: bool,
-    /// Why a guard skipped the step: `run` is then `skipped run: REASON`.
+    /// Why a guard skipped the step: `run` is then `skipped run: REASON`;
+    /// or why a handler could not run, `run` being the reason too.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip)]
@@ -44,6 +45,13 @@ pub struct StepReport {
     /// That task's `name`, if it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Whether the step changed something, so its `notify` fired: `None` for
+    /// the package step and `anvil run`, false for every skip and failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed: Option<bool>,
+    /// The `[[handlers]]` entry this step is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handler: Option<String>,
 }
 
 impl StepReport {
@@ -56,9 +64,13 @@ impl StepReport {
         }
     }
 
-    /// This step's task line in human output; `None` for a legacy entry.
+    /// This step's task line in human output, or `handler NAME`; `None`
+    /// for a legacy entry.
     pub fn title(&self) -> Option<String> {
-        task_title(self.task.as_deref(), self.name.as_deref())
+        match &self.handler {
+            Some(name) => Some(format!("handler {name}")),
+            None => task_title(self.task.as_deref(), self.name.as_deref()),
+        }
     }
 
     /// The step's `$` line text, unescaped but for a rollback note, which names
@@ -85,6 +97,8 @@ impl StepReport {
             entry,
             task: None,
             name: None,
+            changed: None,
+            handler: None,
         }
     }
 
@@ -100,6 +114,8 @@ impl StepReport {
             entry,
             task: None,
             name: None,
+            changed: None,
+            handler: None,
         }
     }
 
@@ -270,6 +286,15 @@ impl TargetReport {
             .iter()
             .enumerate()
             .rfind(|(_, step)| step.code != Some(0))?;
+        if let Some(name) = &step.handler {
+            if let Some(reason) = &step.reason {
+                return Some(format!("handler {name}: {reason}"));
+            }
+            return Some(match step.code {
+                Some(code) => format!("handler {name} exited {code}"),
+                None => format!("handler {name} was killed by a signal"),
+            });
+        }
         let number = index + 1;
         Some(match step.code {
             Some(code) => format!("step {number} exited {code}"),
@@ -777,6 +802,8 @@ pub(crate) mod tests {
             entry: Entry::Script,
             task: None,
             name: None,
+            changed: None,
+            handler: None,
         }
     }
 

@@ -1728,6 +1728,8 @@ pub mod tests {
             entry: anvil::step::Entry::Script,
             task: None,
             name: None,
+            changed: None,
+            handler: None,
         }
     }
 
@@ -1784,6 +1786,7 @@ pub mod tests {
             secrets: [("API".to_owned(), doctor::SecretStatus::Missing)].into(),
             plugins: Default::default(),
             record: None,
+            record_warnings: Vec::new(),
             tag_key: None,
             unused_tags: Vec::new(),
         }

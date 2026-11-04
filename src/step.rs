@@ -93,9 +93,19 @@ impl RunKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
     Packages,
-    File { dest: String },
-    Service { name: String },
-    Step { number: usize },
+    File {
+        dest: String,
+    },
+    Service {
+        name: String,
+    },
+    Step {
+        number: usize,
+    },
+    /// A `[[handlers]]` entry, run in the handler phase.
+    Handler {
+        name: String,
+    },
     Script,
 }
 

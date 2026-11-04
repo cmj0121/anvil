@@ -113,8 +113,8 @@ fn a_guard_skips_a_plugin_step_naming_the_plugin() {
         steps,
         &serde_json::json!([
             {"run": "skipped plugin harden: unless exited 0", "code": 0, "stdout": "",
-             "stderr": "", "skipped": true, "reason": "unless exited 0"},
-            {"run": SCRIPT, "code": 0, "stdout": "plugin-ran\n", "stderr": ""},
+             "stderr": "", "skipped": true, "reason": "unless exited 0", "changed": false},
+            {"run": SCRIPT, "code": 0, "stdout": "plugin-ran\n", "stderr": "", "changed": true},
         ])
     );
 

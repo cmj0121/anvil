@@ -1014,6 +1014,9 @@ fn local_block(local: &doctor::LocalReport) -> Vec<Line<'static>> {
             row("record", record)
         });
     }
+    for warning in &local.record_warnings {
+        lines.push(row("record", &format!("WARNING: {warning}")).style(Color::Yellow));
+    }
     if let Some(error) = &local.tag_key {
         lines.push(row("tag key", &format!("error: {error}")).style(Color::Red));
     }

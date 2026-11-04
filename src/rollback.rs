@@ -11,9 +11,11 @@
 //! Before any of it, each recorded dest must still be a `[[files]]` dest of
 //! the config with the same `sudo`, so that a record edited by hand cannot
 //! make rollback write, perhaps as root, a path the config never names. The
-//! sudo passwords come from the record's `sudo` flags. The only change a
-//! rollback makes to the record is `rolled_back`, the dests it put back, so
-//! a second rollback restores the same bytes. A file whose text was not kept
+//! sudo passwords come from the record's `sudo` flags. The only changes a
+//! rollback makes to the record are `rolled_back`, the dests it put back, so
+//! a second rollback restores the same bytes, and the `notify` names of the
+//! file items it restored, added to `pending_handlers` for the next apply to
+//! run: a rollback never runs a handler. A file whose text was not kept
 //! cannot be put back: it is named in its target's block, the summary and the
 //! JSON report, yet the exit stays 0, so that a repeat rollback stays
 //! idempotent.
@@ -154,6 +156,7 @@ pub fn run_targets(
     // unknown --force dest; the session reads the record again under it.
     check_force(&recorded(&path)?, &targets, force)?;
     let mut session = engine::open_record("rollback")?;
+    let warnings = session.take_warnings();
     let prepared = Prepared::rollback(opts, config, expanded, targets, &session, cancel)?;
     let targets = &prepared.targets;
     let entries: Vec<Option<TargetRecord>> = targets
@@ -203,7 +206,7 @@ pub fn run_targets(
     Ok(Report {
         targets: reports,
         ok,
-        warnings: Vec::new(),
+        warnings,
         not_restored,
         save_error,
     })
@@ -211,11 +214,11 @@ pub fn run_targets(
 
 /// Runs `roll` on each of `targets` with its entry of `entries` (a target
 /// without one is `nothing recorded`), `parallel` at a time, and saves each
-/// target's `rolled_back` into `session` as it ends. Once a save fails,
-/// `cancel` is stopped, so no further target starts and those left end as
-/// [`report::AbortReason::SaveFailed`], but every target that ends
-/// is still marked and saved: a later save that succeeds records the earlier
-/// ones too. The reports come back with the first save's error, followed by
+/// target's `rolled_back` and queued handlers into `session` as it ends.
+/// Once a save fails, `cancel` is stopped, so no further target starts and
+/// those left end as [`report::AbortReason::SaveFailed`], but every target
+/// that ends is still marked and saved: a later save that succeeds records
+/// the earlier ones too. The reports come back with the first save's error, followed by
 /// every target the record still lacks ([`engine::Saves`]), if one failed.
 fn roll_back_each(
     targets: &[Target],
@@ -238,6 +241,7 @@ fn roll_back_each(
                 if let Some(rolled_back) = &rolled.rolled_back {
                     let name = &targets[index].name;
                     session.mark_rolled_back(name, rolled_back.clone());
+                    session.add_pending(name, &rolled.queued);
                     saves.note(name, session.save().map(drop), cancel);
                 }
                 on(Event::Done(index, &rolled.report));
@@ -261,10 +265,12 @@ fn roll_back_each(
     (reports, saves.error())
 }
 
-/// One target's report, and the dests it put back, if any.
+/// One target's report, the dests it put back, if any, and the handlers
+/// their file items notify, for the next apply to run.
 struct RolledTarget {
     report: TargetReport,
     rolled_back: Option<RolledBack>,
+    queued: Vec<String>,
 }
 
 impl RolledTarget {
@@ -272,6 +278,7 @@ impl RolledTarget {
         RolledTarget {
             report,
             rolled_back: None,
+            queued: Vec::new(),
         }
     }
 }
@@ -362,6 +369,10 @@ fn roll_back(
         }
     }
     let dests = restored(report.steps());
+    let queued = queued(config, expanded, target, &entry.facts, &dests);
+    for name in &queued {
+        report.warn(format!("pending handler {name} queued for the next apply"));
+    }
     let rolled_back = (!dests.is_empty()).then(|| RolledBack {
         at: record::now(),
         dests,
@@ -369,7 +380,32 @@ fn roll_back(
     RolledTarget {
         report,
         rolled_back,
+        queued,
     }
+}
+
+/// The `[[handlers]]` names, in their order, that the file items restored
+/// here notify: those whose dest is one of `dests` and that apply to
+/// `target` by `facts`, the ones the record saved, as rollback never runs
+/// a handler or probes for one.
+fn queued(
+    config: &Config,
+    expanded: &Expanded,
+    target: &Target,
+    facts: &Facts,
+    dests: &[String],
+) -> Vec<String> {
+    let notified: Vec<&String> = expanded
+        .files()
+        .filter(|(item, entry, _)| {
+            item.matches(target, facts) && dests.iter().any(|d| expanded.same_dest(&entry.dest, d))
+        })
+        .flat_map(|(item, _, _)| &item.notify)
+        .collect();
+    (config.handlers.iter())
+        .filter(|handler| notified.contains(&&handler.name))
+        .map(|handler| handler.name.clone())
+        .collect()
 }
 
 /// The dests of the file steps that passed. A note's `dest` is `""` and it is
@@ -681,6 +717,8 @@ mod tests {
             }),
             task: None,
             name: None,
+            changed: None,
+            handler: None,
         };
         let steps = [
             step(None, Some(0), false),
@@ -729,6 +767,7 @@ mod tests {
             ],
             cannot_undo: vec!["packages".to_owned(), "step 2".to_owned()],
             rolled_back: None,
+            pending_handlers: Vec::new(),
         }
     }
 
@@ -820,6 +859,7 @@ mod tests {
                             at: 2,
                             dests: vec!["/etc/a".to_owned()],
                         }),
+                        queued: Vec::new(),
                     }
                 },
             );
@@ -888,6 +928,7 @@ mod tests {
                             at: 2,
                             dests: vec!["/etc/a".to_owned()],
                         }),
+                        queued: Vec::new(),
                     };
                 }
                 // b finds the token stopped, as `roll_back` does once a's save failed.
@@ -1102,6 +1143,7 @@ mod tests {
                 files: vec![record],
                 cannot_undo: Vec::new(),
                 rolled_back: None,
+                pending_handlers: Vec::new(),
             };
             for facts in [None, Some(&Facts::default())] {
                 assert_eq!(
@@ -1126,6 +1168,7 @@ mod tests {
             files: vec![record],
             cannot_undo: Vec::new(),
             rolled_back: None,
+            pending_handlers: Vec::new(),
         };
         let known = Facts::default();
         let (tasks, _) = two_writes((false, true), (false, true));
@@ -1166,6 +1209,7 @@ mod tests {
             files: vec![record.clone()],
             cannot_undo: Vec::new(),
             rolled_back: None,
+            pending_handlers: Vec::new(),
         };
         assert!(record.sudo);
         assert_eq!(
@@ -1199,6 +1243,7 @@ mod tests {
             files: vec![record],
             cannot_undo: Vec::new(),
             rolled_back: None,
+            pending_handlers: Vec::new(),
         };
         assert_eq!(
             super::check_files(&expanded, &web1(), None, &entry),
@@ -1223,6 +1268,7 @@ mod tests {
             files: vec![record(sudo)],
             cannot_undo: Vec::new(),
             rolled_back: None,
+            pending_handlers: Vec::new(),
         };
         config.files[0].sudo = false;
         config.files[1].sudo = true;

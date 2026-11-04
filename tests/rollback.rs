@@ -1088,3 +1088,85 @@ fn a_templated_file_records_its_rendered_hash_and_rolls_back_per_target() {
     assert_eq!(mode(&local), 0o644);
     assert!(!Path::new(&web).exists());
 }
+
+#[test]
+fn rollback_queues_the_handlers_of_the_files_it_restored_and_runs_none() {
+    let sandbox = Sandbox::new("rb");
+    let root = sandbox.root().display().to_string();
+    std::fs::create_dir(sandbox.root().join("out")).unwrap();
+    std::fs::write(sandbox.config_dir().join("motd.txt"), FILE_TEXT).unwrap();
+    let local = format!("{root}/out/local.conf");
+    std::fs::write(&local, PREVIOUS).unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let handler = |name: &str| {
+        format!("[[handlers]]\nname = \"{name}\"\nrun = \"echo {name} >> {root}/handled\"\n\n")
+    };
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"motd.txt\"\ndest = \"{local}\"\nmode = \"0644\"\nsudo = false\n\
+             notify = [\"flush\"]\n\n[[files]]\nsrc = \"motd.txt\"\ndest = \"{root}/out/web.conf\"\n\
+             mode = \"0644\"\nsudo = false\ntags = [\"web\"]\nnotify = [\"never\"]\n\n{}{}{}",
+            handler("log"),
+            handler("never"),
+            handler("flush"),
+        ),
+    );
+    let handled = || std::fs::read_to_string(sandbox.root().join("handled")).unwrap();
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(handled(), "flush\n");
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    record["targets"]["local"]["pending_handlers"] = serde_json::json!(["log", "log"]);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    let out = sandbox.anvil(&["--json", "rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let dropped = format!(
+        "{}: local: dropped 1 bad pending_handlers entries",
+        path.display()
+    );
+    assert_eq!(
+        text(&out.stderr),
+        format!("{dropped}\n"),
+        "shown without -v"
+    );
+    assert_eq!(json(&out)["warnings"], serde_json::json!([dropped]));
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), PREVIOUS);
+    assert_eq!(
+        json(&out)["targets"][0]["warnings"],
+        serde_json::json!(["pending handler flush queued for the next apply"]),
+        "not never: its file was not restored here"
+    );
+    assert_eq!(handled(), "flush\n", "rollback runs no handler");
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["pending_handlers"],
+        serde_json::json!(["log", "flush"]),
+        "the list is kept and the restored file's notify added"
+    );
+    let out = sandbox.anvil(&["rollback"], &[]);
+    assert!(
+        text(&out.stdout).contains("  ⚠ pending handler flush queued for the next apply\n"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(
+        sandbox.last_apply().unwrap()["targets"]["local"]["pending_handlers"],
+        serde_json::json!(["log", "flush"])
+    );
+
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        handled(),
+        "flush\nlog\nflush\n",
+        "[[handlers]] order, once each"
+    );
+    assert!(
+        sandbox.last_apply().unwrap()["targets"]["local"]
+            .get("pending_handlers")
+            .is_none()
+    );
+}

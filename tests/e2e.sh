@@ -260,7 +260,7 @@ else
 fi
 anvil apply --json --target local --target arch
 code=$?
-step_json() { printf '{"run":"hostname","code":0,"stdout":"%s\\n","stderr":""}' "$1"; }
+step_json() { printf '{"run":"hostname","code":0,"stdout":"%s\\n","stderr":"","changed":true}' "$1"; }
 expected=$(printf '{"targets":[{"target":"local","steps":[%s],"ok":true},{"target":"arch","steps":[%s],"ok":true}],"ok":true}' \
   "$(step_json "$LOCAL_HOSTNAME")" "$(step_json "$REMOTE_HOSTNAME")")
 if [ "$code" -eq 0 ] && [ "$(cat "$TMP/out")" = "$expected" ]; then
@@ -1410,6 +1410,37 @@ CONF
     pass "an unknown unit fails archsd; arch skips it (no match) and runs hostname"
   else
     fail "apply anvil-e2e-missing: exit $code"
+  fi
+  # A [[handlers]] restart, notified by the service step only when it changed.
+  cat >"$SVC_DIR/handler.toml" <<CONF
+[[services]]
+name = "anvil-e2e"
+state = "started"
+tags = ["sd"]
+notify = ["restart e2e"]
+
+[[handlers]]
+name = "restart e2e"
+service = { name = "anvil-e2e", state = "restarted" }
+CONF
+  anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/handler.toml" apply --target sd
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  started service anvil-e2e' "$TMP/out" \
+    && grep -qxF '  handler restart e2e' "$TMP/out" && grep -qxF '  restarted service anvil-e2e' "$TMP/out" \
+    && svc_unit active disabled && [ "$(svc_sudo restart)" -eq 1 ]; then
+    pass "a started service notifies its restarted handler, which runs after it"
+  else
+    fail "apply handler.toml: exit $code"
+    cat "$TMP/out"
+  fi
+  anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$SVC_DIR/handler.toml" apply --target sd
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  unchanged service anvil-e2e' "$TMP/out" \
+    && ! grep -qF 'handler restart e2e' "$TMP/out" && [ "$(svc_sudo restart)" -eq 1 ]; then
+    pass "an unchanged service notifies nothing: no restart"
+  else
+    fail "rerun handler.toml: exit $code"
+    cat "$TMP/out"
   fi
 else
   printf 'SKIP  systemd: %s (%s)\n' "$sd_skip" "$(took)"

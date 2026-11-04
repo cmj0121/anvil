@@ -114,7 +114,10 @@ impl Expanded {
     }
 
     /// The sudo secrets a step may type on a target its tags reach: for a
-    /// package item, a `sudo = true` file item or a service item.
+    /// package item, a `sudo = true` file item or a service item; and on
+    /// any target for a service handler, deliberately broad: which handlers
+    /// are due is known only after the steps. A secret that is not set
+    /// fails a target only once one of its service handlers is due.
     pub fn sudo_secrets<'a>(
         &'a self,
         config: &'a Config,
@@ -136,6 +139,15 @@ impl Expanded {
                 }
                 ItemKind::Step(_) => {}
             }
+        }
+        if config
+            .handlers
+            .iter()
+            .any(|handler| handler.service.is_some())
+        {
+            names.extend(
+                (targets.iter()).filter_map(|target| files::sudo_secret_for(config, target)),
+            );
         }
         names
     }

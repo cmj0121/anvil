@@ -30,8 +30,9 @@ use serde_json::json;
 use zeroize::Zeroizing;
 
 use crate::bytes::{self, CappedError};
-use crate::config::{check_dest, is_mode, is_sha256};
+use crate::config::{MAX_HANDLERS, check_dest, is_handler_name, is_mode, is_sha256};
 use crate::facts::Facts;
+use crate::logger::escape_invisible;
 use crate::paths::{self, PathsError};
 use crate::private::{self, LockError};
 use crate::trust::{self, TrustError};
@@ -86,6 +87,24 @@ pub struct TargetRecord {
     pub cannot_undo: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rolled_back: Option<RolledBack>,
+    /// The handlers notified on the target that have not run and exited 0
+    /// since, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_handlers: Vec<String>,
+}
+
+impl TargetRecord {
+    /// Drops the pending handlers apply could not have saved: invalid names,
+    /// then repeats (the first kept), then all past [`MAX_HANDLERS`]; how
+    /// many it dropped.
+    fn drop_bad_pending(&mut self) -> usize {
+        let before = self.pending_handlers.len();
+        let mut seen = BTreeSet::new();
+        self.pending_handlers
+            .retain(|name| is_handler_name(name) && seen.insert(name.clone()));
+        self.pending_handlers.truncate(MAX_HANDLERS);
+        before - self.pending_handlers.len()
+    }
 }
 
 /// One file the apply wrote.
@@ -300,12 +319,24 @@ fn read_record(file: impl Read, size: u64, bytes: &mut Vec<u8>) -> Result<(), St
 /// followed or waited on), at most [`MAX_RECORD`] bytes, version
 /// [`VERSION`] and valid JSON with no `refused` write, which is never
 /// stored, and whose every file has a dest the config would accept, octal
-/// modes and hex hashes; errors never quote the content.
+/// modes and hex hashes; errors never quote the content. Pending handlers
+/// apply could not have saved are dropped instead, with one warning per
+/// target, logged; [`load_warned`] returns them to show.
 pub fn load(path: &Path) -> Result<Option<Record>, String> {
+    let (record, warnings) = load_warned(path)?;
+    for warning in warnings {
+        log::warn!("{warning}");
+    }
+    Ok(record)
+}
+
+/// [`load`], and the warning of each target whose bad pending handlers it
+/// dropped, not logged.
+pub fn load_warned(path: &Path) -> Result<(Option<Record>, Vec<String>), String> {
     let shown = path.display();
     let (file, meta) = match trust::open(path, trust::PRIVATE) {
         Ok(opened) => opened,
-        Err(TrustError::NotFound { .. }) => return Ok(None),
+        Err(TrustError::NotFound { .. }) => return Ok((None, Vec::new())),
         Err(err) => return Err(err.to_string()),
     };
     if meta.size() > MAX_RECORD as u64 {
@@ -321,7 +352,7 @@ pub fn load(path: &Path) -> Result<Option<Record>, String> {
     }
     // One full parse; only a record that does not parse is read again, for
     // a version to name.
-    let record: Record = match serde_json::from_slice(&bytes) {
+    let mut record: Record = match serde_json::from_slice(&bytes) {
         Ok(record) => record,
         Err(_) => {
             return Err(match serde_json::from_slice::<Versioned>(&bytes) {
@@ -341,7 +372,28 @@ pub fn load(path: &Path) -> Result<Option<Record>, String> {
     if bad {
         return Err(cannot_parse());
     }
-    Ok(Some(record))
+    let mut warnings = Vec::new();
+    for (name, target) in &mut record.targets {
+        let dropped = target.drop_bad_pending();
+        if dropped > 0 {
+            let name = escape_invisible(name);
+            warnings.push(format!(
+                "{shown}: {name}: dropped {dropped} bad pending_handlers entries"
+            ));
+        }
+    }
+    Ok((Some(record), warnings))
+}
+
+/// Appends each of `names` not in `list` yet, in order; whether it grew.
+pub(crate) fn push_unique(list: &mut Vec<String>, names: &[String]) -> bool {
+    let before = list.len();
+    for name in names {
+        if !list.contains(name) {
+            list.push(name.clone());
+        }
+    }
+    list.len() > before
 }
 
 /// Whether `s` is a sha256 as the record stores it: empty, or 64 lowercase
@@ -390,6 +442,8 @@ pub struct Session {
     dropped: BTreeSet<(String, String)>,
     /// The most bytes a save writes: [`MAX_RECORD`] but in tests.
     limit: usize,
+    /// What the load warned of, not yet taken.
+    warnings: Vec<String>,
 }
 
 impl Session {
@@ -408,7 +462,8 @@ impl Session {
             }
             _ => err.to_string(),
         })?;
-        let record = load(path)?.unwrap_or_default();
+        let (record, warnings) = load_warned(path)?;
+        let record = record.unwrap_or_default();
         Ok(Session {
             path: path.to_path_buf(),
             _lock: lock,
@@ -417,7 +472,14 @@ impl Session {
             base: BTreeMap::new(),
             dropped: BTreeSet::new(),
             limit: MAX_RECORD,
+            warnings,
         })
+    }
+
+    /// What loading the record warned of: the targets whose bad pending
+    /// handlers it dropped. Empty once taken.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Replaces `name`'s entry with `target`, what this apply has written
@@ -513,14 +575,19 @@ impl Session {
     }
 
     /// Records that this apply reached `name` but wrote no file there:
-    /// its entry's `at`, anvil version and facts become `target`'s, while
-    /// its files, `ok` and `cannot_undo` stay, as a rollback still needs
-    /// them; with no entry, `target` becomes it. A `rolled_back` newer than
-    /// the old `at` moves to the new one, as no write has come since.
+    /// its entry's `at`, anvil version, facts and pending handlers become
+    /// `target`'s, while its files, `ok` and `cannot_undo` stay, as a
+    /// rollback still needs them; with no entry before this apply, `target`
+    /// becomes it. A `rolled_back` newer than the old `at` moves to the new
+    /// one, as no write has come since.
     pub fn refresh(&mut self, name: &str, target: TargetRecord) {
-        let Some(old) = self.record.targets.get_mut(name) else {
-            self.record.targets.insert(name.to_owned(), target);
-            return;
+        let new_here = matches!(self.base.get(name), Some(None));
+        let old = match self.record.targets.get_mut(name) {
+            Some(old) if !new_here => old,
+            _ => {
+                self.record.targets.insert(name.to_owned(), target);
+                return;
+            }
         };
         if let Some(rolled_back) = &mut old.rolled_back
             && rolled_back.at >= old.at
@@ -530,9 +597,41 @@ impl Session {
         old.at = target.at;
         old.anvil = target.anvil;
         old.facts = target.facts;
+        old.pending_handlers = target.pending_handlers;
     }
 
-    /// Sets `rolled_back` on `name`'s entry, the only change a rollback makes.
+    /// Sets `name`'s pending handlers to `pending`, as this apply notified or
+    /// ran them; with no entry yet, `fallback` becomes it. A later merge or
+    /// refresh still goes against the entry as loaded.
+    pub fn set_pending(
+        &mut self,
+        name: &str,
+        pending: Vec<String>,
+        fallback: impl FnOnce() -> TargetRecord,
+    ) {
+        let current = self.record.targets.get(name);
+        (self.base.entry(name.to_owned())).or_insert_with(|| current.cloned());
+        match self.record.targets.get_mut(name) {
+            Some(target) => target.pending_handlers = pending,
+            None => {
+                let target = TargetRecord {
+                    pending_handlers: pending,
+                    ..fallback()
+                };
+                self.record.targets.insert(name.to_owned(), target);
+            }
+        }
+    }
+
+    /// Adds each of `names` not pending yet to `name`'s pending handlers,
+    /// as a rollback queues them; no entry, no change.
+    pub fn add_pending(&mut self, name: &str, names: &[String]) {
+        if let Some(target) = self.record.targets.get_mut(name) {
+            push_unique(&mut target.pending_handlers, names);
+        }
+    }
+
+    /// Sets `rolled_back` on `name`'s entry; its pending handlers stay.
     pub fn mark_rolled_back(&mut self, name: &str, rolled_back: RolledBack) {
         if let Some(target) = self.record.targets.get_mut(name) {
             target.rolled_back = Some(rolled_back);
@@ -816,6 +915,7 @@ mod tests {
             files,
             cannot_undo: vec!["packages".to_owned(), "step 4".to_owned()],
             rolled_back: None,
+            pending_handlers: Vec::new(),
         }
     }
 
@@ -921,6 +1021,106 @@ mod tests {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(path, bytes).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn load_drops_bad_pending_handlers_and_reads_a_record_without_them() {
+        let (path, root) = record_path("record-pending");
+        let mut old = serde_json::to_value(target(1, true, Vec::new())).unwrap();
+        assert!(old.get("pending_handlers").is_none(), "empty is left out");
+        let mut bad = old.clone();
+        let many: Vec<String> = (0..70).map(|i| format!("h{i}")).collect();
+        bad["pending_handlers"] = json!(["reload sshd", "bad/name", "", "reload sshd", "flush"]);
+        old["pending_handlers"] = json!(many);
+        let record = json!({"version": 1, "targets": {"web1": bad, "db1": old, "x": target(1, true, Vec::new())}});
+        plant(&path, &serde_json::to_vec(&record).unwrap());
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(
+            loaded.targets["web1"].pending_handlers,
+            names(&["reload sshd", "flush"])
+        );
+        assert_eq!(loaded.targets["db1"].pending_handlers, many[..64]);
+        assert!(
+            loaded.targets["x"].pending_handlers.is_empty(),
+            "an older record loads"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn set_pending_changes_only_the_list_or_inserts_the_fallback() {
+        let old = target(
+            1,
+            false,
+            vec![file("/etc/a", &sha('a'), Write::Written, Previous::Absent)],
+        );
+        let (mut session, root) = session_with("record-set-pending", vec![("web1", old.clone())]);
+        session.set_pending("web1", names(&["flush"]), || target(5, false, Vec::new()));
+        assert_eq!(
+            session.record.targets["web1"],
+            TargetRecord {
+                pending_handlers: names(&["flush"]),
+                ..old.clone()
+            }
+        );
+        session.set_pending("db1", names(&["log"]), || target(5, false, Vec::new()));
+        assert_eq!(session.record.targets["db1"].at, 5);
+        assert_eq!(
+            session.record.targets["db1"].pending_handlers,
+            names(&["log"])
+        );
+
+        // The end of the apply: the merge and the refresh take the list as given.
+        let mut ended = target(6, true, Vec::new());
+        ended.pending_handlers = names(&["log", "flush"]);
+        session.refresh("db1", ended.clone());
+        assert_eq!(
+            session.record.targets["db1"], ended,
+            "an entry this apply made is replaced whole"
+        );
+        session.refresh("web1", ended.clone());
+        let web1 = &session.record.targets["web1"];
+        assert_eq!((web1.at, &web1.files), (6, &old.files));
+        assert_eq!(web1.pending_handlers, names(&["log", "flush"]));
+        ended.pending_handlers = Vec::new();
+        session.merge("web1", ended.clone());
+        assert!(session.record.targets["web1"].pending_handlers.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn add_pending_appends_the_names_missing_and_a_rollback_mark_keeps_them() {
+        let mut old = target(1, true, Vec::new());
+        old.pending_handlers = names(&["log"]);
+        let (mut session, root) = session_with("record-add-pending", vec![("web1", old)]);
+        session.add_pending("web1", &names(&["flush", "log", "reload"]));
+        session.add_pending("db1", &names(&["flush"]));
+        session.mark_rolled_back(
+            "web1",
+            RolledBack {
+                at: 2,
+                dests: vec!["/etc/a".to_owned()],
+            },
+        );
+        assert_eq!(
+            session.record.targets["web1"].pending_handlers,
+            names(&["log", "flush", "reload"])
+        );
+        assert!(
+            !session.record.targets.contains_key("db1"),
+            "no entry, no change"
+        );
+        session.save().unwrap();
+        let loaded = load(&session.path).unwrap().unwrap();
+        assert_eq!(
+            loaded.targets["web1"].pending_handlers,
+            names(&["log", "flush", "reload"])
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

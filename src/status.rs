@@ -36,7 +36,8 @@ const TICK: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Probe,
-    /// A run of `execute_inner`: `kind` is "packages" | "files" | "services" | "step"; shown `kind n/of`.
+    /// A run of `execute_inner` or the handler phase: `kind` is "packages" |
+    /// "files" | "services" | "step" | "handler"; shown `kind n/of`.
     Run {
         kind: &'static str,
         n: usize,

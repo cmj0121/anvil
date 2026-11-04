@@ -36,6 +36,12 @@
 //! target the probe reached is saved as it ends, with its facts and, per
 //! file written, what DEST held before, read back by a capture run right
 //! before the write, which then refuses to write if DEST changed meanwhile.
+//!
+//! A step that changed something notifies its `notify` handlers: each name
+//! is saved to the target's `pending_handlers` in the record at once. After
+//! the target's last step, when every step passed, each `[[handlers]]` entry
+//! pending from an earlier apply or notified now runs once, in config order,
+//! and leaves the list only once it exited 0.
 
 use std::num::NonZeroU8;
 use std::sync::Arc;
@@ -44,7 +50,7 @@ use crate::cancel::Cancel;
 use crate::config::{Config, Plugin};
 use crate::engine::{
     Journal, Passwords, Reached, Recorder, Unresolved, cannot_undo, execute, open_record, probe,
-    resolve,
+    resolve, run_handlers,
 };
 use crate::error::Failure;
 use crate::fanout::{self, Event};
@@ -198,9 +204,11 @@ pub fn run(out: Output, opts: &Options) -> Result<(), Failure> {
 
 /// Whether apply probes each target: the list has package, file or service
 /// items, a plugin step, or an item selecting on facts, or a doctor plugin is
-/// configured (its drift needs the facts).
+/// configured (its drift needs the facts), or `[[handlers]]` are (their
+/// pending list lives in the record).
 fn needs_facts(config: &Config, expanded: &Expanded) -> bool {
-    config.plugins.values().any(Plugin::is_doctor)
+    !config.handlers.is_empty()
+        || config.plugins.values().any(Plugin::is_doctor)
         || expanded.items.iter().any(|item| {
             !item.facts.is_empty()
                 || match &item.kind {
@@ -211,9 +219,11 @@ fn needs_facts(config: &Config, expanded: &Expanded) -> bool {
 }
 
 /// Probes `target` when [`needs_facts`], then runs the steps [`resolve`]
-/// lists; `passwords` holds the sudo passwords to type. A target the probe
-/// reached comes back with its record: its facts, each file written with
-/// what DEST held before, and the steps that ran but cannot be undone.
+/// lists, then the handler phase ([`run_handlers`]); `passwords` holds the
+/// sudo passwords to type. A target the probe reached comes back with its
+/// record: its facts, each file written with what DEST held before, the
+/// steps that ran but cannot be undone, and the handlers still pending. A
+/// pending name `[[handlers]]` no longer has is dropped with a warning.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one input of the target's apply, passed through"
@@ -254,7 +264,14 @@ fn apply_target(
     } else {
         None
     };
-    let mut recorder = Recorder::new(expanded, sources, target, facts.as_ref(), journal);
+    let mut recorder = Recorder::new(
+        expanded,
+        sources,
+        target,
+        &config.handlers,
+        facts.as_ref(),
+        journal,
+    );
     let resolved = resolve(
         target,
         facts.as_ref(),
@@ -264,19 +281,37 @@ fn apply_target(
         plugins,
         cancel,
     );
-    let report = match resolved {
-        Ok(runs) => execute(
-            "apply",
-            target,
-            transport.as_ref(),
-            &runs,
-            passwords,
-            cancel,
-            Some(&mut recorder),
-        ),
+    let mut report = match resolved {
+        Ok(runs) => {
+            let report = execute(
+                "apply",
+                target,
+                transport.as_ref(),
+                &runs,
+                passwords,
+                cancel,
+                Some(&mut recorder),
+            );
+            run_handlers(
+                "apply",
+                target,
+                transport.as_ref(),
+                config,
+                facts.as_ref(),
+                passwords,
+                cancel,
+                &mut recorder,
+                report,
+            )
+        }
         Err(Unresolved::Failed(error)) => failed("apply", target, Vec::new(), error),
         Err(Unresolved::Cancelled) => cancelled("apply", target, Vec::new(), cancel),
     };
+    for name in &recorder.stale {
+        let warning = format!("pending handler `{name}` is not in [[handlers]]; dropped");
+        log::warn!("apply {}: {warning}", target.name);
+        report.warn(warning);
+    }
     let reached = recorder.finish(report.ok(), cannot_undo(report.steps()));
     Applied { report, reached }
 }
@@ -747,6 +782,7 @@ mod tests {
             entry: Entry::File {
                 dest: "/etc/b.conf".to_owned(),
             },
+            changed: Some(false),
             ..step("file /etc/b.conf", code, stdout, stderr)
         }
     }
@@ -763,12 +799,12 @@ mod tests {
         assert_eq!(
             value["steps"],
             serde_json::json!([
-                {"run": "one", "code": 0, "stdout": "one-out\n", "stderr": ""},
-                {"run": "two", "code": 0, "stdout": "two-out\n", "stderr": ""},
+                {"run": "one", "code": 0, "stdout": "one-out\n", "stderr": "", "changed": true},
+                {"run": "two", "code": 0, "stdout": "two-out\n", "stderr": "", "changed": true},
             ])
         );
         for step in value["steps"].as_array().unwrap() {
-            assert_eq!(keys(step), ["code", "run", "stderr", "stdout"]);
+            assert_eq!(keys(step), ["changed", "code", "run", "stderr", "stdout"]);
         }
     }
 
@@ -781,7 +817,7 @@ mod tests {
         assert_eq!(value["ok"], false);
         assert_eq!(
             value["steps"][1],
-            serde_json::json!({"run": "fail", "code": 3, "stdout": "partial\n", "stderr": "boom\n"})
+            serde_json::json!({"run": "fail", "code": 3, "stdout": "partial\n", "stderr": "boom\n", "changed": false})
         );
         assert_eq!(value["steps"].as_array().unwrap().len(), 2);
     }
@@ -835,7 +871,7 @@ mod tests {
             value,
             serde_json::json!({
                 "target": "box",
-                "steps": [{"run": "one", "code": 0, "stdout": "one-out\n", "stderr": ""}],
+                "steps": [{"run": "one", "code": 0, "stdout": "one-out\n", "stderr": "", "changed": true}],
                 "error": "timed out after 30 s",
                 "ok": false,
             })
@@ -869,8 +905,8 @@ mod tests {
             serde_json::json!({
                 "target": "box",
                 "steps": [
-                    {"run": "one", "code": 0, "stdout": "one-out\n", "stderr": ""},
-                    {"run": "slow", "code": null, "stdout": "start\n", "stderr": "warn\n"},
+                    {"run": "one", "code": 0, "stdout": "one-out\n", "stderr": "", "changed": true},
+                    {"run": "slow", "code": null, "stdout": "start\n", "stderr": "warn\n", "changed": false},
                 ],
                 "error": "timed out after 30 s",
                 "ok": false,
@@ -1095,8 +1131,8 @@ mod tests {
             serde_json::json!({
                 "target": "a",
                 "steps": [
-                    {"run": "one", "code": 0, "stdout": "one-out\n", "stderr": ""},
-                    {"run": "stop", "code": 0, "stdout": "stop-out\n", "stderr": ""},
+                    {"run": "one", "code": 0, "stdout": "one-out\n", "stderr": "", "changed": true},
+                    {"run": "stop", "code": 0, "stdout": "stop-out\n", "stderr": "", "changed": true},
                 ],
                 "ok": false,
             })
@@ -2447,13 +2483,15 @@ mod tests {
                 },
                 task: None,
                 name: None,
+                changed: Some(false),
+                handler: None,
             }
         );
         let value = json(&report);
         assert_eq!(value["steps"][2]["skipped"], true);
         assert_eq!(
             keys(&value["steps"][1]),
-            ["code", "run", "stderr", "stdout"],
+            ["changed", "code", "run", "stderr", "stdout"],
             "skipped only when true"
         );
         assert_eq!(report.failure(), None);
@@ -3387,6 +3425,7 @@ mod tests {
             );
             let ran = StepReport {
                 entry: Entry::Step { number: 1 },
+                changed: Some(true),
                 ..step("meet", Some(0), "meet-out\n", "")
             };
             let expected: Vec<TargetReport> = [("a", true), ("b", parallel == 2), ("c", false)]
@@ -3993,6 +4032,8 @@ mod tests {
                     },
                     task: None,
                     name: None,
+                    changed: Some(false),
+                    handler: None,
                 }]
             );
             let reached = applied.reached.unwrap();
@@ -5093,5 +5134,107 @@ mod tests {
         assert!(reached.wrote);
         assert_eq!(reached.record.files.len(), 1);
         assert_eq!(reached.record.files[0].mode, "0600");
+    }
+
+    /// Applies `["one"]`, notifying `svc` and `after` when `notify`, to
+    /// `target` probing as `probe`, with `[[handlers]]` `svc` restarting
+    /// `sshd` then `after` running `echo after`, recorded in the session at
+    /// `path`; the target's report and its pending handlers.
+    fn apply_svc_handler(
+        path: &std::path::Path,
+        target: &Target,
+        probe: &'static str,
+        notify: bool,
+    ) -> (TargetReport, Vec<String>) {
+        let mut step = Step::script("one");
+        if notify {
+            step.notify = vec!["svc".to_owned(), "after".to_owned()];
+        }
+        let config = Config {
+            steps: vec![step],
+            handlers: vec![
+                crate::config::Handler {
+                    name: "svc".to_owned(),
+                    run: None,
+                    service: Some(service_entry("sshd", "restarted", None, &[])),
+                },
+                crate::config::Handler {
+                    name: "after".to_owned(),
+                    run: Some("echo after".to_owned()),
+                    service: None,
+                },
+            ],
+            ..Config::default()
+        };
+        let report = apply_targets(
+            std::slice::from_ref(target),
+            ONE,
+            |_| {
+                Ok(Box::new(Fake {
+                    probe,
+                    ..Fake::new(&Arc::default())
+                }))
+            },
+            &config,
+            &Sources::default(),
+            &FakePlugins::none(),
+            &Passwords::new(),
+            &Cancel::new(),
+            Some(Session::open(path).unwrap()),
+            &mut |_| {},
+        );
+        let record = record::load(path).unwrap().unwrap();
+        let pending = record.targets[&target.name].pending_handlers.clone();
+        (report.targets.into_iter().next().unwrap(), pending)
+    }
+
+    #[test]
+    fn a_service_handler_a_target_cannot_run_fails_it_only_once_due() {
+        let mut with_secret = target("a");
+        with_secret.sudo_secret = Some("A_SUDO".to_owned());
+        let arch_password = "distro=arch\nuser=cmj\nsudo=binary\npkg=pacman\nanvil-probe-end=1\n";
+        for (host, probe, why) in [
+            (
+                target("a"),
+                "distro=plan9\nuser=cmj\nsudo=nopasswd\nanvil-probe-end=1\n",
+                "services: no init known for distro `plan9`",
+            ),
+            (
+                target("a"),
+                arch_password,
+                "services: sudo asks for a password",
+            ),
+            (
+                with_secret,
+                arch_password,
+                "services: secret A_SUDO is not set",
+            ),
+        ] {
+            let root = crate::test_util::temp_dir("apply-svc-handler");
+            let path = root.join("state/anvil/last-apply.json");
+            let (report, pending) = apply_svc_handler(&path, &host, probe, false);
+            assert!(report.ok(), "not due, never resolved: {report:?}");
+            assert!(pending.is_empty());
+            for notify in [true, false] {
+                let (report, pending) = apply_svc_handler(&path, &host, probe, notify);
+                assert!(
+                    matches!(report, TargetReport::Ran { ok: false, .. }),
+                    "{report:?}"
+                );
+                let error = report.failure().unwrap();
+                assert!(error.starts_with(&format!("handler svc: {why}")), "{error}");
+                let steps = report.steps();
+                let svc = &steps[1];
+                assert_eq!(svc.handler.as_deref(), Some("svc"));
+                assert_eq!((svc.code, svc.changed), (None, Some(false)));
+                assert!(svc.run.starts_with(why), "{svc:?}");
+                let after: Vec<_> = steps[2..].iter().map(|s| s.stdout.as_str()).collect();
+                let want: &[&str] = if notify { &["echo after-out\n"] } else { &[] };
+                assert_eq!(after, want, "the other due handler still runs");
+                assert_eq!(pending, ["svc"], "notify {notify}: only svc stays pending");
+                assert!(!cannot_undo(steps).contains(&"handler svc".to_owned()));
+            }
+            std::fs::remove_dir_all(&root).unwrap();
+        }
     }
 }

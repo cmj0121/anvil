@@ -89,6 +89,10 @@ pub struct LocalReport {
     /// cannot be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record: Option<String>,
+    /// What loading the record warned of (bad pending handlers dropped): a
+    /// warning that does not affect exit.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub record_warnings: Vec<String>,
     /// With doctor plugins: why no tag key could be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag_key: Option<String>,
@@ -421,7 +425,11 @@ impl DoctorRun {
         }
         let record = record::path()
             .map_err(|err| format!("the record: {err}"))
-            .and_then(|path| record::load(&path));
+            .and_then(|path| record::load_warned(&path))
+            .map(|(record, warnings)| {
+                local.record_warnings = warnings;
+                record
+            });
         local.record = Some(match &record {
             Ok(None) => NO_RECORD.to_owned(),
             Ok(Some(_)) => FOUND_RECORD.to_owned(),
@@ -712,6 +720,7 @@ fn local_checks(
         secrets,
         plugins: BTreeMap::new(),
         record: None,
+        record_warnings: Vec::new(),
         tag_key: None,
         unused_tags: Vec::new(),
     }
@@ -988,6 +997,9 @@ fn render(report: &Report) -> String {
         } else {
             writeln!(out, "  {:<15} {record}", "record")
         };
+    }
+    for warning in &local.record_warnings {
+        let _ = writeln!(out, "  {:<15} WARNING: {warning}", "record");
     }
     if let Some(error) = &local.tag_key {
         let _ = writeln!(out, "  {:<15} error: {error}", "tag key");
@@ -1904,6 +1916,7 @@ mod tests {
                     files,
                     cannot_undo: Vec::new(),
                     rolled_back: None,
+                    pending_handlers: Vec::new(),
                 },
             )]),
             ..Record::default()
@@ -2374,6 +2387,27 @@ mod tests {
         let text = render(&Report::new(healthy_local(&store, &[]), vec![report]));
         assert!(
             text.contains("  audit           error: bad\\x1b[2J\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn bad_pending_handlers_the_record_dropped_are_a_warning_row_that_keeps_the_exit() {
+        let store = Memory::default();
+        let mut local = healthy_local(&store, &[]);
+        local.record = Some(FOUND_RECORD.to_owned());
+        let warning = "/s/last-apply.json: web1: dropped 2 bad pending_handlers entries";
+        local.record_warnings = vec![warning.to_owned()];
+        assert!(local.ok());
+        assert_eq!(
+            json(&local)["record_warnings"],
+            serde_json::json!([warning])
+        );
+        let text = render(&Report::new(local, vec![]));
+        assert!(
+            text.ends_with(&format!(
+                "  record          found\n  record          WARNING: {warning}\n"
+            )),
             "{text}"
         );
     }
