@@ -368,6 +368,37 @@ pub struct Step {
     pub plugin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creates: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onlyif: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unless: Option<String>,
+}
+
+/// A run or plugin step's guards, checked in this order on the target.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Guards {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creates: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onlyif: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unless: Option<String>,
+}
+
+impl Guards {
+    /// Whether no guard is set, so the step always runs.
+    pub fn is_empty(&self) -> bool {
+        self.creates.is_none()
+            && self.removes.is_none()
+            && self.onlyif.is_none()
+            && self.unless.is_none()
+    }
 }
 
 /// A `[[tasks]]` entry: exactly one kind (`run`, `plugin`, `packages`, `file`,
@@ -387,6 +418,14 @@ pub struct Task {
     pub plugin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creates: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onlyif: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unless: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub packages: Option<TaskPackages>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -956,6 +995,18 @@ impl Config {
                 ));
             }
         }
+        for (key, path) in [("creates", &step.creates), ("removes", &step.removes)] {
+            if let Some(path) = path {
+                check_dest(path).map_err(|why| {
+                    format!("{prefix}.{key} `{}`: {why}", secret::shown_name(path))
+                })?;
+            }
+        }
+        for (key, command) in [("onlyif", &step.onlyif), ("unless", &step.unless)] {
+            if let Some(command) = command {
+                check_guard_command(&format!("{prefix}.{key}"), command)?;
+            }
+        }
         Ok(())
     }
 
@@ -1046,7 +1097,34 @@ impl Config {
     }
 }
 
+/// An `onlyif` or `unless` command, held to the `run` limits; `key` names it.
+fn check_guard_command(key: &str, command: &str) -> Result<(), String> {
+    if command.trim().is_empty() {
+        return Err(format!("{key}: is empty or blank"));
+    }
+    if command.len() > MAX_RUN_BYTES {
+        return Err(format!(
+            "{key}: {} bytes exceeds the {MAX_RUN_BYTES} byte limit",
+            command.len()
+        ));
+    }
+    if command.contains('\0') {
+        return Err(format!("{key}: contains NUL"));
+    }
+    Ok(())
+}
+
 impl Step {
+    /// This step's guards.
+    pub fn guards(&self) -> Guards {
+        Guards {
+            creates: self.creates.clone(),
+            removes: self.removes.clone(),
+            onlyif: self.onlyif.clone(),
+            unless: self.unless.clone(),
+        }
+    }
+
     /// A step that runs `run`.
     pub fn script(run: impl Into<String>) -> Step {
         Step {
@@ -1404,6 +1482,19 @@ pub(crate) fn check_tasks(tasks: &[Task], prefix: &str) -> Result<(), String> {
                 ));
             }
             many => return Err(format!("{path}: has {}; keep one", many.join(" and "))),
+        }
+        if task.run.is_none()
+            && task.plugin.is_none()
+            && let Some((key, _)) = [
+                ("creates", &task.creates),
+                ("removes", &task.removes),
+                ("onlyif", &task.onlyif),
+                ("unless", &task.unless),
+            ]
+            .into_iter()
+            .find(|(_, guard)| guard.is_some())
+        {
+            return Err(format!("{path}.{key}: only on a run or plugin task"));
         }
         if let Some(file) = &task.file
             && (!file.tags.is_empty() || !file.facts.is_empty())
@@ -2217,6 +2308,14 @@ mod tests {
             ),
             ("invalid/config-empty-run.yaml", "steps[1].run"),
             ("invalid/config-blank-run.toml", "steps[0].run"),
+            (
+                "invalid/config-guard-relative-creates.toml",
+                "steps[0].creates `usr/local/bin/x`: must be an absolute path",
+            ),
+            (
+                "invalid/config-guard-on-service.yaml",
+                "tasks[0].unless: only on a run or plugin task",
+            ),
             (
                 "invalid/config-bad-timeout.toml",
                 "packages.timeout `0`: must be 1..=3600",
@@ -3148,6 +3247,188 @@ facts = { os = "Linux" }
             .and_then(|config| check_tasks(&config.tasks, "tasks"))
             .unwrap_err();
         assert!(err.starts_with("tasks[0]: needs one of"), "{err}");
+    }
+
+    const GUARDED: &str = r#"
+[[steps]]
+run = "install.sh"
+unless = "x --version"
+creates = "/usr/local/bin/x"
+
+[[steps]]
+plugin = "harden"
+args = { level = 2 }
+onlyif = "test -d /etc/ssh"
+removes = "/tmp/stale"
+"#;
+
+    #[test]
+    fn guards_on_steps_load_validate_and_round_trip_in_order() {
+        let config = parse(&plugin_config("", GUARDED));
+        config.check_steps().unwrap();
+        assert_eq!(
+            config.steps[0].guards(),
+            Guards {
+                creates: Some("/usr/local/bin/x".into()),
+                unless: Some("x --version".into()),
+                ..Guards::default()
+            }
+        );
+        assert!(!config.steps[1].guards().is_empty());
+        assert!(Step::script("a").guards().is_empty());
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&config, format).unwrap();
+            let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(back, config, "{text}");
+            let at = |key: &str| text.find(key).unwrap_or_else(|| panic!("{key}: {text}"));
+            assert!(at("install.sh") < at("creates") && at("creates") < at("unless"));
+            assert!(
+                at("unless") < at("removes") && at("removes") < at("onlyif"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn guards_on_run_and_plugin_tasks_load_and_round_trip_through_yaml() {
+        let yaml = "tasks:\n  - run: a\n    creates: /a\n    removes: /b\n    onlyif: c\n    unless: d\n  \
+                    - plugin: harden\n    args: { level: 2 }\n    unless: e\n";
+        let config: Config = document::from_str(yaml, Format::Yaml).unwrap();
+        check_tasks(&config.tasks, "tasks").unwrap();
+        assert_eq!(config.tasks[0].creates.as_deref(), Some("/a"));
+        assert_eq!(config.tasks[0].removes.as_deref(), Some("/b"));
+        assert_eq!(config.tasks[0].onlyif.as_deref(), Some("c"));
+        assert_eq!(config.tasks[1].unless.as_deref(), Some("e"));
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&config, format).unwrap();
+            let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(back, config, "{text}");
+            let at = |key: &str| text.find(key).unwrap_or_else(|| panic!("{key}: {text}"));
+            assert!(at("creates") < at("removes") && at("removes") < at("onlyif"));
+            assert!(at("onlyif") < at("unless"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_config_without_guards_serializes_as_before() {
+        for text in [
+            "[[steps]]\nrun = \"a\"\n",
+            "[[tasks]]\nrun = \"b\"\n\n[[tasks]]\n\n[tasks.file]\nsrc = \"a\"\ndest = \"/a\"\nmode = \"0644\"\n",
+        ] {
+            let config = parse(text);
+            let toml = document::to_string(&config, Format::Toml).unwrap();
+            assert_eq!(toml, format!("[anvil]\nformat = \"toml\"\n\n{text}"));
+            let yaml = document::to_string(&config, Format::Yaml).unwrap();
+            for key in ["creates", "removes", "onlyif", "unless"] {
+                assert!(!yaml.contains(key), "{yaml}");
+            }
+        }
+    }
+
+    fn step_refusal(guard: &str) -> String {
+        parse(&format!("[[steps]]\nrun = \"a\"\n{guard}\n"))
+            .check_steps()
+            .unwrap_err()
+    }
+
+    #[test]
+    fn guard_paths_follow_the_dest_rules() {
+        for (key, path, why) in [
+            ("creates", "rel/x", "must be an absolute path"),
+            ("removes", "/a b", "must match [A-Za-z0-9._/@+-]"),
+            ("creates", "/a/../b", "must not contain a . or .. component"),
+            ("removes", "/a/", "must not end with /"),
+        ] {
+            assert_eq!(
+                step_refusal(&format!("{key} = \"{path}\"")),
+                format!("steps[0].{key} `{path}`: {why}")
+            );
+        }
+        let long = format!("/{}", "a".repeat(MAX_DEST_BYTES));
+        assert_eq!(
+            step_refusal(&format!("creates = \"{long}\"")),
+            format!(
+                "steps[0].creates `{}`: {} bytes exceeds the {MAX_DEST_BYTES} byte limit",
+                secret::shown_name(&long),
+                long.len()
+            )
+        );
+        let fits = format!("/{}", "a".repeat(MAX_DEST_BYTES - 1));
+        parse(&format!("[[steps]]\nrun = \"a\"\nremoves = \"{fits}\"\n"))
+            .check_steps()
+            .unwrap();
+    }
+
+    #[test]
+    fn guard_commands_follow_the_run_rules() {
+        for key in ["onlyif", "unless"] {
+            assert_eq!(
+                step_refusal(&format!("{key} = \" \\t\"")),
+                format!("steps[0].{key}: is empty or blank")
+            );
+            assert_eq!(
+                step_refusal(&format!("{key} = \"a\\u0000b\"")),
+                format!("steps[0].{key}: contains NUL")
+            );
+            let over = "x".repeat(MAX_RUN_BYTES + 1);
+            assert_eq!(
+                step_refusal(&format!("{key} = \"{over}\"")),
+                format!("steps[0].{key}: 4097 bytes exceeds the 4096 byte limit")
+            );
+            let fits = "x".repeat(MAX_RUN_BYTES);
+            parse(&format!("[[steps]]\nrun = \"a\"\n{key} = \"{fits}\"\n"))
+                .check_steps()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn guards_on_other_task_kinds_are_refused_naming_the_first_set() {
+        let refused = |text: &str| validated(text).unwrap_err();
+        for kind in [
+            "packages = { install = [\"git\"] }",
+            "file = { src = \"a\", dest = \"/a\", mode = \"0644\" }",
+            "service = { name = \"nginx\", state = \"started\" }",
+            "include = \"$/a.toml\"",
+            "tasks = []",
+        ] {
+            for key in [
+                "creates = \"/a\"",
+                "removes = \"/a\"",
+                "onlyif = \"a\"",
+                "unless = \"a\"",
+            ] {
+                let name = key.split(' ').next().unwrap();
+                assert_eq!(
+                    refused(&format!("[[tasks]]\n{kind}\n{key}\n")),
+                    format!("tasks[0].{name}: only on a run or plugin task")
+                );
+            }
+        }
+        assert_eq!(
+            refused("[[tasks]]\ntasks = []\nunless = \"a\"\nremoves = \"/a\"\n"),
+            "tasks[0].removes: only on a run or plugin task"
+        );
+        assert_eq!(
+            refused(
+                "[[tasks]]\n[[tasks.tasks]]\nservice = { name = \"x\", state = \"started\" }\nonlyif = \"a\"\n"
+            ),
+            "tasks[0].tasks[0].onlyif: only on a run or plugin task"
+        );
+        validated("[[tasks]]\nrun = \"a\"\ncreates = \"/a\"\n\n[[tasks]]\nplugin = \"p\"\nunless = \"b\"\n")
+            .unwrap();
+    }
+
+    #[test]
+    fn guards_on_legacy_sections_are_unknown_fields() {
+        for text in [
+            "[[files]]\nsrc = \"a\"\ndest = \"/a\"\nmode = \"0644\"\ncreates = \"/a\"\n",
+            "[[services]]\nname = \"x\"\nstate = \"started\"\nunless = \"a\"\n",
+            "[packages]\ninstall = [\"git\"]\nonlyif = \"a\"\n",
+        ] {
+            let err = document::from_str::<Config>(text, Format::Toml).unwrap_err();
+            assert!(err.contains("unknown field"), "{err}");
+        }
     }
 
     #[test]

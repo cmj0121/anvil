@@ -433,6 +433,10 @@ impl Walk<'_> {
                 run: task.run.clone(),
                 plugin: task.plugin.clone(),
                 args: task.args.clone(),
+                creates: task.creates.clone(),
+                removes: task.removes.clone(),
+                onlyif: task.onlyif.clone(),
+                unless: task.unless.clone(),
             };
             self.config.check_step(&path, &step)?;
             ItemKind::Step(step)
@@ -514,6 +518,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+    use crate::config::Guards;
     use crate::test_util::temp_dir;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1247,7 +1252,88 @@ mod tests {
             r#"packages = { install = ["-x"] }"#,
             ".packages.install[0] `-x`",
         ),
+        (
+            r#"run = "x"
+            creates = "rel""#,
+            ".creates `rel`: must be an absolute path",
+        ),
+        (
+            r#"plugin = "step"
+            removes = "/a/../b""#,
+            ".removes `/a/../b`: must not contain a . or .. component",
+        ),
+        (
+            r#"run = "x"
+            onlyif = " ""#,
+            ".onlyif: is empty or blank",
+        ),
+        (
+            r#"plugin = "step"
+            unless = "a\u0000b""#,
+            ".unless: contains NUL",
+        ),
+        (
+            r#"packages = { install = ["git"] }
+            creates = "/a""#,
+            ".creates: only on a run or plugin task",
+        ),
+        (
+            r#"file = { src = "s", dest = "/d", mode = "0644" }
+            removes = "/a""#,
+            ".removes: only on a run or plugin task",
+        ),
+        (
+            r#"service = { name = "a", state = "started" }
+            onlyif = "a""#,
+            ".onlyif: only on a run or plugin task",
+        ),
+        (
+            r#"include = "$/other.toml"
+            unless = "a""#,
+            ".unless: only on a run or plugin task",
+        ),
+        (
+            r#"tasks = []
+            unless = "a"
+            creates = "/a""#,
+            ".creates: only on a run or plugin task",
+        ),
     ];
+
+    #[test]
+    fn guards_reach_the_built_step_from_the_main_file_and_an_include() {
+        let ws = Workspace::new();
+        let body = "[[tasks]]\nrun = \"a\"\ncreates = \"/a\"\nremoves = \"/b\"\n\
+                    onlyif = \"c\"\nunless = \"d\"\n\n\
+                    [[tasks]]\nplugin = \"step\"\nunless = \"e\"\n";
+        ws.include("guarded.toml", body);
+        let wanted = Guards {
+            creates: Some("/a".into()),
+            removes: Some("/b".into()),
+            onlyif: Some("c".into()),
+            unless: Some("d".into()),
+        };
+        for config in [body.to_string(), include("guarded.toml")] {
+            let items = ws.items(&format!("{}{config}", plugins()));
+            let steps: Vec<Guards> = items
+                .iter()
+                .map(|item| match &item.kind {
+                    ItemKind::Step(step) => step.guards(),
+                    _ => panic!("not a step"),
+                })
+                .collect();
+            assert_eq!(
+                steps,
+                [
+                    wanted.clone(),
+                    Guards {
+                        unless: Some("e".into()),
+                        ..Guards::default()
+                    }
+                ]
+            );
+        }
+    }
 
     fn plugins() -> String {
         format!(
