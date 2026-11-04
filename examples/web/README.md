@@ -14,8 +14,13 @@ creates a directory, writes a config, validates it and starts the service. See [
 - `Install nginx` needs no refresh task of its own, since an apt install runs `apt-get update` first and so sees the new
   repository.
 - `Site role` includes `$/roles/site.toml`, which is `files/roles/site.toml` here, since `$/` is the `files/` folder of
-  the workspace, the directory of `--config`. Its `Configure and start` task nests the config, its validation, the
-  service and a reload. If `nginx -t` fails, the target stops there and nginx keeps running its old config.
+  the workspace, the directory of `--config`. `Create the site directory` has `creates = "/var/www/site"`, so a rerun
+  skips it. `Configure and start` nests the config, its validation and the service.
+- `Write the site config` has `notify = ["reload nginx"]`, a `[[handlers]]` entry in `config.toml` (an include cannot
+  hold one) with `service = { name = "nginx", state = "reloaded" }`. It runs once after the last task, only when the
+  file changed: `started` leaves a running nginx as it is, so the handler loads the new config. If `nginx -t` fails,
+  the target stops there, the handler stays pending for the next apply and nginx keeps running its old config
+  ([Handlers](../../docs/configuration.md#handlers)).
 - `/var/www/site` stays empty, so the host IP or any other `Host` gets 403 until you add content (an `index.html` then
   gives 200), and `Host: localhost` is answered by the package's `default.conf`, not this site.
 

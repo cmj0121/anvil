@@ -129,7 +129,6 @@ fn the_web_scenario_runs_its_tasks_in_order_through_nesting_and_an_include() {
             (at("[1].tasks[0]"), "Write the site config"),
             (at("[1].tasks[1]"), "Validate the config"),
             (at("[1].tasks[2]"), "Start nginx"),
-            (at("[1].tasks[3]"), "Load the config"),
         ]
     );
 }

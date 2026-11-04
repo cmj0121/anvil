@@ -13,8 +13,13 @@
   `files/apt/nginx.list` 中的套件庫那一行指名 Debian bookworm：請改成符合你的 host。
 - `Install nginx` 不需要另外的更新 task，因為 apt 安裝會先執行 `apt-get update`，所以看得到新的套件庫。
 - `Site role` 引入 `$/roles/site.toml`，在這裡就是 `files/roles/site.toml`，因為 `$/` 是 workspace 的 `files/`
-  資料夾，而 workspace 是 `--config` 所在的目錄。其中的 `Configure and start` task 巢狀了設定、驗證、服務與重新載入。
-  `nginx -t` 失敗時，該 target 就停在那裡，nginx 繼續使用舊設定執行。
+  資料夾，而 workspace 是 `--config` 所在的目錄。`Create the site directory` 設有 `creates = "/var/www/site"`，
+  所以重跑時會略過。`Configure and start` 巢狀了設定、驗證與服務。
+- `Write the site config` 設有 `notify = ["reload nginx"]`，這是 `config.toml` 中的一個 `[[handlers]]` 項目
+  （include 不能放 handler），內容為 `service = { name = "nginx", state = "reloaded" }`。它只在檔案改變時、
+  於最後一個 task 之後執行一次：`started` 不會動已在執行的 nginx，所以由 handler 載入新設定。`nginx -t` 失敗時，
+  該 target 就停在那裡，handler 保留為 pending 留待下次 apply，nginx 繼續使用舊設定執行
+  （[Handlers](../../docs/configuration.zh-TW.md#handlers)）。
 - `/var/www/site` 維持空的，所以用 host IP 或其他任何 `Host` 存取都會得到 403，直到你加入內容（有了 `index.html` 就會得到 200）；
   而 `Host: localhost` 是由套件的 `default.conf` 回應，不是這個網站。
 

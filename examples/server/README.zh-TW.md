@@ -2,13 +2,18 @@
 
 [English](README.md) | 繁體中文
 
-維護一台遠端 host：升級、pin、移除、一個 `/etc` 下 root 擁有的檔案，以及一個執行中的服務。
+維護一台遠端 host：升級、pin、移除、一個 `/etc` 下 root 擁有的檔案、一個執行中的服務、帶 guard 的 step，以及一個 handler。
 
 - `[packages]`：`upgrade = true` 先升級所有已安裝套件，`pin = ["vim"]` 在缺少時安裝 vim 並在該次升級中略過它，
   `remove = ["nano"]` 在已安裝時移除 nano。pin 只在 pacman 與 dnf 上有效；在 brew、apt 或 apk 上，任何 `pin`
   都會讓該 target 失敗（[鎖定與移除](../../docs/packages.zh-TW.md#鎖定與移除)）。
 - `[[files]]` 透過 sudo 把 `files/motd` 寫到 `/etc/motd`，`[[services]]` 讓 `sshd` 保持啟動並啟用。
   兩者都帶 `tags = ["linode"]`，也就是 `inventory.toml` 中 host `linode1` 的 tag，因此會略過其他所有 target。
+- 兩個 `[[steps]]` 帶有 [guard](../../docs/configuration.zh-TW.md#config)，重跑時不會再動它們：`/var/tmp/anvil-provisioned`
+  存在後 `creates` 就略過第一個；`grep -qx 'managed by anvil' /var/tmp/anvil-note` 結束碼為 0 時 `unless` 就略過第二個。
+  `[[steps]]` 不接受 tags，所以兩者在每個 target 上都會執行。
+- motd 檔案設有 `notify = ["log motd change"]`：當它印出 `wrote /etc/motd` 時，同名的 `run` handler 會在該 target
+  最後一個 step 之後執行一次；`unchanged /etc/motd` 則什麼都不執行（[Handlers](../../docs/configuration.zh-TW.md#handlers)）。
 
 ## 試試看
 

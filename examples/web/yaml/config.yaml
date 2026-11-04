@@ -37,3 +37,10 @@ tasks:
     tags:
       - web
     include: $/roles/site.toml
+# Runs once after the last task, only when a step notified it: `started` leaves a
+# running nginx as it is, so this loads a config the role just wrote.
+handlers:
+  - name: reload nginx
+    service:
+      name: nginx
+      state: reloaded
