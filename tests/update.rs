@@ -13,7 +13,7 @@ use std::process::{Command, Output};
 
 use common::{FixtureServer, Route, Sandbox, json, keys, text};
 
-const API: &str = "/repos/mini-poc/anvil/releases/latest";
+const API: &str = "/repos/cmj0121/anvil/releases/latest";
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
 fn triple() -> &'static str {
@@ -270,7 +270,7 @@ fn a_download_url_elsewhere_is_refused() {
     let server = serving_with(
         "v9.9.9",
         all_assets("v9.9.9"),
-        Some("https://github.com/mini-poc/anvil/releases/download/"),
+        Some("https://github.com/cmj0121/anvil/releases/download/"),
     );
     assert_failed(
         &check(&server, &[]),

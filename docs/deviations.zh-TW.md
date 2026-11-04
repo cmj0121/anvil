@@ -4,7 +4,7 @@
 
 ## 與 #2/#3 的差異
 
-- inventory（主機清單）與 config（設定）只以 TOML 儲存（[#4](https://github.com/mini-poc/anvil/issues/4)）；
+- inventory（主機清單）與 config（設定）只以 TOML 儲存（[#4](https://github.com/cmj0121/anvil/issues/4)）；
   YAML 只是編輯時的檢視格式。
   設定鍵是 `format`（`[anvil].format`），而非 `inventory_format`：它決定 `anvil inventory` 與 `anvil config` 以哪種格式開啟，
   `--format` 可在單次編輯時覆寫它；兩者都不會改變任何內容的儲存方式。

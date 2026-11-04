@@ -25,8 +25,15 @@ use crate::secret::shown_name;
 use crate::transport::{TransportError, collect_capped};
 
 const API: &str = "https://api.github.com";
-const REPO: &str = "/repos/mini-poc/anvil/releases/latest";
-const DOWNLOAD: &str = "https://github.com/mini-poc/anvil/releases/download/";
+/// The GitHub repository releases come from, written once so the API path
+/// and the download prefix cannot name different repositories.
+macro_rules! slug {
+    () => {
+        "cmj0121/anvil"
+    };
+}
+const REPO: &str = concat!("/repos/", slug!(), "/releases/latest");
+const DOWNLOAD: &str = concat!("https://github.com/", slug!(), "/releases/download/");
 /// Most bytes of the API answer read.
 const BODY_LIMIT: u64 = 1 << 20;
 /// Most bytes of the response headers read.
@@ -626,7 +633,7 @@ mod tests {
         assert_eq!(after(&args, "-o"), "/s/body");
         assert_eq!(
             args.last().unwrap(),
-            "https://api.github.com/repos/mini-poc/anvil/releases/latest"
+            "https://api.github.com/repos/cmj0121/anvil/releases/latest"
         );
         assert!(!args.iter().any(|arg| arg.contains("Authorization")));
         assert!(
@@ -639,7 +646,20 @@ mod tests {
         assert_eq!(after(&local, "--proto-redir"), "=http,https");
         assert_eq!(
             local.last().unwrap(),
-            "http://127.0.0.1:9/repos/mini-poc/anvil/releases/latest"
+            "http://127.0.0.1:9/repos/cmj0121/anvil/releases/latest"
+        );
+    }
+
+    #[test]
+    fn github_asks_and_downloads_from_the_same_repository() {
+        let github = Source::github();
+        assert_eq!(
+            github.api,
+            "https://api.github.com/repos/cmj0121/anvil/releases/latest"
+        );
+        assert_eq!(
+            github.prefix,
+            "https://github.com/cmj0121/anvil/releases/download/"
         );
     }
 
@@ -697,7 +717,7 @@ mod tests {
         );
     }
 
-    const PREFIX: &str = "https://github.com/mini-poc/anvil/releases/download/";
+    const PREFIX: &str = "https://github.com/cmj0121/anvil/releases/download/";
     const TRIPLE: &str = "x86_64-apple-darwin";
 
     fn body(tag: &str, names: &[&str], prefix: &str) -> Vec<u8> {
@@ -799,9 +819,9 @@ mod tests {
         let names = all_assets("v0.2.0");
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         for other in [
-            "https://evil.example/mini-poc/anvil/releases/download/",
-            "http://github.com/mini-poc/anvil/releases/download/",
-            "https://github.com/mini-poc/anvil/releases/download/x/../",
+            "https://evil.example/cmj0121/anvil/releases/download/",
+            "http://github.com/cmj0121/anvil/releases/download/",
+            "https://github.com/cmj0121/anvil/releases/download/x/../",
         ] {
             let err = release_of(&ok(body("v0.2.0", &names, other)), PREFIX, TRIPLE).unwrap_err();
             assert_eq!(

@@ -29,7 +29,7 @@ make build                 # builds target/release/anvil
 
 ### 預先建置的執行檔
 
-[Releases](https://github.com/mini-poc/anvil/releases) 頁面為每個 `<target>` 提供 `anvil-<version>-<target>.tar.gz` 封存檔、
+[Releases](https://github.com/cmj0121/anvil/releases) 頁面為每個 `<target>` 提供 `anvil-<version>-<target>.tar.gz` 封存檔、
 `.sha256` 檔與 `.minisig` 簽章，`<target>` 為 `aarch64-apple-darwin`、`x86_64-apple-darwin` 與 `x86_64-unknown-linux-musl`。
 下載它們後，驗證封存檔、解開，再將執行檔放到 `PATH` 上：
 
@@ -42,7 +42,7 @@ install -m 0755 anvil-<version>-<target>/anvil ~/.local/bin/
 ```
 
 checksum 只能抓出損毀的下載。要確認封存檔是誰做的，請以 [minisign](https://jedisct1.github.io/minisign/)
-與 [`keys/minisign.pub`](https://github.com/mini-poc/anvil/blob/main/keys/minisign.pub) 第二行的金鑰驗證它的簽章：
+與 [`keys/minisign.pub`](https://github.com/cmj0121/anvil/blob/main/keys/minisign.pub) 第二行的金鑰驗證它的簽章：
 
 ```sh
 minisign -Vm anvil-<version>-<target>.tar.gz -P <key>   # reads anvil-<version>-<target>.tar.gz.minisig
