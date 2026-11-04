@@ -124,6 +124,9 @@ struct HardenReport<'a> {
     strict: bool,
     suggestions: &'a [harden::Suggestion],
     held: &'a [harden::Held],
+    /// Templated srcs not judged, to check by hand.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    review: &'a [harden::Review],
     warnings: &'a [String],
     /// An include's or nested task's entry still needs changing by hand.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -218,10 +221,17 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool, write: bool) -> Result<()
             held.reason
         ));
     }
+    for review in &outcome.review {
+        notes.push(format!(
+            "harden: review {}: {}",
+            review.rules.join(", "),
+            review.what
+        ));
+    }
     for warning in &outcome.warnings {
         notes.push(format!("harden: warning {warning}"));
     }
-    if !cli.json && count == 0 && !outcome.unresolved {
+    if !cli.json && count == 0 && !outcome.unresolved && outcome.review.is_empty() {
         notes.push(
             "config carries every harden rule; anvil plan / apply bring the hosts to it".to_owned(),
         );
@@ -243,6 +253,7 @@ pub fn harden(cli: &Cli, opts: &Options, strict: bool, write: bool) -> Result<()
                 strict,
                 suggestions: &outcome.suggestions,
                 held: &outcome.held,
+                review: &outcome.review,
                 warnings: &outcome.warnings,
                 unresolved: outcome.unresolved,
                 diff: &diff,

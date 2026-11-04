@@ -155,7 +155,11 @@ pub enum Command {
     /// Run the config's steps on every target
     Apply,
     /// Show the steps apply would run on every target, running none
-    Plan,
+    Plan {
+        /// Also print each templated file's rendered text, per target
+        #[arg(long)]
+        show_rendered: bool,
+    },
     /// Restore the files the last apply wrote, on every selected target
     Rollback {
         /// Restore DEST even if it changed since the last apply (repeatable)
@@ -266,7 +270,7 @@ impl Command {
             Command::Files { .. } => "files",
             Command::Doctor => "doctor",
             Command::Apply => "apply",
-            Command::Plan => "plan",
+            Command::Plan { .. } => "plan",
             Command::Rollback { .. } => "rollback",
             Command::Run { .. } => "run",
             Command::Secret { .. } => "secret",
@@ -313,7 +317,7 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
             anvil::doctor::run(out, &opts, &config, &expanded, store.as_ref())
         }
         Command::Apply => anvil::apply::run(out, &opts),
-        Command::Plan => anvil::plan::run(out, &opts),
+        Command::Plan { show_rendered } => anvil::plan::run(out, &opts, *show_rendered),
         Command::Rollback {
             force,
             force_all,
@@ -523,7 +527,18 @@ mod tests {
         }
         assert!(matches!(command(&["doctor"]), Command::Doctor));
         assert!(matches!(command(&["apply"]), Command::Apply));
-        assert!(matches!(command(&["plan"]), Command::Plan));
+        assert!(matches!(
+            command(&["plan"]),
+            Command::Plan {
+                show_rendered: false
+            }
+        ));
+        assert!(matches!(
+            command(&["plan", "--show-rendered"]),
+            Command::Plan {
+                show_rendered: true
+            }
+        ));
         match command(&["run", "-"]) {
             Command::Run { script, timeout } => {
                 assert_eq!(script, PathBuf::from("-"));

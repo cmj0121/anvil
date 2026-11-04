@@ -20,6 +20,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
   plan                           show the steps apply would run on every target, running none
+       [--show-rendered]         --show-rendered also prints each templated file's rendered text
   rollback [--force DEST]...     restore the files the last apply wrote on every target
   run [--timeout SECS] <FILE|->  run a POSIX sh script on every target, read from FILE or stdin
   secret <NAME>                  edit one secret in the editor
@@ -210,7 +211,10 @@ stdout is only a unified diff (three lines of context), one section per changed 
   `harden: held ssh.root-login: hosts db2, web1 connect as root or name no user; set user, or skip the rule`;
 - with `--strict`:
   `harden: warning ssh.password-auth: hosts that log in by password lose access; check every host has a key first`;
-- with nothing to suggest, and nothing printed on stdout:
+- a [templated](configuration.md#templating) src, which harden neither judges nor changes:
+  `harden: review ssh.root-login: files[0]: src $/sshd.conf.j2 is a template, not judged; check it sets PermitRootLogin no`
+  (`does not contradict` for another file of that service, such as `/etc/ssh/sshd_config`);
+- with nothing to suggest, no review, and nothing printed on stdout:
   `config carries every harden rule; anvil plan / apply bring the hosts to it`;
 - for a legacy YAML config: `harden: config.yaml is shown as the TOML anvil config would migrate it to`, and the diff
   is against that TOML.
@@ -261,7 +265,21 @@ behind it, `diff` the same text the preview prints, and `written` whether `--wri
 }
 ```
 
-`action` is `add`, `change` or `remove`; `warnings` holds the `--strict` text without the `harden: warning` prefix.
+`action` is `add`, `change` or `remove`; `warnings` holds the `--strict` text without the `harden: warning` prefix. A
+config with a templated src adds `review`, one object per src to check by hand, left out when empty:
+
+```json
+{
+  "review": [
+    {
+      "rules": ["ssh.root-login"],
+      "what": "files[0]: src $/sshd.conf.j2 is a template, not judged; check it sets PermitRootLogin no"
+    }
+  ]
+}
+```
+
+A review alone does not change the exit code.
 
 `--write` writes what the preview shows, and nothing when there is nothing to suggest. The edited config is validated
 first; then every store file and workspace src is written, then the config last, each atomically. Comments, key order
@@ -413,6 +431,28 @@ Local checks, then every selected target's facts:
   when it cannot be resolved (`` `pacman` needs root and sudo is not installed ``, say, or the sudo password refusal in
   [Root and sudo](packages.md#root-and-sudo)). A target with a sudo secret resolves the way apply does, so sudo `binary` is
   accepted for it. An unreachable target gets no `manager` row.
+- `vars` and `env`: each target's resolved [vars and env](configuration.md#vars-and-env), after the facts, one row
+  per key with the level that set it (`global`, `tag:NAME` or `host`). A var shows as JSON text, so its type shows; an
+  env value shows as written. Invisible and bidi characters are escaped. Values are shown as is: they are not secrets.
+  A target without vars or env gets no such rows.
+- `tag NAME`: a `[tags.NAME]` table no host carries, `local` aside, is a `tag NAME` row in the local checks reading
+  `WARNING: no host carries this tag`, and a log warning `tag NAME: no host carries this tag`. It does not change the
+  exit.
+
+```text
+local checks
+  …
+  tag db          WARNING: no host carries this tag
+
+web1
+  transport       ssh 203.0.113.10
+  hostname        web1
+  …
+  vars.list       [1,"a"] (global)
+  vars.port       9090 (host)
+  env.APP_ENV     it's $HOME (host)
+  env.HTTP_PROXY  http://proxy:3128 (global)
+```
 
 Exit 0 when every check passed and every target is connectable, else 1. With `[packages]`, a target whose package
 manager cannot be resolved also makes the exit 1; without `[packages]` nothing is resolved and the exit is as before.
@@ -424,11 +464,19 @@ manager cannot be resolved also makes the exit 1; without `[packages]` nothing i
     "ssh": true,
     "sh": true,
     "editor": "/opt/homebrew/bin/nvim",
-    "secrets": { "HOST_SUDO": "ok" }
+    "secrets": { "HOST_SUDO": "ok" },
+    "unused_tags": ["db"]
   },
   "targets": [
     {
       "target": "local",
+      "vars": {
+        "editor": { "value": "nvim", "level": "tag:local" },
+        "port": { "value": 80, "level": "global" }
+      },
+      "env": {
+        "HTTP_PROXY": { "value": "http://proxy:3128", "level": "global" }
+      },
       "connectable": true,
       "facts": {
         "arch": "arm64",
@@ -452,7 +500,9 @@ manager cannot be resolved also makes the exit 1; without `[packages]` nothing i
 
 `editor` is a string or `null`; each secret is `"ok"`, `"missing"`, `"locked"` or `"error"`; `facts` holds every key
 the probe reported (abridged above). `manager` (the resolved manager) or `manager_error` (the reason, without the
-`error:` prefix) appears only with `[packages]` and only on a connectable target.
+`error:` prefix) appears only with `[packages]` and only on a connectable target. `vars` and `env` map each key to its
+`value` (a var keeps its JSON type, an env value is a string) and its `level`, on every target, reachable or not; each
+is left out when empty. `local.unused_tags` lists the unused tags and is left out when there are none.
 
 With `[packages]` and a resolved manager, each target also has a `packages` string: `"ok"` or
 `"WARNING: not found by MANAGER: a, b"`, shown as a `packages` row in human output.
@@ -1087,15 +1137,24 @@ secret is set and free of control characters is not checked, so plan can pass wh
 2 targets, nothing executed
 ```
 
+- A target with [vars or env](configuration.md#vars-and-env) starts its block with a `vars.KEY = VALUE (LEVEL)` line
+  per var, then an `env.KEY = VALUE (LEVEL)` line per env value, shown as doctor shows them, on a planned, failed or
+  cancelled target alike: `vars.port = 8080 (tag:web)`, `env.APP_ENV = prod (host)`. Values are shown as is.
 - A [`[[tasks]]`](#tasks-in-a-run) config adds a `PATH  NAME` line above each step.
 - Each step is a `would $ RUN` line (a multi-line `run` shows its first line and `…`), followed by
   `(sudo password from secret NAME)` when apply would type that secret's value at sudo's prompt.
+- A [templated](configuration.md#templating) file step adds `rendered N bytes, sha256 HEX` under its `would $ file DEST`
+  line: the size and the full sha256 of that target's rendered text, the bytes apply would write. A target whose render
+  fails ends in `✘` with the template message ([Templating](configuration.md#templating)).
 - The block ends with `✔ N steps`, or `✘ REASON` for a target that failed. The summary is `N targets, nothing executed`,
   with `M failed` before `nothing executed` when any target failed (`2 targets, 1 failed, nothing executed`).
 - Colour and escaping follow apply's rules.
 
 `--json` is apply's document with `"executed": false` first; a step has its `run` and, when apply would type a sudo
-password, its `sudo_secret`, plus `task` and `name` on a tasks config, but never `code`, `stdout` or `stderr`:
+password, its `sudo_secret`, plus `task` and `name` on a tasks config, but never `code`, `stdout` or `stderr`. A
+target with vars or env also has `vars` and `env`, as in doctor's `--json`
+(`"vars": {"port": {"value": 8080, "level": "tag:web"}}`), and a step's `run` is the script as written, without the
+env lines:
 
 ```json
 {
@@ -1129,6 +1188,82 @@ password, its `sudo_secret`, plus `task` and `name` on a tasks config, but never
 
 A target a cancel skipped is `{"target": "pi", "ok": false}`, with `"abort": "terminated"` or `"hung_up"` when a first
 SIGTERM or SIGHUP did it ([Ctrl-C](#ctrl-c)).
+
+**Templated files.** plan never reads a dest, so it cannot diff; it shows what each target would get instead. Without
+a flag that is the `rendered N bytes, sha256 HEX` line, and no file bytes are printed. `--show-rendered` also prints
+each target's rendered text under that line, one `│ LINE` per line, with control and invisible characters escaped, and
+`(no newline at end)` when the text lacks a final newline. With the
+[workstation example](../examples/workstation/):
+
+```sh
+anvil --inventory examples/workstation/inventory.toml \
+      --config examples/workstation/config.toml \
+      --target local plan --show-rendered
+```
+
+prints, with the package step's long line cut:
+
+```text
+▶ local
+  vars.git_email = "dev@home.example" (tag:local)
+  vars.git_name = "Dev" (global)
+  env.GIT_PAGER = less -FRX (global)
+  would $ export PATH="$PATH:…"; … brew install $a; }
+  would $ file /home/dev/.config/git/ignore
+  would $ file /home/dev/.config/git/config
+    rendered 152 bytes, sha256 e193e046d4db16a0590b91195db5e9bf31f7680334d590bd8b7a567de25541d8
+    │ [user]
+    │     name = Dev
+    │     email = dev@home.example
+    │ [core]
+    │     editor = vi
+    │     excludesFile = ~/.config/git/ignore
+    │ [credential]
+    │     helper = osxkeychain
+  would $ git --version && echo "pager: $GIT_PAGER"
+  ✔ 4 steps
+
+1 target, nothing executed
+```
+
+The rendered text holds whatever the vars put there; it is printed on your terminal only. In `--json` a templated step
+always has `"rendered": {"bytes": N, "sha256": "HEX"}`, and `--show-rendered` adds a top-level `rendered` list, one
+object per target and templated step, where `step` indexes that target's `steps` (`vars` and `env` left out here):
+
+```json
+{
+  "executed": false,
+  "targets": [
+    {
+      "target": "local",
+      "steps": [
+        { "run": "export PATH=\"$PATH:…\"; … brew install $a; }" },
+        { "run": "file /home/dev/.config/git/ignore" },
+        {
+          "run": "file /home/dev/.config/git/config",
+          "rendered": {
+            "bytes": 152,
+            "sha256": "e193e046d4db16a0590b91195db5e9bf31f7680334d590bd8b7a567de25541d8"
+          }
+        },
+        { "run": "git --version && echo \"pager: $GIT_PAGER\"" }
+      ],
+      "ok": true
+    }
+  ],
+  "ok": true,
+  "rendered": [
+    {
+      "target": "local",
+      "step": 2,
+      "dest": "/home/dev/.config/git/config",
+      "text": "[user]\n    name = Dev\n    email = dev@home.example\n…"
+    }
+  ]
+}
+```
+
+The TUI's plan view shows the `rendered` line too, never the text.
 
 Exit 0 when every selected target resolves, 1 when any cannot be reached or resolved, 2 for usage or config; 143 or
 129 when a first SIGTERM or SIGHUP ended the plan.
@@ -1292,13 +1427,16 @@ In `--json` a file step's `run` is that label. A skipped step has `"skipped": tr
 ```
 
 `anvil plan` shows `would $ file DEST`, with `(sudo password from secret NAME)` when apply would take the password path,
-and `would $ skipped file DEST: no match`. In `plan --json` the `run` is the same label, with `sudo_secret` for the
+and `would $ skipped file DEST: no match`; a templated file adds its `rendered N bytes, sha256 HEX` line. In
+`plan --json` the `run` is the same label, with `sudo_secret` for the
 password path.
 
 Before each write, apply reads DEST back and keeps what it held in the [apply record](#the-apply-record), so
 [`anvil rollback`](#anvil-rollback) can put it back; the write then refuses a DEST that changed since that read.
 
 The file's bytes are never printed: not in the human output, `--json`, `plan`, the `-v` logs or the ssh command line.
+The one exception is a [templated](configuration.md#templating) file's rendered text under `anvil plan --show-rendered`,
+which you ask for ([`anvil plan`](#anvil-plan)).
 The bytes go to the target on the script's stdin; on the password path they go to a mode-0600 `/tmp/anvil-` file
 first, which is removed after the step, on success, failure or cancel. A lost connection or a killed anvil (a Ctrl-C
 while the bytes are staged, say) can leave that file behind, readable only by the connecting user.
@@ -1665,7 +1803,9 @@ no confirmation.
 
 Human output (with its `-v` level), `--json` and the exit codes are apply's: one block per target with the script as
 its one `$` line (the first line and `…` when it has more), then the summary. In `--json` the step's `run` is the
-script as given, without the wrapper. Exit 0 when the script exited 0 on every target, 1 when any target failed, 2 for usage.
+script as given, without the wrapper or the target's [env](configuration.md#vars-and-env), which the script receives
+as exported variables ahead of it on the same stdin. Exit 0 when the script exited 0 on every target, 1 when any
+target failed, 2 for usage.
 `printf 'hostname\nuname -s\n' | anvil -vv run --target local -` on a Mac prints on stdout:
 
 ```text

@@ -2,17 +2,24 @@
 
 [English](README.md) | 繁體中文
 
-個人機器：在各管理器下名稱不同的套件，以及一個以你自己的使用者寫入的 dotfile。
+個人機器：在各管理器下名稱不同的套件，以及兩個以你自己的使用者寫入的 dotfile，其中一個由 inventory 的 vars 算繪。
 
 - `[packages.alias.fd]`：apt 與 dnf 以 `fd-find` 安裝 `fd`；brew、pacman 與 apk 使用 `fd`
   （[別名](../../docs/packages.zh-TW.md#別名)）。
-- 一個 `[[files]]` 項目把 `files/gitignore` 複製成 dotfile，並設定 `sudo = false`，因此以連線使用者寫入、不經 sudo。
+- 第一個 `[[files]]` 項目把 `files/gitignore` 複製成 dotfile，並設定 `sudo = false`，因此以連線使用者寫入、不經 sudo。
   `tags = ["local"]` 只選中這台機器，它帶有 tag `local`。`dest` 必須是絕對路徑：apply 之前請把 `/home/dev` 改成你的家目錄。
-- `inventory.toml` 有一台 ssh host `laptop`，tag 為 `workstation`；檔案項目不符合它。
+- 第二個項目沒有 `tags`，以 `template = true` 為每個 target 算繪 `files/gitconfig`：`{{ vars.git_name }}` 與
+  `{{ vars.git_email }}` 來自 `inventory.toml`，`editor` 在 `laptop` 上是 `nvim`，
+  其他地方透過 `default` 退回 `vi`，`[credential]` 區塊只在 `facts.os` 為 `Darwin` 時寫入
+  （[Templating](../../docs/configuration.zh-TW.md#templating)）。
+- `inventory.toml` 在全域設定 `vars` 與 `env`，在 `[tags.local.vars]` 為這台機器覆寫 `git_email`，並給 `laptop`
+  自己的 `editor`（[Vars 與 env](../../docs/configuration.zh-TW.md#vars-與-env)）。step 從 `[env]` 讀取 `$GIT_PAGER`。
+- `inventory.toml` 有一台 ssh host `laptop`，tag 為 `workstation`；只有範本項目符合它。
 
 ## 試試看
 
-`plan` 列出 step（包括檔案 step），但一個都不執行。
+`plan` 列出 step（包括檔案 step），但一個都不執行。範本檔案下方會顯示 `rendered N bytes, sha256 HEX`；
+加上 `--show-rendered` 可看到這台機器會得到的文字。
 
 ```sh
 anvil --inventory examples/workstation/inventory.toml \

@@ -532,7 +532,12 @@ mod tests {
         assert!(matches!(&msgs[0], Msg::Begin(names) if names[..] == ["local"]));
         assert!(matches!(&msgs[1], Msg::Start(name) if name == "local"));
         match &msgs[2] {
-            Msg::PlanDone(_, plan::PlanReport::Planned { target, steps, ok }) => {
+            Msg::PlanDone(
+                _,
+                plan::PlanReport::Planned {
+                    target, steps, ok, ..
+                },
+            ) => {
                 assert_eq!((target.as_str(), *ok), ("local", true));
                 assert_eq!(*steps[0].run, format!("touch {}", ran.display()));
             }

@@ -1092,3 +1092,68 @@ fn a_contradicting_store_src_others_can_write_is_refused() {
     assert!(stderr.contains("files[0].src `$/other.conf`"), "{stderr}");
     assert_eq!(mode(&path), 0o664);
 }
+
+#[test]
+fn a_templated_src_is_reported_for_review_and_never_judged_or_changed() {
+    let sb = sandbox(&format!(
+        "{}[[files]]\nsrc = \"$/sshd.conf.j2\"\ndest = \"{SSHD_DEST}\"\nmode = \"0644\"\ntemplate = true\n\n\
+         [[files]]\nsrc = \"$/main.j2\"\ndest = \"/etc/ssh/sshd_config\"\nmode = \"0600\"\ntemplate = true\n\n\
+         [[steps]]\nrun = \"# anvil-harden: ssh\\ntrue\"\n",
+        only(&["ssh.root-login"])
+    ));
+    store_file(&sb, "sshd.conf.j2", "PermitRootLogin {{ vars.root }}\n");
+    store_file(&sb, "main.j2", "PermitRootLogin yes\n");
+    let before = read_config(&sb);
+    for args in [&[][..], &["--write"]] {
+        let out = harden(&sb, args);
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(out.status.code(), Some(0), "{stderr}");
+        assert_eq!(stdout, "", "no src is changed");
+        assert!(
+            stderr.contains(
+                "harden: review ssh.root-login: files[0]: src $/sshd.conf.j2 is a template, \
+                 not judged; check it sets PermitRootLogin no\n"
+            ),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "harden: review ssh.root-login: files[1]: src $/main.j2 is a template, \
+                 not judged; check it does not contradict PermitRootLogin no\n"
+            ),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains(D11),
+            "a template is not judged as meeting the rule"
+        );
+    }
+    assert_eq!(read_config(&sb), before);
+    let store = sb.config_dir().join("files");
+    assert_eq!(
+        fs::read_to_string(store.join("sshd.conf.j2")).unwrap(),
+        "PermitRootLogin {{ vars.root }}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(store.join("main.j2")).unwrap(),
+        "PermitRootLogin yes\n"
+    );
+
+    let doc = json(&harden(&sb, &["--json"]));
+    assert_eq!(doc["suggestions"], serde_json::json!([]));
+    assert_eq!(
+        doc["review"][0],
+        serde_json::json!({
+            "rules": ["ssh.root-login"],
+            "what": "files[0]: src $/sshd.conf.j2 is a template, not judged; \
+                     check it sets PermitRootLogin no"
+        })
+    );
+    assert_eq!(doc["review"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn a_config_without_a_template_has_no_review_key() {
+    let doc = json(&harden(&sandbox(SKIP_ALL), &["--json"]));
+    assert!(doc.get("review").is_none(), "{doc}");
+}

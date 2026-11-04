@@ -2338,6 +2338,7 @@ mod tests {
             facts: BTreeMap::new(),
             sudo,
             rollback: true,
+            template: false,
         }
     }
 

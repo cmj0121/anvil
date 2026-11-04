@@ -182,6 +182,49 @@ fn step_output_is_not_logged_above_debug() {
 }
 
 #[test]
+fn a_step_sees_the_targets_env_and_reports_what_was_written() {
+    let sandbox = Sandbox::new("aa");
+    sandbox.write_config(
+        "inventory.toml",
+        "[env]\nAPP = \"it's $HOME a\\\\b\"\n\n[hosts.fake]\nhost = \"fakehost\"\n",
+    );
+    let step = "printf '%s\\n' \"$APP\"";
+    sandbox.write_config(
+        "config.toml",
+        "[[steps]]\nrun = \"printf '%s\\\\n' \\\"$APP\\\"\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let targets = json(&out)["targets"].clone();
+    assert_eq!(targets.as_array().unwrap().len(), 2, "{targets}");
+    for target in targets.as_array().unwrap() {
+        let steps = target["steps"].as_array().unwrap();
+        let run = steps.last().unwrap();
+        assert_eq!(run["run"], step, "{target}");
+        assert_eq!(run["stdout"], "it's $HOME a\\b\n", "{target}");
+    }
+}
+
+#[test]
+fn a_task_run_sees_the_targets_env() {
+    let sandbox = Sandbox::new("aa");
+    sandbox.write_config(
+        "inventory.toml",
+        "[hosts.fake]\nhost = \"fakehost\"\n[hosts.fake.env]\nAPP = \"task $x 'q'\"\n",
+    );
+    sandbox.write_config(
+        "config.toml",
+        "[[tasks]]\nrun = \"printf '%s\\\\n' \\\"$APP\\\"\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let target = &json(&out)["targets"][0];
+    let run = target["steps"].as_array().unwrap().last().unwrap();
+    assert_eq!(run["run"], "printf '%s\\n' \"$APP\"", "{target}");
+    assert_eq!(run["stdout"], "task $x 'q'\n", "{target}");
+}
+
+#[test]
 fn unknown_target_exits_two() {
     let sandbox = Sandbox::new("aa");
     let out = sandbox.anvil(&["apply", "--target", "nope"], &[]);
@@ -1964,4 +2007,150 @@ fn a_file_of_1_mib_with_trailing_newlines_lands_byte_for_byte_through_the_wrappe
     let out = sandbox.anvil(&["apply", "--target", "fake"], &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(std::fs::read(&dest).unwrap(), body.as_bytes());
+}
+
+/// The fake host tagged `web` with `vars.name = "fake"`, `local` with
+/// `vars.name = "local"` unless `local_vars` is false, and `src` as
+/// `site.j2`, templated to `<root>/out/web.conf` on `web` and
+/// `<root>/out/local.conf` on `local`; `plain.txt` holds `{{ vars.name }}`
+/// and is copied as it is to `<root>/out/plain.conf` on `local`. Returns
+/// the three dests.
+fn with_template(sandbox: &Sandbox, src: &str, local_vars: bool) -> [String; 3] {
+    let local = if local_vars {
+        "[tags.local.vars]\nname = \"local\"\n\n"
+    } else {
+        ""
+    };
+    sandbox.write_config(
+        "inventory.toml",
+        &format!(
+            "{local}[hosts.fake]\nhost = \"fakehost\"\ntags = [\"web\"]\n\
+             [hosts.fake.vars]\nname = \"fake\"\n"
+        ),
+    );
+    std::fs::create_dir(sandbox.root().join("out")).unwrap();
+    std::fs::write(sandbox.config_dir().join("site.j2"), src).unwrap();
+    std::fs::write(sandbox.config_dir().join("plain.txt"), "{{ vars.name }}\n").unwrap();
+    let dest = |name: &str| sandbox.root().join("out").join(name).display().to_string();
+    let dests = [dest("web.conf"), dest("local.conf"), dest("plain.conf")];
+    let entry = |src: &str, dest: &str, tag: &str, template: bool| {
+        format!(
+            "[[files]]\nsrc = \"{src}\"\ndest = \"{dest}\"\nmode = \"0640\"\n\
+             tags = [\"{tag}\"]\nsudo = false\ntemplate = {template}\n\n"
+        )
+    };
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}{}{}",
+            entry("site.j2", &dests[0], "web", true),
+            entry("site.j2", &dests[1], "local", true),
+            entry("plain.txt", &dests[2], "local", false),
+        ),
+    );
+    dests
+}
+
+#[test]
+fn a_templated_file_renders_per_target_and_a_plain_one_stays_verbatim() {
+    let sandbox = Sandbox::new("aa");
+    let [web, local, plain] = with_template(
+        &sandbox,
+        "name = {{ vars.name }}\nhost = {{ facts.hostname }}\n",
+        true,
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let host = local_hostname();
+    let host = host.trim_end();
+    assert_eq!(
+        std::fs::read_to_string(&web).unwrap(),
+        format!("name = fake\nhost = {host}\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&local).unwrap(),
+        format!("name = local\nhost = {host}\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plain).unwrap(),
+        "{{ vars.name }}\n"
+    );
+    let record = sandbox.last_apply().unwrap();
+    for (name, dest) in [("fake", &web), ("local", &local)] {
+        let file = &record["targets"][name]["files"][0];
+        assert_eq!(file["dest"], *dest);
+        assert_eq!(
+            file["written_sha256"],
+            sha256_hex(std::fs::read(dest).unwrap()),
+            "{name}"
+        );
+    }
+
+    let out = sandbox.anvil(&["-vv", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    for dest in [&web, &local, &plain] {
+        assert!(stdout.contains(&format!("unchanged {dest}\n")), "{stdout}");
+    }
+}
+
+#[test]
+fn a_render_error_fails_only_its_target_before_any_change_and_shows_no_value() {
+    let sandbox = Sandbox::new("aa");
+    let [web, local, plain] = with_template(&sandbox, "a\nname = {{ vars.name }}\n", false);
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let value = json(&out);
+    let local_run = &value["targets"][0];
+    assert_eq!(local_run["target"], "local");
+    assert_eq!(local_run["ok"], false);
+    let error = local_run["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("files[1].src `site.j2`: template: line 2")
+            && error.contains("vars.name"),
+        "{error}"
+    );
+    assert!(!error.contains("fake"), "no value: {error}");
+    assert_eq!(value["targets"][1]["ok"], true, "{value}");
+    assert_eq!(std::fs::read_to_string(&web).unwrap(), "a\nname = fake\n");
+    assert!(!std::path::Path::new(&local).exists());
+    assert!(
+        !std::path::Path::new(&plain).exists(),
+        "nothing changed on local"
+    );
+}
+
+#[test]
+fn a_template_syntax_error_exits_two_before_any_target() {
+    let sandbox = Sandbox::new("aa");
+    let [web, local, _] = with_template(&sandbox, "ok\n{% if %}\n", true);
+    for command in ["apply", "plan"] {
+        let out = sandbox.anvil(&[command], &[]);
+        assert_eq!(out.status.code(), Some(2), "{command}");
+        assert!(out.stdout.is_empty(), "{command}: {}", text(&out.stdout));
+        let stderr = text(&out.stderr);
+        assert!(
+            stderr.contains("files[0].src `site.j2`: template: line 2"),
+            "{command}: {stderr}"
+        );
+    }
+    assert!(!std::path::Path::new(&web).exists());
+    assert!(!std::path::Path::new(&local).exists());
+}
+
+#[test]
+fn a_render_over_one_mib_fails_its_target() {
+    let sandbox = Sandbox::new("aa");
+    let [web, ..] = with_template(
+        &sandbox,
+        "{% for i in range(2000) %}{{ vars.name * 200 }}{% endfor %}",
+        true,
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "fake"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(
+        json(&out)["targets"][0]["error"],
+        "files[0].src `site.j2`: template: rendered output exceeds the 1 MiB limit"
+    );
+    assert!(!std::path::Path::new(&web).exists());
 }

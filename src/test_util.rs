@@ -308,5 +308,7 @@ pub(crate) fn target(name: &str) -> crate::inventory::Target {
         pkg: None,
         sudo_secret: None,
         tags: Vec::new(),
+        vars: Default::default(),
+        env: Default::default(),
     }
 }

@@ -113,6 +113,45 @@ fn the_script_is_never_on_an_ssh_argv_and_nothing_is_probed() {
     assert!(calls.iter().all(|c| !c.contains(marker)), "{calls:?}");
 }
 
+/// An inventory giving `local` and the fake host each their own env, the
+/// fake host's value full of shell metacharacters.
+const ENV_INVENTORY: &str = "[env]\nAPP = \"global\"\n\n\
+    [tags.local.env]\nAPP = \"from local\"\n\n\
+    [hosts.fake]\nhost = \"fakehost\"\n\
+    [hosts.fake.env]\nAPP = \"it's $HOME `id` a\\\\b marker-9c1e\"\n";
+
+#[test]
+fn each_target_sees_its_own_env_literally_and_never_on_argv() {
+    let sandbox = Sandbox::new("ru");
+    sandbox.write_config("inventory.toml", ENV_INVENTORY);
+    let log = sandbox.root().join("ssh.log");
+    let body = "printf '%s\\n' \"$APP\"\n";
+    let out = anvil_stdin(
+        &sandbox,
+        &["--json", "run", "-"],
+        &[("FAKE_SSH_LOG", log.to_str().unwrap())],
+        body.as_bytes(),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let seen: Vec<_> = (value["targets"].as_array().unwrap().iter())
+        .map(|target| {
+            let step = &target["steps"][0];
+            assert_eq!(step["run"], body, "the report shows the script: {target}");
+            (target["target"].clone(), step["stdout"].clone())
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("local".into(), "from local\n".into()),
+            ("fake".into(), "it's $HOME `id` a\\b marker-9c1e\n".into()),
+        ]
+    );
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(!calls.contains("marker-9c1e"), "{calls}");
+}
+
 #[test]
 fn a_command_reading_stdin_does_not_eat_the_later_lines() {
     let sandbox = Sandbox::new("ru");

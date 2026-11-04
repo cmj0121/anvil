@@ -947,7 +947,8 @@ fn apply_lines(report: &TargetReport) -> (Vec<Line<'static>>, Vec<usize>) {
 }
 
 /// Like the CLI's plan block: `▶ target`, a `PATH  NAME` line per task and a
-/// `would $ command` line per step, then `✔ N steps`, `✘ reason` or `⊘ cancelled`.
+/// `would $ command` line per step (a templated file's followed by its rendered
+/// size and sha256), then `✔ N steps`, `✘ reason` or `⊘ cancelled`.
 fn plan_block(report: &PlanReport) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(format!("▶ {}", text(report.target()))).style(heading())];
     let end = match report {
@@ -956,6 +957,9 @@ fn plan_block(report: &PlanReport) -> Vec<Line<'static>> {
                 lines.extend(step.title().map(task_line));
                 let command = format!("  {}", text(&plan::would_text(step)));
                 lines.push(Line::from(command).style(Modifier::DIM));
+                if let Some(rendered) = plan::rendered_text(step) {
+                    lines.push(Line::from(format!("    {rendered}")).style(Modifier::DIM));
+                }
             }
             Line::from(format!("  ✔ {}", report::steps_text(steps.len()))).style(Color::Green)
         }
@@ -1574,6 +1578,7 @@ mod tests {
             facts: Default::default(),
             sudo: false,
             rollback: true,
+            template: false,
         };
         let config = Config {
             packages: Some(Packages {
@@ -1647,6 +1652,7 @@ mod tests {
                 facts: Default::default(),
                 sudo: false,
                 rollback: true,
+                template: false,
             }],
             services: vec![service("sshd", "local"), service("cron", "web")],
             steps: vec![Step::script("hostname")],
@@ -2560,6 +2566,8 @@ mod tests {
         ));
         let plan = plan_block(&PlanReport::Planned {
             target: "local".to_owned(),
+            vars: Default::default(),
+            env: Default::default(),
             steps: vec![PlannedRun {
                 run: run.to_owned().into(),
                 label: None,
@@ -2578,6 +2586,64 @@ mod tests {
             let shown: Vec<String> = lines.iter().map(ToString::to_string).collect();
             assert!(shown.iter().any(|l| l.contains(wanted)), "{shown:?}");
         }
+    }
+
+    #[test]
+    fn a_templated_file_shows_its_rendered_size_and_sha256_under_its_would_line() {
+        use anvil::files::{FileWrite, Rendered};
+        use anvil::plan::PlanReport;
+        use anvil::step::{FileRun, PlannedRun, RunKind};
+        use anvil::transport::RUN_TIMEOUT;
+
+        let file = |rendered: Option<Rendered>| PlannedRun {
+            run: "rendered-bytes".to_owned().into(),
+            label: Some("file /etc/a".to_owned()),
+            sudo_secret: None,
+            timeout: RUN_TIMEOUT,
+            kind: RunKind::File {
+                dest: "/etc/a".to_owned(),
+                run: FileRun {
+                    upload: None,
+                    skip: false,
+                    write: Some(FileWrite {
+                        ordinal: 0,
+                        dest: "/etc/a".to_owned(),
+                        mode: "0644".to_owned(),
+                        sudo: String::new(),
+                        checks: String::new(),
+                        as_root: false,
+                        password: false,
+                        rendered: rendered.map(Box::new),
+                    }),
+                },
+            },
+            task: None,
+            name: None,
+        };
+        let rendered = Rendered {
+            text: "rendered-bytes".to_owned().into(),
+            sha256: "ab".repeat(32),
+        };
+        let plan = plan_block(&PlanReport::Planned {
+            target: "local".to_owned(),
+            vars: Default::default(),
+            env: Default::default(),
+            steps: vec![file(Some(rendered)), file(None)],
+            ok: true,
+        });
+        let shown: Vec<String> = plan.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown[1..4],
+            [
+                "  would $ file /etc/a".to_owned(),
+                format!("    rendered 14 bytes, sha256 {}", "ab".repeat(32)),
+                "  would $ file /etc/a".to_owned(),
+            ]
+        );
+        assert!(
+            shown.iter().all(|l| !l.contains("rendered-bytes")),
+            "{shown:?}"
+        );
     }
 
     #[test]
@@ -2652,6 +2718,8 @@ mod tests {
             RunResult::Plan {
                 targets: done(vec![PlanReport::Planned {
                     target: "local".to_owned(),
+                    vars: Default::default(),
+                    env: Default::default(),
                     steps: vec![PlannedRun {
                         run: "true".to_owned().into(),
                         label: None,
@@ -2687,6 +2755,8 @@ mod tests {
                 targets: done(vec![
                     PlanReport::Planned {
                         target: "local".to_owned(),
+                        vars: Default::default(),
+                        env: Default::default(),
                         steps: vec![
                             PlannedRun {
                                 run: "pacman -S git".to_owned().into(),
@@ -2711,11 +2781,15 @@ mod tests {
                     },
                     PlanReport::Failed {
                         target: "pi".to_owned(),
+                        vars: Default::default(),
+                        env: Default::default(),
                         error: "packages: probe exited 2".to_owned(),
                         ok: false,
                     },
                     PlanReport::Cancelled {
                         target: "mac".to_owned(),
+                        vars: Default::default(),
+                        env: Default::default(),
                         ok: false,
                         abort: report::AbortReason::Cancelled,
                     },

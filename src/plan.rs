@@ -8,12 +8,14 @@
 //! secret is set is `anvil doctor`'s job. A plugin step runs its plugin, on
 //! the controller only, to list the script it returns. Each `[[files]]`
 //! src is read before any target, as apply reads it; its bytes are never
-//! shown. A `[[services]]` step shows as `service NAME`, never its script.
+//! shown, except a templated src's rendered text under `--show-rendered`.
+//! A `[[services]]` step shows as `service NAME`, never its script.
 
 use std::num::NonZeroU8;
 use std::sync::Arc;
 
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 use crate::cancel::{AbortReason, Cancel};
 use crate::config::Config;
@@ -27,9 +29,9 @@ use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
 use crate::options::{Options, Output};
 use crate::plugin::Plugins;
 use crate::prepared::Prepared;
-use crate::report::{self, Escape, Line, Style, print_lines};
+use crate::report::{self, Escape, Line, Shown, Style, print_lines};
 use crate::status;
-use crate::step::PlannedRun;
+use crate::step::{PlannedRun, RunKind};
 use crate::tasks::Expanded;
 use crate::transport::{Transport, TransportError};
 
@@ -38,12 +40,22 @@ use crate::transport::{Transport, TransportError};
 pub enum PlanReport {
     Planned {
         target: String,
+        /// The target's resolved `vars`, each with its level.
+        #[serde(skip_serializing_if = "Shown::is_empty")]
+        vars: Shown,
+        /// The target's resolved `env`, each with its level.
+        #[serde(skip_serializing_if = "Shown::is_empty")]
+        env: Shown,
         steps: Vec<PlannedRun>,
         ok: bool,
     },
     /// The target could not be reached, probed or resolved.
     Failed {
         target: String,
+        #[serde(skip_serializing_if = "Shown::is_empty")]
+        vars: Shown,
+        #[serde(skip_serializing_if = "Shown::is_empty")]
+        env: Shown,
         error: String,
         ok: bool,
     },
@@ -52,6 +64,10 @@ pub enum PlanReport {
     /// the user.
     Cancelled {
         target: String,
+        #[serde(skip_serializing_if = "Shown::is_empty")]
+        vars: Shown,
+        #[serde(skip_serializing_if = "Shown::is_empty")]
+        env: Shown,
         ok: bool,
         #[serde(skip_serializing_if = "AbortReason::is_cancelled")]
         abort: AbortReason,
@@ -74,6 +90,15 @@ impl PlanReport {
             | PlanReport::Cancelled { target, .. } => target,
         }
     }
+
+    /// The target's resolved `vars` and `env`.
+    pub fn values(&self) -> (&Shown, &Shown) {
+        match self {
+            PlanReport::Planned { vars, env, .. }
+            | PlanReport::Failed { vars, env, .. }
+            | PlanReport::Cancelled { vars, env, .. } => (vars, env),
+        }
+    }
 }
 
 /// The `--json` document; `executed` is always false.
@@ -82,6 +107,57 @@ pub struct Plan {
     pub executed: bool,
     pub targets: Vec<PlanReport>,
     pub ok: bool,
+    /// Each templated file's rendered text, per target, under `--show-rendered`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rendered: Vec<RenderedText>,
+}
+
+/// One target's rendered text of one templated file; `step` indexes that
+/// target's `steps`.
+#[derive(Serialize)]
+pub struct RenderedText {
+    pub target: String,
+    pub step: usize,
+    pub dest: String,
+    #[serde(serialize_with = "serialize_text")]
+    pub text: Zeroizing<String>,
+}
+
+fn serialize_text<S: serde::Serializer>(text: &Zeroizing<String>, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(text)
+}
+
+/// By hand: the length, never the text.
+impl std::fmt::Debug for RenderedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderedText")
+            .field("target", &self.target)
+            .field("step", &self.step)
+            .field("dest", &self.dest)
+            .field("text", &format_args!("<{} bytes>", self.text.len()))
+            .finish()
+    }
+}
+
+/// Every templated file step's rendered text in `targets`, in order.
+fn rendered_texts(targets: &[PlanReport]) -> Vec<RenderedText> {
+    let mut texts = Vec::new();
+    for report in targets {
+        let PlanReport::Planned { target, steps, .. } = report else {
+            continue;
+        };
+        for (step, run) in steps.iter().enumerate() {
+            if let (RunKind::File { dest, .. }, Some(rendered)) = (&run.kind, run.rendered()) {
+                texts.push(RenderedText {
+                    target: target.clone(),
+                    step,
+                    dest: dest.clone(),
+                    text: rendered.text.clone(),
+                });
+            }
+        }
+    }
+    texts
 }
 
 /// What [`plan_targets`] reports as it goes: the targets, a target about to
@@ -156,12 +232,15 @@ pub fn plan_targets(
         executed: false,
         targets: reports,
         ok,
+        rendered: Vec::new(),
     }
 }
 
 fn failed(target: &Target, error: String) -> PlanReport {
     PlanReport::Failed {
         target: target.name.clone(),
+        vars: report::shown_vars(target),
+        env: report::shown_env(target),
         error,
         ok: false,
     }
@@ -173,6 +252,8 @@ fn cancelled(target: &Target, cancel: &Cancel) -> PlanReport {
     log::info!("plan {}: cancelled", target.name);
     PlanReport::Cancelled {
         target: target.name.clone(),
+        vars: report::shown_vars(target),
+        env: report::shown_env(target),
         ok: false,
         abort: cancel.reason().unwrap_or(AbortReason::Cancelled),
     }
@@ -210,6 +291,8 @@ fn plan_target(
             log::info!("plan {}: {} steps", target.name, steps.len());
             PlanReport::Planned {
                 target: target.name.clone(),
+                vars: report::shown_vars(target),
+                env: report::shown_env(target),
                 steps,
                 ok: true,
             }
@@ -224,21 +307,24 @@ fn plan_target(
 
 /// `anvil plan`: prints each target's block once it and every earlier
 /// target have ended (or one JSON document), then the summary.
-pub fn run(out: Output, opts: &Options) -> Result<(), Failure> {
+pub fn run(out: Output, opts: &Options, show_rendered: bool) -> Result<(), Failure> {
     let style = Style::detect();
     let (config, expanded) = opts.load_expanded()?;
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
-    let mut print = fanout::in_order(|report| print_lines(&render(report), style));
+    let mut print = fanout::in_order(|report| print_lines(&render(report, show_rendered), style));
     let mut follow = status::Follow::new("plan", status::enabled(out.no_progress));
     let prepared = Prepared::plan(opts, config, expanded, cancel)?;
-    let plan = run_targets(&prepared, &mut |progress| {
+    let mut plan = run_targets(&prepared, &mut |progress| {
         follow.event(&progress);
         if !out.json {
             print(progress);
         }
     });
     drop(follow);
+    if show_rendered {
+        plan.rendered = rendered_texts(&plan.targets);
+    }
     let failed = plan.targets.iter().filter(|t| !t.ok()).count();
     if out.json {
         print_json(&plan, Failure::failed)?;
@@ -256,11 +342,17 @@ pub fn run(out: Output, opts: &Options) -> Result<(), Failure> {
     }
 }
 
-/// One target's block: a `▶ target` header, a `PATH  NAME` line per task and a
+/// One target's block: a `▶ target` header, a `vars.KEY = VALUE (LEVEL)` line
+/// per resolved var and env value, a `PATH  NAME` line per task and a
 /// `would $ command` line per step, then `✔ N steps`, `✘ reason` or `⊘ cancelled` (or its abort
-/// reason), then a blank line.
-pub fn render(report: &PlanReport) -> Vec<Line> {
+/// reason), then a blank line. A templated file step's would line is followed
+/// by its [`rendered_text`] and, with `show_rendered`, the text itself.
+pub fn render(report: &PlanReport, show_rendered: bool) -> Vec<Line> {
     let mut lines = vec![Line::header(report.target())];
+    let (vars, env) = report.values();
+    for (key, value) in report::value_rows(vars, env) {
+        lines.push(Line::out(format!("{key} = {value}"), Escape::Always, None));
+    }
     let end = match report {
         PlanReport::Planned { steps, .. } => {
             for step in steps {
@@ -269,6 +361,12 @@ pub fn render(report: &PlanReport) -> Vec<Line> {
                         .map(|title| Line::out(title, Escape::Always, None)),
                 );
                 lines.push(Line::out(would_text(step), Escape::Always, Some(DIM)));
+                if let Some(text) = rendered_text(step) {
+                    lines.push(Line::out(format!("  {text}"), Escape::Never, Some(DIM)));
+                }
+                if show_rendered && let Some(rendered) = step.rendered() {
+                    lines.extend(text_lines(&rendered.text));
+                }
             }
             Line::out(
                 format!("✔ {}", report::steps_text(steps.len())),
@@ -307,6 +405,45 @@ pub fn would_text(step: &PlannedRun) -> String {
     }
 }
 
+/// `rendered N bytes, sha256 HEX` for a templated file step; `None` for a
+/// plain file, a skip or any other step.
+pub fn rendered_text(step: &PlannedRun) -> Option<String> {
+    step.rendered().map(|rendered| {
+        format!(
+            "rendered {} bytes, sha256 {}",
+            rendered.text.len(),
+            rendered.sha256
+        )
+    })
+}
+
+/// `text` as `  │ LINE` lines, with control and invisible characters
+/// escaped, then `  (no newline at end)` when it lacks a final `\n`.
+fn text_lines(text: &str) -> Vec<Line> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let mut lines: Vec<Line> = body
+        .split('\n')
+        .map(|line| {
+            Line::out(
+                format!("  │ {}", escape_invisible(line)),
+                Escape::Always,
+                None,
+            )
+        })
+        .collect();
+    if !text.ends_with('\n') {
+        lines.push(Line::out(
+            "  (no newline at end)".to_owned(),
+            Escape::Never,
+            Some(DIM),
+        ));
+    }
+    lines
+}
+
 /// The last line of the human output: `N targets, [M failed, ]nothing executed`.
 pub(crate) fn render_summary(targets: usize, failed: usize, style: Style) -> String {
     let plural = if targets == 1 { "" } else { "s" };
@@ -323,7 +460,6 @@ pub(crate) fn render_summary(targets: usize, failed: usize, style: Style) -> Str
 
 #[cfg(test)]
 mod tests {
-    use crate::step::RunKind;
     use crate::tasks::legacy;
     use std::sync::Mutex;
 
@@ -352,6 +488,21 @@ mod tests {
         assert_eq!(would_text(&task), "would $ true \\u{202e}x");
         assert!(serde_json::to_string(&task).unwrap().contains(run));
         assert_eq!(would_text(&step(None)), format!("would $ {run}"), "legacy");
+    }
+
+    #[test]
+    fn rendered_text_lines_end_without_an_empty_line_and_mark_a_missing_newline() {
+        let style = Style::new(false, false, None);
+        let shown = |text: &str| -> String {
+            text_lines(text)
+                .iter()
+                .map(|line| line.show(style))
+                .collect()
+        };
+        assert_eq!(shown("a\n\tb\r\n"), "    │ a\n    │ \tb\\x0d\n");
+        assert_eq!(shown("a\n\n"), "    │ a\n    │ \n");
+        assert_eq!(shown("a"), "    │ a\n    (no newline at end)\n");
+        assert_eq!(shown(""), "");
     }
 
     /// [`super::run_targets`] on a legacy config's list.
@@ -436,6 +587,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         }
     }
 
@@ -553,7 +706,10 @@ mod tests {
 
     fn screen(report: &PlanReport) -> String {
         let style = Style::new(false, false, None);
-        render(report).iter().map(|line| line.show(style)).collect()
+        render(report, false)
+            .iter()
+            .map(|line| line.show(style))
+            .collect()
     }
 
     #[test]
@@ -568,6 +724,7 @@ mod tests {
             facts: Default::default(),
             sudo: true,
             rollback: true,
+            template: false,
         };
         let config = Config {
             files: vec![file("/etc/a.conf", &[]), file("/etc/b.conf", &["web"])],
@@ -656,6 +813,8 @@ mod tests {
                  -z \"$a\" ] || sudo -n pacman -S --noconfirm --needed $a; }";
         let local = PlanReport::Planned {
             target: "local".to_owned(),
+            vars: Default::default(),
+            env: Default::default(),
             steps: vec![
                 PlannedRun {
                     run: one_liner.to_owned().into(),
@@ -724,6 +883,8 @@ mod tests {
             plan.targets[0],
             PlanReport::Failed {
                 target: "a".to_owned(),
+                vars: Default::default(),
+                env: Default::default(),
                 error: error.clone(),
                 ok: false,
             }
@@ -863,6 +1024,51 @@ mod tests {
             serde_json::json!({"target": "a", "ok": false})
         );
         assert_eq!(screen(&plan.targets[0]), "▶ a\n  ⊘ cancelled\n\n");
+    }
+
+    /// `name` with a var from tag `web` and an env value from the host, each
+    /// carrying an invisible character.
+    fn valued(name: &str) -> Target {
+        use crate::inventory::{Level, VarValue};
+        Target {
+            vars: [(
+                "motd".to_owned(),
+                (
+                    VarValue::String("a\u{202e}b".to_owned()),
+                    Level::Tag("web".to_owned()),
+                ),
+            )]
+            .into(),
+            env: [("APP".to_owned(), ("x\u{200b}y".to_owned(), Level::Host))].into(),
+            ..target(name)
+        }
+    }
+
+    #[test]
+    fn failed_and_cancelled_targets_show_their_vars_and_env_escaped() {
+        let rows = "  vars.motd = \"a\\u{202e}b\" (tag:web)\n  env.APP = x\\u{200b}y (host)\n";
+        let failed = failed(&valued("a"), "probe: refused".to_owned());
+        assert_eq!(
+            screen(&failed),
+            format!("▶ a\n{rows}  ✘ probe: refused\n\n")
+        );
+        let cancelled = cancelled(&valued("b"), &Cancel::new());
+        assert_eq!(screen(&cancelled), format!("▶ b\n{rows}  ⊘ cancelled\n\n"));
+        let values = serde_json::json!({
+            "vars": {"motd": {"value": "a\u{202e}b", "level": "tag:web"}},
+            "env": {"APP": {"value": "x\u{200b}y", "level": "host"}},
+        });
+        for (report, rest) in [
+            (&failed, serde_json::json!({"error": "probe: refused"})),
+            (&cancelled, serde_json::json!({})),
+        ] {
+            let value = json(report);
+            assert_eq!(value["vars"], values["vars"]);
+            assert_eq!(value["env"], values["env"]);
+            for (key, expected) in rest.as_object().unwrap() {
+                assert_eq!(&value[key], expected);
+            }
+        }
     }
 
     #[test]
@@ -1020,6 +1226,8 @@ mod tests {
             plan.targets[2],
             PlanReport::Cancelled {
                 target: "c".to_owned(),
+                vars: Default::default(),
+                env: Default::default(),
                 ok: false,
                 abort: AbortReason::Cancelled,
             }
@@ -1038,7 +1246,9 @@ mod tests {
         );
         assert!(plan.targets[0].ok() && plan.targets[2].ok(), "{plan:?}");
         match &plan.targets[1] {
-            PlanReport::Failed { target, error, ok } => {
+            PlanReport::Failed {
+                target, error, ok, ..
+            } => {
                 assert_eq!((target.as_str(), *ok), ("b", false));
                 assert!(error.starts_with("internal error: "), "{error}");
                 assert!(error.contains("b blew up"), "{error}");
@@ -1084,6 +1294,7 @@ mod tests {
                 executed: false,
                 targets: vec![report],
                 ok: false,
+                rendered: Vec::new(),
             };
             assert_eq!(plan.abort(), Some(reason));
         }
@@ -1091,6 +1302,7 @@ mod tests {
             executed: false,
             targets: Vec::new(),
             ok: true,
+            rendered: Vec::new(),
         };
         assert_eq!(plan.abort(), None);
     }

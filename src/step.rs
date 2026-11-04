@@ -166,6 +166,11 @@ impl PlannedRun {
         }
     }
 
+    /// A templated file step's rendered text; `None` for any other step.
+    pub(crate) fn rendered(&self) -> Option<&files::Rendered> {
+        self.file()?.write.as_ref()?.rendered.as_deref()
+    }
+
     pub(crate) fn service(&self) -> Option<&ServiceRun> {
         match &self.kind {
             RunKind::Service { run, .. } => Some(run),
@@ -187,13 +192,26 @@ impl Serialize for PlannedRun {
             task: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             name: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            rendered: Option<RenderedShown<'a>>,
         }
+        /// A templated file's rendered size and hash, never its text.
+        #[derive(Serialize)]
+        struct RenderedShown<'a> {
+            bytes: usize,
+            sha256: &'a str,
+        }
+        let rendered = self.rendered().map(|rendered| RenderedShown {
+            bytes: rendered.text.len(),
+            sha256: &rendered.sha256,
+        });
         Shown {
             run: self.shown(),
             sudo_secret: self.sudo_secret.as_deref(),
             plugin: self.plugin(),
             task: self.task.as_deref(),
             name: self.name.as_deref(),
+            rendered,
         }
         .serialize(serializer)
     }

@@ -44,6 +44,8 @@ pub struct Outcome {
     pub files: Vec<FileChange>,
     pub suggestions: Vec<Suggestion>,
     pub held: Vec<Held>,
+    /// Templated srcs harden did not judge, to check by hand.
+    pub review: Vec<Review>,
     pub warnings: Vec<String>,
     /// A warning names an include's or nested task's entry that still needs
     /// changing, so the config does not yet carry every rule.
@@ -90,6 +92,14 @@ pub struct Suggestion {
     pub what: String,
 }
 
+/// A templated src harden neither judged nor changed: its text is a
+/// template, so whether it meets the rules shows only once rendered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Review {
+    pub rules: Vec<&'static str>,
+    pub what: String,
+}
+
 /// A rule left out because applying it could lock the named hosts out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Held {
@@ -117,6 +127,7 @@ pub fn suggest(input: &Input) -> Result<Outcome, Failure> {
         sources: Sources::new(input.workspace),
         files: Vec::new(),
         suggestions: Vec::new(),
+        review: Vec::new(),
         added: Vec::new(),
         warnings: Vec::new(),
         unresolved: false,
@@ -174,6 +185,7 @@ pub fn suggest(input: &Input) -> Result<Outcome, Failure> {
         files: run.files,
         suggestions: run.suggestions,
         held,
+        review: run.review,
         warnings: run.warnings,
         unresolved: run.unresolved,
     })
@@ -369,6 +381,7 @@ struct Run<'a> {
     sources: Sources<'a>,
     files: Vec<FileChange>,
     suggestions: Vec<Suggestion>,
+    review: Vec<Review>,
     added: Vec<Added>,
     warnings: Vec<String>,
     unresolved: bool,
@@ -410,6 +423,11 @@ impl<'a> Run<'a> {
             .files()
             .find(|(_, file, _)| expanded.same_dest(&file.dest, drop_in.dest));
         let entry = found.map(|(item, _, i)| (item, i));
+        if let Some((item, file, i)) = found.filter(|(_, file, _)| file.template) {
+            self.review(drop_in, item, i, &file.src, "sets");
+            self.contradictions(drop_in, Some(i))?;
+            return self.step(&ids, drop_in.marker, drop_in.script);
+        }
         let src = match found {
             Some((_, file, _)) => file.src.clone(),
             None => {
@@ -480,6 +498,10 @@ impl<'a> Run<'a> {
             if Some(i) == entry || !drop_in.syntax.shares(&expanded.spelled_dest(&file.dest)) {
                 continue;
             }
+            if file.template {
+                self.review(drop_in, item, i, &file.src, "does not contradict");
+                continue;
+            }
             match self.text(&file.src) {
                 Ok(Some(old)) => self.ensure_entry(drop_in, Some((item, i)), &file.src, old, false),
                 Err(why) if why.refused => {
@@ -520,6 +542,27 @@ impl<'a> Run<'a> {
             }
             None => self.ensure_src(drop_in, src, old, append),
         }
+    }
+
+    /// Reports the templated `src` of entry `i` for review: `check` says
+    /// what to check it does with every directive of `drop_in`.
+    fn review(&mut self, drop_in: &DropIn, item: &tasks::Item, i: usize, src: &str, check: &str) {
+        let lines: Vec<String> = drop_in
+            .rules
+            .iter()
+            .flat_map(|(_, directives)| directives.iter())
+            .map(|(key, value)| drop_in.syntax.line(key, value))
+            .collect();
+        let what = item.shown_message(format!(
+            "{}: src {} is a template, not judged; check it {check} {}",
+            item.label("files", i),
+            secret::shown_name(&Sources::shown(src)),
+            lines.join("; ")
+        ));
+        self.review.push(Review {
+            rules: drop_in.rules.iter().map(|(id, _)| *id).collect(),
+            what,
+        });
     }
 
     fn unresolved(&mut self, what: String) {

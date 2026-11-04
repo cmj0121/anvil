@@ -277,7 +277,7 @@ impl Options {
     }
 
     /// Selects this run's targets from an already loaded inventory.
-    fn select_targets(&self, inventory: Inventory) -> Result<Vec<Target>, Failure> {
+    pub(crate) fn select_targets(&self, inventory: Inventory) -> Result<Vec<Target>, Failure> {
         let sels: Vec<Sel> = self.target.iter().map(|sel| Sel::parse(sel)).collect();
         Ok(inventory.select(&sels)?)
     }
@@ -537,6 +537,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         let cancel = Arc::new(Cancel::new());
         let ssh = opts.transport(&host, &cancel).unwrap();
@@ -558,6 +560,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         assert_eq!(
             opts.transport(&local, &Arc::default()).unwrap().name(),
@@ -580,6 +584,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         let cancel = Arc::default();
         assert_eq!(

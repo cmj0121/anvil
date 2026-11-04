@@ -757,6 +757,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         for writable_again in [false, true] {
             let root = crate::test_util::temp_dir("rollback-record-ro");
@@ -855,6 +857,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         let root = crate::test_util::temp_dir("rollback-record-abort");
         let dir = root.join("state/anvil");
@@ -990,6 +994,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: vec!["web".to_owned()],
+            vars: Default::default(),
+            env: Default::default(),
         }
     }
 
@@ -1002,6 +1008,7 @@ mod tests {
             facts: BTreeMap::new(),
             sudo,
             rollback: true,
+            template: false,
         }
     }
 
@@ -1021,6 +1028,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         let record = Record {
             version: record::VERSION,

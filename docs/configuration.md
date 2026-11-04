@@ -205,6 +205,80 @@ tag `local`; defining it is an error, as is a host name equal to a tag. Its pack
 with ``host `linode1`: sudo_secret `VALUE`: must match [A-Z][A-Z0-9_]*``; `local`'s is
 `[packages].local_sudo_secret`.
 
+### Vars and env
+
+The inventory can give every target `vars` and `env` values, at three levels: global, per tag and per host. A step
+reads its target's `env` as environment variables:
+
+```toml
+[vars]                      # global
+port = 80
+ntp = "pool.ntp.org"
+
+[env]                       # global; a step reads $HTTP_PROXY
+HTTP_PROXY = "http://proxy:3128"
+
+[tags.web.vars]             # every host tagged web
+port = 8080
+[tags.web.env]
+APP_ENV = "prod"
+
+[tags.local.vars]           # the local target
+editor = "nvim"
+
+[hosts.web1]
+host = "203.0.113.10"
+tags = ["web"]
+[hosts.web1.vars]           # this host only
+port = 9090
+[hosts.web1.env]
+APP_ENV = "staging"
+```
+
+```toml
+[[steps]]
+run = 'echo "deploying to $APP_ENV"'   # web1: staging; another web host: prod
+```
+
+**`vars` and `env` are not for secrets.** `anvil doctor`, `anvil plan` and their `--json` print every value as is,
+and each `env` value travels in clear inside every step script it is given to. Keep passwords and tokens in the
+[secret store](secrets.md).
+
+- **Precedence.** A target takes global, then each of its tags, then its host's own values. A key
+  set at a later level replaces the whole value: a table or an array is not merged, so `list = [3]` on a tag replaces a
+  global `list = [1, 2]`.
+- **Tag conflicts.** Two tags of one host setting a key to different values, with no value for it on the host, is exit
+  2 before any target starts, with
+  ``host `NAME`: vars.KEY is set by tags `A` and `B` with different values; set it in [hosts.NAME.vars]`` (`env.KEY` and
+  `[hosts.NAME.env]` for env). Equal values are not a conflict, and setting the key on the host resolves one.
+- **`local`.** The local target takes global, then `[tags.local]`; it still has no `[hosts.local]` entry.
+- **Tags.** A `[tags.NAME]` name matches `[A-Za-z0-9_-]+` and is not a host name (exit 2 with
+  ``tag `NAME`: name must match [A-Za-z0-9_-]+`` or ``tag `NAME`: name is a host name``), and holds only `vars` and
+  `env`. A tag no host carries, `local` aside, is a doctor warning ([`anvil doctor`](cli.md#anvil-doctor)).
+- **`vars` values** are strings, integers, booleans, arrays and tables. A float, a TOML datetime or a YAML null is exit 2
+  naming the level and key, such as `vars.ratio: must be a string, integer, boolean, array or table, not a float` or
+  `tags.web.vars.list[1]: ..., not null`. Keys, nested table keys included, match `[A-Za-z_][A-Za-z0-9_]*`
+  (``vars `a-b`: must match [A-Za-z_][A-Za-z0-9_]*``). Limits: 256 keys per level and per table, a value nested at most
+  8 levels deep counting itself, a string at most 64 KiB, an integer within 64 bits. Past one, the exit is 2 with
+  `vars: has more than 256 keys`, `vars.KEY: nests deeper than 8 levels`, `vars.KEY: is longer than 65536 bytes` or
+  `vars.KEY: is outside the 64-bit integer range`. A [templated file](#templating) reads `vars`; a step does not.
+- **`env` keys** match `[A-Za-z_][A-Za-z0-9_]*`. `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `IFS`, `ENV`,
+  `BASH_ENV`, `CDPATH`, `PS4`, `TMPDIR`, `SHELLOPTS`, `BASHOPTS`, `UID`, `EUID`, `PPID` and `GROUPS`, and any key
+  starting with `ANVIL_`, `LD_`, `DYLD_`, `LC_`, `SUDO_` or `SSH_`, are refused with ``env `PATH`: is reserved``. A
+  value is a string (`env.KEY: must be a string`) with no control character, tab and newline included
+  (`env.KEY: contains a control character`), at most 4 KiB (`env.KEY: is longer than 4096 bytes`), with at most 64
+  keys per level (`env: has more than 64 keys`).
+- **Where `env` goes.** A `[[steps]]` or task `run`, a plugin step and an `anvil run` script start with the target's
+  env as `KEY='value'` and `export KEY` lines, inside the script on the transport's stdin, never on an argv. Values are
+  single-quoted, so quotes, `$`, backticks and backslashes arrive literally. Packages, files and services get no env.
+  The report, plan and `--json` show the script as you wrote it, without these lines.
+- **sudo.** `sudo` resets the environment (`env_reset`), so a command run through it does not see `env`. Pass a value
+  on by name: `sudo APP_ENV="$APP_ENV" cmd`.
+
+Each `vars` and `env` value or key message starts with its level: `vars`, `tags.NAME.vars` or `hosts.NAME.vars`,
+and `env`, `tags.NAME.env` or `hosts.NAME.env`. An inventory without `vars`, `env` or `tags` loads and saves as
+before. The YAML view mirrors the TOML (`vars:`, `env:`, `tags: {web: {vars: …}}` and `vars:` / `env:` under a host).
+
 ## Config
 
 ```toml
@@ -348,6 +422,7 @@ tags = ["linode"]                # optional; [A-Za-z0-9_-]+; every one must be o
 facts = { distro = "arch" }      # optional; a probe key, equal to that fact
 sudo = false                     # optional; default true. false: write as the connecting user
 rollback = false                 # optional; default true. false: the apply record keeps the hash only
+template = true                  # optional; default false. true: render src per target (see Templating)
 ```
 
 **`mode`.** Required, and a quoted string. Three or four octal digits, at most `0777` plus the sticky bit, so `644`,
@@ -559,6 +634,95 @@ A rule that allows `sh` but neither hash tool refuses a file others cannot read 
 `files: sudo could not check DEST; nothing was changed`. A file root cannot read on a root-squashed mount fails the
 same way; use `sudo = false` where the login user can write it.
 
+### Templating
+
+`template = true` on a `[[files]]` entry, or on a task `file`, renders its src with
+[MiniJinja](https://docs.rs/minijinja) once per target, from that target's [vars](#vars-and-env) and probe facts, and
+writes the result. Without it a src is copied byte for byte, `{{` included.
+
+```toml
+[[files]]
+src = "files/nginx.conf.j2"
+dest = "/etc/nginx/nginx.conf"
+mode = "0644"
+template = true
+```
+
+`files/nginx.conf.j2`:
+
+```jinja
+server {
+    listen {{ vars.port }};
+    server_name {{ facts.hostname }};
+{% if facts.distro == "debian" %}
+    include /etc/nginx/debian.conf;
+{% endif %}
+}
+```
+
+With the inventory in [Vars and env](#vars-and-env), `web1` gets `listen 9090;` and another host tagged `web`
+`listen 8080;`. A file task takes it the same way:
+`file = { src = "$/nginx.conf.j2", dest = "/etc/nginx/nginx.conf", mode = "0644", template = true }`.
+
+**Context.** Two names, nothing else: no `env`, no secrets, no file, no clock.
+
+- `vars.KEY` is the target's resolved var with its type: `{{ vars.port + 1 }}`, `{{ vars.users[0] }}`,
+  `{{ vars.db.host }}`, `{% for u in vars.users %}`.
+- `facts.KEY` is a probe fact as a string, one of the keys listed under [`tags` and `facts`](#files). `facts.pkg` is the
+  probe's raw string, such as `brew pacman`, not one manager: test one with `{% if "pacman" in (facts.pkg | split) %}`.
+
+**Syntax.** A subset of MiniJinja: `{{ … }}`, `{# … #}`, `{% if %}` / `elif` / `else`, `{% for %}` (with `loop`),
+`{% set %}`, `{% with %}`, `{% filter %}`, `{% raw %}`, and the built-in filters and tests (`default`, `join`, `length`,
+`lower`, `upper`, `trim`, `split`, `items`, `is defined`, …). Output is not escaped.
+
+- No other file is read: `include`, `import`, `from` and `extends` are refused (`line 1: include is not allowed`).
+  `macro` and `call` are not available (`line 1: syntax error: unknown statement macro`), nor are methods such as
+  `facts.pkg.split()` (`line 1: unknown method`): use the filter form.
+- The `replace` filter is removed, since its output has no size limit (`line 1: unknown filter`).
+- A boolean renders as `True` or `False`, as in Jinja: write `{{ vars.flag | lower }}` for `true`, or
+  `{{ "yes" if vars.flag else "no" }}`.
+- Trim and lstrip blocks are on: a line that holds only a `{% … %}` tag leaves no blank line and no indent behind, as
+  in the `{% if %}` above. The src's final newline is kept.
+
+**Undefined is an error.** A var or fact the target does not have fails the render, as does a missing table key or
+one passed to a filter: ``line 1: undefined variable `vars.db.nope` ``. Guard an optional one with
+`{% if vars.tls is defined %}` or `{{ vars.port | default(80) }}`.
+
+**Limits.** A render takes at most 1,000,000 engine steps (`fuel exhausted`), and its output must be UTF-8, without a
+NUL byte, at most 1 MiB (`rendered output exceeds the 1 MiB limit`, `rendered output contains a NUL byte`). The src
+keeps its own checks above.
+
+**When it fails.** A syntax error is found when `apply` or `plan` reads the src, and is exit 2 before any target, like
+any other src refusal. The `nginx.conf.j2` above without its `{% endif %}` line gives:
+
+```text
+ERROR anvil: files[0].src `files/nginx.conf.j2`: template: line 5: syntax error: unexpected end of input, expected end of block
+```
+
+A render error (an undefined name, an unknown filter, fuel, the size limit) fails only that target, before any change
+on it; the other targets go on. The same `nginx.conf.j2`, under an inventory whose only var is
+`ntp = "pool.ntp.org"`, gives:
+
+```text
+▶ local
+  vars.ntp = "pool.ntp.org" (global)
+  ✘ files[0].src `files/nginx.conf.j2`: template: line 2: undefined variable `vars.port`
+```
+
+A message gives the line (no column) and the names involved, never a value. A file task is named by its path,
+``tasks[2].file.src `$/nginx.conf.j2`: template: …``. An entry that matches no target is never rendered.
+
+**The rendered bytes are the file.** For each target, the comparison with dest (`unchanged DEST`), the write, the heredoc
+delimiter, the password path's temp file, the [apply record](cli.md#the-apply-record)'s hash of what was written,
+[`anvil rollback`](cli.md#anvil-rollback) and doctor's drift check all use that target's rendered text. A changed var
+therefore shows as `wrote DEST` on the next apply, and rollback restores what dest held before it.
+[`anvil plan`](cli.md#anvil-plan) shows each target's rendered size and sha256, and `--show-rendered` its text.
+[`config --harden`](#harden) does not judge a templated src: it reports it for review.
+
+**Known limit.** String concatenation (`~`) and a large repetition (`*`) can use a lot of memory on the controller
+before the 1 MiB limit applies (MiniJinja caps one repetition at 100 MB). A template is trusted like the config: whoever
+can edit it can already run any step on the targets.
+
 ## Services
 
 A `[[services]]` entry brings one service to a state, and to an enablement when `enabled` is set, on each selected
@@ -720,15 +884,15 @@ facts = { os = "Linux" }           # ANDed with the parent's tags
 the parser's message. Two kinds are exit 2 with `tasks[0]: has run and include; keep one`, none with
 `tasks[0]: needs one of run, plugin, packages, file, service, include, tasks`.
 
-| Kind       | What it does                                                                         |
-| ---------- | ------------------------------------------------------------------------------------ |
-| `run`      | a POSIX sh script, at most 4 KiB, as in `[[steps]]`                                  |
-| `plugin`   | a `[plugins]` entry, with optional `args`, as in [Plugin steps](cli.md#plugin-steps) |
-| `packages` | only `install`, `pin`, `remove` and `upgrade`, as in `[packages]`                    |
-| `file`     | `src`, `dest`, `mode`, `sudo` and `rollback`, as in [`[[files]]`](#files)            |
-| `service`  | `name`, `state` and `enabled`, as in [`[[services]]`](#services)                     |
-| `include`  | a `$/…` task file, expanded in place                                                 |
-| `tasks`    | child tasks, written as `[[tasks.tasks]]` or an inline array                         |
+| Kind       | What it does                                                                          |
+| ---------- | ------------------------------------------------------------------------------------- |
+| `run`      | a POSIX sh script, at most 4 KiB, as in `[[steps]]`                                   |
+| `plugin`   | a `[plugins]` entry, with optional `args`, as in [Plugin steps](cli.md#plugin-steps)  |
+| `packages` | only `install`, `pin`, `remove` and `upgrade`, as in `[packages]`                     |
+| `file`     | `src`, `dest`, `mode`, `sudo`, `rollback` and `template`, as in [`[[files]]`](#files) |
+| `service`  | `name`, `state` and `enabled`, as in [`[[services]]`](#services)                      |
+| `include`  | a `$/…` task file, expanded in place                                                  |
+| `tasks`    | child tasks, written as `[[tasks.tasks]]` or an inline array                          |
 
 `tags` and `facts` go on the task, not inside `file` or `service`: that is exit 2 with
 `tasks[0].file: tags and facts belong on the task, not the file`. A task whose selector does not match is still a step,
@@ -914,6 +1078,10 @@ line that sets the same key to another value is rewritten, also in any other `[[
 `/etc/ssh/sshd_config`, `/etc/ssh/sshd_config.d/…`, `/etc/sysctl.conf` or `/etc/sysctl.d/…`. A marked step is never
 rewritten, so you may edit it.
 
+A [templated](#templating) src is neither judged nor changed, since what it sets shows only once rendered. harden
+reports it for review instead, naming what to check, and never says the config carries every rule while one is open
+([`anvil config --harden`](cli.md#anvil-config---harden)).
+
 On a [`[[tasks]]`](#tasks) config the rules suggest tasks instead of sections, and only the main file's top-level tasks are
 written. An entry already in an include or a nested task counts as present; one there that needs changing is left to
 you ([On a tasks config](cli.md#on-a-tasks-config)).
@@ -937,7 +1105,8 @@ What keeps you from locking yourself out:
 ## Limits and refusals
 
 Every config or inventory file is capped at 1 MiB, checked before parsing. A `[[files]]` src has its own 1 MiB cap,
-checked when `apply` or `plan` reads it ([Files](#files)), and so does an [include](#tasks). YAML refuses anchors and aliases,
+checked when `apply` or `plan` reads it ([Files](#files)), and so does an [include](#tasks) and each target's
+[rendered template](#templating). YAML refuses anchors and aliases,
 merge keys (`<<`), duplicate
 keys, unsupported tags and more than one document, in a legacy file and in the YAML edit view alike. `anvil inventory`
 and `anvil config` open the parsed document, not the file's text, so comments are not preserved once you save. The

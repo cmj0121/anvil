@@ -20,6 +20,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
   plan                           show the steps apply would run on every target, running none
+       [--show-rendered]         --show-rendered also prints each templated file's rendered text
   rollback [--force DEST]...     restore the files the last apply wrote on every target
   run [--timeout SECS] <FILE|->  run a POSIX sh script on every target, read from FILE or stdin
   secret <NAME>                  edit one secret in the editor
@@ -203,7 +204,10 @@ stdout 只有一份 unified diff（三行上下文），每個變更的檔案一
   `harden: held ssh.root-login: hosts db2, web1 connect as root or name no user; set user, or skip the rule`；
 - 使用 `--strict` 時：
   `harden: warning ssh.password-auth: hosts that log in by password lose access; check every host has a key first`；
-- 沒有任何建議時（stdout 不印任何東西）：
+- [範本](configuration.zh-TW.md#templating) src，harden 既不評斷也不修改：
+  `harden: review ssh.root-login: files[0]: src $/sshd.conf.j2 is a template, not judged; check it sets PermitRootLogin no`
+  （同一服務的其他檔案，例如 `/etc/ssh/sshd_config`，則為 `does not contradict`）；
+- 沒有任何建議、沒有待檢查項目時（stdout 不印任何東西）：
   `config carries every harden rule; anvil plan / apply bring the hosts to it`；
 - 舊版 YAML config：`harden: config.yaml is shown as the TOML anvil config would migrate it to`，diff 以該 TOML 為準。
 
@@ -254,6 +258,20 @@ stdout 只有一份 unified diff（三行上下文），每個變更的檔案一
 ```
 
 `action` 為 `add`、`change` 或 `remove`；`warnings` 存放 `--strict` 的文字，不含 `harden: warning` 前綴。
+含有範本 src 的 config 另加 `review`，每個要手動檢查的 src 一個物件，空時省略：
+
+```json
+{
+  "review": [
+    {
+      "rules": ["ssh.root-login"],
+      "what": "files[0]: src $/sshd.conf.j2 is a template, not judged; check it sets PermitRootLogin no"
+    }
+  ]
+}
+```
+
+只有待檢查項目時不影響結束碼。
 
 `--write` 寫入預覽所顯示的內容；沒有任何建議時什麼也不寫。它先驗證編輯後的 config，
 接著寫入每個儲存區檔案與工作區 src，最後才寫 config，每個都以原子方式寫入。
@@ -398,6 +416,26 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
   無法解析時則為 `manager         error: REASON`（例如 `` `pacman` needs root and sudo is not installed ``，
   或 [Root 與 sudo](packages.zh-TW.md#root-與-sudo) 中的 sudo 密碼拒絕訊息）。
   有 sudo secret 的 target 以 apply 的方式解析，因此對它而言 sudo `binary` 是可接受的。無法連線的 target 沒有 `manager` 列。
+- `vars` 與 `env`：每個 target 解析後的 [vars 與 env](configuration.zh-TW.md#vars-與-env)，接在 facts 之後，
+  每個鍵一列，並附上設定它的層級（`global`、`tag:NAME` 或 `host`）。var 以 JSON 文字顯示，因此看得出型別；env 值照寫的顯示。
+  不可見字元與 bidi 字元會被跳脫。值原樣顯示：它們不是機密。沒有 vars 或 env 的 target 沒有這些列。
+- `tag NAME`：沒有任何 host 帶有的 `[tags.NAME]` table（`local` 除外），會在本機檢查中顯示為一列 `tag NAME`，
+  內容為 `WARNING: no host carries this tag`，並記一則日誌警告 `tag NAME: no host carries this tag`。它不改變結束碼。
+
+```text
+local checks
+  …
+  tag db          WARNING: no host carries this tag
+
+web1
+  transport       ssh 203.0.113.10
+  hostname        web1
+  …
+  vars.list       [1,"a"] (global)
+  vars.port       9090 (host)
+  env.APP_ENV     it's $HOME (host)
+  env.HTTP_PROXY  http://proxy:3128 (global)
+```
 
 每項檢查都通過且每個 target 都可連線時以 0 結束，否則為 1。
 有 `[packages]` 時，套件管理器無法解析的 target 也會讓結束碼為 1；沒有 `[packages]` 時不做任何解析，結束碼照舊。
@@ -409,11 +447,19 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
     "ssh": true,
     "sh": true,
     "editor": "/opt/homebrew/bin/nvim",
-    "secrets": { "HOST_SUDO": "ok" }
+    "secrets": { "HOST_SUDO": "ok" },
+    "unused_tags": ["db"]
   },
   "targets": [
     {
       "target": "local",
+      "vars": {
+        "editor": { "value": "nvim", "level": "tag:local" },
+        "port": { "value": 80, "level": "global" }
+      },
+      "env": {
+        "HTTP_PROXY": { "value": "http://proxy:3128", "level": "global" }
+      },
       "connectable": true,
       "facts": {
         "arch": "arm64",
@@ -438,6 +484,8 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
 `editor` 是字串或 `null`；每個 secret 是 `"ok"`、`"missing"`、`"locked"` 或 `"error"`；
 `facts` 含探測回報的每個鍵（上例有刪節）。
 `manager`（解析出的套件管理器）或 `manager_error`（原因，不含 `error:` 前綴）只在有 `[packages]` 且 target 可連線時出現。
+`vars` 與 `env` 把每個鍵對應到它的 `value`（var 保留其 JSON 型別，env 值是字串）與 `level`，
+出現在每個 target 上，無論可否連線；為空時省略。`local.unused_tags` 列出未使用的 tag，沒有時省略。
 
 有 `[packages]` 且 manager 解析成功時，target 另有 `packages` 字串：`"ok"` 或
 `"WARNING: not found by MANAGER: a, b"`，也會顯示為 `packages` 列。
@@ -1023,15 +1071,23 @@ secret 由 `anvil doctor` 檢查。
 2 targets, nothing executed
 ```
 
+- 有 [vars 或 env](configuration.zh-TW.md#vars-與-env) 的 target，區塊開頭每個 var 一行 `vars.KEY = VALUE (LEVEL)`，
+  接著每個 env 值一行 `env.KEY = VALUE (LEVEL)`，顯示方式與 doctor 相同，planned、failed 或 cancelled 的 target 皆然：
+  `vars.port = 8080 (tag:web)`、`env.APP_ENV = prod (host)`。值原樣顯示。
 - [`[[tasks]]`](#執行中的-task) config 在每個 step 上方多一行 `PATH  NAME`。
 - 每個 step 是一行 `would $ RUN`（多行的 `run` 顯示第一行加上 `…`）；
   apply 會在 sudo 的提示輸入某個 secret 的值時，後面再加上 `(sudo password from secret NAME)`。
+- [範本](configuration.zh-TW.md#templating)檔案 step 在其 `would $ file DEST` 行下方多一行 `rendered N bytes, sha256 HEX`：
+  該 target 算繪文字的大小與完整 sha256，也就是 apply 會寫入的位元組。算繪失敗的 target 以 `✘` 加上範本訊息結束
+  （[Templating](configuration.zh-TW.md#templating)）。
 - 區塊以 `✔ N steps` 結尾，失敗的 target 則為 `✘ REASON`。
   摘要為 `N targets, nothing executed`，有 target 失敗時在 `nothing executed` 前加上 `M failed`（`2 targets, 1 failed, nothing executed`）。
 - 顏色與跳脫規則與 apply 相同。
 
 `--json` 是 apply 的文件，最前面加上 `"executed": false`；
-step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`，以及 tasks config 上的 `task` 與 `name`，絕不會有 `code`、`stdout` 或 `stderr`：
+step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`，以及 tasks config 上的 `task` 與 `name`，絕不會有 `code`、`stdout` 或 `stderr`。
+有 vars 或 env 的 target 另有 `vars` 與 `env`，與 doctor 的 `--json` 相同
+（`"vars": {"port": {"value": 8080, "level": "tag:web"}}`），而 step 的 `run` 是照寫的腳本，不含 env 行：
 
 ```json
 {
@@ -1065,6 +1121,81 @@ step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`，以及 tas
 
 被取消而略過的 target 為 `{"target": "pi", "ok": false}`，由第一個 SIGTERM 或 SIGHUP 造成時另帶
 `"abort": "terminated"` 或 `"hung_up"`（[Ctrl-C](#ctrl-c)）。
+
+**範本檔案。** plan 從不讀取 dest，因此無法做 diff；改為顯示每個 target 會得到什麼。不加旗標時就是
+`rendered N bytes, sha256 HEX` 這一行，不印出任何檔案位元組。`--show-rendered` 另外在該行下方印出每個 target 的算繪文字，
+每行一個 `│ LINE`，控制字元與不可見字元會被跳脫，文字結尾沒有換行時加上 `(no newline at end)`。
+以 [workstation 範例](../examples/workstation/)：
+
+```sh
+anvil --inventory examples/workstation/inventory.toml \
+      --config examples/workstation/config.toml \
+      --target local plan --show-rendered
+```
+
+會印出（套件 step 的長行已截短）：
+
+```text
+▶ local
+  vars.git_email = "dev@home.example" (tag:local)
+  vars.git_name = "Dev" (global)
+  env.GIT_PAGER = less -FRX (global)
+  would $ export PATH="$PATH:…"; … brew install $a; }
+  would $ file /home/dev/.config/git/ignore
+  would $ file /home/dev/.config/git/config
+    rendered 152 bytes, sha256 e193e046d4db16a0590b91195db5e9bf31f7680334d590bd8b7a567de25541d8
+    │ [user]
+    │     name = Dev
+    │     email = dev@home.example
+    │ [core]
+    │     editor = vi
+    │     excludesFile = ~/.config/git/ignore
+    │ [credential]
+    │     helper = osxkeychain
+  would $ git --version && echo "pager: $GIT_PAGER"
+  ✔ 4 steps
+
+1 target, nothing executed
+```
+
+算繪文字包含 vars 放進去的任何內容；它只印在你的終端機上。在 `--json` 中，範本 step 一律帶有
+`"rendered": {"bytes": N, "sha256": "HEX"}`，`--show-rendered` 另加最上層的 `rendered` 清單，每個 target 的每個範本 step 一個物件，
+其中 `step` 是該 target 的 `steps` 索引（此處省略 `vars` 與 `env`）：
+
+```json
+{
+  "executed": false,
+  "targets": [
+    {
+      "target": "local",
+      "steps": [
+        { "run": "export PATH=\"$PATH:…\"; … brew install $a; }" },
+        { "run": "file /home/dev/.config/git/ignore" },
+        {
+          "run": "file /home/dev/.config/git/config",
+          "rendered": {
+            "bytes": 152,
+            "sha256": "e193e046d4db16a0590b91195db5e9bf31f7680334d590bd8b7a567de25541d8"
+          }
+        },
+        { "run": "git --version && echo \"pager: $GIT_PAGER\"" }
+      ],
+      "ok": true
+    }
+  ],
+  "ok": true,
+  "rendered": [
+    {
+      "target": "local",
+      "step": 2,
+      "dest": "/home/dev/.config/git/config",
+      "text": "[user]\n    name = Dev\n    email = dev@home.example\n…"
+    }
+  ]
+}
+```
+
+TUI 的 plan 檢視也顯示 `rendered` 這一行，但絕不顯示文字。
 
 每個選定的 target 都解析成功時以 0 結束，任一個無法連線或解析時為 1，用法或設定錯誤為 2；
 第一個 SIGTERM 或 SIGHUP 結束 plan 時為 143 或 129。
@@ -1221,12 +1352,13 @@ facts = { distro = "arch" }
 ```
 
 `anvil plan` 顯示 `would $ file DEST`（apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
-與 `would $ skipped file DEST: no match`。在 `plan --json` 中 `run` 是同一個標籤，走密碼路徑時另有 `sudo_secret`。
+與 `would $ skipped file DEST: no match`；範本檔案另加一行 `rendered N bytes, sha256 HEX`。在 `plan --json` 中 `run` 是同一個標籤，走密碼路徑時另有 `sudo_secret`。
 
 每次寫入之前，apply 會讀回 DEST，並把它的內容保存在 [apply 紀錄](#apply-紀錄)中，讓 [`anvil rollback`](#anvil-rollback)
 能把它放回去；接著寫入會拒絕在那次讀取後被改過的 DEST。
 
 檔案的位元組絕不會印出：人類可讀輸出、`--json`、`plan`、`-v` 日誌與 ssh 命令列都不會包含它們。
+唯一的例外是你要求的 `anvil plan --show-rendered` 所印出的[範本](configuration.zh-TW.md#templating)算繪文字（[`anvil plan`](#anvil-plan)）。
 位元組透過腳本的 stdin 送到 target；走密碼路徑時先寫入一個 mode 0600 的 `/tmp/anvil-` 檔案，
 該檔案在 step 結束後移除，不論成功、失敗或取消。
 連線中斷或 anvil 被終止（例如在暫存位元組時按下 Ctrl-C）時，該檔案可能留下來，只有連線使用者能讀取。
@@ -1567,7 +1699,8 @@ target 的選法與 apply 相同（`--target`；未指定表示 `local` 加上�
   | 無法讀取的 `FILE`（或 stdin） | `run: cannot read FILE: REASON`（`-` 時為 `stdin`） |
 
 給人看的輸出（含其 `-v` 層級）、`--json` 與結束碼都與 apply 相同：每個 target 一個區塊，腳本是其唯一的 `$` 行
-（有多行時顯示第一行與 `…`），接著是摘要。`--json` 中 step 的 `run` 是原本給的腳本，不含外層包裝。
+（有多行時顯示第一行與 `…`），接著是摘要。`--json` 中 step 的 `run` 是原本給的腳本，不含外層包裝，也不含 target 的 [env](configuration.zh-TW.md#vars-與-env)；
+腳本會在同一個 stdin 上，於其前方以匯出的變數收到 env。
 腳本在每個 target 上都以 0 結束時以 0 結束，任一 target 失敗時為 1，用法錯誤為 2。
 在 Mac 上執行 `printf 'hostname\nuname -s\n' | anvil -vv run --target local -`，stdout 印出：
 

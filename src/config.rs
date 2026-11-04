@@ -436,6 +436,10 @@ pub struct FileEntry {
     /// replaces, never its bytes, so `anvil rollback` cannot restore it.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub rollback: bool,
+    /// `true`: `src` is a MiniJinja template rendered per target with
+    /// `vars` and `facts`; `false` copies it byte for byte.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub template: bool,
 }
 
 /// By hand, so a field added later must be chosen for `Debug` rather than
@@ -450,6 +454,7 @@ impl std::fmt::Debug for FileEntry {
             .field("facts", &self.facts)
             .field("sudo", &self.sudo)
             .field("rollback", &self.rollback)
+            .field("template", &self.template)
             .finish()
     }
 }
@@ -1611,6 +1616,23 @@ mod tests {
             assert!(text.contains("rollback"), "{text}");
             let back: Config = document::from_str(&text, format).unwrap();
             assert_eq!(back, off);
+        }
+    }
+
+    #[test]
+    fn a_files_entry_is_not_templated_unless_set_true() {
+        let config = file_entry(ENTRY);
+        assert!(!config.files[0].template);
+        let on = file_entry(&format!("{ENTRY}\ntemplate = true"));
+        on.check_files().unwrap();
+        assert!(on.files[0].template);
+        assert!(format!("{:?}", on.files[0]).contains("template: true"));
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&config, format).unwrap();
+            assert!(!text.contains("template"), "{text}");
+            let text = document::to_string(&on, format).unwrap();
+            let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(back, on);
         }
     }
 

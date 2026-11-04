@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{CONNECT_REFUSED, CONNECT_REFUSED_MESSAGE, Sandbox, json, keys, text};
+use common::{CONNECT_REFUSED, CONNECT_REFUSED_MESSAGE, Sandbox, json, keys, sha256_hex, text};
 
 /// A config whose one step would create `<root>/ran`.
 fn touching(sandbox: &Sandbox, before: &str) -> String {
@@ -511,4 +511,178 @@ fn a_plan_ended_by_sigterm_exits_143_and_names_why() {
         "{}",
         text(&out.stdout)
     );
+}
+
+#[test]
+fn each_target_shows_its_vars_and_env_with_their_level() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.write_config(
+        "inventory.toml",
+        "[vars]\nport = 80\n[env]\nAPP_ENV = \"dev\"\n[tags.web.vars]\nport = 8080\n\
+         [hosts.fake]\nhost = \"fakehost\"\ntags = [\"web\"]\n[hosts.fake.env]\nAPP_ENV = \"prod\"\n",
+    );
+    sandbox.write_config("config.toml", "[[steps]]\nrun = \"true\"\n");
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "▶ local\n  vars.port = 80 (global)\n  env.APP_ENV = dev (global)\n  \
+         would $ true\n  ✔ 1 step\n\n\
+         ▶ fake\n  vars.port = 8080 (tag:web)\n  env.APP_ENV = prod (host)\n  \
+         would $ true\n  ✔ 1 step\n\n\
+         2 targets, nothing executed\n"
+    );
+
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let levelled =
+        |value: serde_json::Value, level: &str| serde_json::json!({"value": value, "level": level});
+    assert_eq!(
+        json(&out)["targets"],
+        serde_json::json!([
+            {
+                "target": "local",
+                "vars": {"port": levelled(80.into(), "global")},
+                "env": {"APP_ENV": levelled("dev".into(), "global")},
+                "steps": [{"run": "true"}],
+                "ok": true,
+            },
+            {
+                "target": "fake",
+                "vars": {"port": levelled(8080.into(), "tag:web")},
+                "env": {"APP_ENV": levelled("prod".into(), "host")},
+                "steps": [{"run": "true"}],
+                "ok": true,
+            },
+        ])
+    );
+}
+
+/// `local` tagged with `vars.name = "local"` and the fake host with
+/// `vars.name = "fake"`; `site.j2` (holding `src`) templated and `plain.txt`
+/// copied as it is, both to every target, then a `true` step. Returns the
+/// two dests.
+fn with_template(sandbox: &Sandbox, src: &str) -> (String, String) {
+    sandbox.write_config(
+        "inventory.toml",
+        "[tags.local.vars]\nname = \"local\"\n\n\
+         [hosts.fake]\nhost = \"fakehost\"\n[hosts.fake.vars]\nname = \"fake\"\n",
+    );
+    std::fs::write(sandbox.config_dir().join("site.j2"), src).unwrap();
+    std::fs::write(
+        sandbox.config_dir().join("plain.txt"),
+        "plain-bytes {{ vars.name }}\n",
+    )
+    .unwrap();
+    let dest = |name: &str| sandbox.root().join(name).display().to_string();
+    let (site, plain) = (dest("site.conf"), dest("plain.conf"));
+    let entry = |src: &str, dest: &str, template: bool| {
+        format!(
+            "[[files]]\nsrc = \"{src}\"\ndest = \"{dest}\"\nmode = \"0644\"\n\
+             sudo = false\ntemplate = {template}\n\n"
+        )
+    };
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}{}[[steps]]\nrun = \"true\"\n",
+            entry("site.j2", &site, true),
+            entry("plain.txt", &plain, false)
+        ),
+    );
+    (site, plain)
+}
+
+#[test]
+fn a_templated_file_shows_each_targets_rendered_size_and_sha256_and_no_bytes() {
+    let sandbox = Sandbox::new("pl");
+    let (site, plain) = with_template(&sandbox, "server {{ vars.name }}\n");
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let local = sha256_hex("server local\n");
+    let fake = sha256_hex("server fake\n");
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  vars.name = \"local\" (tag:local)\n  would $ file {site}\n    \
+             rendered 13 bytes, sha256 {local}\n  would $ file {plain}\n  would $ true\n  ✔ 3 steps\n\n\
+             ▶ fake\n  vars.name = \"fake\" (host)\n  would $ file {site}\n    \
+             rendered 12 bytes, sha256 {fake}\n  would $ file {plain}\n  would $ true\n  ✔ 3 steps\n\n\
+             2 targets, nothing executed\n"
+        )
+    );
+    assert!(!text(&out.stdout).contains("server "), "no rendered bytes");
+
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let doc = json(&out);
+    assert_eq!(keys(&doc), ["executed", "ok", "targets"], "no rendered[]");
+    for (i, (bytes, sha)) in [(13, &local), (12, &fake)].into_iter().enumerate() {
+        assert_eq!(
+            doc["targets"][i]["steps"],
+            serde_json::json!([
+                {"run": format!("file {site}"), "rendered": {"bytes": bytes, "sha256": sha}},
+                {"run": format!("file {plain}")},
+                {"run": "true"},
+            ])
+        );
+    }
+    let stdout = text(&out.stdout);
+    assert!(!stdout.contains("server ") && !stdout.contains("plain-bytes"));
+    assert!(
+        !sandbox.root().join("site.conf").exists(),
+        "nothing written"
+    );
+}
+
+#[test]
+fn show_rendered_prints_each_targets_text_escaped_and_json_lists_it() {
+    let sandbox = Sandbox::new("pl");
+    let src = "name = {{ vars.name }}\nesc \x1b[2J bidi \u{202e}x";
+    let (site, plain) = with_template(&sandbox, src);
+    let out = sandbox.anvil(&["plan", "--show-rendered"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    for name in ["local", "fake"] {
+        let rendered = format!("name = {name}\nesc \x1b[2J bidi \u{202e}x");
+        let block = format!(
+            "  would $ file {site}\n    rendered {} bytes, sha256 {}\n    \
+             │ name = {name}\n    │ esc \\x1b[2J bidi \\u{{202e}}x\n    (no newline at end)\n  \
+             would $ file {plain}\n  would $ true\n  ✔ 3 steps\n",
+            rendered.len(),
+            sha256_hex(&rendered)
+        );
+        assert!(stdout.contains(&block), "{name}: {stdout}");
+    }
+    assert!(!stdout.contains('\x1b') && !stdout.contains('\u{202e}'));
+    assert!(!stdout.contains("plain-bytes"), "a plain src never shows");
+
+    let out = sandbox.anvil(&["--json", "plan", "--show-rendered"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let doc = json(&out);
+    assert_eq!(keys(&doc), ["executed", "ok", "rendered", "targets"]);
+    assert_eq!(
+        doc["rendered"],
+        serde_json::json!([
+            {"target": "local", "step": 0, "dest": site,
+             "text": "name = local\nesc \x1b[2J bidi \u{202e}x"},
+            {"target": "fake", "step": 0, "dest": site,
+             "text": "name = fake\nesc \x1b[2J bidi \u{202e}x"},
+        ])
+    );
+    assert!(!text(&out.stdout).contains("plain-bytes"));
+}
+
+#[test]
+fn show_rendered_leaves_a_config_without_templates_unchanged() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.with_fake_host();
+    let run = touching(&sandbox, "");
+    let plain = sandbox.anvil(&["plan"], &[]);
+    let shown = sandbox.anvil(&["plan", "--show-rendered"], &[]);
+    assert_eq!(shown.status.code(), Some(0), "{}", text(&shown.stderr));
+    assert_eq!(text(&shown.stdout), text(&plain.stdout));
+    assert!(text(&shown.stdout).contains(&format!("would $ {run}\n")));
+    let doc = json(&sandbox.anvil(&["--json", "plan", "--show-rendered"], &[]));
+    assert_eq!(keys(&doc), ["executed", "ok", "targets"]);
 }

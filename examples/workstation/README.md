@@ -2,18 +2,27 @@
 
 English | [繁體中文](README.zh-TW.md)
 
-A personal machine: packages whose names differ per manager, and one dotfile written as your own user.
+A personal machine: packages whose names differ per manager, and two dotfiles written as your own user, one
+rendered from the inventory's vars.
 
 - `[packages.alias.fd]`: apt and dnf install `fd` as `fd-find`; brew, pacman and apk use `fd`
   ([Aliases](../../docs/packages.md#aliases)).
-- One `[[files]]` entry copies `files/gitignore` to a dotfile with `sudo = false`, so it is written as the connecting
+- The first `[[files]]` entry copies `files/gitignore` to a dotfile with `sudo = false`, so it is written as the connecting
   user, without sudo. `tags = ["local"]` selects only this machine, which carries the tag `local`. `dest` must be an
   absolute path: change `/home/dev` to your home directory before you apply it.
-- `inventory.toml` has one ssh host, `laptop`, tagged `workstation`; the file entry does not match it.
+- A second entry, with no `tags`, renders `files/gitconfig` for every target with `template = true`:
+  `{{ vars.git_name }}` and `{{ vars.git_email }}` come from `inventory.toml`, `editor` is `nvim` on `laptop` and falls
+  back to `vi` elsewhere through `default`, and the `[credential]` block is written
+  only where `facts.os` is `Darwin` ([Templating](../../docs/configuration.md#templating)).
+- `inventory.toml` sets `vars` and `env` globally, overrides `git_email` for this machine under `[tags.local.vars]`, and
+  gives `laptop` its own `editor` ([Vars and env](../../docs/configuration.md#vars-and-env)). The step reads
+  `$GIT_PAGER` from `[env]`.
+- `inventory.toml` has one ssh host, `laptop`, tagged `workstation`; only the templated entry matches it.
 
 ## Try it
 
-`plan` prints the steps, including the file step, and runs none.
+`plan` prints the steps, including the file steps, and runs none. Under the templated file it shows
+`rendered N bytes, sha256 HEX`; add `--show-rendered` to see the text this machine would get.
 
 ```sh
 anvil --inventory examples/workstation/inventory.toml \

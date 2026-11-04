@@ -2453,6 +2453,8 @@ add) echo "install $*"; return "$FAIL";; esac; }
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         let host = Target {
             name: "box".into(),
@@ -2464,6 +2466,8 @@ add) echo "install $*"; return "$FAIL";; esac; }
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         let p = Packages {
             manager: Choice::Is(Manager::Pacman),
@@ -2628,6 +2632,8 @@ add) echo "install $*"; return "$FAIL";; esac; }
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         let host = Target {
             name: "box".into(),
@@ -2639,6 +2645,8 @@ add) echo "install $*"; return "$FAIL";; esac; }
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         let p = Packages {
             local_sudo_secret: Some("LOCAL_SUDO".into()),

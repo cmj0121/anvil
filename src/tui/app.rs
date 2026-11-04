@@ -1644,6 +1644,8 @@ pub mod tests {
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
             pkg: None,
             sudo_secret: None,
+            vars: Default::default(),
+            env: Default::default(),
         };
         Inventory {
             hosts: BTreeMap::from([
@@ -1656,6 +1658,7 @@ pub mod tests {
                     host("pi.lan", None, None, &["home", "dev"]),
                 ),
             ]),
+            ..Inventory::default()
         }
     }
 
@@ -1758,6 +1761,8 @@ pub mod tests {
         );
         doctor::TargetReport {
             target: target.to_owned(),
+            vars: Default::default(),
+            env: Default::default(),
             connectable: error.is_none(),
             facts: error.is_none().then_some(facts),
             error: error.map(str::to_owned),
@@ -1779,6 +1784,7 @@ pub mod tests {
             plugins: Default::default(),
             record: None,
             tag_key: None,
+            unused_tags: Vec::new(),
         }
     }
 
@@ -2241,6 +2247,8 @@ pub mod tests {
             0,
             plan::PlanReport::Planned {
                 target: "local".to_owned(),
+                vars: Default::default(),
+                env: Default::default(),
                 steps: Vec::new(),
                 ok: true,
             },
@@ -2250,6 +2258,8 @@ pub mod tests {
             1,
             plan::PlanReport::Cancelled {
                 target: "pi".to_owned(),
+                vars: Default::default(),
+                env: Default::default(),
                 ok: false,
                 abort: report::AbortReason::Cancelled,
             },
@@ -3309,6 +3319,8 @@ pub mod tests {
                         index,
                         plan::PlanReport::Cancelled {
                             target: name.to_owned(),
+                            vars: Default::default(),
+                            env: Default::default(),
                             ok: false,
                             abort: report::AbortReason::Cancelled,
                         },

@@ -198,6 +198,75 @@ Host 名稱須符合 `[A-Za-z0-9_-]+`。`local` 是保留名稱：它永遠存�
 不是 secret 名稱的 `sudo_secret` 以 2 結束並顯示 ``host `linode1`: sudo_secret `VALUE`: must match [A-Z][A-Z0-9_]*``；
 `local` 的對應設定是 `[packages].local_sudo_secret`。
 
+### Vars 與 env
+
+inventory 可在三個層級為每個 target 提供 `vars` 與 `env` 值：全域、每個 tag、每個 host。
+step 會以環境變數讀取其 target 的 `env`：
+
+```toml
+[vars]                      # global
+port = 80
+ntp = "pool.ntp.org"
+
+[env]                       # global; a step reads $HTTP_PROXY
+HTTP_PROXY = "http://proxy:3128"
+
+[tags.web.vars]             # every host tagged web
+port = 8080
+[tags.web.env]
+APP_ENV = "prod"
+
+[tags.local.vars]           # the local target
+editor = "nvim"
+
+[hosts.web1]
+host = "203.0.113.10"
+tags = ["web"]
+[hosts.web1.vars]           # this host only
+port = 9090
+[hosts.web1.env]
+APP_ENV = "staging"
+```
+
+```toml
+[[steps]]
+run = 'echo "deploying to $APP_ENV"'   # web1: staging; another web host: prod
+```
+
+**`vars` 與 `env` 不可用於機密。** `anvil doctor`、`anvil plan` 及其 `--json` 會原樣印出每個值，
+每個 `env` 值也會以明文出現在它所交給的每個 step 腳本中。密碼與 token 請放在 [secret store](secrets.zh-TW.md)。
+
+- **優先順序。** target 依序取全域、它的每個 tag，最後是其 host 自身的值。
+  較後層級設定的鍵會取代整個值：table 或 array 不會合併，因此 tag 上的 `list = [3]` 會取代全域的 `list = [1, 2]`。
+- **Tag 衝突。** 同一 host 的兩個 tag 把某個鍵設為不同的值，而 host 本身未設定該鍵時，會在任何 target 開始前以 2 結束並顯示
+  ``host `NAME`: vars.KEY is set by tags `A` and `B` with different values; set it in [hosts.NAME.vars]``
+  （env 則為 `env.KEY` 與 `[hosts.NAME.env]`）。相同的值不算衝突；在 host 上設定該鍵即可解除衝突。
+- **`local`。** 本機 target 依序取全域與 `[tags.local]`；它仍然沒有 `[hosts.local]` 項目。
+- **Tags。** `[tags.NAME]` 的名稱須符合 `[A-Za-z0-9_-]+` 且不能是 host 名稱
+  （以 2 結束並顯示 ``tag `NAME`: name must match [A-Za-z0-9_-]+`` 或 ``tag `NAME`: name is a host name``），
+  且只能包含 `vars` 與 `env`。沒有任何 host 帶有的 tag（`local` 除外）是 doctor 的警告（[`anvil doctor`](cli.zh-TW.md#anvil-doctor)）。
+- **`vars` 值**可以是字串、整數、布林、array 與 table。浮點數、TOML datetime 或 YAML null 以 2 結束並指出層級與鍵，
+  例如 `vars.ratio: must be a string, integer, boolean, array or table, not a float` 或 `tags.web.vars.list[1]: ..., not null`。
+  鍵（包括巢狀 table 的鍵）須符合 `[A-Za-z_][A-Za-z0-9_]*`（``vars `a-b`: must match [A-Za-z_][A-Za-z0-9_]*``）。
+  上限：每個層級與每個 table 256 個鍵、值的巢狀深度（含自身）至多 8 層、字串至多 64 KiB、整數在 64 位元範圍內。
+  超過時以 2 結束並顯示 `vars: has more than 256 keys`、`vars.KEY: nests deeper than 8 levels`、
+  `vars.KEY: is longer than 65536 bytes` 或 `vars.KEY: is outside the 64-bit integer range`。[範本檔案](#templating)會讀取 `vars`；step 不會。
+- **`env` 鍵**須符合 `[A-Za-z_][A-Za-z0-9_]*`。`PATH`、`HOME`、`USER`、`LOGNAME`、`SHELL`、`IFS`、`ENV`、
+  `BASH_ENV`、`CDPATH`、`PS4`、`TMPDIR`、`SHELLOPTS`、`BASHOPTS`、`UID`、`EUID`、`PPID` 與 `GROUPS`，
+  以及任何以 `ANVIL_`、`LD_`、`DYLD_`、`LC_`、`SUDO_` 或 `SSH_` 開頭的鍵，都會被拒絕並顯示 ``env `PATH`: is reserved``。值必須是字串（`env.KEY: must be a string`），
+  不含任何控制字元，tab 與換行也算在內（`env.KEY: contains a control character`），至多 4 KiB
+  （`env.KEY: is longer than 4096 bytes`），每個層級至多 64 個鍵（`env: has more than 64 keys`）。
+- **`env` 的去處。** `[[steps]]` 或 task 的 `run`、plugin step 與 `anvil run` 腳本，開頭會是 target 的 env，
+  以 `KEY='value'` 與 `export KEY` 行寫在經由傳輸 stdin 送出的腳本內，絕不放在 argv 上。
+  值以單引號包住，因此引號、`$`、反引號與反斜線都會原樣抵達。套件、檔案與服務不會取得 env。
+  報告、plan 與 `--json` 顯示的是你寫的腳本，不含這些行。
+- **sudo。** `sudo` 會重設環境（`env_reset`），因此經由它執行的指令看不到 `env`。請以名稱傳遞值：
+  `sudo APP_ENV="$APP_ENV" cmd`。
+
+每則 `vars` 與 `env` 值或鍵的訊息都以其層級開頭：`vars`、`tags.NAME.vars` 或 `hosts.NAME.vars`，以及 `env`、`tags.NAME.env` 或 `hosts.NAME.env`。
+沒有 `vars`、`env` 或 `tags` 的 inventory 載入與儲存都與以前相同。
+YAML 檢視與 TOML 對應（`vars:`、`env:`、`tags: {web: {vars: …}}`，以及 host 底下的 `vars:` / `env:`）。
+
 ## Config
 
 ```toml
@@ -337,6 +406,7 @@ tags = ["linode"]                # optional; [A-Za-z0-9_-]+; every one must be o
 facts = { distro = "arch" }      # optional; a probe key, equal to that fact
 sudo = false                     # optional; default true. false: write as the connecting user
 rollback = false                 # optional; default true. false: the apply record keeps the hash only
+template = true                  # optional; default false. true: render src per target (see Templating)
 ```
 
 **`mode`。** 必填，且必須是加引號的字串。三或四位八進位數字，最大為 `0777` 加上 sticky bit，
@@ -520,6 +590,90 @@ SELinux 標籤以外的延伸屬性、`chattr +i` 之類的檔案旗標，以及
 允許 `sh` 但不允許任一雜湊工具的規則，對其他人無法讀取的檔案同樣拒絕，並顯示 `files: sudo could not check DEST; nothing was changed`。
 root-squash 掛載點上 root 無法讀取的檔案也會同樣失敗；若登入使用者能寫入，請改用 `sudo = false`。
 
+### Templating
+
+在 `[[files]]` 項目或 task 的 `file` 上設定 `template = true`，會以 [MiniJinja](https://docs.rs/minijinja)
+為每個 target 各算繪一次 src，取用該 target 的 [vars](#vars-與-env) 與探測得到的 fact，再寫入算繪結果。
+未設定時 src 逐位元組複製，`{{` 也照原樣。
+
+```toml
+[[files]]
+src = "files/nginx.conf.j2"
+dest = "/etc/nginx/nginx.conf"
+mode = "0644"
+template = true
+```
+
+`files/nginx.conf.j2`：
+
+```jinja
+server {
+    listen {{ vars.port }};
+    server_name {{ facts.hostname }};
+{% if facts.distro == "debian" %}
+    include /etc/nginx/debian.conf;
+{% endif %}
+}
+```
+
+以 [Vars 與 env](#vars-與-env) 中的 inventory 為例，`web1` 得到 `listen 9090;`，其他帶 tag `web` 的 host 得到 `listen 8080;`。
+file task 的寫法相同：
+`file = { src = "$/nginx.conf.j2", dest = "/etc/nginx/nginx.conf", mode = "0644", template = true }`。
+
+**Context。** 只有兩個名稱，沒有其他：沒有 `env`、沒有機密、沒有檔案、沒有時鐘。
+
+- `vars.KEY` 是 target 解析後的 var，保留其型別：`{{ vars.port + 1 }}`、`{{ vars.users[0] }}`、
+  `{{ vars.db.host }}`、`{% for u in vars.users %}`。
+- `facts.KEY` 是探測得到的 fact，為字串，鍵即 [`tags` 與 `facts`](#files) 所列。`facts.pkg` 是探測的原始字串，
+  例如 `brew pacman`，而非單一管理器：要測試某一個請寫 `{% if "pacman" in (facts.pkg | split) %}`。
+
+**語法。** MiniJinja 的子集：`{{ … }}`、`{# … #}`、`{% if %}` / `elif` / `else`、`{% for %}`（含 `loop`）、
+`{% set %}`、`{% with %}`、`{% filter %}`、`{% raw %}`，以及內建的 filter 與 test（`default`、`join`、`length`、
+`lower`、`upper`、`trim`、`split`、`items`、`is defined`…）。輸出不做跳脫。
+
+- 不讀取任何其他檔案：`include`、`import`、`from` 與 `extends` 會被拒絕（`line 1: include is not allowed`）。
+  沒有 `macro` 與 `call`（`line 1: syntax error: unknown statement macro`），也沒有 `facts.pkg.split()` 這類方法
+  （`line 1: unknown method`）：請改用 filter 寫法。
+- `replace` filter 已移除，因為它的輸出沒有大小上限（`line 1: unknown filter`）。
+- 布林值算繪為 `True` 或 `False`，與 Jinja 相同：要得到 `true` 請寫 `{{ vars.flag | lower }}`，
+  或 `{{ "yes" if vars.flag else "no" }}`。
+- trim 與 lstrip blocks 已開啟：只含一個 `{% … %}` 標籤的行不會留下空行或縮排，如上例的 `{% if %}`。
+  src 結尾的換行會保留。
+
+**未定義即錯誤。** target 沒有的 var 或 fact 會讓算繪失敗，缺少的 table 鍵或傳給 filter 的未定義值也一樣：
+``line 1: undefined variable `vars.db.nope` ``。可選的值請以 `{% if vars.tls is defined %}` 或
+`{{ vars.port | default(80) }}` 防護。
+
+**限制。** 一次算繪最多 1,000,000 個引擎步驟（`fuel exhausted`），輸出必須是 UTF-8、不含 NUL 位元組、最多 1 MiB
+（`rendered output exceeds the 1 MiB limit`、`rendered output contains a NUL byte`）。src 本身仍受上述檢查。
+
+**失敗時。** 語法錯誤在 `apply` 或 `plan` 讀取 src 時發現，與其他 src 拒絕一樣在任何 target 之前以 2 結束。上面的 `nginx.conf.j2` 少了 `{% endif %}` 那一行時會得到：
+
+```text
+ERROR anvil: files[0].src `files/nginx.conf.j2`: template: line 5: syntax error: unexpected end of input, expected end of block
+```
+
+算繪錯誤（未定義的名稱、未知的 filter、fuel、大小上限）只讓該 target 失敗，且發生在它有任何變更之前；其他 target 照常進行。
+同一份 `nginx.conf.j2`，在唯一的 var 是 `ntp = "pool.ntp.org"` 的 inventory 下會得到：
+
+```text
+▶ local
+  vars.ntp = "pool.ntp.org" (global)
+  ✘ files[0].src `files/nginx.conf.j2`: template: line 2: undefined variable `vars.port`
+```
+
+訊息只給行號（沒有欄號）與相關名稱，絕不給值。file task 以其路徑命名，
+``tasks[2].file.src `$/nginx.conf.j2`: template: …``。不符合任何 target 的項目永遠不會算繪。
+
+**算繪結果就是檔案。** 對每個 target，與 dest 的比較（`unchanged DEST`）、寫入、heredoc 分隔符、密碼路徑的暫存檔、
+[apply 紀錄](cli.zh-TW.md#apply-紀錄)中寫入內容的雜湊、[`anvil rollback`](cli.zh-TW.md#anvil-rollback) 與 doctor 的
+drift 檢查，全都使用該 target 的算繪文字。因此 var 改變後，下次 apply 會顯示 `wrote DEST`，rollback 則還原 dest 先前的內容。
+[`anvil plan`](cli.zh-TW.md#anvil-plan) 顯示每個 target 的算繪大小與 sha256，`--show-rendered` 另外顯示文字。
+[`config --harden`](#harden) 不評斷範本 src，而是將它列為待檢查。
+
+**已知限制。** 字串串接（`~`）與大量重複（`*`）可能在 1 MiB 上限生效之前就在控制端用掉大量記憶體
+（MiniJinja 把單次重複限制在 100 MB）。範本與 config 一樣被信任：能編輯它的人本來就能在 target 上執行任何 step。
+
 ## Services
 
 `[[services]]` 項目在每個 tag 與 fact 全部符合的選定 target 上，把一個服務帶到指定的狀態；設定了 `enabled` 時，也帶到該啟用狀態。
@@ -671,15 +825,15 @@ facts = { os = "Linux" }           # ANDed with the parent's tags
 兩種以上以 2 結束並顯示 `tasks[0]: has run and include; keep one`，都沒有時為
 `tasks[0]: needs one of run, plugin, packages, file, service, include, tasks`。
 
-| 種類       | 作用                                                                             |
-| ---------- | -------------------------------------------------------------------------------- |
-| `run`      | POSIX sh 腳本，最多 4 KiB，與 `[[steps]]` 相同                                   |
-| `plugin`   | `[plugins]` 項目，可選 `args`，與 [Plugin steps](cli.zh-TW.md#plugin-steps) 相同 |
-| `packages` | 只有 `install`、`pin`、`remove` 與 `upgrade`，與 `[packages]` 相同               |
-| `file`     | `src`、`dest`、`mode`、`sudo` 與 `rollback`，與 [`[[files]]`](#files) 相同       |
-| `service`  | `name`、`state` 與 `enabled`，與 [`[[services]]`](#services) 相同                |
-| `include`  | `$/…` task 檔，就地展開                                                          |
-| `tasks`    | 子 task，寫成 `[[tasks.tasks]]` 或 inline array                                  |
+| 種類       | 作用                                                                                   |
+| ---------- | -------------------------------------------------------------------------------------- |
+| `run`      | POSIX sh 腳本，最多 4 KiB，與 `[[steps]]` 相同                                         |
+| `plugin`   | `[plugins]` 項目，可選 `args`，與 [Plugin steps](cli.zh-TW.md#plugin-steps) 相同       |
+| `packages` | 只有 `install`、`pin`、`remove` 與 `upgrade`，與 `[packages]` 相同                     |
+| `file`     | `src`、`dest`、`mode`、`sudo`、`rollback` 與 `template`，與 [`[[files]]`](#files) 相同 |
+| `service`  | `name`、`state` 與 `enabled`，與 [`[[services]]`](#services) 相同                      |
+| `include`  | `$/…` task 檔，就地展開                                                                |
+| `tasks`    | 子 task，寫成 `[[tasks.tasks]]` 或 inline array                                        |
 
 `tags` 與 `facts` 寫在 task 上，不寫在 `file` 或 `service` 裡：否則以 2 結束並顯示
 `tasks[0].file: tags and facts belong on the task, not the file`。
@@ -858,6 +1012,9 @@ skip = ["updates.auto"]          # rule ids config --harden never suggests; defa
 `/etc/ssh/sshd_config`、`/etc/ssh/sshd_config.d/…`、`/etc/sysctl.conf` 或 `/etc/sysctl.d/…` 的其他 `[[files]]` src 也一樣。
 帶標記的 step 絕不會被改寫，因此你可以自行編輯它。
 
+[範本](#templating) src 既不評斷也不修改，因為它設定了什麼要算繪後才知道。harden 改為把它列為待檢查並指出要檢查的內容，
+只要還有待檢查項目，就絕不會說 config 已包含每條規則（[`anvil config --harden`](cli.zh-TW.md#anvil-config---harden)）。
+
 在 [`[[tasks]]`](#tasks) config 上，規則建議的是 task 而非區段，且只寫入主檔案的頂層 task。
 已在 include 或巢狀 task 中的項目視為存在；其中需要變更的項目留給你處理（[在 tasks config 上](cli.zh-TW.md#在-tasks-config-上)）。
 
@@ -879,7 +1036,7 @@ skip = ["updates.auto"]          # rule ids config --harden never suggests; defa
 ## 限制與拒絕
 
 每個 config 或 inventory 檔案上限為 1 MiB，於解析前檢查。
-`[[files]]` 的 src 另有自己的 1 MiB 上限，在 `apply` 或 `plan` 讀取它時檢查（[Files](#files)），[include](#tasks) 也一樣。
+`[[files]]` 的 src 另有自己的 1 MiB 上限，在 `apply` 或 `plan` 讀取它時檢查（[Files](#files)），[include](#tasks) 與每個 target 的[範本算繪結果](#templating)也一樣。
 YAML 會拒絕 anchor 與 alias、merge key（`<<`）、重複的鍵、不支援的 tag 以及多於一份的文件，舊版檔案與 YAML 編輯檢視皆然。
 `anvil inventory` 與 `anvil config` 開啟的是解析後的文件，而非檔案原文，因此一旦儲存，註解便不會保留。
 1 MiB 上限同樣適用於編輯檢視與儲存的 TOML：
