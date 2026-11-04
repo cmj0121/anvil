@@ -1628,6 +1628,8 @@ mod tests {
             pkg: None,
             sudo_secret: sudo_secret.map(str::to_owned),
             tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            vars: Default::default(),
+            env: Default::default(),
         }
     }
 

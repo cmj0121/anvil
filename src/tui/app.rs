@@ -1644,6 +1644,8 @@ pub mod tests {
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
             pkg: None,
             sudo_secret: None,
+            vars: Default::default(),
+            env: Default::default(),
         };
         Inventory {
             hosts: BTreeMap::from([
@@ -1656,6 +1658,7 @@ pub mod tests {
                     host("pi.lan", None, None, &["home", "dev"]),
                 ),
             ]),
+            ..Inventory::default()
         }
     }
 

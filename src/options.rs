@@ -537,6 +537,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         let cancel = Arc::new(Cancel::new());
         let ssh = opts.transport(&host, &cancel).unwrap();
@@ -558,6 +560,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         assert_eq!(
             opts.transport(&local, &Arc::default()).unwrap().name(),
@@ -580,6 +584,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         let cancel = Arc::default();
         assert_eq!(

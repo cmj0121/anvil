@@ -692,6 +692,8 @@ mod tests {
                 pkg: None,
                 sudo_secret: None,
                 tags: Vec::new(),
+                vars: Default::default(),
+                env: Default::default(),
             })
             .collect();
         // Disabled, so Begin leaves the status started above in place.

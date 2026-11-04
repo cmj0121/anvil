@@ -1204,6 +1204,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         }
     }
 
@@ -1651,6 +1653,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         assert_eq!(describe(&local), "local");
         let bare = Target {
@@ -1723,6 +1727,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         let boxed = Target {
             sudo_secret: Some("BOX_SUDO".to_owned()),
@@ -2420,6 +2426,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         assert!(super::required_names(&config, &expanded, std::slice::from_ref(&local)).is_empty());
         let mut tagged = local;
@@ -2438,6 +2446,8 @@ mod tests {
             pkg: None,
             sudo_secret: None,
             tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
         };
         let names = |task: &str| {
             let config: Config = toml::from_str(&format!(
