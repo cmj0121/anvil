@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 use crate::bytes::{fill_random, hex};
 use crate::config::is_mode;
 use crate::inventory::Resolved;
+use crate::transport::Output;
 
 /// The `find` test for a directory root owns.
 pub(crate) const ROOT_OWNED: &str = "-user 0";
@@ -141,6 +142,15 @@ pub(crate) fn not_a_symlink(sudo: &str, d: &str, dest: &str) -> String {
 /// does not follow `dir` when it is a symlink. A missing `dir` passes, so the
 /// write fails as it would; a failing `sudo` does not.
 pub(crate) fn owned_only(sudo: &str, dir: &str, owner: &str) -> String {
+    format!(
+        "{{ {} || {}; }} && ",
+        is_owned_only(sudo, dir, owner),
+        not_owned_only(sudo, dir, owner)
+    )
+}
+
+/// The refusal of `dir`, which fails the `owner` test or others may write.
+fn not_owned_only(sudo: &str, dir: &str, owner: &str) -> String {
     let message = if owner == LOGIN_OWNED {
         format!(
             "files: {dir} is not owned by root or the login user, or others can write it; \
@@ -150,11 +160,7 @@ pub(crate) fn owned_only(sudo: &str, dir: &str, owner: &str) -> String {
         format!("files: {dir} is not root-only; root will not write under it")
     };
     let probe = format!("find {} -prune", quote(dir));
-    format!(
-        "{{ {} || {}; }} && ",
-        is_owned_only(sudo, dir, owner),
-        refusal(sudo, dir, &probe, &message)
-    )
+    refusal(sudo, dir, &probe, &message)
 }
 
 /// The test [`owned_only`] runs, alone: true when `dir` is missing or a
@@ -193,7 +199,7 @@ fn dir_checks(sudo: &str, dirs: &[&str], owner: &str) -> String {
 
 /// The directories from `top` down to the one holding `dest`; from `/` when
 /// `dest` is not under `top`.
-fn path_dirs<'a>(dest: &'a str, top: &Path) -> Vec<&'a str> {
+pub(crate) fn path_dirs<'a>(dest: &'a str, top: &Path) -> Vec<&'a str> {
     let top = if Path::new(dest).starts_with(top) {
         top
     } else {
@@ -227,6 +233,120 @@ pub(crate) fn link_removal_checks(sudo: &str, dest: &str, as_root: bool, top: &P
         dir_checks(sudo, &path_dirs(dest, Path::new("/")), ROOT_OWNED)
     } else {
         dir_checks("", &path_dirs(dest, top), LOGIN_OWNED)
+    }
+}
+
+/// What marks a walk's created-directory lines: `anvil-walk-` and 32 fresh
+/// hex digits, so neither a login shell nor a tool can print one; its `Debug`
+/// never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WalkNonce(String);
+
+impl WalkNonce {
+    pub(crate) fn generate() -> Result<Self, String> {
+        Ok(Self(format!("anvil-walk-{}", random_hex(16)?)))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for WalkNonce {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WalkNonce(<redacted>)")
+    }
+}
+
+/// The walk of DEST's directories just before the temp: each existing one
+/// passes the `owner` test of the checks and is no symlink, and a missing one
+/// fails the write, or with `parents = true` is created 0755 as the write's
+/// identity and must then pass the same test. Each created directory is
+/// announced at once on its own stdout line, marked with `create`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Walk {
+    /// From the checks' top down to the one holding DEST.
+    pub dirs: Vec<String>,
+    /// [`ROOT_OWNED`] or [`LOGIN_OWNED`], as the checks'.
+    pub owner: String,
+    /// With `parents = true`, the nonce that marks a created directory's line.
+    pub create: Option<WalkNonce>,
+}
+
+impl Walk {
+    /// The walk of a write as root, from `/`, or as the login user, from `top`.
+    pub(crate) fn new(dest: &str, as_root: bool, top: &Path, create: Option<WalkNonce>) -> Walk {
+        let (top, owner) = if as_root {
+            (Path::new("/"), ROOT_OWNED)
+        } else {
+            (top, LOGIN_OWNED)
+        };
+        Walk {
+            dirs: path_dirs(dest, top)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            owner: owner.to_owned(),
+            create,
+        }
+    }
+
+    /// The lines of the walk through `sudo`; a failure exits [`REFUSED`],
+    /// DEST untouched.
+    pub(crate) fn script(&self, sudo: &str) -> String {
+        let found = root_only_find(&self.owner);
+        self.dirs
+            .iter()
+            .map(|dir| {
+                let d = quote(dir);
+                let missing = match &self.create {
+                    // A mkdir that fails may still have made the directory,
+                    // when its chmod failed: it is announced all the same.
+                    Some(nonce) => {
+                        let line = quote(&format!("{} created {dir}", nonce.as_str()));
+                        format!(
+                            "{sudo}mkdir -m 0755 {d} || {{ \
+                             if {sudo}test -d {d} && {sudo}test ! -L {d}; then printf '%s\\n' {line}; fi; \
+                             echo {} >&2; exit {REFUSED}; }}\n\
+                             printf '%s\\n' {line}\n",
+                            quote(&format!("files: cannot create {dir}"))
+                        )
+                    }
+                    None => format!(
+                        "echo {} >&2; exit {REFUSED}\n",
+                        quote(&format!(
+                            "files: {dir} does not exist; set parents = true to create it"
+                        ))
+                    ),
+                };
+                format!(
+                    "if {sudo}test ! -e {d} && {sudo}test ! -L {d}; then\n{missing}fi\n\
+                     {{ [ -n \"$({sudo}find {d} {found})\" ] || {}; }} || exit {REFUSED}\n",
+                    not_owned_only(sudo, dir, &self.owner)
+                )
+            })
+            .collect()
+    }
+
+    /// The directories `output`'s marked lines say were created, in order,
+    /// those lines taken out of its stdout.
+    pub(crate) fn created(&self, output: &mut Output) -> Vec<String> {
+        let Some(nonce) = &self.create else {
+            return Vec::new();
+        };
+        let mark = format!("{} created ", nonce.as_str());
+        let mut created = Vec::new();
+        let mut kept = Vec::with_capacity(output.stdout.len());
+        for line in output.stdout.split_inclusive(|&b| b == b'\n') {
+            let body = line.strip_suffix(b"\n").unwrap_or(line);
+            let body = body.strip_suffix(b"\r").unwrap_or(body);
+            match body.strip_prefix(mark.as_bytes()) {
+                Some(dir) => created.push(String::from_utf8_lossy(dir).into_owned()),
+                None => kept.extend_from_slice(line),
+            }
+        }
+        output.stdout = kept;
+        created
     }
 }
 
@@ -734,5 +854,47 @@ mod tests {
             .split_terminator('\0')
             .collect();
         assert_eq!(seen, values);
+    }
+
+    #[test]
+    fn only_lines_marked_with_the_walks_own_nonce_name_created_directories() {
+        let nonce = WalkNonce::generate().unwrap();
+        let other = WalkNonce::generate().unwrap();
+        let walk = Walk::new("/etc/app/a.conf", true, Path::new("/"), Some(nonce.clone()));
+        assert_eq!(walk.dirs, ["/", "/etc", "/etc/app"]);
+        let (n, o) = (nonce.as_str(), other.as_str());
+        let mut output = Output {
+            stdout: format!(
+                "motd\n{n} created /etc/app\r\n{o} created /etc/x\n created /etc/y\nwrote /etc/app/a.conf\n"
+            )
+            .into_bytes(),
+            ..Output::default()
+        };
+        assert_eq!(walk.created(&mut output), ["/etc/app"]);
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("motd\n{o} created /etc/x\n created /etc/y\nwrote /etc/app/a.conf\n")
+        );
+        let plain = Walk::new("/etc/a", true, Path::new("/"), None);
+        let mut output = Output {
+            stdout: format!("{n} created /etc\n").into_bytes(),
+            ..Output::default()
+        };
+        assert!(plain.created(&mut output).is_empty());
+        assert!(!output.stdout.is_empty());
+        assert!(!plain.script("").contains("mkdir"));
+    }
+
+    #[test]
+    fn a_user_walk_starts_at_its_top_and_accepts_the_login_users_directories() {
+        let walk = Walk::new("/home/u/.config/app/a", false, Path::new("/home/u"), None);
+        assert_eq!(
+            walk.dirs,
+            ["/home/u", "/home/u/.config", "/home/u/.config/app"]
+        );
+        assert_eq!(walk.owner, LOGIN_OWNED);
+        let nonce = WalkNonce::generate().unwrap();
+        assert!(nonce.as_str().starts_with("anvil-walk-") && nonce.as_str().len() == 43);
+        assert_eq!(format!("{nonce:?}"), "WalkNonce(<redacted>)");
     }
 }

@@ -621,7 +621,7 @@ fn execute_inner(
             captured = Some(intent);
         }
         let mut staged = true;
-        let output = match (password, upload) {
+        let mut output = match (password, upload) {
             (None, None) => transport.run(run, timeout),
             (None, Some(_)) => {
                 let error = format!("files: internal error: {label} has no sudo secret");
@@ -645,6 +645,21 @@ fn execute_inner(
                 }
             }
         };
+        // Announced at once, so they are known even when the step then failed.
+        let created = match (write, &mut output) {
+            (Some(write), Ok(output)) => write.walk.created(output),
+            (
+                Some(write),
+                Err(TransportError::Timeout {
+                    output: Some(output),
+                    ..
+                }),
+            ) => write.walk.created(output),
+            _ => Vec::new(),
+        };
+        for dir in &created {
+            log::info!("{command} {}: created {dir}", target.name);
+        }
         if let (Some(recorder), Some(mut file)) = (recorder.as_deref_mut(), captured) {
             // Only a write that may have changed DEST failed midway: a
             // failed stage, a refusal (root checks, hash guard), a password

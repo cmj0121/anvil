@@ -3394,3 +3394,106 @@ fn a_user_write_cannot_give_the_same_bytes_a_group_it_is_not_in() {
         "the narrowed mode is put back"
     );
 }
+
+#[test]
+fn parents_creates_missing_directories_0755_top_down_on_local_and_the_fake_host() {
+    let sandbox = Sandbox::new("ap");
+    let path = nopasswd_sudo(&sandbox);
+    let out = sandbox.root().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let (local, web, root) = (
+        out.join("l/a/b/motd"),
+        out.join("w/a/b/motd"),
+        out.join("r/a/motd"),
+    );
+    with_owned_files(
+        &sandbox,
+        &[
+            (&local, "local", "parents = true\n"),
+            (&web, "web", "parents = true\n"),
+            (&root, "local", "sudo = true\nparents = true\n"),
+        ],
+    );
+    let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
+    command.args(["--secret-store", "memory", "--ssh-program"]);
+    command.arg(common::fixture("fake-ssh.sh"));
+    let run = command
+        .args(["--json", "apply"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
+    for dest in [&local, &web, &root] {
+        assert_eq!(std::fs::read_to_string(dest).unwrap(), "motd\n");
+        let mut dir = dest.parent().unwrap();
+        while dir != out {
+            assert_eq!(common::mode(dir) & 0o7777, 0o755, "{}", dir.display());
+            dir = dir.parent().unwrap();
+        }
+    }
+    let shown = text(&run.stdout);
+    assert!(!shown.contains("anvil-sudo-"), "{shown}");
+    assert!(!shown.contains(" created "), "{shown}");
+    for target in json(&run)["targets"].as_array().unwrap() {
+        for step in target["steps"].as_array().unwrap() {
+            if step["run"].as_str().unwrap().starts_with("file ") {
+                assert_eq!(step["changed"], true, "{step}");
+                assert!(
+                    step["stdout"].as_str().unwrap().starts_with("wrote "),
+                    "{step}"
+                );
+            }
+        }
+    }
+
+    let again = sandbox.anvil(&["apply"], &[("PATH", path.as_str())]);
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again.stdout));
+    assert!(!text(&again.stdout).contains("anvil-sudo-"));
+}
+
+#[test]
+fn parents_refuses_under_a_group_writable_directory_and_creates_nothing() {
+    let sandbox = Sandbox::new("ap");
+    let open = sandbox.root().join("open");
+    std::fs::create_dir(&open).unwrap();
+    common::chmod(&open, 0o775);
+    let dest = open.join("a/motd");
+    with_owned_files(&sandbox, &[(&dest, "local", "parents = true\n")]);
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        shown.contains(&format!(
+            "files: {} is not owned by root or the login user",
+            open.display()
+        )),
+        "{shown}"
+    );
+    assert!(!open.join("a").exists());
+}
+
+#[test]
+fn without_parents_a_missing_directory_fails_the_step_on_local_and_the_fake_host() {
+    let sandbox = Sandbox::new("ap");
+    let (local, web) = (sandbox.root().join("l/motd"), sandbox.root().join("w/motd"));
+    with_owned_files(&sandbox, &[(&local, "local", ""), (&web, "web", "")]);
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let mut failed: Vec<String> = json(&out)["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|target| target["steps"].as_array().unwrap().clone())
+        .filter(|step| step["code"] != 0)
+        .map(|step| step["stderr"].as_str().unwrap().to_owned())
+        .collect();
+    failed.sort();
+    let message = |dir: &str| {
+        format!(
+            "files: {} does not exist; set parents = true to create it\n",
+            sandbox.root().join(dir).display()
+        )
+    };
+    assert_eq!(failed, [message("l"), message("w")]);
+    assert!(!sandbox.root().join("l").exists() && !sandbox.root().join("w").exists());
+}

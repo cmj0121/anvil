@@ -38,6 +38,7 @@ use crate::remote::{
     root_only_find, sweep, temp_beside, unchecked, zeroizing,
 };
 pub(crate) use crate::remote::{REFUSED, quote};
+pub use crate::remote::{Walk, WalkNonce};
 use crate::secret;
 use crate::step::{FileRun, PlannedRun, RunKind, Upload};
 use crate::tasks::{Expanded, Item};
@@ -256,6 +257,11 @@ pub fn run(
     });
     let secret =
         sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
+    let create = if entry.parents {
+        Some(WalkNonce::generate()?)
+    } else {
+        None
+    };
     let write = match secret {
         Some(name) => {
             log::info!(
@@ -268,6 +274,7 @@ pub fn run(
                 mode: mode.clone(),
                 sudo: "sudo ".to_owned(),
                 checks: root_checks("sudo ", dest),
+                walk: Box::new(Walk::new(dest, true, &login_top(), create)),
                 as_root: true,
                 password: true,
                 rendered,
@@ -278,10 +285,11 @@ pub fn run(
             log::info!("{}: {label} {dest}", target.name);
             let sudo = if root || !entry.sudo { "" } else { "sudo -n " };
             let as_root = root || entry.sudo;
+            let top = login_top();
             let checks = if as_root {
                 root_checks(sudo, dest)
             } else {
-                login_checks(dest, &login_top())
+                login_checks(dest, &top)
             };
             FileWrite {
                 ordinal: i,
@@ -289,6 +297,7 @@ pub fn run(
                 mode: mode.clone(),
                 sudo: sudo.to_owned(),
                 checks,
+                walk: Box::new(Walk::new(dest, as_root, &top, create)),
                 as_root,
                 password: false,
                 rendered,
@@ -375,6 +384,9 @@ pub struct FileWrite {
     pub sudo: String,
     /// [`root_checks`] or [`login_checks`], by `as_root`.
     pub checks: String,
+    /// The walk of the same directories just before the temp, which with
+    /// `parents = true` creates the missing ones.
+    pub walk: Box<Walk>,
     /// Whether the write runs as root, through sudo or on a root login.
     pub as_root: bool,
     /// Whether the bytes are staged in a temp file and installed by a
@@ -613,11 +625,13 @@ pub(crate) fn skip_run(dest: &str, label: String) -> PlannedRun {
 }
 
 /// One run under `umask 077` that first refuses a `sudo` that fails, then runs
-/// `checks`, then refuses a directory DEST, then the guard; when DEST already
-/// holds the bytes, [`fix_script`], else [`Replacement::replace`].
+/// `checks`, then refuses a directory DEST, then the owner checks, the guard
+/// and `walk`; when DEST already holds the bytes, [`fix_script`], else
+/// [`Replacement::replace`].
 fn replace_script(
     write: &Replacement<'_>,
     checks: &str,
+    walk: &Walk,
     ids: Option<&Ownership>,
     expected: &Expected,
 ) -> Zeroizing<String> {
@@ -635,11 +649,12 @@ fn replace_script(
     let wrote = quote(&format!("wrote {dest}"));
     zeroizing(format_args!(
         "{open}{ready}{checks}{directory} || exit {REFUSED}\n\
-         {owner}{guard}{sweep}if {same}; then\n{fix}\
+         {owner}{guard}{walk}{sweep}if {same}; then\n{fix}\
          else {replace}fi\n\
          }}\n",
         open = *write.open(),
         owner = ids.map(Ownership::checks).unwrap_or_default(),
+        walk = walk.script(sudo),
         sweep = sweep(sudo, dest),
         same = write.same(),
         fix = fix_script(write, ids),
@@ -790,6 +805,7 @@ fn tee_script(
             ids: step.ids.as_ref().map_or(Ids::Keep, Ownership::ids),
         },
         &step.checks,
+        &step.walk,
         step.ids.as_ref(),
         expected,
     ))
@@ -825,6 +841,7 @@ fn install_script(
             ids: step.ids.as_ref().map_or(Ids::Keep, Ownership::ids),
         },
         &step.checks,
+        &step.walk,
         step.ids.as_ref(),
         expected,
     ))
@@ -1823,6 +1840,11 @@ mod tests {
             mode: mode.to_owned(),
             sudo: sudo.to_owned(),
             checks: checks.to_owned(),
+            walk: Box::new(Walk {
+                dirs: Vec::new(),
+                owner: ROOT_OWNED.to_owned(),
+                create: None,
+            }),
             as_root,
             password: false,
             rendered: None,
@@ -2545,7 +2567,10 @@ mod tests {
             &dir,
             &[],
             &[
-                &[("sudo", "case $1 in -n) shift ;; esac\nexec \"$@\"")],
+                &[(
+                    "sudo",
+                    "case $1 in -n) shift ;; -k) exit 0 ;; esac\nexec \"$@\"",
+                )],
                 scripts,
             ]
             .concat(),
@@ -7078,5 +7103,247 @@ mod tests {
             err,
             "files[1].src `a.j2`: template: rendered output exceeds the 1 MiB limit"
         );
+    }
+
+    /// A write of "new\n" to `dest`, as the login user or through `sudo -n`
+    /// as root (`password`: the password path), checked and walked from `top`;
+    /// `create` is the walk's nonce with `parents = true`.
+    fn walking(
+        dest: &Path,
+        top: &Path,
+        sudo: &str,
+        create: Option<WalkNonce>,
+        ids: Option<Ownership>,
+    ) -> String {
+        let d = dest.to_str().unwrap();
+        let (checks, owner) = match sudo {
+            "" => (login_checks(d, top), LOGIN_OWNED.to_owned()),
+            _ => (
+                user_checks(sudo, dest, top),
+                format!("-user {}", fs::metadata(top).unwrap().uid()),
+            ),
+        };
+        let walk = Walk {
+            dirs: crate::remote::path_dirs(d, top)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            owner,
+            create,
+        };
+        let step = FileWrite {
+            walk: Box::new(walk),
+            ids,
+            ..plain(d, "0640", sudo, &checks, !sudo.is_empty())
+        };
+        let heredoc = Heredoc::new("new\n").unwrap();
+        match sudo {
+            "sudo " => {
+                let temp = top.parent().unwrap().join("staged");
+                fs::write(&temp, "new\n").unwrap();
+                let step = FileWrite {
+                    password: true,
+                    ..step
+                };
+                super::install_script(temp.to_str().unwrap(), 4, &step, &Expected::Unchecked)
+            }
+            _ => super::tee_script(&heredoc, &step, &Expected::Unchecked),
+        }
+        .unwrap()
+        .to_string()
+    }
+
+    #[test]
+    fn parents_creates_each_missing_directory_0755_top_down_and_announces_it() {
+        for sudo in ["", "sudo -n ", "sudo "] {
+            let (dir, bin, conf) = write_case("files-parents", &[]);
+            let top = conf.parent().unwrap();
+            let (a, b) = (top.join("a"), top.join("a/b"));
+            let dest = b.join("conf");
+            let nonce = WalkNonce::generate().unwrap();
+            let walk = Walk {
+                dirs: Vec::new(),
+                owner: String::new(),
+                create: Some(nonce.clone()),
+            };
+            let mut out = sh_with(&bin, &walking(&dest, top, sudo, Some(nonce.clone()), None));
+            assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{sudo:?}");
+            assert_eq!(out.code, Some(0), "{sudo:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!(
+                    "{n} created {}\n{n} created {}\nwrote {}\n",
+                    a.display(),
+                    b.display(),
+                    dest.display(),
+                    n = nonce.as_str()
+                ),
+                "{sudo:?}"
+            );
+            assert_eq!(
+                walk.created(&mut out),
+                [a.display().to_string(), b.display().to_string()]
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("wrote {}\n", dest.display())
+            );
+            assert_eq!((mode(&a), mode(&b)), (0o755, 0o755), "{sudo:?}");
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+
+            let mut again = sh_with(&bin, &walking(&dest, top, sudo, Some(nonce.clone()), None));
+            assert_eq!(again.code, Some(0), "{sudo:?}");
+            assert!(walk.created(&mut again).is_empty(), "{sudo:?}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn without_parents_a_missing_directory_fails_the_write_naming_it() {
+        for sudo in ["", "sudo -n ", "sudo "] {
+            let (dir, bin, conf) = write_case("files-no-parents", &[]);
+            let top = conf.parent().unwrap();
+            let dest = top.join("a/b/conf");
+            let out = sh_with(&bin, &walking(&dest, top, sudo, None, None));
+            assert_eq!(out.code, Some(REFUSED), "{sudo:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr),
+                format!(
+                    "files: {} does not exist; set parents = true to create it\n",
+                    top.join("a").display()
+                ),
+                "{sudo:?}"
+            );
+            assert!(out.stdout.is_empty(), "{sudo:?}");
+            assert!(!top.join("a").exists(), "{sudo:?}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn parents_creates_nothing_under_a_directory_that_fails_the_walk() {
+        for sudo in ["", "sudo -n "] {
+            let (dir, bin, conf) = write_case("files-parents-open", &[]);
+            let top = conf.parent().unwrap();
+            let open = top.join("a");
+            fs::create_dir(&open).unwrap();
+            fs::set_permissions(&open, fs::Permissions::from_mode(0o775)).unwrap();
+            let dest = open.join("b/conf");
+            let nonce = WalkNonce::generate().unwrap();
+            let out = sh_with(&bin, &walking(&dest, top, sudo, Some(nonce), None));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.code, Some(REFUSED), "{sudo:?}: {stderr}");
+            assert!(
+                stderr.contains(&format!("files: {} is not", open.display())),
+                "{sudo:?}: {stderr}"
+            );
+            assert!(out.stdout.is_empty(), "{sudo:?}");
+            assert!(!open.join("b").exists(), "{sudo:?}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_created_directory_that_fails_the_recheck_fails_the_write_but_is_announced() {
+        // A default ACL that grants the group write, as a mkdir would see it.
+        let mkdir = format!("{REAL} mkdir \"$@\" && chmod 0775 \"$3\"");
+        let (dir, bin, conf) = write_case("files-parents-acl", &[("mkdir", &mkdir)]);
+        let top = conf.parent().unwrap();
+        let a = top.join("a");
+        let nonce = WalkNonce::generate().unwrap();
+        let walk = Walk {
+            dirs: Vec::new(),
+            owner: String::new(),
+            create: Some(nonce.clone()),
+        };
+        let mut out = sh_with(
+            &bin,
+            &walking(&a.join("b/conf"), top, "", Some(nonce), None),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.code, Some(REFUSED), "{stderr}");
+        assert!(
+            stderr.contains(&format!("files: {} is not owned by root", a.display())),
+            "{stderr}"
+        );
+        assert_eq!(walk.created(&mut out), [a.display().to_string()]);
+        assert!(out.stdout.is_empty());
+        assert!(!a.join("b").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mkdir_that_fails_after_making_the_directory_still_announces_it() {
+        // The directory is made, then its chmod fails.
+        let mkdir = format!("{REAL} mkdir \"$3\" && exit 1");
+        let (dir, bin, conf) = write_case("files-parents-half", &[("mkdir", &mkdir)]);
+        let top = conf.parent().unwrap();
+        let a = top.join("a");
+        let nonce = WalkNonce::generate().unwrap();
+        let walk = Walk {
+            dirs: Vec::new(),
+            owner: String::new(),
+            create: Some(nonce.clone()),
+        };
+        let mut out = sh_with(&bin, &walking(&a.join("conf"), top, "", Some(nonce), None));
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.code, Some(REFUSED), "{stderr}");
+        assert!(
+            stderr.contains(&format!("files: cannot create {}", a.display())),
+            "{stderr}"
+        );
+        assert_eq!(walk.created(&mut out), [a.display().to_string()]);
+        assert!(out.stdout.is_empty());
+        assert!(!a.join("conf").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_owner_refuses_before_parents_creates_anything() {
+        let (dir, bin, conf) = write_case("files-parents-owner", &[]);
+        let top = conf.parent().unwrap();
+        let ids = Ownership {
+            owner: Some("anvil-no-such-user".to_owned()),
+            group: None,
+            user: None,
+        };
+        let nonce = WalkNonce::generate().unwrap();
+        let script = walking(&top.join("a/conf"), top, "sudo -n ", Some(nonce), Some(ids));
+        let out = sh_with(&bin, &script);
+        assert_eq!(out.code, Some(REFUSED));
+        assert!(out.stdout.is_empty());
+        assert!(!top.join("a").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_parents_entry_gets_a_fresh_nonce_and_walks_from_the_top_of_its_checks() {
+        let dir = dir("files-parents-run");
+        let src = dir.join("a.txt");
+        fs::write(&src, "a\n").unwrap();
+        let mut deep = entry("a.txt", "/etc/app/conf.d/a.conf");
+        deep.parents = true;
+        let config = config_in(&dir, vec![deep, entry("a.txt", "/etc/b")]);
+        let sources = load(&config, || Ok(dir.clone())).unwrap();
+        let runs = runs(
+            &config,
+            &sources,
+            &host(&[], None),
+            Some(&user_facts("nopasswd")),
+        )
+        .unwrap();
+        let walk = |n: usize| runs[n].file().unwrap().write.clone().unwrap().walk;
+        assert_eq!(walk(0).dirs, ["/", "/etc", "/etc/app", "/etc/app/conf.d"]);
+        assert_eq!(walk(0).owner, ROOT_OWNED);
+        assert!(walk(0).create.is_some());
+        assert!(walk(1).create.is_none());
+        assert!(runs[0].run.contains("mkdir -m 0755 '/etc/app/conf.d'"));
+        assert!(
+            runs[1]
+                .run
+                .contains("files: /etc does not exist; set parents = true to create it")
+        );
+        assert!(!format!("{:?}", runs[0]).contains(walk(0).create.unwrap().as_str()));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

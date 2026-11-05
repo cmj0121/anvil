@@ -2607,7 +2607,7 @@ mod tests {
 
     #[test]
     fn a_templated_file_shows_its_rendered_size_and_sha256_under_its_would_line() {
-        use anvil::files::{FileWrite, Rendered};
+        use anvil::files::{FileWrite, Rendered, Walk};
         use anvil::plan::PlanReport;
         use anvil::step::{FileRun, PlannedRun, RunKind};
         use anvil::transport::RUN_TIMEOUT;
@@ -2628,6 +2628,11 @@ mod tests {
                         mode: "0644".to_owned(),
                         sudo: String::new(),
                         checks: String::new(),
+                        walk: Box::new(Walk {
+                            dirs: Vec::new(),
+                            owner: String::new(),
+                            create: None,
+                        }),
                         as_root: false,
                         password: false,
                         rendered: rendered.map(Box::new),

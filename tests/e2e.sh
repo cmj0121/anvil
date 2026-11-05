@@ -356,7 +356,7 @@ else
   fail "apply --json with [packages]: exit $code"
 fi
 
-step "(l) [[files]] on arch (NOPASSWD): a sudo rename writes, keeps the owner or sets owner and group, fixes them on the same bytes, refuses a symlinked dest or a user-owned directory, an unmatched entry is skipped"
+step "(l) [[files]] on arch (NOPASSWD): a sudo rename writes, keeps the owner or sets owner and group, fixes them on the same bytes, parents creates missing directories, refuses a symlinked dest or a user-owned directory, an unmatched entry is skipped"
 # The probed distro: arch, or archarm on the arm64 image.
 REMOTE_DISTRO=$(docker exec "$NAME" sh -c '. /etc/os-release && printf %s "$ID"')
 FILES_DIR="$TMP/files"
@@ -596,6 +596,24 @@ if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-attrs' "$TMP/out";
   pass "a second apply found nothing to fix"
 else
   fail "a second apply after the fix: exit $code"
+fi
+cat >"$FILES_DIR/parents.toml" <<CONF
+[[files]]
+src = "managed.conf"
+dest = "/etc/anvil-e2e-p/a/b/file"
+mode = "0644"
+parents = true
+CONF
+anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/parents.toml" apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  wrote /etc/anvil-e2e-p/a/b/file' "$TMP/out" \
+  && ! grep -qF 'anvil-sudo-' "$TMP/out" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-p /etc/anvil-e2e-p/a /etc/anvil-e2e-p/a/b)" \
+    = "$(printf '755 root:root\n755 root:root\n755 root:root')" ] \
+  && docker exec "$NAME" cat /etc/anvil-e2e-p/a/b/file | cmp -s - "$FILES_DIR/managed.conf"; then
+  pass "parents = true created each missing directory 0755 root:root, top down"
+else
+  fail "apply with parents = true: exit $code"
 fi
 # 1 MiB, the src limit: bash `sh -s` over ssh carries the text twice (D13).
 yes 'anvil e2e: one line of a 1 MiB text file' | head -c 1048576 >"$FILES_DIR/big.txt"
