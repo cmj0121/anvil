@@ -1230,6 +1230,14 @@ mod tests {
             ".file.mode `4755`: setuid and setgid are refused",
         ),
         (
+            r#"file = { src = "s", dest = "/d", mode = "0644", owner = "Bad" }"#,
+            ".file.owner `Bad`: must be a user name or a numeric id",
+        ),
+        (
+            r#"file = { src = "s", dest = "/d", mode = "0644", group = "1app" }"#,
+            ".file.group `1app`: must be a group name or a numeric id",
+        ),
+        (
             r#"file = { src = "s", dest = "/d", mode = "0644", tags = ["web"] }"#,
             ".file: tags and facts belong on the task",
         ),

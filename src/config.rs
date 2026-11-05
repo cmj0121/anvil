@@ -481,6 +481,15 @@ pub struct FileEntry {
     /// own message from [`Config::validate`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<ModeValue>,
+    /// A user name or numeric id; unset keeps dest's owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// A group name or numeric id; unset keeps dest's group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// `true`: create each missing directory on dest's path.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parents: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -508,6 +517,9 @@ impl std::fmt::Debug for FileEntry {
             .field("src", &self.src)
             .field("dest", &self.dest)
             .field("mode", &self.mode)
+            .field("owner", &self.owner)
+            .field("group", &self.group)
+            .field("parents", &self.parents)
             .field("tags", &self.tags)
             .field("facts", &self.facts)
             .field("sudo", &self.sudo)
@@ -685,6 +697,9 @@ apt = "fd-find"
 src = "$/motd"
 dest = "/etc/motd"
 mode = "0644"
+owner = "root"
+group = "root"
+parents = false
 [[services]]
 name = "sshd"
 state = "started"
@@ -1307,7 +1322,35 @@ pub(crate) fn check_file(prefix: &str, entry: &FileEntry) -> Result<(), String> 
     check_dest(&entry.dest)
         .map_err(|why| format!("{prefix}.dest `{}`: {why}", secret::shown_name(&entry.dest)))?;
     check_mode(entry.mode.as_ref()).map_err(|why| format!("{prefix}.mode{why}"))?;
+    check_account(prefix, "owner", entry.owner.as_deref())?;
+    check_account(prefix, "group", entry.group.as_deref())?;
     check_selector(prefix, &entry.tags, &entry.facts)
+}
+
+/// An `owner` or `group` (`key`): a numeric id that fits a u32, or a name
+/// `[a-z_][a-z0-9_.-]*` of 1 to 32 bytes.
+fn check_account(prefix: &str, key: &str, value: Option<&str>) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let id = value.len() <= 10
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && value.parse::<u32>().is_ok();
+    let mut bytes = value.bytes();
+    let name = value.len() <= 32
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b));
+    let what = if key == "owner" { "user" } else { "group" };
+    if id || name {
+        Ok(())
+    } else {
+        Err(format!(
+            "{prefix}.{key} `{}`: must be a {what} name or a numeric id",
+            secret::shown_name(value)
+        ))
+    }
 }
 
 /// One service entry's rules; `prefix` names it, as `services[0]`. Only a
@@ -1917,6 +1960,104 @@ mod tests {
     }
 
     #[test]
+    fn a_files_entry_takes_owner_group_and_parents() {
+        let plain = file_entry(ENTRY);
+        assert_eq!(
+            (&plain.files[0].owner, &plain.files[0].group),
+            (&None, &None)
+        );
+        assert!(!plain.files[0].parents);
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&plain, format).unwrap();
+            for key in ["owner", "group", "parents"] {
+                assert!(!text.contains(key), "{text}");
+            }
+        }
+
+        let set = file_entry(&format!(
+            "{ENTRY}\nowner = \"root\"\ngroup = \"0\"\nparents = true"
+        ));
+        set.check_files().unwrap();
+        let entry = &set.files[0];
+        assert_eq!(entry.owner.as_deref(), Some("root"));
+        assert_eq!(entry.group.as_deref(), Some("0"));
+        assert!(entry.parents);
+        let debug = format!("{entry:?}");
+        for field in [
+            "owner: Some(\"root\")",
+            "group: Some(\"0\")",
+            "parents: true",
+        ] {
+            assert!(debug.contains(field), "{debug}");
+        }
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&set, format).unwrap();
+            let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(back, set, "{text}");
+        }
+
+        let task = parse(
+            "[[tasks]]\nfile = { src = \"motd\", dest = \"/etc/motd\", mode = \"0644\", \
+             owner = \"app\", group = \"app\", parents = true }\n",
+        );
+        let file = task.tasks[0].file.as_ref().unwrap();
+        assert_eq!(file.owner.as_deref(), Some("app"));
+        assert_eq!(file.group.as_deref(), Some("app"));
+        assert!(file.parents);
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&task, format).unwrap();
+            let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(back, task, "{text}");
+        }
+    }
+
+    #[test]
+    fn files_owner_and_group_are_a_name_or_a_numeric_id() {
+        let long = "a".repeat(32);
+        for value in [
+            "root",
+            "_apt",
+            "www-data",
+            "a.b_c-1",
+            long.as_str(),
+            "0",
+            "1000",
+            "4294967295",
+        ] {
+            for key in ["owner", "group"] {
+                let config = file_entry(&format!("{ENTRY}\n{key} = \"{value}\""));
+                assert_eq!(config.check_files(), Ok(()), "{key} {value}");
+            }
+        }
+        let too_long = "a".repeat(33);
+        for value in [
+            "",
+            "Bad",
+            "1app",
+            "-x",
+            ".x",
+            "a b",
+            "a$b",
+            "a/b",
+            too_long.as_str(),
+            "4294967296",
+            "00000000001",
+            "-1",
+        ] {
+            for (key, what) in [("owner", "user"), ("group", "group")] {
+                let err = file_entry(&format!("{ENTRY}\n{key} = {value:?}"))
+                    .check_files()
+                    .unwrap_err();
+                assert!(
+                    err.starts_with(&format!("files[0].{key} `"))
+                        && err.ends_with(&format!("`: must be a {what} name or a numeric id")),
+                    "{key} {value}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn files_modes_and_dests_within_the_rules_pass() {
         for mode in ["644", "0644", "0444", "0000", "0777", "1777", "0600", "755"] {
             let config = file_entry(&format!("src = \"a\"\ndest = \"/a\"\nmode = \"{mode}\""));
@@ -2132,6 +2273,14 @@ mod tests {
                 "invalid/config-files-unknown-fact.yaml",
                 "files[0].facts.distribution: unknown fact",
             ),
+            (
+                "invalid/config-files-bad-owner.toml",
+                "files[0].owner `Bad`: must be a user name or a numeric id",
+            ),
+            (
+                "invalid/config-files-bad-group.yaml",
+                "files[1].group `1app`: must be a group name or a numeric id",
+            ),
         ] {
             let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
             let message = err.to_string();
@@ -2144,14 +2293,14 @@ mod tests {
         }
         // Serde refuses these while parsing; its message names the key.
         for (file, key, line) in [
-            ("invalid/config-files-unknown-key.toml", "owner", "line 5"),
+            ("invalid/config-files-unknown-key.toml", "user", "line 5"),
             ("invalid/config-files-sudo-not-bool.toml", "sudo", "line 5"),
             (
                 "invalid/config-files-rollback-not-bool.toml",
                 "rollback",
                 "line 5",
             ),
-            ("invalid/config-files-unknown-key.yaml", "owner", "line 5"),
+            ("invalid/config-files-unknown-key.yaml", "user", "line 5"),
         ] {
             let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
             let message = err.to_string();
