@@ -646,16 +646,16 @@ fn execute_inner(
             }
         };
         // Announced at once, so they are known even when the step then failed.
-        let created = match (write, &mut output) {
-            (Some(write), Ok(output)) => write.walk.created(output),
+        let (created, written_attrs) = match (write, &mut output) {
+            (Some(write), Ok(output)) => (write.walk.created(output), write.written_attrs(output)),
             (
                 Some(write),
                 Err(TransportError::Timeout {
                     output: Some(output),
                     ..
                 }),
-            ) => write.walk.created(output),
-            _ => Vec::new(),
+            ) => (write.walk.created(output), write.written_attrs(output)),
+            _ => (Vec::new(), None),
         };
         for dir in &created {
             log::info!("{command} {}: created {dir}", target.name);
@@ -684,6 +684,10 @@ fn execute_inner(
                 // the running ssh (Wait) may have cut it.
                 _ => record::Write::FailedMidway,
             };
+            if file.write == record::Write::Written {
+                file.written_attrs = written_attrs;
+            }
+            file.created_dirs = created;
             keep(recorder.expanded, &mut recorder.files, file);
             // A failure has set the cancel token: the next step does not start.
             recorder.snapshot(None, &reports);

@@ -1486,7 +1486,10 @@ fn apply_records_what_each_target_held_before_it_wrote() {
         "no step script, nor the bytes written: {raw}"
     );
     let record = sandbox.last_apply().unwrap();
-    assert_eq!(record["version"], 1);
+    assert_eq!(
+        record["version"], 1,
+        "the attrs written alone stay version 1"
+    );
     let uid = std::fs::metadata(&local).unwrap().uid();
     let gid = std::fs::metadata(&local).unwrap().gid();
     let written = sha256_hex(FILE_TEXT);
@@ -1501,6 +1504,7 @@ fn apply_records_what_each_target_held_before_it_wrote() {
             "written_sha256": written, "write": "written",
             "previous": {"state": "file", "mode": "0644", "uid": uid, "gid": gid,
                          "sha256": sha256_hex(PREVIOUS), "kept": true, "text": PREVIOUS},
+            "written_attrs": {"uid": uid, "gid": gid, "mode": "0640"},
         }])
     );
     assert_eq!(
@@ -3446,9 +3450,34 @@ fn parents_creates_missing_directories_0755_top_down_on_local_and_the_fake_host(
         }
     }
 
+    let created = |dest: &Path, top: &str| {
+        let mut dirs: Vec<String> = dest
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| dir.starts_with(out.join(top)))
+            .map(|dir| dir.display().to_string())
+            .collect();
+        dirs.reverse();
+        serde_json::json!(dirs)
+    };
+    let recorded = |record: &serde_json::Value| {
+        let files = |target: &str| record["targets"][target]["files"].clone();
+        let (local_files, web_files) = (files("local"), files("fake"));
+        assert_eq!(local_files[0]["created_dirs"], created(&local, "l"));
+        assert_eq!(local_files[1]["created_dirs"], created(&root, "r"));
+        assert_eq!(web_files[0]["created_dirs"], created(&web, "w"));
+        assert_eq!(local_files[0]["written_attrs"]["mode"], "0640");
+    };
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["version"], 2);
+    recorded(&record);
+    assert!(!shown.contains("anvil-attrs-"), "{shown}");
+
     let again = sandbox.anvil(&["apply"], &[("PATH", path.as_str())]);
     assert_eq!(again.status.code(), Some(0), "{}", text(&again.stdout));
     assert!(!text(&again.stdout).contains("anvil-sudo-"));
+    // An unchanged rerun keeps the dirs the first apply created.
+    recorded(&sandbox.last_apply().unwrap());
 }
 
 #[test]

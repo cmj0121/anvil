@@ -236,15 +236,21 @@ pub(crate) fn link_removal_checks(sudo: &str, dest: &str, as_root: bool, top: &P
     }
 }
 
-/// What marks a walk's created-directory lines: `anvil-walk-` and 32 fresh
-/// hex digits, so neither a login shell nor a tool can print one; its `Debug`
-/// never shows it.
+/// What marks a write's own stdout lines: `anvil-walk-` and 32 fresh hex
+/// digits for a walk's created-directory lines, `anvil-attrs-` and 32 for the
+/// line with DEST's attrs as written, so neither a login shell nor a tool can
+/// print one; its `Debug` never shows it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WalkNonce(String);
 
 impl WalkNonce {
-    pub(crate) fn generate() -> Result<Self, String> {
+    pub fn generate() -> Result<Self, String> {
         Ok(Self(format!("anvil-walk-{}", random_hex(16)?)))
+    }
+
+    /// The mark of the line with DEST's attrs as written.
+    pub fn attrs() -> Result<Self, String> {
+        Ok(Self(format!("anvil-attrs-{}", random_hex(16)?)))
     }
 
     pub(crate) fn as_str(&self) -> &str {

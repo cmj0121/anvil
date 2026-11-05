@@ -769,7 +769,8 @@ fn a_refused_write_after_its_intent_rolls_back_to_the_earlier_previous() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
 
     // The next capture reads `found`; its `od` then puts back what the first
-    // apply wrote, so the write sees DEST changed since the read and refuses.
+    // apply wrote, bytes and mode, so the write sees DEST changed since the
+    // read and refuses.
     std::fs::write(&dest, "found\n").unwrap();
     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
     std::fs::write(sandbox.config_dir().join("a.txt"), "bytes-new\n").unwrap();
@@ -780,7 +781,7 @@ fn a_refused_write_after_its_intent_rolls_back_to_the_earlier_previous() {
         &od,
         format!(
             "#!/bin/sh\n/usr/bin/od \"$@\"\nanvil_od=$?\ncase \"$*\" in *{dest}*) \
-             printf 'bytes-a\\n' >{dest} ;; esac\nexit $anvil_od\n"
+             printf 'bytes-a\\n' >{dest}; chmod 0640 {dest} ;; esac\nexit $anvil_od\n"
         ),
     )
     .unwrap();
@@ -1169,4 +1170,226 @@ fn rollback_queues_the_handlers_of_the_files_it_restored_and_runs_none() {
             .get("pending_handlers")
             .is_none()
     );
+}
+
+/// A `[[files]]` entry copying `a.txt` to `dest` at `mode` as the login
+/// user, with `parents = true` when `parents`.
+fn files_entry(dest: &str, mode: &str, parents: bool) -> String {
+    format!(
+        "[[files]]\nsrc = \"a.txt\"\ndest = \"{dest}\"\nmode = \"{mode}\"\nsudo = false\n{}\n",
+        if parents { "parents = true\n" } else { "" }
+    )
+}
+
+/// `<root>/out`, created, and `a.txt` holding `bytes-a`.
+fn out_dir(sandbox: &Sandbox) -> std::path::PathBuf {
+    let out = sandbox.root().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(sandbox.config_dir().join("a.txt"), "bytes-a\n").unwrap();
+    out
+}
+
+#[test]
+fn rollback_puts_back_the_mode_of_a_write_and_of_an_attrs_only_fix_without_its_text() {
+    let sandbox = Sandbox::new("rb");
+    let out = out_dir(&sandbox);
+    let (fixed, written) = (out.join("fixed"), out.join("written"));
+    // Its own bytes, but 0640: not world-readable, so no text is kept.
+    std::fs::write(&fixed, "bytes-a\n").unwrap();
+    std::fs::set_permissions(&fixed, std::fs::Permissions::from_mode(0o640)).unwrap();
+    std::fs::write(&written, PREVIOUS).unwrap();
+    std::fs::set_permissions(&written, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (f, w) = (fixed.display().to_string(), written.display().to_string());
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}{}",
+            files_entry(&f, "0644", false),
+            files_entry(&w, "0600", false)
+        ),
+    );
+    let applied = sandbox.anvil(&["-vv", "apply", "--target", "local"], &[]);
+    assert_eq!(applied.status.code(), Some(0), "{}", text(&applied.stderr));
+    assert!(
+        text(&applied.stdout).contains(&format!("fixed {f}: mode")),
+        "{}",
+        text(&applied.stdout)
+    );
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["version"], 2);
+    let entry = &record["targets"]["local"]["files"][0];
+    assert_eq!(entry["dest"], f.as_str());
+    assert_eq!(entry["previous"]["kept"], false);
+    assert_eq!(entry["previous"]["mode"], "0640");
+    assert_eq!(entry["written_attrs"]["mode"], "0644");
+
+    let dry = sandbox.anvil(&["rollback", "--dry-run", "--target", "local"], &[]);
+    assert!(
+        text(&dry.stdout).contains(&format!("would restore owner, group and mode of {f}")),
+        "{}",
+        text(&dry.stdout)
+    );
+    let out = sandbox.anvil(&["-vv", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains(&format!("restored owner, group and mode of {f}")),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(
+        !text(&out.stderr).contains("not restored"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&fixed).unwrap(), "bytes-a\n");
+    assert_eq!(mode(&fixed), 0o640);
+    assert_eq!(std::fs::read_to_string(&written).unwrap(), PREVIOUS);
+    assert_eq!(mode(&written), 0o644);
+}
+
+#[test]
+fn a_mode_changed_since_the_apply_is_refused_unless_forced() {
+    let sandbox = Sandbox::new("rb");
+    let out = out_dir(&sandbox);
+    let dest = out.join("conf");
+    std::fs::write(&dest, PREVIOUS).unwrap();
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let d = dest.display().to_string();
+    sandbox.write_config("config.toml", &files_entry(&d, "0640", false));
+    let applied = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(applied.status.code(), Some(0), "{}", text(&applied.stderr));
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        shown.contains(&format!(
+            "files: {d} changed since the last apply; anvil rollback --force {d} restores it anyway"
+        )),
+        "{shown}"
+    );
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "bytes-a\n");
+    assert_eq!(mode(&dest), 0o600);
+
+    let out = sandbox.anvil(&["rollback", "--target", "local", "--force", &d], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), PREVIOUS);
+    assert_eq!(mode(&dest), 0o644);
+}
+
+#[test]
+fn rollback_removes_the_created_dirs_deepest_first_and_leaves_a_non_empty_one() {
+    let sandbox = Sandbox::new("rb");
+    let out = out_dir(&sandbox);
+    let (a, b) = (out.join("a"), out.join("a/b"));
+    let dest = b.join("conf").display().to_string();
+    let (a_, b_) = (a.display().to_string(), b.display().to_string());
+    sandbox.write_config("config.toml", &files_entry(&dest, "0644", true));
+    let apply = || {
+        let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    };
+    apply();
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["files"][0]["created_dirs"],
+        serde_json::json!([a_, b_])
+    );
+    let dry = text(
+        &sandbox
+            .anvil(&["rollback", "--dry-run", "--target", "local"], &[])
+            .stdout,
+    );
+    let (at_b, at_a) = (
+        dry.find(&format!("would remove directory {b_} when empty")),
+        dry.find(&format!("would remove directory {a_} when empty")),
+    );
+    assert!(at_b.is_some() && at_b < at_a, "{dry}");
+
+    let rolled = sandbox.anvil(&["-vv", "rollback", "--target", "local"], &[]);
+    assert_eq!(rolled.status.code(), Some(0), "{}", text(&rolled.stderr));
+    let shown = text(&rolled.stdout);
+    let (at_b, at_a) = (
+        shown.find(&format!("removed directory {b_}\n")),
+        shown.find(&format!("removed directory {a_}\n")),
+    );
+    assert!(at_b.is_some() && at_b < at_a, "{shown}");
+    assert!(!a.exists());
+
+    apply();
+    std::fs::write(a.join("theirs"), "").unwrap();
+    let rolled = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(rolled.status.code(), Some(0), "{}", text(&rolled.stderr));
+    let shown = format!("{}{}", text(&rolled.stdout), text(&rolled.stderr));
+    assert!(
+        shown.contains(&format!("rollback: {a_} is not empty; left in place")),
+        "{shown}"
+    );
+    assert!(a.join("theirs").exists() && !b.exists());
+}
+
+#[test]
+fn the_dirs_a_failed_or_refused_write_created_are_removed() {
+    let bin_with = |sandbox: &Sandbox, name: &str, body: &str| {
+        let bin = sandbox.root().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join(name);
+        std::fs::write(&tool, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
+    };
+    // `install` fails after the walk: the write failed; `mkdir` leaves a
+    // directory others may write: the walk's re-check refuses the write.
+    for (tool, body, write, dirs) in [
+        (
+            "install",
+            "exit 1",
+            "failed_midway",
+            ["a", "a/b"].as_slice(),
+        ),
+        (
+            "mkdir",
+            "PATH=/usr/bin:/bin mkdir \"$@\" && chmod 0777 \"$3\"",
+            "refused",
+            ["a"].as_slice(),
+        ),
+    ] {
+        let sandbox = Sandbox::new("rb");
+        let out = out_dir(&sandbox);
+        let dest = out.join("a/b/conf").display().to_string();
+        sandbox.write_config("config.toml", &files_entry(&dest, "0644", true));
+        let path = bin_with(&sandbox, tool, body);
+        let applied = sandbox.anvil(&["apply", "--target", "local"], &[("PATH", &path)]);
+        assert_eq!(
+            applied.status.code(),
+            Some(1),
+            "{tool}: {}",
+            text(&applied.stderr)
+        );
+        let record = sandbox.last_apply().unwrap();
+        let file = &record["targets"]["local"]["files"][0];
+        assert_eq!(file["write"], write, "{tool}");
+        let created: Vec<String> = dirs
+            .iter()
+            .map(|d| out.join(d).display().to_string())
+            .collect();
+        assert_eq!(file["created_dirs"], serde_json::json!(created), "{tool}");
+
+        let rolled = sandbox.anvil(&["-vv", "rollback", "--target", "local"], &[]);
+        assert_eq!(
+            rolled.status.code(),
+            Some(0),
+            "{tool}: {}",
+            text(&rolled.stderr)
+        );
+        for dir in &created {
+            assert!(
+                text(&rolled.stdout).contains(&format!("removed directory {dir}")),
+                "{tool}: {}",
+                text(&rolled.stdout)
+            );
+        }
+        assert!(!out.join("a").exists(), "{tool}");
+    }
 }

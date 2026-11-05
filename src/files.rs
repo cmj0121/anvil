@@ -30,7 +30,8 @@ use crate::facts::Facts;
 use crate::filestore::{self, StoreError};
 use crate::inventory::{self, Target, TargetKind};
 use crate::record::{
-    FileRecord, NO_ROLLBACK, NOT_WORLD_READABLE, Previous, PreviousFile, Write, is_world_readable,
+    Attrs, FileRecord, NO_ROLLBACK, NOT_WORLD_READABLE, Previous, PreviousFile, Write,
+    is_world_readable,
 };
 use crate::remote::{
     Bytes, Heredoc, Ids, LOGIN_OWNED, ROOT_OWNED, Replacement, is_owned_only, link_removal_checks,
@@ -43,7 +44,7 @@ use crate::secret;
 use crate::step::{FileRun, PlannedRun, RunKind, Upload};
 use crate::tasks::{Expanded, Item};
 use crate::template;
-use crate::transport::RUN_TIMEOUT;
+use crate::transport::{Output, RUN_TIMEOUT};
 use crate::trust::{self, TrustError};
 
 /// Each file item's src text, by ordinal.
@@ -262,6 +263,7 @@ pub fn run(
     } else {
         None
     };
+    let mark = WalkNonce::attrs()?;
     let write = match secret {
         Some(name) => {
             log::info!(
@@ -279,6 +281,7 @@ pub fn run(
                 password: true,
                 rendered,
                 ids,
+                mark,
             }
         }
         None => {
@@ -302,6 +305,7 @@ pub fn run(
                 password: false,
                 rendered,
                 ids,
+                mark,
             }
         }
     };
@@ -398,6 +402,9 @@ pub struct FileWrite {
     /// The entry's owner and group; `None` when it sets neither, which keeps
     /// an existing DEST's.
     pub ids: Option<Ownership>,
+    /// What marks the line with DEST's `ls -lLdn` once the write succeeded
+    /// ([`FileWrite::written_attrs`]).
+    pub mark: WalkNonce,
 }
 
 /// A write's `owner` and `group`, each by name or numeric id, `None`
@@ -520,7 +527,34 @@ impl FileWrite {
             written_sha256: hex(&Sha256::digest(written.as_bytes())),
             write,
             previous,
+            written_attrs: None,
+            created_dirs: Vec::new(),
         }
+    }
+
+    /// DEST's owner, group and mode from `output`'s marked line, which the
+    /// write prints once it succeeded, those lines taken out of its stdout;
+    /// `None` without one, or when the last does not parse.
+    pub(crate) fn written_attrs(&self, output: &mut Output) -> Option<Attrs> {
+        let mark = format!("{} ", self.mark.as_str());
+        let mut attrs = None;
+        let mut kept = Vec::with_capacity(output.stdout.len());
+        for line in output.stdout.split_inclusive(|&b| b == b'\n') {
+            let body = line.strip_suffix(b"\n").unwrap_or(line);
+            let body = body.strip_suffix(b"\r").unwrap_or(body);
+            match body.strip_prefix(mark.as_bytes()) {
+                Some(ls) => {
+                    attrs = std::str::from_utf8(ls)
+                        .ok()
+                        .and_then(|ls| parse_ls(ls).ok())
+                        .filter(|&(.., kind)| kind == '-')
+                        .map(|(mode, uid, gid, ..)| Attrs { uid, gid, mode });
+                }
+                None => kept.extend_from_slice(line),
+            }
+        }
+        output.stdout = kept;
+        attrs
     }
 }
 
@@ -627,13 +661,16 @@ pub(crate) fn skip_run(dest: &str, label: String) -> PlannedRun {
 /// One run under `umask 077` that first refuses a `sudo` that fails, then runs
 /// `checks`, then refuses a directory DEST, then the owner checks, the guard
 /// and `walk`; when DEST already holds the bytes, [`fix_script`], else
-/// [`Replacement::replace`].
+/// [`Replacement::replace`]. Once either succeeded, DEST's `ls -lLdn` line
+/// follows `mark` ([`FileWrite::written_attrs`]); every failure before it
+/// exits.
 fn replace_script(
     write: &Replacement<'_>,
     checks: &str,
     walk: &Walk,
     ids: Option<&Ownership>,
     expected: &Expected,
+    mark: &WalkNonce,
 ) -> Zeroizing<String> {
     let (dest, sudo) = (write.dest, write.sudo);
     let d = quote(dest);
@@ -649,8 +686,9 @@ fn replace_script(
     let wrote = quote(&format!("wrote {dest}"));
     zeroizing(format_args!(
         "{open}{ready}{checks}{directory} || exit {REFUSED}\n\
-         {owner}{guard}{walk}{sweep}if {same}; then\n{fix}\
+         {owner}{guard}{walk}{sweep}{OCTAL}if {same}; then\n{fix}\
          else {replace}fi\n\
+         anvil_line=$({sudo}ls -lLdn {d} 2>/dev/null) && printf '%s %s\\n' {mark} \"$anvil_line\" || :\n\
          }}\n",
         open = *write.open(),
         owner = ids.map(Ownership::checks).unwrap_or_default(),
@@ -659,6 +697,7 @@ fn replace_script(
         same = write.same(),
         fix = fix_script(write, ids),
         replace = write.replace(&format!("echo {wrote}")),
+        mark = quote(mark.as_str()),
     ))
 }
 
@@ -679,7 +718,7 @@ printf '%04o\\n' \"$anvil_v\"; }
 /// never briefly gets access, and the mode is set last; a fix that does not
 /// take fails the run, so it cannot report a change on every run. It prints
 /// `fixed DEST: …` naming what it changed, or `unchanged DEST` and runs
-/// nothing on DEST.
+/// nothing on DEST. It needs [`OCTAL`].
 fn fix_script(write: &Replacement<'_>, ids: Option<&Ownership>) -> String {
     let (dest, sudo) = (write.dest, write.sudo);
     let d = quote(dest);
@@ -766,7 +805,7 @@ fn fix_script(write: &Replacement<'_>, ids: Option<&Ownership>) -> String {
         )
     });
     format!(
-        "{OCTAL}{wanted_uid}\
+        "{wanted_uid}\
          anvil_attrs() {{ anvil_line=$({sudo}ls -lLdn {d}) || return 1\nset -- $anvil_line\n\
          anvil_now=\"$3:$4 $(anvil_octal \"$1\")\"; anvil_o=; anvil_g=; anvil_m=\n\
          {owner_cmp}{group_cmp}[ \"${{anvil_now#* }}\" = {want} ] || anvil_m=mode; }}\n\
@@ -808,6 +847,7 @@ fn tee_script(
         &step.walk,
         step.ids.as_ref(),
         expected,
+        &step.mark,
     ))
 }
 
@@ -844,6 +884,7 @@ fn install_script(
         &step.walk,
         step.ids.as_ref(),
         expected,
+        &step.mark,
     ))
 }
 
@@ -1500,13 +1541,17 @@ pub enum Wording {
 pub(crate) const CONFLICT: i32 = 3;
 
 /// One step per recorded file, last written first, that puts back what
-/// DEST held before the apply: `restore DEST` for a file, `remove DEST` for
-/// one that was absent or a dangling link, or a skip `cannot undo: DEST
-/// (reason)` when its text was not kept. Each takes the write's path again,
-/// from the recorded `sudo` and `target`'s current facts and secret, with
-/// the same root checks. A guard refuses, exit [`CONFLICT`], a DEST that is
-/// neither what the apply wrote nor what was there before, unless the write
-/// failed midway or `force` allows the dest.
+/// DEST held before the apply: `restore DEST` for a file, `restore owner,
+/// group and mode of DEST` for an attrs-only fix, which needs no text,
+/// `remove DEST` for one that was absent or a dangling link, or a skip
+/// `cannot undo: DEST (reason)` when its text was not kept. Each takes the
+/// write's path again, from the recorded `sudo` and `target`'s current facts
+/// and secret, with the same root checks, and then removes the directories
+/// the write created, deepest first, leaving one that is not empty; a
+/// refused write kept for those only removes them. A guard refuses, exit
+/// [`CONFLICT`], a DEST that is neither what the apply wrote (with the
+/// owner, group and mode written, when recorded) nor what was there before,
+/// unless the write failed midway or `force` allows the dest.
 pub(crate) fn restore_runs(
     config: &Config,
     target: &Target,
@@ -1537,8 +1582,10 @@ fn restore_runs_from(
             runs.push(skip(reason));
             continue;
         }
+        // An attrs-only fix needs no text: the bytes stay.
         let previous = match &file.previous {
-            Previous::File(previous) => previous.text.as_deref().map(|text| (previous, text)),
+            Previous::File(previous) if file.attrs_only() => Some((previous, None)),
+            Previous::File(previous) => previous.text.as_deref().map(|text| (previous, Some(text))),
             _ => None,
         };
         if let Some((previous, _)) = previous
@@ -1554,21 +1601,46 @@ fn restore_runs_from(
             None => "sudo -n ",
         };
         let as_root = root || file.sudo;
+        let refused = file.write == Write::Refused;
+        let dirs = file.dirs_deepest_first();
+        // A refused write may have stopped at a created directory that fails
+        // the checks: the path to the deepest one it created must pass, so
+        // that every created directory above it still does, and `rmdir`
+        // does not follow that one.
+        let checked = match dirs.first() {
+            Some(deepest) if refused => deepest,
+            _ => dest,
+        };
         let checks = match (&file.previous, as_root) {
             // Removing the link does not follow it, so a v1 record still rolls back.
             (Previous::Dangling { .. }, _) => link_removal_checks(sudo, dest, as_root, top),
-            (_, true) => root_checks(sudo, dest),
-            (_, false) => login_checks(dest, top),
+            (_, true) => root_checks(sudo, checked),
+            (_, false) => login_checks(checked, top),
         };
         let restore = Restore {
             dest,
             sudo,
             checks: &checks,
             as_root,
-            guard: restore_guard(sudo, file, force.allows(dest), wording),
+            guard: if refused {
+                String::new()
+            } else {
+                restore_guard(sudo, file, force.allows(dest), wording)
+            },
+            dirs: remove_dirs(sudo, &dirs),
         };
         let (run, label, upload) = match (previous, &file.previous) {
-            (Some((previous, text)), _) => {
+            _ if refused => (
+                restore.dirs_only().into(),
+                format!("remove the directories made for {dest}"),
+                None,
+            ),
+            (Some((previous, None)), _) => (
+                restore.attrs(previous).into(),
+                format!("restore owner, group and mode of {dest}"),
+                None,
+            ),
+            (Some((previous, Some(text))), _) => {
                 let heredoc = Heredoc::new(text).map_err(|why| format!("files: {dest}: {why}"))?;
                 let label = format!("restore {dest}");
                 match secret {
@@ -1611,11 +1683,35 @@ fn restore_runs_from(
     Ok(runs)
 }
 
+/// The lines that remove each of `deepest` that is still a directory, in
+/// order, through `sudo`; one that is not empty stays, with a warning, and
+/// any other failure is a warning with `rmdir`'s error.
+fn remove_dirs(sudo: &str, deepest: &[&str]) -> String {
+    deepest
+        .iter()
+        .map(|dir| {
+            let q = quote(dir);
+            format!(
+                "if {sudo}test -d {q} && {sudo}test ! -L {q}; then\n\
+                 if anvil_err=$({sudo}rmdir {q} 2>&1); then echo {removed}\n\
+                 elif [ -n \"$({sudo}ls -A {q} 2>/dev/null)\" ]; then echo {left} >&2\n\
+                 else printf '%s: %s\\n' {cannot} \"$anvil_err\" >&2; fi\n\
+                 fi\n",
+                removed = quote(&format!("removed directory {dir}")),
+                left = quote(&format!("rollback: {dir} is not empty; left in place")),
+                cannot = quote(&format!("rollback: cannot remove {dir}")),
+            )
+        })
+        .collect()
+}
+
 /// The lines that set `anvil_same` when DEST already holds `file`'s
 /// previous state, else exit [`CONFLICT`] unless DEST holds what the apply
 /// wrote, the write failed midway, or `forced`. DEST's state is `absent` or
 /// its sha256 through `sudo`; a dangling previous link matches when DEST is
-/// still that link.
+/// still that link. When the record has the owner, group and mode written,
+/// DEST holds what the apply wrote only with those too, and the previous
+/// state of an attrs-only fix is the previous ones.
 fn restore_guard(sudo: &str, file: &FileRecord, forced: bool, wording: Wording) -> String {
     let (dest, d) = (file.dest.as_str(), quote(&file.dest));
     let previous = match &file.previous {
@@ -1631,13 +1727,30 @@ fn restore_guard(sudo: &str, file: &FileRecord, forced: bool, wording: Wording) 
         ),
         _ => String::new(),
     };
+    let attrs_now = |attrs: &Attrs| format!(" && [ \"$anvil_at\" = {} ]", quote(&attrs.shown()));
+    let previous_attrs = match &file.previous {
+        Previous::File(previous) if file.attrs_only() => attrs_now(&previous.attrs()),
+        _ => String::new(),
+    };
     let same = match previous {
         Some(sha) => format!(
-            "[ -n \"$anvil_same\" ] || [ \"$anvil_cur\" = {} ]",
+            "[ -n \"$anvil_same\" ] || {{ [ \"$anvil_cur\" = {} ]{previous_attrs}; }}",
             quote(sha)
         ),
         None => "[ -n \"$anvil_same\" ]".to_owned(),
     };
+    let read_attrs = match &file.written_attrs {
+        Some(_) => format!(
+            "{OCTAL}anvil_at=; anvil_l=$({sudo}ls -lLdn {d} 2>/dev/null) \
+             && {{ set -- $anvil_l; anvil_at=\"$3:$4 $(anvil_octal \"$1\")\"; }}\n"
+        ),
+        None => String::new(),
+    };
+    let written_attrs = file
+        .written_attrs
+        .as_ref()
+        .map(attrs_now)
+        .unwrap_or_default();
     let conflict = if forced || file.write == Write::FailedMidway {
         String::new()
     } else {
@@ -1648,7 +1761,7 @@ fn restore_guard(sudo: &str, file: &FileRecord, forced: bool, wording: Wording) 
         let changed = format!("files: {dest} changed since the last apply; {force} it anyway");
         let no_tool = format!("files: no sha256 tool on the target to check {dest}; {force} it");
         format!(
-            "elif [ \"$anvil_cur\" = {written} ]; then :\n\
+            "elif [ \"$anvil_cur\" = {written} ]{written_attrs}; then :\n\
              elif [ \"$anvil_rc\" -eq 2 ]; then echo {no_tool} >&2; exit {CONFLICT}\n\
              elif [ \"$anvil_rc\" -eq 3 ]; then echo {unchecked} >&2; exit {CONFLICT}\n\
              else echo {changed} >&2; exit {CONFLICT}\n",
@@ -1662,11 +1775,14 @@ fn restore_guard(sudo: &str, file: &FileRecord, forced: bool, wording: Wording) 
         "{hash}anvil_same=\n\
          {link}if {sudo}test ! -e {d}; then anvil_cur=absent; anvil_rc=0\n\
          else anvil_cur=$(anvil_sha256 {d}); anvil_rc=$?; fi\n\
-         if {same}; then anvil_same=1\n\
+         {read_attrs}if {same}; then anvil_same=1\n\
          {conflict}fi\n",
         hash = hash_fn(sudo),
     )
 }
+
+/// What opens a restore script that writes no bytes.
+const PLAIN_OPEN: &str = "{ umask 077; LC_ALL=C; export LC_ALL; set -f\n";
 
 /// What every restore script of one dest shares.
 struct Restore<'a> {
@@ -1677,8 +1793,10 @@ struct Restore<'a> {
     /// [`link_removal_checks`].
     checks: &'a str,
     as_root: bool,
-    /// [`restore_guard`]'s lines.
+    /// [`restore_guard`]'s lines; none for a refused write, which wrote nothing.
     guard: String,
+    /// [`remove_dirs`]' lines, after DEST is restored or removed.
+    dirs: String,
 }
 
 impl Restore<'_> {
@@ -1686,10 +1804,7 @@ impl Restore<'_> {
     /// the guard and the sweep.
     fn head(&self, open: &str) -> Zeroizing<String> {
         let d = quote(self.dest);
-        let ready = match self.sudo {
-            "" => String::new(),
-            sudo => format!("{sudo}true || exit 1\n"),
-        };
+        let ready = self.ready();
         let directory = not_a_directory(self.sudo, &d, self.dest);
         zeroizing(format_args!(
             "{open}{ready}{}{directory} || exit 1\n\
@@ -1698,6 +1813,97 @@ impl Restore<'_> {
             self.guard,
             sweep(self.sudo, self.dest),
         ))
+    }
+
+    /// After a restore that succeeded, the removal of the directories the
+    /// write created.
+    fn after(&self) -> String {
+        match self.dirs.as_str() {
+            "" => String::new(),
+            dirs => format!("[ $? -eq 0 ] || exit 1\n{dirs}"),
+        }
+    }
+
+    /// The line that exits when `sudo` fails.
+    fn ready(&self) -> String {
+        match self.sudo {
+            "" => String::new(),
+            sudo => format!("{sudo}true || exit 1\n"),
+        }
+    }
+
+    /// A refused write's: after the checks, only the directories it created
+    /// are removed; DEST was never written.
+    fn dirs_only(&self) -> String {
+        format!(
+            "{PLAIN_OPEN}{}{}true || exit 1\n{}}}\n",
+            self.ready(),
+            self.checks,
+            self.dirs
+        )
+    }
+
+    /// An attrs-only fix's: DEST's bytes stay; its owner and group go back,
+    /// after its mode is narrowed to its owner's bits so that neither
+    /// briefly gets access, then its mode. As root a failed `chown` puts the
+    /// mode back and fails; as the user only the group can go back, and a
+    /// group or owner that cannot is a warning. It prints what it restored.
+    fn attrs(&self, previous: &PreviousFile) -> String {
+        let (d, sudo) = (quote(self.dest), self.sudo);
+        let ids = format!("{}:{}", previous.uid, previous.gid);
+        let all = quote("owner, group and ");
+        let (own, chmod) = if self.as_root {
+            let failed = quote(&format!(
+                "files: cannot give {} owner and group {ids}",
+                self.dest
+            ));
+            let own = format!(
+                "anvil_what={all}\n\
+                 if [ \"$3:$4\" != {ids} ]; then {sudo}chmod go= {d} || exit 1\n\
+                 {sudo}chown {ids} {d} || {{ {sudo}chmod \"$anvil_was\" {d}; echo {failed} >&2; exit 1; }}\n\
+                 fi\n"
+            );
+            (
+                own,
+                format!("{sudo}chmod {} {d} || exit 1\n", previous.mode),
+            )
+        } else {
+            let warning = quote(&format!(
+                "files: {} was owned by {ids}; only root can give it back",
+                self.dest
+            ));
+            // A group that did not go back never gets the recorded mode's
+            // group bits, not even for a moment: one chmod without them.
+            let mode = &previous.mode;
+            let at = mode.len().saturating_sub(2);
+            let masked = format!("{}0{}", &mode[..at], &mode[at + 1..]);
+            let chmod = format!(
+                "if [ -n \"$anvil_g\" ]; then chmod {mode} {d}; else chmod {masked} {d}; fi || exit 1\n"
+            );
+            let own = format!(
+                "anvil_g=1\n\
+                 if [ \"$4\" != {gid} ]; then chmod go= {d} || exit 1\n\
+                 chgrp {gid} {d} 2>/dev/null || anvil_g=\n\
+                 fi\n\
+                 if [ \"$3\" = {uid} ] && [ -n \"$anvil_g\" ]; then anvil_what={all}\n\
+                 else echo {warning} >&2; anvil_what=${{anvil_g:+'group and '}}; fi\n",
+                uid = previous.uid,
+                gid = previous.gid,
+            );
+            (own, chmod)
+        };
+        format!(
+            "{}if [ -n \"$anvil_same\" ]; then echo {unchanged}\n\
+             else\n{OCTAL}anvil_line=$({sudo}ls -lLdn {d}) || exit 1\n\
+             set -- $anvil_line\n\
+             anvil_was=$(anvil_octal \"$1\")\n\
+             {own}{chmod}\
+             printf 'restored %smode of %s\\n' \"$anvil_what\" {d}\n\
+             fi\n{after}}}\n",
+            *self.head(PLAIN_OPEN),
+            unchanged = quote(&format!("unchanged {}", self.dest)),
+            after = self.after(),
+        )
     }
 
     /// As the user, a warning when DEST's owner is not the recorded one;
@@ -1758,10 +1964,11 @@ impl Restore<'_> {
         Ok(zeroizing(format_args!(
             "{}if [ -n \"$anvil_same\" ]; then {warning}{same}anvil_mode && echo {unchanged}\n\
              else {replace}fi\n\
-             }}\n",
+             {after}}}\n",
             *self.head(&write.open()),
             same = self.same_owner(previous),
             replace = write.replace(&format!("{warning}echo {restored}")),
+            after = self.after(),
         )))
     }
 
@@ -1791,8 +1998,9 @@ impl Restore<'_> {
         format!(
             "{}if [ -n \"$anvil_same\" ]; then echo {unchanged}\n\
              else {sudo}rm -f {d} && echo {removed}; fi\n\
-             }}\n",
-            *self.head("{ umask 077; LC_ALL=C; export LC_ALL; set -f\n")
+             {}}}\n",
+            *self.head(PLAIN_OPEN),
+            self.after(),
         )
     }
 }
@@ -1849,6 +2057,7 @@ mod tests {
             password: false,
             rendered: None,
             ids: None,
+            mark: WalkNonce::attrs().unwrap(),
         }
     }
 
@@ -4039,7 +4248,7 @@ mod tests {
 
     /// Runs `script` with `/bin/sh -s`; its exit code and stdout.
     fn sh(script: &str) -> (Option<i32>, String) {
-        let out = Local.run(script, RUN_TIMEOUT).unwrap();
+        let out = unmarked(Local.run(script, RUN_TIMEOUT).unwrap());
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.is_empty(), "{stderr}");
         (out.code, String::from_utf8(out.stdout).unwrap())
@@ -4222,7 +4431,20 @@ mod tests {
             "PATH",
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         );
-        crate::transport::run_with_script(&mut command, script, RUN_TIMEOUT).unwrap()
+        unmarked(crate::transport::run_with_script(&mut command, script, RUN_TIMEOUT).unwrap())
+    }
+
+    /// `out` without the write's attrs line, which [`written_attrs`] tests.
+    ///
+    /// [`written_attrs`]: FileWrite::written_attrs
+    fn unmarked(mut out: crate::transport::Output) -> crate::transport::Output {
+        let lines = out.stdout.split_inclusive(|&b| b == b'\n');
+        out.stdout = lines
+            .filter(|line| !line.starts_with(b"anvil-attrs-"))
+            .flatten()
+            .copied()
+            .collect();
+        out
     }
 
     /// [`checks`] as [`root_checks`] builds them, but over the directories
@@ -4563,6 +4785,7 @@ mod tests {
             checks: "",
             as_root: true,
             guard: restore_guard("sudo -n ", &file, false, Wording::Cli),
+            dirs: String::new(),
         };
         let out = sh_with(&bin, &restore.remove(&format!("removed {d}")));
         assert_eq!(out.code, Some(CONFLICT));
@@ -4666,6 +4889,7 @@ mod tests {
             checks: "",
             as_root: true,
             guard: restore_guard("sudo -n ", &file, false, Wording::Cli),
+            dirs: String::new(),
         };
         let out = sh_with(&bin, &restore.remove(&format!("removed {d}")));
         let stderr = String::from_utf8(out.stderr).unwrap();
@@ -5252,7 +5476,7 @@ mod tests {
     fn sh_only(bin: &Path, script: &str) -> crate::transport::Output {
         let mut command = std::process::Command::new("/bin/sh");
         command.arg("-s").env("PATH", bin);
-        crate::transport::run_with_script(&mut command, script, RUN_TIMEOUT).unwrap()
+        unmarked(crate::transport::run_with_script(&mut command, script, RUN_TIMEOUT).unwrap())
     }
 
     const BASE: [&str; 4] = ["ls", "sh", "readlink", "tr"];
@@ -5847,6 +6071,8 @@ mod tests {
             written_sha256: sha_hex(written.as_bytes()),
             write,
             previous,
+            written_attrs: None,
+            created_dirs: Vec::new(),
         }
     }
 
@@ -5922,6 +6148,350 @@ mod tests {
             0o640,
             "the mode comes back also when unchanged"
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The attrs of `path` now, as the record keeps them.
+    fn attrs_of(path: &Path) -> Attrs {
+        let (uid, gid) = ids(path);
+        Attrs {
+            uid,
+            gid,
+            mode: format!("{:04o}", mode(path)),
+        }
+    }
+
+    /// An attrs-only fix of `dest`, which holds `text`, from `mode`: its
+    /// text was not kept, as a 0640 file's is not.
+    fn attrs_fixed(dest: &Path, text: &str, mode: &str) -> FileRecord {
+        let (uid, gid) = ids(dest);
+        FileRecord {
+            written_attrs: Some(attrs_of(dest)),
+            ..recorded(
+                dest,
+                text,
+                Write::Written,
+                Previous::File(PreviousFile {
+                    mode: mode.to_owned(),
+                    uid,
+                    gid,
+                    sha256: sha_hex(text.as_bytes()),
+                    kept: false,
+                    text: None,
+                    reason: Some(NOT_WORLD_READABLE.to_owned()),
+                }),
+            )
+        }
+    }
+
+    #[test]
+    fn an_attrs_only_fix_puts_the_mode_back_without_any_text() {
+        let dir = dir("files-restore-attrs");
+        let dest = dir.join("conf");
+        fs::write(&dest, "v1\n").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
+        let file = attrs_fixed(&dest, "v1\n", "0640");
+        assert_eq!(file.not_kept(), None);
+        let d = dest.display();
+        assert_eq!(
+            restore(std::slice::from_ref(&file), &Force::None),
+            [ok(format!("restored owner, group and mode of {d}\n"))]
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "v1\n");
+        assert_eq!(mode(&dest), 0o640);
+        assert_eq!(
+            restore(&[file], &Force::None),
+            [ok(format!("unchanged {d}\n"))]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn as_the_user_an_attrs_only_restore_gives_back_the_group_and_names_what_it_restored() {
+        let dir = dir("files-restore-attrs-user");
+        let dest = dir.join("conf");
+        let d = dest.display().to_string();
+        let (uid, gid) = ids(&dir);
+        let text = text_of(std::process::Command::new("id").arg("-G"));
+        let mine: Vec<u32> = text
+            .split_whitespace()
+            .filter_map(|g| g.parse().ok())
+            .collect();
+        let stranger = (60000..65000).find(|g| !mine.contains(g)).unwrap();
+        let warning =
+            |ids: String| format!("files: {d} was owned by {ids}; only root can give it back\n");
+        let fixed_from = |uid: u32, gid: u32| {
+            // Anew, so that it has the directory's group again.
+            let _ = fs::remove_file(&dest);
+            fs::write(&dest, "v1\n").unwrap();
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
+            let mut file = attrs_fixed(&dest, "v1\n", "0640");
+            let Previous::File(previous) = &mut file.previous else {
+                unreachable!()
+            };
+            (previous.uid, previous.gid) = (uid, gid);
+            file
+        };
+        // A group of the user's goes back.
+        if let Some(&other) = mine.iter().find(|&&g| g != gid) {
+            let file = fixed_from(uid, other);
+            assert_eq!(
+                restore(&[file], &Force::None),
+                [ok(format!("restored owner, group and mode of {d}\n"))]
+            );
+            assert_eq!(ids(&dest), (uid, other));
+            assert_eq!(mode(&dest), 0o640);
+        }
+        // One that is not, or another owner, only root can give back.
+        let file = fixed_from(uid, stranger);
+        assert_eq!(
+            restore(&[file], &Force::None),
+            [(
+                Some(0),
+                format!("restored mode of {d}\n"),
+                warning(format!("{uid}:{stranger}"))
+            )]
+        );
+        // The group it kept does not get the recorded mode's group bits.
+        assert_eq!(mode(&dest), 0o600);
+        let file = fixed_from(uid + 1, gid);
+        assert_eq!(
+            restore(&[file], &Force::None),
+            [(
+                Some(0),
+                format!("restored group and mode of {d}\n"),
+                warning(format!("{}:{gid}", uid + 1))
+            )]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn as_root_a_failed_chown_puts_the_mode_back_and_fails() {
+        let (dir, bin, dest) = write_case("files-restore-attrs-chown", &[("chown", "exit 1")]);
+        fs::write(&dest, "v1\n").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut file = attrs_fixed(&dest, "v1\n", "0640");
+        let Previous::File(previous) = &mut file.previous else {
+            unreachable!()
+        };
+        previous.gid += 1;
+        let Previous::File(previous) = &file.previous else {
+            unreachable!()
+        };
+        let restore = Restore {
+            dest: &file.dest,
+            sudo: "sudo -n ",
+            checks: "",
+            as_root: true,
+            guard: restore_guard("sudo -n ", &file, false, Wording::Cli),
+            dirs: String::new(),
+        };
+        let out = sh_with(&bin, &restore.attrs(previous));
+        assert_eq!(out.code, Some(1));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!(
+                "files: cannot give {} owner and group {}:{}\n",
+                dest.display(),
+                previous.uid,
+                previous.gid
+            )
+        );
+        assert_eq!(mode(&dest), 0o644, "the mode put back");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attrs_changed_since_the_apply_refuse_the_restore_unless_forced() {
+        let dir = dir("files-restore-attrs-guard");
+        let dest = dir.join("conf");
+        let d = dest.display();
+        let changed = format!(
+            "files: {d} changed since the last apply; anvil rollback --force {d} restores it anyway\n"
+        );
+        fs::write(&dest, "v1\n").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o640)).unwrap();
+        let content = FileRecord {
+            written_attrs: Some(attrs_of(&dest)),
+            ..recorded(
+                &dest,
+                "v1\n",
+                Write::Written,
+                kept_file("v0\n", "0600", &dir),
+            )
+        };
+        let fix = attrs_fixed(&dest, "v1\n", "0600");
+        for file in [content, fix] {
+            fs::write(&dest, "v1\n").unwrap();
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                restore(std::slice::from_ref(&file), &Force::None),
+                [(Some(CONFLICT), String::new(), changed.clone())],
+                "{file:?}"
+            );
+            assert_eq!(mode(&dest), 0o644, "untouched");
+            let [(code, _, stderr)] = &restore(&[file], &Force::All)[..] else {
+                panic!("one run")
+            };
+            assert_eq!((code, stderr.as_str()), (&Some(0), ""));
+            assert_eq!(mode(&dest), 0o600);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_rollback_removes_the_dirs_the_write_created_deepest_first() {
+        let dir = dir("files-restore-dirs");
+        let (a, b) = (dir.join("a"), dir.join("a/b"));
+        fs::create_dir_all(&b).unwrap();
+        let dest = b.join("conf");
+        fs::write(&dest, "v1\n").unwrap();
+        let file = FileRecord {
+            created_dirs: [&a, &b].map(|p| p.display().to_string()).to_vec(),
+            ..recorded(&dest, "v1\n", Write::Written, Previous::Absent)
+        };
+        let top = dir.as_path();
+        let run = |file: &FileRecord| {
+            let runs = restore_runs_from(
+                top,
+                &Config::default(),
+                &host(&[], None),
+                &user_facts("nopasswd"),
+                std::slice::from_ref(file),
+                &Force::None,
+                Wording::Cli,
+            )
+            .unwrap();
+            let out = Local.run(&runs[0].run, RUN_TIMEOUT).unwrap();
+            (
+                out.code,
+                String::from_utf8(out.stdout).unwrap(),
+                String::from_utf8(out.stderr).unwrap(),
+            )
+        };
+        let (d, a_, b_) = (dest.display(), a.display(), b.display());
+        assert_eq!(
+            run(&file),
+            ok(format!(
+                "removed {d}\nremoved directory {b_}\nremoved directory {a_}\n"
+            ))
+        );
+        assert!(!a.exists());
+
+        // Someone else's file keeps its directory, and those above it.
+        fs::create_dir_all(&b).unwrap();
+        fs::write(&dest, "v1\n").unwrap();
+        fs::write(a.join("theirs"), "").unwrap();
+        assert_eq!(
+            run(&file),
+            (
+                Some(0),
+                format!("removed {d}\nremoved directory {b_}\n"),
+                format!("rollback: {a_} is not empty; left in place\n")
+            )
+        );
+        assert!(a.join("theirs").exists() && !b.exists());
+
+        // A refused write only removes the dirs it created.
+        fs::remove_file(a.join("theirs")).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let refused = FileRecord {
+            write: Write::Refused,
+            ..file.clone()
+        };
+        assert_eq!(
+            run(&refused),
+            ok(format!("removed directory {b_}\nremoved directory {a_}\n"))
+        );
+        assert!(!a.exists());
+
+        // A created directory others may now write fails the checks of the
+        // ones below it: nothing is removed through it.
+        fs::create_dir_all(&b).unwrap();
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o777)).unwrap();
+        let (code, stdout, stderr) = run(&refused);
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!((code, stdout.as_str()), (Some(1), ""));
+        assert!(
+            stderr.starts_with(&format!(
+                "files: {a_} is not owned by root or the login user"
+            )),
+            "{stderr}"
+        );
+        assert!(b.exists());
+        fs::remove_dir(&b).unwrap();
+        fs::remove_dir(&a).unwrap();
+
+        // An empty one that cannot go is not called "not empty".
+        let only_b = FileRecord {
+            created_dirs: vec![b.display().to_string()],
+            ..refused
+        };
+        fs::create_dir_all(&b).unwrap();
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o555)).unwrap();
+        let (code, stdout, stderr) = run(&only_b);
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).unwrap();
+        if ids(&dir).0 != 0 {
+            assert_eq!((code, stdout.as_str()), (Some(0), ""));
+            assert!(
+                stderr.starts_with(&format!("rollback: cannot remove {b_}: "))
+                    && stderr.contains("rmdir"),
+                "{stderr}"
+            );
+            assert!(b.exists());
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_marks_the_owner_group_and_mode_it_left() {
+        let dir = dir("files-written-attrs");
+        let dest = dir.join("conf");
+        let step = plain(dest.to_str().unwrap(), "0640", "", "", false);
+        let heredoc = Heredoc::new("new\n").unwrap();
+        for _ in ["wrote", "unchanged"] {
+            let script = super::tee_script(&heredoc, &step, &Expected::Unchecked).unwrap();
+            let mut out = Local.run(&script, RUN_TIMEOUT).unwrap();
+            assert_eq!(
+                out.code,
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(step.written_attrs(&mut out), Some(attrs_of(&dest)));
+            assert!(
+                !String::from_utf8(out.stdout)
+                    .unwrap()
+                    .contains("anvil-attrs-"),
+                "taken out"
+            );
+        }
+        assert_eq!(attrs_of(&dest).mode, "0640");
+
+        let line = |ls: &str| crate::transport::Output {
+            stdout: format!("motd\n{} {ls}\r\nwrote x\n", step.mark.as_str()).into_bytes(),
+            ..Local.run("true", RUN_TIMEOUT).unwrap()
+        };
+        let mut out = line("-rw-r----- 1 0 5 4 Jan 1 00:00 /x");
+        assert_eq!(
+            step.written_attrs(&mut out),
+            Some(Attrs {
+                uid: 0,
+                gid: 5,
+                mode: "0640".to_owned()
+            })
+        );
+        assert_eq!(out.stdout, b"motd\nwrote x\n");
+        for bad in ["drwxr-xr-x 1 0 0 4 Jan 1 00:00 /x", "garbage"] {
+            assert_eq!(step.written_attrs(&mut line(bad)), None, "{bad}");
+        }
+        let other = WalkNonce::attrs().unwrap();
+        let mut forged = crate::transport::Output {
+            stdout: format!("{} -rw-r--r-- 1 0 0 4 x /x\n", other.as_str()).into_bytes(),
+            ..Local.run("true", RUN_TIMEOUT).unwrap()
+        };
+        assert_eq!(step.written_attrs(&mut forged), None, "another nonce");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -6141,6 +6711,7 @@ mod tests {
             checks: &checks,
             as_root: true,
             guard: restore_guard(sudo, file, false, Wording::Cli),
+            dirs: String::new(),
         };
         match &file.previous {
             Previous::File(previous) => {
@@ -6311,6 +6882,7 @@ mod tests {
             checks: &checks,
             as_root: true,
             guard: restore_guard("sudo ", &file, false, Wording::Cli),
+            dirs: String::new(),
         };
         let Previous::File(previous) = &file.previous else {
             unreachable!()

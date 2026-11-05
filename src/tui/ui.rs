@@ -2607,7 +2607,7 @@ mod tests {
 
     #[test]
     fn a_templated_file_shows_its_rendered_size_and_sha256_under_its_would_line() {
-        use anvil::files::{FileWrite, Rendered, Walk};
+        use anvil::files::{FileWrite, Rendered, Walk, WalkNonce};
         use anvil::plan::PlanReport;
         use anvil::step::{FileRun, PlannedRun, RunKind};
         use anvil::transport::RUN_TIMEOUT;
@@ -2637,6 +2637,7 @@ mod tests {
                         password: false,
                         rendered: rendered.map(Box::new),
                         ids: None,
+                        mark: WalkNonce::generate().unwrap(),
                     }),
                 },
             },

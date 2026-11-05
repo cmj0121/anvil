@@ -5,9 +5,12 @@
 //! Each target is probed first, and refused when it is no longer the host
 //! the record is from (its machine-id when both sides have one, else its
 //! short hostname), unless `--allow-host-change`. Then each recorded file
-//! is restored or removed, last written first, by [`files::restore_runs`],
-//! whose guard refuses a dest changed since the apply unless `--force DEST`
-//! or `--force-all`; the steps that cannot be undone are listed as skips.
+//! is restored or removed, last written first, by [`files::restore_runs`]
+//! (only its owner, group and mode after an attrs-only fix), and the
+//! directories its write created are removed when empty; the guard refuses
+//! a dest changed since the apply, its owner, group and mode included,
+//! unless `--force DEST` or `--force-all`; the steps that cannot be undone
+//! are listed as skips.
 //! Before any of it, each recorded dest must still be a `[[files]]` dest of
 //! the config with the same `sudo`, so that a record edited by hand cannot
 //! make rollback write, perhaps as root, a path the config never names. The
@@ -38,7 +41,7 @@ use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, escape_invisible};
 use crate::options::{Options, Output};
 use crate::prepared::Prepared;
-use crate::record::{self, Previous, Record, RolledBack, Session, TargetRecord};
+use crate::record::{self, Previous, Record, RolledBack, Session, TargetRecord, Write};
 use crate::report::{
     self, Escape, Line, NotRestored, Progress, Report, StepReport, Style, TargetReport, print_lines,
 };
@@ -369,7 +372,13 @@ fn roll_back(
             report.warn(format!("not restored: {} ({reason})", file.dest));
         }
     }
-    let dests = restored(report.steps());
+    // A refused write's step only removed the directories it created.
+    let dests: Vec<String> = restored(report.steps())
+        .into_iter()
+        .filter(|dest| {
+            (entry.files.iter()).any(|file| &file.dest == dest && file.write != Write::Refused)
+        })
+        .collect();
     let queued = queued(config, expanded, target, &entry.facts, &dests);
     for name in &queued {
         report.warn(format!("pending handler {name} queued for the next apply"));
@@ -425,7 +434,8 @@ fn restored(steps: &[StepReport]) -> Vec<String> {
 /// Refuses `entry` unless each of its files is the dest of a file item of
 /// `expanded` with the same `sudo` that applies to `target` (its
 /// tags, and its facts when `facts` is given) and, for a file whose text
-/// the record keeps, does not say `rollback = false`. The record is only a
+/// the record keeps, does not say `rollback = false`, and for a file with
+/// created directories says `parents = true`. The record is only a
 /// file the user owns, and must not choose what rollback writes, or as whom.
 fn check_files(
     expanded: &Expanded,
@@ -462,6 +472,11 @@ fn check_files(
             return refuse(format!(
                 "no {entry_word} for {dest} applies to {}",
                 target.name
+            ));
+        }
+        if !file.created_dirs.is_empty() && !same().any(|(item, f)| selected(item) && f.parents) {
+            return refuse(format!(
+                "{dest} has directories created for it in the record but no parents = true in {section}"
             ));
         }
         let kept = matches!(&file.previous, Previous::File(p) if p.kept || p.text.is_some());
@@ -547,17 +562,26 @@ fn would(entry: Option<&TargetRecord>) -> Vec<String> {
     let Some(entry) = entry else {
         return vec![NOTHING.to_owned()];
     };
-    let files = entry
-        .files
-        .iter()
-        .rev()
-        .map(|file| match (file.not_kept(), &file.previous) {
-            (Some(reason), _) => format!("cannot undo: {} ({reason})", file.dest),
-            (None, Previous::File(_)) => format!("would restore {}", file.dest),
+    let files = entry.files.iter().rev().flat_map(|file| {
+        let dest = match (file.not_kept(), &file.previous) {
+            _ if file.write == Write::Refused => None,
+            (Some(reason), _) => Some(format!("cannot undo: {} ({reason})", file.dest)),
+            _ if file.attrs_only() => Some(format!(
+                "would restore owner, group and mode of {}",
+                file.dest
+            )),
+            (None, Previous::File(_)) => Some(format!("would restore {}", file.dest)),
             (None, Previous::Absent | Previous::Dangling { .. }) => {
-                format!("would remove {}", file.dest)
+                Some(format!("would remove {}", file.dest))
             }
-        });
+        };
+        let dirs = match file.not_kept() {
+            Some(_) => Vec::new(),
+            None => file.dirs_deepest_first(),
+        };
+        let dirs = (dirs.into_iter()).map(|dir| format!("would remove directory {dir} when empty"));
+        dest.into_iter().chain(dirs)
+    });
     let rest = entry
         .cannot_undo
         .iter()
@@ -740,6 +764,8 @@ mod tests {
             written_sha256: "a".repeat(64),
             write: Write::Written,
             previous,
+            written_attrs: None,
+            created_dirs: Vec::new(),
         }
     }
 
@@ -982,6 +1008,24 @@ mod tests {
     }
 
     #[test]
+    fn created_dirs_need_parents_in_the_config() {
+        let web1 = web1();
+        let mut entry = entry();
+        entry.files[1].created_dirs = vec!["/etc".to_owned()];
+        let mut config = files_config(&["/etc/a", "/etc/b", "/etc/c"]);
+        assert_eq!(
+            check_files(&config, &web1, None, &entry),
+            Err(
+                "rollback: /etc/b has directories created for it in the record \
+                 but no parents = true in [[files]]; refusing to restore it"
+                    .to_owned()
+            )
+        );
+        config.files[1].parents = true;
+        assert_eq!(check_files(&config, &web1, None, &entry), Ok(()));
+    }
+
+    #[test]
     fn the_files_entry_must_apply_to_the_target() {
         let web1 = web1();
         let arch = facts(&[("hostname", "web1"), ("distro", "arch")]);
@@ -1118,6 +1162,8 @@ mod tests {
                 text: rollback.then(|| "old".to_owned().into()),
                 reason: (!rollback).then(|| record::NO_ROLLBACK.to_owned()),
             }),
+            written_attrs: None,
+            created_dirs: Vec::new(),
         };
         // A dest any applying write keeps hash-only is hash-only from the first.
         let mut record = write(first.0, first.1 && later.1);

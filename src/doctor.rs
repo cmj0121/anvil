@@ -497,6 +497,7 @@ impl DoctorRun {
         let (Ok(record), Some(key)) = (record, key) else {
             return None;
         };
+        let record = record.map(Record::without_refused);
         let view = record.as_ref().map(Record::audit_view).unwrap_or_default();
         Some(DoctorRun {
             pins,
@@ -1957,6 +1958,8 @@ mod tests {
                 written_sha256: X_SHA.to_owned(),
                 write: record::Write::Written,
                 previous: record::Previous::Absent,
+                written_attrs: None,
+                created_dirs: Vec::new(),
             })
             .collect();
         Record {

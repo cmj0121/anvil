@@ -3849,6 +3849,8 @@ mod tests {
                 written_sha256: sha256_hex(FILE_TEXT),
                 write: record::Write::Written,
                 previous: record::Previous::Absent,
+                written_attrs: None,
+                created_dirs: Vec::new(),
             }]
         );
     }

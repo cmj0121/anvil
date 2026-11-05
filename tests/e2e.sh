@@ -795,6 +795,58 @@ else
   fail "rollback over a 0600 previous: exit $code"
 fi
 
+step "(o) rollback on arch puts back an owner and group fixed in place and removes the directories parents created"
+AR_STATE="$TMP/state-attrs"
+AR_RECORD="$AR_STATE/anvil/last-apply.json"
+AR_DIR="$TMP/rollback-attrs"
+mkdir -p "$AR_DIR"
+printf 'managed = "anvil-e2e-rb-attrs"\n' >"$AR_DIR/a.conf"
+cat >"$AR_DIR/config.toml" <<CONF
+[[files]]
+src = "a.conf"
+dest = "/etc/anvil-e2e-rb-attrs"
+mode = "0640"
+owner = "pw"
+group = "key"
+
+[[files]]
+src = "a.conf"
+dest = "/etc/anvil-e2e-rb-p/a/b/file"
+mode = "0644"
+parents = true
+CONF
+ar_anvil() {
+  run_env XDG_STATE_HOME="$AR_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$AR_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+# The bytes are already there, root:root 0640, so no text is kept: the apply
+# only fixes the owner and group.
+docker exec -i "$NAME" sh -c 'rm -rf /etc/anvil-e2e-rb-p && cat >/etc/anvil-e2e-rb-attrs \
+  && chown root:root /etc/anvil-e2e-rb-attrs && chmod 640 /etc/anvil-e2e-rb-attrs' <"$AR_DIR/a.conf"
+ar_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  fixed /etc/anvil-e2e-rb-attrs: owner, group' "$TMP/out" \
+  && grep -qxF '  wrote /etc/anvil-e2e-rb-p/a/b/file' "$TMP/out" \
+  && grep -qF '"version":2' "$AR_RECORD" \
+  && grep -qF '"created_dirs":["/etc/anvil-e2e-rb-p","/etc/anvil-e2e-rb-p/a","/etc/anvil-e2e-rb-p/a/b"]' "$AR_RECORD"; then
+  pass "apply recorded an owner and group fixed in place and the directories it created, record version 2"
+else
+  fail "apply to record attrs and created directories: exit $code"
+fi
+ar_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  restored owner, group and mode of /etc/anvil-e2e-rb-attrs' "$TMP/out" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-rb-attrs)" = '640 root:root' ] \
+  && docker exec "$NAME" cat /etc/anvil-e2e-rb-attrs | cmp -s - "$AR_DIR/a.conf" \
+  && [ "$(grep -F 'removed directory /etc/anvil-e2e-rb-p' "$TMP/out")" = "$(printf '%s\n' \
+    '  removed directory /etc/anvil-e2e-rb-p/a/b' '  removed directory /etc/anvil-e2e-rb-p/a' \
+    '  removed directory /etc/anvil-e2e-rb-p')" ] \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-rb-p && ! grep -qF 'not restored' "$TMP/out"; then
+  pass "rollback gave the 0640 file back root:root without its text and removed the created directories deepest first"
+else
+  fail "rollback of attrs and created directories: exit $code"
+fi
+
 step "(u) a timed-out plain run dies on arch, without timeout(1) there; a step reading stdin ends at once"
 U_DIR="$TMP/remote-kill"
 U_STATE="$TMP/state-u"
