@@ -282,6 +282,7 @@ pub fn run(
                 rendered,
                 ids,
                 mark,
+                parents: entry.parents,
             }
         }
         None => {
@@ -306,6 +307,7 @@ pub fn run(
                 rendered,
                 ids,
                 mark,
+                parents: entry.parents,
             }
         }
     };
@@ -405,6 +407,8 @@ pub struct FileWrite {
     /// What marks the line with DEST's `ls -lLdn` once the write succeeded
     /// ([`FileWrite::written_attrs`]).
     pub mark: WalkNonce,
+    /// The entry's `parents`.
+    pub parents: bool,
 }
 
 /// A write's `owner` and `group`, each by name or numeric id, `None`
@@ -2058,6 +2062,7 @@ mod tests {
             rendered: None,
             ids: None,
             mark: WalkNonce::attrs().unwrap(),
+            parents: false,
         }
     }
 

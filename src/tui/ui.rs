@@ -2638,6 +2638,7 @@ mod tests {
                         rendered: rendered.map(Box::new),
                         ids: None,
                         mark: WalkNonce::generate().unwrap(),
+                        parents: false,
                     }),
                 },
             },

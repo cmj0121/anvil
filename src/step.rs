@@ -216,6 +216,20 @@ impl PlannedRun {
         self.file()?.write.as_ref()?.rendered.as_deref()
     }
 
+    /// A file step's `owner` and `group`, each `None` when unset, and its
+    /// `parents`; all unset for any other step.
+    pub fn attrs(&self) -> (Option<&str>, Option<&str>, bool) {
+        let Some(write) = self.file().and_then(|run| run.write.as_ref()) else {
+            return (None, None, false);
+        };
+        let ids = write.ids.as_ref();
+        (
+            ids.and_then(|ids| ids.owner.as_deref()),
+            ids.and_then(|ids| ids.group.as_deref()),
+            write.parents,
+        )
+    }
+
     pub(crate) fn service(&self) -> Option<&ServiceRun> {
         match &self.kind {
             RunKind::Service { run, .. } => Some(run),
@@ -240,6 +254,12 @@ impl Serialize for PlannedRun {
             #[serde(skip_serializing_if = "Option::is_none")]
             rendered: Option<RenderedShown<'a>>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            owner: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            group: Option<&'a str>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            parents: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
             guards: Option<&'a Guards>,
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             notify: &'a [String],
@@ -254,6 +274,7 @@ impl Serialize for PlannedRun {
             bytes: rendered.text.len(),
             sha256: &rendered.sha256,
         });
+        let (owner, group, parents) = self.attrs();
         Shown {
             run: self.shown(),
             sudo_secret: self.sudo_secret.as_deref(),
@@ -261,6 +282,9 @@ impl Serialize for PlannedRun {
             task: self.task.as_deref(),
             name: self.name.as_deref(),
             rendered,
+            owner,
+            group,
+            parents,
             guards: self.guards(),
             notify: &self.notify,
         }

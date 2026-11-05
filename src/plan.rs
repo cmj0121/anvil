@@ -417,7 +417,7 @@ pub fn run(out: Output, opts: &Options, show_rendered: bool) -> Result<(), Failu
 
 /// One target's block: a `▶ target` header, a `vars.KEY = VALUE (LEVEL)` line
 /// per resolved var and env value, a `PATH  NAME` line per task and a
-/// `would $ command` line per step and a line per guard ([`guard_texts`]), then `✔ N steps`, `✘ reason` or `⊘ cancelled` (or its abort
+/// `would $ command` line per step and a line per guard ([`guard_texts`]) and file attribute ([`attr_texts`]), then `✔ N steps`, `✘ reason` or `⊘ cancelled` (or its abort
 /// reason), then a blank line. A templated file step's would line is followed
 /// by its [`rendered_text`] and, with `show_rendered`, the text itself.
 pub fn render(report: &PlanReport, show_rendered: bool) -> Vec<Line> {
@@ -438,7 +438,7 @@ pub fn render(report: &PlanReport, show_rendered: bool) -> Vec<Line> {
                         .map(|title| Line::out(title, Escape::Always, None)),
                 );
                 lines.push(Line::out(would_text(step), Escape::Always, Some(DIM)));
-                for text in guard_texts(step) {
+                for text in guard_texts(step).into_iter().chain(attr_texts(step)) {
                     lines.push(Line::out(format!("  {text}"), Escape::Always, Some(DIM)));
                 }
                 if !step.notify.is_empty() {
@@ -508,6 +508,20 @@ pub fn guard_texts(step: &PlannedRun) -> Vec<String> {
     ]
     .into_iter()
     .filter_map(|(key, text)| Some(escape_invisible(&format!("{key} {}", text?))))
+    .collect()
+}
+
+/// A file step's `owner NAME`, `group NAME` and `parents`, one line each,
+/// for those it sets; names are validated config text.
+fn attr_texts(step: &PlannedRun) -> Vec<String> {
+    let (owner, group, parents) = step.attrs();
+    [
+        owner.map(|owner| format!("owner {owner}")),
+        group.map(|group| format!("group {group}")),
+        parents.then(|| "parents".to_owned()),
+    ]
+    .into_iter()
+    .flatten()
     .collect()
 }
 

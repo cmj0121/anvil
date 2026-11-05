@@ -277,6 +277,50 @@ fn each_file_is_listed_and_neither_written_nor_shown() {
 }
 
 #[test]
+fn a_file_shows_the_owner_group_and_parents_it_sets() {
+    let sandbox = Sandbox::new("pl");
+    std::fs::write(sandbox.config_dir().join("motd.txt"), "hi\n").unwrap();
+    let owned = sandbox.root().join("new/dir/motd");
+    let owned = owned.display();
+    let plain = sandbox.root().join("plain");
+    let plain = plain.display();
+    let grouped = sandbox.root().join("grouped");
+    let grouped = grouped.display();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"motd.txt\"\ndest = \"{owned}\"\nmode = \"0644\"\nsudo = false\n\
+             owner = \"0\"\ngroup = \"wheel\"\nparents = true\n\n\
+             [[files]]\nsrc = \"motd.txt\"\ndest = \"{plain}\"\nmode = \"0644\"\nsudo = false\n\n\
+             [[files]]\nsrc = \"motd.txt\"\ndest = \"{grouped}\"\nmode = \"0644\"\nsudo = false\n\
+             group = \"staff\"\n"
+        ),
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  would $ file {owned}\n    owner 0\n    group wheel\n    parents\n  \
+             would $ file {plain}\n  would $ file {grouped}\n    group staff\n  \
+             would $ hostname\n  ✔ 4 steps\n\n1 target, nothing executed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"],
+        serde_json::json!([
+            {"run": format!("file {owned}"), "owner": "0", "group": "wheel", "parents": true},
+            {"run": format!("file {plain}")},
+            {"run": format!("file {grouped}"), "group": "staff"},
+            {"run": "hostname"},
+        ])
+    );
+    assert!(!sandbox.root().join("new").exists(), "nothing created");
+}
+
+#[test]
 fn parallel_two_plans_two_hosts_at_once_and_keeps_inventory_order() {
     let sandbox = Sandbox::new("pl");
     sandbox.with_two_fake_hosts();
