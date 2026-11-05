@@ -1065,7 +1065,8 @@ pub(crate) enum Sent {
 
 /// Whether `planned`, which ended with `output` and was not skipped by a
 /// guard, changed something, so that its `notify` fires: a file step that
-/// wrote (a mode-only fix prints `unchanged` too), a service step that
+/// wrote or fixed DEST's owner, group or mode (`unchanged` when nothing
+/// differed), a service step that
 /// printed neither `unchanged service NAME` nor the `reloaded` no-op line, a
 /// run or plugin step that exited 0. Never the package step, a skip or a
 /// failure.
@@ -1077,8 +1078,8 @@ fn changed(planned: &PlannedRun, output: &Output) -> bool {
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
     match &planned.kind {
         RunKind::File { dest, .. } => {
-            let wrote = format!("wrote {dest}");
-            lines.any(|line| line == wrote.as_bytes())
+            let (wrote, fixed) = (format!("wrote {dest}"), format!("fixed {dest}: "));
+            lines.any(|line| line == wrote.as_bytes() || line.starts_with(fixed.as_bytes()))
         }
         RunKind::Service { name, .. } => {
             let unchanged = format!("unchanged service {name}");
@@ -1561,11 +1562,12 @@ mod tests {
             ended(file(), Some(0), "[sudo] x\r\nwrote /etc/a\r\n"),
             "a terminal"
         );
-        assert!(
-            !ended(file(), Some(0), "unchanged /etc/a\n"),
-            "a mode-only fix too"
-        );
+        assert!(ended(file(), Some(0), "fixed /etc/a: mode\n"));
+        assert!(ended(file(), Some(0), "fixed /etc/a: owner, group\r\n"));
+        assert!(!ended(file(), Some(0), "unchanged /etc/a\n"));
         assert!(!ended(file(), Some(0), "wrote /etc/ab\n"));
+        assert!(!ended(file(), Some(0), "fixed /etc/ab: mode\n"));
+        assert!(!ended(file(), Some(1), "fixed /etc/a: mode\n"), "a failure");
         assert!(!ended(file(), Some(1), "wrote /etc/a\n"), "a failure");
 
         let service = || RunKind::Service {

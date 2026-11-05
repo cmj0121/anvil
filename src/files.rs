@@ -614,7 +614,7 @@ pub(crate) fn skip_run(dest: &str, label: String) -> PlannedRun {
 
 /// One run under `umask 077` that first refuses a `sudo` that fails, then runs
 /// `checks`, then refuses a directory DEST, then the guard; when DEST already
-/// holds the bytes, only the mode, else [`Replacement::replace`].
+/// holds the bytes, [`fix_script`], else [`Replacement::replace`].
 fn replace_script(
     write: &Replacement<'_>,
     checks: &str,
@@ -632,21 +632,144 @@ fn replace_script(
             quote(&format!("files: sudo failed; {dest} is unchanged"))
         ),
     };
-    let (unchanged, wrote) = (
-        quote(&format!("unchanged {dest}")),
-        quote(&format!("wrote {dest}")),
-    );
+    let wrote = quote(&format!("wrote {dest}"));
     zeroizing(format_args!(
         "{open}{ready}{checks}{directory} || exit {REFUSED}\n\
-         {owner}{guard}{sweep}if {same}; then anvil_mode && echo {unchanged}\n\
+         {owner}{guard}{sweep}if {same}; then\n{fix}\
          else {replace}fi\n\
          }}\n",
         open = *write.open(),
         owner = ids.map(Ownership::checks).unwrap_or_default(),
         sweep = sweep(sudo, dest),
         same = write.same(),
+        fix = fix_script(write, ids),
         replace = write.replace(&format!("echo {wrote}")),
     ))
+}
+
+/// Defines `anvil_octal LS_MODE`, which prints the `ls -l` mode string
+/// LS_MODE as four octal digits.
+const OCTAL: &str = "anvil_octal() { anvil_s=${1#?}; anvil_v=0; anvil_b=256; anvil_x=2048
+while [ \"$anvil_b\" -gt 0 ]; do anvil_c=${anvil_s%\"${anvil_s#?}\"}; anvil_s=${anvil_s#?}
+case $anvil_c in [rwx]) anvil_v=$((anvil_v + anvil_b)) ;; [st]) anvil_v=$((anvil_v + anvil_b + anvil_x)) ;; \
+[ST]) anvil_v=$((anvil_v + anvil_x)) ;; esac
+case $anvil_b in 64 | 8 | 1) anvil_x=$((anvil_x / 2)) ;; esac
+anvil_b=$((anvil_b / 2)); done
+printf '%04o\\n' \"$anvil_v\"; }
+";
+
+/// The lines for a DEST that already holds the bytes: no temp, and only what
+/// differs from the entry's owner, group and mode is fixed. A new owner or
+/// group goes on after the mode is narrowed to its owner's bits, so that it
+/// never briefly gets access, and the mode is set last; a fix that does not
+/// take fails the run, so it cannot report a change on every run. It prints
+/// `fixed DEST: …` naming what it changed, or `unchanged DEST` and runs
+/// nothing on DEST.
+fn fix_script(write: &Replacement<'_>, ids: Option<&Ownership>) -> String {
+    let (dest, sudo) = (write.dest, write.sudo);
+    let d = quote(dest);
+    let want = format!("{:0>4}", write.mode);
+    let (owner, group) = ids.map_or((None, None), |ids| {
+        (ids.owner.as_deref(), ids.group.as_deref())
+    });
+    let numeric = |id: &str| id.bytes().all(|b| b.is_ascii_digit());
+    let unread = format!(
+        "{{ echo {} >&2; exit 1; }}",
+        quote(&format!(
+            "files: cannot read {dest}'s owner, group and mode"
+        ))
+    );
+    let wanted_uid = match owner {
+        None => String::new(),
+        Some(owner) if numeric(owner) => format!("anvil_uid={owner}\n"),
+        Some(owner) => format!(
+            "anvil_uid=$(id -u {}) || {}\n",
+            quote(owner),
+            refused(&format!(
+                "files: owner {owner} does not exist on the target"
+            ))
+        ),
+    };
+    let owner_cmp = match owner {
+        None => "",
+        Some(_) => "[ \"$3\" -eq \"$anvil_uid\" ] 2>/dev/null || anvil_o=owner\n",
+    };
+    // A name goes through `find -group`, as `ls -l` may cut it short.
+    let group_cmp = match group {
+        None => String::new(),
+        Some(group) if numeric(group) => {
+            format!("[ \"$4\" -eq {group} ] 2>/dev/null || anvil_g=group\n")
+        }
+        Some(group) => format!(
+            "[ -n \"$({sudo}find {d} -prune -group {} 2>/dev/null)\" ] || anvil_g=group\n",
+            quote(group)
+        ),
+    };
+    let user = ids.and_then(|ids| ids.user.as_ref());
+    let give = match (owner, group) {
+        (Some(o), Some(g)) => Some(format!(
+            "if [ -n \"$anvil_o\" ] && [ -n \"$anvil_g\" ]; then {sudo}chown {og} {d}; \
+             elif [ -n \"$anvil_o\" ]; then {sudo}chown {o} {d}; else {sudo}chgrp {g} {d}; fi",
+            og = quote(&format!("{o}:{g}")),
+            o = quote(o),
+            g = quote(g),
+        )),
+        (Some(o), None) => Some(format!("{sudo}chown {} {d}", quote(o))),
+        (None, Some(g)) => Some(format!("{sudo}chgrp {} {d}", quote(g))),
+        (None, None) => None,
+    };
+    let own = give.map_or_else(String::new, |give| {
+        let foreign = refused(&format!(
+            "files: {dest} cannot be given mode {}: only its owner can chmod it",
+            write.mode
+        ));
+        let no_owner = owner.map(|o| refused(&format!("files: cannot give {dest} owner {o}")));
+        let no_group = group.map(|g| {
+            refused(&match user {
+                Some((_, user)) => format!("files: group {g} is not one of {user}'s groups"),
+                None => format!("files: group {g} does not exist on the target"),
+            })
+        });
+        let why = match (no_owner, no_group) {
+            (Some(o), Some(g)) => format!("if [ -n \"$anvil_g\" ]; then {g}; else {o}; fi"),
+            (o, g) => o.or(g).expect("an owner or a group"),
+        };
+        let not_mine = match (owner, user) {
+            (Some(o), Some((label, user))) => format!(
+                "[ -z \"$anvil_o\" ] || {}\n",
+                refused(&format!(
+                    "{label}.owner {o}: needs sudo; the login user is {user}"
+                ))
+            ),
+            _ => String::new(),
+        };
+        format!(
+            "if [ -n \"$anvil_o$anvil_g\" ]; then\n{not_mine}\
+             {sudo}chmod go= {d} 2>/dev/null || {foreign}\n\
+             {{ {give}; }} 2>/dev/null || {{ {sudo}chmod \"$anvil_was\" {d} 2>/dev/null; {why}; }}\n\
+             fi\n"
+        )
+    });
+    format!(
+        "{OCTAL}{wanted_uid}\
+         anvil_attrs() {{ anvil_line=$({sudo}ls -lLdn {d}) || return 1\nset -- $anvil_line\n\
+         anvil_now=\"$3:$4 $(anvil_octal \"$1\")\"; anvil_o=; anvil_g=; anvil_m=\n\
+         {owner_cmp}{group_cmp}[ \"${{anvil_now#* }}\" = {want} ] || anvil_m=mode; }}\n\
+         anvil_attrs || {unread}\n\
+         anvil_was=${{anvil_now#* }}; anvil_what=$anvil_o\n\
+         [ -z \"$anvil_g\" ] || anvil_what=${{anvil_what:+$anvil_what, }}group\n\
+         [ -z \"$anvil_m\" ] || anvil_what=${{anvil_what:+$anvil_what, }}mode\n\
+         if [ -z \"$anvil_what\" ]; then echo {unchanged}\n\
+         else\n\
+         {own}anvil_mode || exit 1\n\
+         anvil_attrs || {unread}\n\
+         [ -z \"$anvil_o$anvil_g$anvil_m\" ] || {{ printf 'files: %s: owner, group or mode did not take (now %s)\\n' \
+         {d} \"$anvil_now\" >&2; exit 1; }}\n\
+         printf '%s%s\\n' {fixed} \"$anvil_what\"\n\
+         fi\n",
+        unchanged = quote(&format!("unchanged {dest}")),
+        fixed = quote(&format!("fixed {dest}: ")),
+    )
 }
 
 /// The plain run: a root target, a `sudo = false` entry, or `sudo -n`.
@@ -3187,6 +3310,286 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn octal_reads_each_ls_mode_with_its_special_bits() {
+        for (ls, octal) in [
+            ("-rw-r--r--", "0644"),
+            ("-rw-r-----+", "0640"),
+            ("-rwsr-sr-t", "7755"),
+            ("-rwSr-S--T", "7640"),
+            ("----------", "0000"),
+            ("-rwxrwxrwx@", "0777"),
+        ] {
+            let script = format!("{OCTAL}anvil_octal {}\n", quote(ls));
+            assert_eq!(sh(&script), (Some(0), format!("{octal}\n")), "{ls}");
+        }
+    }
+
+    /// [`write_case`] with `dest` already holding the bytes [`owning`]
+    /// writes, in `mode`, and chown, chgrp and chmod logged.
+    fn same_case(tag: &str, mode: u32, more: &[(&str, &str)]) -> (PathBuf, PathBuf, PathBuf) {
+        let tools = [
+            ("chown", logging("chown")),
+            ("chgrp", logging("chgrp")),
+            ("chmod", logging("chmod")),
+        ];
+        let tools: Vec<(&str, &str)> = tools.iter().map(|(t, b)| (*t, b.as_str())).collect();
+        let (dir, bin, dest) = write_case(tag, &[tools.as_slice(), more].concat());
+        fs::write(&dest, "new\n").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(mode)).unwrap();
+        (dir, bin, dest)
+    }
+
+    #[test]
+    fn the_same_bytes_and_attributes_run_nothing_on_dest_and_make_no_temp() {
+        let (uid, _) = own_ids();
+        let (dir, bin, dest) = same_case("files-same", 0o640, &[]);
+        let gid_now = fs::metadata(&dest).unwrap().gid().to_string();
+        let d = dest.to_str().unwrap();
+        let log = dir.join("log");
+        for script in [
+            replacing(&dest, ""),
+            replacing(&dest, "sudo -n "),
+            owning(&dest, "sudo -n ", (Some(&uid), Some(&gid_now)), None),
+            owning(&dest, "", (None, Some(&gid_now)), Some("me")),
+        ] {
+            let parent = fs::metadata(dest.parent().unwrap()).unwrap().mtime_nsec();
+            let ctime = fs::metadata(&dest).unwrap().ctime_nsec();
+            let out = sh_with(&bin, &logged_to(&log, &script));
+            assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+            assert_eq!(
+                (out.code, String::from_utf8(out.stdout).unwrap()),
+                (Some(0), format!("unchanged {d}\n"))
+            );
+            assert!(!log.exists(), "{}", fs::read_to_string(&log).unwrap());
+            assert_eq!(fs::metadata(&dest).unwrap().ctime_nsec(), ctime);
+            assert_eq!(
+                fs::metadata(dest.parent().unwrap()).unwrap().mtime_nsec(),
+                parent,
+                "no temp beside it"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mode_drift_with_the_same_bytes_is_only_a_chmod() {
+        let (dir, bin, dest) = same_case("files-same-mode", 0o664, &[]);
+        let d = dest.to_str().unwrap();
+        let log = dir.join("log");
+        let out = sh_with(&bin, &logged_to(&log, &replacing(&dest, "sudo -n ")));
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+        assert_eq!(
+            (out.code, String::from_utf8(out.stdout).unwrap()),
+            (Some(0), format!("fixed {d}: mode\n"))
+        );
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            format!("chmod 0640 {d} \n")
+        );
+        assert_eq!(mode(&dest), 0o640);
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A group the test user is in that `dest` does not have, by number.
+    fn another_group(dest: &Path) -> Option<String> {
+        let was = fs::metadata(dest).unwrap().gid().to_string();
+        let groups = text_of(std::process::Command::new("id").arg("-G"));
+        groups.split(' ').find(|gid| *gid != was).map(str::to_owned)
+    }
+
+    #[test]
+    fn a_new_group_with_the_same_bytes_narrows_then_chgrps_then_sets_the_mode() {
+        for (was, named) in [(0o664, "group, mode"), (0o640, "group")] {
+            let (dir, bin, dest) = same_case("files-same-group", was, &[]);
+            let Some(other) = another_group(&dest) else {
+                eprintln!("skip: the user is in one group only");
+                return;
+            };
+            let d = dest.to_str().unwrap();
+            let log = dir.join("log");
+            let script = owning(&dest, "sudo -n ", (None, Some(&other)), None);
+            let out = sh_with(&bin, &logged_to(&log, &script));
+            assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+            assert_eq!(
+                (out.code, String::from_utf8(out.stdout).unwrap()),
+                (Some(0), format!("fixed {d}: {named}\n"))
+            );
+            assert_eq!(
+                fs::read_to_string(&log).unwrap(),
+                format!("chmod go= {d} \nchgrp {other} {d} \nchmod 0640 {d} \n")
+            );
+            assert_eq!(fs::metadata(&dest).unwrap().gid().to_string(), other);
+            assert_eq!(mode(&dest), 0o640);
+            let out = sh_with(&bin, &script);
+            assert_eq!(
+                String::from_utf8(out.stdout).unwrap(),
+                format!("unchanged {d}\n"),
+                "then nothing differs"
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_group_name_is_compared_through_find_not_the_name_ls_prints() {
+        let ls = format!(
+            "{REAL}\ncase $1 in -lLd | -l) ls \"$@\" | awk '{{$4=substr($4,1,2); print}}' ;; \
+             *) ls \"$@\" ;; esac"
+        );
+        let (dir, bin, dest) = same_case("files-same-name", 0o640, &[("ls", &ls)]);
+        let d = dest.to_str().unwrap();
+        let line = text_of(std::process::Command::new("ls").args(["-lLd", d]));
+        let name = line.split_whitespace().nth(3).unwrap().to_owned();
+        let out = sh_with(&bin, &owning(&dest, "sudo -n ", (None, Some(&name)), None));
+        assert_eq!(
+            (out.code, String::from_utf8(out.stdout).unwrap()),
+            (Some(0), format!("unchanged {d}\n")),
+            "{name} as ls -l cuts it short"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_user_write_to_another_users_dest_says_it_cannot_chmod_not_the_group() {
+        let chmod = format!("{REAL}\ncase $1 in go=) exit 1 ;; esac\nexec chmod \"$@\"");
+        let (dir, bin, dest) = same_case("files-same-foreign", 0o664, &[("chmod", &chmod)]);
+        let d = dest.to_str().unwrap();
+        let gid = (fs::metadata(&dest).unwrap().gid() + 1).to_string();
+        let log = dir.join("log");
+        let script = owning(&dest, "", (None, Some(&gid)), Some("me"));
+        let out = sh_with(&bin, &logged_to(&log, &script));
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!("files: {d} cannot be given mode 0640: only its owner can chmod it\n")
+        );
+        assert!(
+            !fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("chgrp")
+        );
+        assert_eq!(mode(&dest), 0o664);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_owner_gone_between_the_check_and_the_compare_is_refused() {
+        let id = format!(
+            "{REAL}\necho \"$*\" >>\"$0.ran\"\n[ \"$(wc -l <\"$0.ran\")\" -lt 2 ] || exit 1\nexec id \"$@\""
+        );
+        let (dir, bin, dest) = same_case("files-same-gone", 0o640, &[("id", &id)]);
+        let name = text_of(std::process::Command::new("id").arg("-un"));
+        let out = sh_with(&bin, &owning(&dest, "sudo -n ", (Some(&name), None), None));
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!("files: owner {name} does not exist on the target\n")
+        );
+        assert_eq!(
+            fs::read_to_string(bin.join("id.ran")).unwrap(),
+            format!("-u {name}\n-u {name}\n"),
+            "the check passed, the compare's lookup failed"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attributes_it_cannot_read_fail_with_a_message() {
+        let ls = format!("{REAL}\ncase $1 in -lLdn) exit 1 ;; esac\nexec ls \"$@\"");
+        let (dir, bin, dest) = same_case("files-same-unread", 0o640, &[("ls", &ls)]);
+        let d = dest.to_str().unwrap();
+        let out = sh_with(&bin, &replacing(&dest, "sudo -n "));
+        assert_eq!(out.code, Some(1));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!("files: cannot read {d}'s owner, group and mode\n")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_user_write_whose_dest_has_another_owner_is_refused_without_a_change() {
+        let (uid, _) = own_ids();
+        let ls = format!(
+            "{REAL}\ncase $1 in -lLdn) ls -lLdn \"$2\" | awk '{{$3=1234; print}}' ;; *) ls \"$@\" ;; esac"
+        );
+        let (dir, bin, dest) = same_case("files-same-owner", 0o664, &[("ls", &ls)]);
+        let log = dir.join("log");
+        let script = owning(&dest, "", (Some(&uid), None), Some("me"));
+        let out = sh_with(&bin, &logged_to(&log, &script));
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!("files[0].owner {uid}: needs sudo; the login user is me\n")
+        );
+        assert!(!log.exists());
+        assert_eq!(mode(&dest), 0o664);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_chgrp_that_fails_puts_the_narrowed_mode_back_and_refuses() {
+        let chgrp = format!("{REAL}\nexit 1");
+        let (dir, bin, dest) = same_case("files-same-nogroup", 0o664, &[("chgrp", &chgrp)]);
+        let gid = fs::metadata(&dest).unwrap().gid() + 1;
+        for (user, why) in [
+            (
+                None,
+                format!("files: group {gid} does not exist on the target\n"),
+            ),
+            (
+                Some("me"),
+                format!("files: group {gid} is not one of me's groups\n"),
+            ),
+        ] {
+            let sudo = if user.is_some() { "" } else { "sudo -n " };
+            let script = owning(&dest, sudo, (None, Some(&gid.to_string())), user);
+            let out = sh_with(&bin, &script);
+            assert_eq!(out.code, Some(REFUSED));
+            assert_eq!(String::from_utf8(out.stderr).unwrap(), why);
+            assert_eq!(mode(&dest), 0o664);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_fix_that_does_not_take_fails_and_names_what_dest_has_now() {
+        let chmod = format!("{REAL}\ncase $1 in go=) exec chmod \"$@\" ;; esac\nexit 0");
+        let (dir, bin, dest) = same_case("files-same-stuck", 0o664, &[("chmod", &chmod)]);
+        let d = dest.to_str().unwrap();
+        let meta = fs::metadata(&dest).unwrap();
+        let out = sh_with(&bin, &replacing(&dest, "sudo -n "));
+        assert_eq!(out.code, Some(1));
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "");
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!(
+                "files: {d}: owner, group or mode did not take (now {}:{} 0664)\n",
+                meta.uid(),
+                meta.gid()
+            )
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_password_path_fixes_the_same_bytes_too() {
+        let run = install_script(
+            "/tmp/anvil-00",
+            "/etc/a",
+            "0640",
+            &root_checks("sudo ", "/etc/a"),
+            &Expected::Unchecked,
+        );
+        assert!(
+            run.contains("printf '%s%s\\n' 'fixed /etc/a: ' \"$anvil_what\"\n"),
+            "{run}"
+        );
+        assert!(run.contains("sudo ls -lLdn '/etc/a'"), "{run}");
+    }
+
     /// The trimmed stdout of `command`.
     fn text_of(command: &mut std::process::Command) -> String {
         String::from_utf8(command.output().unwrap().stdout)
@@ -3684,9 +4087,13 @@ mod tests {
         assert_eq!(mode(&dest), 0o444);
         assert_eq!(
             write("two\n", "0600"),
-            (Some(0), format!("unchanged {dest_str}\n"))
+            (Some(0), format!("fixed {dest_str}: mode\n"))
         );
         assert_eq!(mode(&dest), 0o600);
+        assert_eq!(
+            write("two\n", "0600"),
+            (Some(0), format!("unchanged {dest_str}\n"))
+        );
         fs::set_permissions(&dest, fs::Permissions::from_mode(0o666)).unwrap();
         assert_eq!(
             write("three, longer than two\n", "644"),

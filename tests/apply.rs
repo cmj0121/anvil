@@ -3243,3 +3243,154 @@ fn an_owner_and_group_reach_dest_on_the_password_path() {
     );
     assert!(at(&format!("chgrp {gid} ")) < at("tee "), "{sudo}");
 }
+
+#[test]
+fn a_mode_drift_is_fixed_and_notifies_and_unchanged_does_not() {
+    let sandbox = Sandbox::new("af");
+    let root = sandbox.root().display().to_string();
+    with_handlers(&sandbox, "");
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(handled(&sandbox, "local"), ["flush"]);
+    let dest = sandbox.root().join("out/local.conf");
+    common::chmod(&dest, 0o600);
+    let before = std::fs::metadata(&dest).unwrap();
+
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let target = &value["targets"][0];
+    let step = &target["steps"][1];
+    assert_eq!(step["changed"], true, "{target}");
+    assert_eq!(
+        step["stdout"],
+        format!("fixed {root}/out/local.conf: mode\n"),
+        "{target}"
+    );
+    assert_eq!(common::mode(&dest) & 0o7777, 0o644);
+    assert_eq!(handled(&sandbox, "local"), ["flush", "flush"]);
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        std::fs::metadata(&dest).unwrap().ino(),
+        before.ino(),
+        "fixed in place, no new file"
+    );
+
+    let out = sandbox.anvil(&["-vv", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(&format!("unchanged {root}/out/local.conf\n")),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("handler flush"), "{stdout}");
+    assert_eq!(handled(&sandbox, "local"), ["flush", "flush"]);
+}
+
+#[test]
+fn a_fix_that_does_not_take_fails_the_step_and_does_not_notify() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new("af");
+    let root = sandbox.root().display().to_string();
+    with_handlers(&sandbox, "");
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let dest = sandbox.root().join("out/local.conf");
+    common::chmod(&dest, 0o600);
+    let bin = sandbox.root().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(bin.join("chmod"), "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(bin.join("chmod"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
+    command.args(["apply", "--target", "local"]);
+    let out = command.env("PATH", &path).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let (uid, gid) = ids_of(&dest);
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        shown.contains(&format!(
+            "files: {root}/out/local.conf: owner, group or mode did not take (now {uid}:{gid} 0600)"
+        )),
+        "{shown}"
+    );
+    assert_eq!(handled(&sandbox, "local"), ["flush"], "no notify");
+}
+
+#[test]
+fn a_group_only_difference_is_fixed_with_the_same_bytes() {
+    let sandbox = Sandbox::new("af");
+    let dest = sandbox.root().join("conf");
+    std::fs::write(&dest, "motd\n").unwrap();
+    common::chmod(&dest, 0o640);
+    let (_, was) = ids_of(&dest);
+    let Some(other) = id("-G")
+        .split(' ')
+        .find(|gid| *gid != was)
+        .map(str::to_owned)
+    else {
+        eprintln!("skip: the user is in one group only");
+        return;
+    };
+    with_owned_files(
+        &sandbox,
+        &[(&dest, "local", &format!("group = \"{other}\"\n"))],
+    );
+    let out = sandbox.anvil(&["-vv", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(&format!("fixed {}: group\n", dest.display())),
+        "{stdout}"
+    );
+    assert_eq!(ids_of(&dest).1, other);
+    assert_eq!(common::mode(&dest) & 0o7777, 0o640);
+    let out = sandbox.anvil(&["-vv", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stdout).contains(&format!("unchanged {}\n", dest.display())),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn a_user_write_cannot_give_the_same_bytes_a_group_it_is_not_in() {
+    if id("-u") == "0" {
+        eprintln!("skip: root may give any group");
+        return;
+    }
+    let sandbox = Sandbox::new("af");
+    let dest = sandbox.root().join("conf");
+    std::fs::write(&dest, "motd\n").unwrap();
+    common::chmod(&dest, 0o644);
+    let mine: Vec<String> = id("-G").split(' ').map(str::to_owned).collect();
+    let (_, was) = ids_of(&dest);
+    let Some(foreign) = (0..100u32)
+        .map(|gid| gid.to_string())
+        .find(|gid| !mine.contains(gid) && *gid != was)
+    else {
+        eprintln!("skip: no group outside the user's");
+        return;
+    };
+    with_owned_files(
+        &sandbox,
+        &[(&dest, "local", &format!("group = \"{foreign}\"\n"))],
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        shown.contains(&format!(
+            "files: group {foreign} is not one of {}'s groups",
+            id("-un")
+        )),
+        "{shown}"
+    );
+    assert_eq!(
+        common::mode(&dest) & 0o7777,
+        0o644,
+        "the narrowed mode is put back"
+    );
+}

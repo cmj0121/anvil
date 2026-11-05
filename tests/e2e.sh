@@ -356,7 +356,7 @@ else
   fail "apply --json with [packages]: exit $code"
 fi
 
-step "(l) [[files]] on arch (NOPASSWD): a sudo rename writes, keeps the owner or sets owner and group, refuses a symlinked dest or a user-owned directory, an unmatched entry is skipped"
+step "(l) [[files]] on arch (NOPASSWD): a sudo rename writes, keeps the owner or sets owner and group, fixes them on the same bytes, refuses a symlinked dest or a user-owned directory, an unmatched entry is skipped"
 # The probed distro: arch, or archarm on the arm64 image.
 REMOTE_DISTRO=$(docker exec "$NAME" sh -c '. /etc/os-release && printf %s "$ID"')
 FILES_DIR="$TMP/files"
@@ -577,6 +577,25 @@ if [ "$code" -eq 1 ] \
   pass "sudo = false with another owner failed the target before any step"
 else
   fail "sudo = false apply with another owner: exit $code"
+fi
+# The same bytes with another owner and group: fixed in place, no new file.
+docker exec "$NAME" chown root:root /etc/anvil-e2e-attrs
+INODE=$(docker exec "$NAME" stat -c %i /etc/anvil-e2e-attrs)
+anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/attrs.toml" apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  fixed /etc/anvil-e2e-attrs: owner, group' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-attrs-id' "$TMP/out" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G %i' /etc/anvil-e2e-attrs)" = "640 pw:key $INODE" ]; then
+  pass "sudo fixed the owner and group of the same bytes in place"
+else
+  fail "apply over the same bytes with another owner and group: exit $code"
+fi
+anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/attrs.toml" apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-attrs' "$TMP/out"; then
+  pass "a second apply found nothing to fix"
+else
+  fail "a second apply after the fix: exit $code"
 fi
 # 1 MiB, the src limit: bash `sh -s` over ssh carries the text twice (D13).
 yes 'anvil e2e: one line of a 1 MiB text file' | head -c 1048576 >"$FILES_DIR/big.txt"
