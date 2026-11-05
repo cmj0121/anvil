@@ -356,7 +356,7 @@ else
   fail "apply --json with [packages]: exit $code"
 fi
 
-step "(l) [[files]] on arch (NOPASSWD): a sudo rename writes, keeps the owner, refuses a symlinked dest or a user-owned directory, an unmatched entry is skipped"
+step "(l) [[files]] on arch (NOPASSWD): a sudo rename writes, keeps the owner or sets owner and group, refuses a symlinked dest or a user-owned directory, an unmatched entry is skipped"
 # The probed distro: arch, or archarm on the arm64 image.
 REMOTE_DISTRO=$(docker exec "$NAME" sh -c '. /etc/os-release && printf %s "$ID"')
 FILES_DIR="$TMP/files"
@@ -494,6 +494,89 @@ if [ "$code" -eq 1 ] && grep -qxF '  $ file /home/key/anvil-e2e-root' "$TMP/out"
   pass "sudo refused a dest under key's home and wrote nothing"
 else
   fail "apply to a dest under a user-owned directory: exit $code"
+fi
+# owner and group: pw and its group are not key's, so only root can give them.
+PW_IDS=$(docker exec "$NAME" sh -c 'printf %s:%s "$(id -u pw)" "$(id -g pw)"')
+cat >"$FILES_DIR/attrs.toml" <<CONF
+[[files]]
+src = "managed.conf"
+dest = "/etc/anvil-e2e-attrs"
+mode = "0640"
+owner = "pw"
+group = "key"
+
+[[files]]
+src = "managed.conf"
+dest = "/etc/anvil-e2e-attrs-id"
+mode = "0640"
+owner = "${PW_IDS%:*}"
+group = "${PW_IDS#*:}"
+CONF
+docker exec "$NAME" sh -c 'printf old >/etc/anvil-e2e-attrs && chmod 644 /etc/anvil-e2e-attrs'
+anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/attrs.toml" apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  wrote /etc/anvil-e2e-attrs' "$TMP/out" \
+  && grep -qxF '  wrote /etc/anvil-e2e-attrs-id' "$TMP/out" \
+  && docker exec "$NAME" cat /etc/anvil-e2e-attrs | cmp -s - "$FILES_DIR/managed.conf" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-attrs)" = '640 pw:key' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-attrs-id)" = '640 pw:pw' ] \
+  && [ -z "$(docker exec "$NAME" sh -c 'ls -A /etc | grep "^\.anvil-"')" ]; then
+  pass "sudo gave a dest owner and group by name and by id"
+else
+  fail "apply with owner and group: exit $code"
+fi
+cat >"$FILES_DIR/attrs-bad.toml" <<CONF
+[[files]]
+src = "managed.conf"
+dest = "/etc/anvil-e2e-attrs"
+mode = "0600"
+owner = "anvil-e2e-nobody"
+CONF
+# Other bytes, so the write reaches the temp's chgrp.
+printf 'managed = "anvil-e2e-attrs"\n' >"$FILES_DIR/attrs.conf"
+cat >"$FILES_DIR/attrs-user.toml" <<CONF
+[[files]]
+src = "attrs.conf"
+dest = "/home/key/anvil-e2e-user"
+mode = "0600"
+sudo = false
+group = "pw"
+CONF
+cat >"$FILES_DIR/attrs-sudo.toml" <<CONF
+[[files]]
+src = "managed.conf"
+dest = "/home/key/anvil-e2e-user"
+mode = "0600"
+sudo = false
+owner = "pw"
+CONF
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/attrs-bad.toml" apply --target arch
+code=$?
+if [ "$code" -eq 1 ] \
+  && grep -qF 'files: owner anvil-e2e-nobody does not exist on the target' "$TMP/err" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-attrs)" = '640 pw:key' ]; then
+  pass "an owner unknown on arch failed the step, dest unchanged"
+else
+  fail "apply with an unknown owner: exit $code"
+fi
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/attrs-user.toml" apply --target arch
+code=$?
+if [ "$code" -eq 1 ] \
+  && grep -qF "files: group pw is not one of key's groups" "$TMP/err" \
+  && [ "$(docker exec "$NAME" stat -c '%U:%G' /home/key/anvil-e2e-user)" = 'key:key' ] \
+  && docker exec "$NAME" cat /home/key/anvil-e2e-user | cmp -s - "$FILES_DIR/managed.conf" \
+  && [ -z "$(docker exec "$NAME" sh -c 'ls -A /home/key | grep "^\.anvil-"')" ]; then
+  pass "sudo = false refused a group key is not in"
+else
+  fail "sudo = false apply with another group: exit $code"
+fi
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/attrs-sudo.toml" apply --target arch
+code=$?
+if [ "$code" -eq 1 ] \
+  && grep -qF 'files[0].owner pw: needs sudo; the login user is key' "$TMP/out" "$TMP/err"; then
+  pass "sudo = false with another owner failed the target before any step"
+else
+  fail "sudo = false apply with another owner: exit $code"
 fi
 # 1 MiB, the src limit: bash `sh -s` over ssh carries the text twice (D13).
 yes 'anvil e2e: one line of a 1 MiB text file' | head -c 1048576 >"$FILES_DIR/big.txt"

@@ -341,8 +341,26 @@ pub(crate) struct Replacement<'a> {
     /// From [`temp_beside`].
     pub temp: &'a str,
     pub bytes: Bytes<'a>,
-    /// The owner to give the file as root; `None` keeps an existing DEST's.
-    pub ids: Option<(u32, u32)>,
+    pub ids: Ids<'a>,
+}
+
+/// The owner and group a [`Replacement`] gives the file.
+#[derive(Clone, Copy)]
+pub(crate) enum Ids<'a> {
+    /// An existing DEST's as root, else whose the write is.
+    Keep,
+    /// An entry's, each by name or numeric id, `None` keeping an existing
+    /// DEST's: set on the empty temp, so the in-place fallbacks, which write
+    /// the bytes before any owner, refuse. `user` is a user write's login user,
+    /// which names the group refusal.
+    Set {
+        owner: Option<&'a str>,
+        group: Option<&'a str>,
+        user: Option<&'a str>,
+    },
+    /// A restore's recorded ids, as root: also set on DEST after an in-place
+    /// fallback.
+    Restore(u32, u32),
 }
 
 impl Replacement<'_> {
@@ -438,7 +456,9 @@ impl Replacement<'_> {
     /// so a full disk never reaches a `tee` of DEST. Each `tee` of DEST first
     /// checks its source's size, and opens a file source by a redirect before
     /// `tee` starts, so a missing source leaves DEST intact; `anvil_verify` then
-    /// fails the run unless DEST holds the bytes.
+    /// fails the run unless DEST holds the bytes. An entry's owner and group
+    /// ([`Ids::Set`]) go on the empty temp, whose numeric ids are then read
+    /// back into `$anvil_ids`; with them pending, each fallback refuses instead.
     pub(crate) fn replace(&self, finish: &str) -> String {
         let (d, t, sudo, mode) = (quote(self.dest), quote(self.temp), self.sudo, self.mode);
         let dir = quote(dir_of(self.dest));
@@ -469,42 +489,91 @@ impl Replacement<'_> {
         ));
         let warn =
             format!("printf 'files: %s: not written atomically: %s\\n' {d} \"$anvil_fb\" >&2");
+        let refuse = format!(
+            "{{ printf 'files: %s: owner and group need an atomic write: %s\\n' {d} \"$anvil_fb\" >&2; \
+             exit {REFUSED}; }}"
+        );
         let set_owner = |file: &str| match self.ids {
-            Some((uid, gid)) if self.as_root => format!("{sudo}chown {uid}:{gid} {file} && "),
+            Ids::Restore(uid, gid) => format!("{sudo}chown {uid}:{gid} {file} && "),
             _ => String::new(),
         };
+        let owned_by = "anvil_fb=\"it is owned by $3:$4, which only root can keep\"";
         let owner_of_dest = match (self.as_root, self.ids) {
-            (true, Some(_)) => String::new(),
-            (true, None) => format!("{sudo}chown \"$3:$4\" {t} || {fail}\n"),
-            (false, _) => "[ \"$3:$4\" = \"$anvil_mine\" ] \
-                           || anvil_fb=\"it is owned by $3:$4, which only root can keep\"\n"
-                .to_owned(),
+            (
+                true,
+                Ids::Restore(..)
+                | Ids::Set {
+                    owner: Some(_),
+                    group: Some(_),
+                    ..
+                },
+            ) => String::new(),
+            (true, Ids::Keep) => format!("{sudo}chown \"$3:$4\" {t} || {fail}\n"),
+            (true, Ids::Set { owner: Some(_), .. }) => {
+                format!("{sudo}chgrp \"$4\" {t} || {fail}\n")
+            }
+            (true, Ids::Set { .. }) => format!("{sudo}chown \"$3\" {t} || {fail}\n"),
+            (false, Ids::Set { owner, group, .. }) => match (owner, group) {
+                (Some(_), Some(_)) => String::new(),
+                (Some(_), None) => {
+                    format!("chgrp \"$4\" {t} 2>/dev/null || {{ {owned_by}; {refuse}; }}\n")
+                }
+                _ => format!(
+                    "[ \"$3:${{anvil_mine#*:}}\" = \"$anvil_mine\" ] || {{ {owned_by}; {refuse}; }}\n"
+                ),
+            },
+            (false, _) => format!("[ \"$3:$4\" = \"$anvil_mine\" ] || {owned_by}\n"),
         };
         let labels = self.labels(&fail);
-        let (set_temp_owner, set_dest_owner) = (
-            match set_owner(&t) {
-                s if s.is_empty() => String::new(),
-                s => format!("{} : || {fail}\n", s),
-            },
-            set_owner(&d),
-        );
+        let set_temp_owner = match set_owner(&t) {
+            s if s.is_empty() => String::new(),
+            s => format!("{} : || {fail}\n", s),
+        };
+        let set_dest_owner = set_owner(&d);
+        let pending = matches!(self.ids, Ids::Set { .. });
+        let in_place = if pending {
+            format!("anvil_fb='its directory is not writable'; {refuse}\n")
+        } else {
+            format!(
+                "command -v wc >/dev/null 2>&1 || {{ echo {no_wc} >&2; exit 1; }}\n\
+                 set -- $(anvil_bytes | wc -c); [ \"$1\" = {len} ] || {{ echo {no_source} >&2; exit 1; }}\n\
+                 anvil_tight\n\
+                 anvil_fb='its directory is not writable'; {warn}\n\
+                 {tee_bytes} || exit 1\n\
+                 anvil_verify\n\
+                 {set_dest_owner}anvil_mode || exit 1\n"
+            )
+        };
+        let mv_failed = if pending {
+            refuse
+        } else {
+            format!("{sudo}chmod 600 {t} || {fail}")
+        };
+        let (ids_of_temp, read_ids) = match self.ids {
+            Ids::Set { owner, group, user } => (
+                self.ids_of_temp(owner.filter(|_| self.as_root), group, user),
+                format!(
+                    "anvil_line=$({sudo}ls -ln {t}) || {fail}\n\
+                     set -- $anvil_line\n\
+                     case $3 in '' | *[!0-9]*) {fail} ;; esac\n\
+                     case $4 in '' | *[!0-9]*) {fail} ;; esac\n\
+                     anvil_ids=$3:$4\n"
+                ),
+            ),
+            _ => (String::new(), String::new()),
+        };
         // `mv` onto a directory raced in after the checks moves the temp into
         // it: only whoever may write this directory can do that, and the
         // checks above leave that to root and the login user.
         format!(
             "if ! {sudo}test -w {dir} && {sudo}test -e {d}; then\n\
-             command -v wc >/dev/null 2>&1 || {{ echo {no_wc} >&2; exit 1; }}\n\
-             set -- $(anvil_bytes | wc -c); [ \"$1\" = {len} ] || {{ echo {no_source} >&2; exit 1; }}\n\
-             anvil_tight\n\
-             anvil_fb='its directory is not writable'; {warn}\n\
-             {tee_bytes} || exit 1\n\
-             anvil_verify\n\
-             {set_dest_owner}anvil_mode || exit 1\n\
+             {in_place}\
              else\n\
              anvil_fb=; anvil_no_acl=\n\
              {sudo}test ! -e {t} && {sudo}test ! -L {t} || {fail}\n\
              anvil_t=1\n\
              {sudo}install -m 600 /dev/null {t} || {fail}\n\
+             {ids_of_temp}\
              set -- $({sudo}ls -ln {t}); [ \"$5\" = 0 ] || {fail}\n\
              anvil_mine=$3:$4\n\
              {set_temp_owner}\
@@ -515,13 +584,14 @@ impl Replacement<'_> {
              {owner_of_dest}\
              [ -n \"$anvil_fb\" ] || {{ {labels} }}\n\
              fi\n\
+             {read_ids}\
              if {sudo}chmod 600 {t} && anvil_bytes | {sudo}tee {t} >/dev/null; then \
              set -- $({sudo}ls -ln {t}); [ \"$5\" = {len} ] || {fail}\n\
              else {fail}; fi\n\
              if [ -z \"$anvil_fb\" ]; then\n\
              {sudo}chmod {mode} {t} || {fail}\n\
              if {sudo}mv -f {t} {d}; then anvil_t=; [ -z \"$anvil_no_acl\" ] || echo {acl_lost} >&2\n\
-             else anvil_fb='mv failed'; {sudo}chmod 600 {t} || {fail}; fi\n\
+             else anvil_fb='mv failed'; {mv_failed}; fi\n\
              fi\n\
              if [ -n \"$anvil_fb\" ]; then\n\
              set -- $({sudo}ls -ln {t}); [ \"$5\" = {len} ] || {fail}\n\
@@ -534,6 +604,27 @@ impl Replacement<'_> {
              fi\n\
              {finish}\n"
         )
+    }
+
+    /// Gives the empty temp `owner`, a root write's only, and `group`, each
+    /// by name, before any byte: a failure refuses, and the trap removes it.
+    fn ids_of_temp(&self, owner: Option<&str>, group: Option<&str>, user: Option<&str>) -> String {
+        let (t, sudo) = (quote(self.temp), self.sudo);
+        let owner = owner.map(|owner| {
+            let why = format!(
+                "files: cannot give the temp for {} owner {owner}",
+                self.dest
+            );
+            format!("{sudo}chown {} {t} || {}\n", quote(owner), refused(&why))
+        });
+        let group = group.map(|group| {
+            let why = match user {
+                Some(user) => format!("files: group {group} is not one of {user}'s groups"),
+                None => format!("files: group {group} does not exist on the target"),
+            };
+            format!("{sudo}chgrp {} {t} || {}\n", quote(group), refused(&why))
+        });
+        owner.into_iter().chain(group).collect()
     }
 
     /// Commands that give the temp DEST's SELinux label and ACL, where the
@@ -563,6 +654,11 @@ impl Replacement<'_> {
              else case $1 in *+) anvil_no_acl=1 ;; esac; fi;"
         )
     }
+}
+
+/// A brace group that prints `why` on stderr and exits [`REFUSED`].
+pub(crate) fn refused(why: &str) -> String {
+    format!("{{ echo {} >&2; exit {REFUSED}; }}", quote(why))
 }
 
 /// Removes what an interrupted run left of `dest`, through `sudo`, and no other

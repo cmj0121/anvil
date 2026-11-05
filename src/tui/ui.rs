@@ -2631,6 +2631,7 @@ mod tests {
                         as_root: false,
                         password: false,
                         rendered: rendered.map(Box::new),
+                        ids: None,
                     }),
                 },
             },
