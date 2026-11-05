@@ -464,6 +464,9 @@ names = ["HOST_SUDO"]
 src = "files/sshd_config"        # required: relative to the workspace, or $/… in the store
 dest = "/etc/ssh/sshd_config"    # required: absolute path on the target
 mode = "0644"                    # required: quoted, 3 or 4 octal digits
+owner = "root"                   # optional; a user name or numeric id. Unset: keep dest's owner
+group = "wheel"                  # optional; a group name or numeric id. Unset: keep dest's group
+parents = true                   # optional; default false. true: create missing directories on dest's path
 tags = ["linode"]                # optional; [A-Za-z0-9_-]+; every one must be on the target
 facts = { distro = "arch" }      # optional; a probe key, equal to that fact
 sudo = false                     # optional; default true. false: write as the connecting user
@@ -579,6 +582,34 @@ secret 失敗與套件 step 相同，前綴改為 `files`：
 `apply` 才會為 files 開啟 secret store；項目全是 `sudo = false`，或 tag 不符合任何選定 target 的 config，
 不會為 files 開啟它。`plan` 從不開啟它。
 
+**`owner` 與 `group`。** 選填，各為名稱或數字 id。名稱為 1 到 32 位元組、符合 `[a-z_][a-z0-9_.-]*`
+（`root`、`_apt`、`www-data`）；id 只有數字，最多 10 位，範圍 `0` 到 `4294967295`。其他值以 2 結束並指出該項目：
+
+- ``files[0].owner `Bad`: must be a user name or a numeric id``（`1app`、`a b` 與 `4294967296` 也是同一則訊息）
+- ``files[0].group `1app`: must be a group name or a numeric id``
+
+名稱在 target 上解析，絕不在 controller 上。未設定時，既有的 dest 保留自己的擁有者或群組，新檔案取得預設值（[檔案如何被取代](#files)）；
+只設定其中一個時，另一個也照此保留。兩者都在暫存檔仍為空時、寫入位元組與 `mode` 之前套用，因此 dest 絕不會在擁有者錯誤時帶有新位元組。
+target 不認得的擁有者名稱會在寫入任何東西之前讓 step 失敗，並顯示 `files: owner NAME does not exist on the target`；
+以 root 寫入時，不存在的群組則顯示 `files: group NAME does not exist on the target`。
+
+誰能設定它們取決於誰寫入：
+
+- **以 root 寫入**（`sudo = true`，或以 root 登入，此時忽略 `sudo`）：target 認得的任何擁有者與群組。
+- **以連線使用者寫入**（非 root 登入且 `sudo = false`）：擁有者只能是該使用者，群組只能是該使用者所屬的群組之一。
+  登入使用者要到探測之後才知道，因此不是 `user` fact 的 `owner` 名稱會在該 target 上任何 step 執行之前讓它失敗，以 1 結束，
+  其他 target 照常執行：`files[0].owner NAME: needs sudo; the login user is USER`（task 則為 `tasks[0].file.owner …`）。
+  數字的 `owner` 在 target 上與 `id -u` 比較，不同時 step 以同一則訊息失敗，不寫入任何東西。
+  使用者不屬於的群組，或不存在的群組，讓 step 失敗並顯示 `files: group NAME is not one of USER's groups`。
+
+**`parents`。** 選填，預設為 false。沒有它時，dest 路徑上不存在的目錄會在寫入任何東西之前讓 step 失敗：
+`files: DIR does not exist; set parents = true to create it`。設定 `parents = true` 時，每個不存在的目錄由上而下以
+`mkdir -m 0755` 建立，身分與寫入相同：以 root 寫入時為 root，`sudo = false` 時為連線使用者。
+下面的目錄規則仍然適用：新目錄之上的每個既有目錄都必須先通過它，才會在其下建立任何東西；每個新目錄在 `mkdir` 之後立刻再檢查一次，
+因此建立後對群組或其他人開放的目錄（例如因為預設 ACL）會讓 step 以該規則的訊息失敗。`mkdir` 失敗時為 `files: cannot create DIR`。
+每個建立的目錄都記在 [apply 紀錄](cli.zh-TW.md#apply-紀錄)中，即使 step 之後失敗也一樣，
+[`anvil rollback`](cli.zh-TW.md#anvil-rollback) 會在它為空時移除它。
+
 **`rollback`。** 預設為 true，為 true 時 anvil 寫回的檔案會省略它。每次寫入之前，apply 會把 dest 的內容保存在
 [apply 紀錄](cli.zh-TW.md#apply-紀錄)中，也就是 `$XDG_STATE_HOME/anvil`（否則為 `~/.local/state/anvil`）中的 `last-apply.json`，
 讓 [`anvil rollback`](cli.zh-TW.md#anvil-rollback) 能把它放回去。紀錄是明文，mode 0600，沒有加密。
@@ -587,15 +618,25 @@ dest 保存 secret（例如 token 或私鑰）的每個項目都請設定它。�
 其他的只保存雜湊，寫入仍會進行。mode 不讓其他人讀取的先前檔案（0600、0640）不論此設定都只保存雜湊：除非位元組未變更或較早的項目仍保存先前狀態，
 apply 會警告，rollback 會以 `cannot undo: DEST (not world-readable)` 指名它，且不在那裡還原任何東西。
 
-**寫到 target 上的結果。** 位元組以 `cmp` 與 dest 比較。位元組相同時保留原檔，`chmod` 套用 `mode`，step 印出 `unchanged DEST`；
-否則印出 `wrote DEST`。兩者都以 0 結束。不存在或無法讀取的 dest 會被寫入。
+**寫到 target 上的結果。** 位元組以 `cmp` 與 dest 比較。位元組不同，或 dest 不存在或無法讀取時，寫入它，step 印出 `wrote DEST`。
+位元組相同時保留原檔，只把 dest 的擁有者（設定了 `owner` 時）、群組（設定了 `group` 時）與 mode 和項目比較。
+不同之處就地修正，不用暫存檔，step 印出 `fixed DEST: owner, group, mode`，只依此順序列出它改了的部分（`fixed /etc/motd: mode`）。
+沒有不同時，dest 完全不被改動，step 印出 `unchanged DEST`。三者都以 0 結束。
+沒有 `owner` 或 `group` 的 config 上的 mode 漂移也會印出 `fixed DEST: mode`；舊版 anvil 對它印出 `unchanged DEST`（[Handlers](#handlers)）。
+
+新的擁有者或群組只在 mode 收緊為擁有者的位元之後才套用，項目的 `mode` 最後才設定，因此新群組連片刻都拿不到存取權；只有 mode 漂移時只需一次 `chmod`。
+之後再讀一次 dest。沒有生效的修正（例如 NFS 的 root_squash、vfat 或 ACL mask 之下）會讓 step 失敗並顯示
+`files: DEST: owner, group or mode did not take (now UID:GID MODE)`，因此它不會每次執行都回報變更。
+無法讀取擁有者、群組與 mode 的 dest 以 `files: cannot read DEST's owner, group and mode` 失敗，
+`chown` 失敗則顯示 `files: cannot give DEST owner NAME`（或 [`owner` 與 `group`](#files) 中的群組訊息）。
+
 這項比較需要 target 上有 `cmp`（diffutils），且在寫入時使用的 `PATH` 上（透過 sudo 寫入時是 sudo 的 `PATH`）。
 沒有它時檔案一律重寫，step 一律印出 `wrote DEST`；有些精簡的容器映像檔沒有它。
 沒有擁有者寫入權限的 mode（例如 `0444`）仍可寫入。
-anvil 設定 `mode`，並保留既有 dest 的擁有者與群組。它不建立不存在的上層目錄；此時 step 以 `tee` 自己的訊息失敗。
+anvil 設定 `mode`，沒有 `owner` 或 `group` 時保留既有 dest 的擁有者與群組。
 
-**`notify`。** 選填：step 印出 `wrote DEST` 時要執行的 [handler](#handlers)。`unchanged DEST` 不通知任何 handler，
-即使 `chmod` 修正了 mode 也一樣；沒有 `cmp` 的 target 每次 apply 都會重寫，因此每次都會通知。
+**`notify`。** 選填：step 印出 `wrote DEST` 或 `fixed DEST: …` 時要執行的 [handler](#handlers)。`unchanged DEST` 不通知任何 handler；
+沒有 `cmp` 的 target 每次 apply 都會重寫，因此每次都會通知。
 每個名稱都必須是某個 `[[handlers]]` 項目的名稱，否則以 2 結束並顯示
 ``files[0].notify[0] `reload ssh`: names no [[handlers]] entry``。
 
@@ -605,7 +646,7 @@ anvil 設定 `mode`，並保留既有 dest 的擁有者與群組。它不建立�
 （`/home/u/.config/app.conf` 的 DIR 為 `/home/u`），且不寫入任何東西。
 路徑上本身是 symlink 的目錄也不符合。以 root 寫入也會拒絕本身是 symlink 的系統目錄：macOS 的 `/etc`、`/var` 與 `/tmp`（指向 `/private` 之下的連結），
 以及目前 Linux 發行版上合併 /usr 後的連結 `/bin`、`/sbin` 與 `/lib`；請改用實際路徑，例如 `/usr/bin/x`。
-路徑上不存在的目錄會通過檢查，接著寫入如上所述地失敗。因此位於使用者家目錄之下的 dest 需要 `sudo = false`。
+路徑上不存在的目錄會讓 step 失敗，或在 `parents = true` 時被建立，如上所述。因此位於使用者家目錄之下的 dest 需要 `sudo = false`。
 少了這條規則，能寫入路徑上某個目錄的人就能把該目錄或其中的東西換成指向其他檔案的 symlink 或 hard link，讓 root 寫入那個檔案。
 
 這些檢查在失敗時一律拒絕。透過 sudo 寫入時會先執行 `sudo true`；它失敗時 sudo 印出自己的訊息，
@@ -626,12 +667,12 @@ dest 是目錄時 step 失敗並顯示 `files: DEST is a directory`（`/etc/a` �
 
 **檔案如何被取代。** 每次寫入，不論走哪條路徑，都把位元組放進 dest 所在目錄中一個 mode 0600 的暫存檔，
 其名稱在 controller 上產生：`.anvil-<dest 的 sha256 前 16 位十六進位>-<16 位隨機十六進位>`，再以 `mv -f` 改名蓋過 dest。
-因此被中斷的寫入會讓 dest 保持完整的舊內容或完整的新內容。暫存檔由 `install` 以 mode 0600 建立，因此目錄上的預設 ACL 無法開放它；它仍為空時，會取得 dest 的擁有者與群組、
+因此被中斷的寫入會讓 dest 保持完整的舊內容或完整的新內容。暫存檔由 `install` 以 mode 0600 建立，因此目錄上的預設 ACL 無法開放它；它仍為空時，會取得項目的 `owner` 與 `group`（未設定的那個取 dest 自己的）、
 SELinux 標籤（`selinuxenabled` 成功時，以 `chcon --reference`）、ACL（有 GNU `getfacl` 與 `setfacl`，且 target 有 `sed` 時）；
 接著寫入位元組，最後在改名之前設定 `mode`，此時 ACL 的項目才生效。
 被終止的執行所留下的暫存檔，在超過一小時後由下一次寫入同一個 dest 時移除，因此同時進行的執行能保有自己的暫存檔；其他 dest 的暫存檔不受影響。
 以 root 寫入的新檔案屬於 root；其群組在 Linux 上是 root 的主要群組，在 macOS 與 BSD 上或位於設有 setgid 的上層目錄之下時，
-則是上層目錄的群組。`sudo = false` 時新檔案屬於連線使用者。
+則是上層目錄的群組。`sudo = false` 時新檔案屬於連線使用者。`owner` 與 `group` 會取代這些預設值。
 
 改名會讓 dest 得到新的 inode。指向舊檔案的 hard link 保留舊的位元組，已開啟舊檔案的行程也會繼續讀到舊內容。
 SELinux 標籤以外的延伸屬性、`chattr +i` 之類的檔案旗標，以及在沒有 GNU 工具的 target 上的 ACL 都會遺失；ACL 遺失時會顯示警告
@@ -648,12 +689,16 @@ SELinux 標籤以外的延伸屬性、`chattr +i` 之類的檔案旗標，以及
   `files: DEST cannot be given mode MODE: only its owner can chmod it`；
 - `mv` 失敗但暫存檔已完整寫入，例如 bind mount 的檔案（`mv failed`）。
 
+就地寫入會在設定任何擁有者之前寫入位元組，因此設定了 `owner` 或 `group` 時，這些情況都不寫入：step 失敗並顯示
+`files: DEST: owner and group need an atomic write: REASON`（REASON 相同），dest 保持不變。
+
 無法完整寫入暫存檔不在此列：step 會失敗並顯示 `files: cannot write a temp file beside DEST; DEST is unchanged`，
 因此磁碟已滿不會影響到 dest。每次就地寫入都先檢查來源的大小，寫入後再與 dest 比對；不符時 step 失敗並顯示
 `files: DEST does not hold the bytes written; re-run apply or anvil rollback`。就地寫入也需要 `wc`。
 
 **受限的 sudo 規則。** 從檔案就地寫入時會執行 `sh -c 'tee "$1" <"$2"'`，這樣來源不存在時 dest 保持不動；只允許 `tee` 而不允許 `sh` 的規則會讓它失敗。列出指令的 `NOPASSWD` 規則需要 `true`、`test`、`find`、`install`、`tee`、`cmp`、`mv`、`chown`、`chmod`、`rm`、`ls`、
-`getfacl`、`setfacl`、`chcon`、`od`、`sha256sum` 或 `shasum`，以及 `sh`（它以 `sh -c` 探測工具）。
+`getfacl`、`setfacl`、`chcon`、`od`、`sha256sum` 或 `shasum`，以及 `sh`（它以 `sh -c` 探測工具）；
+設定 `group` 時還需要 `chgrp`，設定 `parents` 時需要 `mkdir`，rollback 移除 `parents` 建立的目錄時需要 `rmdir`。
 沒有 `getfacl` 與 `setfacl` 時 ACL 會遺失。沒有 `sh` 時 SELinux 標籤會遺失，比較也一律重寫，且已存在的 dest 會被拒絕，因為無法檢查它是否已變更。
 允許 `sh` 但不允許任一雜湊工具的規則，對其他人無法讀取的檔案同樣拒絕，並顯示 `files: sudo could not check DEST; nothing was changed`。
 root-squash 掛載點上 root 無法讀取的檔案也會同樣失敗；若登入使用者能寫入，請改用 `sudo = false`。
@@ -898,15 +943,15 @@ facts = { os = "Linux" }           # ANDed with the parent's tags
 兩種以上以 2 結束並顯示 `tasks[0]: has run and include; keep one`，都沒有時為
 `tasks[0]: needs one of run, plugin, packages, file, service, include, tasks`。
 
-| 種類       | 作用                                                                                   |
-| ---------- | -------------------------------------------------------------------------------------- |
-| `run`      | POSIX sh 腳本，最多 4 KiB，與 `[[steps]]` 相同                                         |
-| `plugin`   | `[plugins]` 項目，可選 `args`，與 [Plugin steps](cli.zh-TW.md#plugin-steps) 相同       |
-| `packages` | 只有 `install`、`pin`、`remove` 與 `upgrade`，與 `[packages]` 相同                     |
-| `file`     | `src`、`dest`、`mode`、`sudo`、`rollback` 與 `template`，與 [`[[files]]`](#files) 相同 |
-| `service`  | `name`、`state` 與 `enabled`，與 [`[[services]]`](#services) 相同                      |
-| `include`  | `$/…` task 檔，就地展開                                                                |
-| `tasks`    | 子 task，寫成 `[[tasks.tasks]]` 或 inline array                                        |
+| 種類       | 作用                                                                             |
+| ---------- | -------------------------------------------------------------------------------- |
+| `run`      | POSIX sh 腳本，最多 4 KiB，與 `[[steps]]` 相同                                   |
+| `plugin`   | `[plugins]` 項目，可選 `args`，與 [Plugin steps](cli.zh-TW.md#plugin-steps) 相同 |
+| `packages` | 只有 `install`、`pin`、`remove` 與 `upgrade`，與 `[packages]` 相同               |
+| `file`     | [`[[files]]`](#files) 的鍵，但 `tags`、`facts` 與 `notify` 寫在 task 上          |
+| `service`  | `name`、`state` 與 `enabled`，與 [`[[services]]`](#services) 相同                |
+| `include`  | `$/…` task 檔，就地展開                                                          |
+| `tasks`    | 子 task，寫成 `[[tasks.tasks]]` 或 inline array                                  |
 
 `tags` 與 `facts` 寫在 task 上，不寫在 `file` 或 `service` 裡：否則以 2 結束並顯示
 `tasks[0].file: tags and facts belong on the task, not the file`。
@@ -1033,16 +1078,20 @@ run = "fc-cache -f"
 
 **step 何時通知。** 只有在 target 上執行、以 0 結束且改變了東西的 step：
 
-| Step          | 在下列情況通知    | 下列情況不通知                |
-| ------------- | ----------------- | ----------------------------- |
-| file          | 印出 `wrote DEST` | 印出 `unchanged DEST`         |
-| service       | 印出任何變更行    | 印出 `unchanged service NAME` |
-| run 或 plugin | 執行且以 0 結束   | 被 [guard](#config) 略過      |
-| 任何          |                   | 以 no match 略過，或失敗      |
+| Step          | 在下列情況通知                       | 下列情況不通知                |
+| ------------- | ------------------------------------ | ----------------------------- |
+| file          | 印出 `wrote DEST` 或 `fixed DEST: …` | 印出 `unchanged DEST`         |
+| service       | 印出任何變更行                       | 印出 `unchanged service NAME` |
+| run 或 plugin | 執行且以 0 結束                      | 被 [guard](#config) 略過      |
+| 任何          |                                      | 以 no match 略過，或失敗      |
 
 變更行是 `started service NAME`、`stopped service NAME`、`enabled service NAME` 或 `disabled service NAME`。
-套件 step 從不通知，也無法要求通知。位元組已正確、anvil 只修正了 mode 的檔案會印出 `unchanged DEST`，不會通知：
-這是刻意的設計，handler 跟隨的是內容的變更。沒有 `cmp` 的 target 每次 apply 都會重寫檔案（[`[[files]]`](#files)），
+套件 step 從不通知，也無法要求通知。位元組已正確、但 anvil 修正了擁有者、群組或 mode 的檔案會印出 `fixed DEST: …` 並通知：
+handler 跟隨檔案的任何變更，包括擁有者、群組與 mode。`unchanged DEST` 代表完全沒有變更。
+
+**與舊版 anvil 的差異。** 只修正 mode 的情況以前印出 `unchanged DEST` 且不通知任何 handler。現在它印出 `fixed DEST: mode`，
+算作變更（`--json` 中為 `"changed": true`）並通知，適用於每個 config，包括沒有 `owner` 與 `group` 的。
+因此升級後的第一次 apply 會為 mode 曾經漂移的檔案執行其 handler。沒有 `cmp` 的 target 每次 apply 都會重寫檔案（[`[[files]]`](#files)），
 因此它的 `notify` 每次都會觸發。
 
 **順序。** target 的最後一個 step 之後，且只在每個 step 都通過時，它的 handler 依 `[[handlers]]` 順序執行，

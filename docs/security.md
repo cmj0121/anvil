@@ -38,9 +38,10 @@ English | [繁體中文](security.zh-TW.md)
   current config's `[[files]]` or file tasks still name, with the same `sudo`, for a target the entry applies to
   ([anvil rollback](cli.md#anvil-rollback)).
 - **The record is trusted as the config is.** It is not signed or authenticated. At a dest the config names, the
-  record decides the bytes, owner and mode rollback puts back, so whoever can write it can have rollback (through sudo,
-  as root) write any text with any owner and mode there. Keep it as private as the config: the same user, the 0700
-  state directory, no shared or synced copy.
+  record decides the bytes, owner, group and mode rollback puts back, so whoever can write it can have rollback (through
+  sudo, as root) write any text with any owner, group and mode there. Its `created_dirs` also decide which empty
+  directories on such a dest's path rollback removes, when that entry says `parents = true`. Keep it as private as the
+  config: the same user, the 0700 state directory, no shared or synced copy.
 - **An include is trusted as the config is.** A [`[[tasks]]` include](configuration.md#tasks) decides what runs on your
   targets, with sudo where a task uses it, so whoever can write one can run anything there. Keep it as private as the
   config. An include holds only `tasks`, so it cannot change `[plugins]`, `[secrets]` or any other setting; a `plugin`

@@ -33,8 +33,9 @@
   這些文字絕不會印出或記錄，且讀取紀錄前會先關閉 core dump。紀錄只是你擁有的一個檔案，因此 rollback 絕不讓它決定路徑：
   dest 或 mode 不可能由 apply 寫出的紀錄會被拒絕，且只還原目前 config 的 `[[files]]` 或 file task 仍列出、`sudo` 相同、
   且該項目適用於該 target 的 dest（[anvil rollback](cli.zh-TW.md#anvil-rollback)）。
-- **紀錄與 config 受到同等的信任**。它沒有簽章，也沒有驗證。在 config 列出的 dest 上，rollback 放回的位元組、owner
-  與 mode 由紀錄決定，因此能寫入紀錄的人，就能讓 rollback（透過 sudo、以 root）在那裡寫入任意文字、任意 owner 與 mode。
+- **紀錄與 config 受到同等的信任**。它沒有簽章，也沒有驗證。在 config 列出的 dest 上，rollback 放回的位元組、owner、group
+  與 mode 由紀錄決定，因此能寫入紀錄的人，就能讓 rollback（透過 sudo、以 root）在那裡寫入任意文字、任意 owner、group 與 mode。
+  當該項目設定 `parents = true` 時，紀錄的 `created_dirs` 也決定 rollback 會移除這種 dest 路徑上的哪些空目錄。
   請讓它與 config 一樣私密：同一個使用者、0700 的狀態目錄，不要有共用或同步的副本。
 - **include 與 config 受到同等的信任**。[`[[tasks]]` include](configuration.zh-TW.md#tasks) 決定 target 上執行什麼，
   task 使用 sudo 時也包含在內，因此能寫入它的人就能在那裡執行任何東西。請讓它與 config 一樣私密。
