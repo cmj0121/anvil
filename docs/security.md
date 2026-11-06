@@ -18,30 +18,33 @@ English | [繁體中文](security.zh-TW.md)
 - **Plaintext on disk.** Secrets are only ever written encrypted, except for the editor temp file `anvil secret` uses
   while you edit a value. The apply record is the other exception, below.
 - **The apply record holds previous file texts in plain text.** `last-apply.json` in `$XDG_STATE_HOME/anvil` (else
-  `~/.local/state/anvil`) keeps the text each `[[files]]` write replaced, so that `anvil rollback` can put it back
-  ([The apply record](cli.md#the-apply-record)). It is not encrypted: its protection is mode 0600 in a 0700 directory
-  owned by you, both checked on every run, and anvil refuses a record or directory open to others. Anyone who can read
-  your files as you, or a backup of them, can read it. A previous file others may not read (mode without `0o004`, such
-  as `/etc/sudoers.d/*` at 0440) keeps only its sha256, and its bytes never leave the target, so rollback cannot put it
-  back: apply warns and rollback names it. Text of such a file that an older anvil recorded stays in the record until
-  that target's next apply that writes a file, which drops it with a warning. A 0644 file in a 0700 directory is still
-  kept, as only the file's mode counts.
-  Set `rollback = false` on a `[[files]]` entry whose dest holds a
-  secret: the record then keeps only its sha256 ([Files](configuration.md#files)). A symlink, hard link or
-  case-insensitive alias of a dest cannot be seen on the controller and counts as a separate dest, so set it on every
-  entry for that file. Legacy `[[files]]` duplicates for one dest, the first with the default rollback and a later one
-  with `rollback = false`, still keep the later entry's secret as text on the second apply: use `[[tasks]]` or set
-  `rollback = false` on both. Never point `$XDG_STATE_HOME` into a
-  dotfiles or other shared repository, and never commit the record. The texts are never printed or logged, and core
-  dumps are turned off before the record is read. Since the record is only a file you own, rollback never trusts it to
-  choose a path: it refuses a record whose dest or mode apply could not have written, and restores only dests the
-  current config's `[[files]]` or file tasks still name, with the same `sudo`, for a target the entry applies to
-  ([anvil rollback](cli.md#anvil-rollback)).
-- **The record is trusted as the config is.** It is not signed or authenticated. At a dest the config names, the
-  record decides the bytes, owner, group and mode rollback puts back, so whoever can write it can have rollback (through
-  sudo, as root) write any text with any owner, group and mode there. Its `created_dirs` also decide which empty
-  directories on such a dest's path rollback removes, when that entry says `parents = true`. Keep it as private as the
-  config: the same user, the 0700 state directory, no shared or synced copy.
+  `~/.local/state/anvil`) keeps the text each `[[files]]` write replaced, and each file a `[[links]]` entry with
+  `force = true` replaced, so that `anvil rollback` can put it back ([The apply record](cli.md#the-apply-record)). It is
+  not encrypted: its protection is mode 0600 in a 0700 directory owned by you, both checked on every run, and anvil
+  refuses a record or directory open to others. Anyone who can read your files as you, or a backup of them, can read it.
+  A previous file others may not read (mode without `0o004`, such as `/etc/sudoers.d/*` at 0440) keeps only its sha256,
+  and its bytes never leave the target, so rollback cannot put it back: apply warns and rollback names it. Text of such
+  a file that an older anvil recorded stays in the record until that target's next apply that writes a file, which drops
+  it with a warning. A 0644 file in a 0700 directory is still kept, as only the file's mode counts. Set
+  `rollback = false` on a `[[files]]` entry whose dest holds a secret: the record then keeps only its sha256
+  ([Files](configuration.md#files)). A symlink, hard link or case-insensitive alias of a dest cannot be seen on the
+  controller and counts as a separate dest, so set it on every entry for that file. Legacy `[[files]]` duplicates for
+  one dest, the first with the default rollback and a later one with `rollback = false`, still keep the later entry's
+  secret as text on the second apply: use `[[tasks]]` or set `rollback = false` on both. A `[[links]]` entry with
+  `force = true` keeps the regular file it replaces under the same rules, and only its sha256 when a `[[files]]` entry
+  or file task for that path says `rollback = false`. Never point `$XDG_STATE_HOME`
+  into a dotfiles or other shared repository, and never commit the record. The texts are never printed or logged, and
+  core dumps are turned off before the record is read. Since the record is only a file you own, rollback never trusts it
+  to choose a path: it refuses a record whose dest or mode apply could not have written, and restores only dests the
+  current config's `[[files]]` or file tasks still name, with the same `sudo`, for a target the entry applies to, and
+  likewise only directories and links its `[[dirs]]` and `[[links]]` (or dir and link tasks) still name ([anvil
+  rollback](cli.md#anvil-rollback)).
+- **The record is trusted as the config is.** It is not signed or authenticated. At a dest the config names, the record
+  decides the bytes, owner, group and mode rollback puts back, so whoever can write it can have rollback (through sudo,
+  as root) write any text with any owner, group and mode there. Its `created_dirs` also decide which empty directories
+  on such a dest's path rollback removes, when that entry says `parents = true`. At a directory or link path the config
+  names it decides the owner, group and mode a directory gets back and the target a link points at again. Keep it as
+  private as the config: the same user, the 0700 state directory, no shared or synced copy.
 - **An include is trusted as the config is.** A [`[[tasks]]` include](configuration.md#tasks) decides what runs on your
   targets, with sudo where a task uses it, so whoever can write one can run anything there. Keep it as private as the
   config. An include holds only `tasks`, so it cannot change `[plugins]`, `[secrets]` or any other setting; a `plugin`

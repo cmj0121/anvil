@@ -49,8 +49,9 @@ Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
   started (`· ⠙ linode1, pi`), come before `targets:`. On the right, `✔ ok  ✘ failed` counts the shown result's
   targets. Text that does not fit is cut with `…`.
   An inventory that does not load shows `inventory error` in red instead of the selection, and its error as a notice.
-- **Steps.** The steps apply runs, numbered: `packages` when `[packages]` has work, then `file DEST` for each
-  `[[files]]` entry and `service NAME` for each `[[services]]` entry, then each `[[steps]]` command (its first line,
+- **Steps.** The steps apply runs, numbered: `packages` when `[packages]` has work, then `dir PATH` for each
+  `[[dirs]]` entry, `file DEST` for each `[[files]]` entry, `link PATH -> TARGET` for each `[[links]]` entry and
+  `service NAME` for each `[[services]]` entry, then each `[[steps]]` command (its first line,
   with `…` when it has more); a config without `[[steps]]` runs the default `hostname` step. A
   [`[[tasks]]`](configuration.md#tasks) config lists its expanded tasks in run order instead, each as `NAME  PATH` (the
   label above when it has no `name`), and apply and plan sections add a `PATH  NAME` line above each step. The cursor row is marked

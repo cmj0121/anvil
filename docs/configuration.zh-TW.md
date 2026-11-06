@@ -51,14 +51,22 @@ timeout = 300              # seconds the package step may run, 1..=3600; default
 apt = "fd-find"
 dnf = "fd-find"
 
-[[files]]                  # optional; after packages, before [[steps]]; see Files
+[[dirs]]                   # optional; after packages, before [[files]]; see Dirs
+path = "/etc/app/conf.d"   # the directory to create or fix
+mode = "0755"              # required, quoted
+
+[[files]]                  # optional; after [[dirs]], before [[links]]; see Files
 src = "files/sshd_config"  # relative to the workspace
 dest = "/etc/ssh/sshd_config"
 mode = "0644"              # required, quoted
 tags = ["linode"]          # optional; the target must carry every tag
 facts = { distro = "arch" } # optional; pkg matches by list membership
 
-[[services]]               # optional; after files, before [[steps]]; see Services
+[[links]]                  # optional; after [[files]], before [[services]]; see Links
+path = "/usr/local/bin/app" # the symlink
+target = "/opt/app/bin/app" # what it points at; need not exist
+
+[[services]]               # optional; after links, before [[steps]]; see Services
 name = "sshd"              # the unit, OpenRC service or launchd label
 state = "started"          # required: started | stopped
 enabled = true             # optional; omit to leave enablement alone
@@ -258,7 +266,7 @@ run = 'echo "deploying to $APP_ENV"'   # web1: staging; another web host: prod
   （`env.KEY: is longer than 4096 bytes`），每個層級至多 64 個鍵（`env: has more than 64 keys`）。
 - **`env` 的去處。** `[[steps]]` 或 task 的 `run`、plugin step 與 `anvil run` 腳本，開頭會是 target 的 env，
   以 `KEY='value'` 與 `export KEY` 行寫在經由傳輸 stdin 送出的腳本內，絕不放在 argv 上。
-  值以單引號包住，因此引號、`$`、反引號與反斜線都會原樣抵達。套件、檔案與服務不會取得 env。
+  值以單引號包住，因此引號、`$`、反引號與反斜線都會原樣抵達。套件、目錄、檔案、連結與服務不會取得 env。
   報告、plan 與 `--json` 顯示的是你寫的腳本，不含這些行。
 - **sudo。** `sudo` 會重設環境（`env_reset`），因此經由它執行的指令看不到 `env`。請以名稱傳遞值：
   `sudo APP_ENV="$APP_ENV" cmd`。
@@ -314,6 +322,16 @@ tags = ["linode"]          # optional; every tag must be on the target
 facts = { distro = "arch" } # optional; each value equals that fact
 sudo = true                # optional; default true. false writes as the connecting user
 notify = ["reload sshd"]   # optional; [[handlers]] to run when this step changes the file; see Handlers
+
+[[dirs]]                   # optional; one directory created or fixed per matching target; see Dirs
+path = "/etc/app/conf.d"   # required: absolute path on the target, the dest rules
+mode = "0755"              # required: a quoted string of 3 or 4 octal digits
+owner = "root"             # optional; also group, parents, tags, facts, sudo, notify as on [[files]]
+
+[[links]]                  # optional; one symlink per matching target; see Links
+path = "/usr/local/bin/app" # required: absolute path on the target, the dest rules
+target = "/opt/app/bin/app" # required: absolute or relative, at most 4096 bytes; need not exist
+force = false              # optional; default false. true replaces a regular file at path
 
 [[services]]               # optional; one service brought to a state per matching target; see Services
 name = "sshd"              # required: [A-Za-z0-9:_@.-]+, at most 255 bytes
@@ -385,7 +403,7 @@ symlink 視為存在，即使是懸空的。一個 step 可設定多個 guard；
 plugin step 的訊息改以 `skipped plugin NAME:` 開頭（`skipped plugin harden: /etc/x exists`）。
 被略過的 step 不會讓 target 失敗，下一個 step 照常執行；其輸出見 [Guarded steps](cli.zh-TW.md#guarded-steps)。
 
-guard 可寫在 `[[steps]]` 項目以及 `run` 與 `plugin` [task](#tasks) 上。`[[files]]`、`[[services]]` 與 `[packages]`
+guard 可寫在 `[[steps]]` 項目以及 `run` 與 `plugin` [task](#tasks) 上。`[[dirs]]`、`[[files]]`、`[[links]]`、`[[services]]` 與 `[packages]`
 沒有這些鍵，會以解析器的 `unknown field` 訊息拒絕；其他 task 上的 guard 也以 2 結束（[Tasks](#tasks)）。
 這些種類本身已會收斂，或沒有單一指令可守衛。
 
@@ -408,8 +426,8 @@ guard 隨 step 自己的腳本送出，因此有 guard 的 step 仍只需一次�
 每個名稱都必須是某個 `[[handlers]]` 項目的名稱，否則以 2 結束並顯示
 ``steps[0].notify[0] `reload ssh`: names no [[handlers]] entry``。
 
-上述區段依固定順序執行：套件、檔案、服務、step。要自行決定順序，請改用 [`[[tasks]]`](#tasks)，
-取代 `[[files]]`、`[[services]]`、`[[steps]]` 與 `[packages]` 中的清單。
+上述區段依固定順序執行：套件、目錄、檔案、連結、服務、step，最後是 handler。要自行決定順序，請改用 [`[[tasks]]`](#tasks)，
+取代 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[services]]`、`[[steps]]` 與 `[packages]` 中的清單。
 
 沒有 `[secrets]` 時，backend（後端）在 macOS 上是 keychain（其他平台不支援）。
 只有被選中的 backend 的區段是必要的且會被檢查：缺少該區段、未知的 backend，或在非 macOS 上使用 `keychain`，
@@ -453,7 +471,7 @@ names = ["HOST_SUDO"]
 ## Files
 
 `[[files]]` 項目把一份文字檔複製到每個 tag 與 fact 全部符合的選定 target。沒有 `tags` 也沒有 `facts` 時代表每個選定的 target。
-符合的項目依 config 順序執行，排在套件 step 之後、`[[steps]]` 之前（`file` [task](#tasks) 則在它所在的位置執行）；
+符合的項目依 config 順序執行，排在套件 step 與 [`[[dirs]]`](#dirs) step 之後、[`[[links]]`](#links) step 之前（`file` [task](#tasks) 則在它所在的位置執行）；
 不符合的項目仍是一個 step，回報為略過，該 target 的其他 step 仍會執行（[File steps](cli.zh-TW.md#file-steps)）。
 最多 64 個項目：多一個就以 2 結束並顯示 `files: N entries exceeds the 64 entry limit`（65 個時為 `files: 65 entries exceeds the 64 entry limit`）。
 未知的鍵，或不是布林值的 `sudo` 或 `rollback`，以 2 結束並顯示解析器的訊息，其中會指出該鍵與行號。
@@ -787,11 +805,148 @@ drift 檢查，全都使用該 target 的算繪文字。因此 var 改變後，�
 **已知限制。** 字串串接（`~`）與大量重複（`*`）可能在 1 MiB 上限生效之前就在控制端用掉大量記憶體
 （MiniJinja 把單次重複限制在 100 MB）。範本與 config 一樣被信任：能編輯它的人本來就能在 target 上執行任何 step。
 
+## Dirs
+
+`[[dirs]]` 項目在每個 tag 與 fact 全部符合的選定 target 上建立一個目錄，或修正它的擁有者、群組與 mode。
+符合的項目依 config 順序執行，排在套件 step 之後、`[[files]]` 之前，因此目錄會在放入它的檔案之前就存在
+（`dir` [task](#tasks) 則在它所在的位置執行）。不符合的項目仍是一個 step，回報為 `skipped dir PATH: no match`，
+該 target 的其他 step 仍會執行（[Dir steps](cli.zh-TW.md#dir-steps)）。
+
+```toml
+[[dirs]]
+path = "/etc/app/conf.d"         # required: absolute path on the target, the dest rules of [[files]]
+mode = "0750"                    # required: quoted, 3 or 4 octal digits
+owner = "root"                   # optional; a user name or numeric id. Unset: keep the directory's owner
+group = "app"                    # optional; a group name or numeric id. Unset: keep the directory's group
+parents = true                   # optional; default false. true: create missing directories above path
+tags = ["linode"]                # optional; every one must be on the target
+facts = { distro = "arch" }      # optional; a probe key, equal to that fact
+sudo = false                     # optional; default true. false: work as the connecting user
+notify = ["reload app"]          # optional; the [[handlers]] to run when the step creates or fixes it
+```
+
+各鍵遵循 [Files](#files) 的規則與訊息，前綴為 `dirs[I]`：`path` 依 `dest` 的規則檢查
+（``dirs[0].path `etc/app`: must be an absolute path``），`mode` 依檔案的 mode 檢查（`dirs[0].mode: required`、
+``dirs[0].mode `2755`: setuid and setgid are refused``），`owner`、`group`、`tags`、`facts`、`sudo` 與 `notify` 與
+`[[files]]` 相同。其他鍵（例如 `src` 或 `template`）以 2 結束並顯示解析器的訊息。最多 64 個項目，與 `[[files]]` 分開計算：
+多一個就以 2 結束並顯示 `dirs: 65 entries exceeds the 64 entry limit`。
+
+**寫到 target 上的結果。** step 檢視 `path` 時不跟隨它：
+
+- 什麼都沒有：建立目錄（在它仍為空、不屬於其他人時為 mode 0700），再以修正的方式給它擁有者、群組與 mode，
+  step 印出 `created DIR`。這一步失敗時，新目錄會再被移除，step 失敗。
+- 是目錄：把它的擁有者（設定了 `owner` 時）、群組（設定了 `group` 時）與 mode 和項目比較。不同之處依檔案的順序修正：
+  先把 mode 收窄為擁有者的位元，再套用新的擁有者或群組，最後設定 `mode`；只有 mode 偏移時只需一次 `chmod`。
+  之後再讀一次，沒有生效的修正讓 step 失敗並顯示 `dirs: DIR: owner, group or mode did not take (now UID:GID MODE)`。
+  step 印出 `fixed DIR: owner, group, mode`，只列出它變更的項目；沒有任何不同時印出 `unchanged DIR`。
+- 其他任何東西，包括一般檔案或 symlink（指向目錄或懸空）：step 失敗並顯示 `dirs: DIR is not a directory`，該路徑保持原樣。
+
+絕不遞迴：目錄的內容、其擁有者與 mode 都不會被動到。目錄的 setuid 與 setgid 位元不受管理。`mode` 無法要求它們，
+目錄已有的（手動設定，或從 setgid 的上層目錄繼承）在每個平台上都保持原樣，不列入比較，也不記入
+[apply 紀錄](cli.zh-TW.md#apply-紀錄)。sticky 位元（`1777`）與其他位元一樣受管理。
+
+其他失敗都會指名 DIR：`dirs: cannot create DIR`、`dirs: cannot read DIR's owner, group and mode`、
+`dirs: cannot give DIR owner NAME`、`dirs: DIR cannot be given mode MODE: only its owner can chmod it`（以連線使用者處理其他使用者的目錄），
+以及 [Files](#files) 中以 `dirs` 為前綴的擁有者與群組訊息：`dirs: owner NAME does not exist on the target`、
+`dirs: group NAME does not exist on the target` 與 `dirs: group NAME is not one of USER's groups`。
+
+**誰寫入。** 與 [`[[files]]`](#files) 相同：預設透過 sudo 以 root，`sudo = false` 時為連線使用者，以 root 登入時不論
+`sudo` 為何都是 root；sudo 要求密碼時，從 target 的 sudo secret 輸入密碼。`sudo = false` 時擁有者必須是登入使用者：
+其他擁有者名稱會在該 target 上任何 step 執行之前讓它失敗，以 1 結束，並顯示
+`dirs[0].owner NAME: needs sudo; the login user is USER`（task 則為 `tasks[0].dir.owner …`）。
+sudo 失敗時拒絕該 step，顯示 `dirs: sudo failed; DIR is unchanged`。
+
+**其上的目錄。** `path` 之上的每個目錄都必須通過檔案 dest 的 root-only 規則：由 root 擁有（`sudo = false` 時由 root 或登入使用者擁有），
+且群組與其他人都不可寫入。第一個不通過的會在建立任何東西之前停下 step，顯示
+`dirs: DIR is not root-only; root will not write under it` 或
+`dirs: DIR is not owned by root or the login user, or others can write it; anvil will not write under it`。
+不存在的目錄以 `dirs: DIR does not exist; set parents = true to create it` 失敗；設定 `parents = true` 時，它以寫入的身分
+由上而下用 `mkdir -m 0755` 建立，建立後立刻再檢查，並記在紀錄中，讓 rollback 在它為空時移除它。
+sudo 無法執行的檢查為 `dirs: sudo could not check DIR; nothing was changed`。
+
+**`notify`。** step 印出 `created DIR` 或 `fixed DIR: …` 時要執行的 handler；`unchanged DIR` 不通知任何東西（[Handlers](#handlers)）。
+
+受限的 sudo 規則需要 `true`、`test`、`find`、`ls`、`mkdir` 與 `chmod`，`owner` 另需 `chown`，`group` 另需 `chgrp`，
+建立失敗時與 rollback 另需 `rmdir`。
+
+## Links
+
+`[[links]]` 項目在每個 tag 與 fact 全部符合的選定 target 上，讓 `path` 成為指向 `target` 的 symlink。
+符合的項目依 config 順序執行，排在 `[[files]]` 之後、`[[services]]` 之前（`link` [task](#tasks) 則在它所在的位置執行）。
+不符合的項目仍是一個 step，回報為 `skipped link PATH: no match`（[Link steps](cli.zh-TW.md#link-steps)）。
+
+```toml
+[[links]]
+path = "/usr/local/bin/app"      # required: absolute path on the target, the dest rules of [[files]]
+target = "/opt/app/bin/app"      # required: what the link points at; absolute or relative
+force = false                    # optional; default false. true: replace a regular file at path
+parents = true                   # optional; default false. true: create missing directories above path
+tags = ["linode"]                # optional; every one must be on the target
+facts = { distro = "arch" }      # optional; a probe key, equal to that fact
+sudo = false                     # optional; default true. false: work as the connecting user
+notify = ["restart app"]         # optional; the [[handlers]] to run when the step links or relinks it
+```
+
+`path`、`tags`、`facts`、`sudo` 與 `notify` 遵循 [Files](#files) 的規則，前綴為 `links[I]`。連結沒有 `mode`、`owner` 或 `group`：
+這些鍵與其他未知的鍵都以 2 結束並顯示解析器的訊息。最多 64 個項目，與 `[[files]]` 及 `[[dirs]]` 分開計算：
+`links: 65 entries exceeds the 64 entry limit`。
+
+**`target`。** 絕對或相對路徑（相對路徑與任何 symlink 一樣，從連結所在的目錄解讀），1 到 4096 位元組，
+不含控制字元（因此沒有 NUL 與換行），也不含不可見或 bidi 字元，因為輸出、`plan` 與 `--json` 都會顯示它。
+它從不檢查是否存在：允許懸空的連結，以 `-` 開頭的 target 也可以。以 2 結束：
+
+- `links[0].target ``: is empty`
+- ``links[0].target `/aaa…`: 4097 bytes exceeds the 4096 byte limit``
+- ``links[0].target `/srv/app\nbin`: contains a control character``（該字元以跳脫序列顯示）
+- ``links[0].target `/srv/\u{202e}app`: contains an invisible or bidi character``
+
+**寫到 target 上的結果。** step 檢視 `path` 時不跟隨它：
+
+- 什麼都沒有：`ln -s -- TARGET PATH`，step 印出 `linked PATH -> TARGET`。
+- symlink 的內容（`readlink` 印出的樣子）與 `target` 逐位元組相同：`unchanged PATH`。`/opt/app` 與 `/opt/app/` 不同。
+- 指向其他東西的 symlink，包括指向目錄的：以原子方式取代，step 印出 `relinked PATH -> TARGET`。絕不跟隨該連結。
+- 一般檔案：除非 `force = true`，否則拒絕並顯示 `links: PATH is a regular file; set force = true to replace it`。
+  設定後，該檔案會像寫入前讀取檔案 dest 一樣先讀取，並以檔案先前文字的方式保存在 [apply 紀錄](cli.zh-TW.md#apply-紀錄)中
+  （只在 world-readable、UTF-8 且最多 256 KiB 時），再以原子方式取代，step 印出 `linked PATH -> TARGET`。
+  無法讀取的檔案以 `links: cannot read PATH before replacing it` 失敗。
+  若同一路徑的 `[[files]]` 項目或 file task 設定 `rollback = false`，就只保存該檔案的 sha256。
+- 目錄：不論有沒有 `force` 都一律拒絕，顯示 `links: PATH is a directory`。
+- 其他東西（FIFO、socket、裝置）：`links: PATH is not a symlink or a regular file`。
+
+每次拒絕都讓 `path` 保持原樣。目前 target 無法記入紀錄的連結會在比較之前就被拒絕，讓 rollback 永遠能把它放回去：
+含換行的會以 `links: PATH points at a target with a newline; anvil will not replace it` 失敗，
+不是 UTF-8 文字或含控制字元的則顯示 `links: PATH points at a target anvil cannot record; anvil will not replace it`。
+非 ASCII 的舊 target 由 target 上的 `iconv` 檢查；沒有 `iconv` 時也以同樣方式拒絕。
+
+**原子性的重新連結。** 連結或檔案的取代方式是：在 `path` 旁建立新連結（`ln -s --` 到名為 `.anvil-<16 hex>-<16 hex>` 的暫存名稱），
+再把它改名蓋過去，因此 `path` 永遠是舊連結或新連結。單純的 `mv -f` 遇到指向目錄的連結時會把新連結移進那個目錄，
+所以改名使用 `mv -fT`（GNU），否則用 `mv -fh`（macOS、BSD），兩者都不會跟隨 `path`。改名之前，以及改名失敗之後，
+`path` 上的真正目錄都會被拒絕（`links: PATH is a directory`）。只有 `mv` 兩個選項都不認得時，才會先移除 `path`，
+再把暫存連結改名到空出來的名稱，並發出警告 `links: PATH: not replaced atomically: no mv -T or mv -h`；
+其他 `mv` 錯誤會以該錯誤讓 step 失敗。之後讀回連結：沒有指向 `target` 時，step 以 `links: PATH was not replaced`
+（新建的連結則為 `links: PATH was not linked`）失敗。無法建立暫存連結時以
+`links: cannot create a link beside PATH; PATH is unchanged` 失敗，暫存連結在改名前消失時則為
+`links: the new link beside PATH is gone; PATH is unchanged`。step 失敗或被中斷時會移除暫存連結；
+被殺掉的執行留下的暫存連結，會在超過一小時後由同一路徑的下一個 step 移除。
+
+**誰寫入，以及其上的目錄。** 與 [`[[dirs]]`](#dirs) 相同，前綴為 `links`：預設透過 sudo 以 root，`sudo = false` 時為連線使用者，
+sudo 失敗時為 `links: sudo failed; PATH is unchanged`。`path` 之上的每個目錄都必須通過檔案 dest 的 root-only 規則，
+`parents = true` 會建立不存在的目錄（`links: DIR is not root-only; root will not write under it`、
+`links: DIR is not owned by root or the login user, or others can write it; anvil will not write under it`、
+`links: DIR does not exist; set parents = true to create it`、`links: cannot create DIR`）。
+`target` 以及它指向的東西從不檢查。
+
+**`notify`。** step 印出 `linked PATH -> TARGET` 或 `relinked PATH -> TARGET` 時要執行的 handler；
+`unchanged PATH` 不通知任何東西（[Handlers](#handlers)）。
+
+受限的 sudo 規則需要 `true`、`test`、`find`、`readlink`、`ln`、`mv` 與 `rm`，`parents` 另需 `mkdir`，
+移除所建立目錄的 rollback 另需 `rmdir`，讀取 `force` 取代的檔案另需 `ls` 與 `od`。
+
 ## Services
 
 `[[services]]` 項目在每個 tag 與 fact 全部符合的選定 target 上，把一個服務帶到指定的狀態；設定了 `enabled` 時，也帶到該啟用狀態。
 它先詢問 target 的 init，只變更不同之處，因此服務已在該狀態時再次執行會印出 `unchanged service NAME`。
-符合的項目依 config 順序執行，排在 `[[files]]` step 之後、`[[steps]]` 之前（`service` [task](#tasks) 則在它所在的位置執行）；
+符合的項目依 config 順序執行，排在 `[[links]]` step 之後、`[[steps]]` 之前（`service` [task](#tasks) 則在它所在的位置執行）；
 不符合的項目仍是一個 step，回報為 `skipped service NAME: no match`，該 target 的其他 step 仍會執行
 （[Service steps](cli.zh-TW.md#service-steps)）。
 
@@ -895,8 +1050,8 @@ launchd 的變更是以替身工具測試的，而非實際的 launchd；只有 
 ## Tasks
 
 `[[tasks]]` 清單在每個 target 上由上而下，依你寫的順序執行。
-當設定需要舊版區段固定順序（套件、檔案、服務、step）以外的順序時就用它：
-先建立目錄再放入檔案，或在檔案與讀取它的服務之間執行 migration。
+當設定需要舊版區段固定順序（套件、目錄、檔案、連結、服務、step）以外的順序時就用它：
+在兩個檔案之間執行一個 step，或在檔案與讀取它的服務之間執行 migration。
 task 可以巢狀，也可以 include [檔案儲存區](cli.zh-TW.md#anvil-files)中的 task 檔。沒有 `[[tasks]]` 的 config 行為完全不變。
 
 `config.toml`：
@@ -941,7 +1096,7 @@ facts = { os = "Linux" }           # ANDed with the parent's tags
 
 **種類。** 每個 task 恰有下列其中一種，另可設定 `name`、`tags` 與 `facts`。未知的鍵以 2 結束並顯示解析器的訊息。
 兩種以上以 2 結束並顯示 `tasks[0]: has run and include; keep one`，都沒有時為
-`tasks[0]: needs one of run, plugin, packages, file, service, include, tasks`。
+`tasks[0]: needs one of run, plugin, packages, file, service, dir, link, include, tasks`。
 
 | 種類       | 作用                                                                             |
 | ---------- | -------------------------------------------------------------------------------- |
@@ -950,28 +1105,32 @@ facts = { os = "Linux" }           # ANDed with the parent's tags
 | `packages` | 只有 `install`、`pin`、`remove` 與 `upgrade`，與 `[packages]` 相同               |
 | `file`     | [`[[files]]`](#files) 的鍵，但 `tags`、`facts` 與 `notify` 寫在 task 上          |
 | `service`  | `name`、`state` 與 `enabled`，與 [`[[services]]`](#services) 相同                |
+| `dir`      | [`[[dirs]]`](#dirs) 的鍵，但 `tags`、`facts` 與 `notify` 寫在 task 上            |
+| `link`     | [`[[links]]`](#links) 的鍵，但 `tags`、`facts` 與 `notify` 寫在 task 上          |
 | `include`  | `$/…` task 檔，就地展開                                                          |
 | `tasks`    | 子 task，寫成 `[[tasks.tasks]]` 或 inline array                                  |
 
-`tags` 與 `facts` 寫在 task 上，不寫在 `file` 或 `service` 裡：否則以 2 結束並顯示
-`tasks[0].file: tags and facts belong on the task, not the file`。
+`tags` 與 `facts` 寫在 task 上，不寫在 `file`、`service`、`dir` 或 `link` 裡：否則以 2 結束並顯示
+`tasks[0].file: tags and facts belong on the task, not the file`（`… not the dir`、`… not the link`）。
 selector 不符合的 task 仍是一個 step，回報為略過（`skipped run: no match`、`skipped packages: no match`），
 該 target 的其他 step 仍會執行。失敗的 task 會結束該 target；其他 target 繼續。
 沒有要做任何事的 `packages` task、空的 `tasks` 與沒有 task 的 include 都不產生 step。
-每個 file 與 service task 都是自己的 step，可以重複：[`[[services]]` 的重複規則](#services)不適用，
+每個 file、dir、link 與 service task 都是自己的 step，可以重複：[`[[services]]` 的重複規則](#services)不適用，
 因為停止、migration、啟動就是這樣寫的。含 `[[tasks]]` 的 config 沒有預設的 `hostname` step。
 
 **Guard。** `run` 或 `plugin` task 也可設定 [guard](#config) `creates`、`removes`、`onlyif` 與 `unless`，
-規則與 `[[steps]]` 相同。在 `packages`、`file`、`service`、`include` 或 `tasks` task 上，guard 在任何深度都以 2 結束，
+規則與 `[[steps]]` 相同。在 `packages`、`file`、`service`、`dir`、`link`、`include` 或 `tasks` task 上，guard 在任何深度都以 2 結束，
 並依上述順序指名第一個設定的 guard：`tasks[0].creates: only on a run or plugin task`、
 `tasks[0].tasks[0].onlyif: only on a run or plugin task`。
 
-**`notify`。** `run`、`plugin`、`file` 或 `service` task 可以設定 [`notify`](#handlers)，寫在 task 上，而不是 `file` 或 `service` 裡面。
+**`notify`。** `run`、`plugin`、`file`、`service`、`dir` 或 `link` task 可以設定 [`notify`](#handlers)，寫在 task 上，
+而不是 `file`、`service`、`dir` 或 `link` 裡面。
 以 2 結束：`tasks[0].notify: not on a packages task; packages give no change signal`、
-`tasks[0].notify: only on a run, plugin, file or service task`（`include` 或 `tasks` 群組）、
-`tasks[0].file: notify belongs on the task, not the file` 與
-`tasks[0].service: notify belongs on the task, not the service`。`[[handlers]]` 留在主檔案中：含有它的 include
-以 2 結束並顯示解析器的訊息。
+`tasks[0].notify: only on a run, plugin, file, service, dir or link task`（`include` 或 `tasks` 群組）、
+`tasks[0].file: notify belongs on the task, not the file`、
+`tasks[0].service: notify belongs on the task, not the service`、
+`tasks[0].dir: notify belongs on the task, not the dir` 與 `tasks[0].link: notify belongs on the task, not the link`。
+`[[handlers]]` 留在主檔案中：含有它的 include 以 2 結束並顯示解析器的訊息。
 
 **巢狀。** 子 task 繼承 `tags` 與 `facts`，每一層都必須符合：target 必須帶有鏈上的每個 tag，fact 以 AND 結合。
 同一條鏈上同一個 fact 鍵有兩個不同的值永遠不會符合，因此以 2 結束並顯示
@@ -1004,10 +1163,12 @@ include 受儲存區的限制（不含 NUL 的一般 UTF-8 文字檔，最多 1 
 | 256 個 task                              | `PATH: more than 256 tasks after expansion`           |
 | 64 個 file task                          | `PATH: more than 64 file tasks after expansion`       |
 | 64 個 service task                       | `PATH: more than 64 service tasks after expansion`    |
+| 64 個 dir task                           | `PATH: more than 64 dir tasks after expansion`        |
+| 64 個 link task                          | `PATH: more than 64 link tasks after expansion`       |
 | 走訪 4096 個 task，群組與 include 也計入 | `PATH: more than 4096 tasks visited during expansion` |
 
-**混用。** `[[tasks]]` 與 `[[files]]`、`[[services]]`、`[[steps]]`，或 `[packages]` 的 `install`、`pin`、`remove`、`upgrade` 並用時，
-以 2 結束並顯示 `[[tasks]] cannot be mixed with [[steps]]; move it into a task`。沒有自動遷移。
+**混用。** `[[tasks]]` 與 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[services]]`、`[[steps]]`，
+或 `[packages]` 的 `install`、`pin`、`remove`、`upgrade` 並用時，以 2 結束並顯示 `[[tasks]] cannot be mixed with [[steps]]; move it into a task`。沒有自動遷移。
 `[packages.alias]` 與其他 `[packages]` 設定（`manager`、`local`、`local_sudo_secret`、`timeout`）維持全域，可與 `[[tasks]]` 並用，
 `[[handlers]]`、`[plugins]`、`[secrets]`、`[harden]` 與 `[anvil]` 也一樣。
 
@@ -1072,15 +1233,18 @@ run = "fc-cache -f"
 - handler 本身的 `tags`、`facts`、`notify`、guard、`plugin` 或任何其他鍵：解析器的 `unknown field` 訊息。
   handler 只在被通知的地方執行，且 handler 不會通知 handler。
 
-**`notify`。** 一串 handler 名稱，可寫在 `[[files]]`、`[[services]]` 與 `[[steps]]` 項目上，以及 `run`、`plugin`、
-`file` 與 `service` [task](#tasks) 上。列出兩次的名稱只算一次。沒有對應 handler 的名稱以 2 結束並指名該項目：
-``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry``（或 `files[I]`、`services[I]`、`tasks[I]`）。
+**`notify`。** 一串 handler 名稱，可寫在 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[services]]` 與 `[[steps]]` 項目上，
+以及 `run`、`plugin`、`file`、`service`、`dir` 與 `link` [task](#tasks) 上。列出兩次的名稱只算一次。
+沒有對應 handler 的名稱以 2 結束並指名該項目：
+``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry``（或 `dirs[I]`、`files[I]`、`links[I]`、`services[I]`、`tasks[I]`）。
 
 **step 何時通知。** 只有在 target 上執行、以 0 結束且改變了東西的 step：
 
 | Step          | 在下列情況通知                       | 下列情況不通知                |
 | ------------- | ------------------------------------ | ----------------------------- |
 | file          | 印出 `wrote DEST` 或 `fixed DEST: …` | 印出 `unchanged DEST`         |
+| dir           | 印出 `created DIR` 或 `fixed DIR: …` | 印出 `unchanged DIR`          |
+| link          | 印出 `linked …` 或 `relinked …`      | 印出 `unchanged PATH`         |
 | service       | 印出任何變更行                       | 印出 `unchanged service NAME` |
 | run 或 plugin | 執行且以 0 結束                      | 被 [guard](#config) 略過      |
 | 任何          |                                      | 以 no match 略過，或失敗      |
@@ -1120,8 +1284,8 @@ handler 只有在執行並以 0 結束後才會離開該清單。後面的 step 
 下一次 apply 會再執行它：請把 handler 寫成可以執行兩次。通知在 step 結束後立即存檔，因此在結束與存檔之間當機會遺失該通知；
 下一次 apply 時，file 或 service step 找不到要變更的東西，不會再次通知。發生這種當機後，請自行執行 handler 的指令。
 
-**Rollback。** [`anvil rollback`](cli.zh-TW.md#anvil-rollback) 從不執行 handler。對它放回的每個檔案（還原、移除或發現未變更），
-它把該 dest 的 file 項目中適用於該 target 者（以紀錄保存的 fact 比對）的 `notify` 名稱，依 `[[handlers]]` 順序加入該 target 的待執行清單，
+**Rollback。** [`anvil rollback`](cli.zh-TW.md#anvil-rollback) 從不執行 handler。對它放回的每個檔案、目錄或連結（還原、移除或發現未變更），
+它把該路徑的項目中適用於該 target 者（以紀錄保存的 fact 比對）的 `notify` 名稱，依 `[[handlers]]` 順序加入該 target 的待執行清單，
 讓下一次 apply 重新載入讀取那個還原檔案的服務。
 
 **`restarted` 與 `reloaded`。** 兩個只用於 handler 的服務狀態；`[[services]]` 項目或 `service` task 使用其中之一會以 2 結束，

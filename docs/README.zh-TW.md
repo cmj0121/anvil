@@ -7,7 +7,7 @@
 ## 從這裡開始
 
 - [入門](getting-started.zh-TW.md)：安裝（含預先建置的執行檔）、首次執行與範例輸出。
-- [設定](configuration.zh-TW.md)：inventory 與 config 的每個鍵，包括檔案、服務與 plugin。
+- [設定](configuration.zh-TW.md)：inventory 與 config 的每個鍵，包括目錄、檔案、連結、服務與 plugin。
 - [套件](packages.zh-TW.md)：target 使用哪個管理器、別名、pin 與 remove，以及 root 與 sudo 如何運作。
 - [機密](secrets.zh-TW.md)：keychain、age 與 sops backend，以及在它們之間搬移 secret。
 - [終端機介面](tui.zh-TW.md)：`anvil tui` 的畫面（在終端機上單獨執行 `anvil` 亦同）、按鍵、檔案瀏覽器與規則。

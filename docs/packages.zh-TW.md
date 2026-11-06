@@ -43,7 +43,7 @@ apply 會先套用 alias、排除與 pin 相同的 install 名稱，再查詢 in
   ✔ ok · 4 steps
 ```
 
-未知名稱不會使 target 失敗，後續 files、services 與 steps 照常執行。
+未知名稱不會使 target 失敗，後續 dirs、files、links、services 與 steps 照常執行。
 所有 target 成功時 exit code 為 0，即使有警告；實際安裝、更新或 sudo 失敗仍會使 target 失敗。
 請用 `[packages.alias.NAME]` 指定正確名稱，anvil 不會猜測。
 

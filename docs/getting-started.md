@@ -64,7 +64,7 @@ not own, and one in a directory you cannot write; the details are in [cli.md](cl
 
 ```sh
 anvil inventory            # add your hosts (opens $EDITOR, default nvim)
-anvil config               # edit the preferences, packages, files, services and steps
+anvil config               # edit the preferences, packages, dirs, files, links, services and steps
 anvil inventory --format=yaml   # edit it as YAML this once; it is still saved as TOML
 anvil files cp motd '$/'   # keep a file in the store, for [[files]] src = "$/motd"
 anvil secret HOST_SUDO     # store a secret (in the macOS keychain unless [secrets] says otherwise)
