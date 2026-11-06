@@ -7,6 +7,7 @@ pub mod apply;
 mod bytes;
 pub mod cancel;
 pub mod config;
+pub mod dirs;
 pub mod doctor;
 pub mod document;
 pub mod editor;

@@ -849,3 +849,43 @@ fn show_rendered_leaves_a_config_without_templates_unchanged() {
     let doc = json(&sandbox.anvil(&["--json", "plan", "--show-rendered"], &[]));
     assert_eq!(keys(&doc), ["executed", "ok", "targets"]);
 }
+
+#[test]
+fn a_dir_shows_its_mode_owner_group_and_parents() {
+    let sandbox = Sandbox::new("pl");
+    let owned = sandbox.root().join("new/app");
+    let owned = owned.display();
+    let plain = sandbox.root().join("plain");
+    let plain = plain.display();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[dirs]]\npath = \"{owned}\"\nmode = \"0750\"\nsudo = false\n\
+             owner = \"0\"\ngroup = \"wheel\"\nparents = true\n\n\
+             [[dirs]]\npath = \"{plain}\"\nmode = \"0755\"\nsudo = false\n\n\
+             [[dirs]]\npath = \"/nowhere\"\nmode = \"0755\"\ntags = [\"web\"]\n"
+        ),
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  would $ dir {owned}\n    mode 0750\n    owner 0\n    group wheel\n    parents\n  \
+             would $ dir {plain}\n    mode 0755\n  would $ skipped dir /nowhere: no match\n  \
+             would $ hostname\n  ✔ 4 steps\n\n1 target, nothing executed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let steps = &json(&out)["targets"][0]["steps"];
+    assert_eq!(
+        steps[0],
+        serde_json::json!({"run": format!("dir {owned}"), "mode": "0750", "owner": "0", "group": "wheel", "parents": true})
+    );
+    assert_eq!(
+        steps[1],
+        serde_json::json!({"run": format!("dir {plain}"), "mode": "0755"})
+    );
+    assert!(!sandbox.root().join("new").exists(), "nothing created");
+}

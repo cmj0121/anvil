@@ -511,11 +511,18 @@ pub fn guard_texts(step: &PlannedRun) -> Vec<String> {
     .collect()
 }
 
-/// A file step's `owner NAME`, `group NAME` and `parents`, one line each,
-/// for those it sets; names are validated config text.
+/// A dir step's `mode MODE`, a file or dir step's `owner NAME`, `group
+/// NAME` and `parents`, one line each, for those it sets; names are
+/// validated config text.
 fn attr_texts(step: &PlannedRun) -> Vec<String> {
-    let (owner, group, parents) = step.attrs();
+    let crate::step::Attrs {
+        mode,
+        owner,
+        group,
+        parents,
+    } = step.attrs();
     [
+        mode.map(|mode| format!("mode {mode}")),
         owner.map(|owner| format!("owner {owner}")),
         group.map(|group| format!("group {group}")),
         parents.then(|| "parents".to_owned()),

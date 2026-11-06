@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::config::Guards;
+use crate::dirs;
 use crate::files;
 use crate::logger::{escape_invisible, escape_line};
 use crate::packages;
@@ -42,6 +43,8 @@ pub enum RunKind {
     /// rollback restore, and a rollback note, which is always a skip and has
     /// `dest` `""`.
     File { dest: String, run: FileRun },
+    /// A `[[dirs]]` step; also a rollback restore of one.
+    Dir { path: String, run: DirRun },
     /// A `[[services]]` step.
     Service { name: String, run: ServiceRun },
     /// A `[[steps]]` entry, 1-based among them, the plugin that returned it,
@@ -81,6 +84,7 @@ impl RunKind {
         match self {
             RunKind::Packages { .. } => Entry::Packages,
             RunKind::File { dest, .. } => Entry::File { dest: dest.clone() },
+            RunKind::Dir { path, .. } => Entry::Dir { path: path.clone() },
             RunKind::Service { name, .. } => Entry::Service { name: name.clone() },
             RunKind::Step { number, .. } => Entry::Step { number: *number },
             RunKind::Skip | RunKind::Script => Entry::Script,
@@ -95,6 +99,9 @@ pub enum Entry {
     Packages,
     File {
         dest: String,
+    },
+    Dir {
+        path: String,
     },
     Service {
         name: String,
@@ -141,6 +148,14 @@ pub struct FileRun {
     /// How the step writes, to build it again with what the capture saw;
     /// `None` for a skip.
     pub write: Option<files::FileWrite>,
+}
+
+/// A `[[dirs]]` step: whether the entry matched no tag or fact of the
+/// target, and how it runs; `None` for a skip or a rollback restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirRun {
+    pub skip: bool,
+    pub write: Option<dirs::DirWrite>,
 }
 
 /// A `[[services]]` step: whether the entry matched no tag or fact of the target.
@@ -216,18 +231,42 @@ impl PlannedRun {
         self.file()?.write.as_ref()?.rendered.as_deref()
     }
 
-    /// A file step's `owner` and `group`, each `None` when unset, and its
-    /// `parents`; all unset for any other step.
-    pub fn attrs(&self) -> (Option<&str>, Option<&str>, bool) {
-        let Some(write) = self.file().and_then(|run| run.write.as_ref()) else {
-            return (None, None, false);
+    /// A dir step's mode, a file or dir step's `owner` and `group`, each
+    /// `None` when unset, and its `parents`; all unset for any other step.
+    pub fn attrs(&self) -> Attrs<'_> {
+        let (mode, ids, parents) = match (&self.kind, self.file()) {
+            (
+                _,
+                Some(FileRun {
+                    write: Some(write), ..
+                }),
+            ) => (None, &write.ids, write.parents),
+            (
+                RunKind::Dir {
+                    run:
+                        DirRun {
+                            write: Some(write), ..
+                        },
+                    ..
+                },
+                _,
+            ) => (Some(write.mode.as_str()), &write.ids, write.parents),
+            _ => return Attrs::default(),
         };
-        let ids = write.ids.as_ref();
-        (
-            ids.and_then(|ids| ids.owner.as_deref()),
-            ids.and_then(|ids| ids.group.as_deref()),
-            write.parents,
-        )
+        let ids = ids.as_ref();
+        Attrs {
+            mode,
+            owner: ids.and_then(|ids| ids.owner.as_deref()),
+            group: ids.and_then(|ids| ids.group.as_deref()),
+            parents,
+        }
+    }
+
+    pub(crate) fn dir(&self) -> Option<&DirRun> {
+        match &self.kind {
+            RunKind::Dir { run, .. } => Some(run),
+            _ => None,
+        }
     }
 
     pub(crate) fn service(&self) -> Option<&ServiceRun> {
@@ -236,6 +275,15 @@ impl PlannedRun {
             _ => None,
         }
     }
+}
+
+/// What [`PlannedRun::attrs`] shows of a file or dir step.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Attrs<'a> {
+    pub mode: Option<&'a str>,
+    pub owner: Option<&'a str>,
+    pub group: Option<&'a str>,
+    pub parents: bool,
 }
 
 impl Serialize for PlannedRun {
@@ -253,6 +301,8 @@ impl Serialize for PlannedRun {
             name: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             rendered: Option<RenderedShown<'a>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            mode: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             owner: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -274,7 +324,12 @@ impl Serialize for PlannedRun {
             bytes: rendered.text.len(),
             sha256: &rendered.sha256,
         });
-        let (owner, group, parents) = self.attrs();
+        let Attrs {
+            mode,
+            owner,
+            group,
+            parents,
+        } = self.attrs();
         Shown {
             run: self.shown(),
             sudo_secret: self.sudo_secret.as_deref(),
@@ -282,6 +337,7 @@ impl Serialize for PlannedRun {
             task: self.task.as_deref(),
             name: self.name.as_deref(),
             rendered,
+            mode,
             owner,
             group,
             parents,

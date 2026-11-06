@@ -89,6 +89,14 @@ impl Expanded {
         })
     }
 
+    /// The dir items in order, each with its entry.
+    pub fn dirs(&self) -> impl Iterator<Item = (&Item, &DirEntry)> {
+        self.items.iter().filter_map(|item| match &item.kind {
+            ItemKind::Dir { entry, .. } => Some((item, entry)),
+            _ => None,
+        })
+    }
+
     /// Whether two dests name one path: on a tasks config repeated slashes do
     /// not count, on a legacy one only the same spelling does.
     pub fn same_dest(&self, a: &str, b: &str) -> bool {

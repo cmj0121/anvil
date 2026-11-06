@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::cancel::{AbortReason, Cancel};
 use crate::config::{Config, Handler, Step, StepKind};
+use crate::dirs;
 use crate::error::Failure;
 use crate::facts::{self, Facts};
 use crate::fanout;
@@ -16,7 +17,7 @@ use crate::guard;
 use crate::inventory::Target;
 use crate::packages::{self, Packages};
 use crate::plugin::{Plugins, Request};
-use crate::record::{self, FileRecord, Session, TargetRecord};
+use crate::record::{self, DirRecord, FileRecord, Session, TargetRecord};
 use crate::remote::env_prefix;
 use crate::report::{Progress, Report, StepReport, TargetReport, cancelled, failed};
 use crate::secret::Store;
@@ -282,7 +283,7 @@ impl Books {
 }
 
 /// The record of a target the probe reached; `wrote`: a `[[files]]` write
-/// started on it, so `record` replaces its entry, else only refreshes it.
+/// or a `[[dirs]]` step started on it, so `record` replaces its entry, else only refreshes it.
 #[derive(Clone)]
 pub(crate) struct Reached {
     pub(crate) record: TargetRecord,
@@ -328,17 +329,19 @@ pub(crate) fn for_each_target(
     }
 }
 
-/// What a target's `[[files]]` steps wrote, for the record.
+/// What a target's `[[files]]` and `[[dirs]]` steps did, for the record.
 pub(crate) struct Recorder<'a> {
     expanded: &'a Expanded,
     sources: &'a Sources,
     files: Vec<FileRecord>,
+    dirs: Vec<DirRecord>,
     /// On a tasks config, the dests with a `rollback = false` file item that
     /// applies to this target. Known before any write, since one kept text
     /// could already be that item's bytes from the last apply, and the item
     /// may never run to drop it.
     hash_only: Vec<&'a str>,
-    /// Whether a write started: its capture ran, then the write did.
+    /// Whether a write started: its capture ran, then the write did, or a
+    /// dir step ran.
     wrote: bool,
     target: &'a str,
     facts: Option<&'a Facts>,
@@ -375,6 +378,7 @@ impl<'a> Recorder<'a> {
             expanded,
             sources,
             files: Vec::new(),
+            dirs: Vec::new(),
             hash_only,
             wrote: false,
             target: &target.name,
@@ -424,6 +428,7 @@ impl<'a> Recorder<'a> {
             ok,
             facts: facts.clone(),
             files,
+            dirs: self.dirs.clone(),
             cannot_undo,
             rolled_back: None,
             pending_handlers: self.pending.clone(),
@@ -472,6 +477,42 @@ fn keep(expanded: &Expanded, files: &mut Vec<FileRecord>, file: FileRecord) {
     }
 }
 
+/// `dir` into `dirs`: a path stepped on again in the same apply keeps one
+/// record ([`DirRecord::written_again`]).
+fn keep_dir(expanded: &Expanded, dirs: &mut Vec<DirRecord>, dir: DirRecord) {
+    match (dirs.iter_mut()).find(|kept| expanded.same_dest(&kept.path, &dir.path)) {
+        Some(kept) => kept.written_again(dir),
+        None => dirs.push(dir),
+    }
+}
+
+/// How a write step that ended with `output` ended, for the record; not
+/// `staged`, the password path's stage failed. Only a write that may have
+/// changed DEST failed midway: a failed stage, a refusal (root checks, hash
+/// guard), a password sudo -v rejected, and a run that never reached the
+/// target (no master: cancelled, refused, an unknown host key, a denied
+/// key, ssh not spawned) all left it as it was.
+fn write_end(output: &Result<Output, TransportError>, staged: bool) -> record::Write {
+    match output {
+        _ if !staged => record::Write::Refused,
+        Ok(output) if output.code == Some(0) => record::Write::Written,
+        Ok(output) if output.code == Some(files::REFUSED) => record::Write::Refused,
+        Err(
+            TransportError::PasswordRejected
+            | TransportError::Cancelled
+            | TransportError::Connect { .. }
+            | TransportError::HostKey
+            | TransportError::AuthDenied { .. }
+            | TransportError::Spawn(_),
+        ) => record::Write::Refused,
+        // NoPrompt: sudo asked some other way, or took the password
+        // without anvil's prompt, so the write may have started
+        // unseen. A timeout, a lost transport or a failed wait on
+        // the running ssh (Wait) may have cut it.
+        _ => record::Write::FailedMidway,
+    }
+}
+
 /// The steps that ran and that a rollback cannot undo: `packages`,
 /// `service NAME`, `step N` (1-based among `[[steps]]`) and `handler NAME`,
 /// or a task's path; never a skip.
@@ -480,7 +521,7 @@ pub(crate) fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
         .iter()
         .filter(|step| !step.skipped && step.reason.is_none())
         .filter_map(|step| match (&step.entry, &step.task) {
-            (Entry::File { .. } | Entry::Script, _) => None,
+            (Entry::File { .. } | Entry::Dir { .. } | Entry::Script, _) => None,
             (_, Some(path)) => Some(path.clone()),
             (Entry::Packages, None) => Some("packages".to_owned()),
             (Entry::Service { name }, None) => Some(format!("service {name}")),
@@ -538,6 +579,7 @@ fn execute_inner(
         // A sudo error on a plain step reads "packages", as before.
         let (prefix, kind) = match &planned.kind {
             RunKind::File { .. } => ("files", "files"),
+            RunKind::Dir { .. } => ("dirs", "dirs"),
             RunKind::Service { .. } => ("services", "services"),
             RunKind::Packages { .. } => ("packages", "packages"),
             RunKind::Step { .. } | RunKind::Skip | RunKind::Script => ("packages", "step"),
@@ -546,6 +588,7 @@ fn execute_inner(
         let label = planned.shown();
         let entry = planned.kind.entry();
         if planned.file().is_some_and(|file| file.skip)
+            || planned.dir().is_some_and(|dir| dir.skip)
             || planned.service().is_some_and(|service| service.skip)
             || matches!(planned.kind, RunKind::Skip)
         {
@@ -563,6 +606,10 @@ fn execute_inner(
         let (mut run, timeout) = (planned.run.as_str(), planned.timeout);
         let mut upload = planned.file().and_then(|file| file.upload.as_ref());
         let write = planned.file().and_then(|file| file.write.as_ref());
+        let dir = planned.dir().and_then(|dir| dir.write.as_ref());
+        if let (Some(recorder), Some(_)) = (recorder.as_deref_mut(), dir) {
+            recorder.wrote = true;
+        }
         let rebuilt;
         let mut captured = None;
         if let (Some(recorder), Some(write)) = (recorder.as_deref_mut(), write) {
@@ -657,33 +704,29 @@ fn execute_inner(
             ) => (write.walk.created(output), write.written_attrs(output)),
             _ => (Vec::new(), None),
         };
-        for dir in &created {
+        let seen = match (dir, &mut output) {
+            (Some(dir), Ok(output)) => Some(dir.seen(output)),
+            (
+                Some(dir),
+                Err(TransportError::Timeout {
+                    output: Some(output),
+                    ..
+                }),
+            ) => Some(dir.seen(output)),
+            _ => None,
+        };
+        let created_above = seen.as_ref().map_or(&created, |seen| &seen.created);
+        for dir in created_above {
             log::info!("{command} {}: created {dir}", target.name);
         }
+        if let (Some(recorder), Some(dir), Some(seen)) = (recorder.as_deref_mut(), dir, seen)
+            && let Some(record) = dir.record(seen, write_end(&output, true))
+        {
+            keep_dir(recorder.expanded, &mut recorder.dirs, record);
+            recorder.snapshot(None, &reports);
+        }
         if let (Some(recorder), Some(mut file)) = (recorder.as_deref_mut(), captured) {
-            // Only a write that may have changed DEST failed midway: a
-            // failed stage, a refusal (root checks, hash guard), a password
-            // sudo -v rejected, and a run that never reached the target (no
-            // master: cancelled, refused, an unknown host key, a denied key,
-            // ssh not spawned) all left it as it was.
-            file.write = match &output {
-                _ if !staged => record::Write::Refused,
-                Ok(output) if output.code == Some(0) => record::Write::Written,
-                Ok(output) if output.code == Some(files::REFUSED) => record::Write::Refused,
-                Err(
-                    TransportError::PasswordRejected
-                    | TransportError::Cancelled
-                    | TransportError::Connect { .. }
-                    | TransportError::HostKey
-                    | TransportError::AuthDenied { .. }
-                    | TransportError::Spawn(_),
-                ) => record::Write::Refused,
-                // NoPrompt: sudo asked some other way, or took the password
-                // without anvil's prompt, so the write may have started
-                // unseen. A timeout, a lost transport or a failed wait on
-                // the running ssh (Wait) may have cut it.
-                _ => record::Write::FailedMidway,
-            };
+            file.write = write_end(&output, staged);
             if file.write == record::Write::Written {
                 file.written_attrs = written_attrs;
             }
@@ -1100,6 +1143,10 @@ fn changed(planned: &PlannedRun, output: &Output) -> bool {
             let (wrote, fixed) = (format!("wrote {dest}"), format!("fixed {dest}: "));
             lines.any(|line| line == wrote.as_bytes() || line.starts_with(fixed.as_bytes()))
         }
+        RunKind::Dir { path, .. } => {
+            let (created, fixed) = (format!("created {path}"), format!("fixed {path}: "));
+            lines.any(|line| line == created.as_bytes() || line.starts_with(fixed.as_bytes()))
+        }
         RunKind::Service { name, .. } => {
             let unchanged = format!("unchanged service {name}");
             let not_running = format!("service {name} is not running; not reloaded");
@@ -1192,8 +1239,8 @@ impl From<TransportError> for Unresolved {
 /// from [`probe`], is required when [`needs_facts`] says so; being one probe,
 /// no step can change what a later item sees. A failure is
 /// `packages: <reason>`, `files…`, `services: <reason>`,
-/// `plugin <name>: <reason>`, or `<label>: not supported yet by this anvil`
-/// for any dir or link item, matched or not, until this build runs them; the
+/// `dirs…`, `plugin <name>: <reason>`, or `<label>: not supported yet by
+/// this anvil` for any link item, matched or not, until this build runs them; the
 /// first one ends the list.
 pub fn resolve(
     target: &Target,
@@ -1219,8 +1266,8 @@ pub fn resolve(
                 facts,
             )?),
             ItemKind::Service(entry) => Some(services.run(item, entry)?),
-            ItemKind::Dir { ordinal, .. } => {
-                return Err(not_built(item.label("dirs", *ordinal)));
+            ItemKind::Dir { entry, ordinal } => {
+                Some(dirs::run(config, item, (entry, *ordinal), target, facts)?)
             }
             ItemKind::Link { ordinal, .. } => {
                 return Err(not_built(item.label("links", *ordinal)));
@@ -1242,7 +1289,7 @@ pub fn resolve(
     Ok(runs)
 }
 
-/// The failure of a dir or link item, `label`, until this build runs them.
+/// The failure of a link item, `label`, until this build runs them.
 fn not_built(label: String) -> Unresolved {
     Unresolved::Failed(format!("{label}: not supported yet by this anvil"))
 }
@@ -1564,36 +1611,22 @@ mod tests {
     }
 
     #[test]
-    fn a_dir_or_link_item_fails_the_target_until_it_is_built() {
-        let config: Config = toml::from_str(
-            "[[dirs]]\npath = \"/d\"\nmode = \"0755\"\n\
-             [[links]]\npath = \"/l\"\ntarget = \"/d\"\n",
+    fn a_link_item_fails_the_target_until_it_is_built() {
+        let config: Config = toml::from_str("[[links]]\npath = \"/l\"\ntarget = \"/d\"\n").unwrap();
+        let err = resolve(
+            &target("a"),
+            None,
+            &config,
+            &crate::tasks::legacy(&config),
+            &Sources::default(),
+            &FakePlugins::none(),
+            &Cancel::new(),
         )
-        .unwrap();
-        let all = crate::tasks::legacy(&config);
-        for (items, wanted) in [
-            (&all.items[..1], "dirs[0]: not supported yet by this anvil"),
-            (
-                &all.items[1..2],
-                "links[0]: not supported yet by this anvil",
-            ),
-        ] {
-            let expanded = Expanded {
-                items: items.to_vec(),
-                from_tasks: false,
-            };
-            let err = resolve(
-                &target("a"),
-                None,
-                &config,
-                &expanded,
-                &Sources::default(),
-                &FakePlugins::none(),
-                &Cancel::new(),
-            )
-            .unwrap_err();
-            assert_eq!(err, Unresolved::Failed(wanted.to_owned()));
-        }
+        .unwrap_err();
+        assert_eq!(
+            err,
+            Unresolved::Failed("links[0]: not supported yet by this anvil".to_owned())
+        );
     }
 
     /// A run of `kind` that ended with `code` and printed `stdout`.
@@ -1635,6 +1668,19 @@ mod tests {
         assert!(!ended(file(), Some(0), "fixed /etc/ab: mode\n"));
         assert!(!ended(file(), Some(1), "fixed /etc/a: mode\n"), "a failure");
         assert!(!ended(file(), Some(1), "wrote /etc/a\n"), "a failure");
+
+        let dir = || RunKind::Dir {
+            path: "/etc/d".to_owned(),
+            run: crate::step::DirRun {
+                skip: false,
+                write: None,
+            },
+        };
+        assert!(ended(dir(), Some(0), "created /etc/d\n"));
+        assert!(ended(dir(), Some(0), "fixed /etc/d: owner, mode\r\n"));
+        assert!(!ended(dir(), Some(0), "unchanged /etc/d\n"));
+        assert!(!ended(dir(), Some(0), "created /etc/dd\n"));
+        assert!(!ended(dir(), Some(4), "created /etc/d\n"), "a failure");
 
         let service = || RunKind::Service {
             name: "sshd".to_owned(),

@@ -1393,3 +1393,139 @@ fn the_dirs_a_failed_or_refused_write_created_are_removed() {
         assert!(!out.join("a").exists(), "{tool}");
     }
 }
+
+/// A config of three `[[dirs]]` on local, `sudo = false`, each notifying
+/// `flush`: `<root>/n/new` (absent, `parents = true`), `<root>/old` (0700
+/// before) and `<root>/full` (absent); applied once. Returns the three.
+fn dirs_applied(sandbox: &Sandbox) -> (String, String, String) {
+    let root = sandbox.root().display().to_string();
+    let (new, old, full) = (
+        format!("{root}/n/new"),
+        format!("{root}/old"),
+        format!("{root}/full"),
+    );
+    std::fs::create_dir(&old).unwrap();
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = |path: &str, keys: &str| {
+        format!(
+            "[[dirs]]\npath = \"{path}\"\nmode = \"0755\"\nsudo = false\nnotify = [\"flush\"]\n{keys}\n"
+        )
+    };
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}{}{}[[handlers]]\nname = \"flush\"\nrun = \"true\"\n",
+            dir(&new, "parents = true\n"),
+            dir(&old, ""),
+            dir(&full, "")
+        ),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    (new, old, full)
+}
+
+#[test]
+fn rollback_removes_the_dirs_it_created_when_empty_and_restores_a_fixed_ones_mode() {
+    let sandbox = Sandbox::new("rd");
+    let (new, old, full) = dirs_applied(&sandbox);
+    let root = sandbox.root().display().to_string();
+    assert_eq!(mode(Path::new(&old)), 0o755);
+    std::fs::write(format!("{full}/kept"), "x").unwrap();
+
+    let out = sandbox.anvil(&["rollback", "--dry-run", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  would remove directory {full} when empty\n  \
+             would restore owner, group and mode of {old}\n  \
+             would remove directory {new} when empty\n  \
+             would remove directory {root}/n when empty\n  \
+             cannot undo: step 1\n  cannot undo: handler flush\n  ✔ 6 steps\n\n\
+             1 target, nothing executed\n"
+        )
+    );
+
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let steps = value["targets"][0]["steps"].as_array().unwrap();
+    let runs: Vec<&str> = steps[..3]
+        .iter()
+        .map(|s| s["run"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        runs,
+        [
+            format!("remove {full}"),
+            format!("restore owner, group and mode of {old}"),
+            format!("remove {new}"),
+        ]
+    );
+    assert_eq!(
+        steps[0]["stderr"],
+        format!("rollback: {full} is not empty; left in place\n")
+    );
+    assert_eq!(
+        steps[1]["stdout"],
+        format!("restored owner, group and mode of {old}\n")
+    );
+    assert_eq!(
+        steps[2]["stdout"],
+        format!("removed directory {new}\nremoved directory {root}/n\n")
+    );
+    assert_eq!(mode(Path::new(&old)), 0o700);
+    assert!(!Path::new(&format!("{root}/n")).exists());
+    assert!(Path::new(&format!("{full}/kept")).exists());
+    let record = sandbox.last_apply().unwrap();
+    let target = &record["targets"]["local"];
+    assert_eq!(
+        target["rolled_back"]["dests"],
+        serde_json::json!([full, old, new])
+    );
+    assert_eq!(target["pending_handlers"], serde_json::json!(["flush"]));
+
+    let out = sandbox.anvil(&["-vv", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains(&format!("unchanged {old}\n")),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn a_dir_changed_since_the_apply_is_refused_unless_forced() {
+    let sandbox = Sandbox::new("rd");
+    let (_, old, _) = dirs_applied(&sandbox);
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o711)).unwrap();
+    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        shown.contains(&format!(
+            "dirs: {old} changed since the last apply; anvil rollback --force {old} restores it anyway"
+        )),
+        "{shown}"
+    );
+    assert_eq!(mode(Path::new(&old)), 0o711);
+    let out = sandbox.anvil(&["rollback", "--target", "local", "--force", &old], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(mode(Path::new(&old)), 0o700);
+}
+
+#[test]
+fn a_recorded_dir_the_config_no_longer_names_is_refused() {
+    let sandbox = Sandbox::new("rd");
+    let (new, _, _) = dirs_applied(&sandbox);
+    sandbox.write_config("config.toml", "[[steps]]\nrun = \"true\"\n");
+    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        shown.contains("is not in [[dirs]]; refusing to restore it"),
+        "{shown}"
+    );
+    assert!(Path::new(&new).exists());
+}

@@ -1971,6 +1971,7 @@ mod tests {
                     ok: true,
                     facts: Facts::default(),
                     files,
+                    dirs: Vec::new(),
                     cannot_undo: Vec::new(),
                     rolled_back: None,
                     pending_handlers: Vec::new(),

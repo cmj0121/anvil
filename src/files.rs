@@ -240,22 +240,12 @@ pub fn run(
         ));
     }
     let rendered = render_entry(item, entry, &label, sources, i, target, facts)?;
-    let user = facts.get("user").unwrap_or_default();
-    let by_user = !root && !entry.sudo;
-    if let Some(owner) = entry
-        .owner
-        .as_deref()
-        .filter(|owner| by_user && *owner != user && !owner.bytes().all(|b| b.is_ascii_digit()))
-    {
-        return Err(format!(
-            "{label}.owner {owner}: needs sudo; the login user is {user}"
-        ));
-    }
-    let ids = (entry.owner.is_some() || entry.group.is_some()).then(|| Ownership {
-        owner: entry.owner.clone(),
-        group: entry.group.clone(),
-        user: by_user.then(|| (label.clone(), user.to_owned())),
-    });
+    let ids = Ownership::of(
+        &label,
+        (entry.owner.as_deref(), entry.group.as_deref()),
+        !root && !entry.sudo,
+        facts,
+    )?;
     let secret =
         sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
     let create = if entry.parents {
@@ -423,6 +413,30 @@ pub struct Ownership {
 }
 
 impl Ownership {
+    /// The `(owner, group)` of the entry `label` for a write, as the login
+    /// user when `by_user`; `None` when it sets neither. A user write may
+    /// not name another user as owner: that needs sudo.
+    pub(crate) fn of(
+        label: &str,
+        (owner, group): (Option<&str>, Option<&str>),
+        by_user: bool,
+        facts: &Facts,
+    ) -> Result<Option<Ownership>, String> {
+        let user = facts.get("user").unwrap_or_default();
+        if let Some(owner) = owner
+            .filter(|owner| by_user && *owner != user && !owner.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(format!(
+                "{label}.owner {owner}: needs sudo; the login user is {user}"
+            ));
+        }
+        Ok((owner.is_some() || group.is_some()).then(|| Ownership {
+            owner: owner.map(str::to_owned),
+            group: group.map(str::to_owned),
+            user: by_user.then(|| (label.to_owned(), user.to_owned())),
+        }))
+    }
+
     fn ids(&self) -> Ids<'_> {
         Ids::Set {
             owner: self.owner.as_deref(),
@@ -434,12 +448,12 @@ impl Ownership {
     /// The lines that refuse the write before anything changes: an owner
     /// name the target does not know, or on a user write a numeric owner
     /// that is not the login user's id.
-    fn checks(&self) -> String {
+    pub(crate) fn checks(&self, kind: &str) -> String {
         let Some(owner) = self.owner.as_deref() else {
             return String::new();
         };
         if !owner.bytes().all(|b| b.is_ascii_digit()) {
-            let why = format!("files: owner {owner} does not exist on the target");
+            let why = format!("{kind}: owner {owner} does not exist on the target");
             return format!(
                 "id -u {} >/dev/null 2>&1 || {}\n",
                 quote(owner),
@@ -695,11 +709,11 @@ fn replace_script(
          anvil_line=$({sudo}ls -lLdn {d} 2>/dev/null) && printf '%s %s\\n' {mark} \"$anvil_line\" || :\n\
          }}\n",
         open = *write.open(),
-        owner = ids.map(Ownership::checks).unwrap_or_default(),
+        owner = ids.map(|ids| ids.checks("files")).unwrap_or_default(),
         walk = walk.script(sudo),
         sweep = sweep(sudo, dest),
         same = write.same(),
-        fix = fix_script(write, ids),
+        fix = fix_script("files", (dest, sudo, write.mode), ids, false),
         replace = write.replace(&format!("echo {wrote}")),
         mark = quote(mark.as_str()),
     ))
@@ -707,7 +721,7 @@ fn replace_script(
 
 /// Defines `anvil_octal LS_MODE`, which prints the `ls -l` mode string
 /// LS_MODE as four octal digits.
-const OCTAL: &str = "anvil_octal() { anvil_s=${1#?}; anvil_v=0; anvil_b=256; anvil_x=2048
+pub(crate) const OCTAL: &str = "anvil_octal() { anvil_s=${1#?}; anvil_v=0; anvil_b=256; anvil_x=2048
 while [ \"$anvil_b\" -gt 0 ]; do anvil_c=${anvil_s%\"${anvil_s#?}\"}; anvil_s=${anvil_s#?}
 case $anvil_c in [rwx]) anvil_v=$((anvil_v + anvil_b)) ;; [st]) anvil_v=$((anvil_v + anvil_b + anvil_x)) ;; \
 [ST]) anvil_v=$((anvil_v + anvil_x)) ;; esac
@@ -716,17 +730,33 @@ anvil_b=$((anvil_b / 2)); done
 printf '%04o\\n' \"$anvil_v\"; }
 ";
 
+/// Defines `anvil_perm OCTAL`, which prints the four octal digits OCTAL
+/// without the setuid and setgid bits, and `anvil_kept MODE`, which prints
+/// the four octal digits MODE, which has neither, with those of
+/// `$anvil_was`: a directory's are left as they are, also where a numeric
+/// `chmod` would clear them.
+pub(crate) const KEEP_SPECIAL: &str = "anvil_perm() { anvil_d=${1%???}; printf '%s%s\\n' $((anvil_d % 2)) \"${1#?}\"; }
+anvil_kept() { anvil_d=${anvil_was%???}; anvil_e=${1%???}; printf '%s%s\\n' $((anvil_d - anvil_d % 2 + anvil_e)) \"${1#?}\"; }
+";
+
 /// The lines for a DEST that already holds the bytes: no temp, and only what
 /// differs from the entry's owner, group and mode is fixed. A new owner or
 /// group goes on after the mode is narrowed to its owner's bits, so that it
 /// never briefly gets access, and the mode is set last; a fix that does not
 /// take fails the run, so it cannot report a change on every run. It prints
 /// `fixed DEST: …` naming what it changed, or `unchanged DEST` and runs
-/// nothing on DEST. It needs [`OCTAL`].
-fn fix_script(write: &Replacement<'_>, ids: Option<&Ownership>) -> String {
-    let (dest, sudo) = (write.dest, write.sudo);
+/// nothing on DEST. It needs [`OCTAL`] and `anvil_mode`, which sets DEST's
+/// mode; `kind`, `files` or `dirs`, starts its messages. With
+/// `keep_special`, for a directory, the setuid and setgid bits are neither
+/// compared nor checked, and it needs [`KEEP_SPECIAL`].
+pub(crate) fn fix_script(
+    kind: &str,
+    (dest, sudo, mode): (&str, &str, &str),
+    ids: Option<&Ownership>,
+    keep_special: bool,
+) -> String {
     let d = quote(dest);
-    let want = format!("{:0>4}", write.mode);
+    let want = format!("{mode:0>4}");
     let (owner, group) = ids.map_or((None, None), |ids| {
         (ids.owner.as_deref(), ids.group.as_deref())
     });
@@ -734,7 +764,7 @@ fn fix_script(write: &Replacement<'_>, ids: Option<&Ownership>) -> String {
     let unread = format!(
         "{{ echo {} >&2; exit 1; }}",
         quote(&format!(
-            "files: cannot read {dest}'s owner, group and mode"
+            "{kind}: cannot read {dest}'s owner, group and mode"
         ))
     );
     let wanted_uid = match owner {
@@ -744,7 +774,7 @@ fn fix_script(write: &Replacement<'_>, ids: Option<&Ownership>) -> String {
             "anvil_uid=$(id -u {}) || {}\n",
             quote(owner),
             refused(&format!(
-                "files: owner {owner} does not exist on the target"
+                "{kind}: owner {owner} does not exist on the target"
             ))
         ),
     };
@@ -778,14 +808,13 @@ fn fix_script(write: &Replacement<'_>, ids: Option<&Ownership>) -> String {
     };
     let own = give.map_or_else(String::new, |give| {
         let foreign = refused(&format!(
-            "files: {dest} cannot be given mode {}: only its owner can chmod it",
-            write.mode
+            "{kind}: {dest} cannot be given mode {mode}: only its owner can chmod it"
         ));
-        let no_owner = owner.map(|o| refused(&format!("files: cannot give {dest} owner {o}")));
+        let no_owner = owner.map(|o| refused(&format!("{kind}: cannot give {dest} owner {o}")));
         let no_group = group.map(|g| {
             refused(&match user {
-                Some((_, user)) => format!("files: group {g} is not one of {user}'s groups"),
-                None => format!("files: group {g} does not exist on the target"),
+                Some((_, user)) => format!("{kind}: group {g} is not one of {user}'s groups"),
+                None => format!("{kind}: group {g} does not exist on the target"),
             })
         });
         let why = match (no_owner, no_group) {
@@ -811,22 +840,27 @@ fn fix_script(write: &Replacement<'_>, ids: Option<&Ownership>) -> String {
     format!(
         "{wanted_uid}\
          anvil_attrs() {{ anvil_line=$({sudo}ls -lLdn {d}) || return 1\nset -- $anvil_line\n\
-         anvil_now=\"$3:$4 $(anvil_octal \"$1\")\"; anvil_o=; anvil_g=; anvil_m=\n\
+         anvil_full=$(anvil_octal \"$1\"); anvil_now=\"$3:$4 {now}\"; anvil_o=; anvil_g=; anvil_m=\n\
          {owner_cmp}{group_cmp}[ \"${{anvil_now#* }}\" = {want} ] || anvil_m=mode; }}\n\
          anvil_attrs || {unread}\n\
-         anvil_was=${{anvil_now#* }}; anvil_what=$anvil_o\n\
+         anvil_was=$anvil_full; anvil_what=$anvil_o\n\
          [ -z \"$anvil_g\" ] || anvil_what=${{anvil_what:+$anvil_what, }}group\n\
          [ -z \"$anvil_m\" ] || anvil_what=${{anvil_what:+$anvil_what, }}mode\n\
          if [ -z \"$anvil_what\" ]; then echo {unchanged}\n\
          else\n\
          {own}anvil_mode || exit 1\n\
          anvil_attrs || {unread}\n\
-         [ -z \"$anvil_o$anvil_g$anvil_m\" ] || {{ printf 'files: %s: owner, group or mode did not take (now %s)\\n' \
-         {d} \"$anvil_now\" >&2; exit 1; }}\n\
+         [ -z \"$anvil_o$anvil_g$anvil_m\" ] || {{ printf '%s: %s: owner, group or mode did not take (now %s)\\n' \
+         {kind} {d} \"$anvil_now\" >&2; exit 1; }}\n\
          printf '%s%s\\n' {fixed} \"$anvil_what\"\n\
          fi\n",
         unchanged = quote(&format!("unchanged {dest}")),
         fixed = quote(&format!("fixed {dest}: ")),
+        now = if keep_special {
+            "$(anvil_perm \"$anvil_full\")"
+        } else {
+            "$anvil_full"
+        },
     )
 }
 
@@ -1524,7 +1558,7 @@ pub enum Force {
 }
 
 impl Force {
-    fn allows(&self, dest: &str) -> bool {
+    pub(crate) fn allows(&self, dest: &str) -> bool {
         match self {
             Force::None => false,
             Force::Dests(dests) => dests.contains(dest),
@@ -1690,7 +1724,7 @@ fn restore_runs_from(
 /// The lines that remove each of `deepest` that is still a directory, in
 /// order, through `sudo`; one that is not empty stays, with a warning, and
 /// any other failure is a warning with `rmdir`'s error.
-fn remove_dirs(sudo: &str, deepest: &[&str]) -> String {
+pub(crate) fn remove_dirs(sudo: &str, deepest: &[&str]) -> String {
     deepest
         .iter()
         .map(|dir| {
@@ -1785,6 +1819,77 @@ fn restore_guard(sudo: &str, file: &FileRecord, forced: bool, wording: Wording) 
     )
 }
 
+/// The lines that put back `previous`, the owner, group and mode of the
+/// file or directory at `dest`, through `sudo`: its owner and group go back
+/// after its mode is narrowed to its owner's bits so that neither briefly
+/// gets access, then its mode. As root a failed `chown` puts the mode back
+/// and fails; as the user only the group can go back, and a group or owner
+/// that cannot is a warning. It prints what it restored. It defines
+/// [`OCTAL`]. With `keep_special`, for a directory, whose recorded modes
+/// have neither, it keeps the setuid and setgid bits it has now.
+pub(crate) fn restore_attrs(
+    kind: &str,
+    (dest, sudo, as_root): (&str, &str, bool),
+    previous: &Attrs,
+    keep_special: bool,
+) -> String {
+    let kept = |mode: &str| {
+        if keep_special {
+            format!("\"$(anvil_kept {mode})\"")
+        } else {
+            mode.to_owned()
+        }
+    };
+    let d = quote(dest);
+    let ids = format!("{}:{}", previous.uid, previous.gid);
+    let all = quote("owner, group and ");
+    let (own, chmod) = if as_root {
+        let failed = quote(&format!("{kind}: cannot give {dest} owner and group {ids}"));
+        let own = format!(
+            "anvil_what={all}\n\
+                 if [ \"$3:$4\" != {ids} ]; then {sudo}chmod go= {d} || exit 1\n\
+                 {sudo}chown {ids} {d} || {{ {sudo}chmod \"$anvil_was\" {d}; echo {failed} >&2; exit 1; }}\n\
+                 fi\n"
+        );
+        (
+            own,
+            format!("{sudo}chmod {} {d} || exit 1\n", kept(&previous.mode)),
+        )
+    } else {
+        let warning = quote(&format!(
+            "{kind}: {dest} was owned by {ids}; only root can give it back"
+        ));
+        // A group that did not go back never gets the recorded mode's
+        // group bits, not even for a moment: one chmod without them.
+        let mode = &previous.mode;
+        let at = mode.len().saturating_sub(2);
+        let masked = format!("{}0{}", &mode[..at], &mode[at + 1..]);
+        let (mode, masked) = (kept(mode), kept(&masked));
+        let chmod = format!(
+            "if [ -n \"$anvil_g\" ]; then chmod {mode} {d}; else chmod {masked} {d}; fi || exit 1\n"
+        );
+        let own = format!(
+            "anvil_g=1\n\
+                 if [ \"$4\" != {gid} ]; then chmod go= {d} || exit 1\n\
+                 chgrp {gid} {d} 2>/dev/null || anvil_g=\n\
+                 fi\n\
+                 if [ \"$3\" = {uid} ] && [ -n \"$anvil_g\" ]; then anvil_what={all}\n\
+                 else echo {warning} >&2; anvil_what=${{anvil_g:+'group and '}}; fi\n",
+            uid = previous.uid,
+            gid = previous.gid,
+        );
+        (own, chmod)
+    };
+    let special = if keep_special { KEEP_SPECIAL } else { "" };
+    format!(
+        "{OCTAL}{special}anvil_line=$({sudo}ls -lLdn {d}) || exit 1\n\
+         set -- $anvil_line\n\
+         anvil_was=$(anvil_octal \"$1\")\n\
+         {own}{chmod}\
+         printf 'restored %smode of %s\\n' \"$anvil_what\" {d}\n"
+    )
+}
+
 /// What opens a restore script that writes no bytes.
 const PLAIN_OPEN: &str = "{ umask 077; LC_ALL=C; export LC_ALL; set -f\n";
 
@@ -1847,64 +1952,19 @@ impl Restore<'_> {
         )
     }
 
-    /// An attrs-only fix's: DEST's bytes stay; its owner and group go back,
-    /// after its mode is narrowed to its owner's bits so that neither
-    /// briefly gets access, then its mode. As root a failed `chown` puts the
-    /// mode back and fails; as the user only the group can go back, and a
-    /// group or owner that cannot is a warning. It prints what it restored.
+    /// An attrs-only fix's: DEST's bytes stay and [`restore_attrs`] puts
+    /// back its owner, group and mode.
     fn attrs(&self, previous: &PreviousFile) -> String {
-        let (d, sudo) = (quote(self.dest), self.sudo);
-        let ids = format!("{}:{}", previous.uid, previous.gid);
-        let all = quote("owner, group and ");
-        let (own, chmod) = if self.as_root {
-            let failed = quote(&format!(
-                "files: cannot give {} owner and group {ids}",
-                self.dest
-            ));
-            let own = format!(
-                "anvil_what={all}\n\
-                 if [ \"$3:$4\" != {ids} ]; then {sudo}chmod go= {d} || exit 1\n\
-                 {sudo}chown {ids} {d} || {{ {sudo}chmod \"$anvil_was\" {d}; echo {failed} >&2; exit 1; }}\n\
-                 fi\n"
-            );
-            (
-                own,
-                format!("{sudo}chmod {} {d} || exit 1\n", previous.mode),
-            )
-        } else {
-            let warning = quote(&format!(
-                "files: {} was owned by {ids}; only root can give it back",
-                self.dest
-            ));
-            // A group that did not go back never gets the recorded mode's
-            // group bits, not even for a moment: one chmod without them.
-            let mode = &previous.mode;
-            let at = mode.len().saturating_sub(2);
-            let masked = format!("{}0{}", &mode[..at], &mode[at + 1..]);
-            let chmod = format!(
-                "if [ -n \"$anvil_g\" ]; then chmod {mode} {d}; else chmod {masked} {d}; fi || exit 1\n"
-            );
-            let own = format!(
-                "anvil_g=1\n\
-                 if [ \"$4\" != {gid} ]; then chmod go= {d} || exit 1\n\
-                 chgrp {gid} {d} 2>/dev/null || anvil_g=\n\
-                 fi\n\
-                 if [ \"$3\" = {uid} ] && [ -n \"$anvil_g\" ]; then anvil_what={all}\n\
-                 else echo {warning} >&2; anvil_what=${{anvil_g:+'group and '}}; fi\n",
-                uid = previous.uid,
-                gid = previous.gid,
-            );
-            (own, chmod)
-        };
         format!(
             "{}if [ -n \"$anvil_same\" ]; then echo {unchanged}\n\
-             else\n{OCTAL}anvil_line=$({sudo}ls -lLdn {d}) || exit 1\n\
-             set -- $anvil_line\n\
-             anvil_was=$(anvil_octal \"$1\")\n\
-             {own}{chmod}\
-             printf 'restored %smode of %s\\n' \"$anvil_what\" {d}\n\
-             fi\n{after}}}\n",
+             else\n{}fi\n{after}}}\n",
             *self.head(PLAIN_OPEN),
+            restore_attrs(
+                "files",
+                (self.dest, self.sudo, self.as_root),
+                &previous.attrs(),
+                false
+            ),
             unchanged = quote(&format!("unchanged {}", self.dest)),
             after = self.after(),
         )
