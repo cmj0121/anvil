@@ -12,16 +12,19 @@
 //! unless `--force DEST` or `--force-all`. Then each recorded dir, last
 //! first, by [`dirs::restore_runs`]: one it created is removed when empty,
 //! one it fixed gets its owner, group and mode back under the same guard,
-//! and the directories created above it go when empty. The steps that
-//! cannot be undone are listed as skips.
+//! and the directories created above it go when empty. Links come first,
+//! last first, by [`links::restore_runs`]: one it created is removed, one
+//! it replaced points at its old target again, and a regular file `force`
+//! replaced is written back, each only while the path is what the apply
+//! left unless forced. The steps that cannot be undone are listed as skips.
 //! Before any of it, each recorded dest must still be a `[[files]]` dest of
-//! the config with the same `sudo`, and each dir a `[[dirs]]` path, so
-//! that a record edited by hand cannot
+//! the config with the same `sudo`, each dir a `[[dirs]]` path and each
+//! link a `[[links]]` path, so that a record edited by hand cannot
 //! make rollback write, perhaps as root, a path the config never names. The
 //! sudo passwords come from the record's `sudo` flags. The only changes a
 //! rollback makes to the record are `rolled_back`, the dests it put back, so
 //! a second rollback restores the same bytes, and the `notify` names of the
-//! file and dir items it restored, added to `pending_handlers` for the next apply to
+//! file, dir and link items it restored, added to `pending_handlers` for the next apply to
 //! run: a rollback never runs a handler. A file whose text was not kept
 //! cannot be put back: it is named in its target's block, the summary and the
 //! JSON report, yet the exit stays 0, so that a repeat rollback stays
@@ -43,15 +46,18 @@ use crate::fanout::{self, Event};
 use crate::files::{self, Force, Wording};
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
+use crate::links;
 use crate::logger::{DIM, GREEN, RED, escape_invisible};
 use crate::options::{Options, Output};
 use crate::prepared::Prepared;
-use crate::record::{self, Previous, Record, RolledBack, Session, TargetRecord, Write};
+use crate::record::{
+    self, LinkPrevious, Previous, Record, RolledBack, Session, TargetRecord, Write,
+};
 use crate::report::{
     self, Escape, Line, NotRestored, Progress, Report, StepReport, Style, TargetReport, print_lines,
 };
 use crate::status;
-use crate::step::{Entry, PlannedRun};
+use crate::step::{Entry, PlannedRun, shown_text};
 use crate::tasks::{Expanded, Item};
 use crate::transport::{Transport, TransportError};
 
@@ -131,7 +137,10 @@ fn check_force(record: &Record, targets: &[Target], force: &Force) -> Result<(),
         .filter_map(|target| record.targets.get(&target.name))
         .flat_map(|entry| {
             let files = entry.files.iter().map(|file| file.dest.as_str());
-            files.chain(entry.dirs.iter().map(|dir| dir.path.as_str()))
+            let links = entry.links.iter().map(|link| link.path.as_str());
+            files
+                .chain(entry.dirs.iter().map(|dir| dir.path.as_str()))
+                .chain(links)
         })
         .collect();
     match dests.iter().find(|dest| !known.contains(dest.as_str())) {
@@ -205,11 +214,13 @@ pub fn run_targets(
         .zip(&entries)
         .filter_map(|(target, entry)| Some((target, entry.as_ref()?)))
         .flat_map(|(target, entry)| {
-            entry.files.iter().filter_map(|file| {
+            let files = (entry.files.iter()).map(|file| (&file.dest, file.not_kept()));
+            let links = (entry.links.iter()).map(|link| (&link.path, link.not_kept()));
+            files.chain(links).filter_map(|(dest, reason)| {
                 Some(NotRestored {
                     target: target.name.clone(),
-                    dest: file.dest.clone(),
-                    reason: file.not_kept()?.to_owned(),
+                    dest: dest.clone(),
+                    reason: reason?.to_owned(),
                 })
             })
         })
@@ -361,10 +372,14 @@ fn roll_back(
         return failed(error);
     }
     let mut runs =
-        match files::restore_runs(config, target, &facts, &entry.files, force, host.wording) {
+        match links::restore_runs(config, target, &facts, &entry.links, force, host.wording) {
             Ok(runs) => runs,
             Err(error) => return failed(error),
         };
+    match files::restore_runs(config, target, &facts, &entry.files, force, host.wording) {
+        Ok(more) => runs.extend(more),
+        Err(error) => return failed(error),
+    }
     runs.extend(dirs::restore_runs(
         config,
         target,
@@ -383,9 +398,11 @@ fn roll_back(
         cancel,
         None,
     );
-    for file in &entry.files {
-        if let Some(reason) = file.not_kept() {
-            report.warn(format!("not restored: {} ({reason})", file.dest));
+    let links = (entry.links.iter()).map(|link| (&link.path, link.not_kept()));
+    for (dest, reason) in links.chain(entry.files.iter().map(|file| (&file.dest, file.not_kept())))
+    {
+        if let Some(reason) = reason {
+            report.warn(format!("not restored: {dest} ({reason})"));
         }
     }
     // A refused write's step only removed the directories it created.
@@ -394,6 +411,8 @@ fn roll_back(
         .filter(|dest| {
             (entry.files.iter()).any(|file| &file.dest == dest && file.write != Write::Refused)
                 || (entry.dirs.iter()).any(|dir| &dir.path == dest && dir.write != Write::Refused)
+                || (entry.links.iter())
+                    .any(|link| &link.path == dest && link.write != Write::Refused)
         })
         .collect();
     let queued = queued(config, expanded, target, &entry.facts, &dests);
@@ -411,8 +430,8 @@ fn roll_back(
     }
 }
 
-/// The `[[handlers]]` names, in their order, that the file and dir items
-/// restored here notify: those whose dest or path is one of `dests` and that apply to
+/// The `[[handlers]]` names, in their order, that the file, dir and link
+/// items restored here notify: those whose dest or path is one of `dests` and that apply to
 /// `target` by `facts`, the ones the record saved, as rollback never runs
 /// a handler or probes for one.
 fn queued(
@@ -437,6 +456,15 @@ fn queued(
                 })
                 .flat_map(|(item, _)| &item.notify),
         )
+        .chain(
+            expanded
+                .links()
+                .filter(|(item, entry)| {
+                    item.matches(target, facts)
+                        && dests.iter().any(|d| expanded.same_dest(&entry.path, d))
+                })
+                .flat_map(|(item, _)| &item.notify),
+        )
         .collect();
     (config.handlers.iter())
         .filter(|handler| notified.contains(&&handler.name))
@@ -444,14 +472,17 @@ fn queued(
         .collect()
 }
 
-/// The dests of the file steps and the paths of the dir steps that passed. A note's `dest` is `""` and it is
+/// The dests of the file steps and the paths of the dir and link steps that
+/// passed. A note's `dest` is `""` and it is
 /// always a skip, so the `!step.skipped` filter is what keeps it out.
 fn restored(steps: &[StepReport]) -> Vec<String> {
     steps
         .iter()
         .filter(|step| !step.skipped && step.code == Some(0))
         .filter_map(|step| match &step.entry {
-            Entry::File { dest } | Entry::Dir { path: dest } => Some(dest.clone()),
+            Entry::File { dest } | Entry::Dir { path: dest } | Entry::Link { path: dest } => {
+                Some(dest.clone())
+            }
             _ => None,
         })
         .collect()
@@ -524,7 +555,8 @@ fn check_files(
             ));
         }
     }
-    check_dirs(expanded, target, facts, entry)
+    check_dirs(expanded, target, facts, entry)?;
+    check_links(expanded, target, facts, entry)
 }
 
 /// [`check_files`] for `entry`'s dirs: each path is the path of a dir item
@@ -565,6 +597,58 @@ fn check_dirs(
         if !dir.created_dirs.is_empty() && !same().any(|(item, d)| selected(item) && d.parents) {
             return refuse(format!(
                 "{path} has directories created for it in the record but no parents = true in {section}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`check_files`] for `entry`'s links: each path is the path of a link
+/// item of `expanded` with the same `sudo` that applies to `target`, says
+/// `parents = true` when the record lists directories created above it,
+/// and `force = true` when it keeps a regular file the step replaced.
+fn check_links(
+    expanded: &Expanded,
+    target: &Target,
+    facts: Option<&Facts>,
+    entry: &TargetRecord,
+) -> Result<(), String> {
+    let (section, entry_word) = if expanded.from_tasks {
+        ("the config", "link task")
+    } else {
+        ("[[links]]", "[[links]] entry")
+    };
+    for link in &entry.links {
+        let path = link.path.as_str();
+        let refuse = |why: String| Err(format!("rollback: {why}; refusing to restore it"));
+        let named = || (expanded.links()).filter(move |(_, l)| expanded.same_dest(&l.path, path));
+        let same = || named().filter(|(_, l)| l.sudo == link.sudo);
+        let selected = |item: &Item| item.may_match(target, facts);
+        let Some((_, first)) = named().next() else {
+            return refuse(format!("{path} is not in {section}"));
+        };
+        if same().next().is_none() {
+            return refuse(format!(
+                "{path} has sudo = {} in {section} but sudo = {} in the record",
+                first.sudo, link.sudo
+            ));
+        }
+        if !same().any(|(item, _)| selected(item)) {
+            return refuse(format!(
+                "no {entry_word} for {path} applies to {}",
+                target.name
+            ));
+        }
+        if !link.created_dirs.is_empty() && !same().any(|(item, l)| selected(item) && l.parents) {
+            return refuse(format!(
+                "{path} has directories created for it in the record but no parents = true in {section}"
+            ));
+        }
+        let replaced =
+            link.write != Write::Refused && matches!(link.previous, LinkPrevious::File(_));
+        if replaced && !same().any(|(item, l)| selected(item) && l.force) {
+            return refuse(format!(
+                "{path} has a replaced file in the record but no force = true in {section}"
             ));
         }
     }
@@ -665,11 +749,28 @@ fn would(entry: Option<&TargetRecord>) -> Vec<String> {
             .map(|above| format!("would remove directory {above} when empty"));
         path.into_iter().chain(above)
     });
+    let links = entry.links.iter().rev().flat_map(|link| {
+        let path = &link.path;
+        let undo = match (&link.previous, link.not_kept()) {
+            _ if link.write == Write::Refused => None,
+            (_, Some(reason)) => Some(format!("cannot undo: {path} ({reason})")),
+            (LinkPrevious::Absent, _) => Some(format!("would remove link {path}")),
+            (LinkPrevious::Link { target }, _) => Some(format!(
+                "would restore link {path} -> {}",
+                shown_text(target)
+            )),
+            (LinkPrevious::File(_), _) => Some(format!("would restore {path}")),
+            (LinkPrevious::Unknown { .. }, None) => None,
+        };
+        let above = (link.dirs_deepest_first().into_iter())
+            .map(|above| format!("would remove directory {above} when empty"));
+        undo.into_iter().chain(above)
+    });
     let rest = entry
         .cannot_undo
         .iter()
         .map(|what| format!("cannot undo: {what}"));
-    files.chain(dirs).chain(rest).collect()
+    links.chain(files).chain(dirs).chain(rest).collect()
 }
 
 /// What `--dry-run` shows for `target`: what a rollback of its entry would
@@ -876,6 +977,7 @@ mod tests {
                 file("/etc/c", kept(None)),
             ],
             dirs: Vec::new(),
+            links: Vec::new(),
             cannot_undo: vec!["packages".to_owned(), "step 2".to_owned()],
             rolled_back: None,
             pending_handlers: Vec::new(),
@@ -1276,6 +1378,7 @@ mod tests {
                 facts: Facts::default(),
                 files: vec![record],
                 dirs: Vec::new(),
+                links: Vec::new(),
                 cannot_undo: Vec::new(),
                 rolled_back: None,
                 pending_handlers: Vec::new(),
@@ -1302,6 +1405,7 @@ mod tests {
             facts: Facts::default(),
             files: vec![record],
             dirs: Vec::new(),
+            links: Vec::new(),
             cannot_undo: Vec::new(),
             rolled_back: None,
             pending_handlers: Vec::new(),
@@ -1344,6 +1448,7 @@ mod tests {
             facts: Facts::default(),
             files: vec![record.clone()],
             dirs: Vec::new(),
+            links: Vec::new(),
             cannot_undo: Vec::new(),
             rolled_back: None,
             pending_handlers: Vec::new(),
@@ -1379,6 +1484,7 @@ mod tests {
             facts: Facts::default(),
             files: vec![record],
             dirs: Vec::new(),
+            links: Vec::new(),
             cannot_undo: Vec::new(),
             rolled_back: None,
             pending_handlers: Vec::new(),
@@ -1405,6 +1511,7 @@ mod tests {
             facts: Facts::default(),
             files: vec![record(sudo)],
             dirs: Vec::new(),
+            links: Vec::new(),
             cannot_undo: Vec::new(),
             rolled_back: None,
             pending_handlers: Vec::new(),

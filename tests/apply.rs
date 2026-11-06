@@ -3674,7 +3674,7 @@ fn a_dir_with_parents_creates_whats_missing_above_and_without_it_fails() {
     assert_eq!(
         steps[0]["stderr"],
         format!(
-            "files: {} does not exist; set parents = true to create it\n",
+            "dirs: {} does not exist; set parents = true to create it\n",
             sandbox.root().join("p").display()
         )
     );
@@ -3741,4 +3741,209 @@ fn a_dir_with_sudo_runs_through_sudo_and_is_recorded_so() {
     assert_eq!(common::mode(&path) & 0o7777, 0o750);
     let record = sandbox.last_apply().unwrap();
     assert_eq!(record["targets"]["local"]["dirs"][0]["sudo"], true);
+}
+
+/// A config with one `[[links]]` entry per `(path, target, tag, extra
+/// keys)`, `sudo = false` unless the keys say otherwise, each notifying
+/// handler `log` of [`with_dirs`]; the fake host is tagged `web`.
+fn with_links(sandbox: &Sandbox, links: &[(&Path, &str, &str, &str)]) {
+    sandbox.write_config(
+        "inventory.toml",
+        "[hosts.fake]\nhost = \"fakehost\"\ntags = [\"web\"]\n",
+    );
+    let root = sandbox.root().display().to_string();
+    let entries: String = links
+        .iter()
+        .map(|(path, target, tag, keys)| {
+            let sudo = if keys.contains("sudo =") {
+                ""
+            } else {
+                "sudo = false\n"
+            };
+            format!(
+                "[[links]]\npath = \"{}\"\ntarget = \"{target}\"\ntags = [\"{tag}\"]\n\
+                 notify = [\"log\"]\n{sudo}{keys}\n",
+                path.display()
+            )
+        })
+        .collect();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{entries}[[handlers]]\nname = \"log\"\nrun = 'echo log >> {root}/\"$(hostname)\".log'\n"
+        ),
+    );
+}
+
+#[test]
+fn a_link_is_linked_then_left_then_relinked_and_only_changes_notify() {
+    let sandbox = Sandbox::new("al");
+    let (path, old, new) = (
+        sandbox.root().join("app"),
+        sandbox.root().join("old"),
+        sandbox.root().join("new"),
+    );
+    std::fs::create_dir(&old).unwrap();
+    let shown = path.display().to_string();
+    let step = |out: &std::process::Output| {
+        let value = json(out);
+        value["targets"][0]["steps"][0].clone()
+    };
+    let apply = |target: &Path| {
+        with_links(&sandbox, &[(&path, target.to_str().unwrap(), "local", "")]);
+        let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+        assert!(!text(&out.stdout).contains("anvil-attrs-"));
+        step(&out)
+    };
+
+    let first = apply(&old);
+    assert_eq!(first["run"], format!("link {shown} -> {}", old.display()));
+    assert_eq!(
+        first["stdout"],
+        format!("linked {shown} -> {}\n", old.display())
+    );
+    assert_eq!(first["changed"], true);
+    assert_eq!(std::fs::read_link(&path).unwrap(), old);
+    assert_eq!(logged(&sandbox), 1);
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["version"], 2);
+    let links = &record["targets"]["local"]["links"];
+    assert_eq!(links[0]["path"], shown);
+    assert_eq!(links[0]["previous"], serde_json::json!({"state": "absent"}));
+
+    let same = apply(&old);
+    assert_eq!(same["stdout"], format!("unchanged {shown}\n"));
+    assert_eq!(same["changed"], false);
+    assert_eq!(logged(&sandbox), 1, "unchanged does not notify");
+
+    let relinked = apply(&new);
+    assert_eq!(
+        relinked["stdout"],
+        format!("relinked {shown} -> {}\n", new.display())
+    );
+    assert_eq!(relinked["changed"], true);
+    assert_eq!(std::fs::read_link(&path).unwrap(), new, "dangling is fine");
+    assert_eq!(
+        std::fs::read_dir(&old).unwrap().count(),
+        0,
+        "not moved into"
+    );
+    assert_eq!(logged(&sandbox), 2);
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["links"][0]["previous"],
+        serde_json::json!({"state": "link", "target": old.display().to_string()})
+    );
+}
+
+#[test]
+fn a_file_at_a_links_path_needs_force_and_a_directory_never_goes_on_local_and_the_fake_host() {
+    let sandbox = Sandbox::new("al");
+    let (local, web, dir) = (
+        sandbox.root().join("l"),
+        sandbox.root().join("w"),
+        sandbox.root().join("d"),
+    );
+    for path in [&local, &web] {
+        std::fs::write(path, "keep\n").unwrap();
+    }
+    std::fs::create_dir(&dir).unwrap();
+    with_links(
+        &sandbox,
+        &[(&local, "/opt/a", "local", ""), (&web, "/opt/a", "web", "")],
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let mut failed: Vec<String> = json(&out)["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|target| target["steps"].as_array().unwrap().clone())
+        .filter(|step| step["code"] != 0)
+        .map(|step| step["stderr"].as_str().unwrap().to_owned())
+        .collect();
+    failed.sort();
+    let message = |path: &Path| {
+        format!(
+            "links: {} is a regular file; set force = true to replace it\n",
+            path.display()
+        )
+    };
+    assert_eq!(failed, [message(&local), message(&web)]);
+    for path in [&local, &web] {
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "keep\n");
+    }
+    assert_eq!(logged(&sandbox), 0);
+
+    with_links(
+        &sandbox,
+        &[
+            (&local, "-a", "local", "force = true\n"),
+            (&web, "/opt/a", "web", "force = true\n"),
+        ],
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(std::fs::read_link(&local).unwrap(), Path::new("-a"));
+    assert_eq!(std::fs::read_link(&web).unwrap(), Path::new("/opt/a"));
+    let record = sandbox.last_apply().unwrap();
+    let previous = &record["targets"]["local"]["links"][0]["previous"];
+    assert_eq!(previous["state"], "file");
+    assert_eq!(previous["text"], "keep\n");
+
+    with_links(&sandbox, &[(&dir, "/opt/a", "local", "force = true\n")]);
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][0]["stderr"],
+        format!("links: {} is a directory\n", dir.display())
+    );
+    assert!(dir.is_dir() && !dir.is_symlink());
+}
+
+#[test]
+fn a_link_with_sudo_runs_through_sudo_and_is_recorded_so() {
+    let sandbox = Sandbox::new("al");
+    let sudo = nopasswd_sudo(&sandbox);
+    let path = sandbox.root().join("app");
+    with_links(&sandbox, &[(&path, "/opt/app", "local", "sudo = true\n")]);
+    let out = sandbox.anvil(
+        &["--json", "apply", "--target", "local"],
+        &[("PATH", sudo.as_str())],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][0]["stdout"],
+        format!("linked {} -> /opt/app\n", path.display())
+    );
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["targets"]["local"]["links"][0]["sudo"], true);
+}
+
+#[test]
+fn a_forced_link_keeps_only_the_hash_of_a_file_a_files_entry_says_rollback_false_for() {
+    let sandbox = Sandbox::new("al");
+    let path = sandbox.root().join("app");
+    std::fs::write(&path, "kept bytes\n").unwrap();
+    common::chmod(&path, 0o644);
+    std::fs::write(sandbox.config_dir().join("app.conf"), "new\n").unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"app.conf\"\ndest = \"{p}\"\nmode = \"0644\"\nsudo = false\n\
+             rollback = false\ntags = [\"web\"]\n\n\
+             [[links]]\npath = \"{p}\"\ntarget = \"/opt/app\"\nforce = true\nsudo = false\n",
+            p = path.display()
+        ),
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(std::fs::read_link(&path).unwrap(), Path::new("/opt/app"));
+    let record = sandbox.last_apply().unwrap();
+    let previous = &record["targets"]["local"]["links"][0]["previous"];
+    assert_eq!(previous["state"], "file", "{record}");
+    assert_eq!(previous["text"], serde_json::Value::Null);
+    assert_eq!(previous["reason"], "rollback = false");
+    assert!(!record.to_string().contains("kept bytes"));
 }

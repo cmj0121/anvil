@@ -252,7 +252,7 @@ pub fn run(
         mode: mode.clone(),
         sudo: sudo.to_owned(),
         entry_sudo: entry.sudo,
-        walk: Box::new(Walk::new(path, as_root, &login_top(), create)),
+        walk: Box::new(Walk::new("dirs", path, as_root, &login_top(), create)),
         ids,
         mark: WalkNonce::attrs()?,
         parents: entry.parents,
@@ -344,7 +344,7 @@ fn restore_runs_from(
                 Some(deepest) if refused => deepest,
                 _ => path,
             };
-            let checks = link_removal_checks(sudo, checked, as_root, top);
+            let checks = link_removal_checks("dirs", sudo, checked, as_root, top);
             let ready = match sudo {
                 "" => String::new(),
                 _ => format!("{sudo}true || exit 1\n"),
@@ -451,7 +451,7 @@ mod tests {
         let path = path.to_str().unwrap().to_owned();
         let create = parents.then(|| WalkNonce::generate().unwrap());
         DirWrite {
-            walk: Box::new(Walk::new(&path, false, top, create)),
+            walk: Box::new(Walk::new("dirs", &path, false, top, create)),
             path,
             mode: mode.to_owned(),
             sudo: String::new(),
@@ -659,7 +659,7 @@ mod tests {
         assert_eq!(
             stderr,
             format!(
-                "files: {} does not exist; set parents = true to create it\n",
+                "dirs: {} does not exist; set parents = true to create it\n",
                 top.join("a").display()
             )
         );
@@ -695,6 +695,7 @@ mod tests {
         let path = open.join("app");
         let (code, _, stderr, _) = applied(&write(&path, "0755", None, true, &top), None);
         assert_eq!(code, Some(REFUSED));
+        assert!(stderr.starts_with("dirs: "), "{stderr}");
         assert!(stderr.contains("anvil will not write under it"), "{stderr}");
         assert!(!path.exists());
     }

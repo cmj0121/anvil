@@ -847,6 +847,117 @@ else
   fail "rollback of attrs and created directories: exit $code"
 fi
 
+step "(v) [[dirs]], [[files]] and [[links]] on arch (NOPASSWD): a dir, a file in it and links to it; a relink over a link to a directory and a forced file; rollback undoes them all"
+DL_STATE="$TMP/state-links"
+DL_RECORD="$DL_STATE/anvil/last-apply.json"
+DL_DIR="$TMP/links"
+mkdir -p "$DL_DIR"
+printf 'managed = "anvil-e2e-dl"\n' >"$DL_DIR/app.conf"
+cat >"$DL_DIR/config.toml" <<CONF
+[[dirs]]
+path = "/etc/anvil-e2e-dl"
+mode = "0750"
+group = "key"
+
+[[files]]
+src = "app.conf"
+dest = "/etc/anvil-e2e-dl/app.conf"
+mode = "0640"
+group = "key"
+
+[[links]]
+path = "/etc/anvil-e2e-dl-link"
+target = "/etc/anvil-e2e-dl"
+
+[[links]]
+path = "/etc/anvil-e2e-dl-moved"
+target = "/etc/anvil-e2e-dl"
+
+[[links]]
+path = "/etc/anvil-e2e-dl-file"
+target = "anvil-e2e-dl/app.conf"
+force = true
+CONF
+dl_anvil() {
+  run_env XDG_STATE_HOME="$DL_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$DL_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+# Before: a link to the directory -old, which a plain mv -f would move the
+# new link into, and a regular file the forced link replaces.
+docker exec "$NAME" sh -c 'rm -rf /etc/anvil-e2e-dl /etc/anvil-e2e-dl-old /etc/anvil-e2e-dl-link \
+  /etc/anvil-e2e-dl-moved /etc/anvil-e2e-dl-file && mkdir /etc/anvil-e2e-dl-old \
+  && ln -s /etc/anvil-e2e-dl-old /etc/anvil-e2e-dl-moved \
+  && printf "old file\n" >/etc/anvil-e2e-dl-file && chmod 644 /etc/anvil-e2e-dl-file'
+dl_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  created /etc/anvil-e2e-dl' "$TMP/out" \
+  && grep -qxF '  wrote /etc/anvil-e2e-dl/app.conf' "$TMP/out" \
+  && grep -qxF '  linked /etc/anvil-e2e-dl-link -> /etc/anvil-e2e-dl' "$TMP/out" \
+  && grep -qxF '  relinked /etc/anvil-e2e-dl-moved -> /etc/anvil-e2e-dl' "$TMP/out" \
+  && grep -qxF '  linked /etc/anvil-e2e-dl-file -> anvil-e2e-dl/app.conf' "$TMP/out" \
+  && ! grep -qF 'not replaced atomically' "$TMP/out" "$TMP/err" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-dl)" = '750 root:key' ] \
+  && [ "$(docker exec "$NAME" readlink /etc/anvil-e2e-dl-moved)" = /etc/anvil-e2e-dl ] \
+  && [ "$(docker exec "$NAME" readlink /etc/anvil-e2e-dl-file)" = anvil-e2e-dl/app.conf ] \
+  && [ -z "$(docker exec "$NAME" ls -A /etc/anvil-e2e-dl-old)" ] \
+  && [ -z "$(docker exec "$NAME" sh -c 'ls -A /etc | grep "^\.anvil-"')" ] \
+  && docker exec "$NAME" cat /etc/anvil-e2e-dl-file | cmp -s - "$DL_DIR/app.conf" \
+  && grep -qF '"links":[' "$DL_RECORD" && grep -qF '"version":2' "$DL_RECORD"; then
+  pass "apply created the dir, wrote the file in it, linked, relinked over a link to a directory without moving into it, replaced the forced file"
+else
+  fail "apply of dirs, files and links: exit $code"
+fi
+dl_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-dl' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-dl/app.conf' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-dl-link' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-dl-moved' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-dl-file' "$TMP/out"; then
+  pass "a second apply is unchanged everywhere"
+else
+  fail "second apply of dirs, files and links: exit $code"
+fi
+dl_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  restored /etc/anvil-e2e-dl-file' "$TMP/out" \
+  && grep -qxF '  restored link /etc/anvil-e2e-dl-moved -> /etc/anvil-e2e-dl-old' "$TMP/out" \
+  && grep -qxF '  removed link /etc/anvil-e2e-dl-link' "$TMP/out" \
+  && grep -qxF '  removed /etc/anvil-e2e-dl/app.conf' "$TMP/out" \
+  && grep -qxF '  removed directory /etc/anvil-e2e-dl' "$TMP/out" \
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-dl-file)" = 'old file' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G %F' /etc/anvil-e2e-dl-file)" = '644 root:root regular file' ] \
+  && [ "$(docker exec "$NAME" readlink /etc/anvil-e2e-dl-moved)" = /etc/anvil-e2e-dl-old ] \
+  && [ -z "$(docker exec "$NAME" ls -A /etc/anvil-e2e-dl-old)" ] \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-dl-link && ! docker exec "$NAME" test -L /etc/anvil-e2e-dl-link \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-dl; then
+  pass "rollback restored the forced file, pointed the relinked link back, removed the new link, the file and the dir"
+else
+  fail "rollback of dirs, files and links: exit $code"
+fi
+dl_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-dl-file' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-dl-moved' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-dl-link' "$TMP/out"; then
+  pass "a second rollback of the links is unchanged"
+else
+  fail "second rollback of dirs, files and links: exit $code"
+fi
+# A link whose old target is not UTF-8 would not survive the record: refused, left as is.
+docker exec "$NAME" sh -c 'ln -s "$(printf "/w/\377")" /etc/anvil-e2e-dl-link'
+dl_anvil apply --target arch
+code=$?
+if [ "$code" -eq 1 ] \
+  && grep -qF 'links: /etc/anvil-e2e-dl-link points at a target anvil cannot record; anvil will not replace it' "$TMP/err" \
+  && [ "$(docker exec "$NAME" readlink /etc/anvil-e2e-dl-link | od -An -tx1 | tr -d ' \n')" = 2f772fff0a ]; then
+  pass "a link to a target that is not UTF-8 is refused and left as it is"
+else
+  fail "apply over a link to a non-UTF-8 target: exit $code"
+  docker exec "$NAME" readlink /etc/anvil-e2e-dl-link | od -c
+fi
+docker exec "$NAME" rm -f /etc/anvil-e2e-dl-link
+
 step "(u) a timed-out plain run dies on arch, without timeout(1) there; a step reading stdin ends at once"
 U_DIR="$TMP/remote-kill"
 U_STATE="$TMP/state-u"

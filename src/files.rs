@@ -266,7 +266,7 @@ pub fn run(
                 mode: mode.clone(),
                 sudo: "sudo ".to_owned(),
                 checks: root_checks("sudo ", dest),
-                walk: Box::new(Walk::new(dest, true, &login_top(), create)),
+                walk: Box::new(Walk::new("files", dest, true, &login_top(), create)),
                 as_root: true,
                 password: true,
                 rendered,
@@ -291,7 +291,7 @@ pub fn run(
                 mode: mode.clone(),
                 sudo: sudo.to_owned(),
                 checks,
-                walk: Box::new(Walk::new(dest, as_root, &top, create)),
+                walk: Box::new(Walk::new("files", dest, as_root, &top, create)),
                 as_root,
                 password: false,
                 rendered,
@@ -507,37 +507,7 @@ impl FileWrite {
             .file(self.ordinal)
             .expect("a write comes from the list it is recorded against");
         let written = self.text(sources).unwrap_or("");
-        let previous = match captured {
-            Captured::Absent => Previous::Absent,
-            Captured::File {
-                mode,
-                uid,
-                gid,
-                sha256,
-                bytes,
-                reason,
-                ..
-            } => {
-                let text = match bytes {
-                    _ if hash_only || !entry.rollback => Err(NO_ROLLBACK),
-                    None => Err(reason.unwrap_or("unreadable")),
-                    Some(bytes) => match std::str::from_utf8(&bytes) {
-                        Err(_) => Err("not UTF-8 text"),
-                        Ok(text) if text.contains('\0') => Err("contains NUL"),
-                        Ok(text) => Ok(Zeroizing::new(text.to_owned())),
-                    },
-                };
-                Previous::File(PreviousFile {
-                    mode,
-                    uid,
-                    gid,
-                    sha256,
-                    kept: text.is_ok(),
-                    reason: text.as_ref().err().map(|why| (*why).to_owned()),
-                    text: text.ok(),
-                })
-            }
-        };
+        let previous = previous_of(captured, hash_only || !entry.rollback);
         FileRecord {
             dest: self.dest.clone(),
             mode: format!("{:0>4}", self.mode),
@@ -573,6 +543,42 @@ impl FileWrite {
         }
         output.stdout = kept;
         attrs
+    }
+}
+
+/// What `captured` says DEST held, as the record keeps it: a file's bytes
+/// as text unless `hash_only` or they are not text.
+pub(crate) fn previous_of(captured: Captured, hash_only: bool) -> Previous {
+    match captured {
+        Captured::Absent => Previous::Absent,
+        Captured::File {
+            mode,
+            uid,
+            gid,
+            sha256,
+            bytes,
+            reason,
+            ..
+        } => {
+            let text = match bytes {
+                _ if hash_only => Err(NO_ROLLBACK),
+                None => Err(reason.unwrap_or("unreadable")),
+                Some(bytes) => match std::str::from_utf8(&bytes) {
+                    Err(_) => Err("not UTF-8 text"),
+                    Ok(text) if text.contains('\0') => Err("contains NUL"),
+                    Ok(text) => Ok(Zeroizing::new(text.to_owned())),
+                },
+            };
+            Previous::File(PreviousFile {
+                mode,
+                uid,
+                gid,
+                sha256,
+                kept: text.is_ok(),
+                reason: text.as_ref().err().map(|why| (*why).to_owned()),
+                text: text.ok(),
+            })
+        }
     }
 }
 
@@ -873,6 +879,7 @@ fn tee_script(
     let temp = temp_beside(&step.dest)?;
     Ok(replace_script(
         &Replacement {
+            undo: "",
             dest: &step.dest,
             mode: &step.mode,
             sudo: &step.sudo,
@@ -910,6 +917,7 @@ fn install_script(
     let dest_temp = temp_beside(&step.dest)?;
     Ok(replace_script(
         &Replacement {
+            undo: "",
             dest: &step.dest,
             mode: &step.mode,
             sudo: "sudo ",
@@ -949,7 +957,7 @@ printf '%s\\n' \"${anvil_h%% *}\"
 ";
 
 /// [`HASH`] with `$anvil_sudo` set to `sudo`.
-fn hash_fn(sudo: &str) -> String {
+pub(crate) fn hash_fn(sudo: &str) -> String {
     format!("anvil_sudo={}\n{HASH}", quote(sudo.trim_end()))
 }
 
@@ -1651,7 +1659,9 @@ fn restore_runs_from(
         };
         let checks = match (&file.previous, as_root) {
             // Removing the link does not follow it, so a v1 record still rolls back.
-            (Previous::Dangling { .. }, _) => link_removal_checks(sudo, dest, as_root, top),
+            (Previous::Dangling { .. }, _) => {
+                link_removal_checks("files", sudo, dest, as_root, top)
+            }
             (_, true) => root_checks(sudo, checked),
             (_, false) => login_checks(checked, top),
         };
@@ -1666,6 +1676,7 @@ fn restore_runs_from(
                 restore_guard(sudo, file, force.allows(dest), wording)
             },
             dirs: remove_dirs(sudo, &dirs),
+            link: None,
         };
         let (run, label, upload) = match (previous, &file.previous) {
             _ if refused => (
@@ -1719,6 +1730,53 @@ fn restore_runs_from(
         ));
     }
     Ok(runs)
+}
+
+/// The restore of `previous`, the regular file a `[[links]]` step replaced
+/// at `dest` with `force`, from its kept `text`, through `sudo`, after
+/// `checks` (the directory checks only) and `link`, the lines that take
+/// the link away or refuse, with `undo` added to the EXIT trap to put the
+/// link back if the write then fails; then the lines `dirs` from
+/// [`remove_dirs`]. It
+/// writes the file as a restore of a `[[files]]` write does, with the
+/// recorded owner as root, printing `restored DEST`, or `unchanged DEST`
+/// when DEST already holds those bytes. With `password`, the bytes are
+/// staged first: the upload comes back with the script.
+pub(crate) fn restore_replaced(
+    (dest, sudo, as_root): (&str, &str, bool),
+    (checks, link, undo, dirs): (&str, &str, &str, String),
+    previous: &PreviousFile,
+    text: &str,
+    password: bool,
+) -> Result<(Zeroizing<String>, Option<Upload>), String> {
+    let file = FileRecord {
+        dest: dest.to_owned(),
+        mode: previous.mode.clone(),
+        sudo: !sudo.is_empty(),
+        written_sha256: previous.sha256.clone(),
+        write: Write::Written,
+        previous: Previous::File(previous.clone()),
+        written_attrs: None,
+        created_dirs: Vec::new(),
+    };
+    let restore = Restore {
+        dest,
+        sudo,
+        checks,
+        as_root,
+        // `link` refuses a path changed since the apply: this only finds
+        // the bytes already there.
+        guard: restore_guard(sudo, &file, true, Wording::Cli),
+        dirs,
+        link: Some((link, undo)),
+    };
+    let heredoc = Heredoc::new(text).map_err(|why| format!("links: {dest}: {why}"))?;
+    if password {
+        let (temp, upload) = staged(&heredoc)?;
+        Ok((restore.install(&temp, text.len(), previous)?, Some(upload)))
+    } else {
+        Ok((restore.tee(&heredoc, previous)?, None))
+    }
 }
 
 /// The lines that remove each of `deepest` that is still a directory, in
@@ -1906,6 +1964,10 @@ struct Restore<'a> {
     guard: String,
     /// [`remove_dirs`]' lines, after DEST is restored or removed.
     dirs: String,
+    /// For a file a `[[links]]` step replaced, the lines that run in place
+    /// of the directory refusal, which would follow the link, and what the
+    /// EXIT trap then adds ([`Replacement::undo`]).
+    link: Option<(&'a str, &'a str)>,
 }
 
 impl Restore<'_> {
@@ -1914,10 +1976,12 @@ impl Restore<'_> {
     fn head(&self, open: &str) -> Zeroizing<String> {
         let d = quote(self.dest);
         let ready = self.ready();
-        let directory = not_a_directory(self.sudo, &d, self.dest);
+        let directory = match self.link {
+            Some((lines, _)) => format!("true || exit 1\n{lines}"),
+            None => format!("{} || exit 1\n", not_a_directory(self.sudo, &d, self.dest)),
+        };
         zeroizing(format_args!(
-            "{open}{ready}{}{directory} || exit 1\n\
-             {}{}",
+            "{open}{ready}{}{directory}{}{}",
             self.checks,
             self.guard,
             sweep(self.sudo, self.dest),
@@ -2008,6 +2072,7 @@ impl Restore<'_> {
     ) -> Result<Zeroizing<String>, String> {
         let temp = temp_beside(self.dest)?;
         let write = Replacement {
+            undo: self.link.map_or("", |(_, undo)| undo),
             dest: self.dest,
             mode: &previous.mode,
             sudo: self.sudo,
@@ -2113,6 +2178,7 @@ mod tests {
             sudo: sudo.to_owned(),
             checks: checks.to_owned(),
             walk: Box::new(Walk {
+                kind: "files",
                 dirs: Vec::new(),
                 owner: ROOT_OWNED.to_owned(),
                 create: None,
@@ -4689,6 +4755,7 @@ mod tests {
             let heredoc = Heredoc::new("new\n").unwrap();
             let temp = temp_beside(dest.to_str().unwrap()).unwrap();
             let write = Replacement {
+                undo: "",
                 dest: dest.to_str().unwrap(),
                 mode: "0640",
                 sudo: "sudo -n ",
@@ -4734,6 +4801,7 @@ mod tests {
             }
             let heredoc = Heredoc::new("new\n").unwrap();
             let write = Replacement {
+                undo: "",
                 dest: dest.to_str().unwrap(),
                 mode: "0640",
                 sudo: "sudo -n ",
@@ -4851,6 +4919,7 @@ mod tests {
             as_root: true,
             guard: restore_guard("sudo -n ", &file, false, Wording::Cli),
             dirs: String::new(),
+            link: None,
         };
         let out = sh_with(&bin, &restore.remove(&format!("removed {d}")));
         assert_eq!(out.code, Some(CONFLICT));
@@ -4955,6 +5024,7 @@ mod tests {
             as_root: true,
             guard: restore_guard("sudo -n ", &file, false, Wording::Cli),
             dirs: String::new(),
+            link: None,
         };
         let out = sh_with(&bin, &restore.remove(&format!("removed {d}")));
         let stderr = String::from_utf8(out.stderr).unwrap();
@@ -6351,6 +6421,7 @@ mod tests {
             as_root: true,
             guard: restore_guard("sudo -n ", &file, false, Wording::Cli),
             dirs: String::new(),
+            link: None,
         };
         let out = sh_with(&bin, &restore.attrs(previous));
         assert_eq!(out.code, Some(1));
@@ -6777,6 +6848,7 @@ mod tests {
             as_root: true,
             guard: restore_guard(sudo, file, false, Wording::Cli),
             dirs: String::new(),
+            link: None,
         };
         match &file.previous {
             Previous::File(previous) => {
@@ -6948,6 +7020,7 @@ mod tests {
             as_root: true,
             guard: restore_guard("sudo ", &file, false, Wording::Cli),
             dirs: String::new(),
+            link: None,
         };
         let Previous::File(previous) = &file.previous else {
             unreachable!()
@@ -7761,6 +7834,7 @@ mod tests {
             ),
         };
         let walk = Walk {
+            kind: "files",
             dirs: crate::remote::path_dirs(d, top)
                 .into_iter()
                 .map(str::to_owned)
@@ -7799,6 +7873,7 @@ mod tests {
             let dest = b.join("conf");
             let nonce = WalkNonce::generate().unwrap();
             let walk = Walk {
+                kind: "files",
                 dirs: Vec::new(),
                 owner: String::new(),
                 create: Some(nonce.clone()),
@@ -7889,6 +7964,7 @@ mod tests {
         let a = top.join("a");
         let nonce = WalkNonce::generate().unwrap();
         let walk = Walk {
+            kind: "files",
             dirs: Vec::new(),
             owner: String::new(),
             create: Some(nonce.clone()),
@@ -7918,6 +7994,7 @@ mod tests {
         let a = top.join("a");
         let nonce = WalkNonce::generate().unwrap();
         let walk = Walk {
+            kind: "files",
             dirs: Vec::new(),
             owner: String::new(),
             create: Some(nonce.clone()),

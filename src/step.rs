@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::config::Guards;
 use crate::dirs;
 use crate::files;
+use crate::links;
 use crate::logger::{escape_invisible, escape_line};
 use crate::packages;
 use zeroize::Zeroizing;
@@ -45,6 +46,9 @@ pub enum RunKind {
     File { dest: String, run: FileRun },
     /// A `[[dirs]]` step; also a rollback restore of one.
     Dir { path: String, run: DirRun },
+    /// A `[[links]]` step; also a rollback restore of one, whose `run` may
+    /// carry a replaced file's bytes.
+    Link { path: String, run: LinkRun },
     /// A `[[services]]` step.
     Service { name: String, run: ServiceRun },
     /// A `[[steps]]` entry, 1-based among them, the plugin that returned it,
@@ -85,6 +89,7 @@ impl RunKind {
             RunKind::Packages { .. } => Entry::Packages,
             RunKind::File { dest, .. } => Entry::File { dest: dest.clone() },
             RunKind::Dir { path, .. } => Entry::Dir { path: path.clone() },
+            RunKind::Link { path, .. } => Entry::Link { path: path.clone() },
             RunKind::Service { name, .. } => Entry::Service { name: name.clone() },
             RunKind::Step { number, .. } => Entry::Step { number: *number },
             RunKind::Skip | RunKind::Script => Entry::Script,
@@ -103,6 +108,9 @@ pub enum Entry {
     Dir {
         path: String,
     },
+    Link {
+        path: String,
+    },
     Service {
         name: String,
     },
@@ -116,12 +124,12 @@ pub enum Entry {
     Script,
 }
 
-/// By hand: a `[[files]]` step's `run` is shown only by its length, as is a
-/// guarded step's, which carries the guards' nonce.
+/// By hand: a `[[files]]` or `[[links]]` step's `run` is shown only by its
+/// length, as is a guarded step's, which carries the guards' nonce.
 impl std::fmt::Debug for PlannedRun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = f.debug_struct("PlannedRun");
-        if self.file().is_some() || self.guards().is_some() {
+        if self.file().is_some() || self.link().is_some() || self.guards().is_some() {
             debug.field("run", &Redacted(self.run.len()));
         } else {
             debug.field("run", &*self.run);
@@ -156,6 +164,16 @@ pub struct FileRun {
 pub struct DirRun {
     pub skip: bool,
     pub write: Option<dirs::DirWrite>,
+}
+
+/// A `[[links]]` step: whether the entry matched no tag or fact of the
+/// target, and how it runs; `None` for a skip or a rollback restore, whose
+/// password path may stage a replaced file's bytes (`upload`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkRun {
+    pub skip: bool,
+    pub write: Option<links::LinkWrite>,
+    pub upload: Option<Upload>,
 }
 
 /// A `[[services]]` step: whether the entry matched no tag or fact of the target.
@@ -232,8 +250,17 @@ impl PlannedRun {
     }
 
     /// A dir step's mode, a file or dir step's `owner` and `group`, each
-    /// `None` when unset, and its `parents`; all unset for any other step.
+    /// `None` when unset, a link step's target and `force`, and a file, dir
+    /// or link step's `parents`; all unset for any other step.
     pub fn attrs(&self) -> Attrs<'_> {
+        if let Some(write) = self.link().and_then(|run| run.write.as_ref()) {
+            return Attrs {
+                target: Some(&write.target),
+                force: write.force,
+                parents: write.parents,
+                ..Attrs::default()
+            };
+        }
         let (mode, ids, parents) = match (&self.kind, self.file()) {
             (
                 _,
@@ -259,12 +286,20 @@ impl PlannedRun {
             owner: ids.and_then(|ids| ids.owner.as_deref()),
             group: ids.and_then(|ids| ids.group.as_deref()),
             parents,
+            ..Attrs::default()
         }
     }
 
     pub(crate) fn dir(&self) -> Option<&DirRun> {
         match &self.kind {
             RunKind::Dir { run, .. } => Some(run),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn link(&self) -> Option<&LinkRun> {
+        match &self.kind {
+            RunKind::Link { run, .. } => Some(run),
             _ => None,
         }
     }
@@ -277,12 +312,14 @@ impl PlannedRun {
     }
 }
 
-/// What [`PlannedRun::attrs`] shows of a file or dir step.
+/// What [`PlannedRun::attrs`] shows of a file, dir or link step.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Attrs<'a> {
     pub mode: Option<&'a str>,
     pub owner: Option<&'a str>,
     pub group: Option<&'a str>,
+    pub target: Option<&'a str>,
+    pub force: bool,
     pub parents: bool,
 }
 
@@ -307,6 +344,10 @@ impl Serialize for PlannedRun {
             owner: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             group: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            target: Option<&'a str>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            force: bool,
             #[serde(skip_serializing_if = "std::ops::Not::not")]
             parents: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -328,6 +369,8 @@ impl Serialize for PlannedRun {
             mode,
             owner,
             group,
+            target,
+            force,
             parents,
         } = self.attrs();
         Shown {
@@ -340,6 +383,8 @@ impl Serialize for PlannedRun {
             mode,
             owner,
             group,
+            target,
+            force,
             parents,
             guards: self.guards(),
             notify: &self.notify,

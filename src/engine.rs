@@ -15,9 +15,10 @@ use crate::fanout;
 use crate::files::{self, Sources};
 use crate::guard;
 use crate::inventory::Target;
+use crate::links;
 use crate::packages::{self, Packages};
 use crate::plugin::{Plugins, Request};
-use crate::record::{self, DirRecord, FileRecord, Session, TargetRecord};
+use crate::record::{self, DirRecord, FileRecord, LinkRecord, Session, TargetRecord};
 use crate::remote::env_prefix;
 use crate::report::{Progress, Report, StepReport, TargetReport, cancelled, failed};
 use crate::secret::Store;
@@ -283,7 +284,8 @@ impl Books {
 }
 
 /// The record of a target the probe reached; `wrote`: a `[[files]]` write
-/// or a `[[dirs]]` step started on it, so `record` replaces its entry, else only refreshes it.
+/// or a `[[dirs]]` or `[[links]]` step started on it, so `record` replaces
+/// its entry, else only refreshes it.
 #[derive(Clone)]
 pub(crate) struct Reached {
     pub(crate) record: TargetRecord,
@@ -329,19 +331,21 @@ pub(crate) fn for_each_target(
     }
 }
 
-/// What a target's `[[files]]` and `[[dirs]]` steps did, for the record.
+/// What a target's `[[files]]`, `[[dirs]]` and `[[links]]` steps did, for
+/// the record.
 pub(crate) struct Recorder<'a> {
     expanded: &'a Expanded,
     sources: &'a Sources,
     files: Vec<FileRecord>,
     dirs: Vec<DirRecord>,
+    links: Vec<LinkRecord>,
     /// On a tasks config, the dests with a `rollback = false` file item that
     /// applies to this target. Known before any write, since one kept text
     /// could already be that item's bytes from the last apply, and the item
     /// may never run to drop it.
     hash_only: Vec<&'a str>,
     /// Whether a write started: its capture ran, then the write did, or a
-    /// dir step ran.
+    /// dir or link step ran.
     wrote: bool,
     target: &'a str,
     facts: Option<&'a Facts>,
@@ -379,6 +383,7 @@ impl<'a> Recorder<'a> {
             sources,
             files: Vec::new(),
             dirs: Vec::new(),
+            links: Vec::new(),
             hash_only,
             wrote: false,
             target: &target.name,
@@ -429,6 +434,7 @@ impl<'a> Recorder<'a> {
             facts: facts.clone(),
             files,
             dirs: self.dirs.clone(),
+            links: self.links.clone(),
             cannot_undo,
             rolled_back: None,
             pending_handlers: self.pending.clone(),
@@ -438,6 +444,14 @@ impl<'a> Recorder<'a> {
     /// Whether `dest` is to keep its previous file's hash only.
     fn is_hash_only(&self, dest: &str) -> bool {
         (self.hash_only.iter()).any(|hash_only| self.expanded.same_dest(hash_only, dest))
+    }
+
+    /// Whether a regular file a forced link replaces at `path` is to keep
+    /// its hash only: a file item for the same dest, on any target, says
+    /// `rollback = false`.
+    fn link_hash_only(&self, path: &str) -> bool {
+        (self.expanded.files())
+            .any(|(_, entry, _)| !entry.rollback && self.expanded.same_dest(&entry.dest, path))
     }
 
     /// Saves what the target did so far, with `intent`, a write about to
@@ -486,6 +500,15 @@ fn keep_dir(expanded: &Expanded, dirs: &mut Vec<DirRecord>, dir: DirRecord) {
     }
 }
 
+/// `link` into `links`: a path stepped on again in the same apply keeps one
+/// record ([`LinkRecord::written_again`]).
+fn keep_link(expanded: &Expanded, links: &mut Vec<LinkRecord>, link: LinkRecord) {
+    match (links.iter_mut()).find(|kept| expanded.same_dest(&kept.path, &link.path)) {
+        Some(kept) => kept.written_again(link),
+        None => links.push(link),
+    }
+}
+
 /// How a write step that ended with `output` ended, for the record; not
 /// `staged`, the password path's stage failed. Only a write that may have
 /// changed DEST failed midway: a failed stage, a refusal (root checks, hash
@@ -521,7 +544,9 @@ pub(crate) fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
         .iter()
         .filter(|step| !step.skipped && step.reason.is_none())
         .filter_map(|step| match (&step.entry, &step.task) {
-            (Entry::File { .. } | Entry::Dir { .. } | Entry::Script, _) => None,
+            (Entry::File { .. } | Entry::Dir { .. } | Entry::Link { .. } | Entry::Script, _) => {
+                None
+            }
             (_, Some(path)) => Some(path.clone()),
             (Entry::Packages, None) => Some("packages".to_owned()),
             (Entry::Service { name }, None) => Some(format!("service {name}")),
@@ -580,6 +605,7 @@ fn execute_inner(
         let (prefix, kind) = match &planned.kind {
             RunKind::File { .. } => ("files", "files"),
             RunKind::Dir { .. } => ("dirs", "dirs"),
+            RunKind::Link { .. } => ("links", "links"),
             RunKind::Service { .. } => ("services", "services"),
             RunKind::Packages { .. } => ("packages", "packages"),
             RunKind::Step { .. } | RunKind::Skip | RunKind::Script => ("packages", "step"),
@@ -589,6 +615,7 @@ fn execute_inner(
         let entry = planned.kind.entry();
         if planned.file().is_some_and(|file| file.skip)
             || planned.dir().is_some_and(|dir| dir.skip)
+            || planned.link().is_some_and(|link| link.skip)
             || planned.service().is_some_and(|service| service.skip)
             || matches!(planned.kind, RunKind::Skip)
         {
@@ -604,10 +631,14 @@ fn execute_inner(
             },
         };
         let (mut run, timeout) = (planned.run.as_str(), planned.timeout);
-        let mut upload = planned.file().and_then(|file| file.upload.as_ref());
+        let mut upload = (planned.file().and_then(|file| file.upload.as_ref()))
+            .or_else(|| planned.link().and_then(|link| link.upload.as_ref()));
         let write = planned.file().and_then(|file| file.write.as_ref());
         let dir = planned.dir().and_then(|dir| dir.write.as_ref());
-        if let (Some(recorder), Some(_)) = (recorder.as_deref_mut(), dir) {
+        let link = planned.link().and_then(|link| link.write.as_ref());
+        if let Some(recorder) = recorder.as_deref_mut()
+            && (dir.is_some() || link.is_some())
+        {
             recorder.wrote = true;
         }
         let rebuilt;
@@ -715,9 +746,30 @@ fn execute_inner(
             ) => Some(dir.seen(output)),
             _ => None,
         };
-        let created_above = seen.as_ref().map_or(&created, |seen| &seen.created);
+        let hash_only = (link.zip(recorder.as_deref()))
+            .is_some_and(|(link, recorder)| recorder.link_hash_only(&link.path));
+        let seen_link = match (link, &mut output) {
+            (Some(link), Ok(output)) => Some(link.seen(output, hash_only)),
+            (
+                Some(link),
+                Err(TransportError::Timeout {
+                    output: Some(output),
+                    ..
+                }),
+            ) => Some(link.seen(output, hash_only)),
+            _ => None,
+        };
+        let created_above = (seen.as_ref().map(|seen| &seen.created))
+            .or(seen_link.as_ref().map(|seen| &seen.created))
+            .unwrap_or(&created);
         for dir in created_above {
             log::info!("{command} {}: created {dir}", target.name);
+        }
+        if let (Some(recorder), Some(link), Some(seen)) = (recorder.as_deref_mut(), link, seen_link)
+            && let Some(record) = link.record(seen, write_end(&output, true))
+        {
+            keep_link(recorder.expanded, &mut recorder.links, record);
+            recorder.snapshot(None, &reports);
         }
         if let (Some(recorder), Some(dir), Some(seen)) = (recorder.as_deref_mut(), dir, seen)
             && let Some(record) = dir.record(seen, write_end(&output, true))
@@ -1128,7 +1180,8 @@ pub(crate) enum Sent {
 /// Whether `planned`, which ended with `output` and was not skipped by a
 /// guard, changed something, so that its `notify` fires: a file step that
 /// wrote or fixed DEST's owner, group or mode (`unchanged` when nothing
-/// differed), a service step that
+/// differed), a dir step that created or fixed its directory, a link step
+/// that linked or relinked its path, a service step that
 /// printed neither `unchanged service NAME` nor the `reloaded` no-op line, a
 /// run or plugin step that exited 0. Never the package step, a skip or a
 /// failure.
@@ -1146,6 +1199,12 @@ fn changed(planned: &PlannedRun, output: &Output) -> bool {
         RunKind::Dir { path, .. } => {
             let (created, fixed) = (format!("created {path}"), format!("fixed {path}: "));
             lines.any(|line| line == created.as_bytes() || line.starts_with(fixed.as_bytes()))
+        }
+        RunKind::Link { path, .. } => {
+            let (linked, relinked) = (format!("linked {path} -> "), format!("relinked {path} -> "));
+            lines.any(|line| {
+                line.starts_with(linked.as_bytes()) || line.starts_with(relinked.as_bytes())
+            })
         }
         RunKind::Service { name, .. } => {
             let unchanged = format!("unchanged service {name}");
@@ -1238,10 +1297,8 @@ impl From<TransportError> for Unresolved {
 /// plugin on the controller, in order, `cancel` checked before each. `facts`,
 /// from [`probe`], is required when [`needs_facts`] says so; being one probe,
 /// no step can change what a later item sees. A failure is
-/// `packages: <reason>`, `files…`, `services: <reason>`,
-/// `dirs…`, `plugin <name>: <reason>`, or `<label>: not supported yet by
-/// this anvil` for any link item, matched or not, until this build runs them; the
-/// first one ends the list.
+/// `packages: <reason>`, `files…`, `services: <reason>`, `dirs…`,
+/// `links…` or `plugin <name>: <reason>`; the first one ends the list.
 pub fn resolve(
     target: &Target,
     facts: Option<&Facts>,
@@ -1269,8 +1326,8 @@ pub fn resolve(
             ItemKind::Dir { entry, ordinal } => {
                 Some(dirs::run(config, item, (entry, *ordinal), target, facts)?)
             }
-            ItemKind::Link { ordinal, .. } => {
-                return Err(not_built(item.label("links", *ordinal)));
+            ItemKind::Link { entry, ordinal } => {
+                Some(links::run(config, item, (entry, *ordinal), target, facts)?)
             }
             ItemKind::Step(step) => {
                 number += 1;
@@ -1287,11 +1344,6 @@ pub fn resolve(
         }));
     }
     Ok(runs)
-}
-
-/// The failure of a link item, `label`, until this build runs them.
-fn not_built(label: String) -> Unresolved {
-    Unresolved::Failed(format!("{label}: not supported yet by this anvil"))
 }
 
 /// Whether the list has a package item; one exists only when it has work.
@@ -1610,25 +1662,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_link_item_fails_the_target_until_it_is_built() {
-        let config: Config = toml::from_str("[[links]]\npath = \"/l\"\ntarget = \"/d\"\n").unwrap();
-        let err = resolve(
-            &target("a"),
-            None,
-            &config,
-            &crate::tasks::legacy(&config),
-            &Sources::default(),
-            &FakePlugins::none(),
-            &Cancel::new(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            err,
-            Unresolved::Failed("links[0]: not supported yet by this anvil".to_owned())
-        );
-    }
-
     /// A run of `kind` that ended with `code` and printed `stdout`.
     fn ended(kind: RunKind, code: Option<i32>, stdout: &str) -> bool {
         let planned = PlannedRun {
@@ -1681,6 +1714,23 @@ mod tests {
         assert!(!ended(dir(), Some(0), "unchanged /etc/d\n"));
         assert!(!ended(dir(), Some(0), "created /etc/dd\n"));
         assert!(!ended(dir(), Some(4), "created /etc/d\n"), "a failure");
+
+        let link = || RunKind::Link {
+            path: "/usr/bin/a".to_owned(),
+            run: crate::step::LinkRun {
+                skip: false,
+                write: None,
+                upload: None,
+            },
+        };
+        assert!(ended(link(), Some(0), "linked /usr/bin/a -> /opt/a\n"));
+        assert!(ended(link(), Some(0), "relinked /usr/bin/a -> -x\r\n"));
+        assert!(!ended(link(), Some(0), "unchanged /usr/bin/a\n"));
+        assert!(!ended(link(), Some(0), "linked /usr/bin/ab -> /opt/a\n"));
+        assert!(
+            !ended(link(), Some(4), "linked /usr/bin/a -> /opt/a\n"),
+            "a failure"
+        );
 
         let service = || RunKind::Service {
             name: "sshd".to_owned(),

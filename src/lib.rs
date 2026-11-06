@@ -24,6 +24,7 @@ mod guard;
 pub mod harden;
 mod interrupt;
 pub mod inventory;
+pub mod links;
 pub mod logger;
 pub mod options;
 pub mod packages;

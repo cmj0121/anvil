@@ -889,3 +889,44 @@ fn a_dir_shows_its_mode_owner_group_and_parents() {
     );
     assert!(!sandbox.root().join("new").exists(), "nothing created");
 }
+
+#[test]
+fn a_link_shows_its_target_force_and_parents() {
+    let sandbox = Sandbox::new("pl");
+    let forced = sandbox.root().join("new/app");
+    let forced = forced.display();
+    let plain = sandbox.root().join("plain");
+    let plain = plain.display();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[links]]\npath = \"{forced}\"\ntarget = \"/opt/app\"\nsudo = false\n\
+             force = true\nparents = true\n\n\
+             [[links]]\npath = \"{plain}\"\ntarget = \"-x y\"\nsudo = false\n\n\
+             [[links]]\npath = \"/nowhere\"\ntarget = \"/x\"\ntags = [\"web\"]\n"
+        ),
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  would $ link {forced} -> /opt/app\n    force\n    parents\n  \
+             would $ link {plain} -> -x y\n  would $ skipped link /nowhere: no match\n  \
+             would $ hostname\n  ✔ 4 steps\n\n1 target, nothing executed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let steps = &json(&out)["targets"][0]["steps"];
+    assert_eq!(
+        steps[0],
+        serde_json::json!({"run": format!("link {forced} -> /opt/app"), "target": "/opt/app", "force": true, "parents": true})
+    );
+    assert_eq!(
+        steps[1],
+        serde_json::json!({"run": format!("link {plain} -> -x y"), "target": "-x y"})
+    );
+    assert!(!sandbox.root().join("new").exists(), "nothing created");
+    assert!(!sandbox.root().join("plain").exists());
+}

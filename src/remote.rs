@@ -94,7 +94,12 @@ pub(crate) fn env_prefix(env: &Resolved<String>) -> String {
 
 /// What a refusal says when `sudo` could not run a check on `path`.
 pub(crate) fn unchecked(path: &str) -> String {
-    format!("files: sudo could not check {path}; nothing was changed")
+    unchecked_as("files", path)
+}
+
+/// [`unchecked`] for a step of `kind` (`files`, `dirs`, `links`).
+fn unchecked_as(kind: &str, path: &str) -> String {
+    format!("{kind}: sudo could not check {path}; nothing was changed")
 }
 
 /// `message` on stderr and a non-zero status, for a check that failed. A
@@ -102,11 +107,16 @@ pub(crate) fn unchecked(path: &str) -> String {
 /// asks `probe` whether the path really is what `message` says, and otherwise
 /// says that the check could not run. Either way the check has failed.
 pub(crate) fn refusal(sudo: &str, path: &str, probe: &str, message: &str) -> String {
+    refusal_as("files", sudo, path, probe, message)
+}
+
+/// [`refusal`] for a step of `kind`.
+fn refusal_as(kind: &str, sudo: &str, path: &str, probe: &str, message: &str) -> String {
     let message = quote(message);
     if sudo.is_empty() {
         return format!("{{ echo {message} >&2; false; }}");
     }
-    let unchecked = quote(&unchecked(path));
+    let unchecked = quote(&unchecked_as(kind, path));
     format!(
         "{{ if {sudo}{probe} >/dev/null 2>&1; then echo {message} >&2; \
          else echo {unchecked} >&2; fi; false; }}"
@@ -141,26 +151,27 @@ pub(crate) fn not_a_symlink(sudo: &str, d: &str, dest: &str) -> String {
 /// that passes the `owner` test and neither group nor others may write; `find`
 /// does not follow `dir` when it is a symlink. A missing `dir` passes, so the
 /// write fails as it would; a failing `sudo` does not.
-pub(crate) fn owned_only(sudo: &str, dir: &str, owner: &str) -> String {
+pub(crate) fn owned_only(kind: &str, sudo: &str, dir: &str, owner: &str) -> String {
     format!(
         "{{ {} || {}; }} && ",
         is_owned_only(sudo, dir, owner),
-        not_owned_only(sudo, dir, owner)
+        not_owned_only(kind, sudo, dir, owner)
     )
 }
 
-/// The refusal of `dir`, which fails the `owner` test or others may write.
-fn not_owned_only(sudo: &str, dir: &str, owner: &str) -> String {
+/// The refusal of `dir`, which fails the `owner` test or others may write,
+/// for a step of `kind`.
+fn not_owned_only(kind: &str, sudo: &str, dir: &str, owner: &str) -> String {
     let message = if owner == LOGIN_OWNED {
         format!(
-            "files: {dir} is not owned by root or the login user, or others can write it; \
+            "{kind}: {dir} is not owned by root or the login user, or others can write it; \
              anvil will not write under it"
         )
     } else {
-        format!("files: {dir} is not root-only; root will not write under it")
+        format!("{kind}: {dir} is not root-only; root will not write under it")
     };
     let probe = format!("find {} -prune", quote(dir));
-    refusal(sudo, dir, &probe, &message)
+    refusal_as(kind, sudo, dir, &probe, &message)
 }
 
 /// The test [`owned_only`] runs, alone: true when `dir` is missing or a
@@ -187,13 +198,13 @@ pub(crate) fn root_only_find(owner: &str) -> String {
 /// whoever may write one of them could swap a directory for a link, or
 /// hard-link a file, between the checks and the write.
 pub(crate) fn checks(sudo: &str, dest: &str, dirs: &[&str], owner: &str) -> String {
-    dir_checks(sudo, dirs, owner) + &not_a_symlink(sudo, &quote(dest), dest)
+    dir_checks("files", sudo, dirs, owner) + &not_a_symlink(sudo, &quote(dest), dest)
 }
 
 /// The directory half of [`checks`].
-fn dir_checks(sudo: &str, dirs: &[&str], owner: &str) -> String {
+fn dir_checks(kind: &str, sudo: &str, dirs: &[&str], owner: &str) -> String {
     dirs.iter()
-        .map(|dir| owned_only(sudo, dir, owner))
+        .map(|dir| owned_only(kind, sudo, dir, owner))
         .collect()
 }
 
@@ -227,12 +238,19 @@ pub(crate) fn login_checks(dest: &str, top: &Path) -> String {
 }
 
 /// [`root_checks`] or [`login_checks`] without the symlink refusal, for
-/// removing a link recorded as dangling: `rm` does not follow it.
-pub(crate) fn link_removal_checks(sudo: &str, dest: &str, as_root: bool, top: &Path) -> String {
+/// removing a link recorded as dangling: `rm` does not follow it. Its
+/// refusals name `kind`: `files`, `dirs` or `links`.
+pub(crate) fn link_removal_checks(
+    kind: &str,
+    sudo: &str,
+    dest: &str,
+    as_root: bool,
+    top: &Path,
+) -> String {
     if as_root {
-        dir_checks(sudo, &path_dirs(dest, Path::new("/")), ROOT_OWNED)
+        dir_checks(kind, sudo, &path_dirs(dest, Path::new("/")), ROOT_OWNED)
     } else {
-        dir_checks("", &path_dirs(dest, top), LOGIN_OWNED)
+        dir_checks(kind, "", &path_dirs(dest, top), LOGIN_OWNED)
     }
 }
 
@@ -268,9 +286,12 @@ impl fmt::Debug for WalkNonce {
 /// passes the `owner` test of the checks and is no symlink, and a missing one
 /// fails the write, or with `parents = true` is created 0755 as the write's
 /// identity and must then pass the same test. Each created directory is
-/// announced at once on its own stdout line, marked with `create`.
+/// announced at once on its own stdout line, marked with `create`. Its
+/// messages start with `kind`: `files`, `dirs` or `links`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Walk {
+    /// The step kind its messages name.
+    pub kind: &'static str,
     /// From the checks' top down to the one holding DEST.
     pub dirs: Vec<String>,
     /// [`ROOT_OWNED`] or [`LOGIN_OWNED`], as the checks'.
@@ -280,14 +301,22 @@ pub struct Walk {
 }
 
 impl Walk {
-    /// The walk of a write as root, from `/`, or as the login user, from `top`.
-    pub(crate) fn new(dest: &str, as_root: bool, top: &Path, create: Option<WalkNonce>) -> Walk {
+    /// The walk of a `kind` write as root, from `/`, or as the login user,
+    /// from `top`.
+    pub(crate) fn new(
+        kind: &'static str,
+        dest: &str,
+        as_root: bool,
+        top: &Path,
+        create: Option<WalkNonce>,
+    ) -> Walk {
         let (top, owner) = if as_root {
             (Path::new("/"), ROOT_OWNED)
         } else {
             (top, LOGIN_OWNED)
         };
         Walk {
+            kind,
             dirs: path_dirs(dest, top)
                 .into_iter()
                 .map(str::to_owned)
@@ -300,7 +329,7 @@ impl Walk {
     /// The lines of the walk through `sudo`; a failure exits [`REFUSED`],
     /// DEST untouched.
     pub(crate) fn script(&self, sudo: &str) -> String {
-        let found = root_only_find(&self.owner);
+        let (found, kind) = (root_only_find(&self.owner), self.kind);
         self.dirs
             .iter()
             .map(|dir| {
@@ -315,20 +344,20 @@ impl Walk {
                              if {sudo}test -d {d} && {sudo}test ! -L {d}; then printf '%s\\n' {line}; fi; \
                              echo {} >&2; exit {REFUSED}; }}\n\
                              printf '%s\\n' {line}\n",
-                            quote(&format!("files: cannot create {dir}"))
+                            quote(&format!("{kind}: cannot create {dir}"))
                         )
                     }
                     None => format!(
                         "echo {} >&2; exit {REFUSED}\n",
                         quote(&format!(
-                            "files: {dir} does not exist; set parents = true to create it"
+                            "{kind}: {dir} does not exist; set parents = true to create it"
                         ))
                     ),
                 };
                 format!(
                     "if {sudo}test ! -e {d} && {sudo}test ! -L {d}; then\n{missing}fi\n\
                      {{ [ -n \"$({sudo}find {d} {found})\" ] || {}; }} || exit {REFUSED}\n",
-                    not_owned_only(sudo, dir, &self.owner)
+                    not_owned_only(kind, sudo, dir, &self.owner)
                 )
             })
             .collect()
@@ -401,7 +430,8 @@ pub(crate) fn random_hex(n: usize) -> Result<String, String> {
     Ok(hex(&bytes))
 }
 
-/// What every temp file of `dest` is called up to its random part.
+/// What every temp file of `dest` is called up to its random part, which
+/// is 16 hex digits ([`temp_beside`], [`sweep`]).
 fn temp_prefix(dest: &str) -> String {
     format!(".anvil-{}-", &hex(&Sha256::digest(dest.as_bytes()))[..16])
 }
@@ -468,6 +498,8 @@ pub(crate) struct Replacement<'a> {
     pub temp: &'a str,
     pub bytes: Bytes<'a>,
     pub ids: Ids<'a>,
+    /// More of the EXIT trap, after the temp's removal; usually empty.
+    pub undo: &'a str,
 }
 
 /// The owner and group a [`Replacement`] gives the file.
@@ -499,7 +531,11 @@ impl Replacement<'_> {
     pub(crate) fn open(&self) -> Zeroizing<String> {
         let (d, sudo, mode) = (quote(self.dest), self.sudo, self.mode);
         debug_assert!(is_mode(mode), "{mode}");
-        let remove = format!("[ -z \"$anvil_t\" ] || {sudo}rm -f {}", quote(self.temp));
+        let remove = format!(
+            "[ -z \"$anvil_t\" ] || {sudo}rm -f {}{}",
+            quote(self.temp),
+            self.undo
+        );
         let (trap, staged_check) = match &self.bytes {
             Bytes::Staged(staged, _) => {
                 let s = quote(staged);
@@ -788,16 +824,16 @@ pub(crate) fn refused(why: &str) -> String {
 }
 
 /// Removes what an interrupted run left of `dest`, through `sudo`, and no other
-/// dest's temp. Two inventory entries for one machine can run at once and the
+/// dest's temp: a file, or a link of a `[[links]]` step. Two inventory entries for one machine can run at once and the
 /// target has no lock, so a temp may be a live run's: only one older than an hour
 /// goes, far past the 30 s a file step may take: a plain run dies on the target
 /// within seconds of its timeout, or at the timeout plus 10 s on a lost network
 /// ([`crate::ssh::WRAPPER`]). A `find` without `-mmin` just sweeps nothing.
 pub(crate) fn sweep(sudo: &str, dest: &str) -> String {
     let dir = quote(&format!("{}/.", dir_of(dest).trim_end_matches('/')));
-    let name = quote(&format!("{}*", temp_prefix(dest)));
+    let name = quote(&format!("{}{}", temp_prefix(dest), "[0-9a-f]".repeat(16)));
     format!(
-        "{sudo}find {dir} ! -name . -prune -type f -name {name} -mmin +60 -exec rm -f {{}} + >/dev/null 2>&1\n"
+        "{sudo}find {dir} ! -name . -prune \\( -type f -o -type l \\) -name {name} -mmin +60 -exec rm -f {{}} + >/dev/null 2>&1\n"
     )
 }
 
@@ -866,7 +902,13 @@ mod tests {
     fn only_lines_marked_with_the_walks_own_nonce_name_created_directories() {
         let nonce = WalkNonce::generate().unwrap();
         let other = WalkNonce::generate().unwrap();
-        let walk = Walk::new("/etc/app/a.conf", true, Path::new("/"), Some(nonce.clone()));
+        let walk = Walk::new(
+            "files",
+            "/etc/app/a.conf",
+            true,
+            Path::new("/"),
+            Some(nonce.clone()),
+        );
         assert_eq!(walk.dirs, ["/", "/etc", "/etc/app"]);
         let (n, o) = (nonce.as_str(), other.as_str());
         let mut output = Output {
@@ -881,7 +923,7 @@ mod tests {
             String::from_utf8(output.stdout).unwrap(),
             format!("motd\n{o} created /etc/x\n created /etc/y\nwrote /etc/app/a.conf\n")
         );
-        let plain = Walk::new("/etc/a", true, Path::new("/"), None);
+        let plain = Walk::new("files", "/etc/a", true, Path::new("/"), None);
         let mut output = Output {
             stdout: format!("{n} created /etc\n").into_bytes(),
             ..Output::default()
@@ -893,7 +935,13 @@ mod tests {
 
     #[test]
     fn a_user_walk_starts_at_its_top_and_accepts_the_login_users_directories() {
-        let walk = Walk::new("/home/u/.config/app/a", false, Path::new("/home/u"), None);
+        let walk = Walk::new(
+            "links",
+            "/home/u/.config/app/a",
+            false,
+            Path::new("/home/u"),
+            None,
+        );
         assert_eq!(
             walk.dirs,
             ["/home/u", "/home/u/.config", "/home/u/.config/app"]

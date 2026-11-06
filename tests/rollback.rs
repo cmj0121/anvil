@@ -1529,3 +1529,151 @@ fn a_recorded_dir_the_config_no_longer_names_is_refused() {
     );
     assert!(Path::new(&new).exists());
 }
+
+/// A config of three `[[links]]` on local, `sudo = false`, each notifying
+/// `flush`: `<root>/n/new` (absent, `parents = true`), `<root>/moved` (a
+/// link to the directory `<root>/old` before) and `<root>/file` (a 0644
+/// regular file before, `force = true`), all pointed at `<root>/target`;
+/// applied once. Returns the three paths and `<root>/old`.
+fn links_applied(sandbox: &Sandbox) -> [String; 4] {
+    let root = sandbox.root().display().to_string();
+    let [new, moved, file, old] = ["n/new", "moved", "file", "old"].map(|p| format!("{root}/{p}"));
+    std::fs::create_dir(&old).unwrap();
+    std::os::unix::fs::symlink(&old, &moved).unwrap();
+    std::fs::write(&file, "kept text\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let link = |path: &str, keys: &str| {
+        format!(
+            "[[links]]\npath = \"{path}\"\ntarget = \"{root}/target\"\nsudo = false\n\
+             notify = [\"flush\"]\n{keys}\n"
+        )
+    };
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}{}{}[[handlers]]\nname = \"flush\"\nrun = \"true\"\n",
+            link(&new, "parents = true\n"),
+            link(&moved, ""),
+            link(&file, "force = true\n")
+        ),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    [new, moved, file, old]
+}
+
+#[test]
+fn rollback_removes_a_created_link_points_a_replaced_one_back_and_restores_a_forced_file() {
+    let sandbox = Sandbox::new("rl");
+    let [new, moved, file, old] = links_applied(&sandbox);
+    let root = sandbox.root().display().to_string();
+
+    let out = sandbox.anvil(&["rollback", "--dry-run", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  would restore {file}\n  \
+             would restore link {moved} -> {old}\n  \
+             would remove link {new}\n  \
+             would remove directory {root}/n when empty\n  \
+             cannot undo: step 1\n  cannot undo: handler flush\n  ✔ 6 steps\n\n\
+             1 target, nothing executed\n"
+        )
+    );
+
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let value = json(&out);
+    let steps = value["targets"][0]["steps"].as_array().unwrap();
+    let runs: Vec<&str> = steps[..3]
+        .iter()
+        .map(|s| s["run"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        runs,
+        [
+            format!("restore {file}"),
+            format!("restore link {moved} -> {old}"),
+            format!("remove link {new}"),
+        ]
+    );
+    assert_eq!(steps[0]["stdout"], format!("restored {file}\n"));
+    assert_eq!(
+        steps[1]["stdout"],
+        format!("restored link {moved} -> {old}\n")
+    );
+    assert_eq!(
+        steps[2]["stdout"],
+        format!("removed link {new}\nremoved directory {root}/n\n")
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept text\n");
+    assert_eq!(mode(Path::new(&file)), 0o644);
+    assert_eq!(std::fs::read_link(&moved).unwrap(), Path::new(&old));
+    assert_eq!(
+        std::fs::read_dir(&old).unwrap().count(),
+        0,
+        "not moved into"
+    );
+    assert!(!Path::new(&format!("{root}/n")).exists());
+    let record = sandbox.last_apply().unwrap();
+    let target = &record["targets"]["local"];
+    assert_eq!(
+        target["rolled_back"]["dests"],
+        serde_json::json!([file, moved, new])
+    );
+    assert_eq!(target["pending_handlers"], serde_json::json!(["flush"]));
+
+    let out = sandbox.anvil(&["-vv", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let shown = text(&out.stdout);
+    for path in [&file, &moved, &new] {
+        assert!(shown.contains(&format!("unchanged {path}\n")), "{shown}");
+    }
+}
+
+#[test]
+fn a_link_changed_since_the_apply_is_refused_unless_forced() {
+    let sandbox = Sandbox::new("rl");
+    let [new, ..] = links_applied(&sandbox);
+    std::fs::remove_file(&new).unwrap();
+    std::os::unix::fs::symlink("/elsewhere", &new).unwrap();
+    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        shown.contains(&format!(
+            "links: {new} changed since the last apply; anvil rollback --force {new} restores it anyway"
+        )),
+        "{shown}"
+    );
+    assert_eq!(std::fs::read_link(&new).unwrap(), Path::new("/elsewhere"));
+    let out = sandbox.anvil(&["rollback", "--target", "local", "--force", &new], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(std::fs::symlink_metadata(&new).is_err());
+}
+
+#[test]
+fn a_recorded_replaced_file_needs_force_in_the_config() {
+    let sandbox = Sandbox::new("rl");
+    let [_, _, file, _] = links_applied(&sandbox);
+    let root = sandbox.root().display().to_string();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[links]]\npath = \"{root}/n/new\"\ntarget = \"{root}/target\"\nsudo = false\nparents = true\n\
+             [[links]]\npath = \"{root}/moved\"\ntarget = \"{root}/target\"\nsudo = false\n\
+             [[links]]\npath = \"{file}\"\ntarget = \"{root}/target\"\nsudo = false\n"
+        ),
+    );
+    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        shown.contains(&format!(
+            "rollback: {file} has a replaced file in the record but no force = true in [[links]]; refusing to restore it"
+        )),
+        "{shown}"
+    );
+    assert!(std::fs::symlink_metadata(&file).unwrap().is_symlink());
+}

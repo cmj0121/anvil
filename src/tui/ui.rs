@@ -2629,6 +2629,7 @@ mod tests {
                         sudo: String::new(),
                         checks: String::new(),
                         walk: Box::new(Walk {
+                            kind: "files",
                             dirs: Vec::new(),
                             owner: String::new(),
                             create: None,
