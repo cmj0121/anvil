@@ -1,0 +1,4 @@
+links:
+  - path: /usr/local/bin/app
+    target: /srv/app/bin/app
+    force: yes please

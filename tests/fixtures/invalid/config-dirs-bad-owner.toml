@@ -1,0 +1,4 @@
+[[dirs]]
+path = "/srv/app"
+mode = "0755"
+owner = "Bad"

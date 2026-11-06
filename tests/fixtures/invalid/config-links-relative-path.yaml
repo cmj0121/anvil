@@ -1,0 +1,5 @@
+links:
+  - path: /usr/local/bin/app
+    target: ../app
+  - path: bin/app
+    target: /srv/app/bin/app

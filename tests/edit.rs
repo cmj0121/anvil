@@ -1149,7 +1149,7 @@ fn config_save_keeps_file_owner_group_and_parents_in_either_format() {
 }
 
 #[test]
-fn a_bad_file_owner_or_group_exits_two_naming_the_entry() {
+fn a_bad_file_dir_or_link_entry_exits_two_naming_it() {
     for (file, args, key) in [
         (
             "invalid/config-files-bad-owner.toml",
@@ -1160,6 +1160,16 @@ fn a_bad_file_owner_or_group_exits_two_naming_the_entry() {
             "invalid/config-files-bad-group.yaml",
             &["config", "--format", "yaml"][..],
             "files[1].group `1app`",
+        ),
+        (
+            "invalid/config-dirs-bad-owner.toml",
+            &["config"][..],
+            "dirs[0].owner `Bad`",
+        ),
+        (
+            "invalid/config-links-relative-path.yaml",
+            &["config", "--format", "yaml"][..],
+            "links[1].path `bin/app`",
         ),
     ] {
         let sb = sandbox();

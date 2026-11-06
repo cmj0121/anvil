@@ -1191,8 +1191,10 @@ impl From<TransportError> for Unresolved {
 /// plugin on the controller, in order, `cancel` checked before each. `facts`,
 /// from [`probe`], is required when [`needs_facts`] says so; being one probe,
 /// no step can change what a later item sees. A failure is
-/// `packages: <reason>`, `files…`, `services: <reason>` or
-/// `plugin <name>: <reason>`; the first one ends the list.
+/// `packages: <reason>`, `files…`, `services: <reason>`,
+/// `plugin <name>: <reason>`, or `<label>: not supported yet by this anvil`
+/// for any dir or link item, matched or not, until this build runs them; the
+/// first one ends the list.
 pub fn resolve(
     target: &Target,
     facts: Option<&Facts>,
@@ -1217,6 +1219,12 @@ pub fn resolve(
                 facts,
             )?),
             ItemKind::Service(entry) => Some(services.run(item, entry)?),
+            ItemKind::Dir { ordinal, .. } => {
+                return Err(not_built(item.label("dirs", *ordinal)));
+            }
+            ItemKind::Link { ordinal, .. } => {
+                return Err(not_built(item.label("links", *ordinal)));
+            }
             ItemKind::Step(step) => {
                 number += 1;
                 Some(step_run(
@@ -1233,6 +1241,12 @@ pub fn resolve(
     }
     Ok(runs)
 }
+
+/// The failure of a dir or link item, `label`, until this build runs them.
+fn not_built(label: String) -> Unresolved {
+    Unresolved::Failed(format!("{label}: not supported yet by this anvil"))
+}
+
 /// Whether the list has a package item; one exists only when it has work.
 fn package_work(expanded: &Expanded) -> bool {
     expanded
@@ -1547,6 +1561,39 @@ mod tests {
             notify,
             [&["reload sshd".to_owned()][..], &["x".to_owned()], &[]]
         );
+    }
+
+    #[test]
+    fn a_dir_or_link_item_fails_the_target_until_it_is_built() {
+        let config: Config = toml::from_str(
+            "[[dirs]]\npath = \"/d\"\nmode = \"0755\"\n\
+             [[links]]\npath = \"/l\"\ntarget = \"/d\"\n",
+        )
+        .unwrap();
+        let all = crate::tasks::legacy(&config);
+        for (items, wanted) in [
+            (&all.items[..1], "dirs[0]: not supported yet by this anvil"),
+            (
+                &all.items[1..2],
+                "links[0]: not supported yet by this anvil",
+            ),
+        ] {
+            let expanded = Expanded {
+                items: items.to_vec(),
+                from_tasks: false,
+            };
+            let err = resolve(
+                &target("a"),
+                None,
+                &config,
+                &expanded,
+                &Sources::default(),
+                &FakePlugins::none(),
+                &Cancel::new(),
+            )
+            .unwrap_err();
+            assert_eq!(err, Unresolved::Failed(wanted.to_owned()));
+        }
     }
 
     /// A run of `kind` that ended with `code` and printed `stdout`.

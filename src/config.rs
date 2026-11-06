@@ -1,6 +1,7 @@
 //! The config document: `[anvil]` preferences, the `[secrets]` backend, the
-//! `[packages]` to install, the pinned `[plugins]`, the `[[files]]` to copy,
-//! the `[[services]]` to bring to a state, the `[[steps]]` that
+//! `[packages]` to install, the pinned `[plugins]`, the `[[dirs]]` to make,
+//! the `[[files]]` to copy, the `[[links]]` to point, the `[[services]]` to
+//! bring to a state, the `[[steps]]` that
 //! `anvil apply` runs, the `[harden]` rules `config --harden` skips and the
 //! ordered `[[tasks]]` that replace the fixed sections.
 
@@ -15,7 +16,7 @@ use crate::document::{self, DocumentError, Format};
 use crate::facts;
 use crate::harden::rules;
 use crate::inventory;
-use crate::logger::{escape_controls, escape_invisible};
+use crate::logger::{escape_controls, escape_invisible, is_invisible};
 use crate::packages::Packages;
 use crate::paths::{self, DocPath};
 use crate::secret::{self, BackendKind, SERVICE};
@@ -33,6 +34,15 @@ pub const MAX_FILES: usize = 64;
 
 /// Longest `[[files]]` dest, in bytes: Linux's `PATH_MAX`.
 pub(crate) const MAX_DEST_BYTES: usize = 4096;
+
+/// Most `[[dirs]]` entries in one config.
+pub const MAX_DIRS: usize = 64;
+
+/// Most `[[links]]` entries in one config.
+pub const MAX_LINKS: usize = 64;
+
+/// Longest `[[links]]` target, in bytes: Linux's `PATH_MAX`.
+const MAX_TARGET_BYTES: usize = 4096;
 
 /// Most `[[services]]` entries in one config.
 pub const MAX_SERVICES: usize = 64;
@@ -60,7 +70,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub plugins: BTreeMap<String, Plugin>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dirs: Vec<DirEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<FileEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<ServiceEntry>,
     #[serde(skip_serializing_if = "Harden::is_empty")]
@@ -86,7 +100,11 @@ struct RawConfig {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     plugins: BTreeMap<String, Plugin>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    dirs: Vec<DirEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     files: Vec<FileEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    links: Vec<LinkEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     services: Vec<ServiceEntry>,
     #[serde(skip_serializing_if = "Harden::is_empty")]
@@ -116,7 +134,9 @@ impl TryFrom<RawConfig> for Config {
             let packages = raw.packages.as_ref();
             let mixed = [
                 (raw.steps.is_some(), "[[steps]]"),
+                (!raw.dirs.is_empty(), "[[dirs]]"),
                 (!raw.files.is_empty(), "[[files]]"),
+                (!raw.links.is_empty(), "[[links]]"),
                 (!raw.services.is_empty(), "[[services]]"),
                 (
                     packages.is_some_and(|p| !p.install.is_empty()),
@@ -148,7 +168,9 @@ impl TryFrom<RawConfig> for Config {
             secrets: raw.secrets,
             packages: raw.packages,
             plugins: raw.plugins,
+            dirs: raw.dirs,
             files: raw.files,
+            links: raw.links,
             services: raw.services,
             harden: raw.harden,
             path: None,
@@ -166,7 +188,9 @@ impl From<Config> for RawConfig {
             secrets: config.secrets,
             packages: config.packages,
             plugins: config.plugins,
+            dirs: config.dirs,
             files: config.files,
+            links: config.links,
             services: config.services,
             harden: config.harden,
             steps: config.tasks.is_empty().then_some(config.steps),
@@ -183,7 +207,9 @@ impl Default for Config {
             secrets: None,
             packages: None,
             plugins: BTreeMap::new(),
+            dirs: Vec::new(),
             files: Vec::new(),
+            links: Vec::new(),
             services: Vec::new(),
             harden: Harden::default(),
             path: None,
@@ -450,6 +476,10 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<ServiceEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<DirEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<LinkEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks: Option<Vec<Task>>,
@@ -525,6 +555,91 @@ impl std::fmt::Debug for FileEntry {
             .field("sudo", &self.sudo)
             .field("rollback", &self.rollback)
             .field("template", &self.template)
+            .field("notify", &self.notify)
+            .finish()
+    }
+}
+
+/// A `[[dirs]]` entry: the directory `path` made, or its owner, group and
+/// mode fixed, on each target whose tags and facts all match. Never recursive.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirEntry {
+    pub path: String,
+    /// Required; `Option<ModeValue>` so a missing or unquoted mode gets its
+    /// own message from [`Config::validate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ModeValue>,
+    /// A user name or numeric id; unset keeps the directory's owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// A group name or numeric id; unset keeps the directory's group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// `true`: create each missing directory above `path`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parents: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facts: BTreeMap<String, String>,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub sudo: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<String>,
+}
+
+/// By hand, as for [`FileEntry`]: a field added later is chosen for `Debug`.
+impl std::fmt::Debug for DirEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirEntry")
+            .field("path", &self.path)
+            .field("mode", &self.mode)
+            .field("owner", &self.owner)
+            .field("group", &self.group)
+            .field("parents", &self.parents)
+            .field("tags", &self.tags)
+            .field("facts", &self.facts)
+            .field("sudo", &self.sudo)
+            .field("notify", &self.notify)
+            .finish()
+    }
+}
+
+/// A `[[links]]` entry: a symlink at `path` pointing at `target`, which may
+/// dangle, on each target whose tags and facts all match.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkEntry {
+    pub path: String,
+    pub target: String,
+    /// `true`: replace a regular file at `path`; a directory is always refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+    /// `true`: create each missing directory above `path`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parents: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facts: BTreeMap<String, String>,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub sudo: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<String>,
+}
+
+/// By hand, as for [`FileEntry`]: a field added later is chosen for `Debug`.
+impl std::fmt::Debug for LinkEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkEntry")
+            .field("path", &self.path)
+            .field("target", &self.target)
+            .field("force", &self.force)
+            .field("parents", &self.parents)
+            .field("tags", &self.tags)
+            .field("facts", &self.facts)
+            .field("sudo", &self.sudo)
             .field("notify", &self.notify)
             .finish()
     }
@@ -671,9 +786,13 @@ remove = []
 pin = []
 upgrade = false
 timeout = 300
+[[dirs]]
+sudo = true
 [[files]]
 sudo = true
 rollback = true
+[[links]]
+sudo = true
 [plugins.NAME]
 on = "step"
 [harden]
@@ -699,6 +818,17 @@ dest = "/etc/motd"
 mode = "0644"
 owner = "root"
 group = "root"
+parents = false
+[[dirs]]
+path = "/srv/app"
+mode = "0755"
+owner = "root"
+group = "root"
+parents = false
+[[links]]
+path = "/usr/local/bin/app"
+target = "/srv/app/bin/app"
+force = false
 parents = false
 [[services]]
 name = "sshd"
@@ -794,7 +924,8 @@ impl Config {
         }
         let examples: toml::Table = full_parse(FULL_EXAMPLES, Format::Toml)?;
         for (key, example) in examples {
-            let refused = !self.tasks.is_empty() && matches!(key.as_str(), "files" | "services");
+            let refused = !self.tasks.is_empty()
+                && matches!(key.as_str(), "dirs" | "files" | "links" | "services");
             if value.get(&key).is_none() && !refused {
                 let table = toml::Table::from_iter([(key, example)]);
                 rendered.push('\n');
@@ -898,7 +1029,11 @@ impl Config {
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_handlers()
             .map_err(|message| DocumentError::invalid(path, message))?;
+        self.check_dirs()
+            .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_files()
+            .map_err(|message| DocumentError::invalid(path, message))?;
+        self.check_links()
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_services()
             .map_err(|message| DocumentError::invalid(path, message))?;
@@ -941,6 +1076,38 @@ impl Config {
         for (i, entry) in self.files.iter().enumerate() {
             let prefix = format!("files[{i}]");
             check_file(&prefix, entry)?;
+            check_notify(&prefix, &entry.notify, &self.handlers)?;
+        }
+        Ok(())
+    }
+
+    /// The `[[dirs]]` syntax rules; nothing here touches the filesystem.
+    fn check_dirs(&self) -> Result<(), String> {
+        if self.dirs.len() > MAX_DIRS {
+            return Err(format!(
+                "dirs: {} entries exceeds the {MAX_DIRS} entry limit",
+                self.dirs.len()
+            ));
+        }
+        for (i, entry) in self.dirs.iter().enumerate() {
+            let prefix = format!("dirs[{i}]");
+            check_dir(&prefix, entry)?;
+            check_notify(&prefix, &entry.notify, &self.handlers)?;
+        }
+        Ok(())
+    }
+
+    /// The `[[links]]` syntax rules; a target is never checked to exist.
+    fn check_links(&self) -> Result<(), String> {
+        if self.links.len() > MAX_LINKS {
+            return Err(format!(
+                "links: {} entries exceeds the {MAX_LINKS} entry limit",
+                self.links.len()
+            ));
+        }
+        for (i, entry) in self.links.iter().enumerate() {
+            let prefix = format!("links[{i}]");
+            check_link(&prefix, entry)?;
             check_notify(&prefix, &entry.notify, &self.handlers)?;
         }
         Ok(())
@@ -1327,6 +1494,51 @@ pub(crate) fn check_file(prefix: &str, entry: &FileEntry) -> Result<(), String> 
     check_selector(prefix, &entry.tags, &entry.facts)
 }
 
+/// One dir entry's rules; `prefix` names it, as `dirs[0]`.
+pub(crate) fn check_dir(prefix: &str, entry: &DirEntry) -> Result<(), String> {
+    check_dest(&entry.path)
+        .map_err(|why| format!("{prefix}.path `{}`: {why}", secret::shown_name(&entry.path)))?;
+    check_mode(entry.mode.as_ref()).map_err(|why| format!("{prefix}.mode{why}"))?;
+    check_account(prefix, "owner", entry.owner.as_deref())?;
+    check_account(prefix, "group", entry.group.as_deref())?;
+    check_selector(prefix, &entry.tags, &entry.facts)
+}
+
+/// One link entry's rules; `prefix` names it, as `links[0]`.
+pub(crate) fn check_link(prefix: &str, entry: &LinkEntry) -> Result<(), String> {
+    check_dest(&entry.path)
+        .map_err(|why| format!("{prefix}.path `{}`: {why}", secret::shown_name(&entry.path)))?;
+    check_target(&entry.target).map_err(|why| {
+        format!(
+            "{prefix}.target `{}`: {why}",
+            escape_invisible(&secret::shown_name(&entry.target))
+        )
+    })?;
+    check_selector(prefix, &entry.tags, &entry.facts)
+}
+
+/// A `[[links]]` target: absolute or relative, 1 to [`MAX_TARGET_BYTES`]
+/// bytes, with no control character (so no NUL or newline) and no bidi or
+/// invisible character, since output lines, plan and `--json` show it.
+fn check_target(target: &str) -> Result<(), String> {
+    if target.is_empty() {
+        return Err("is empty".to_string());
+    }
+    if target.len() > MAX_TARGET_BYTES {
+        return Err(format!(
+            "{} bytes exceeds the {MAX_TARGET_BYTES} byte limit",
+            target.len()
+        ));
+    }
+    if target.chars().any(char::is_control) {
+        return Err("contains a control character".to_string());
+    }
+    if target.chars().any(is_invisible) {
+        return Err("contains an invisible or bidi character".to_string());
+    }
+    Ok(())
+}
+
 /// An `owner` or `group` (`key`): a numeric id that fits a u32, or a name
 /// `[a-z_][a-z0-9_.-]*` of 1 to 32 bytes.
 fn check_account(prefix: &str, key: &str, value: Option<&str>) -> Result<(), String> {
@@ -1670,6 +1882,8 @@ pub(crate) fn check_tasks(
             ("packages", task.packages.is_some()),
             ("file", task.file.is_some()),
             ("service", task.service.is_some()),
+            ("dir", task.dir.is_some()),
+            ("link", task.link.is_some()),
             ("include", task.include.is_some()),
             ("tasks", task.tasks.is_some()),
         ]
@@ -1679,7 +1893,8 @@ pub(crate) fn check_tasks(
             [_] => {}
             [] => {
                 return Err(format!(
-                    "{path}: needs one of run, plugin, packages, file, service, include, tasks"
+                    "{path}: needs one of run, plugin, packages, file, service, dir, link, include, \
+                     tasks"
                 ));
             }
             many => return Err(format!("{path}: has {}; keep one", many.join(" and "))),
@@ -1705,7 +1920,7 @@ pub(crate) fn check_tasks(
             }
             if task.include.is_some() || task.tasks.is_some() {
                 return Err(format!(
-                    "{path}.notify: only on a run, plugin, file or service task"
+                    "{path}.notify: only on a run, plugin, file, service, dir or link task"
                 ));
             }
             check_notify(&path, &task.notify, handlers)?;
@@ -1726,6 +1941,34 @@ pub(crate) fn check_tasks(
         {
             return Err(format!(
                 "{path}.service: notify belongs on the task, not the service"
+            ));
+        }
+        if task.dir.as_ref().is_some_and(|dir| !dir.notify.is_empty()) {
+            return Err(format!(
+                "{path}.dir: notify belongs on the task, not the dir"
+            ));
+        }
+        if task
+            .link
+            .as_ref()
+            .is_some_and(|link| !link.notify.is_empty())
+        {
+            return Err(format!(
+                "{path}.link: notify belongs on the task, not the link"
+            ));
+        }
+        if let Some(dir) = &task.dir
+            && (!dir.tags.is_empty() || !dir.facts.is_empty())
+        {
+            return Err(format!(
+                "{path}.dir: tags and facts belong on the task, not the dir"
+            ));
+        }
+        if let Some(link) = &task.link
+            && (!link.tags.is_empty() || !link.facts.is_empty())
+        {
+            return Err(format!(
+                "{path}.link: tags and facts belong on the task, not the link"
             ));
         }
         if let Some(file) = &task.file
@@ -2301,6 +2544,307 @@ mod tests {
                 "line 5",
             ),
             ("invalid/config-files-unknown-key.yaml", "user", "line 5"),
+        ] {
+            let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                matches!(err, DocumentError::Parse { .. }),
+                "{file}: {message}"
+            );
+            assert!(message.contains(file), "{file}: {message}");
+            assert!(message.contains(key), "{file}: {message}");
+            assert!(message.contains(line), "{file}: {message}");
+        }
+    }
+
+    const DIR: &str = "path = \"/srv/app\"\nmode = \"0755\"";
+    const LINK: &str = "path = \"/usr/local/bin/app\"\ntarget = \"/srv/app/bin/app\"";
+
+    /// A config with one `[[dirs]]` entry made of `keys`.
+    fn dir_entry(keys: &str) -> Config {
+        parse(&format!("[[dirs]]\n{keys}\n"))
+    }
+
+    /// A config with one `[[links]]` entry made of `keys`.
+    fn link_entry(keys: &str) -> Config {
+        parse(&format!("[[links]]\n{keys}\n"))
+    }
+
+    #[test]
+    fn dirs_and_links_parse_with_their_defaults_and_round_trip_in_both_formats() {
+        let plain = parse(&format!("[[dirs]]\n{DIR}\n[[links]]\n{LINK}\n"));
+        plain.validate(Path::new("config.toml")).unwrap();
+        let [dir] = plain.dirs.as_slice() else {
+            panic!("{:?}", plain.dirs);
+        };
+        assert_eq!(dir.path, "/srv/app");
+        assert_eq!(dir.mode, Some(ModeValue::Text("0755".into())));
+        assert_eq!((&dir.owner, &dir.group), (&None, &None));
+        assert!(dir.sudo && !dir.parents);
+        let [link] = plain.links.as_slice() else {
+            panic!("{:?}", plain.links);
+        };
+        assert_eq!(
+            (link.path.as_str(), link.target.as_str()),
+            ("/usr/local/bin/app", "/srv/app/bin/app")
+        );
+        assert!(link.sudo && !link.force && !link.parents);
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&plain, format).unwrap();
+            for key in ["owner", "group", "parents", "sudo", "force", "notify"] {
+                assert!(!text.contains(key), "{key} in {text}");
+            }
+            assert_eq!(document::from_str::<Config>(&text, format).unwrap(), plain);
+        }
+
+        let set = parse(&format!(
+            "[[dirs]]\n{DIR}\nowner = \"app\"\ngroup = \"0\"\nparents = true\n\
+             tags = [\"web\"]\nfacts = {{ os = \"Linux\" }}\nsudo = false\nnotify = [\"reload sshd\"]\n\
+             [[links]]\n{LINK}\nforce = true\nparents = true\ntags = [\"web\"]\n\
+             facts = {{ os = \"Linux\" }}\nsudo = false\nnotify = [\"reload sshd\"]\n{HANDLERS}"
+        ));
+        set.validate(Path::new("config.toml")).unwrap();
+        let (dir, link) = (&set.dirs[0], &set.links[0]);
+        assert_eq!(
+            (dir.owner.as_deref(), dir.group.as_deref()),
+            (Some("app"), Some("0"))
+        );
+        assert!(dir.parents && !dir.sudo && dir.notify == ["reload sshd"]);
+        assert!(link.force && link.parents && !link.sudo && link.tags == ["web"]);
+        let debug = format!("{dir:?} {link:?}");
+        for field in [
+            "DirEntry",
+            "LinkEntry",
+            "owner: Some(\"app\")",
+            "force: true",
+        ] {
+            assert!(debug.contains(field), "{debug}");
+        }
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&set, format).unwrap();
+            assert_eq!(
+                document::from_str::<Config>(&text, format).unwrap(),
+                set,
+                "{text}"
+            );
+        }
+        let yaml: Config = document::from_str(
+            "dirs:\n  - path: /srv/app\n    mode: \"0755\"\n\
+             links:\n  - path: /usr/local/bin/app\n    target: /srv/app/bin/app\n",
+            Format::Yaml,
+        )
+        .unwrap();
+        assert_eq!(yaml, plain);
+    }
+
+    #[test]
+    fn dirs_refusals_name_the_entry_and_the_key() {
+        for (keys, expected) in [
+            ("path = \"/srv/app\"", "dirs[0].mode: required"),
+            (
+                "path = \"/srv/app\"\nmode = 755",
+                "dirs[0].mode: write it as a quoted string such as \"0644\"",
+            ),
+            (
+                "path = \"/srv/app\"\nmode = \"0758\"",
+                "dirs[0].mode `0758`: must be 3 or 4 octal digits",
+            ),
+            (
+                "path = \"/srv/app\"\nmode = \"2775\"",
+                "dirs[0].mode `2775`: setuid and setgid are refused",
+            ),
+            (
+                "path = \"srv/app\"\nmode = \"0755\"",
+                "dirs[0].path `srv/app`: must be an absolute path",
+            ),
+            (
+                "path = \"/srv/../app\"\nmode = \"0755\"",
+                "dirs[0].path `/srv/../app`: must not contain a . or .. component",
+            ),
+            (
+                "path = \"/srv/app/\"\nmode = \"0755\"",
+                "dirs[0].path `/srv/app/`: must not end with /",
+            ),
+            (
+                "path = \"/srv/my app\"\nmode = \"0755\"",
+                "dirs[0].path `/srv/my app`: must match [A-Za-z0-9._/@+-]",
+            ),
+            (
+                &format!("{DIR}\nowner = \"Bad\""),
+                "dirs[0].owner `Bad`: must be a user name or a numeric id",
+            ),
+            (
+                &format!("{DIR}\ngroup = \"1app\""),
+                "dirs[0].group `1app`: must be a group name or a numeric id",
+            ),
+            (
+                &format!("{DIR}\ntags = [\"bad tag\"]"),
+                "dirs[0].tags[0] `bad tag`: must match [A-Za-z0-9_-]+",
+            ),
+            (
+                &format!("{DIR}\nnotify = [\"gone\"]"),
+                "dirs[0].notify[0] `gone`: names no [[handlers]] entry",
+            ),
+        ] {
+            let err = dir_entry(keys).check_dirs().unwrap_err();
+            assert_eq!(err, expected, "{keys}");
+        }
+        dir_entry("path = \"/tmp/x\"\nmode = \"1777\"")
+            .check_dirs()
+            .unwrap();
+    }
+
+    #[test]
+    fn link_targets_are_any_short_line_and_paths_follow_the_dest_rules() {
+        let long = "a/".repeat(2048);
+        for target in [
+            "/srv/app",
+            "../app/bin",
+            "-x",
+            "a b",
+            "$HOME/x",
+            "é",
+            long.as_str(),
+        ] {
+            let quoted = toml::Value::String(target.to_owned());
+            let config = link_entry(&format!("path = \"/a\"\ntarget = {quoted}"));
+            assert_eq!(config.check_links(), Ok(()), "{target}");
+        }
+        let too_long = "a".repeat(4097);
+        for (target, why) in [
+            ("", "is empty"),
+            ("a\nb", "contains a control character"),
+            ("a\u{0}b", "contains a control character"),
+            ("a\tb", "contains a control character"),
+            ("a\u{1b}[2Jb", "contains a control character"),
+            (too_long.as_str(), "4097 bytes exceeds the 4096 byte limit"),
+            (
+                "/srv/\u{202e}ppa",
+                "contains an invisible or bidi character",
+            ),
+            ("a\u{200b}b", "contains an invisible or bidi character"),
+            ("\u{feff}/a", "contains an invisible or bidi character"),
+        ] {
+            let quoted = toml::Value::String(target.to_owned());
+            let err = link_entry(&format!("path = \"/a\"\ntarget = {quoted}"))
+                .check_links()
+                .unwrap_err();
+            assert!(!err.chars().any(is_invisible), "{err:?}");
+            assert!(
+                err.starts_with("links[0].target `") && err.ends_with(&format!("`: {why}")),
+                "{target:?}: {err}"
+            );
+        }
+        for (keys, expected) in [
+            (
+                "path = \"bin/app\"\ntarget = \"/a\"",
+                "links[0].path `bin/app`: must be an absolute path",
+            ),
+            (
+                "path = \"/bin/./app\"\ntarget = \"/a\"",
+                "links[0].path `/bin/./app`: must not contain a . or .. component",
+            ),
+            (
+                &format!("{LINK}\nfacts = {{ distro = \"\" }}"),
+                "links[0].facts.distro: is empty",
+            ),
+            (
+                &format!("{LINK}\nnotify = [\"gone\"]"),
+                "links[0].notify[0] `gone`: names no [[handlers]] entry",
+            ),
+        ] {
+            assert_eq!(
+                link_entry(keys).check_links().unwrap_err(),
+                expected,
+                "{keys}"
+            );
+        }
+    }
+
+    #[test]
+    fn links_refuse_mode_owner_group_and_unknown_keys_as_dirs_do() {
+        for (text, key) in [
+            (format!("[[links]]\n{LINK}\nmode = \"0755\"\n"), "mode"),
+            (format!("[[links]]\n{LINK}\nowner = \"root\"\n"), "owner"),
+            (format!("[[links]]\n{LINK}\ngroup = \"root\"\n"), "group"),
+            (format!("[[links]]\n{LINK}\nrollback = true\n"), "rollback"),
+            (format!("[[dirs]]\n{DIR}\ntarget = \"/a\"\n"), "target"),
+            (format!("[[dirs]]\n{DIR}\nrecurse = true\n"), "recurse"),
+            (format!("[[dirs]]\n{DIR}\ncreates = \"/a\"\n"), "creates"),
+            ("[[links]]\npath = \"/a\"\n".to_string(), "target"),
+            ("[[dirs]]\nmode = \"0755\"\n".to_string(), "path"),
+        ] {
+            let err = document::from_str::<Config>(&text, Format::Toml).unwrap_err();
+            assert!(err.contains(&format!("`{key}`")), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn dirs_and_links_hold_64_entries_each_apart_from_files() {
+        let files = format!("[[files]]\n{ENTRY}\n").repeat(MAX_FILES);
+        let dirs = format!("[[dirs]]\n{DIR}\n");
+        let links = format!("[[links]]\n{LINK}\n");
+        let full = parse(&format!(
+            "{files}{}{}",
+            dirs.repeat(MAX_DIRS),
+            links.repeat(MAX_LINKS)
+        ));
+        full.validate(Path::new("config.toml")).unwrap();
+        assert_eq!(
+            parse(&dirs.repeat(MAX_DIRS + 1)).check_dirs().unwrap_err(),
+            "dirs: 65 entries exceeds the 64 entry limit"
+        );
+        assert_eq!(
+            parse(&links.repeat(MAX_LINKS + 1))
+                .check_links()
+                .unwrap_err(),
+            "links: 65 entries exceeds the 64 entry limit"
+        );
+    }
+
+    #[test]
+    fn dirs_and_links_fixtures_are_refused_naming_the_entry_and_the_key() {
+        for (file, field) in [
+            (
+                "invalid/config-dirs-relative-path.toml",
+                "dirs[1].path `srv/app/data`: must be an absolute path",
+            ),
+            (
+                "invalid/config-dirs-missing-mode.yaml",
+                "dirs[0].mode: required",
+            ),
+            (
+                "invalid/config-dirs-bad-owner.toml",
+                "dirs[0].owner `Bad`: must be a user name or a numeric id",
+            ),
+            (
+                "invalid/config-links-bad-target.toml",
+                "links[0].target `/srv/app\\nbin`: contains a control character",
+            ),
+            (
+                "invalid/config-links-relative-path.yaml",
+                "links[1].path `bin/app`: must be an absolute path",
+            ),
+        ] {
+            let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                matches!(err, DocumentError::Invalid { .. }),
+                "{file}: {message}"
+            );
+            assert!(message.contains(file), "{file}: {message}");
+            assert!(message.contains(field), "{file}: {message}");
+        }
+        for (file, key, line) in [
+            ("invalid/config-dirs-unknown-key.toml", "force", "line 4"),
+            ("invalid/config-dirs-unknown-key.yaml", "recurse", "line 4"),
+            ("invalid/config-links-mode.toml", "mode", "line 4"),
+            ("invalid/config-links-owner.yaml", "owner", "line 4"),
+            (
+                "invalid/config-links-force-not-bool.yaml",
+                "force",
+                "line 4",
+            ),
         ] {
             let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
             let message = err.to_string();
@@ -3436,6 +3980,14 @@ facts = { os = "Linux" }
                 "file = { src = \"a\", dest = \"/b\", mode = \"0644\" }\nrun = \"c\"",
                 "tasks[0]: has run and file; keep one",
             ),
+            (
+                "dir = { path = \"/a\", mode = \"0755\" }\nlink = { path = \"/b\", target = \"/a\" }",
+                "tasks[0]: has dir and link; keep one",
+            ),
+            (
+                "name = \"only\"",
+                "tasks[0]: needs one of run, plugin, packages, file, service, dir, link, include, tasks",
+            ),
         ] {
             let err = validated(&format!("[[tasks]]\n{task}\n")).unwrap_err();
             assert!(err.contains(expected), "{err}");
@@ -3480,6 +4032,11 @@ facts = { os = "Linux" }
                 "service",
                 "name = \"a\", state = \"started\", facts = { os = \"Linux\" }",
             ),
+            ("dir", "path = \"/a\", mode = \"0755\", tags = [\"web\"]"),
+            (
+                "link",
+                "path = \"/a\", target = \"/b\", facts = { os = \"Linux\" }",
+            ),
         ] {
             let err = validated(&format!("[[tasks]]\n{kind} = {{ {inner} }}\n")).unwrap_err();
             assert!(
@@ -3523,6 +4080,8 @@ facts = { os = "Linux" }
         const TASK: &str = "[[tasks]]\nrun = \"a\"\n";
         const FILE: &str = "[[files]]\nsrc = \"a\"\ndest = \"/b\"\nmode = \"0644\"\n";
         const SERVICE: &str = "[[services]]\nname = \"a\"\nstate = \"started\"\n";
+        const DIR: &str = "[[dirs]]\npath = \"/a\"\nmode = \"0755\"\n";
+        const LINK: &str = "[[links]]\npath = \"/a\"\ntarget = \"/b\"\n";
         let err =
             document::from_str::<Config>(&format!("steps = []\n{TASK}"), Format::Toml).unwrap_err();
         assert!(err.contains("cannot be mixed with [[steps]]"), "{err}");
@@ -3530,6 +4089,8 @@ facts = { os = "Linux" }
             ("[[steps]]\nrun = \"hostname\"\n", "[[steps]]"),
             (FILE, "[[files]]"),
             (SERVICE, "[[services]]"),
+            (DIR, "[[dirs]]"),
+            (LINK, "[[links]]"),
             ("[packages]\ninstall = [\"a\"]\n", "[packages] install"),
             ("[packages]\npin = [\"a\"]\n", "[packages] pin"),
             ("[packages]\nremove = [\"a\"]\n", "[packages] remove"),
@@ -3861,7 +4422,9 @@ removes = "/tmp/stale"
     fn checked(text: &str) -> Result<Config, String> {
         let config: Config = document::from_str(text, Format::Toml)?;
         config.check_handlers()?;
+        config.check_dirs()?;
         config.check_files()?;
+        config.check_links()?;
         config.check_services()?;
         config.check_steps()?;
         check_tasks(&config.tasks, "tasks", &config.handlers)?;
@@ -4125,7 +4688,9 @@ removes = "/tmp/stale"
     #[test]
     fn unknown_notify_names_are_refused_in_every_legacy_section() {
         for (section, entry) in [
+            ("dirs", "path = \"/d\"\nmode = \"0755\""),
             ("files", "src = \"a\"\ndest = \"/a\"\nmode = \"0644\""),
+            ("links", "path = \"/l\"\ntarget = \"/d\""),
             ("services", "name = \"x\"\nstate = \"started\""),
             ("steps", "run = \"a\""),
         ] {
@@ -4180,7 +4745,7 @@ removes = "/tmp/stale"
         for kind in ["include = \"$/a.toml\"", "tasks = []"] {
             assert_eq!(
                 refused(&format!("{kind}\nnotify = [\"reload sshd\"]")),
-                "tasks[0].notify: only on a run, plugin, file or service task"
+                "tasks[0].notify: only on a run, plugin, file, service, dir or link task"
             );
         }
         assert_eq!(
@@ -4193,12 +4758,52 @@ removes = "/tmp/stale"
             refused("service = { name = \"x\", state = \"started\", notify = [\"reload sshd\"] }"),
             "tasks[0].service: notify belongs on the task, not the service"
         );
+        assert_eq!(
+            refused("dir = { path = \"/a\", mode = \"0755\", notify = [\"reload sshd\"] }"),
+            "tasks[0].dir: notify belongs on the task, not the dir"
+        );
+        assert_eq!(
+            refused("link = { path = \"/a\", target = \"/b\", notify = [\"reload sshd\"] }"),
+            "tasks[0].link: notify belongs on the task, not the link"
+        );
         let err = document::from_str::<Config>(
             "[packages]\ninstall = [\"git\"]\nnotify = [\"h\"]\n",
             Format::Toml,
         )
         .unwrap_err();
         assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn dir_and_link_tasks_take_notify_and_refuse_guards_and_unknown_notify_names() {
+        for kind in [
+            "dir = { path = \"/a\", mode = \"0755\", owner = \"root\", parents = true }",
+            "link = { path = \"/a\", target = \"../b\", force = true, sudo = false }",
+        ] {
+            let config = checked(&format!(
+                "[[tasks]]\n{kind}\nnotify = [\"reload sshd\"]\n\n{HANDLERS}"
+            ))
+            .unwrap();
+            for format in [Format::Toml, Format::Yaml] {
+                let text = document::to_string(&config, format).unwrap();
+                let back: Config = document::from_str(&text, format).unwrap();
+                assert_eq!(back, config, "{text}");
+            }
+            assert_eq!(
+                checked(&format!(
+                    "[[tasks]]\n{kind}\nnotify = [\"gone\"]\n\n{HANDLERS}"
+                ))
+                .unwrap_err(),
+                "tasks[0].notify[0] `gone`: names no [[handlers]] entry"
+            );
+            for guard in ["creates = \"/a\"", "unless = \"true\""] {
+                let key = guard.split_once(' ').unwrap().0;
+                assert_eq!(
+                    checked(&format!("[[tasks]]\n{kind}\n{guard}\n")).unwrap_err(),
+                    format!("tasks[0].{key}: only on a run or plugin task")
+                );
+            }
+        }
     }
 
     #[test]
@@ -4267,7 +4872,8 @@ mod full_tests {
         for format in [Format::Toml, Format::Yaml] {
             let view = original.full_view(base, format).unwrap();
             for absent in [
-                "steps", "install", "pin", "remove", "upgrade", "files", "services",
+                "steps", "install", "pin", "remove", "upgrade", "files", "services", "dirs",
+                "links",
             ] {
                 assert!(!view.contains(absent), "{absent} in {view}");
             }
@@ -4310,6 +4916,16 @@ mod full_tests {
                 "[[files]]",
                 "src = '$/a'\ndest = '/a'\nmode = '0644'\n",
                 defaults["files"][0].as_table().unwrap(),
+            ),
+            (
+                "[[dirs]]",
+                "path = '/a'\nmode = '0755'\n",
+                defaults["dirs"][0].as_table().unwrap(),
+            ),
+            (
+                "[[links]]",
+                "path = '/a'\ntarget = '/b'\n",
+                defaults["links"][0].as_table().unwrap(),
             ),
             (
                 "[plugins.NAME]",
@@ -4370,6 +4986,8 @@ mod full_tests {
             "# [secrets]",
             "# [[services]]",
             "# [[handlers]]",
+            "# [[dirs]]",
+            "# [[links]]",
             "# editor =",
         ] {
             assert!(view.contains(expected), "missing {expected}: {view}");
@@ -4381,6 +4999,8 @@ mod full_tests {
             "# packages:",
             "# secrets:",
             "# files:",
+            "# dirs:",
+            "# links:",
             "# services:",
             "# handlers:",
             "# plugins:",
