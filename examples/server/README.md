@@ -2,14 +2,21 @@
 
 English | [繁體中文](README.zh-TW.md)
 
-A remote host kept in shape: upgrade, pin, remove, a root-owned file under `/etc`, a running service, guarded steps and
-a handler.
+A remote host kept in shape: upgrade, pin, remove, a config directory, root-owned files under `/etc`, a running
+service, guarded steps and handlers.
 
 - `[packages]`: `upgrade = true` upgrades every installed package first, `pin = ["vim"]` installs vim when missing and
   skips it in that upgrade, `remove = ["nano"]` removes nano when installed. Pin works only on pacman and dnf; on brew,
   apt or apk any `pin` fails that target ([Pin and remove](../../docs/packages.md#pin-and-remove)).
 - `[[files]]` writes `files/motd` to `/etc/motd` through sudo, and `[[services]]` keeps `sshd` started and enabled.
   Both carry `tags = ["linode"]`, the tag of the host `linode1` in `inventory.toml`, so they skip every other target.
+- `[[dirs]]` creates `/etc/app/conf.d` as `root:wheel 0750`, and `parents = true` creates the missing `/etc/app` above
+  it (0755); a rerun prints `unchanged`, or `fixed DIR: …` for an owner, group or mode that drifted
+  ([Dirs](../../docs/configuration.md#dirs)). It runs before `[[files]]`, so the directory is there for `app.conf`.
+- The second `[[files]]` entry writes `files/app.conf` as `root:wheel 0640`: root writes it, the admins in `wheel` (a
+  group Arch ships) read it, and others cannot. With the same bytes and only the owner, group or mode off, it prints
+  `fixed /etc/app/conf.d/app.conf: …` and notifies `log app config change` as a write does
+  ([`owner` and `group`](../../docs/configuration.md#files)).
 - Two `[[steps]]` carry [guards](../../docs/configuration.md#config), so a rerun leaves them alone: `creates` skips the
   first once `/var/tmp/anvil-provisioned` exists, and `unless` skips the second while
   `grep -qx 'managed by anvil' /var/tmp/anvil-note` exits 0. `[[steps]]` take no tags, so both run on every target.
