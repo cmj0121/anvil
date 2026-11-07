@@ -41,6 +41,9 @@ pub const MAX_DIRS: usize = 64;
 /// Most `[[links]]` entries in one config.
 pub const MAX_LINKS: usize = 64;
 
+/// Most `[[absent]]` entries in one config.
+pub const MAX_ABSENT: usize = 64;
+
 /// Longest `[[links]]` target, in bytes: Linux's `PATH_MAX`.
 const MAX_TARGET_BYTES: usize = 4096;
 
@@ -76,6 +79,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<LinkEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub absent: Vec<AbsentEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<ServiceEntry>,
     #[serde(skip_serializing_if = "Harden::is_empty")]
     pub harden: Harden,
@@ -105,6 +110,8 @@ struct RawConfig {
     files: Vec<FileEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     links: Vec<LinkEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    absent: Vec<AbsentEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     services: Vec<ServiceEntry>,
     #[serde(skip_serializing_if = "Harden::is_empty")]
@@ -137,6 +144,7 @@ impl TryFrom<RawConfig> for Config {
                 (!raw.dirs.is_empty(), "[[dirs]]"),
                 (!raw.files.is_empty(), "[[files]]"),
                 (!raw.links.is_empty(), "[[links]]"),
+                (!raw.absent.is_empty(), "[[absent]]"),
                 (!raw.services.is_empty(), "[[services]]"),
                 (
                     packages.is_some_and(|p| !p.install.is_empty()),
@@ -171,6 +179,7 @@ impl TryFrom<RawConfig> for Config {
             dirs: raw.dirs,
             files: raw.files,
             links: raw.links,
+            absent: raw.absent,
             services: raw.services,
             harden: raw.harden,
             path: None,
@@ -191,6 +200,7 @@ impl From<Config> for RawConfig {
             dirs: config.dirs,
             files: config.files,
             links: config.links,
+            absent: config.absent,
             services: config.services,
             harden: config.harden,
             steps: config.tasks.is_empty().then_some(config.steps),
@@ -210,6 +220,7 @@ impl Default for Config {
             dirs: Vec::new(),
             files: Vec::new(),
             links: Vec::new(),
+            absent: Vec::new(),
             services: Vec::new(),
             harden: Harden::default(),
             path: None,
@@ -480,6 +491,8 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<LinkEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absent: Option<AbsentEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks: Option<Vec<Task>>,
@@ -645,6 +658,58 @@ impl std::fmt::Debug for LinkEntry {
     }
 }
 
+/// An `[[absent]]` entry: the file, symlink or empty directory at `path`
+/// removed on each target whose tags and facts all match. Never recursive.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbsentEntry {
+    pub path: String,
+    /// Set: the path must be of this type, else the step fails.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<AbsentType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facts: BTreeMap<String, String>,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub sudo: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<String>,
+}
+
+/// By hand, as for [`FileEntry`]: a field added later is chosen for `Debug`.
+impl std::fmt::Debug for AbsentEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AbsentEntry")
+            .field("path", &self.path)
+            .field("type", &self.r#type)
+            .field("tags", &self.tags)
+            .field("facts", &self.facts)
+            .field("sudo", &self.sudo)
+            .field("notify", &self.notify)
+            .finish()
+    }
+}
+
+/// The type an `[[absent]]` path must have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AbsentType {
+    File,
+    Dir,
+    Link,
+}
+
+impl AbsentType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AbsentType::File => "file",
+            AbsentType::Dir => "dir",
+            AbsentType::Link => "link",
+        }
+    }
+}
+
 /// A `[[services]]` entry: `name` brought to `state`, and to `enabled` when
 /// set, on each target whose tags and facts all match.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -793,6 +858,8 @@ sudo = true
 rollback = true
 [[links]]
 sudo = true
+[[absent]]
+sudo = true
 [plugins.NAME]
 on = "step"
 [harden]
@@ -830,6 +897,9 @@ path = "/usr/local/bin/app"
 target = "/srv/app/bin/app"
 force = false
 parents = false
+[[absent]]
+path = "/etc/nginx/sites-enabled/default"
+type = "link"
 [[services]]
 name = "sshd"
 state = "started"
@@ -925,7 +995,10 @@ impl Config {
         let examples: toml::Table = full_parse(FULL_EXAMPLES, Format::Toml)?;
         for (key, example) in examples {
             let refused = !self.tasks.is_empty()
-                && matches!(key.as_str(), "dirs" | "files" | "links" | "services");
+                && matches!(
+                    key.as_str(),
+                    "dirs" | "files" | "links" | "absent" | "services"
+                );
             if value.get(&key).is_none() && !refused {
                 let table = toml::Table::from_iter([(key, example)]);
                 rendered.push('\n');
@@ -1035,6 +1108,8 @@ impl Config {
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_links()
             .map_err(|message| DocumentError::invalid(path, message))?;
+        self.check_absent()
+            .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_services()
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_harden()
@@ -1111,6 +1186,36 @@ impl Config {
             check_notify(&prefix, &entry.notify, &self.handlers)?;
         }
         Ok(())
+    }
+
+    /// The `[[absent]]` syntax rules, and no absent path at or above a
+    /// `[[files]]`, `[[dirs]]` or `[[links]]` path, or under one.
+    fn check_absent(&self) -> Result<(), String> {
+        if self.absent.len() > MAX_ABSENT {
+            return Err(format!(
+                "absent: {} entries exceeds the {MAX_ABSENT} entry limit",
+                self.absent.len()
+            ));
+        }
+        for (i, entry) in self.absent.iter().enumerate() {
+            let prefix = format!("absent[{i}]");
+            check_absent_entry(&prefix, entry)?;
+            check_notify(&prefix, &entry.notify, &self.handlers)?;
+        }
+        let named = |section: &str, i: usize, key: &str| format!("{section}[{i}].{key}");
+        let absent = (self.absent.iter().enumerate())
+            .map(|(i, entry)| (named("absent", i, "path"), entry.path.as_str()));
+        let others = (self.files.iter().enumerate())
+            .map(|(i, entry)| (named("files", i, "dest"), entry.dest.as_str()))
+            .chain(
+                (self.dirs.iter().enumerate())
+                    .map(|(i, d)| (named("dirs", i, "path"), d.path.as_str())),
+            )
+            .chain(
+                (self.links.iter().enumerate())
+                    .map(|(i, l)| (named("links", i, "path"), l.path.as_str())),
+            );
+        check_absent_overlap(absent, others)
     }
 
     /// The `[[handlers]]` rules: unique valid names and exactly one of `run`
@@ -1517,6 +1622,46 @@ pub(crate) fn check_link(prefix: &str, entry: &LinkEntry) -> Result<(), String> 
     check_selector(prefix, &entry.tags, &entry.facts)
 }
 
+/// One absent entry's rules; `prefix` names it, as `absent[0]`.
+pub(crate) fn check_absent_entry(prefix: &str, entry: &AbsentEntry) -> Result<(), String> {
+    check_dest(&entry.path)
+        .map_err(|why| format!("{prefix}.path `{}`: {why}", secret::shown_name(&entry.path)))?;
+    check_selector(prefix, &entry.tags, &entry.facts)
+}
+
+/// Refuses an absent path (named, path) that is, or sits under, one of
+/// `others`, or holds one: removing it would undo or break that entry,
+/// whichever target it runs on. Repeated slashes do not count.
+pub(crate) fn check_absent_overlap<'a>(
+    absent: impl Iterator<Item = (String, &'a str)>,
+    others: impl Iterator<Item = (String, &'a str)> + Clone,
+) -> Result<(), String> {
+    fn parts(path: &str) -> Vec<&str> {
+        path.split('/').filter(|part| !part.is_empty()).collect()
+    }
+    for (name, path) in absent {
+        let gone = parts(path);
+        for (other, kept) in others.clone() {
+            let kept_parts = parts(kept);
+            let why = if kept_parts.starts_with(&gone) && kept_parts.len() > gone.len() {
+                "holds"
+            } else if gone.starts_with(&kept_parts) {
+                if gone.len() == kept_parts.len() {
+                    "is"
+                } else {
+                    "sits under"
+                }
+            } else {
+                continue;
+            };
+            return Err(format!(
+                "{name} `{path}`: {why} {other} `{kept}`; an absent path cannot overlap it"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A `[[links]]` target: absolute or relative, 1 to [`MAX_TARGET_BYTES`]
 /// bytes, with no control character (so no NUL or newline) and no bidi or
 /// invisible character, since output lines, plan and `--json` show it.
@@ -1884,6 +2029,7 @@ pub(crate) fn check_tasks(
             ("service", task.service.is_some()),
             ("dir", task.dir.is_some()),
             ("link", task.link.is_some()),
+            ("absent", task.absent.is_some()),
             ("include", task.include.is_some()),
             ("tasks", task.tasks.is_some()),
         ]
@@ -1893,8 +2039,8 @@ pub(crate) fn check_tasks(
             [_] => {}
             [] => {
                 return Err(format!(
-                    "{path}: needs one of run, plugin, packages, file, service, dir, link, include, \
-                     tasks"
+                    "{path}: needs one of run, plugin, packages, file, service, dir, link, absent, \
+                     include, tasks"
                 ));
             }
             many => return Err(format!("{path}: has {}; keep one", many.join(" and "))),
@@ -1920,7 +2066,7 @@ pub(crate) fn check_tasks(
             }
             if task.include.is_some() || task.tasks.is_some() {
                 return Err(format!(
-                    "{path}.notify: only on a run, plugin, file, service, dir or link task"
+                    "{path}.notify: only on a run, plugin, file, service, dir, link or absent task"
                 ));
             }
             check_notify(&path, &task.notify, handlers)?;
@@ -1955,6 +2101,22 @@ pub(crate) fn check_tasks(
         {
             return Err(format!(
                 "{path}.link: notify belongs on the task, not the link"
+            ));
+        }
+        if task
+            .absent
+            .as_ref()
+            .is_some_and(|absent| !absent.notify.is_empty())
+        {
+            return Err(format!(
+                "{path}.absent: notify belongs on the task, not the absent entry"
+            ));
+        }
+        if let Some(absent) = &task.absent
+            && (!absent.tags.is_empty() || !absent.facts.is_empty())
+        {
+            return Err(format!(
+                "{path}.absent: tags and facts belong on the task, not the absent entry"
             ));
         }
         if let Some(dir) = &task.dir
@@ -2571,6 +2733,153 @@ mod tests {
     }
 
     #[test]
+    fn absent_parses_with_its_defaults_and_round_trips_in_both_formats() {
+        let plain = parse("[[absent]]\npath = \"/etc/nginx/sites-enabled/default\"\n");
+        plain.validate(Path::new("config.toml")).unwrap();
+        let [entry] = plain.absent.as_slice() else {
+            panic!("{:?}", plain.absent);
+        };
+        assert_eq!(entry.path, "/etc/nginx/sites-enabled/default");
+        assert!(entry.r#type.is_none() && entry.sudo && entry.notify.is_empty());
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&plain, format).unwrap();
+            for key in ["type", "sudo", "notify"] {
+                assert!(!text.contains(key), "{key} in {text}");
+            }
+            assert_eq!(document::from_str::<Config>(&text, format).unwrap(), plain);
+        }
+        for (written, wanted) in [
+            ("file", AbsentType::File),
+            ("dir", AbsentType::Dir),
+            ("link", AbsentType::Link),
+        ] {
+            let set = parse(&format!(
+                "[[absent]]\npath = \"/x\"\ntype = \"{written}\"\ntags = [\"web\"]\n\
+                 facts = {{ os = \"Linux\" }}\nsudo = false\nnotify = [\"reload sshd\"]\n{HANDLERS}"
+            ));
+            set.validate(Path::new("config.toml")).unwrap();
+            assert_eq!(set.absent[0].r#type, Some(wanted));
+            assert_eq!(wanted.as_str(), written);
+            let debug = format!("{:?}", set.absent[0]);
+            assert!(
+                debug.contains("AbsentEntry") && debug.contains("sudo: false"),
+                "{debug}"
+            );
+            for format in [Format::Toml, Format::Yaml] {
+                let text = document::to_string(&set, format).unwrap();
+                assert!(text.contains(written), "{text}");
+                assert_eq!(document::from_str::<Config>(&text, format).unwrap(), set);
+            }
+        }
+    }
+
+    #[test]
+    fn a_bad_absent_entry_is_refused() {
+        for (keys, wanted) in [
+            (
+                "path = \"/x\"\ntype = \"socket\"",
+                "unknown variant `socket`",
+            ),
+            ("path = \"/x\"\nmode = \"0644\"", "unknown field `mode`"),
+            (
+                "path = \"/x\"\nrecursive = true",
+                "unknown field `recursive`",
+            ),
+            ("type = \"file\"", "missing field `path`"),
+        ] {
+            let err = document::from_str::<Config>(&format!("[[absent]]\n{keys}\n"), Format::Toml)
+                .unwrap_err();
+            assert!(err.contains(wanted), "{keys}: {err}");
+        }
+        for (path, wanted) in [
+            ("etc/x", "absent[0].path `etc/x`: must be an absolute path"),
+            ("/", "absent[0].path `/`: must not end with /"),
+            (
+                "/a/../b",
+                "absent[0].path `/a/../b`: must not contain a . or .. component",
+            ),
+            (
+                "/a b",
+                "absent[0].path `/a b`: must match [A-Za-z0-9._/@+-]",
+            ),
+        ] {
+            let config = parse(&format!("[[absent]]\npath = \"{path}\"\n"));
+            assert_eq!(config.check_absent().unwrap_err(), wanted);
+        }
+        let config = parse("[[absent]]\npath = \"/x\"\nnotify = [\"gone\"]\n");
+        assert_eq!(
+            config.check_absent().unwrap_err(),
+            "absent[0].notify[0] `gone`: names no [[handlers]] entry"
+        );
+        let config = parse("[[absent]]\npath = \"/x\"\ntags = [\"no spaces\"]\n");
+        assert!(
+            config
+                .check_absent()
+                .unwrap_err()
+                .starts_with("absent[0].tags[0]")
+        );
+    }
+
+    #[test]
+    fn absent_holds_at_most_64_entries_counted_apart() {
+        let absent = |i: usize| format!("[[absent]]\npath = \"/x{i}\"\n");
+        let files = (0..MAX_FILES)
+            .map(|i| format!("[[files]]\nsrc = \"s\"\ndest = \"/f{i}\"\nmode = \"0644\"\n"))
+            .collect::<String>();
+        let full = parse(&format!(
+            "{files}{}",
+            (0..MAX_ABSENT).map(absent).collect::<String>()
+        ));
+        full.validate(Path::new("config.toml")).unwrap();
+        assert_eq!(
+            parse(&(0..=MAX_ABSENT).map(absent).collect::<String>())
+                .check_absent()
+                .unwrap_err(),
+            "absent: 65 entries exceeds the 64 entry limit"
+        );
+    }
+
+    #[test]
+    fn an_absent_path_overlapping_a_file_dir_or_link_is_refused() {
+        for (other, absent, wanted) in [
+            (
+                "[[files]]\nsrc = \"s\"\ndest = \"/etc/app/f\"\nmode = \"0644\"\ntags = [\"web\"]",
+                "/etc/app/f",
+                "absent[0].path `/etc/app/f`: is files[0].dest `/etc/app/f`",
+            ),
+            (
+                "[[dirs]]\npath = \"/srv/app\"\nmode = \"0755\"",
+                "/srv/app/old",
+                "absent[0].path `/srv/app/old`: sits under dirs[0].path `/srv/app`",
+            ),
+            (
+                "[[links]]\npath = \"/usr//local/bin/app\"\ntarget = \"/t\"",
+                "/usr/local",
+                "absent[0].path `/usr/local`: holds links[0].path `/usr//local/bin/app`",
+            ),
+        ] {
+            let config = parse(&format!(
+                "{other}\n[[absent]]\npath = \"{absent}\"\ntags = [\"db\"]\n"
+            ));
+            let err = config.check_absent().unwrap_err();
+            assert_eq!(err, format!("{wanted}; an absent path cannot overlap it"));
+            assert!(config.validate(Path::new("config.toml")).is_err());
+        }
+        let apart = parse(
+            "[[dirs]]\npath = \"/srv/app\"\nmode = \"0755\"\n\
+             [[absent]]\npath = \"/srv/app2\"\n[[absent]]\npath = \"/srv\"\ntype = \"file\"\n",
+        );
+        assert_eq!(
+            apart.check_absent().unwrap_err(),
+            "absent[1].path `/srv`: holds dirs[0].path `/srv/app`; an absent path cannot overlap it"
+        );
+        let apart = parse(
+            "[[dirs]]\npath = \"/srv/app\"\nmode = \"0755\"\n[[absent]]\npath = \"/srv/app2\"\n",
+        );
+        assert_eq!(apart.check_absent(), Ok(()));
+    }
+
+    #[test]
     fn dirs_and_links_parse_with_their_defaults_and_round_trip_in_both_formats() {
         let plain = parse(&format!("[[dirs]]\n{DIR}\n[[links]]\n{LINK}\n"));
         plain.validate(Path::new("config.toml")).unwrap();
@@ -2803,7 +3112,7 @@ mod tests {
     }
 
     #[test]
-    fn dirs_and_links_fixtures_are_refused_naming_the_entry_and_the_key() {
+    fn dirs_links_and_absent_fixtures_are_refused_naming_the_entry_and_the_key() {
         for (file, field) in [
             (
                 "invalid/config-dirs-relative-path.toml",
@@ -2825,6 +3134,14 @@ mod tests {
                 "invalid/config-links-relative-path.yaml",
                 "links[1].path `bin/app`: must be an absolute path",
             ),
+            (
+                "invalid/config-absent-relative-path.toml",
+                "absent[1].path `etc/motd`: must be an absolute path",
+            ),
+            (
+                "invalid/config-absent-overlap.yaml",
+                "absent[0].path `/srv/app/old`: sits under dirs[0].path `/srv/app`",
+            ),
         ] {
             let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
             let message = err.to_string();
@@ -2845,6 +3162,12 @@ mod tests {
                 "force",
                 "line 4",
             ),
+            (
+                "invalid/config-absent-unknown-key.toml",
+                "recursive",
+                "line 4",
+            ),
+            ("invalid/config-absent-bad-type.yaml", "socket", "line 3"),
         ] {
             let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
             let message = err.to_string();
@@ -3986,7 +4309,7 @@ facts = { os = "Linux" }
             ),
             (
                 "name = \"only\"",
-                "tasks[0]: needs one of run, plugin, packages, file, service, dir, link, include, tasks",
+                "tasks[0]: needs one of run, plugin, packages, file, service, dir, link, absent, include, tasks",
             ),
         ] {
             let err = validated(&format!("[[tasks]]\n{task}\n")).unwrap_err();
@@ -4091,6 +4414,7 @@ facts = { os = "Linux" }
             (SERVICE, "[[services]]"),
             (DIR, "[[dirs]]"),
             (LINK, "[[links]]"),
+            ("[[absent]]\npath = \"/a\"\n", "[[absent]]"),
             ("[packages]\ninstall = [\"a\"]\n", "[packages] install"),
             ("[packages]\npin = [\"a\"]\n", "[packages] pin"),
             ("[packages]\nremove = [\"a\"]\n", "[packages] remove"),
@@ -4745,7 +5069,7 @@ removes = "/tmp/stale"
         for kind in ["include = \"$/a.toml\"", "tasks = []"] {
             assert_eq!(
                 refused(&format!("{kind}\nnotify = [\"reload sshd\"]")),
-                "tasks[0].notify: only on a run, plugin, file, service, dir or link task"
+                "tasks[0].notify: only on a run, plugin, file, service, dir, link or absent task"
             );
         }
         assert_eq!(

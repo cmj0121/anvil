@@ -8,9 +8,10 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::config::{
-    Config, DirEntry, FileEntry, LinkEntry, MAX_DIRS, MAX_FILES, MAX_LINKS, MAX_SERVICES,
-    ServiceEntry, Step, Task, TaskPackages, check_dir, check_file, check_link, check_selector,
-    check_service, check_tasks,
+    AbsentEntry, Config, DirEntry, FileEntry, LinkEntry, MAX_ABSENT, MAX_DIRS, MAX_FILES,
+    MAX_LINKS, MAX_SERVICES, ServiceEntry, Step, Task, TaskPackages, check_absent_entry,
+    check_absent_overlap, check_dir, check_file, check_link, check_selector, check_service,
+    check_tasks,
 };
 use crate::document::{self, Format};
 use crate::error::Failure;
@@ -76,6 +77,11 @@ pub enum ItemKind {
         entry: LinkEntry,
         ordinal: usize,
     },
+    /// `ordinal` is the index among the list's absent items.
+    Absent {
+        entry: AbsentEntry,
+        ordinal: usize,
+    },
     Service(ServiceEntry),
     Step(Step),
 }
@@ -103,6 +109,34 @@ impl Expanded {
             ItemKind::Link { entry, .. } => Some((item, entry)),
             _ => None,
         })
+    }
+
+    /// The absent items in order, each with its entry and ordinal.
+    pub fn absent(&self) -> impl Iterator<Item = (&Item, &AbsentEntry, usize)> {
+        self.items.iter().filter_map(|item| match &item.kind {
+            ItemKind::Absent { entry, ordinal } => Some((item, entry, *ordinal)),
+            _ => None,
+        })
+    }
+
+    /// Refuses an absent item at, under or above any file, dir or link
+    /// item, whatever their selectors.
+    fn check_absent_overlap(&self) -> Result<(), String> {
+        let absent = (self.absent())
+            .map(|(item, entry, i)| (item.label("absent", i) + ".path", entry.path.as_str()));
+        let others = self.items.iter().filter_map(|item| match &item.kind {
+            ItemKind::File { entry, ordinal } => {
+                Some((item.label("files", *ordinal) + ".dest", entry.dest.as_str()))
+            }
+            ItemKind::Dir { entry, ordinal } => {
+                Some((item.label("dirs", *ordinal) + ".path", entry.path.as_str()))
+            }
+            ItemKind::Link { entry, ordinal } => {
+                Some((item.label("links", *ordinal) + ".path", entry.path.as_str()))
+            }
+            _ => None,
+        });
+        check_absent_overlap(absent, others)
     }
 
     /// Whether two dests name one path: on a tasks config repeated slashes do
@@ -141,7 +175,8 @@ impl Expanded {
     }
 
     /// The sudo secrets a step may type on a target its tags reach: for a
-    /// package item, a `sudo = true` dir, file or link item or a service item; and on
+    /// package item, a `sudo = true` dir, file, link or absent item or a
+    /// service item; and on
     /// any target for a service handler, deliberately broad: which handlers
     /// are due is known only after the steps. A secret that is not set
     /// fails a target only once one of its service handlers is due.
@@ -162,9 +197,11 @@ impl Expanded {
                 ItemKind::Dir { entry, .. } if !entry.sudo => {}
                 ItemKind::File { entry, .. } if !entry.sudo => {}
                 ItemKind::Link { entry, .. } if !entry.sudo => {}
+                ItemKind::Absent { entry, .. } if !entry.sudo => {}
                 ItemKind::Dir { .. }
                 | ItemKind::File { .. }
                 | ItemKind::Link { .. }
+                | ItemKind::Absent { .. }
                 | ItemKind::Service(_) => {
                     names
                         .extend(tagged.filter_map(|target| files::sudo_secret_for(config, target)));
@@ -231,7 +268,7 @@ struct IncludeFile {
 }
 
 /// Legacy sections in their fixed order: packages, dirs, files, links,
-/// services, steps. Touches no filesystem.
+/// absent, services, steps. Touches no filesystem.
 pub fn legacy(config: &Config) -> Expanded {
     fn item(
         tags: &[String],
@@ -275,6 +312,13 @@ pub fn legacy(config: &Config) -> Expanded {
         };
         item(&entry.tags, &entry.facts, &entry.notify, kind)
     });
+    let absent = config.absent.iter().enumerate().map(|(ordinal, entry)| {
+        let kind = ItemKind::Absent {
+            entry: entry.clone(),
+            ordinal,
+        };
+        item(&entry.tags, &entry.facts, &entry.notify, kind)
+    });
     let services = config.services.iter().map(|entry| {
         let kind = ItemKind::Service(entry.clone());
         item(&entry.tags, &entry.facts, &entry.notify, kind)
@@ -283,6 +327,7 @@ pub fn legacy(config: &Config) -> Expanded {
         .map(|step| item(&[], &none, &step.notify, ItemKind::Step(step.clone())));
     Expanded {
         items: (packages.chain(dirs).chain(files).chain(links))
+            .chain(absent)
             .chain(services)
             .chain(steps)
             .collect(),
@@ -320,6 +365,7 @@ pub fn expand(
         dirs: 0,
         files: 0,
         links: 0,
+        absent: 0,
         services: 0,
         refused: false,
     };
@@ -329,10 +375,14 @@ pub fn expand(
         refused: walk.refused,
         ..Failure::usage(escape_invisible(&why))
     })?;
-    Ok(Expanded {
+    let expanded = Expanded {
         items: walk.items,
         from_tasks: true,
-    })
+    };
+    expanded
+        .check_absent_overlap()
+        .map_err(|why| Failure::usage(escape_invisible(&why)))?;
+    Ok(expanded)
 }
 
 /// Every `$/` path `config`'s tasks name, as (the field naming it, the path),
@@ -448,6 +498,7 @@ struct Walk<'a> {
     dirs: usize,
     files: usize,
     links: usize,
+    absent: usize,
     services: usize,
     /// The walk stopped at an include others can change, not a bad one.
     refused: bool,
@@ -530,6 +581,18 @@ impl Walk<'_> {
             ItemKind::Link {
                 entry: entry.clone(),
                 ordinal: self.links - 1,
+            }
+        } else if let Some(entry) = &task.absent {
+            check_absent_entry(&format!("{path}.absent"), entry)?;
+            self.absent += 1;
+            if self.absent > MAX_ABSENT {
+                return Err(format!(
+                    "{path}: more than {MAX_ABSENT} absent tasks after expansion"
+                ));
+            }
+            ItemKind::Absent {
+                entry: entry.clone(),
+                ordinal: self.absent - 1,
             }
         } else if let Some(entry) = &task.service {
             check_service(&format!("{path}.service"), entry, false)?;
@@ -632,7 +695,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-    use crate::config::Guards;
+    use crate::config::{AbsentType, Guards};
     use crate::test_util::temp_dir;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -742,13 +805,16 @@ mod tests {
     }
 
     #[test]
-    fn legacy_puts_dirs_before_files_and_links_after_them() {
+    fn legacy_puts_dirs_before_files_and_links_and_absent_after_them() {
         let config: Config = toml::from_str(
             r#"
             [packages]
             install = ["git"]
             [[steps]]
             run = "last"
+            [[absent]]
+            path = "/gone"
+            type = "link"
             [[services]]
             name = "sshd"
             state = "started"
@@ -782,6 +848,7 @@ mod tests {
                 ItemKind::Dir { entry, ordinal } => format!("dir {} {ordinal}", entry.path),
                 ItemKind::File { entry, ordinal } => format!("file {} {ordinal}", entry.dest),
                 ItemKind::Link { entry, ordinal } => format!("link {} {ordinal}", entry.path),
+                ItemKind::Absent { entry, ordinal } => format!("absent {} {ordinal}", entry.path),
                 ItemKind::Service(entry) => format!("service {}", entry.name),
                 ItemKind::Step(_) => "step".to_owned(),
             })
@@ -795,6 +862,7 @@ mod tests {
                 "file /a 0",
                 "link /l0 0",
                 "link /l1 1",
+                "absent /gone 0",
                 "service sshd",
                 "step",
             ]
@@ -805,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sudo_dir_or_link_needs_the_targets_sudo_secret() {
+    fn a_sudo_dir_link_or_absent_needs_the_targets_sudo_secret() {
         let target = crate::inventory::Target {
             sudo_secret: Some("SUDO".to_owned()),
             ..crate::test_util::target("web")
@@ -814,6 +882,7 @@ mod tests {
         for (section, entry) in [
             ("dirs", "path = \"/d\"\nmode = \"0755\""),
             ("links", "path = \"/l\"\ntarget = \"/t\""),
+            ("absent", "path = \"/x\""),
         ] {
             for (sudo, wanted) in [("", vec!["SUDO"]), ("sudo = false", vec![])] {
                 let mut config: Config =
@@ -1009,6 +1078,78 @@ mod tests {
         assert!(matches!(&items[3].kind, ItemKind::File { ordinal: 1, .. }));
         assert!(matches!(&items[4].kind, ItemKind::Service(_)));
         assert!(matches!(&items[5].kind, ItemKind::Step(_)));
+    }
+
+    #[test]
+    fn absent_tasks_run_where_they_stand_with_their_own_ordinals() {
+        let ws = Workspace::new();
+        ws.include(
+            "gone.toml",
+            "[[tasks]]\nabsent = { path = \"/x1\", type = \"dir\" }\n",
+        );
+        let items = ws.items(
+            r#"
+            [[tasks]]
+            name = "Old site"
+            tags = ["web"]
+            absent = { path = "/x0", type = "link", sudo = false }
+            [[tasks]]
+            run = "true"
+            [[tasks]]
+            include = "$/gone.toml"
+            "#,
+        );
+        assert_eq!(
+            paths(&items),
+            ["tasks[0]", "tasks[1]", "tasks[2]/gone.toml:tasks[0]"]
+        );
+        assert!(
+            matches!(&items[0].kind, ItemKind::Absent { entry, ordinal: 0 }
+            if entry.r#type == Some(AbsentType::Link) && !entry.sudo)
+        );
+        assert_eq!(items[0].tags, ["web"]);
+        assert_eq!(items[0].label("absent", 0), "tasks[0].absent");
+        assert!(
+            matches!(&items[2].kind, ItemKind::Absent { entry, ordinal: 1 }
+            if entry.path == "/x1" && entry.r#type == Some(AbsentType::Dir))
+        );
+    }
+
+    #[test]
+    fn an_absent_task_overlapping_a_file_dir_or_link_task_is_refused() {
+        let ws = Workspace::new();
+        ws.include(
+            "app.toml",
+            "[[tasks]]\ntags = [\"db\"]\nlink = { path = \"/etc/app/link\", target = \"/t\" }\n",
+        );
+        for (tasks, wanted) in [
+            (
+                r#"absent = { path = "/etc/app/f" }
+                [[tasks]]
+                tags = ["web"]
+                file = { src = "s", dest = "/etc/app/f", mode = "0644" }"#,
+                "tasks[0].absent.path `/etc/app/f`: is tasks[1].file.dest `/etc/app/f`",
+            ),
+            (
+                r#"absent = { path = "/srv//app/old" }
+                [[tasks]]
+                dir = { path = "/srv/app", mode = "0755" }"#,
+                "tasks[0].absent.path `/srv//app/old`: sits under tasks[1].dir.path `/srv/app`",
+            ),
+            (
+                r#"absent = { path = "/etc/app", type = "dir" }
+                [[tasks]]
+                include = "$/app.toml""#,
+                "tasks[0].absent.path `/etc/app`: holds tasks[1]/app.toml:tasks[0].link.path \
+                 `/etc/app/link`",
+            ),
+        ] {
+            let refusal = ws.refusal(&format!("[[tasks]]\n{tasks}\n"));
+            assert_refused(&refusal, wanted);
+        }
+        let apart = "[[tasks]]\nabsent = { path = \"/etc/app2\" }\n\
+                     [[tasks]]\nfile = { src = \"s\", dest = \"/etc/app/f\", mode = \"0644\" }\n";
+        assert_eq!(ws.items(apart).len(), 2, "a shared prefix is not under");
     }
 
     #[test]
@@ -1255,6 +1396,10 @@ mod tests {
         format!("[[tasks]]\nlink = {{ path = \"/l{i}\", target = \"/t\" }}\n")
     }
 
+    fn absent_task(i: usize) -> String {
+        format!("[[tasks]]\nabsent = {{ path = \"/x{i}\" }}\n")
+    }
+
     fn service_task(i: usize) -> String {
         format!("[[tasks]]\nservice = {{ name = \"s{i}\", state = \"started\" }}\n")
     }
@@ -1298,6 +1443,12 @@ mod tests {
         assert_refused(&refusal, "tasks[1]: more than 64 dir tasks");
         let refusal = ws.refusal(&format!("{}{}", include("links.toml"), link_task(64)));
         assert_refused(&refusal, "tasks[1]: more than 64 link tasks");
+
+        ws.include("absent.toml", &repeated(64, absent_task));
+        let apart = format!("{}{}", include("files.toml"), include("absent.toml"));
+        assert_eq!(ws.items(&apart).len(), 128, "absent counted apart");
+        let refusal = ws.refusal(&format!("{}{}", include("absent.toml"), absent_task(64)));
+        assert_refused(&refusal, "tasks[1]: more than 64 absent tasks");
     }
 
     #[test]
@@ -1513,6 +1664,23 @@ mod tests {
             r#"link = { path = "/l", target = "/t" }
             creates = "/a""#,
             ".creates: only on a run or plugin task",
+        ),
+        (
+            r#"absent = { path = "rel" }"#,
+            ".absent.path `rel`: must be an absolute path",
+        ),
+        (
+            r#"absent = { path = "/a/./b" }"#,
+            ".absent.path `/a/./b`: must not contain a . or .. component",
+        ),
+        (
+            r#"absent = { path = "/x", tags = ["web"] }"#,
+            ".absent: tags and facts belong on the task",
+        ),
+        (
+            r#"absent = { path = "/x" }
+            unless = "true""#,
+            ".unless: only on a run or plugin task",
         ),
         (
             r#"service = { name = "-x", state = "started" }"#,
@@ -1846,11 +2014,11 @@ mod tests {
             ),
             (
                 "tasks = []\nnotify = [\"a\"]",
-                ".notify: only on a run, plugin, file, service, dir or link task",
+                ".notify: only on a run, plugin, file, service, dir, link or absent task",
             ),
             (
                 "include = \"$/other.toml\"\nnotify = [\"a\"]",
-                ".notify: only on a run, plugin, file, service, dir or link task",
+                ".notify: only on a run, plugin, file, service, dir, link or absent task",
             ),
             (
                 "file = { src = \"f\", dest = \"/f\", mode = \"0644\", notify = [\"a\"] }",
@@ -1867,6 +2035,10 @@ mod tests {
             (
                 "link = { path = \"/l\", target = \"/t\", notify = [\"a\"] }",
                 ".link: notify belongs on the task, not the link",
+            ),
+            (
+                "absent = { path = \"/x\", notify = [\"a\"] }",
+                ".absent: notify belongs on the task, not the absent entry",
             ),
             (
                 "link = { path = \"/l\", target = \"/t\" }\nnotify = [\"gone\"]",

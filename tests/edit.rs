@@ -1149,7 +1149,7 @@ fn config_save_keeps_file_owner_group_and_parents_in_either_format() {
 }
 
 #[test]
-fn a_bad_file_dir_or_link_entry_exits_two_naming_it() {
+fn a_bad_file_dir_link_or_absent_entry_exits_two_naming_it() {
     for (file, args, key) in [
         (
             "invalid/config-files-bad-owner.toml",
@@ -1170,6 +1170,16 @@ fn a_bad_file_dir_or_link_entry_exits_two_naming_it() {
             "invalid/config-links-relative-path.yaml",
             &["config", "--format", "yaml"][..],
             "links[1].path `bin/app`",
+        ),
+        (
+            "invalid/config-absent-relative-path.toml",
+            &["config"][..],
+            "absent[1].path `etc/motd`",
+        ),
+        (
+            "invalid/config-absent-overlap.yaml",
+            &["config", "--format", "yaml"][..],
+            "absent[0].path `/srv/app/old`",
         ),
     ] {
         let sb = sandbox();

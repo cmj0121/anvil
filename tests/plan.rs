@@ -891,6 +891,50 @@ fn a_dir_shows_its_mode_owner_group_and_parents() {
 }
 
 #[test]
+fn an_absent_entry_shows_its_path_and_type_and_removes_nothing() {
+    let sandbox = Sandbox::new("pl");
+    let typed = sandbox.root().join("gone");
+    std::fs::write(&typed, "kept\n").unwrap();
+    let typed = typed.display();
+    let plain = sandbox.root().join("plain");
+    let plain = plain.display();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[absent]]\npath = \"{typed}\"\ntype = \"file\"\nsudo = false\n\n\
+             [[absent]]\npath = \"{plain}\"\nsudo = false\n\n\
+             [[absent]]\npath = \"/nowhere\"\ntype = \"dir\"\ntags = [\"web\"]\n"
+        ),
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  would $ absent {typed}\n    type file\n  would $ absent {plain}\n  \
+             would $ skipped absent /nowhere: no match\n  \
+             would $ hostname\n  ✔ 4 steps\n\n1 target, nothing executed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let steps = &json(&out)["targets"][0]["steps"];
+    assert_eq!(
+        steps[0],
+        serde_json::json!({"run": format!("absent {typed}"), "path": typed.to_string(), "type": "file"})
+    );
+    assert_eq!(
+        steps[1],
+        serde_json::json!({"run": format!("absent {plain}"), "path": plain.to_string()})
+    );
+    assert_eq!(
+        steps[2],
+        serde_json::json!({"run": "skipped absent /nowhere: no match"})
+    );
+    assert!(sandbox.root().join("gone").exists(), "nothing removed");
+}
+
+#[test]
 fn a_link_shows_its_target_force_and_parents() {
     let sandbox = Sandbox::new("pl");
     let forced = sandbox.root().join("new/app");

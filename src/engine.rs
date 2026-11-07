@@ -6,6 +6,7 @@ use std::num::NonZeroU8;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use crate::absent;
 use crate::cancel::{AbortReason, Cancel};
 use crate::config::{Config, Handler, Step, StepKind};
 use crate::dirs;
@@ -544,9 +545,14 @@ pub(crate) fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
         .iter()
         .filter(|step| !step.skipped && step.reason.is_none())
         .filter_map(|step| match (&step.entry, &step.task) {
-            (Entry::File { .. } | Entry::Dir { .. } | Entry::Link { .. } | Entry::Script, _) => {
-                None
-            }
+            (
+                Entry::File { .. }
+                | Entry::Dir { .. }
+                | Entry::Link { .. }
+                | Entry::Absent { .. }
+                | Entry::Script,
+                _,
+            ) => None,
             (_, Some(path)) => Some(path.clone()),
             (Entry::Packages, None) => Some("packages".to_owned()),
             (Entry::Service { name }, None) => Some(format!("service {name}")),
@@ -606,6 +612,7 @@ fn execute_inner(
             RunKind::File { .. } => ("files", "files"),
             RunKind::Dir { .. } => ("dirs", "dirs"),
             RunKind::Link { .. } => ("links", "links"),
+            RunKind::Absent { .. } => ("absent", "absent"),
             RunKind::Service { .. } => ("services", "services"),
             RunKind::Packages { .. } => ("packages", "packages"),
             RunKind::Step { .. } | RunKind::Skip | RunKind::Script => ("packages", "step"),
@@ -616,12 +623,17 @@ fn execute_inner(
         if planned.file().is_some_and(|file| file.skip)
             || planned.dir().is_some_and(|dir| dir.skip)
             || planned.link().is_some_and(|link| link.skip)
+            || planned.absent().is_some_and(|absent| absent.skip)
             || planned.service().is_some_and(|service| service.skip)
             || matches!(planned.kind, RunKind::Skip)
         {
             let report = StepReport::skipped(label, entry).of(planned);
             reports.push(noted(report, apply, false));
             continue;
+        }
+        if let RunKind::Absent { path, .. } = &planned.kind {
+            let error = format!("absent {path}: not supported yet by this anvil");
+            return failed(command, target, reports, error).at(planned);
         }
         let password = match planned.sudo_secret.as_deref() {
             None => None,
@@ -1206,6 +1218,10 @@ fn changed(planned: &PlannedRun, output: &Output) -> bool {
                 line.starts_with(linked.as_bytes()) || line.starts_with(relinked.as_bytes())
             })
         }
+        RunKind::Absent { path, .. } => {
+            let removed = format!("removed {path}");
+            lines.any(|line| line == removed.as_bytes())
+        }
         RunKind::Service { name, .. } => {
             let unchanged = format!("unchanged service {name}");
             let not_running = format!("service {name} is not running; not reloaded");
@@ -1298,7 +1314,8 @@ impl From<TransportError> for Unresolved {
 /// from [`probe`], is required when [`needs_facts`] says so; being one probe,
 /// no step can change what a later item sees. A failure is
 /// `packages: <reason>`, `files…`, `services: <reason>`, `dirs…`,
-/// `links…` or `plugin <name>: <reason>`; the first one ends the list.
+/// `links…`, `absent…` or `plugin <name>: <reason>`; the first one ends the
+/// list.
 pub fn resolve(
     target: &Target,
     facts: Option<&Facts>,
@@ -1328,6 +1345,9 @@ pub fn resolve(
             }
             ItemKind::Link { entry, ordinal } => {
                 Some(links::run(config, item, (entry, *ordinal), target, facts)?)
+            }
+            ItemKind::Absent { entry, ordinal } => {
+                Some(absent::run(config, item, (entry, *ordinal), target, facts)?)
             }
             ItemKind::Step(step) => {
                 number += 1;

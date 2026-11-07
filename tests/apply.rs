@@ -3947,3 +3947,24 @@ fn a_forced_link_keeps_only_the_hash_of_a_file_a_files_entry_says_rollback_false
     assert_eq!(previous["reason"], "rollback = false");
     assert!(!record.to_string().contains("kept bytes"));
 }
+
+#[test]
+fn an_absent_entry_fails_its_target_until_it_is_built_and_removes_nothing() {
+    let sandbox = Sandbox::new("ab");
+    let path = sandbox.root().join("gone");
+    std::fs::write(&path, "kept\n").unwrap();
+    let shown = path.display();
+    sandbox.write_config(
+        "config.toml",
+        &format!("[[absent]]\npath = \"{shown}\"\nsudo = false\n"),
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let value = json(&out);
+    assert_eq!(
+        value["targets"][0]["error"],
+        format!("absent {shown}: not supported yet by this anvil"),
+        "{value}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
+}

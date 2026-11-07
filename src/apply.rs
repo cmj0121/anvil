@@ -21,7 +21,7 @@
 //! change which manager or facts a later task sees.
 //!
 //! The fixed order is packages, `[[dirs]]`, `[[files]]`, `[[links]]`,
-//! `[[services]]`, `[[steps]]`, then the handlers.
+//! `[[absent]]`, `[[services]]`, `[[steps]]`, then the handlers.
 //!
 //! Each `[[files]]` entry is one step after the package and `[[dirs]]`
 //! steps, before `[[links]]`: it copies its src when the target matches, else it is

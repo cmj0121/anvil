@@ -1,0 +1,4 @@
+[[absent]]
+path = "/etc/motd"
+type = "file"
+recursive = true

@@ -1,0 +1,3 @@
+absent:
+  - path: /etc/motd
+    type: socket
