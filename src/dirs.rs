@@ -188,7 +188,7 @@ impl DirWrite {
 
 /// The four octal digits `mode` without the setuid and setgid bits, which
 /// anvil leaves as they are on a directory.
-fn without_special(mode: &str) -> String {
+pub(crate) fn without_special(mode: &str) -> String {
     let mode = u32::from_str_radix(mode, 8).unwrap_or(0) & 0o1777;
     format!("{mode:04o}")
 }

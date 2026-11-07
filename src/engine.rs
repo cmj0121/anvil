@@ -19,7 +19,7 @@ use crate::inventory::Target;
 use crate::links;
 use crate::packages::{self, Packages};
 use crate::plugin::{Plugins, Request};
-use crate::record::{self, DirRecord, FileRecord, LinkRecord, Session, TargetRecord};
+use crate::record::{self, AbsentRecord, DirRecord, FileRecord, LinkRecord, Session, TargetRecord};
 use crate::remote::env_prefix;
 use crate::report::{Progress, Report, StepReport, TargetReport, cancelled, failed};
 use crate::secret::Store;
@@ -285,8 +285,8 @@ impl Books {
 }
 
 /// The record of a target the probe reached; `wrote`: a `[[files]]` write
-/// or a `[[dirs]]` or `[[links]]` step started on it, so `record` replaces
-/// its entry, else only refreshes it.
+/// or a `[[dirs]]`, `[[links]]` or `[[absent]]` step started on it, so
+/// `record` replaces its entry, else only refreshes it.
 #[derive(Clone)]
 pub(crate) struct Reached {
     pub(crate) record: TargetRecord,
@@ -332,21 +332,23 @@ pub(crate) fn for_each_target(
     }
 }
 
-/// What a target's `[[files]]`, `[[dirs]]` and `[[links]]` steps did, for
-/// the record.
+/// What a target's `[[files]]`, `[[dirs]]`, `[[links]]` and `[[absent]]`
+/// steps did, for the record.
 pub(crate) struct Recorder<'a> {
     expanded: &'a Expanded,
     sources: &'a Sources,
     files: Vec<FileRecord>,
     dirs: Vec<DirRecord>,
     links: Vec<LinkRecord>,
+    /// What each absent step captured, or that it found its path missing.
+    absent: Vec<AbsentRecord>,
     /// On a tasks config, the dests with a `rollback = false` file item that
     /// applies to this target. Known before any write, since one kept text
     /// could already be that item's bytes from the last apply, and the item
     /// may never run to drop it.
     hash_only: Vec<&'a str>,
     /// Whether a write started: its capture ran, then the write did, or a
-    /// dir or link step ran.
+    /// dir, link or absent step ran.
     wrote: bool,
     target: &'a str,
     facts: Option<&'a Facts>,
@@ -385,6 +387,7 @@ impl<'a> Recorder<'a> {
             files: Vec::new(),
             dirs: Vec::new(),
             links: Vec::new(),
+            absent: Vec::new(),
             hash_only,
             wrote: false,
             target: &target.name,
@@ -436,6 +439,7 @@ impl<'a> Recorder<'a> {
             files,
             dirs: self.dirs.clone(),
             links: self.links.clone(),
+            absent: self.absent.clone(),
             cannot_undo,
             rolled_back: None,
             pending_handlers: self.pending.clone(),
@@ -507,6 +511,16 @@ fn keep_link(expanded: &Expanded, links: &mut Vec<LinkRecord>, link: LinkRecord)
     match (links.iter_mut()).find(|kept| expanded.same_dest(&kept.path, &link.path)) {
         Some(kept) => kept.written_again(link),
         None => links.push(link),
+    }
+}
+
+/// `absent` into `absents`: a path stepped on again in the same apply
+/// keeps the first capture, as only that one saw what was there before.
+fn keep_absent(absents: &mut Vec<AbsentRecord>, absent: AbsentRecord) {
+    match (absents.iter_mut()).find(|kept| kept.path == absent.path) {
+        Some(kept) if kept.is_recorded() => {}
+        Some(kept) => *kept = absent,
+        None => absents.push(absent),
     }
 }
 
@@ -631,10 +645,6 @@ fn execute_inner(
             reports.push(noted(report, apply, false));
             continue;
         }
-        if let RunKind::Absent { path, .. } = &planned.kind {
-            let error = format!("absent {path}: not supported yet by this anvil");
-            return failed(command, target, reports, error).at(planned);
-        }
         let password = match planned.sudo_secret.as_deref() {
             None => None,
             Some(name) => match sudo_password(passwords, name, prefix) {
@@ -648,8 +658,9 @@ fn execute_inner(
         let write = planned.file().and_then(|file| file.write.as_ref());
         let dir = planned.dir().and_then(|dir| dir.write.as_ref());
         let link = planned.link().and_then(|link| link.write.as_ref());
+        let absent = planned.absent().and_then(|absent| absent.write.as_ref());
         if let Some(recorder) = recorder.as_deref_mut()
-            && (dir.is_some() || link.is_some())
+            && (dir.is_some() || link.is_some() || absent.is_some())
         {
             recorder.wrote = true;
         }
@@ -771,6 +782,19 @@ fn execute_inner(
             ) => Some(link.seen(output, hash_only)),
             _ => None,
         };
+        // Never hash only: config refuses an absent path that is, holds or
+        // sits under any files dest, so no `rollback = false` file shares it.
+        let seen_absent = match (absent, &mut output) {
+            (Some(absent), Ok(output)) => absent.seen(output, false),
+            (
+                Some(absent),
+                Err(TransportError::Timeout {
+                    output: Some(output),
+                    ..
+                }),
+            ) => absent.seen(output, false),
+            _ => None,
+        };
         let created_above = (seen.as_ref().map(|seen| &seen.created))
             .or(seen_link.as_ref().map(|seen| &seen.created))
             .unwrap_or(&created);
@@ -781,6 +805,10 @@ fn execute_inner(
             && let Some(record) = link.record(seen, write_end(&output, true))
         {
             keep_link(recorder.expanded, &mut recorder.links, record);
+            recorder.snapshot(None, &reports);
+        }
+        if let (Some(recorder), Some(record)) = (recorder.as_deref_mut(), seen_absent) {
+            keep_absent(&mut recorder.absent, record);
             recorder.snapshot(None, &reports);
         }
         if let (Some(recorder), Some(dir), Some(seen)) = (recorder.as_deref_mut(), dir, seen)

@@ -287,7 +287,7 @@ impl fmt::Debug for WalkNonce {
 /// fails the write, or with `parents = true` is created 0755 as the write's
 /// identity and must then pass the same test. Each created directory is
 /// announced at once on its own stdout line, marked with `create`. Its
-/// messages start with `kind`: `files`, `dirs` or `links`.
+/// messages start with `kind`: `files`, `dirs`, `links` or `absent`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Walk {
     /// The step kind its messages name.

@@ -86,7 +86,7 @@ pub(crate) struct Seen {
 /// `iconv` must also give the bytes back unchanged: musl's exits 0 on
 /// invalid UTF-8 and prints nothing. A newline is refused before, so the
 /// command substitution trims nothing.
-fn read_link(sudo: &str, p: &str) -> String {
+pub(crate) fn read_link(sudo: &str, p: &str) -> String {
     format!(
         "anvil_nl='\n'\n\
          anvil_rl() {{ anvil_l=$({sudo}readlink {p} && echo .) || return 1; \

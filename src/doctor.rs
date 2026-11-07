@@ -1973,6 +1973,7 @@ mod tests {
                     files,
                     dirs: Vec::new(),
                     links: Vec::new(),
+                    absent: Vec::new(),
                     cannot_undo: Vec::new(),
                     rolled_back: None,
                     pending_handlers: Vec::new(),

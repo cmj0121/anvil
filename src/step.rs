@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::absent;
 use crate::config::{AbsentType, Guards};
 use crate::dirs;
 use crate::files;
@@ -183,11 +184,13 @@ pub struct LinkRun {
 }
 
 /// An `[[absent]]` step: whether the entry matched no tag or fact of the
-/// target, and the type the path must have, when set.
+/// target, the type the path must have, when set, and how it runs; `None`
+/// for a skip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbsentRun {
     pub skip: bool,
     pub r#type: Option<AbsentType>,
+    pub write: Option<absent::AbsentWrite>,
 }
 
 /// A `[[services]]` step: whether the entry matched no tag or fact of the target.
