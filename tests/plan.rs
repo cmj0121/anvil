@@ -277,6 +277,50 @@ fn each_file_is_listed_and_neither_written_nor_shown() {
 }
 
 #[test]
+fn a_file_shows_the_owner_group_and_parents_it_sets() {
+    let sandbox = Sandbox::new("pl");
+    std::fs::write(sandbox.config_dir().join("motd.txt"), "hi\n").unwrap();
+    let owned = sandbox.root().join("new/dir/motd");
+    let owned = owned.display();
+    let plain = sandbox.root().join("plain");
+    let plain = plain.display();
+    let grouped = sandbox.root().join("grouped");
+    let grouped = grouped.display();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"motd.txt\"\ndest = \"{owned}\"\nmode = \"0644\"\nsudo = false\n\
+             owner = \"0\"\ngroup = \"wheel\"\nparents = true\n\n\
+             [[files]]\nsrc = \"motd.txt\"\ndest = \"{plain}\"\nmode = \"0644\"\nsudo = false\n\n\
+             [[files]]\nsrc = \"motd.txt\"\ndest = \"{grouped}\"\nmode = \"0644\"\nsudo = false\n\
+             group = \"staff\"\n"
+        ),
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  would $ file {owned}\n    owner 0\n    group wheel\n    parents\n  \
+             would $ file {plain}\n  would $ file {grouped}\n    group staff\n  \
+             would $ hostname\n  ✔ 4 steps\n\n1 target, nothing executed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"],
+        serde_json::json!([
+            {"run": format!("file {owned}"), "owner": "0", "group": "wheel", "parents": true},
+            {"run": format!("file {plain}")},
+            {"run": format!("file {grouped}"), "group": "staff"},
+            {"run": "hostname"},
+        ])
+    );
+    assert!(!sandbox.root().join("new").exists(), "nothing created");
+}
+
+#[test]
 fn parallel_two_plans_two_hosts_at_once_and_keeps_inventory_order() {
     let sandbox = Sandbox::new("pl");
     sandbox.with_two_fake_hosts();
@@ -804,4 +848,85 @@ fn show_rendered_leaves_a_config_without_templates_unchanged() {
     assert!(text(&shown.stdout).contains(&format!("would $ {run}\n")));
     let doc = json(&sandbox.anvil(&["--json", "plan", "--show-rendered"], &[]));
     assert_eq!(keys(&doc), ["executed", "ok", "targets"]);
+}
+
+#[test]
+fn a_dir_shows_its_mode_owner_group_and_parents() {
+    let sandbox = Sandbox::new("pl");
+    let owned = sandbox.root().join("new/app");
+    let owned = owned.display();
+    let plain = sandbox.root().join("plain");
+    let plain = plain.display();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[dirs]]\npath = \"{owned}\"\nmode = \"0750\"\nsudo = false\n\
+             owner = \"0\"\ngroup = \"wheel\"\nparents = true\n\n\
+             [[dirs]]\npath = \"{plain}\"\nmode = \"0755\"\nsudo = false\n\n\
+             [[dirs]]\npath = \"/nowhere\"\nmode = \"0755\"\ntags = [\"web\"]\n"
+        ),
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  would $ dir {owned}\n    mode 0750\n    owner 0\n    group wheel\n    parents\n  \
+             would $ dir {plain}\n    mode 0755\n  would $ skipped dir /nowhere: no match\n  \
+             would $ hostname\n  ✔ 4 steps\n\n1 target, nothing executed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let steps = &json(&out)["targets"][0]["steps"];
+    assert_eq!(
+        steps[0],
+        serde_json::json!({"run": format!("dir {owned}"), "mode": "0750", "owner": "0", "group": "wheel", "parents": true})
+    );
+    assert_eq!(
+        steps[1],
+        serde_json::json!({"run": format!("dir {plain}"), "mode": "0755"})
+    );
+    assert!(!sandbox.root().join("new").exists(), "nothing created");
+}
+
+#[test]
+fn a_link_shows_its_target_force_and_parents() {
+    let sandbox = Sandbox::new("pl");
+    let forced = sandbox.root().join("new/app");
+    let forced = forced.display();
+    let plain = sandbox.root().join("plain");
+    let plain = plain.display();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[links]]\npath = \"{forced}\"\ntarget = \"/opt/app\"\nsudo = false\n\
+             force = true\nparents = true\n\n\
+             [[links]]\npath = \"{plain}\"\ntarget = \"-x y\"\nsudo = false\n\n\
+             [[links]]\npath = \"/nowhere\"\ntarget = \"/x\"\ntags = [\"web\"]\n"
+        ),
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  would $ link {forced} -> /opt/app\n    force\n    parents\n  \
+             would $ link {plain} -> -x y\n  would $ skipped link /nowhere: no match\n  \
+             would $ hostname\n  ✔ 4 steps\n\n1 target, nothing executed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let steps = &json(&out)["targets"][0]["steps"];
+    assert_eq!(
+        steps[0],
+        serde_json::json!({"run": format!("link {forced} -> /opt/app"), "target": "/opt/app", "force": true, "parents": true})
+    );
+    assert_eq!(
+        steps[1],
+        serde_json::json!({"run": format!("link {plain} -> -x y"), "target": "-x y"})
+    );
+    assert!(!sandbox.root().join("new").exists(), "nothing created");
+    assert!(!sandbox.root().join("plain").exists());
 }

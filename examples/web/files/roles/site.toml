@@ -1,16 +1,23 @@
 # Included from config.toml, whose `tags` every task here inherits.
+# The nginx package made the group nginx, which its workers run as.
 [[tasks]]
 name = "Create the site directory"
-run = "sudo -n install -d -m 0755 /var/www/site"
-creates = "/var/www/site" # skipped once it exists
+dir = { path = "/var/www/site", mode = "0750", owner = "root", group = "nginx", parents = true }
 
 [[tasks]]
 name = "Configure and start"
 
+  # The nginx.org package has no sites-available, so parents creates it.
   [[tasks.tasks]]
   name = "Write the site config"
-  file = { src = "$/roles/site/site.conf", dest = "/etc/nginx/conf.d/site.conf", mode = "0644" }
+  file = { src = "$/roles/site/site.conf", dest = "/etc/nginx/sites-available/site.conf", mode = "0644", parents = true }
   notify = ["reload nginx"] # [[handlers]] in config.toml; only when the file changes
+
+  # nginx reads conf.d/*.conf; removing this link disables the site.
+  [[tasks.tasks]]
+  name = "Enable the site"
+  link = { path = "/etc/nginx/conf.d/site.conf", target = "../sites-available/site.conf" }
+  notify = ["reload nginx"]
 
   [[tasks.tasks]]
   name = "Validate the config"

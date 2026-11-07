@@ -1577,6 +1577,9 @@ mod tests {
             src: "src.txt".to_owned(),
             dest: dest.to_owned(),
             mode: Some(ModeValue::Text("0644".to_owned())),
+            owner: None,
+            group: None,
+            parents: false,
             tags: vec![tag.to_owned()],
             facts: Default::default(),
             sudo: false,
@@ -1654,6 +1657,9 @@ mod tests {
                 src: "src.txt".to_owned(),
                 dest: "/etc/a.conf".to_owned(),
                 mode: Some(ModeValue::Text("0644".to_owned())),
+                owner: None,
+                group: None,
+                parents: false,
                 tags: vec!["web".to_owned()],
                 facts: Default::default(),
                 sudo: false,
@@ -2601,7 +2607,7 @@ mod tests {
 
     #[test]
     fn a_templated_file_shows_its_rendered_size_and_sha256_under_its_would_line() {
-        use anvil::files::{FileWrite, Rendered};
+        use anvil::files::{FileWrite, Rendered, Walk, WalkNonce};
         use anvil::plan::PlanReport;
         use anvil::step::{FileRun, PlannedRun, RunKind};
         use anvil::transport::RUN_TIMEOUT;
@@ -2622,9 +2628,18 @@ mod tests {
                         mode: "0644".to_owned(),
                         sudo: String::new(),
                         checks: String::new(),
+                        walk: Box::new(Walk {
+                            kind: "files",
+                            dirs: Vec::new(),
+                            owner: String::new(),
+                            create: None,
+                        }),
                         as_root: false,
                         password: false,
                         rendered: rendered.map(Box::new),
+                        ids: None,
+                        mark: WalkNonce::generate().unwrap(),
+                        parents: false,
                     }),
                 },
             },

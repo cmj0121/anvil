@@ -49,7 +49,8 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
   會出現在 `targets:` 之前。
   右側的 `✔ ok  ✘ failed` 計算顯示中結果的 target。放不下的文字以 `…` 截斷。
   inventory 載入失敗時，選擇的位置改以紅色顯示 `inventory error`，錯誤本身則顯示為通知。
-- **Steps。** apply 會執行的 step，附編號：`[packages]` 有工作時為 `packages`，接著是每個 `[[files]]` 項目的 `file DEST`
+- **Steps。** apply 會執行的 step，附編號：`[packages]` 有工作時為 `packages`，接著是每個 `[[dirs]]` 項目的 `dir PATH`、
+  每個 `[[files]]` 項目的 `file DEST`、每個 `[[links]]` 項目的 `link PATH -> TARGET`
   與每個 `[[services]]` 項目的 `service NAME`，然後是每個 `[[steps]]` 的指令
   （第一行，還有更多行時加上 `…`）；沒有 `[[steps]]` 的 config 執行預設的 `hostname` step。
   [`[[tasks]]`](configuration.zh-TW.md#tasks) config 則依執行順序列出展開後的 task，每列為 `NAME  PATH`（沒有 `name` 時用上述標籤），

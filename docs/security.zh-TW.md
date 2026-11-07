@@ -19,7 +19,7 @@
 - **磁碟上的明文**。secret 一律只以加密形式寫入，
   例外是你編輯值時 `anvil secret` 使用的編輯器暫存檔案；apply 紀錄是另一個例外，見下一項。
 - **apply 紀錄以明文保存檔案先前的文字**。`$XDG_STATE_HOME/anvil`（否則為 `~/.local/state/anvil`）中的
-  `last-apply.json` 保存每次 `[[files]]` 寫入所取代的文字，讓 `anvil rollback` 能把它放回去
+  `last-apply.json` 保存每次 `[[files]]` 寫入所取代的文字，以及 `force = true` 的 `[[links]]` 項目所取代的檔案，讓 `anvil rollback` 能把它放回去
   （[apply 紀錄](cli.zh-TW.md#apply-紀錄)）。它沒有加密：保護它的是你擁有的 0700 目錄中的 mode 0600，
   每次執行都會檢查兩者，anvil 會拒絕對他人開放的紀錄或目錄。任何能以你的身分讀取你的檔案的人，或能讀取其備份的人，都能讀到它。
   其他人無法讀取的先前檔案（mode 不含 `0o004`，例如 0440 的 `/etc/sudoers.d/*`）只保存 sha256，位元組也不會離開 target，
@@ -29,12 +29,17 @@
   dest 的 symlink、hard link 或不分大小寫的別名在 controller 上看不出來，會算成不同的 dest，因此該檔案的每個項目都要設定。
   同一 dest 重複的舊式 `[[files]]` 項目，若第一個使用預設 rollback、後面的設定 `rollback = false`，第二次 apply 時仍會把後面項目的
   secret 保存為文字：請改用 `[[tasks]]`，或兩者都設定 `rollback = false`。
+  設定 `force = true` 的 `[[links]]` 項目依同樣規則保存它取代的一般檔案；若該路徑的 `[[files]]` 項目或 file task 設定
+  `rollback = false`，就只保存其 sha256。
   絕不要把 `$XDG_STATE_HOME` 指進 dotfiles 或其他共用的 repository，也絕不要 commit 這份紀錄。
   這些文字絕不會印出或記錄，且讀取紀錄前會先關閉 core dump。紀錄只是你擁有的一個檔案，因此 rollback 絕不讓它決定路徑：
   dest 或 mode 不可能由 apply 寫出的紀錄會被拒絕，且只還原目前 config 的 `[[files]]` 或 file task 仍列出、`sudo` 相同、
-  且該項目適用於該 target 的 dest（[anvil rollback](cli.zh-TW.md#anvil-rollback)）。
-- **紀錄與 config 受到同等的信任**。它沒有簽章，也沒有驗證。在 config 列出的 dest 上，rollback 放回的位元組、owner
-  與 mode 由紀錄決定，因此能寫入紀錄的人，就能讓 rollback（透過 sudo、以 root）在那裡寫入任意文字、任意 owner 與 mode。
+  且該項目適用於該 target 的 dest；目錄與連結也一樣，只還原 `[[dirs]]` 與 `[[links]]`（或 dir 與 link task）仍列出的 path
+  （[anvil rollback](cli.zh-TW.md#anvil-rollback)）。
+- **紀錄與 config 受到同等的信任**。它沒有簽章，也沒有驗證。在 config 列出的 dest 上，rollback 放回的位元組、owner、group
+  與 mode 由紀錄決定，因此能寫入紀錄的人，就能讓 rollback（透過 sudo、以 root）在那裡寫入任意文字、任意 owner、group 與 mode。
+  當該項目設定 `parents = true` 時，紀錄的 `created_dirs` 也決定 rollback 會移除這種 dest 路徑上的哪些空目錄。
+  在 config 列出的目錄或連結 path 上，目錄放回的 owner、group 與 mode，以及連結重新指向的 target，也由紀錄決定。
   請讓它與 config 一樣私密：同一個使用者、0700 的狀態目錄，不要有共用或同步的副本。
 - **include 與 config 受到同等的信任**。[`[[tasks]]` include](configuration.zh-TW.md#tasks) 決定 target 上執行什麼，
   task 使用 sudo 時也包含在內，因此能寫入它的人就能在那裡執行任何東西。請讓它與 config 一樣私密。

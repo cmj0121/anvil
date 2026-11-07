@@ -561,12 +561,13 @@ pub fn load_steps(opts: &Options) -> Result<Vec<StepRow>, String> {
         .map_err(|failure| failure.message)
 }
 
-/// The steps apply runs for `expanded`, in its order: `packages`, `file <dest>`,
-/// `service <name>` (each a step on every target, skipped where it does not
-/// match), each step's command as its `$` line shows it, or `plugin <name>` for
-/// a plugin step, whose script is known only once it has run. A task's row is
-/// `NAME  PATH`, or `<that label>  PATH` without a name: the pane is narrow and a
-/// row is cut at its end, and an include's path alone can fill it.
+/// The steps apply runs for `expanded`, in its order: `packages`, `dir <path>`,
+/// `file <dest>`, `link <path> -> <target>`, `service <name>` (each a step on
+/// every target, skipped where it does not match), each step's command as its
+/// `$` line shows it, or `plugin <name>` for a plugin step, whose script is
+/// known only once it has run. A task's row is `NAME  PATH`, or `<that label>
+/// PATH` without a name: the pane is narrow and a row is cut at its end, and an
+/// include's path alone can fill it.
 pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
     expanded
         .items
@@ -574,7 +575,9 @@ pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
         .map(|item| {
             let label = match &item.kind {
                 ItemKind::Packages(_) => "packages".to_owned(),
+                ItemKind::Dir { entry, .. } => format!("dir {}", entry.path),
                 ItemKind::File { entry, .. } => format!("file {}", entry.dest),
+                ItemKind::Link { entry, .. } => format!("link {} -> {}", entry.path, entry.target),
                 ItemKind::Service(entry) => format!("service {}", entry.name),
                 ItemKind::Step(step) => match step.kind() {
                     StepKind::Plugin(name) => format!("plugin {name}"),
@@ -1959,6 +1962,26 @@ pub mod tests {
                 row("file /etc/motd"),
                 row("service sshd"),
                 row("service cron"),
+                row("hostname"),
+            ])
+        );
+    }
+
+    #[test]
+    fn dir_and_link_rows_frame_the_file_rows() {
+        let opts = config_opts(
+            "tui-steps-dirs-links",
+            "[[links]]\npath = \"/usr/local/bin/app\"\ntarget = \"../app/bin\"\n\n\
+             [[files]]\nsrc = \"motd\"\ndest = \"/etc/motd\"\nmode = \"0644\"\n\n\
+             [[dirs]]\npath = \"/srv/app\"\nmode = \"0755\"\n\n\
+             [[steps]]\nrun = \"hostname\"\n",
+        );
+        assert_eq!(
+            load_steps(&opts),
+            Ok(vec![
+                row("dir /srv/app"),
+                row("file /etc/motd"),
+                row("link /usr/local/bin/app -> ../app/bin"),
                 row("hostname"),
             ])
         );

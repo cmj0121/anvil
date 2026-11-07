@@ -1123,3 +1123,62 @@ fn config_full_save_refuses_a_missing_include_too() {
     assert_eq!(sb.calls(), 3);
     assert_eq!(fs::read_to_string(path).unwrap(), original);
 }
+
+#[test]
+fn config_save_keeps_file_owner_group_and_parents_in_either_format() {
+    let sb = sandbox();
+    let path = sb.put("config.toml", "");
+    let typed = "[[files]]\nsrc = \"motd\"\ndest = \"/etc/app/motd\"\nmode = \"0640\"\n\
+                 owner = \"root\"\ngroup = \"app\"\nparents = true\n";
+    let content = sb.put("content.toml", typed);
+    let out = sb.edit(&["config"], Some(&content), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(fs::read_to_string(&path).unwrap(), typed);
+
+    let yaml = sb.put(
+        "content.yaml",
+        "files:\n  - src: motd\n    dest: /etc/app/motd\n    mode: \"0640\"\n    \
+         owner: \"0\"\n    group: app\n    parents: true\n",
+    );
+    let out = sb.edit(&["config", "--format", "yaml"], Some(&yaml), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let saved = fs::read_to_string(&path).unwrap();
+    for line in ["owner = \"0\"", "group = \"app\"", "parents = true"] {
+        assert!(saved.contains(line), "{saved}");
+    }
+}
+
+#[test]
+fn a_bad_file_dir_or_link_entry_exits_two_naming_it() {
+    for (file, args, key) in [
+        (
+            "invalid/config-files-bad-owner.toml",
+            &["config"][..],
+            "files[0].owner `Bad`",
+        ),
+        (
+            "invalid/config-files-bad-group.yaml",
+            &["config", "--format", "yaml"][..],
+            "files[1].group `1app`",
+        ),
+        (
+            "invalid/config-dirs-bad-owner.toml",
+            &["config"][..],
+            "dirs[0].owner `Bad`",
+        ),
+        (
+            "invalid/config-links-relative-path.yaml",
+            &["config", "--format", "yaml"][..],
+            "links[1].path `bin/app`",
+        ),
+    ] {
+        let sb = sandbox();
+        let original = "[packages]\n";
+        let path = sb.put("config.toml", original);
+        let out = sb.edit(args, Some(&fixture(file)), None);
+        assert_eq!(out.status.code(), Some(2), "{file}");
+        let stderr = text(&out.stderr);
+        assert_eq!(stderr.matches(key).count(), 3, "{file}: {stderr}");
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+}

@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::config::{
-    Config, FileEntry, MAX_FILES, MAX_SERVICES, ServiceEntry, Step, Task, TaskPackages, check_file,
-    check_selector, check_service, check_tasks,
+    Config, DirEntry, FileEntry, LinkEntry, MAX_DIRS, MAX_FILES, MAX_LINKS, MAX_SERVICES,
+    ServiceEntry, Step, Task, TaskPackages, check_dir, check_file, check_link, check_selector,
+    check_service, check_tasks,
 };
 use crate::document::{self, Format};
 use crate::error::Failure;
@@ -60,9 +61,19 @@ pub struct Item {
 pub enum ItemKind {
     /// The global `[packages]` with this task's lists.
     Packages(Packages),
+    /// `ordinal` is the index among the list's dir items.
+    Dir {
+        entry: DirEntry,
+        ordinal: usize,
+    },
     /// `ordinal` is the index among the list's file items.
     File {
         entry: FileEntry,
+        ordinal: usize,
+    },
+    /// `ordinal` is the index among the list's link items.
+    Link {
+        entry: LinkEntry,
         ordinal: usize,
     },
     Service(ServiceEntry),
@@ -74,6 +85,22 @@ impl Expanded {
     pub fn files(&self) -> impl Iterator<Item = (&Item, &FileEntry, usize)> {
         self.items.iter().filter_map(|item| match &item.kind {
             ItemKind::File { entry, ordinal } => Some((item, entry, *ordinal)),
+            _ => None,
+        })
+    }
+
+    /// The dir items in order, each with its entry.
+    pub fn dirs(&self) -> impl Iterator<Item = (&Item, &DirEntry)> {
+        self.items.iter().filter_map(|item| match &item.kind {
+            ItemKind::Dir { entry, .. } => Some((item, entry)),
+            _ => None,
+        })
+    }
+
+    /// The link items in order, each with its entry.
+    pub fn links(&self) -> impl Iterator<Item = (&Item, &LinkEntry)> {
+        self.items.iter().filter_map(|item| match &item.kind {
+            ItemKind::Link { entry, .. } => Some((item, entry)),
             _ => None,
         })
     }
@@ -114,7 +141,7 @@ impl Expanded {
     }
 
     /// The sudo secrets a step may type on a target its tags reach: for a
-    /// package item, a `sudo = true` file item or a service item; and on
+    /// package item, a `sudo = true` dir, file or link item or a service item; and on
     /// any target for a service handler, deliberately broad: which handlers
     /// are due is known only after the steps. A secret that is not set
     /// fails a target only once one of its service handlers is due.
@@ -132,8 +159,13 @@ impl Expanded {
                 ItemKind::Packages(packages) => {
                     names.extend(tagged.filter_map(|target| packages.sudo_secret_for(target)));
                 }
+                ItemKind::Dir { entry, .. } if !entry.sudo => {}
                 ItemKind::File { entry, .. } if !entry.sudo => {}
-                ItemKind::File { .. } | ItemKind::Service(_) => {
+                ItemKind::Link { entry, .. } if !entry.sudo => {}
+                ItemKind::Dir { .. }
+                | ItemKind::File { .. }
+                | ItemKind::Link { .. }
+                | ItemKind::Service(_) => {
                     names
                         .extend(tagged.filter_map(|target| files::sudo_secret_for(config, target)));
                 }
@@ -198,7 +230,8 @@ struct IncludeFile {
     tasks: Vec<Task>,
 }
 
-/// Legacy sections in today's fixed order. Touches no filesystem.
+/// Legacy sections in their fixed order: packages, dirs, files, links,
+/// services, steps. Touches no filesystem.
 pub fn legacy(config: &Config) -> Expanded {
     fn item(
         tags: &[String],
@@ -221,8 +254,22 @@ pub fn legacy(config: &Config) -> Expanded {
         .iter()
         .filter(|p| p.has_work())
         .map(|p| item(&[], &none, &[], ItemKind::Packages(p.clone())));
+    let dirs = config.dirs.iter().enumerate().map(|(ordinal, entry)| {
+        let kind = ItemKind::Dir {
+            entry: entry.clone(),
+            ordinal,
+        };
+        item(&entry.tags, &entry.facts, &entry.notify, kind)
+    });
     let files = config.files.iter().enumerate().map(|(ordinal, entry)| {
         let kind = ItemKind::File {
+            entry: entry.clone(),
+            ordinal,
+        };
+        item(&entry.tags, &entry.facts, &entry.notify, kind)
+    });
+    let links = config.links.iter().enumerate().map(|(ordinal, entry)| {
+        let kind = ItemKind::Link {
             entry: entry.clone(),
             ordinal,
         };
@@ -235,7 +282,10 @@ pub fn legacy(config: &Config) -> Expanded {
     let steps = (config.steps.iter())
         .map(|step| item(&[], &none, &step.notify, ItemKind::Step(step.clone())));
     Expanded {
-        items: packages.chain(files).chain(services).chain(steps).collect(),
+        items: (packages.chain(dirs).chain(files).chain(links))
+            .chain(services)
+            .chain(steps)
+            .collect(),
         from_tasks: false,
     }
 }
@@ -267,7 +317,9 @@ pub fn expand(
         chain: Vec::new(),
         items: Vec::new(),
         visited: 0,
+        dirs: 0,
         files: 0,
+        links: 0,
         services: 0,
         refused: false,
     };
@@ -393,7 +445,9 @@ struct Walk<'a> {
     chain: Vec<String>,
     items: Vec<Item>,
     visited: usize,
+    dirs: usize,
     files: usize,
+    links: usize,
     services: usize,
     /// The walk stopped at an include others can change, not a bad one.
     refused: bool,
@@ -452,6 +506,30 @@ impl Walk<'_> {
             ItemKind::File {
                 entry: entry.clone(),
                 ordinal: self.files - 1,
+            }
+        } else if let Some(entry) = &task.dir {
+            check_dir(&format!("{path}.dir"), entry)?;
+            self.dirs += 1;
+            if self.dirs > MAX_DIRS {
+                return Err(format!(
+                    "{path}: more than {MAX_DIRS} dir tasks after expansion"
+                ));
+            }
+            ItemKind::Dir {
+                entry: entry.clone(),
+                ordinal: self.dirs - 1,
+            }
+        } else if let Some(entry) = &task.link {
+            check_link(&format!("{path}.link"), entry)?;
+            self.links += 1;
+            if self.links > MAX_LINKS {
+                return Err(format!(
+                    "{path}: more than {MAX_LINKS} link tasks after expansion"
+                ));
+            }
+            ItemKind::Link {
+                entry: entry.clone(),
+                ordinal: self.links - 1,
             }
         } else if let Some(entry) = &task.service {
             check_service(&format!("{path}.service"), entry, false)?;
@@ -664,6 +742,94 @@ mod tests {
     }
 
     #[test]
+    fn legacy_puts_dirs_before_files_and_links_after_them() {
+        let config: Config = toml::from_str(
+            r#"
+            [packages]
+            install = ["git"]
+            [[steps]]
+            run = "last"
+            [[services]]
+            name = "sshd"
+            state = "started"
+            [[links]]
+            path = "/l0"
+            target = "/d0"
+            [[files]]
+            src = "a"
+            dest = "/a"
+            mode = "0644"
+            [[links]]
+            path = "/l1"
+            target = "../d1"
+            sudo = false
+            [[dirs]]
+            path = "/d0"
+            mode = "0755"
+            tags = ["web"]
+            [[dirs]]
+            path = "/d1"
+            mode = "0700"
+            notify = ["h", "h"]
+            "#,
+        )
+        .unwrap();
+        let items = legacy(&config).items;
+        let kinds: Vec<String> = items
+            .iter()
+            .map(|item| match &item.kind {
+                ItemKind::Packages(_) => "packages".to_owned(),
+                ItemKind::Dir { entry, ordinal } => format!("dir {} {ordinal}", entry.path),
+                ItemKind::File { entry, ordinal } => format!("file {} {ordinal}", entry.dest),
+                ItemKind::Link { entry, ordinal } => format!("link {} {ordinal}", entry.path),
+                ItemKind::Service(entry) => format!("service {}", entry.name),
+                ItemKind::Step(_) => "step".to_owned(),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "packages",
+                "dir /d0 0",
+                "dir /d1 1",
+                "file /a 0",
+                "link /l0 0",
+                "link /l1 1",
+                "service sshd",
+                "step",
+            ]
+        );
+        assert_eq!(items[1].tags, ["web"]);
+        assert_eq!(items[2].notify, ["h"]);
+        assert_eq!(items[1].label("dirs", 0), "dirs[0]");
+    }
+
+    #[test]
+    fn a_sudo_dir_or_link_needs_the_targets_sudo_secret() {
+        let target = crate::inventory::Target {
+            sudo_secret: Some("SUDO".to_owned()),
+            ..crate::test_util::target("web")
+        };
+        let targets = [target];
+        for (section, entry) in [
+            ("dirs", "path = \"/d\"\nmode = \"0755\""),
+            ("links", "path = \"/l\"\ntarget = \"/t\""),
+        ] {
+            for (sudo, wanted) in [("", vec!["SUDO"]), ("sudo = false", vec![])] {
+                let mut config: Config =
+                    toml::from_str(&format!("[[{section}]]\n{entry}\n{sudo}\n")).unwrap();
+                config.steps.clear();
+                let expanded = legacy(&config);
+                let names: Vec<&str> = expanded
+                    .sudo_secrets(&config, &targets)
+                    .into_iter()
+                    .collect();
+                assert_eq!(names, wanted, "{section} {sudo}");
+            }
+        }
+    }
+
+    #[test]
     fn legacy_has_no_packages_item_without_work_and_keeps_the_default_step() {
         let config: Config = toml::from_str("[packages]\nmanager = \"apt\"\n").unwrap();
         let items = legacy(&config).items;
@@ -843,6 +1009,48 @@ mod tests {
         assert!(matches!(&items[3].kind, ItemKind::File { ordinal: 1, .. }));
         assert!(matches!(&items[4].kind, ItemKind::Service(_)));
         assert!(matches!(&items[5].kind, ItemKind::Step(_)));
+    }
+
+    #[test]
+    fn dir_and_link_tasks_run_where_they_stand_with_their_own_ordinals() {
+        let ws = Workspace::new();
+        ws.include(
+            "links.toml",
+            "[[tasks]]\nlink = { path = \"/l1\", target = \"/d1\" }\n",
+        );
+        let items = ws.items(
+            r#"
+            [[tasks]]
+            link = { path = "/l0", target = "/d0", force = true }
+            [[tasks]]
+            name = "Data"
+            tags = ["db"]
+            dir = { path = "/d0", mode = "0750", owner = "app" }
+            [[tasks]]
+            include = "$/links.toml"
+            [[tasks]]
+            dir = { path = "/d1", mode = "0755" }
+            "#,
+        );
+        assert_eq!(
+            paths(&items),
+            [
+                "tasks[0]",
+                "tasks[1]",
+                "tasks[2]/links.toml:tasks[0]",
+                "tasks[3]"
+            ]
+        );
+        assert!(matches!(&items[0].kind, ItemKind::Link { entry, ordinal: 0 } if entry.force));
+        assert!(
+            matches!(&items[1].kind, ItemKind::Dir { entry, ordinal: 0 } if entry.owner.as_deref() == Some("app"))
+        );
+        assert_eq!(items[1].tags, ["db"]);
+        assert_eq!(items[1].label("dirs", 0), "tasks[1].dir");
+        assert!(
+            matches!(&items[2].kind, ItemKind::Link { entry, ordinal: 1 } if entry.target == "/d1")
+        );
+        assert!(matches!(&items[3].kind, ItemKind::Dir { ordinal: 1, .. }));
     }
 
     #[test]
@@ -1039,6 +1247,14 @@ mod tests {
         format!("[[tasks]]\nfile = {{ src = \"s\", dest = \"/d{i}\", mode = \"0644\" }}\n")
     }
 
+    fn dir_task(i: usize) -> String {
+        format!("[[tasks]]\ndir = {{ path = \"/d{i}\", mode = \"0755\" }}\n")
+    }
+
+    fn link_task(i: usize) -> String {
+        format!("[[tasks]]\nlink = {{ path = \"/l{i}\", target = \"/t\" }}\n")
+    }
+
     fn service_task(i: usize) -> String {
         format!("[[tasks]]\nservice = {{ name = \"s{i}\", state = \"started\" }}\n")
     }
@@ -1068,6 +1284,20 @@ mod tests {
         assert_eq!(ws.items(&include("services.toml")).len(), 64);
         let refusal = ws.refusal(&format!("{}{}", include("services.toml"), service_task(64)));
         assert_refused(&refusal, "tasks[1]: more than 64 service tasks");
+
+        ws.include("dirs.toml", &repeated(64, dir_task));
+        ws.include("links.toml", &repeated(64, link_task));
+        let apart = format!(
+            "{}{}{}",
+            include("files.toml"),
+            include("dirs.toml"),
+            include("links.toml")
+        );
+        assert_eq!(ws.items(&apart).len(), 192, "counted apart from files");
+        let refusal = ws.refusal(&format!("{}{}", include("dirs.toml"), dir_task(64)));
+        assert_refused(&refusal, "tasks[1]: more than 64 dir tasks");
+        let refusal = ws.refusal(&format!("{}{}", include("links.toml"), link_task(64)));
+        assert_refused(&refusal, "tasks[1]: more than 64 link tasks");
     }
 
     #[test]
@@ -1230,8 +1460,59 @@ mod tests {
             ".file.mode `4755`: setuid and setgid are refused",
         ),
         (
+            r#"file = { src = "s", dest = "/d", mode = "0644", owner = "Bad" }"#,
+            ".file.owner `Bad`: must be a user name or a numeric id",
+        ),
+        (
+            r#"file = { src = "s", dest = "/d", mode = "0644", group = "1app" }"#,
+            ".file.group `1app`: must be a group name or a numeric id",
+        ),
+        (
             r#"file = { src = "s", dest = "/d", mode = "0644", tags = ["web"] }"#,
             ".file: tags and facts belong on the task",
+        ),
+        (
+            r#"dir = { path = "rel", mode = "0755" }"#,
+            ".dir.path `rel`: must be an absolute path",
+        ),
+        (r#"dir = { path = "/d" }"#, ".dir.mode: required"),
+        (
+            r#"dir = { path = "/d", mode = "4755" }"#,
+            ".dir.mode `4755`: setuid and setgid are refused",
+        ),
+        (
+            r#"dir = { path = "/d", mode = "0755", group = "1app" }"#,
+            ".dir.group `1app`: must be a group name or a numeric id",
+        ),
+        (
+            r#"dir = { path = "/d", mode = "0755", tags = ["web"] }"#,
+            ".dir: tags and facts belong on the task",
+        ),
+        (
+            r#"dir = { path = "/d", mode = "0755" }
+            onlyif = "true""#,
+            ".onlyif: only on a run or plugin task",
+        ),
+        (
+            r#"link = { path = "/a/../b", target = "/t" }"#,
+            ".link.path `/a/../b`: must not contain",
+        ),
+        (
+            r#"link = { path = "/l", target = "" }"#,
+            ".link.target ``: is empty",
+        ),
+        (
+            r#"link = { path = "/l", target = "a\nb" }"#,
+            ".link.target `a\\nb`: contains a control character",
+        ),
+        (
+            r#"link = { path = "/l", target = "/t", facts = { os = "Linux" } }"#,
+            ".link: tags and facts belong on the task",
+        ),
+        (
+            r#"link = { path = "/l", target = "/t" }
+            creates = "/a""#,
+            ".creates: only on a run or plugin task",
         ),
         (
             r#"service = { name = "-x", state = "started" }"#,
@@ -1565,11 +1846,11 @@ mod tests {
             ),
             (
                 "tasks = []\nnotify = [\"a\"]",
-                ".notify: only on a run, plugin, file or service task",
+                ".notify: only on a run, plugin, file, service, dir or link task",
             ),
             (
                 "include = \"$/other.toml\"\nnotify = [\"a\"]",
-                ".notify: only on a run, plugin, file or service task",
+                ".notify: only on a run, plugin, file, service, dir or link task",
             ),
             (
                 "file = { src = \"f\", dest = \"/f\", mode = \"0644\", notify = [\"a\"] }",
@@ -1578,6 +1859,18 @@ mod tests {
             (
                 "service = { name = \"x\", state = \"started\", notify = [\"a\"] }",
                 ".service: notify belongs on the task, not the service",
+            ),
+            (
+                "dir = { path = \"/d\", mode = \"0755\", notify = [\"a\"] }",
+                ".dir: notify belongs on the task, not the dir",
+            ),
+            (
+                "link = { path = \"/l\", target = \"/t\", notify = [\"a\"] }",
+                ".link: notify belongs on the task, not the link",
+            ),
+            (
+                "link = { path = \"/l\", target = \"/t\" }\nnotify = [\"gone\"]",
+                ".notify[0] `gone`: names no [[handlers]] entry",
             ),
         ] {
             let body = format!("[[tasks]]\n{task}\n");

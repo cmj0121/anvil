@@ -20,14 +20,17 @@
 //! of any kind. Facts come from one probe before the run, so a step cannot
 //! change which manager or facts a later task sees.
 //!
-//! Each `[[files]]` entry is one step after the package step, before
-//! `[[steps]]`: it copies its src when the target matches, else it is
+//! The fixed order is packages, `[[dirs]]`, `[[files]]`, `[[links]]`,
+//! `[[services]]`, `[[steps]]`, then the handlers.
+//!
+//! Each `[[files]]` entry is one step after the package and `[[dirs]]`
+//! steps, before `[[links]]`: it copies its src when the target matches, else it is
 //! reported as skipped without running anything. When sudo asks that
 //! target for a password, the bytes go to a temp file over a plain run,
 //! a terminal run types the password and installs it, and the temp file is
 //! removed whatever happened.
 //!
-//! Each `[[services]]` entry is one step after the `[[files]]` steps: a
+//! Each `[[services]]` entry is one step after the `[[links]]` steps: a
 //! script that brings the service to its state under the target's init when
 //! the target matches, else a skip. A target where an entry matches but no
 //! init is known for its distro fails before any of its steps.
@@ -2464,6 +2467,9 @@ mod tests {
             src: "src.txt".to_owned(),
             dest: dest.to_owned(),
             mode: Some(ModeValue::Text("0644".to_owned())),
+            owner: None,
+            group: None,
+            parents: false,
             tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
             facts: BTreeMap::new(),
             sudo,
@@ -3846,6 +3852,8 @@ mod tests {
                 written_sha256: sha256_hex(FILE_TEXT),
                 write: record::Write::Written,
                 previous: record::Previous::Absent,
+                written_attrs: None,
+                created_dirs: Vec::new(),
             }]
         );
     }

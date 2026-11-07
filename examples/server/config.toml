@@ -4,6 +4,16 @@ pin = ["vim"]       # installed when missing, skipped by the upgrade; pacman and
 remove = ["nano"]   # removed after the install when it is installed
 upgrade = true      # upgrade every installed package first
 
+# Created with its missing parent /etc/app, and kept root:wheel 0750 so only
+# root and the admins in wheel (a group Arch ships) can open it.
+[[dirs]]
+path = "/etc/app/conf.d"
+mode = "0750"
+owner = "root"
+group = "wheel"
+parents = true
+tags = ["linode"]
+
 # Root-owned file under /etc, written through sudo on hosts tagged linode.
 [[files]]
 src = "files/motd"
@@ -11,6 +21,16 @@ dest = "/etc/motd"
 mode = "0644"
 tags = ["linode"]
 notify = ["log motd change"] # only when the bytes change
+
+# Readable by wheel, not by others; a changed owner, group or mode is fixed in place.
+[[files]]
+src = "files/app.conf"
+dest = "/etc/app/conf.d/app.conf"
+mode = "0640"
+owner = "root"
+group = "wheel"
+tags = ["linode"]
+notify = ["log app config change"] # also when only the owner, group or mode is fixed
 
 [[services]]
 name = "sshd"
@@ -35,3 +55,7 @@ unless = "grep -qx 'managed by anvil' /var/tmp/anvil-note"
 [[handlers]]
 name = "log motd change"
 run = "logger -t anvil 'motd updated'"
+
+[[handlers]]
+name = "log app config change"
+run = "logger -t anvil 'app config updated'"

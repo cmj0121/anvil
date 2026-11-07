@@ -2,13 +2,21 @@
 //! `anvil rollback` can put it back.
 //!
 //! The record lives in the state directory ([`paths::state_dir`]), 0700,
-//! never beside the config. It is compact JSON, version [`VERSION`], mode
+//! never beside the config. It is compact JSON, version [`VERSION_1`] or
+//! [`VERSION`] ([`version_of`]), mode
 //! 0600, and not encrypted: it may hold a file's previous text, which is why
 //! `[[files]] rollback = false` keeps only the hash, as does a previous file
 //! others may not read ([`NOT_WORLD_READABLE`]): its text would be more exposed
 //! here than on the target. Per target it keeps the probe's facts and, per
 //! file written, the previous state (absent, a dangling link, or a file's mode,
-//! owner, hash and text), the hash of the bytes written and how the write ended.
+//! owner, hash and text), the hash of the bytes written, the owner, group
+//! and mode they were left with, the directories created for them and how the
+//! write ended; per `[[dirs]]` step that changed something, the directory's
+//! owner, group and mode before (none when it created it) and after, and
+//! the directories created above it; per `[[links]]` step that changed
+//! something, the target it wrote and what was at the path before (nothing,
+//! a link's target, or a regular file replaced with `force`, kept as a
+//! file's previous text is), and the directories created above it.
 //!
 //! An apply holds a [`Session`] (the lock on `<record>.lock`, then the
 //! loaded record) and merges a target's snapshot before and after each file
@@ -37,8 +45,13 @@ use crate::paths::{self, PathsError};
 use crate::private::{self, LockError};
 use crate::trust::{self, TrustError};
 
-/// The record's format version; any other is refused.
-pub const VERSION: u32 = 1;
+/// The record's newest format version: a record holding created directories,
+/// an attrs-only fix, a dir or a link is saved as it, any other as
+/// [`VERSION_1`], so an older anvil refuses only what it would lose fields
+/// of. Any other is refused.
+pub const VERSION: u32 = 2;
+/// The format of a record with none of [`VERSION`]'s fields.
+pub const VERSION_1: u32 = 1;
 /// The most serialised bytes the record may hold, read or written.
 pub const MAX_RECORD: usize = 16 * 1024 * 1024;
 const FILE_NAME: &str = "last-apply.json";
@@ -65,7 +78,7 @@ impl fmt::Debug for Record {
 impl Default for Record {
     fn default() -> Self {
         Record {
-            version: VERSION,
+            version: VERSION_1,
             targets: BTreeMap::new(),
         }
     }
@@ -83,6 +96,14 @@ pub struct TargetRecord {
     pub ok: bool,
     pub facts: Facts,
     pub files: Vec<FileRecord>,
+    /// The `[[dirs]]` steps that created or fixed a directory, or created
+    /// directories above one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dirs: Vec<DirRecord>,
+    /// The `[[links]]` steps that created or replaced a link, or created
+    /// directories above one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkRecord>,
     #[serde(default)]
     pub cannot_undo: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,6 +147,42 @@ pub struct FileRecord {
     pub written_sha256: String,
     pub write: Write,
     pub previous: Previous,
+    /// DEST's owner, group and mode as the write left them, read back on
+    /// the target; `None` when the write did not end or the record is older.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_attrs: Option<Attrs>,
+    /// The directories the write created for DEST (`parents = true`), top
+    /// down, also when it then failed or refused: a `refused` write is kept
+    /// only for these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_dirs: Vec<String>,
+}
+
+/// A file's owner, group and mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attrs {
+    pub uid: u32,
+    pub gid: u32,
+    /// 4 octal digits.
+    pub mode: String,
+}
+
+impl Attrs {
+    /// As a restore's guard compares them: `UID:GID MODE`.
+    pub(crate) fn shown(&self) -> String {
+        format!("{}:{} {}", self.uid, self.gid, self.mode)
+    }
+}
+
+impl PreviousFile {
+    /// Its owner, group and mode.
+    pub fn attrs(&self) -> Attrs {
+        Attrs {
+            uid: self.uid,
+            gid: self.gid,
+            mode: self.mode.clone(),
+        }
+    }
 }
 
 /// Why a previous text was not kept when the entry asks for the hash only.
@@ -148,8 +205,39 @@ impl FileRecord {
                 && p.sha256 != self.written_sha256)
     }
 
-    /// Why a rollback cannot put back this file's previous text, if so.
+    /// Whether the write found the bytes already there and only changed
+    /// DEST's owner, group or mode (`fixed DEST: …`): a rollback puts those
+    /// back without any text.
+    pub fn attrs_only(&self) -> bool {
+        matches!(&self.previous, Previous::File(p)
+            if !p.sha256.is_empty() && p.sha256 == self.written_sha256 && self.attrs_changed())
+    }
+
+    /// Whether the attrs written differ from the previous file's.
+    fn attrs_changed(&self) -> bool {
+        match (&self.previous, &self.written_attrs) {
+            (Previous::File(p), Some(written)) => p.attrs() != *written,
+            _ => false,
+        }
+    }
+
+    /// The directories the write created, deepest first, as a rollback
+    /// removes them.
+    pub fn dirs_deepest_first(&self) -> Vec<&str> {
+        deepest_first(&self.created_dirs)
+    }
+
+    /// Adds each of `dirs` not listed yet.
+    fn add_dirs(&mut self, dirs: Vec<String>) {
+        add_unique(&mut self.created_dirs, dirs);
+    }
+
+    /// Why a rollback cannot put back this file's previous text, if so; never
+    /// for an attrs-only fix or a refused write, which need none.
     pub fn not_kept(&self) -> Option<&str> {
+        if self.write == Write::Refused || self.attrs_only() {
+            return None;
+        }
         match &self.previous {
             Previous::File(p) if !p.kept || p.text.is_none() => {
                 Some(p.reason.as_deref().unwrap_or("not kept"))
@@ -161,9 +249,11 @@ impl FileRecord {
     /// This dest was written again in the same apply: `previous` stays the
     /// one from before the first write, the rest becomes `later`'s, so doctor
     /// compares against the final bytes. A refused `later` left DEST as it
-    /// was and changes nothing else; `sudo` stays set once a write needed it,
-    /// so a restore reaches what that write left.
+    /// was and changes nothing else but the directories it created; `sudo`
+    /// stays set once a write needed it, so a restore reaches what that write
+    /// left.
     pub fn written_again(&mut self, later: FileRecord) {
+        self.add_dirs(later.created_dirs);
         if later.write == Write::Refused {
             return;
         }
@@ -171,6 +261,7 @@ impl FileRecord {
         self.sudo = self.sudo || later.sudo;
         self.written_sha256 = later.written_sha256;
         self.write = later.write;
+        self.written_attrs = later.written_attrs;
     }
 }
 
@@ -184,8 +275,257 @@ impl fmt::Debug for FileRecord {
             .field("written_sha256", &self.written_sha256)
             .field("write", &self.write)
             .field("previous", &self.previous)
+            .field("written_attrs", &self.written_attrs)
+            .field("created_dirs", &self.created_dirs)
             .finish()
     }
+}
+
+/// One directory a `[[dirs]]` step created, fixed or found as wanted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirRecord {
+    pub path: String,
+    pub sudo: bool,
+    pub write: Write,
+    /// The directory's owner, group and mode before the step; `None` when
+    /// there was none and the step created it, or for a `refused` step,
+    /// which left the path as it was.
+    pub previous: Option<Attrs>,
+    /// The directory's owner, group and mode as the step left them; `None`
+    /// when the step did not end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_attrs: Option<Attrs>,
+    /// The directories the step created above it (`parents = true`), top
+    /// down, also when it then failed or refused: a `refused` step is kept
+    /// only for these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_dirs: Vec<String>,
+}
+
+impl DirRecord {
+    /// Whether the step found the directory as wanted and changed nothing.
+    pub fn unchanged(&self) -> bool {
+        self.previous.is_some() && self.previous == self.written_attrs
+    }
+
+    /// The directories the step created above it, deepest first.
+    pub fn dirs_deepest_first(&self) -> Vec<&str> {
+        deepest_first(&self.created_dirs)
+    }
+
+    /// This path was stepped on again in the same apply: `previous` stays
+    /// the one from before the first step that changed it, the rest becomes
+    /// `later`'s; a refused `later` adds only the directories it created.
+    pub fn written_again(&mut self, later: DirRecord) {
+        written_again(self, later);
+    }
+
+    /// Whether a loaded entry is one apply could have written, as
+    /// [`FileRecord::is_valid`] asks of a file.
+    fn is_valid(&self) -> bool {
+        // Four octal digits without setuid or setgid, as apply records them.
+        let mode_ok = |attrs: &Option<Attrs>| {
+            attrs.as_ref().is_none_or(|a| {
+                a.mode.len() == 4
+                    && u32::from_str_radix(&a.mode, 8).is_ok_and(|mode| mode & 0o6000 == 0)
+            })
+        };
+        (self.write != Write::Refused || !self.created_dirs.is_empty())
+            && check_dest(&self.path).is_ok()
+            && mode_ok(&self.previous)
+            && mode_ok(&self.written_attrs)
+            && (self.created_dirs.iter()).all(|dir| holds(dir, &self.path))
+    }
+}
+
+/// One link a `[[links]]` step created, replaced or found as wanted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkRecord {
+    pub path: String,
+    /// The target the step pointed `path` at.
+    pub target: String,
+    pub sudo: bool,
+    pub write: Write,
+    /// What was at `path` before the step; `absent` for a `refused` step,
+    /// which left the path as it was.
+    pub previous: LinkPrevious,
+    /// The directories the step created above it (`parents = true`), top
+    /// down, also when it then failed or refused: a `refused` step is kept
+    /// only for these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_dirs: Vec<String>,
+}
+
+/// What was at a link's path before the step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum LinkPrevious {
+    Absent,
+    /// A symlink to `target`, as `readlink` printed it.
+    Link {
+        target: String,
+    },
+    /// A regular file `force` replaced, kept as a file's previous text is.
+    File(PreviousFile),
+    /// Something the step replaced but could not record, and `reason` why,
+    /// so that a rollback says it cannot undo it.
+    Unknown {
+        reason: String,
+    },
+}
+
+impl LinkRecord {
+    /// Whether the step found the link as wanted and changed nothing.
+    pub fn unchanged(&self) -> bool {
+        self.write != Write::Refused
+            && matches!(&self.previous, LinkPrevious::Link { target } if *target == self.target)
+    }
+
+    /// The directories the step created above it, deepest first.
+    pub fn dirs_deepest_first(&self) -> Vec<&str> {
+        deepest_first(&self.created_dirs)
+    }
+
+    /// Why a rollback cannot put back what the step replaced, if so: a file
+    /// whose text was not kept, or something it could not record.
+    pub fn not_kept(&self) -> Option<&str> {
+        match &self.previous {
+            LinkPrevious::File(p)
+                if self.write != Write::Refused && (!p.kept || p.text.is_none()) =>
+            {
+                Some(p.reason.as_deref().unwrap_or("not kept"))
+            }
+            LinkPrevious::Unknown { reason } if self.write != Write::Refused => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// This path was stepped on again in the same apply: `previous` stays
+    /// the one from before the first step that changed it, the rest becomes
+    /// `later`'s; a refused `later` adds only the directories it created.
+    pub fn written_again(&mut self, later: LinkRecord) {
+        written_again(self, later);
+    }
+
+    /// Whether a loaded entry is one apply could have written, as
+    /// [`FileRecord::is_valid`] asks of a file: a previous link's target is
+    /// what `readlink` can print and apply records, 1 to 4096 bytes with
+    /// no NUL or newline.
+    fn is_valid(&self) -> bool {
+        let target_ok = |t: &str| !t.is_empty() && t.len() <= 4096 && !t.contains(['\0', '\n']);
+        let previous = match &self.previous {
+            LinkPrevious::Absent => true,
+            LinkPrevious::Link { target } => target_ok(target),
+            LinkPrevious::File(p) => is_mode(&p.mode) && is_sha256_or_empty(&p.sha256),
+            LinkPrevious::Unknown { reason } => target_ok(reason),
+        };
+        (self.write != Write::Refused || !self.created_dirs.is_empty())
+            && check_dest(&self.path).is_ok()
+            && target_ok(&self.target)
+            && previous
+            && (self.created_dirs.iter()).all(|dir| holds(dir, &self.path))
+    }
+}
+
+/// A dir or link step's record, as [`merge_steps`] and [`written_again`]
+/// merge them.
+trait Stepped: Sized {
+    fn path(&self) -> &str;
+    fn write(&self) -> Write;
+    fn unchanged(&self) -> bool;
+    fn created_dirs(&mut self) -> &mut Vec<String>;
+    /// `self`, an earlier entry kept, takes how `later` ended.
+    fn ended_as(&mut self, later: &Self);
+    /// `self` with `earlier`'s previous state.
+    fn with_previous_of(self, earlier: Self) -> Self;
+}
+
+impl Stepped for DirRecord {
+    fn path(&self) -> &str {
+        &self.path
+    }
+    fn write(&self) -> Write {
+        self.write
+    }
+    fn unchanged(&self) -> bool {
+        DirRecord::unchanged(self)
+    }
+    fn created_dirs(&mut self) -> &mut Vec<String> {
+        &mut self.created_dirs
+    }
+    fn ended_as(&mut self, later: &Self) {
+        self.write = later.write;
+        self.written_attrs = later.written_attrs.clone();
+    }
+    fn with_previous_of(self, earlier: Self) -> Self {
+        DirRecord {
+            previous: earlier.previous,
+            ..self
+        }
+    }
+}
+
+impl Stepped for LinkRecord {
+    fn path(&self) -> &str {
+        &self.path
+    }
+    fn write(&self) -> Write {
+        self.write
+    }
+    fn unchanged(&self) -> bool {
+        LinkRecord::unchanged(self)
+    }
+    fn created_dirs(&mut self) -> &mut Vec<String> {
+        &mut self.created_dirs
+    }
+    fn ended_as(&mut self, later: &Self) {
+        self.write = later.write;
+        self.target = later.target.clone();
+    }
+    fn with_previous_of(self, earlier: Self) -> Self {
+        LinkRecord {
+            previous: earlier.previous,
+            ..self
+        }
+    }
+}
+
+/// [`DirRecord::written_again`] and [`LinkRecord::written_again`].
+fn written_again<T: Stepped>(kept: &mut T, mut later: T) {
+    let later_dirs = std::mem::take(later.created_dirs());
+    if later.write() == Write::Refused {
+        add_unique(kept.created_dirs(), later_dirs);
+        return;
+    }
+    if kept.write() == Write::Refused {
+        let dirs = std::mem::take(kept.created_dirs());
+        *kept = later;
+        *kept.created_dirs() = dirs;
+    } else {
+        kept.ended_as(&later);
+    }
+    add_unique(kept.created_dirs(), later_dirs);
+}
+
+/// `dirs` deepest first, as a rollback removes them.
+fn deepest_first(dirs: &[String]) -> Vec<&str> {
+    let mut dirs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.matches('/').count()));
+    dirs
+}
+
+/// Adds each of `more` not in `dirs` yet.
+fn add_unique(dirs: &mut Vec<String>, more: Vec<String>) {
+    for dir in more {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+}
+
+/// Whether `dir` passes the dest rule and holds `path`.
+fn holds(dir: &str, path: &str) -> bool {
+    check_dest(dir).is_ok() && (path.strip_prefix(dir)).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// How the write step ended.
@@ -197,8 +537,9 @@ pub enum Write {
     /// It started and then failed, timed out or lost the transport: DEST
     /// may hold part of the bytes.
     FailedMidway,
-    /// It refused before writing anything. Never stored: [`Session::merge`]
-    /// keeps the dest's earlier entry, if any, instead.
+    /// It refused before writing anything. Stored only for the directories
+    /// it created: else [`Session::merge`] keeps the dest's earlier entry,
+    /// if any, instead.
     Refused,
 }
 
@@ -266,6 +607,17 @@ pub struct RolledBack {
 }
 
 impl Record {
+    /// The record without the refused writes kept for the directories they
+    /// created: they wrote no file to compare.
+    pub fn without_refused(mut self) -> Record {
+        for target in self.targets.values_mut() {
+            target.files.retain(|file| file.write != Write::Refused);
+            target.dirs.retain(|dir| dir.write != Write::Refused);
+            target.links.retain(|link| link.write != Write::Refused);
+        }
+        self
+    }
+
     /// The record without any previous state, for plugins: per target its
     /// `at`, facts, `rolled_back`, and each file's dest, mode, written hash
     /// and how the write ended.
@@ -326,9 +678,10 @@ fn read_record(file: impl Read, size: u64, bytes: &mut Vec<u8>) -> Result<(), St
 /// exists. Refused unless the directory is private, the file is a regular
 /// 0600-or-stricter file of the current user's (a symlink or FIFO is not
 /// followed or waited on), at most [`MAX_RECORD`] bytes, version
-/// [`VERSION`] and valid JSON with no `refused` write, which is never
-/// stored, and whose every file has a dest the config would accept, octal
-/// modes and hex hashes; errors never quote the content. Pending handlers
+/// [`VERSION_1`] or [`VERSION`] and valid JSON with no `refused` write but
+/// one kept for the directories it created, and whose every file has a dest
+/// the config would accept, octal modes, hex hashes and created directories
+/// that hold DEST; errors never quote the content. Pending handlers
 /// apply could not have saved are dropped instead, with one warning per
 /// target, logged; [`load_warned`] returns them to show.
 pub fn load(path: &Path) -> Result<Option<Record>, String> {
@@ -365,19 +718,19 @@ pub fn load_warned(path: &Path) -> Result<(Option<Record>, Vec<String>), String>
         Ok(record) => record,
         Err(_) => {
             return Err(match serde_json::from_slice::<Versioned>(&bytes) {
-                Ok(Versioned { version }) if version != VERSION => unsupported(version),
+                Ok(Versioned { version }) if !is_supported(version) => unsupported(version),
                 _ => cannot_parse(),
             });
         }
     };
-    if record.version != VERSION {
+    if !is_supported(record.version) {
         return Err(unsupported(record.version));
     }
-    let bad = record
-        .targets
-        .values()
-        .flat_map(|target| &target.files)
-        .any(|file| !file.is_valid());
+    let bad = record.targets.values().any(|target| {
+        target.files.iter().any(|file| !file.is_valid())
+            || target.dirs.iter().any(|dir| !dir.is_valid())
+            || target.links.iter().any(|link| !link.is_valid())
+    });
     if bad {
         return Err(cannot_parse());
     }
@@ -392,6 +745,77 @@ pub fn load_warned(path: &Path) -> Result<(Option<Record>, Vec<String>), String>
         }
     }
     Ok((Some(record), warnings))
+}
+
+/// Whether this anvil reads records of `version`: [`VERSION_1`] and
+/// [`VERSION`].
+fn is_supported(version: u32) -> bool {
+    version == VERSION_1 || version == VERSION
+}
+
+/// The version `record` is saved as: [`VERSION`] when any target has a dir
+/// or a link, or any file lists created directories (a refused write always does) or
+/// is an attrs-only fix, which an older anvil would mishandle, else [`VERSION_1`]. The attrs
+/// written alone stay version 1: an older anvil ignores them.
+fn version_of(record: &Record) -> u32 {
+    let newer = record.targets.values().any(|target| {
+        !target.dirs.is_empty()
+            || !target.links.is_empty()
+            || (target.files.iter()).any(|file| !file.created_dirs.is_empty() || file.attrs_only())
+    });
+    if newer { VERSION } else { VERSION_1 }
+}
+
+/// `now`, the dir or link steps of an apply, merged with `earlier`, the
+/// entry's as loaded, as [`Session::merge`] merges files: a refused or
+/// unchanged step keeps the earlier entry, with the directories it created,
+/// or has none unless it created some; one whose earlier step failed midway
+/// keeps that entry's `previous`; and when the target failed (`ok` false),
+/// every earlier path it did not touch is kept too.
+fn merge_steps<T: Stepped>(earlier: Vec<T>, now: Vec<T>, ok: bool) -> Vec<T> {
+    let mut earlier: BTreeMap<String, T> = earlier
+        .into_iter()
+        .map(|d| (d.path().to_owned(), d))
+        .collect();
+    let touched: BTreeSet<String> = now.iter().map(|d| d.path().to_owned()).collect();
+    let mut steps: Vec<T> = now
+        .into_iter()
+        .filter_map(|mut step| {
+            let kept = step.write() == Write::Refused || step.unchanged();
+            let dirs = std::mem::take(step.created_dirs());
+            let merged = match earlier.remove(step.path()) {
+                None if kept && dirs.is_empty() => return None,
+                None => step,
+                Some(old) if step.write() == Write::Refused => old,
+                Some(mut old) if kept => {
+                    old.ended_as(&step);
+                    old
+                }
+                Some(mut old) if old.write() == Write::FailedMidway => {
+                    let old_dirs = std::mem::take(old.created_dirs());
+                    let mut step = step.with_previous_of(old);
+                    *step.created_dirs() = old_dirs;
+                    step
+                }
+                Some(mut old) if old.write() == Write::Refused => {
+                    *step.created_dirs() = std::mem::take(old.created_dirs());
+                    step
+                }
+                _ => step,
+            };
+            let mut merged = merged;
+            add_unique(merged.created_dirs(), dirs);
+            Some(merged)
+        })
+        .collect();
+    if !ok {
+        steps.extend(
+            earlier
+                .into_values()
+                .filter(|step| !touched.contains(step.path())),
+        );
+    }
+    steps
 }
 
 /// Appends each of `names` not in `list` yet, in order; whether it grew.
@@ -414,7 +838,9 @@ fn is_sha256_or_empty(s: &str) -> bool {
 impl FileRecord {
     /// Whether a loaded entry is one apply could have written: its dest
     /// passes the config's dest rule, its modes are octal, its hashes are
-    /// empty or lowercase hex, and its write was not `refused`. A record
+    /// empty or lowercase hex, each created directory passes the dest rule
+    /// and holds DEST, and its write was not `refused` unless it created
+    /// directories. A record
     /// edited by hand must not hand rollback, which may run as root, a path
     /// or mode the config would refuse.
     fn is_valid(&self) -> bool {
@@ -424,11 +850,13 @@ impl FileRecord {
             }
             Previous::Absent | Previous::Dangling { .. } => true,
         };
-        self.write != Write::Refused
+        (self.write != Write::Refused || !self.created_dirs.is_empty())
             && check_dest(&self.dest).is_ok()
             && is_mode(&self.mode)
             && is_sha256_or_empty(&self.written_sha256)
             && previous
+            && (self.written_attrs.as_ref()).is_none_or(|attrs| is_mode(&attrs.mode))
+            && (self.created_dirs.iter()).all(|dir| holds(dir, &self.dest))
     }
 }
 
@@ -496,13 +924,16 @@ impl Session {
     /// a later call for `name` replaces this one, against the same entry:
     ///
     /// - a dest whose write was refused keeps its earlier entry, or has
-    ///   none;
+    ///   none unless the write created directories;
     /// - a dest whose earlier write failed midway keeps that entry's
     ///   `previous`, the real one from before, since what this write found
     ///   there may be part of the earlier bytes;
-    /// - a dest that already held the bytes written keeps its earlier entry
-    ///   when that wrote the same bytes, since its `previous` is the real
-    ///   one from before, with this write's `write`;
+    /// - a dest that already held the bytes, owner, group and mode written
+    ///   keeps its earlier entry when that wrote the same bytes, since its
+    ///   `previous` is the real one from before, with this write's `write`
+    ///   and attrs; an attrs-only fix is an entry of its own;
+    /// - the directories any kept earlier entry created stay listed, with
+    ///   this write's.
     /// - when `target` failed (`ok: false`), every earlier dest it did not
     ///   touch is kept too, so a retry that stops early loses nothing.
     ///
@@ -519,31 +950,56 @@ impl Session {
         let old = (self.base.entry(name.to_owned()))
             .or_insert_with(|| current.cloned())
             .clone();
-        let mut earlier: BTreeMap<String, FileRecord> = old
-            .map(|old| old.files.into_iter().map(|f| (f.dest.clone(), f)).collect())
-            .unwrap_or_default();
+        let (old_files, old_dirs, old_links) = match old {
+            Some(old) => (Some(old.files), old.dirs, old.links),
+            None => (None, Vec::new(), Vec::new()),
+        };
+        let mut earlier: BTreeMap<String, FileRecord> = (old_files.into_iter().flatten())
+            .map(|f| (f.dest.clone(), f))
+            .collect();
         let touched: BTreeSet<String> = target.files.iter().map(|f| f.dest.clone()).collect();
         let mut warnings = Vec::new();
         target.files = std::mem::take(&mut target.files)
             .into_iter()
             .filter_map(|file| {
-                let unchanged = matches!(&file.previous,
+                let unchanged = !file.attrs_changed()
+                    && matches!(&file.previous,
                     Previous::File(p) if p.sha256 == file.written_sha256
                         || (p.sha256.is_empty()
                             && p.reason.as_deref() == Some(NOT_WORLD_READABLE)));
                 match earlier.remove(&file.dest) {
-                    old if file.write == Write::Refused => old,
-                    Some(old) if old.write == Write::FailedMidway => Some(FileRecord {
-                        previous: old.previous,
-                        ..file
-                    }),
-                    Some(old) if unchanged && old.written_sha256 == file.written_sha256 => {
-                        Some(FileRecord {
-                            write: file.write,
-                            ..old
-                        })
+                    None if file.write == Write::Refused => {
+                        Some(file).filter(|file| !file.created_dirs.is_empty())
                     }
-                    _ => {
+                    Some(mut old) if file.write == Write::Refused => {
+                        old.add_dirs(file.created_dirs);
+                        Some(old)
+                    }
+                    Some(old) if old.write == Write::FailedMidway => {
+                        let mut kept = FileRecord {
+                            previous: old.previous,
+                            created_dirs: old.created_dirs,
+                            ..file
+                        };
+                        kept.add_dirs(file.created_dirs);
+                        Some(kept)
+                    }
+                    Some(old) if unchanged && old.written_sha256 == file.written_sha256 => {
+                        let mut kept = FileRecord {
+                            write: file.write,
+                            written_attrs: file.written_attrs.or(old.written_attrs),
+                            ..old
+                        };
+                        kept.add_dirs(file.created_dirs);
+                        Some(kept)
+                    }
+                    old => {
+                        let mut file = file;
+                        // A refused write before kept only the dirs it created.
+                        if let Some(old) = old.filter(|old| old.write == Write::Refused) {
+                            let later = std::mem::replace(&mut file.created_dirs, old.created_dirs);
+                            file.add_dirs(later);
+                        }
                         if file.lost_its_previous() {
                             let warning = not_kept_warning(&file.dest, name);
                             if !warnings.contains(&warning) {
@@ -555,6 +1011,8 @@ impl Session {
                 }
             })
             .collect();
+        target.dirs = merge_steps(old_dirs, std::mem::take(&mut target.dirs), target.ok);
+        target.links = merge_steps(old_links, std::mem::take(&mut target.links), target.ok);
         if !target.ok {
             target.files.extend(
                 earlier
@@ -684,6 +1142,11 @@ impl Session {
                     p.drop_text(RECORD_FULL);
                 }
             }
+            for link in target.links.iter_mut().filter(|link| &link.path == dest) {
+                if let LinkPrevious::File(p) = &mut link.previous {
+                    p.drop_text(RECORD_FULL);
+                }
+            }
         }
         let mut newly = Vec::new();
         let mut warnings = Vec::new();
@@ -693,7 +1156,7 @@ impl Session {
                 warnings.push(warning);
             }
         }
-        self.write(&copy)?;
+        self.write(copy)?;
         self.dropped.extend(newly);
         Ok(warnings)
     }
@@ -708,15 +1171,18 @@ impl Session {
         let mut names: Vec<&String> = order.iter().filter(|n| self.merged.contains(n)).collect();
         names.extend(self.merged.iter().filter(|n| !order.contains(n)));
         let dropped = share(&mut copy, &names, self.limit);
-        self.write(&copy)?;
+        self.write(copy)?;
         for warning in &dropped {
             log::warn!("{warning}");
         }
         Ok(dropped)
     }
 
-    fn write(&self, record: &Record) -> Result<(), String> {
+    /// Saves `record` as [`version_of`] it.
+    fn write(&self, mut record: Record) -> Result<(), String> {
         let cannot = |why: String| format!("cannot write {FILE_NAME}: {why}");
+        record.version = version_of(&record);
+        let record = &record;
         let mut bytes = Zeroizing::new(Vec::with_capacity(encoded_len(record)));
         serde_json::to_writer(&mut *bytes, record).map_err(|err| cannot(err.to_string()))?;
         if bytes.len() > self.limit {
@@ -766,26 +1232,70 @@ fn text_cost(file: &PreviousFile) -> usize {
     encoded_len(file).saturating_sub(encoded_len(&without))
 }
 
-/// The kept texts of `name`'s files in `record`: index and cost.
-fn texts(record: &Record, name: &str) -> Vec<(usize, usize)> {
-    record.targets[name]
+/// Where a kept text is in a target's entry.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Slot {
+    File(usize),
+    Link(usize),
+}
+
+/// The kept texts of `name`'s files, then of the files its links replaced,
+/// in `record`: where and cost.
+fn texts(record: &Record, name: &str) -> Vec<(Slot, usize)> {
+    let target = &record.targets[name];
+    let files = target
         .files
         .iter()
         .enumerate()
         .filter_map(|(i, file)| match &file.previous {
-            Previous::File(p) if p.text.is_some() => Some((i, text_cost(p))),
+            Previous::File(p) if p.text.is_some() => Some((Slot::File(i), text_cost(p))),
             _ => None,
-        })
-        .collect()
+        });
+    let links = target
+        .links
+        .iter()
+        .enumerate()
+        .filter_map(|(i, link)| match &link.previous {
+            LinkPrevious::File(p) if p.text.is_some() => Some((Slot::Link(i), text_cost(p))),
+            _ => None,
+        });
+    files.chain(links).collect()
 }
 
-/// Drops `record.targets[name][i]`'s text; the warning.
-fn drop_text(record: &mut Record, name: &str, i: usize) -> String {
-    let file = &mut record.targets.get_mut(name).expect("a merged target").files[i];
-    if let Previous::File(p) = &mut file.previous {
+/// The dest or path of `slot` in `name`'s entry.
+fn slot_dest(record: &Record, name: &str, slot: Slot) -> String {
+    let target = &record.targets[name];
+    match slot {
+        Slot::File(i) => target.files[i].dest.clone(),
+        Slot::Link(i) => target.links[i].path.clone(),
+    }
+}
+
+/// Drops the text at `slot` of `record.targets[name]`; the warning.
+fn drop_text(record: &mut Record, name: &str, slot: Slot) -> String {
+    let target = record.targets.get_mut(name).expect("a merged target");
+    let (previous, dest) = match slot {
+        Slot::File(i) => {
+            let file = &mut target.files[i];
+            let previous = match &mut file.previous {
+                Previous::File(p) => Some(p),
+                _ => None,
+            };
+            (previous, &file.dest)
+        }
+        Slot::Link(i) => {
+            let link = &mut target.links[i];
+            let previous = match &mut link.previous {
+                LinkPrevious::File(p) => Some(p),
+                _ => None,
+            };
+            (previous, &link.path)
+        }
+    };
+    if let Some(p) = previous {
         p.drop_text(RECORD_FULL);
     }
-    full(&file.dest, name)
+    full(dest, name)
 }
 
 /// Drops `name`'s texts from `record`, largest first, until it fits
@@ -796,14 +1306,14 @@ fn shed(record: &mut Record, name: &str, limit: usize) -> Vec<(String, String)> 
         return Vec::new();
     }
     let mut texts = texts(record, name);
-    texts.sort_by_key(|&(i, cost)| (std::cmp::Reverse(cost), i));
+    texts.sort_by_key(|&(slot, cost)| (std::cmp::Reverse(cost), slot));
     let mut dropped = Vec::new();
-    for (i, cost) in texts {
+    for (slot, cost) in texts {
         if size <= limit {
             break;
         }
-        let dest = record.targets[name].files[i].dest.clone();
-        dropped.push((dest, drop_text(record, name, i)));
+        let dest = slot_dest(record, name, slot);
+        dropped.push((dest, drop_text(record, name, slot)));
         size -= cost;
     }
     dropped
@@ -816,7 +1326,7 @@ fn share(record: &mut Record, names: &[&String], limit: usize) -> Vec<String> {
     if size <= limit {
         return Vec::new();
     }
-    let all: Vec<(&String, usize, usize)> = names
+    let all: Vec<(&String, Slot, usize)> = names
         .iter()
         .flat_map(|name| {
             texts(record, name)
@@ -902,6 +1412,8 @@ mod tests {
             written_sha256: written.to_owned(),
             write,
             previous,
+            written_attrs: None,
+            created_dirs: Vec::new(),
         }
     }
 
@@ -943,6 +1455,8 @@ mod tests {
             ok,
             facts: Facts(BTreeMap::from([("hostname".to_owned(), "web1".to_owned())])),
             files,
+            dirs: Vec::new(),
+            links: Vec::new(),
             cannot_undo: vec!["packages".to_owned(), "step 4".to_owned()],
             rolled_back: None,
             pending_handlers: Vec::new(),
@@ -1159,8 +1673,8 @@ mod tests {
         let shown = path.display().to_string();
         for (bytes, message) in [
             (
-                br#"{"version":2,"targets":{}}"#.as_slice(),
-                format!("{shown}: version 2 is not supported"),
+                br#"{"version":3,"targets":{}}"#.as_slice(),
+                format!("{shown}: version 3 is not supported"),
             ),
             (br#"{"hunter2"#.as_slice(), format!("{shown}: cannot parse")),
             (
@@ -2110,5 +2624,700 @@ mod tests {
             shown.contains(&format!("<{} bytes>", TEXT.len())),
             "{shown}"
         );
+    }
+
+    fn attrs(uid: u32, gid: u32, mode: &str) -> Attrs {
+        Attrs {
+            uid,
+            gid,
+            mode: mode.to_owned(),
+        }
+    }
+
+    /// A write to `/etc/app/a` that found its bytes there, of the attrs in
+    /// [`previous`], and left `written`.
+    fn fixed(written: Attrs) -> FileRecord {
+        FileRecord {
+            written_attrs: Some(written),
+            ..file(
+                "/etc/app/a",
+                &sha('a'),
+                Write::Written,
+                previous(&sha('a'), None),
+            )
+        }
+    }
+
+    #[test]
+    fn the_new_fields_round_trip_and_make_the_record_version_2() {
+        let (path, root) = record_path("record-v2");
+        let mut session = Session::open(&path).unwrap();
+        let plain = file("/etc/app/a", &sha('a'), Write::Written, Previous::Absent);
+        session.merge("web1", target(1, true, vec![plain.clone()]));
+        session.save().unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["version"], 1, "no new field");
+        let entry = &raw["targets"]["web1"]["files"][0];
+        assert!(entry.get("written_attrs").is_none() && entry.get("created_dirs").is_none());
+
+        let new = FileRecord {
+            written_attrs: Some(attrs(0, 5, "0640")),
+            created_dirs: vec!["/etc/app".to_owned()],
+            ..plain.clone()
+        };
+        session.merge("web1", target(2, true, vec![new.clone()]));
+        session.save().unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["version"], 2);
+        let entry = &raw["targets"]["web1"]["files"][0];
+        assert_eq!(
+            entry["written_attrs"],
+            json!({"uid": 0, "gid": 5, "mode": "0640"})
+        );
+        assert_eq!(entry["created_dirs"], json!(["/etc/app"]));
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.targets["web1"].files, [new]);
+
+        // Created dirs or an attrs-only fix alone are enough; the attrs
+        // written alone, which an older anvil ignores, are not.
+        for (what, file, version) in [
+            (
+                "written_attrs",
+                FileRecord {
+                    written_attrs: Some(attrs(0, 0, "0644")),
+                    ..plain.clone()
+                },
+                VERSION_1,
+            ),
+            (
+                "created_dirs",
+                FileRecord {
+                    created_dirs: vec!["/etc/app".to_owned()],
+                    ..plain.clone()
+                },
+                VERSION,
+            ),
+            ("attrs-only", fixed(attrs(0, 5, "0640")), VERSION),
+            ("unchanged attrs", fixed(attrs(0, 0, "0644")), VERSION_1),
+        ] {
+            let record = Record {
+                version: VERSION_1,
+                targets: BTreeMap::from([("w".to_owned(), target(1, true, vec![file]))]),
+            };
+            assert_eq!(version_of(&record), version, "{what}");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_version_1_record_without_the_new_fields_loads_unchanged() {
+        let (path, root) = record_path("record-v1");
+        let old = json!({"version": 1, "targets": {"web1": {
+            "at": 1, "anvil": "0.1.0", "ok": true, "facts": {"hostname": "web1"}, "cannot_undo": [],
+            "files": [{"dest": "/etc/a", "mode": "0644", "sudo": true,
+                       "written_sha256": sha('a'), "write": "written",
+                       "previous": {"state": "absent"}}],
+        }}});
+        plant(&path, old.to_string().as_bytes());
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.version, 1);
+        let file = &loaded.targets["web1"].files[0];
+        assert_eq!(file.written_attrs, None);
+        assert!(file.created_dirs.is_empty());
+        assert_eq!(serde_json::to_value(&loaded).unwrap(), old);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn load_refuses_new_fields_rollback_could_not_trust() {
+        let (path, root) = record_path("record-v2-bad");
+        let with = |file: FileRecord| {
+            let record = Record {
+                version: VERSION,
+                targets: BTreeMap::from([("w".to_owned(), target(1, true, vec![file]))]),
+            };
+            plant(&path, &serde_json::to_vec(&record).unwrap());
+            load(&path)
+        };
+        let base = file("/etc/app/a", &sha('a'), Write::Written, Previous::Absent);
+        let dirs = |dirs: &[&str]| FileRecord {
+            created_dirs: dirs.iter().map(|d| (*d).to_owned()).collect(),
+            ..base.clone()
+        };
+        for (what, bad) in [
+            ("a dir not holding dest", dirs(&["/etc/other"])),
+            ("a sibling prefix", dirs(&["/etc/ap"])),
+            ("dest itself", dirs(&["/etc/app/a"])),
+            ("a relative dir", dirs(&["etc/app"])),
+            ("a .. dir", dirs(&["/etc/app/.."])),
+            (
+                "a bad mode",
+                FileRecord {
+                    written_attrs: Some(attrs(0, 0, "9")),
+                    ..base.clone()
+                },
+            ),
+            (
+                "a refused write without dirs",
+                FileRecord {
+                    write: Write::Refused,
+                    ..base.clone()
+                },
+            ),
+        ] {
+            assert!(with(bad).unwrap_err().ends_with("cannot parse"), "{what}");
+        }
+        let refused = FileRecord {
+            write: Write::Refused,
+            ..dirs(&["/etc", "/etc/app"])
+        };
+        assert!(
+            with(refused).unwrap().is_some(),
+            "a refused write kept for its dirs"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_attrs_only_fix_needs_no_text_and_is_its_own_entry() {
+        let fix = fixed(attrs(0, 5, "0640"));
+        assert!(fix.attrs_only());
+        assert_eq!(fix.not_kept(), None, "the bytes stay: no text needed");
+        let same = fixed(attrs(0, 0, "0644"));
+        assert!(!same.attrs_only(), "nothing changed");
+        assert_eq!(same.not_kept(), Some("rollback = false"));
+        let content = FileRecord {
+            written_sha256: sha('b'),
+            ..fix.clone()
+        };
+        assert!(!content.attrs_only(), "other bytes");
+
+        // An earlier apply wrote the same bytes: an unchanged rerun folds into
+        // it, an attrs-only fix replaces it.
+        let earlier = FileRecord {
+            written_attrs: Some(attrs(0, 0, "0644")),
+            ..file(
+                "/etc/app/a",
+                &sha('a'),
+                Write::Written,
+                previous(&sha('0'), Some(TEXT)),
+            )
+        };
+        let (mut session, root) = session_with(
+            "record-attrs",
+            vec![("web1", target(1, true, vec![earlier.clone()]))],
+        );
+        session.merge("web1", target(2, true, vec![same]));
+        assert_eq!(
+            session.record.targets["web1"].files,
+            std::slice::from_ref(&earlier)
+        );
+        session.merge("web1", target(2, true, vec![fix.clone()]));
+        assert_eq!(session.record.targets["web1"].files, [fix]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_dirs_a_refused_or_failed_write_created_are_kept() {
+        let dirs = |dirs: &[&str]| dirs.iter().map(|d| (*d).to_owned()).collect::<Vec<_>>();
+        let refused = FileRecord {
+            created_dirs: dirs(&["/etc/app"]),
+            ..file("/etc/app/a", &sha('a'), Write::Refused, Previous::Absent)
+        };
+        let (mut session, root) = session_with("record-dirs", Vec::new());
+        session.merge("web1", target(1, false, vec![refused.clone()]));
+        assert_eq!(
+            session.record.targets["web1"].files,
+            std::slice::from_ref(&refused),
+            "no earlier entry"
+        );
+        let nothing = file("/etc/app/a", &sha('a'), Write::Refused, Previous::Absent);
+        session.merge("web2", target(1, false, vec![nothing]));
+        assert!(
+            session.record.targets["web2"].files.is_empty(),
+            "no dirs, no entry"
+        );
+
+        let earlier = FileRecord {
+            created_dirs: dirs(&["/etc/app"]),
+            ..file(
+                "/etc/app/a",
+                &sha('b'),
+                Write::FailedMidway,
+                Previous::Absent,
+            )
+        };
+        let (mut session, root2) = session_with(
+            "record-dirs2",
+            vec![("web1", target(1, false, vec![earlier.clone()]))],
+        );
+        let deeper = |write| FileRecord {
+            created_dirs: dirs(&["/etc/app/x"]),
+            ..file("/etc/app/x/a", &sha('a'), write, Previous::Absent)
+        };
+        session.merge(
+            "web1",
+            target(2, false, vec![deeper(Write::Refused), refused.clone()]),
+        );
+        let files = &session.record.targets["web1"].files;
+        assert_eq!(files[0], deeper(Write::Refused));
+        assert_eq!(files[1].previous, earlier.previous, "the earlier entry");
+        assert_eq!(files[1].created_dirs, dirs(&["/etc/app"]), "listed once");
+
+        let again = FileRecord {
+            previous: previous(&sha('c'), Some(TEXT)),
+            ..file("/etc/app/a", &sha('a'), Write::Written, Previous::Absent)
+        };
+        session.merge("web1", target(3, true, vec![again]));
+        let file = &session.record.targets["web1"].files[0];
+        assert_eq!(
+            file.previous,
+            Previous::Absent,
+            "the midway write's previous"
+        );
+        assert_eq!(file.created_dirs, dirs(&["/etc/app"]), "and its dirs");
+        assert_eq!(file.dirs_deepest_first(), ["/etc/app"]);
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&root2).unwrap();
+    }
+
+    #[test]
+    fn a_write_after_a_refused_one_keeps_the_dirs_that_one_created() {
+        let dirs = |dirs: &[&str]| dirs.iter().map(|d| (*d).to_owned()).collect::<Vec<_>>();
+        let refused = FileRecord {
+            created_dirs: dirs(&["/etc/app"]),
+            ..file("/etc/app/x/a", &sha('a'), Write::Refused, Previous::Absent)
+        };
+        let (mut session, root) = session_with(
+            "record-after-refused",
+            vec![("web1", target(1, false, vec![refused]))],
+        );
+        let written = FileRecord {
+            created_dirs: dirs(&["/etc/app/x"]),
+            ..file("/etc/app/x/a", &sha('a'), Write::Written, Previous::Absent)
+        };
+        session.merge("web1", target(2, true, vec![written]));
+        let file = &session.record.targets["web1"].files[0];
+        assert_eq!(file.write, Write::Written);
+        assert_eq!(file.created_dirs, dirs(&["/etc/app", "/etc/app/x"]));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn written_again_adds_the_dirs_even_of_a_refused_write() {
+        let mut record = written_with(false, "6", Write::Written);
+        record.written_again(FileRecord {
+            created_dirs: vec!["/etc".to_owned()],
+            written_attrs: Some(attrs(1, 2, "0600")),
+            ..written_with(true, "4", Write::Refused)
+        });
+        assert_eq!(record.created_dirs, ["/etc"]);
+        assert_eq!(record.written_attrs, None, "a refused write left the attrs");
+        record.written_again(FileRecord {
+            created_dirs: vec!["/etc".to_owned()],
+            written_attrs: Some(attrs(1, 2, "0600")),
+            ..written_with(true, "4", Write::Written)
+        });
+        assert_eq!(record.created_dirs, ["/etc"]);
+        assert_eq!(record.written_attrs, Some(attrs(1, 2, "0600")));
+    }
+
+    #[test]
+    fn the_dirs_come_back_deepest_first() {
+        let record = FileRecord {
+            created_dirs: vec!["/a".to_owned(), "/a/b".to_owned(), "/a/b/c".to_owned()],
+            ..file("/a/b/c/d", &sha('a'), Write::Written, Previous::Absent)
+        };
+        assert_eq!(record.dirs_deepest_first(), ["/a/b/c", "/a/b", "/a"]);
+    }
+
+    fn dir(path: &str, write: Write, previous: Option<Attrs>, written: Option<Attrs>) -> DirRecord {
+        DirRecord {
+            path: path.to_owned(),
+            sudo: true,
+            write,
+            previous,
+            written_attrs: written,
+            created_dirs: Vec::new(),
+        }
+    }
+
+    fn with_dirs(at: u64, ok: bool, dirs: Vec<DirRecord>) -> TargetRecord {
+        TargetRecord {
+            dirs,
+            ..target(at, ok, Vec::new())
+        }
+    }
+
+    #[test]
+    fn dirs_merge_as_files_do_and_need_version_2() {
+        let (path, root) = record_path("record-dirs");
+        let mut session = Session::open(&path).unwrap();
+        let (was, now) = (attrs(0, 0, "0700"), attrs(0, 5, "0750"));
+        let fixed = dir(
+            "/etc/app",
+            Write::Written,
+            Some(was.clone()),
+            Some(now.clone()),
+        );
+        let created = dir("/srv/new", Write::Written, None, Some(now.clone()));
+        session.merge(
+            "w",
+            with_dirs(1, true, vec![fixed.clone(), created.clone()]),
+        );
+        session.save().unwrap();
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.version, VERSION);
+        assert_eq!(loaded.targets["w"].dirs, [fixed.clone(), created.clone()]);
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["targets"]["w"]["dirs"][1]["previous"], json!(null));
+
+        // A later apply that found them as wanted keeps the earlier entries;
+        // an unchanged dir with no earlier one is not kept.
+        drop(session);
+        let mut session = Session::open(&path).unwrap();
+        let unchanged =
+            |path: &str| dir(path, Write::Written, Some(now.clone()), Some(now.clone()));
+        session.merge(
+            "w",
+            with_dirs(
+                2,
+                true,
+                vec![
+                    unchanged("/etc/app"),
+                    unchanged("/srv/new"),
+                    unchanged("/opt"),
+                ],
+            ),
+        );
+        assert_eq!(session.record().targets["w"].dirs, [fixed.clone(), created]);
+
+        // A refused step keeps the earlier entry and adds what it created; a
+        // failed target keeps an earlier path it did not touch.
+        let mut refused = dir("/etc/app", Write::Refused, None, None);
+        refused.created_dirs = vec!["/etc".to_owned()];
+        session.merge("w", with_dirs(3, false, vec![refused]));
+        let dirs = &session.record().targets["w"].dirs;
+        assert_eq!(dirs[0].previous, Some(was));
+        assert_eq!(dirs[0].created_dirs, ["/etc"]);
+        assert_eq!(dirs[1].path, "/srv/new");
+
+        // Nothing changed and no dirs: version 1 again.
+        session.merge("w", with_dirs(4, true, vec![unchanged("/opt")]));
+        session.save().unwrap();
+        assert_eq!(load(&path).unwrap().unwrap().version, VERSION_1);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_dir_stepped_on_twice_keeps_the_first_previous() {
+        let (a, b, c) = (
+            attrs(0, 0, "0700"),
+            attrs(0, 0, "0750"),
+            attrs(0, 0, "0755"),
+        );
+        let mut first = dir("/d", Write::Written, Some(a.clone()), Some(b.clone()));
+        first.written_again(dir("/d", Write::Written, Some(b), Some(c.clone())));
+        assert_eq!(
+            (first.previous, first.written_attrs),
+            (Some(a), Some(c.clone()))
+        );
+        let mut refused = dir("/d", Write::Refused, None, None);
+        refused.created_dirs = vec!["/x".to_owned()];
+        let mut later = dir("/d", Write::Written, None, Some(c));
+        later.created_dirs = vec!["/y".to_owned()];
+        refused.written_again(later.clone());
+        assert_eq!(refused.write, Write::Written);
+        assert_eq!(refused.created_dirs, ["/x", "/y"]);
+    }
+
+    #[test]
+    fn load_refuses_a_dir_rollback_could_not_trust() {
+        let (path, root) = record_path("record-dirs-bad");
+        let with = |dir: DirRecord| {
+            let record = Record {
+                version: VERSION,
+                targets: BTreeMap::from([("w".to_owned(), with_dirs(1, true, vec![dir]))]),
+            };
+            plant(&path, &serde_json::to_vec(&record).unwrap());
+            load(&path)
+        };
+        let base = dir("/etc/app", Write::Written, None, Some(attrs(0, 0, "0755")));
+        for (what, bad) in [
+            (
+                "a relative path",
+                dir("etc/app", Write::Written, None, None),
+            ),
+            (
+                "a bad mode",
+                dir("/etc/app", Write::Written, Some(attrs(0, 0, "x")), None),
+            ),
+            (
+                "three digits",
+                dir("/etc/app", Write::Written, Some(attrs(0, 0, "755")), None),
+            ),
+            (
+                "a setgid previous",
+                dir("/etc/app", Write::Written, Some(attrs(0, 0, "2755")), None),
+            ),
+            (
+                "a setuid written",
+                dir("/etc/app", Write::Written, None, Some(attrs(0, 0, "4755"))),
+            ),
+            (
+                "a refused step without dirs",
+                dir("/etc/app", Write::Refused, None, None),
+            ),
+            (
+                "a dir not above it",
+                DirRecord {
+                    created_dirs: vec!["/srv".to_owned()],
+                    ..base.clone()
+                },
+            ),
+        ] {
+            assert!(with(bad).unwrap_err().ends_with("cannot parse"), "{what}");
+        }
+        assert!(with(base).unwrap().is_some());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn link(path: &str, target: &str, write: Write, previous: LinkPrevious) -> LinkRecord {
+        LinkRecord {
+            path: path.to_owned(),
+            target: target.to_owned(),
+            sudo: true,
+            write,
+            previous,
+            created_dirs: Vec::new(),
+        }
+    }
+
+    fn with_links(at: u64, ok: bool, links: Vec<LinkRecord>) -> TargetRecord {
+        TargetRecord {
+            links,
+            ..target(at, ok, Vec::new())
+        }
+    }
+
+    fn pointed(target: &str) -> LinkPrevious {
+        LinkPrevious::Link {
+            target: target.to_owned(),
+        }
+    }
+
+    #[test]
+    fn links_merge_as_dirs_do_and_need_version_2() {
+        let (path, root) = record_path("record-links");
+        let mut session = Session::open(&path).unwrap();
+        let created = link(
+            "/usr/local/bin/app",
+            "/opt/a",
+            Write::Written,
+            LinkPrevious::Absent,
+        );
+        let relinked = link("/etc/alt", "/opt/new", Write::Written, pointed("/opt/old"));
+        session.merge(
+            "w",
+            with_links(1, true, vec![created.clone(), relinked.clone()]),
+        );
+        session.save().unwrap();
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.version, VERSION);
+        assert_eq!(
+            loaded.targets["w"].links,
+            [created.clone(), relinked.clone()]
+        );
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["targets"]["w"]["links"][1]["previous"],
+            json!({"state": "link", "target": "/opt/old"})
+        );
+
+        // A later apply that found them as wanted keeps the earlier entries;
+        // an unchanged link with no earlier one is not kept.
+        drop(session);
+        let mut session = Session::open(&path).unwrap();
+        let unchanged =
+            |path: &str, target: &str| link(path, target, Write::Written, pointed(target));
+        session.merge(
+            "w",
+            with_links(
+                2,
+                true,
+                vec![
+                    unchanged("/usr/local/bin/app", "/opt/a"),
+                    unchanged("/etc/alt", "/opt/new"),
+                    unchanged("/etc/other", "/x"),
+                ],
+            ),
+        );
+        assert_eq!(
+            session.record().targets["w"].links,
+            [created.clone(), relinked.clone()]
+        );
+
+        // A refused step keeps the earlier entry and adds what it created;
+        // one after a step that failed midway keeps that one's previous.
+        let mut refused = link("/etc/alt", "/opt/new", Write::Refused, LinkPrevious::Absent);
+        refused.created_dirs = vec!["/etc".to_owned()];
+        let midway = link(
+            "/usr/local/bin/app",
+            "/opt/a",
+            Write::FailedMidway,
+            LinkPrevious::Absent,
+        );
+        session.merge("w", with_links(3, false, vec![refused, midway]));
+        session.save().unwrap();
+        drop(session);
+        let mut session = Session::open(&path).unwrap();
+        let again = link(
+            "/usr/local/bin/app",
+            "/opt/b",
+            Write::Written,
+            pointed("/opt/a"),
+        );
+        session.merge("w", with_links(4, true, vec![again]));
+        let links = &session.record().targets["w"].links;
+        assert_eq!(
+            links[0].previous,
+            LinkPrevious::Absent,
+            "from before the midway step"
+        );
+        assert_eq!(links[0].target, "/opt/b");
+
+        // Nothing changed and no links: version 1 again.
+        session.merge("w", with_links(5, true, vec![unchanged("/x", "/y")]));
+        session.save().unwrap();
+        assert_eq!(load(&path).unwrap().unwrap().version, VERSION_1);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_link_stepped_on_twice_keeps_the_first_previous() {
+        let mut first = link("/l", "/b", Write::Written, pointed("/a"));
+        first.written_again(link("/l", "/c", Write::Written, pointed("/b")));
+        assert_eq!(
+            (first.previous.clone(), first.target.as_str()),
+            (pointed("/a"), "/c")
+        );
+        let mut refused = link("/l", "/c", Write::Refused, LinkPrevious::Absent);
+        refused.created_dirs = vec!["/x".to_owned()];
+        refused.written_again(link("/l", "/c", Write::Written, pointed("/b")));
+        assert_eq!(refused.write, Write::Written);
+        assert_eq!(refused.previous, pointed("/b"));
+        assert_eq!(refused.created_dirs, ["/x"]);
+    }
+
+    #[test]
+    fn load_refuses_a_link_rollback_could_not_trust() {
+        let (path, root) = record_path("record-links-bad");
+        let with = |link: LinkRecord| {
+            let record = Record {
+                version: VERSION,
+                targets: BTreeMap::from([("w".to_owned(), with_links(1, true, vec![link]))]),
+            };
+            plant(&path, &serde_json::to_vec(&record).unwrap());
+            load(&path)
+        };
+        let base = link(
+            "/usr/local/bin/app",
+            "/opt/a",
+            Write::Written,
+            LinkPrevious::Absent,
+        );
+        for (what, bad) in [
+            (
+                "a relative path",
+                LinkRecord {
+                    path: "usr/app".to_owned(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "an empty target",
+                LinkRecord {
+                    target: String::new(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "a target with a newline",
+                LinkRecord {
+                    target: "/a\n/b".to_owned(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "a previous target with NUL",
+                LinkRecord {
+                    previous: pointed("/a\0b"),
+                    ..base.clone()
+                },
+            ),
+            (
+                "a previous file with a bad mode",
+                LinkRecord {
+                    previous: LinkPrevious::File(PreviousFile {
+                        mode: "x".to_owned(),
+                        uid: 0,
+                        gid: 0,
+                        sha256: String::new(),
+                        kept: false,
+                        text: None,
+                        reason: None,
+                    }),
+                    ..base.clone()
+                },
+            ),
+            (
+                "a refused step without dirs",
+                LinkRecord {
+                    write: Write::Refused,
+                    ..base.clone()
+                },
+            ),
+            (
+                "a dir not above it",
+                LinkRecord {
+                    created_dirs: vec!["/srv".to_owned()],
+                    ..base.clone()
+                },
+            ),
+        ] {
+            assert!(with(bad).unwrap_err().ends_with("cannot parse"), "{what}");
+        }
+        assert!(with(base).unwrap().is_some());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_file_a_link_replaced_shares_the_record_budget_and_is_dropped_too() {
+        let mut web1 = target(2, true, Vec::new());
+        let text = "l".repeat(4000);
+        let mut forced = link("/etc/app", "/opt/app", Write::Written, LinkPrevious::Absent);
+        if let Previous::File(p) = previous(&sha('0'), Some(&text)) {
+            forced.previous = LinkPrevious::File(p);
+        }
+        web1.links = vec![forced];
+        let mut all = Record::default();
+        all.targets.insert("web1".to_owned(), web1.clone());
+        let (mut session, root) = session_with("record-link-text", Vec::new());
+        session.limit = encoded_len(&all) - 1000;
+        session.merge("web1", web1);
+        assert_eq!(
+            session.save().unwrap(),
+            ["apply: last-apply.json is full; /etc/app on web1 cannot be rolled back"]
+        );
+        let saved = load(&session.path).unwrap().unwrap();
+        assert_eq!(saved.targets["web1"].links[0].not_kept(), Some(RECORD_FULL));
+        assert!(
+            session.record().targets["web1"].links[0]
+                .not_kept()
+                .is_none(),
+            "kept in memory"
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 }

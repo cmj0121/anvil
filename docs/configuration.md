@@ -51,14 +51,22 @@ timeout = 300              # seconds the package step may run, 1..=3600; default
 apt = "fd-find"
 dnf = "fd-find"
 
-[[files]]                  # optional; after packages, before [[steps]]; see Files
+[[dirs]]                   # optional; after packages, before [[files]]; see Dirs
+path = "/etc/app/conf.d"   # the directory to create or fix
+mode = "0755"              # required, quoted
+
+[[files]]                  # optional; after [[dirs]], before [[links]]; see Files
 src = "files/sshd_config"  # relative to the workspace
 dest = "/etc/ssh/sshd_config"
 mode = "0644"              # required, quoted
 tags = ["linode"]          # optional; the target must carry every tag
 facts = { distro = "arch" } # optional; pkg matches by list membership
 
-[[services]]               # optional; after files, before [[steps]]; see Services
+[[links]]                  # optional; after [[files]], before [[services]]; see Links
+path = "/usr/local/bin/app" # the symlink
+target = "/opt/app/bin/app" # what it points at; need not exist
+
+[[services]]               # optional; after links, before [[steps]]; see Services
 name = "sshd"              # the unit, OpenRC service or launchd label
 state = "started"          # required: started | stopped
 enabled = true             # optional; omit to leave enablement alone
@@ -268,10 +276,10 @@ and each `env` value travels in clear inside every step script it is given to. K
   value is a string (`env.KEY: must be a string`) with no control character, tab and newline included
   (`env.KEY: contains a control character`), at most 4 KiB (`env.KEY: is longer than 4096 bytes`), with at most 64
   keys per level (`env: has more than 64 keys`).
-- **Where `env` goes.** A `[[steps]]` or task `run`, a plugin step and an `anvil run` script start with the target's
-  env as `KEY='value'` and `export KEY` lines, inside the script on the transport's stdin, never on an argv. Values are
-  single-quoted, so quotes, `$`, backticks and backslashes arrive literally. Packages, files and services get no env.
-  The report, plan and `--json` show the script as you wrote it, without these lines.
+- **Where `env` goes.** A `[[steps]]` or task `run`, a plugin step and an `anvil run` script start with the target's env
+  as `KEY='value'` and `export KEY` lines, inside the script on the transport's stdin, never on an argv. Values are
+  single-quoted, so quotes, `$`, backticks and backslashes arrive literally. Packages, dirs, files, links and services
+  get no env. The report, plan and `--json` show the script as you wrote it, without these lines.
 - **sudo.** `sudo` resets the environment (`env_reset`), so a command run through it does not see `env`. Pass a value
   on by name: `sudo APP_ENV="$APP_ENV" cmd`.
 
@@ -326,6 +334,16 @@ tags = ["linode"]          # optional; every tag must be on the target
 facts = { distro = "arch" } # optional; each value equals that fact
 sudo = true                # optional; default true. false writes as the connecting user
 notify = ["reload sshd"]   # optional; [[handlers]] to run when this step changes the file; see Handlers
+
+[[dirs]]                   # optional; one directory created or fixed per matching target; see Dirs
+path = "/etc/app/conf.d"   # required: absolute path on the target, the dest rules
+mode = "0755"              # required: a quoted string of 3 or 4 octal digits
+owner = "root"             # optional; also group, parents, tags, facts, sudo, notify as on [[files]]
+
+[[links]]                  # optional; one symlink per matching target; see Links
+path = "/usr/local/bin/app" # required: absolute path on the target, the dest rules
+target = "/opt/app/bin/app" # required: absolute or relative, at most 4096 bytes; need not exist
+force = false              # optional; default false. true replaces a regular file at path
 
 [[services]]               # optional; one service brought to a state per matching target; see Services
 name = "sshd"              # required: [A-Za-z0-9:_@.-]+, at most 255 bytes
@@ -400,9 +418,9 @@ the guard commands after it do not run. A plugin step's message starts with `ski
 (`skipped plugin harden: /etc/x exists`). A skipped step does not fail the target, and the next step runs; its output
 is in [Guarded steps](cli.md#guarded-steps).
 
-Guards go on `[[steps]]` entries and on `run` and `plugin` [tasks](#tasks). `[[files]]`, `[[services]]` and
-`[packages]` have no such keys and refuse them with the parser's `unknown field` message; a guard on any other task is
-exit 2 too ([Tasks](#tasks)). Those kinds already converge, or have no single command to guard.
+Guards go on `[[steps]]` entries and on `run` and `plugin` [tasks](#tasks). `[[dirs]]`, `[[files]]`, `[[links]]`,
+`[[services]]` and `[packages]` have no such keys and refuse them with the parser's `unknown field` message; a guard on
+any other task is exit 2 too ([Tasks](#tasks)). Those kinds already converge, or have no single command to guard.
 
 `creates` and `removes` follow the [`dest` rules](#files): absolute, every character in `[A-Za-z0-9._/@+-]`, no `.` or
 `..` component, not ending with `/`, at most 4096 bytes. A violation is exit 2 naming the step, such as
@@ -424,8 +442,9 @@ guards runs and prints exactly as before.
 skipped it notifies nothing. Each name must be a `[[handlers]]` entry's, else exit 2 with
 ``steps[0].notify[0] `reload ssh`: names no [[handlers]] entry``.
 
-The sections above run in a fixed order: packages, files, services, steps. To choose the order, use [`[[tasks]]`](#tasks)
-instead of `[[files]]`, `[[services]]`, `[[steps]]` and the lists in `[packages]`.
+The sections above run in a fixed order: packages, dirs, files, links, services, steps, then the handlers. To choose the
+order, use [`[[tasks]]`](#tasks) instead of `[[dirs]]`, `[[files]]`, `[[links]]`, `[[services]]`, `[[steps]]` and the
+lists in `[packages]`.
 
 Without `[secrets]` the backend is the keychain on macOS (and unsupported elsewhere). Only the selected backend's section
 is required and checked: a missing section, an unknown backend or `keychain` off macOS is a config error (exit 2). A
@@ -469,19 +488,23 @@ names = ["HOST_SUDO"]
 ## Files
 
 A `[[files]]` entry copies one text file onto each selected target whose tags and facts all match. No `tags` and no
-`facts` means every selected target. Matching entries run in config order, after the package step and before
-`[[steps]]` (a `file` [task](#tasks) runs where it stands instead); an entry that does not match is still a step, reported as
-skipped, and the target's other steps still run
-([File steps](cli.md#file-steps)). At most 64 entries: one more is exit 2 with `files: N entries exceeds the 64 entry limit`
-(`files: 65 entries exceeds the 64 entry limit` for 65). An unknown key, or a `sudo` or `rollback` that is not a
-boolean, is exit 2 with the parser's message, which names the key and the line. A path or value quoted in a message
-below is cut at 64 characters (the cut marked with `…`) and a control character is shown as a `\x1b`-style escape.
+`facts` means every selected target. Matching entries run in config order, after the package step and the
+[`[[dirs]]`](#dirs) steps, and before the [`[[links]]`](#links) steps (a `file` [task](#tasks) runs where it stands
+instead); an entry that does not match is still a step, reported as skipped, and the target's other steps still run
+([File steps](cli.md#file-steps)). At most 64 entries: one more is exit 2 with
+`files: N entries exceeds the 64 entry limit` (`files: 65 entries exceeds the 64 entry limit` for 65). An unknown key,
+or a `sudo` or `rollback` that is not a boolean, is exit 2 with the parser's message, which names the key and the line.
+A path or value quoted in a message below is cut at 64 characters (the cut marked with `…`) and a control character is
+shown as a `\x1b`-style escape.
 
 ```toml
 [[files]]
 src = "files/sshd_config"        # required: relative to the workspace, or $/… in the store
 dest = "/etc/ssh/sshd_config"    # required: absolute path on the target
 mode = "0644"                    # required: quoted, 3 or 4 octal digits
+owner = "root"                   # optional; a user name or numeric id. Unset: keep dest's owner
+group = "wheel"                  # optional; a group name or numeric id. Unset: keep dest's group
+parents = true                   # optional; default false. true: create missing directories on dest's path
 tags = ["linode"]                # optional; [A-Za-z0-9_-]+; every one must be on the target
 facts = { distro = "arch" }      # optional; a probe key, equal to that fact
 sudo = false                     # optional; default true. false: write as the connecting user
@@ -601,6 +624,40 @@ sudo's own message. `apply` opens the secret store for files only when some sele
 carries every tag of a `sudo = true` entry (facts are not known yet); a config whose entries are all `sudo = false`, or
 whose tags match no selected target, does not open it for files. `plan` never opens it.
 
+**`owner` and `group`.** Optional, each a name or a numeric id. A name is 1 to 32 bytes matching `[a-z_][a-z0-9_.-]*`
+(`root`, `_apt`, `www-data`); an id is digits only, at most 10 of them, from `0` to `4294967295`. Anything else is
+exit 2, naming the entry:
+
+- ``files[0].owner `Bad`: must be a user name or a numeric id`` (`1app`, `a b` and `4294967296` get the same message)
+- ``files[0].group `1app`: must be a group name or a numeric id``
+
+Names are resolved on the target, never on the controller. Unset, an existing dest keeps its own owner or group, and a
+new file gets the default ([How the file is replaced](#files)); set one and the other is kept the same way. Both go on
+the temp file while it is still empty, before the bytes and `mode`, so dest never holds the new bytes with the wrong
+owner. An owner name the target does not know fails the step before anything is written, with
+`files: owner NAME does not exist on the target`; a group, on a write as root, with
+`files: group NAME does not exist on the target`.
+
+Who can set them depends on who writes:
+
+- **As root** (`sudo = true`, or a root login, which ignores `sudo`): any owner and group the target knows.
+- **As the connecting user** (`sudo = false` on a login that is not root): the owner can only be that user, and the
+  group only one of that user's groups. The login user is known only after the probe, so an `owner` name other than the
+  `user` fact fails that target before any step runs on it, exit 1, while the other targets go on:
+  `files[0].owner NAME: needs sudo; the login user is USER` (`tasks[0].file.owner …` for a task). A numeric `owner` is
+  compared with `id -u` on the target, and one that differs fails the step with the same message, writing nothing. A
+  group the user is not in, or one that does not exist, fails the step with
+  `files: group NAME is not one of USER's groups`.
+
+**`parents`.** Optional, default false. Without it, a directory missing from dest's path fails the step before anything
+is written: `files: DIR does not exist; set parents = true to create it`. With `parents = true`, each missing directory
+is created top down with `mkdir -m 0755`, as the identity of the write: root for a write as root, the connecting user
+with `sudo = false`. The directory rule below still holds: every existing directory above a new one must pass it before
+anything is created under it, and each new one is checked again right after `mkdir`, so one that comes out open to
+its group or others (a default ACL, say) fails the step with the rule's message. A `mkdir` that fails is
+`files: cannot create DIR`. Each directory created is kept in the [apply record](cli.md#the-apply-record), even when the
+step then fails, and [`anvil rollback`](cli.md#anvil-rollback) removes it if it is empty.
+
 **`rollback`.** Defaults to true, and is omitted from the file anvil writes back when it is true. Before each write,
 apply keeps what dest held in the [apply record](cli.md#the-apply-record), `last-apply.json` in
 `$XDG_STATE_HOME/anvil` (else `~/.local/state/anvil`), so that [`anvil rollback`](cli.md#anvil-rollback) can put it
@@ -612,17 +669,29 @@ let others read it (0600, 0640) is also kept as its hash only, whatever this say
 unchanged or an earlier entry still holds the previous state, and rollback names it,
 `cannot undo: DEST (not world-readable)`, and restores nothing there.
 
-**What lands on the target.** The bytes are compared with dest by `cmp`. The same bytes are left in place, `chmod`
-applies `mode`, and the step prints `unchanged DEST`. Otherwise it prints `wrote DEST`. Both exit 0. A missing or
-unreadable dest is written. The comparison needs `cmp` (diffutils) on the target, on the `PATH` the write runs with
-(sudo's when the write is through sudo). Without it the file is always rewritten and the step always prints
-`wrote DEST`; some minimal container images lack it. A mode without owner write, such as `0444`, still writes. anvil
-sets `mode`, and keeps an existing dest's owner and group. It does not create a missing parent directory; the step
-fails with `tee`'s own message.
+**What lands on the target.** The bytes are compared with dest by `cmp`. Other bytes, or a missing or unreadable
+dest, are written, and the step prints `wrote DEST`. The same bytes are left in place, and only dest's owner (when
+`owner` is set), group (when `group` is set) and mode are compared with the entry's. What differs is fixed in place,
+with no temp file, and the step prints `fixed DEST: owner, group, mode`, naming only what it changed, in that order
+(`fixed /etc/motd: mode`). When nothing differs, dest is left untouched and the step prints `unchanged DEST`. All three
+exit 0. A mode drift on a config without `owner` or `group` prints `fixed DEST: mode` too; earlier anvil printed
+`unchanged DEST` for it ([Handlers](#handlers)).
 
-**`notify`.** Optional: the [handlers](#handlers) to run when the step prints `wrote DEST`. `unchanged DEST` notifies
-nothing, even when `chmod` fixed the mode, and a target without `cmp` rewrites, and so notifies, on every apply. Each
-name must be a `[[handlers]]` entry's, else exit 2 with ``files[0].notify[0] `reload ssh`: names no [[handlers]] entry``.
+A new owner or group goes on only after the mode is narrowed to its owner's bits, and the entry's `mode` is set last, so
+the new group never gets access for a moment; a mode-only drift is a single `chmod`. Then dest is read again. A fix
+that did not take, as on NFS with root_squash, on vfat or under an ACL mask, fails the step with
+`files: DEST: owner, group or mode did not take (now UID:GID MODE)`, so it cannot report a change on every run. A dest
+whose owner, group and mode cannot be read fails with `files: cannot read DEST's owner, group and mode`, and a `chown`
+that fails with `files: cannot give DEST owner NAME` (or a group message from [`owner` and `group`](#files)).
+
+The comparison needs `cmp` (diffutils) on the target, on the `PATH` the write runs with (sudo's when the write is
+through sudo). Without it the file is always rewritten and the step always prints `wrote DEST`; some minimal container
+images lack it. A mode without owner write, such as `0444`, still writes. anvil sets `mode`, and without `owner` or
+`group` keeps an existing dest's owner and group.
+
+**`notify`.** Optional: the [handlers](#handlers) to run when the step prints `wrote DEST` or `fixed DEST: …`.
+`unchanged DEST` notifies nothing, and a target without `cmp` rewrites, and so notifies, on every apply. Each name must
+be a `[[handlers]]` entry's, else exit 2 with ``files[0].notify[0] `reload ssh`: names no [[handlers]] entry``.
 
 A write as root (through sudo, or on a root login) refuses a dest unless every directory on its path, from `/` to the
 one that holds dest, is owned by root and writable by neither its group nor others. Root checks each one in turn,
@@ -631,7 +700,7 @@ before anything else touches dest; the first that fails stops the step with
 nothing is written. A directory on the path that is a symlink also fails. A root write refuses symlinked system
 directories too: macOS `/etc`, `/var` and `/tmp` (links into `/private`), and the merged-/usr links `/bin`, `/sbin` and
 `/lib` on current Linux distributions; use the real path instead, e.g. `/usr/bin/x`. A directory missing from the path
-passes, and the write then fails as above. So a dest under a user's home needs `sudo = false`.
+fails the step, or is created with `parents = true`, as above. So a dest under a user's home needs `sudo = false`.
 Without this rule, whoever can write a directory on the path could swap it, or what is in it, for a symlink or a hard
 link to another file, and root would write that file.
 
@@ -659,7 +728,8 @@ files. A dest that is a directory fails the step with `files: DEST is a director
 **How the file is replaced.** Every write, on every path, puts the bytes in a mode-0600 temp file in dest's own
 directory, named `.anvil-<16 hex of dest's sha256>-<16 random hex>` on the controller, and renames it over dest with
 `mv -f`. So an interrupted write leaves dest fully old or fully new. Created mode 0600 by `install`, so that a default ACL
-on the directory cannot open it, and while it is still empty, the temp gets dest's owner and group, its SELinux label
+on the directory cannot open it, and while it is still empty, the temp gets the entry's `owner` and `group` (dest's
+own for each one unset), its SELinux label
 where `selinuxenabled` succeeds (`chcon --reference`), and its ACL where the GNU `getfacl` and `setfacl` exist, with
 `sed` on the target; the bytes follow, and last `mode`, which opens the ACL's entries, before the rename.
 A temp left by a killed run is removed by the next write of
@@ -667,7 +737,7 @@ the same dest once it is
 over an hour old, so that a concurrent run keeps its own; another dest's temp stays. A new file written as root is
 owned by root; its group is root's primary group
 on Linux, and the parent directory's group on macOS and the BSDs or under a setgid parent directory. With
-`sudo = false` it is owned by the connecting user.
+`sudo = false` it is owned by the connecting user. `owner` and `group` replace these defaults.
 
 The rename gives dest a new inode. A hard link to the old file keeps the old bytes, and a process that holds the old
 file open keeps reading them. Extended attributes other than the SELinux label, file flags such as `chattr +i`, and an
@@ -687,6 +757,10 @@ rename moves the temp into it; only root or the login user can do that, under th
   `files: DEST cannot be given mode MODE: only its owner can chmod it`;
 - `mv` failed with the temp fully written, as on a bind-mounted file (`mv failed`).
 
+An in-place write puts the bytes in before any owner, so with `owner` or `group` set none of these cases writes: the
+step fails with `files: DEST: owner and group need an atomic write: REASON`, with the same REASON, and dest is
+unchanged.
+
 A temp that cannot be fully written is never one of them: the step fails with
 `files: cannot write a temp file beside DEST; DEST is unchanged`, so a full disk does not reach dest. Each in-place
 write checks its source's size first and
@@ -697,7 +771,8 @@ compares dest with the bytes after; a mismatch fails the step with
 dest intact; a rule that allows `tee` but not `sh` breaks it. A `NOPASSWD` rule that lists commands needs `true`,
 `test`, `find`, `install`, `tee`, `cmp`,
 `mv`, `chown`, `chmod`, `rm`, `ls`, `getfacl`, `setfacl`, `chcon`, `od`, `sha256sum` or `shasum`, and `sh` (it probes for tools with
-`sh -c`). Without `getfacl` and `setfacl` the ACL is lost. Without `sh`, the SELinux label is lost, the
+`sh -c`), plus `chgrp` for `group`, `mkdir` for `parents`, and `rmdir` for a rollback that removes the directories
+`parents` created. Without `getfacl` and `setfacl` the ACL is lost. Without `sh`, the SELinux label is lost, the
 comparison always rewrites, and a dest that exists is refused, since the check that it has not changed cannot run.
 A rule that allows `sh` but neither hash tool refuses a file others cannot read the same way, with
 `files: sudo could not check DEST; nothing was changed`. A file root cannot read on a root-squashed mount fails the
@@ -792,14 +867,165 @@ therefore shows as `wrote DEST` on the next apply, and rollback restores what de
 before the 1 MiB limit applies (MiniJinja caps one repetition at 100 MB). A template is trusted like the config: whoever
 can edit it can already run any step on the targets.
 
+## Dirs
+
+A `[[dirs]]` entry creates one directory, or fixes its owner, group and mode, on each selected target whose tags and
+facts all match. Matching entries run in config order, after the package step and before `[[files]]`, so a directory is
+there before the file that goes in it (a `dir` [task](#tasks) runs where it stands instead). An entry that does not
+match is still a step, reported as `skipped dir PATH: no match`, and the target's other steps still run ([Dir
+steps](cli.md#dir-steps)).
+
+```toml
+[[dirs]]
+path = "/etc/app/conf.d"         # required: absolute path on the target, the dest rules of [[files]]
+mode = "0750"                    # required: quoted, 3 or 4 octal digits
+owner = "root"                   # optional; a user name or numeric id. Unset: keep the directory's owner
+group = "app"                    # optional; a group name or numeric id. Unset: keep the directory's group
+parents = true                   # optional; default false. true: create missing directories above path
+tags = ["linode"]                # optional; every one must be on the target
+facts = { distro = "arch" }      # optional; a probe key, equal to that fact
+sudo = false                     # optional; default true. false: work as the connecting user
+notify = ["reload app"]          # optional; the [[handlers]] to run when the step creates or fixes it
+```
+
+The keys follow the [Files](#files) rules and messages, with the prefix `dirs[I]`: `path` is checked as `dest` is
+(``dirs[0].path `etc/app`: must be an absolute path``), `mode` as a file's mode (`dirs[0].mode: required`,
+``dirs[0].mode `2755`: setuid and setgid are refused``), and `owner`, `group`, `tags`, `facts`, `sudo` and `notify` as
+on `[[files]]`. Any other key, `src` or `template` say, is exit 2 with the parser's message. At most 64 entries, counted
+apart from `[[files]]`: one more is exit 2 with `dirs: 65 entries exceeds the 64 entry limit`.
+
+**What lands on the target.** The step looks at `path` without following it:
+
+- Nothing there: the directory is made (mode 0700 while it is empty and nobody else's), then given its owner, group and
+  mode as a fix does, and the step prints `created DIR`. When that fails, the new directory is removed again and the
+  step fails.
+- A directory: its owner (when `owner` is set), group (when `group` is set) and mode are compared with the entry's. What
+  differs is fixed in the order a file's is: a new owner or group goes on only after the mode is narrowed to its owner's
+  bits, and `mode` is set last; a mode-only drift is a single `chmod`. Then it is read again, and a fix that did not
+  take fails the step with `dirs: DIR: owner, group or mode did not take (now UID:GID MODE)`. The step prints
+  `fixed DIR: owner, group, mode`, naming only what it changed, or `unchanged DIR` when nothing differed.
+- Anything else, a regular file or a symlink (to a directory or dangling) included: the step fails with
+  `dirs: DIR is not a directory`, and the path is left as it is.
+
+Never recursive: the directory's contents, their owners and modes are not touched. The setuid and setgid bits of a
+directory are not managed. `mode` cannot ask for them, and the ones a directory has (set by hand, or inherited from a
+setgid parent) are kept as they are, left out of the comparison and of the [apply record](cli.md#the-apply-record), on
+every platform. The sticky bit (`1777`) is managed like the other bits.
+
+The other failures, each naming DIR: `dirs: cannot create DIR`, `dirs: cannot read DIR's owner, group and mode`,
+`dirs: cannot give DIR owner NAME`, `dirs: DIR cannot be given mode MODE: only its owner can chmod it` (a directory of
+another user, as the connecting user), and the owner and group messages of [Files](#files) with the prefix `dirs`:
+`dirs: owner NAME does not exist on the target`, `dirs: group NAME does not exist on the target` and
+`dirs: group NAME is not one of USER's groups`.
+
+**Who writes.** As for [`[[files]]`](#files): root through sudo by default, the connecting user with `sudo = false`,
+root on a root login whatever `sudo` says, with the sudo password typed from the target's sudo secret when sudo asks for
+one. With `sudo = false` the owner must be the login user: another owner name fails that target before any step runs on
+it, exit 1, with `dirs[0].owner NAME: needs sudo; the login user is USER` (`tasks[0].dir.owner …` for a task). A sudo
+that fails refuses the step with `dirs: sudo failed; DIR is unchanged`.
+
+**The directories above it.** Every directory above `path` must pass the root-only rule of a file's dest: owned by root
+(or, with `sudo = false`, by root or the login user) and writable by neither its group nor others. The first that fails
+stops the step before anything is made, with `dirs: DIR is not root-only; root will not write under it` or
+`dirs: DIR is not owned by root or the login user, or others can write it; anvil will not write under it`. A missing one
+fails with `dirs: DIR does not exist; set parents = true to create it`; with `parents = true` it is created top down
+with `mkdir -m 0755` as the identity of the write, checked again right after, and kept in the record so that rollback
+can remove it when empty. A check that sudo could not run is `dirs: sudo could not check DIR; nothing was changed`.
+
+**`notify`.** The handlers to run when the step prints `created DIR` or `fixed DIR: …`; `unchanged DIR` notifies nothing
+([Handlers](#handlers)).
+
+A restricted sudo rule needs `true`, `test`, `find`, `ls`, `mkdir` and `chmod`, plus `chown` for `owner`, `chgrp` for
+`group`, and `rmdir` for a create that fails and for a rollback.
+
+## Links
+
+A `[[links]]` entry makes `path` a symlink to `target` on each selected target whose tags and facts all match. Matching
+entries run in config order, after `[[files]]` and before `[[services]]` (a `link` [task](#tasks) runs where it stands
+instead). An entry that does not match is still a step, reported as `skipped link PATH: no match` ([Link
+steps](cli.md#link-steps)).
+
+```toml
+[[links]]
+path = "/usr/local/bin/app"      # required: absolute path on the target, the dest rules of [[files]]
+target = "/opt/app/bin/app"      # required: what the link points at; absolute or relative
+force = false                    # optional; default false. true: replace a regular file at path
+parents = true                   # optional; default false. true: create missing directories above path
+tags = ["linode"]                # optional; every one must be on the target
+facts = { distro = "arch" }      # optional; a probe key, equal to that fact
+sudo = false                     # optional; default true. false: work as the connecting user
+notify = ["restart app"]         # optional; the [[handlers]] to run when the step links or relinks it
+```
+
+`path`, `tags`, `facts`, `sudo` and `notify` follow the [Files](#files) rules with the prefix `links[I]`. A link has no
+`mode`, `owner` or `group`: those, and any other unknown key, are exit 2 with the parser's message. At most 64 entries,
+counted apart from `[[files]]` and `[[dirs]]`: `links: 65 entries exceeds the 64 entry limit`.
+
+**`target`.** Absolute or relative (a relative one is read from the link's directory, as for any symlink), 1 to 4096
+bytes, with no control character (so no NUL and no newline) and no invisible or bidi character, since output, `plan` and
+`--json` show it. It is never checked to exist: a dangling link is allowed, and a target starting with `-` works. Exit
+2:
+
+- `links[0].target ``: is empty`
+- ``links[0].target `/aaa…`: 4097 bytes exceeds the 4096 byte limit``
+- ``links[0].target `/srv/app\nbin`: contains a control character`` (the character shown as an escape)
+- ``links[0].target `/srv/\u{202e}app`: contains an invisible or bidi character``
+
+**What lands on the target.** The step looks at `path` without following it:
+
+- Nothing there: `ln -s -- TARGET PATH`, and the step prints `linked PATH -> TARGET`.
+- A symlink whose text, as `readlink` prints it, is `target` byte for byte: `unchanged PATH`. `/opt/app` and `/opt/app/`
+  differ.
+- A symlink to anything else, a directory included: it is replaced atomically, and the step prints
+  `relinked PATH -> TARGET`. The link is never followed.
+- A regular file: refused with `links: PATH is a regular file; set force = true to replace it`, unless `force = true`.
+  Then the file is read as a file's dest is before a write and kept in the [apply record](cli.md#the-apply-record) as a
+  file's previous text is (only when world-readable, UTF-8 and at most 256 KiB), then replaced atomically, and the step
+  prints `linked PATH -> TARGET`. A file that cannot be read fails with `links: cannot read PATH before replacing it`.
+  When a `[[files]]` entry or file task for the same path says `rollback = false`, only the file's sha256 is kept.
+- A directory: always refused, `force` or not, with `links: PATH is a directory`.
+- Anything else (a FIFO, a socket, a device): `links: PATH is not a symlink or a regular file`.
+
+Each refusal leaves `path` as it is. A link whose current target the record could not keep is refused before it is
+compared, so that a rollback can always put it back: one with a newline in it fails with
+`links: PATH points at a target with a newline; anvil will not replace it`, and one that is not UTF-8 text, or holds a
+control character, with `links: PATH points at a target anvil cannot record; anvil will not replace it`. A non-ASCII old
+target is checked with `iconv` on the target; without `iconv` it is refused the same way.
+
+**Atomic relink.** A link or file is replaced by a new link made beside `path` (`ln -s --` to a temp named
+`.anvil-<16 hex>-<16 hex>`) and renamed over it, so `path` is always the old link or the new one. A plain `mv -f` onto a
+link to a directory would move the new link into that directory, so the rename is `mv -fT` (GNU), else `mv -fh` (macOS,
+the BSDs), neither of which follows `path`. Right before the rename, and again after one that failed, a real directory
+at `path` is refused (`links: PATH is a directory`). Only when `mv` knows neither option, `path` is removed first and
+the temp renamed onto the free name, with the warning `links: PATH: not replaced atomically: no mv -T or mv -h`; any
+other `mv` error fails the step with that error. Then the link is read back: `links: PATH was not replaced` (or, after a
+plain link, `links: PATH was not linked`) fails the step when it does not point at `target`. A temp that cannot be made
+fails with `links: cannot create a link beside PATH; PATH is unchanged`, and a temp that is gone before the rename with
+`links: the new link beside PATH is gone; PATH is unchanged`. The temp is removed when the step fails or is interrupted;
+one a killed run left is removed by a later step on the same path once it is over an hour old.
+
+**Who writes, and the directories above it.** As for [`[[dirs]]`](#dirs), with the prefix `links`: root through sudo by
+default, the connecting user with `sudo = false`, `links: sudo failed; PATH is unchanged` for a sudo that fails. Every
+directory above `path` must pass the root-only rule of a file's dest, with `parents = true` creating the missing ones
+(`links: DIR is not root-only; root will not write under it`,
+`links: DIR is not owned by root or the login user, or others can write it; anvil will not write under it`,
+`links: DIR does not exist; set parents = true to create it`, `links: cannot create DIR`). `target` and what it points
+at are never checked.
+
+**`notify`.** The handlers to run when the step prints `linked PATH -> TARGET` or `relinked PATH -> TARGET`;
+`unchanged PATH` notifies nothing ([Handlers](#handlers)).
+
+A restricted sudo rule needs `true`, `test`, `find`, `readlink`, `ln`, `mv` and `rm`, plus `mkdir` for `parents`,
+`rmdir` for a rollback that removes the directories it created, and `ls` and `od` to read a file `force` replaces.
+
 ## Services
 
 A `[[services]]` entry brings one service to a state, and to an enablement when `enabled` is set, on each selected
 target whose tags and facts all match. It asks the target's init first and changes only what differs, so a rerun on a
-service already there prints `unchanged service NAME`. Matching entries run in config order, after the `[[files]]`
-steps and before `[[steps]]` (a `service` [task](#tasks) runs where it stands instead); an entry that does not match is still
-a step, reported as
-`skipped service NAME: no match`, and the target's other steps still run ([Service steps](cli.md#service-steps)).
+service already there prints `unchanged service NAME`. Matching entries run in config order, after the `[[links]]` steps
+and before `[[steps]]` (a `service` [task](#tasks) runs where it stands instead); an entry that does not match is still
+a step, reported as `skipped service NAME: no match`, and the target's other steps still run ([Service
+steps](cli.md#service-steps)).
 
 ```toml
 [[services]]
@@ -910,9 +1136,9 @@ What each init runs, and the messages of a service it cannot find, are in [Servi
 ## Tasks
 
 A `[[tasks]]` list runs top to bottom on each target, in the order you write. It replaces the legacy sections' fixed
-order (packages, files, services, steps) when a setup needs another one: a directory before the file that goes in it,
-a migration between a file and the service that reads it. Tasks can nest, and can include task files from the
-[file store](cli.md#anvil-files). A config without `[[tasks]]` behaves exactly as before.
+order (packages, dirs, files, links, services, steps) when a setup needs another one: a step between two files, a
+migration between a file and the service that reads it. Tasks can nest, and can include task files from the [file
+store](cli.md#anvil-files). A config without `[[tasks]]` behaves exactly as before.
 
 `config.toml`:
 
@@ -956,37 +1182,41 @@ facts = { os = "Linux" }           # ANDed with the parent's tags
 
 **Kinds.** A task has exactly one of these, and may also set `name`, `tags` and `facts`. An unknown key is exit 2 with
 the parser's message. Two kinds are exit 2 with `tasks[0]: has run and include; keep one`, none with
-`tasks[0]: needs one of run, plugin, packages, file, service, include, tasks`.
+`tasks[0]: needs one of run, plugin, packages, file, service, dir, link, include, tasks`.
 
-| Kind       | What it does                                                                          |
-| ---------- | ------------------------------------------------------------------------------------- |
-| `run`      | a POSIX sh script, at most 4 KiB, as in `[[steps]]`                                   |
-| `plugin`   | a `[plugins]` entry, with optional `args`, as in [Plugin steps](cli.md#plugin-steps)  |
-| `packages` | only `install`, `pin`, `remove` and `upgrade`, as in `[packages]`                     |
-| `file`     | `src`, `dest`, `mode`, `sudo`, `rollback` and `template`, as in [`[[files]]`](#files) |
-| `service`  | `name`, `state` and `enabled`, as in [`[[services]]`](#services)                      |
-| `include`  | a `$/…` task file, expanded in place                                                  |
-| `tasks`    | child tasks, written as `[[tasks.tasks]]` or an inline array                          |
+| Kind       | What it does                                                                             |
+| ---------- | ---------------------------------------------------------------------------------------- |
+| `run`      | a POSIX sh script, at most 4 KiB, as in `[[steps]]`                                      |
+| `plugin`   | a `[plugins]` entry, with optional `args`, as in [Plugin steps](cli.md#plugin-steps)     |
+| `packages` | only `install`, `pin`, `remove` and `upgrade`, as in `[packages]`                        |
+| `file`     | the keys of [`[[files]]`](#files) but `tags`, `facts` and `notify`, which go on the task |
+| `service`  | `name`, `state` and `enabled`, as in [`[[services]]`](#services)                         |
+| `dir`      | the keys of [`[[dirs]]`](#dirs) but `tags`, `facts` and `notify`, which go on the task   |
+| `link`     | the keys of [`[[links]]`](#links) but `tags`, `facts` and `notify`, which go on the task |
+| `include`  | a `$/…` task file, expanded in place                                                     |
+| `tasks`    | child tasks, written as `[[tasks.tasks]]` or an inline array                             |
 
-`tags` and `facts` go on the task, not inside `file` or `service`: that is exit 2 with
-`tasks[0].file: tags and facts belong on the task, not the file`. A task whose selector does not match is still a step,
-reported as skipped (`skipped run: no match`, `skipped packages: no match`), and the target's other steps still run. A
-failed task ends that target; the other targets go on. A `packages` task that asks for nothing, an empty `tasks` and an
-include with no tasks add no step. Every file and service task is its own step, and repeats are allowed: the
-[`[[services]]` duplicate rule](#services) does not apply, because stop, migrate, start is how a migration is written.
-A config with `[[tasks]]` has no default `hostname` step.
+`tags` and `facts` go on the task, not inside `file`, `service`, `dir` or `link`: that is exit 2 with
+`tasks[0].file: tags and facts belong on the task, not the file` (`… not the dir`, `… not the link`). A task whose
+selector does not match is still a step, reported as skipped (`skipped run: no match`, `skipped packages: no match`),
+and the target's other steps still run. A failed task ends that target; the other targets go on. A `packages` task that
+asks for nothing, an empty `tasks` and an include with no tasks add no step. Every file, dir, link and service task is
+its own step, and repeats are allowed: the [`[[services]]` duplicate rule](#services) does not apply, because stop,
+migrate, start is how a migration is written. A config with `[[tasks]]` has no default `hostname` step.
 
 **Guards.** A `run` or `plugin` task may also set the [guards](#config) `creates`, `removes`, `onlyif` and `unless`,
-with the same rules as on `[[steps]]`. On a `packages`, `file`, `service`, `include` or `tasks` task a guard is exit 2
-naming the first one set, in that order, at any depth: `tasks[0].creates: only on a run or plugin task`,
+with the same rules as on `[[steps]]`. On a `packages`, `file`, `service`, `dir`, `link`, `include` or `tasks` task a
+guard is exit 2 naming the first one set, in that order, at any depth: `tasks[0].creates: only on a run or plugin task`,
 `tasks[0].tasks[0].onlyif: only on a run or plugin task`.
 
-**`notify`.** A `run`, `plugin`, `file` or `service` task may set [`notify`](#handlers), on the task, not inside `file`
-or `service`. Exit 2: `tasks[0].notify: not on a packages task; packages give no change signal`,
-`tasks[0].notify: only on a run, plugin, file or service task` (an `include` or `tasks` group),
-`tasks[0].file: notify belongs on the task, not the file` and
-`tasks[0].service: notify belongs on the task, not the service`. `[[handlers]]` stays in the main file: an include
-with it is exit 2 with the parser's message.
+**`notify`.** A `run`, `plugin`, `file`, `service`, `dir` or `link` task may set [`notify`](#handlers), on the task, not
+inside `file`, `service`, `dir` or `link`. Exit 2:
+`tasks[0].notify: not on a packages task; packages give no change signal`,
+`tasks[0].notify: only on a run, plugin, file, service, dir or link task` (an `include` or `tasks` group),
+`tasks[0].file: notify belongs on the task, not the file`,
+`tasks[0].service: notify belongs on the task, not the service`, `tasks[0].dir: notify belongs on the task, not the dir`
+and `tasks[0].link: notify belongs on the task, not the link`. `[[handlers]]` stays in the main file: an include with it
+is exit 2 with the parser's message.
 
 **Nesting.** Children inherit `tags` and `facts`, and every level must match: a target must carry every tag along the chain,
 facts are ANDed. The same
@@ -1021,12 +1251,15 @@ Including one file from two places, with no cycle, is allowed.
 | 256 tasks                                     | `PATH: more than 256 tasks after expansion`           |
 | 64 file tasks                                 | `PATH: more than 64 file tasks after expansion`       |
 | 64 service tasks                              | `PATH: more than 64 service tasks after expansion`    |
+| 64 dir tasks                                  | `PATH: more than 64 dir tasks after expansion`        |
+| 64 link tasks                                 | `PATH: more than 64 link tasks after expansion`       |
 | 4096 tasks visited, groups and includes too   | `PATH: more than 4096 tasks visited during expansion` |
 
-**Mixing.** `[[tasks]]` with `[[files]]`, `[[services]]`, `[[steps]]`, or `[packages]` `install`, `pin`, `remove` or
-`upgrade` is exit 2 with `[[tasks]] cannot be mixed with [[steps]]; move it into a task`. There is no automatic
-migration. `[packages.alias]` and the other `[packages]` settings (`manager`, `local`, `local_sudo_secret`, `timeout`)
-stay global and work with `[[tasks]]`, as do `[[handlers]]`, `[plugins]`, `[secrets]`, `[harden]` and `[anvil]`.
+**Mixing.** `[[tasks]]` with `[[dirs]]`, `[[files]]`, `[[links]]`, `[[services]]`, `[[steps]]`, or `[packages]`
+`install`, `pin`, `remove` or `upgrade` is exit 2 with `[[tasks]] cannot be mixed with [[steps]]; move it into a task`.
+There is no automatic migration. `[packages.alias]` and the other `[packages]` settings (`manager`, `local`,
+`local_sudo_secret`, `timeout`) stay global and work with `[[tasks]]`, as do `[[handlers]]`, `[plugins]`, `[secrets]`,
+`[harden]` and `[anvil]`.
 
 **`packages` tasks.** Each one is its own step, under the global `[packages]` settings, and does not merge its lists
 with another task's: two tasks can each `pin` a different name. A `manager` or `alias` inside the task is exit 2 with the
@@ -1092,22 +1325,31 @@ only, never in an [include](#tasks), and work with the legacy sections and with 
 - `tags`, `facts`, `notify`, a guard, `plugin` or any other key on the handler itself: the parser's `unknown field`
   message. A handler runs only where it was notified, and handlers do not notify handlers.
 
-**`notify`.** A list of handler names, on `[[files]]`, `[[services]]` and `[[steps]]` entries and on `run`, `plugin`,
-`file` and `service` [tasks](#tasks). A name listed twice counts once. A name no handler has is exit 2, naming the
-entry: ``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry`` (or `files[I]`, `services[I]`, `tasks[I]`).
+**`notify`.** A list of handler names, on `[[dirs]]`, `[[files]]`, `[[links]]`, `[[services]]` and `[[steps]]` entries
+and on `run`, `plugin`, `file`, `service`, `dir` and `link` [tasks](#tasks). A name listed twice counts once. A name no
+handler has is exit 2, naming the entry: ``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry`` (or `dirs[I]`,
+`files[I]`, `links[I]`, `services[I]`, `tasks[I]`).
 
 **When a step notifies.** Only a step that ran on the target, exited 0 and changed something:
 
-| Step          | Notifies when it       | Not when it                      |
-| ------------- | ---------------------- | -------------------------------- |
-| file          | prints `wrote DEST`    | prints `unchanged DEST`          |
-| service       | prints any change line | prints `unchanged service NAME`  |
-| run or plugin | runs and exits 0       | is skipped by a [guard](#config) |
-| any           |                        | is skipped as no match, or fails |
+| Step          | Notifies when it                       | Not when it                      |
+| ------------- | -------------------------------------- | -------------------------------- |
+| file          | prints `wrote DEST` or `fixed DEST: …` | prints `unchanged DEST`          |
+| dir           | prints `created DIR` or `fixed DIR: …` | prints `unchanged DIR`           |
+| link          | prints `linked …` or `relinked …`      | prints `unchanged PATH`          |
+| service       | prints any change line                 | prints `unchanged service NAME`  |
+| run or plugin | runs and exits 0                       | is skipped by a [guard](#config) |
+| any           |                                        | is skipped as no match, or fails |
 
 A change line is `started service NAME`, `stopped service NAME`, `enabled service NAME` or `disabled service NAME`.
-The package step never notifies, nor can it ask to. A file whose bytes are already right and whose mode alone anvil
-fixed prints `unchanged DEST` and does not notify: by design, a handler follows a change of content. A target without
+The package step never notifies, nor can it ask to. A file whose bytes are already right but whose owner, group or
+mode anvil fixed prints `fixed DEST: …` and notifies: a handler follows any change to the file, its owner, group and
+mode included. `unchanged DEST` means nothing changed at all.
+
+**A change from earlier anvil.** A mode-only fix used to print `unchanged DEST` and notify nothing. It now prints
+`fixed DEST: mode`, counts as changed (`"changed": true` in `--json`) and notifies, on every config, those without
+`owner` and `group` included. The first apply after upgrading therefore runs the handlers of any file whose mode had
+drifted. A target without
 `cmp` rewrites the file on every apply ([`[[files]]`](#files)), so its `notify` fires every time.
 
 **Order.** After the target's last step, and only when every step passed, its handlers run in `[[handlers]]` order,
@@ -1140,10 +1382,10 @@ that save runs it again on the next apply: write a handler that can run twice. A
 ends, so a crash between that end and the save can lose the notify; on the next apply a file or service step finds
 nothing to change and does not notify again. After such a crash, run the handler's command yourself.
 
-**Rollback.** [`anvil rollback`](cli.md#anvil-rollback) never runs a handler. For each file it put back (restored,
-removed or found unchanged), it adds the `notify` names of the file entries for that dest that apply to the target,
-matched with the facts the record saved, to the target's pending list, in `[[handlers]]` order, so the next apply
-reloads the service that reads the restored file.
+**Rollback.** [`anvil rollback`](cli.md#anvil-rollback) never runs a handler. For each file, dir or link it put back
+(restored, removed or found unchanged), it adds the `notify` names of the entries for that path that apply to the
+target, matched with the facts the record saved, to the target's pending list, in `[[handlers]]` order, so the next
+apply reloads the service that reads the restored file.
 
 **`restarted` and `reloaded`.** Two service states for handlers only; a `[[services]]` entry or `service` task with
 either is exit 2, since it would act on every apply. Both print one line: `restarted service NAME` or

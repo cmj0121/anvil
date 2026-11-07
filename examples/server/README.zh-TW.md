@@ -2,13 +2,20 @@
 
 [English](README.md) | 繁體中文
 
-維護一台遠端 host：升級、pin、移除、一個 `/etc` 下 root 擁有的檔案、一個執行中的服務、帶 guard 的 step，以及一個 handler。
+維護一台遠端 host：升級、pin、移除、一個設定目錄、`/etc` 下 root 擁有的檔案、一個執行中的服務、帶 guard 的 step，
+以及 handler。
 
 - `[packages]`：`upgrade = true` 先升級所有已安裝套件，`pin = ["vim"]` 在缺少時安裝 vim 並在該次升級中略過它，
   `remove = ["nano"]` 在已安裝時移除 nano。pin 只在 pacman 與 dnf 上有效；在 brew、apt 或 apk 上，任何 `pin`
   都會讓該 target 失敗（[鎖定與移除](../../docs/packages.zh-TW.md#鎖定與移除)）。
 - `[[files]]` 透過 sudo 把 `files/motd` 寫到 `/etc/motd`，`[[services]]` 讓 `sshd` 保持啟動並啟用。
   兩者都帶 `tags = ["linode"]`，也就是 `inventory.toml` 中 host `linode1` 的 tag，因此會略過其他所有 target。
+- `[[dirs]]` 以 `root:wheel 0750` 建立 `/etc/app/conf.d`，`parents = true` 會建立其上缺少的 `/etc/app`（0755）；
+  重跑時印出 `unchanged`，owner、group 或 mode 走樣時則印出 `fixed DIR: …`
+  （[Dirs](../../docs/configuration.zh-TW.md#dirs)）。它在 `[[files]]` 之前執行，所以 `app.conf` 寫入時目錄已經存在。
+- 第二個 `[[files]]` 項目以 `root:wheel 0640` 寫入 `files/app.conf`：root 寫入，`wheel`（Arch 內建的群組）中的管理員
+  可讀，其他人不可讀。內容相同而只有 owner、group 或 mode 不符時，它印出 `fixed /etc/app/conf.d/app.conf: …`，
+  並像寫入一樣通知 `log app config change`（[`owner` 與 `group`](../../docs/configuration.zh-TW.md#files)）。
 - 兩個 `[[steps]]` 帶有 [guard](../../docs/configuration.zh-TW.md#config)，重跑時不會再動它們：`/var/tmp/anvil-provisioned`
   存在後 `creates` 就略過第一個；`grep -qx 'managed by anvil' /var/tmp/anvil-note` 結束碼為 0 時 `unless` 就略過第二個。
   `[[steps]]` 不接受 tags，所以兩者在每個 target 上都會執行。

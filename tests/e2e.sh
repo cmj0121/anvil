@@ -356,7 +356,7 @@ else
   fail "apply --json with [packages]: exit $code"
 fi
 
-step "(l) [[files]] on arch (NOPASSWD): a sudo rename writes, keeps the owner, refuses a symlinked dest or a user-owned directory, an unmatched entry is skipped"
+step "(l) [[files]] on arch (NOPASSWD): a sudo rename writes, keeps the owner or sets owner and group, fixes them on the same bytes, parents creates missing directories, refuses a symlinked dest or a user-owned directory, an unmatched entry is skipped"
 # The probed distro: arch, or archarm on the arm64 image.
 REMOTE_DISTRO=$(docker exec "$NAME" sh -c '. /etc/os-release && printf %s "$ID"')
 FILES_DIR="$TMP/files"
@@ -494,6 +494,126 @@ if [ "$code" -eq 1 ] && grep -qxF '  $ file /home/key/anvil-e2e-root' "$TMP/out"
   pass "sudo refused a dest under key's home and wrote nothing"
 else
   fail "apply to a dest under a user-owned directory: exit $code"
+fi
+# owner and group: pw and its group are not key's, so only root can give them.
+PW_IDS=$(docker exec "$NAME" sh -c 'printf %s:%s "$(id -u pw)" "$(id -g pw)"')
+cat >"$FILES_DIR/attrs.toml" <<CONF
+[[files]]
+src = "managed.conf"
+dest = "/etc/anvil-e2e-attrs"
+mode = "0640"
+owner = "pw"
+group = "key"
+
+[[files]]
+src = "managed.conf"
+dest = "/etc/anvil-e2e-attrs-id"
+mode = "0640"
+owner = "${PW_IDS%:*}"
+group = "${PW_IDS#*:}"
+CONF
+docker exec "$NAME" sh -c 'printf old >/etc/anvil-e2e-attrs && chmod 644 /etc/anvil-e2e-attrs'
+anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/attrs.toml" apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  wrote /etc/anvil-e2e-attrs' "$TMP/out" \
+  && grep -qxF '  wrote /etc/anvil-e2e-attrs-id' "$TMP/out" \
+  && docker exec "$NAME" cat /etc/anvil-e2e-attrs | cmp -s - "$FILES_DIR/managed.conf" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-attrs)" = '640 pw:key' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-attrs-id)" = '640 pw:pw' ] \
+  && [ -z "$(docker exec "$NAME" sh -c 'ls -A /etc | grep "^\.anvil-"')" ]; then
+  pass "sudo gave a dest owner and group by name and by id"
+else
+  fail "apply with owner and group: exit $code"
+fi
+cat >"$FILES_DIR/attrs-bad.toml" <<CONF
+[[files]]
+src = "managed.conf"
+dest = "/etc/anvil-e2e-attrs"
+mode = "0600"
+owner = "anvil-e2e-nobody"
+CONF
+# Other bytes, so the write reaches the temp's chgrp.
+printf 'managed = "anvil-e2e-attrs"\n' >"$FILES_DIR/attrs.conf"
+cat >"$FILES_DIR/attrs-user.toml" <<CONF
+[[files]]
+src = "attrs.conf"
+dest = "/home/key/anvil-e2e-user"
+mode = "0600"
+sudo = false
+group = "pw"
+CONF
+cat >"$FILES_DIR/attrs-sudo.toml" <<CONF
+[[files]]
+src = "managed.conf"
+dest = "/home/key/anvil-e2e-user"
+mode = "0600"
+sudo = false
+owner = "pw"
+CONF
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/attrs-bad.toml" apply --target arch
+code=$?
+if [ "$code" -eq 1 ] \
+  && grep -qF 'files: owner anvil-e2e-nobody does not exist on the target' "$TMP/err" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-attrs)" = '640 pw:key' ]; then
+  pass "an owner unknown on arch failed the step, dest unchanged"
+else
+  fail "apply with an unknown owner: exit $code"
+fi
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/attrs-user.toml" apply --target arch
+code=$?
+if [ "$code" -eq 1 ] \
+  && grep -qF "files: group pw is not one of key's groups" "$TMP/err" \
+  && [ "$(docker exec "$NAME" stat -c '%U:%G' /home/key/anvil-e2e-user)" = 'key:key' ] \
+  && docker exec "$NAME" cat /home/key/anvil-e2e-user | cmp -s - "$FILES_DIR/managed.conf" \
+  && [ -z "$(docker exec "$NAME" sh -c 'ls -A /home/key | grep "^\.anvil-"')" ]; then
+  pass "sudo = false refused a group key is not in"
+else
+  fail "sudo = false apply with another group: exit $code"
+fi
+anvil --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/attrs-sudo.toml" apply --target arch
+code=$?
+if [ "$code" -eq 1 ] \
+  && grep -qF 'files[0].owner pw: needs sudo; the login user is key' "$TMP/out" "$TMP/err"; then
+  pass "sudo = false with another owner failed the target before any step"
+else
+  fail "sudo = false apply with another owner: exit $code"
+fi
+# The same bytes with another owner and group: fixed in place, no new file.
+docker exec "$NAME" chown root:root /etc/anvil-e2e-attrs
+INODE=$(docker exec "$NAME" stat -c %i /etc/anvil-e2e-attrs)
+anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/attrs.toml" apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  fixed /etc/anvil-e2e-attrs: owner, group' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-attrs-id' "$TMP/out" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G %i' /etc/anvil-e2e-attrs)" = "640 pw:key $INODE" ]; then
+  pass "sudo fixed the owner and group of the same bytes in place"
+else
+  fail "apply over the same bytes with another owner and group: exit $code"
+fi
+anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/attrs.toml" apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-attrs' "$TMP/out"; then
+  pass "a second apply found nothing to fix"
+else
+  fail "a second apply after the fix: exit $code"
+fi
+cat >"$FILES_DIR/parents.toml" <<CONF
+[[files]]
+src = "managed.conf"
+dest = "/etc/anvil-e2e-p/a/b/file"
+mode = "0644"
+parents = true
+CONF
+anvil -vv --inventory "$XDG/anvil/inventory.toml" --config "$FILES_DIR/parents.toml" apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  wrote /etc/anvil-e2e-p/a/b/file' "$TMP/out" \
+  && ! grep -qF 'anvil-sudo-' "$TMP/out" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-p /etc/anvil-e2e-p/a /etc/anvil-e2e-p/a/b)" \
+    = "$(printf '755 root:root\n755 root:root\n755 root:root')" ] \
+  && docker exec "$NAME" cat /etc/anvil-e2e-p/a/b/file | cmp -s - "$FILES_DIR/managed.conf"; then
+  pass "parents = true created each missing directory 0755 root:root, top down"
+else
+  fail "apply with parents = true: exit $code"
 fi
 # 1 MiB, the src limit: bash `sh -s` over ssh carries the text twice (D13).
 yes 'anvil e2e: one line of a 1 MiB text file' | head -c 1048576 >"$FILES_DIR/big.txt"
@@ -674,6 +794,169 @@ if [ "$code" -eq 0 ] && grep -qxF '  /etc/anvil-e2e-rb on arch (not world-readab
 else
   fail "rollback over a 0600 previous: exit $code"
 fi
+
+step "(o) rollback on arch puts back an owner and group fixed in place and removes the directories parents created"
+AR_STATE="$TMP/state-attrs"
+AR_RECORD="$AR_STATE/anvil/last-apply.json"
+AR_DIR="$TMP/rollback-attrs"
+mkdir -p "$AR_DIR"
+printf 'managed = "anvil-e2e-rb-attrs"\n' >"$AR_DIR/a.conf"
+cat >"$AR_DIR/config.toml" <<CONF
+[[files]]
+src = "a.conf"
+dest = "/etc/anvil-e2e-rb-attrs"
+mode = "0640"
+owner = "pw"
+group = "key"
+
+[[files]]
+src = "a.conf"
+dest = "/etc/anvil-e2e-rb-p/a/b/file"
+mode = "0644"
+parents = true
+CONF
+ar_anvil() {
+  run_env XDG_STATE_HOME="$AR_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$AR_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+# The bytes are already there, root:root 0640, so no text is kept: the apply
+# only fixes the owner and group.
+docker exec -i "$NAME" sh -c 'rm -rf /etc/anvil-e2e-rb-p && cat >/etc/anvil-e2e-rb-attrs \
+  && chown root:root /etc/anvil-e2e-rb-attrs && chmod 640 /etc/anvil-e2e-rb-attrs' <"$AR_DIR/a.conf"
+ar_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  fixed /etc/anvil-e2e-rb-attrs: owner, group' "$TMP/out" \
+  && grep -qxF '  wrote /etc/anvil-e2e-rb-p/a/b/file' "$TMP/out" \
+  && grep -qF '"version":2' "$AR_RECORD" \
+  && grep -qF '"created_dirs":["/etc/anvil-e2e-rb-p","/etc/anvil-e2e-rb-p/a","/etc/anvil-e2e-rb-p/a/b"]' "$AR_RECORD"; then
+  pass "apply recorded an owner and group fixed in place and the directories it created, record version 2"
+else
+  fail "apply to record attrs and created directories: exit $code"
+fi
+ar_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  restored owner, group and mode of /etc/anvil-e2e-rb-attrs' "$TMP/out" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-rb-attrs)" = '640 root:root' ] \
+  && docker exec "$NAME" cat /etc/anvil-e2e-rb-attrs | cmp -s - "$AR_DIR/a.conf" \
+  && [ "$(grep -F 'removed directory /etc/anvil-e2e-rb-p' "$TMP/out")" = "$(printf '%s\n' \
+    '  removed directory /etc/anvil-e2e-rb-p/a/b' '  removed directory /etc/anvil-e2e-rb-p/a' \
+    '  removed directory /etc/anvil-e2e-rb-p')" ] \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-rb-p && ! grep -qF 'not restored' "$TMP/out"; then
+  pass "rollback gave the 0640 file back root:root without its text and removed the created directories deepest first"
+else
+  fail "rollback of attrs and created directories: exit $code"
+fi
+
+step "(v) [[dirs]], [[files]] and [[links]] on arch (NOPASSWD): a dir, a file in it and links to it; a relink over a link to a directory and a forced file; rollback undoes them all"
+DL_STATE="$TMP/state-links"
+DL_RECORD="$DL_STATE/anvil/last-apply.json"
+DL_DIR="$TMP/links"
+mkdir -p "$DL_DIR"
+printf 'managed = "anvil-e2e-dl"\n' >"$DL_DIR/app.conf"
+cat >"$DL_DIR/config.toml" <<CONF
+[[dirs]]
+path = "/etc/anvil-e2e-dl"
+mode = "0750"
+group = "key"
+
+[[files]]
+src = "app.conf"
+dest = "/etc/anvil-e2e-dl/app.conf"
+mode = "0640"
+group = "key"
+
+[[links]]
+path = "/etc/anvil-e2e-dl-link"
+target = "/etc/anvil-e2e-dl"
+
+[[links]]
+path = "/etc/anvil-e2e-dl-moved"
+target = "/etc/anvil-e2e-dl"
+
+[[links]]
+path = "/etc/anvil-e2e-dl-file"
+target = "anvil-e2e-dl/app.conf"
+force = true
+CONF
+dl_anvil() {
+  run_env XDG_STATE_HOME="$DL_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$DL_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+# Before: a link to the directory -old, which a plain mv -f would move the
+# new link into, and a regular file the forced link replaces.
+docker exec "$NAME" sh -c 'rm -rf /etc/anvil-e2e-dl /etc/anvil-e2e-dl-old /etc/anvil-e2e-dl-link \
+  /etc/anvil-e2e-dl-moved /etc/anvil-e2e-dl-file && mkdir /etc/anvil-e2e-dl-old \
+  && ln -s /etc/anvil-e2e-dl-old /etc/anvil-e2e-dl-moved \
+  && printf "old file\n" >/etc/anvil-e2e-dl-file && chmod 644 /etc/anvil-e2e-dl-file'
+dl_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  created /etc/anvil-e2e-dl' "$TMP/out" \
+  && grep -qxF '  wrote /etc/anvil-e2e-dl/app.conf' "$TMP/out" \
+  && grep -qxF '  linked /etc/anvil-e2e-dl-link -> /etc/anvil-e2e-dl' "$TMP/out" \
+  && grep -qxF '  relinked /etc/anvil-e2e-dl-moved -> /etc/anvil-e2e-dl' "$TMP/out" \
+  && grep -qxF '  linked /etc/anvil-e2e-dl-file -> anvil-e2e-dl/app.conf' "$TMP/out" \
+  && ! grep -qF 'not replaced atomically' "$TMP/out" "$TMP/err" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' /etc/anvil-e2e-dl)" = '750 root:key' ] \
+  && [ "$(docker exec "$NAME" readlink /etc/anvil-e2e-dl-moved)" = /etc/anvil-e2e-dl ] \
+  && [ "$(docker exec "$NAME" readlink /etc/anvil-e2e-dl-file)" = anvil-e2e-dl/app.conf ] \
+  && [ -z "$(docker exec "$NAME" ls -A /etc/anvil-e2e-dl-old)" ] \
+  && [ -z "$(docker exec "$NAME" sh -c 'ls -A /etc | grep "^\.anvil-"')" ] \
+  && docker exec "$NAME" cat /etc/anvil-e2e-dl-file | cmp -s - "$DL_DIR/app.conf" \
+  && grep -qF '"links":[' "$DL_RECORD" && grep -qF '"version":2' "$DL_RECORD"; then
+  pass "apply created the dir, wrote the file in it, linked, relinked over a link to a directory without moving into it, replaced the forced file"
+else
+  fail "apply of dirs, files and links: exit $code"
+fi
+dl_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-dl' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-dl/app.conf' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-dl-link' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-dl-moved' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-dl-file' "$TMP/out"; then
+  pass "a second apply is unchanged everywhere"
+else
+  fail "second apply of dirs, files and links: exit $code"
+fi
+dl_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  restored /etc/anvil-e2e-dl-file' "$TMP/out" \
+  && grep -qxF '  restored link /etc/anvil-e2e-dl-moved -> /etc/anvil-e2e-dl-old' "$TMP/out" \
+  && grep -qxF '  removed link /etc/anvil-e2e-dl-link' "$TMP/out" \
+  && grep -qxF '  removed /etc/anvil-e2e-dl/app.conf' "$TMP/out" \
+  && grep -qxF '  removed directory /etc/anvil-e2e-dl' "$TMP/out" \
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-dl-file)" = 'old file' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G %F' /etc/anvil-e2e-dl-file)" = '644 root:root regular file' ] \
+  && [ "$(docker exec "$NAME" readlink /etc/anvil-e2e-dl-moved)" = /etc/anvil-e2e-dl-old ] \
+  && [ -z "$(docker exec "$NAME" ls -A /etc/anvil-e2e-dl-old)" ] \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-dl-link && ! docker exec "$NAME" test -L /etc/anvil-e2e-dl-link \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-dl; then
+  pass "rollback restored the forced file, pointed the relinked link back, removed the new link, the file and the dir"
+else
+  fail "rollback of dirs, files and links: exit $code"
+fi
+dl_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-dl-file' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-dl-moved' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-dl-link' "$TMP/out"; then
+  pass "a second rollback of the links is unchanged"
+else
+  fail "second rollback of dirs, files and links: exit $code"
+fi
+# A link whose old target is not UTF-8 would not survive the record: refused, left as is.
+docker exec "$NAME" sh -c 'ln -s "$(printf "/w/\377")" /etc/anvil-e2e-dl-link'
+dl_anvil apply --target arch
+code=$?
+if [ "$code" -eq 1 ] \
+  && grep -qF 'links: /etc/anvil-e2e-dl-link points at a target anvil cannot record; anvil will not replace it' "$TMP/err" \
+  && [ "$(docker exec "$NAME" readlink /etc/anvil-e2e-dl-link | od -An -tx1 | tr -d ' \n')" = 2f772fff0a ]; then
+  pass "a link to a target that is not UTF-8 is refused and left as it is"
+else
+  fail "apply over a link to a non-UTF-8 target: exit $code"
+  docker exec "$NAME" readlink /etc/anvil-e2e-dl-link | od -c
+fi
+docker exec "$NAME" rm -f /etc/anvil-e2e-dl-link
 
 step "(u) a timed-out plain run dies on arch, without timeout(1) there; a step reading stdin ends at once"
 U_DIR="$TMP/remote-kill"

@@ -6,14 +6,14 @@
 
 anvil 是一個安全、單一執行檔的 Rust 工具，為人與 agent 設定本機與遠端 host。
 它是 agentless 的：target 只需要 POSIX `sh`，遠端 host 則透過系統的 OpenSSH 用戶端連線。
-inventory 說明在哪裡（各 host），config 說明做什麼（套件、檔案、服務、步驟），兩者皆以 TOML 存放於
+inventory 說明在哪裡（各 host），config 說明做什麼（套件、目錄、檔案、連結、服務、步驟），兩者皆以 TOML 存放於
 `$XDG_CONFIG_HOME/anvil` 或 `~/.config/anvil`。
 
 ## 運作方式
 
-- apply 預設在每個 target 上依固定順序進行：先套件，再檔案，再服務，最後步驟。
+- apply 預設在每個 target 上依固定順序進行：先套件，再目錄、檔案、連結、服務，最後步驟。
   有序的 [`[[tasks]]`](docs/configuration.zh-TW.md#tasks) 清單可巢狀並以 `$/` include，改依你寫的順序執行。
-- rollback 只還原檔案；套件、服務與步驟無法復原。其他人無法讀取的檔案在紀錄中只保存雜湊，因此 apply 會警告，
+- rollback 只還原檔案、目錄與連結；套件、服務與步驟無法復原。其他人無法讀取的檔案在紀錄中只保存雜湊，因此 apply 會警告，
   rollback 會指名它而不還原。
 - 還沒有任何檔案時，inventory 只有 `local`，config 執行 `hostname`，因此 `doctor` 與 `apply` 已可通過。
 
@@ -30,7 +30,7 @@ make build                 # or: builds target/release/anvil
 
 ```sh
 anvil inventory            # edit the hosts (opens $EDITOR)
-anvil config               # edit the packages, files, services and steps
+anvil config               # edit the packages, dirs, files, links, services and steps
 anvil config --harden      # the Linux hardening the config lacks, as a diff; --write adds it
 anvil files cp motd '$/'   # keep a file in the store, for [[files]] src = "$/motd"
 anvil secret NAME          # store a secret
@@ -53,7 +53,7 @@ anvil update               # replace the binary with the latest signed release
 ## 特色
 
 - 支援 brew、pacman、apt、dnf 與 apk 的套件，含各管理器別名、pin 與 remove（[套件](docs/packages.zh-TW.md)）。
-- 檔案、服務與步驟，各自依 tags 與 facts 比對每個 target（[設定](docs/configuration.zh-TW.md)）。
+- 目錄、檔案、連結、服務與步驟，各自依 tags 與 facts 比對每個 target（[設定](docs/configuration.zh-TW.md)）。
 - 全域、每個 tag 或每個 host 的 vars 與 env；步驟取得 env，設定 `template = true` 的檔案以 MiniJinja 為每個 target 算繪
   （[Vars 與 env](docs/configuration.zh-TW.md#vars-與-env)、[Templating](docs/configuration.zh-TW.md#templating)）。
 - plugin 產生步驟的腳本；drift 是 doctor plugin，而非指令

@@ -89,7 +89,7 @@ impl Prepared {
     }
 
     /// Rollback's: the passwords of the targets whose entry in `session`'s
-    /// record wrote a file through sudo.
+    /// record wrote a file or stepped on a directory or link through sudo.
     pub fn rollback(
         opts: &Options,
         config: Config,
@@ -101,8 +101,11 @@ impl Prepared {
         let names = targets
             .iter()
             .filter(|target| {
-                (session.record().targets.get(&target.name))
-                    .is_some_and(|entry| entry.files.iter().any(|file| file.sudo))
+                (session.record().targets.get(&target.name)).is_some_and(|entry| {
+                    entry.files.iter().any(|file| file.sudo)
+                        || entry.dirs.iter().any(|dir| dir.sudo)
+                        || entry.links.iter().any(|link| link.sudo)
+                })
             })
             .filter_map(|target| files::sudo_secret_for(&config, target))
             .collect();

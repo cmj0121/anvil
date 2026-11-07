@@ -1486,7 +1486,10 @@ fn apply_records_what_each_target_held_before_it_wrote() {
         "no step script, nor the bytes written: {raw}"
     );
     let record = sandbox.last_apply().unwrap();
-    assert_eq!(record["version"], 1);
+    assert_eq!(
+        record["version"], 1,
+        "the attrs written alone stay version 1"
+    );
     let uid = std::fs::metadata(&local).unwrap().uid();
     let gid = std::fs::metadata(&local).unwrap().gid();
     let written = sha256_hex(FILE_TEXT);
@@ -1501,6 +1504,7 @@ fn apply_records_what_each_target_held_before_it_wrote() {
             "written_sha256": written, "write": "written",
             "previous": {"state": "file", "mode": "0644", "uid": uid, "gid": gid,
                          "sha256": sha256_hex(PREVIOUS), "kept": true, "text": PREVIOUS},
+            "written_attrs": {"uid": uid, "gid": gid, "mode": "0640"},
         }])
     );
     assert_eq!(
@@ -2987,4 +2991,959 @@ fn drop_pending_whose_save_fails_is_exit_1_before_any_target() {
     );
     assert!(handled(&sandbox, "local").is_empty());
     assert_eq!(pending(&sandbox, "local"), serde_json::json!(["flush"]));
+}
+
+/// `id FLAG` of the user running the tests.
+fn id(flag: &str) -> String {
+    text(&Command::new("id").arg(flag).output().unwrap().stdout)
+        .trim_end()
+        .to_owned()
+}
+
+/// A config copying "motd\n" to each of `dests`, as `(dest, tag, extra keys)`,
+/// on the fake host tagged `web` and local, with `sudo = false` unless the
+/// keys say otherwise.
+fn with_owned_files(sandbox: &Sandbox, dests: &[(&Path, &str, &str)]) {
+    sandbox.write_config(
+        "inventory.toml",
+        "[hosts.fake]\nhost = \"fakehost\"\ntags = [\"web\"]\n",
+    );
+    std::fs::write(sandbox.config_dir().join("motd.txt"), "motd\n").unwrap();
+    let entries: String = dests
+        .iter()
+        .map(|(dest, tag, keys)| {
+            let sudo = if keys.contains("sudo =") {
+                ""
+            } else {
+                "sudo = false\n"
+            };
+            format!(
+                "[[files]]\nsrc = \"motd.txt\"\ndest = \"{}\"\nmode = \"0640\"\n\
+                 tags = [\"{tag}\"]\n{sudo}{keys}\n",
+                dest.display()
+            )
+        })
+        .collect();
+    sandbox.write_config(
+        "config.toml",
+        &format!("{entries}[[steps]]\nrun = \"echo after\"\n"),
+    );
+}
+
+fn ids_of(path: &Path) -> (String, String) {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::metadata(path).unwrap();
+    (meta.uid().to_string(), meta.gid().to_string())
+}
+
+#[test]
+fn an_owner_and_group_by_name_and_by_id_reach_dest_on_local_and_the_fake_host() {
+    let sandbox = Sandbox::new("ao");
+    sandbox.with_fake_host();
+    let (user, uid, group, gid) = (id("-un"), id("-u"), id("-gn"), id("-g"));
+    let out = sandbox.root().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let dests: Vec<PathBuf> = ["l-name", "l-id", "w-name", "w-id"]
+        .iter()
+        .map(|name| out.join(name))
+        .collect();
+    let by_name = format!("owner = \"{user}\"\ngroup = \"{group}\"\n");
+    let by_id = format!("owner = \"{uid}\"\ngroup = \"{gid}\"\n");
+    with_owned_files(
+        &sandbox,
+        &[
+            (&dests[0], "local", &by_name),
+            (&dests[1], "local", &by_id),
+            (&dests[2], "web", &by_name),
+            (&dests[3], "web", &by_id),
+        ],
+    );
+    let run = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(run.status.code(), Some(0), "{}", text(&run.stdout));
+    for dest in &dests {
+        assert_eq!(std::fs::read_to_string(dest).unwrap(), "motd\n");
+        assert_eq!(
+            ids_of(dest),
+            (uid.clone(), gid.clone()),
+            "{}",
+            dest.display()
+        );
+        assert_eq!(common::mode(dest) & 0o7777, 0o640);
+    }
+    let left: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".anvil-"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn sudo_false_with_another_owner_fails_that_target_before_any_change() {
+    if id("-u") == "0" {
+        eprintln!("skip: a root login ignores sudo");
+        return;
+    }
+    let sandbox = Sandbox::new("ao");
+    let (local, web) = (sandbox.root().join("local"), sandbox.root().join("web"));
+    std::fs::write(&local, "old\n").unwrap();
+    with_owned_files(
+        &sandbox,
+        &[
+            (&local, "local", "owner = \"anvil-other\"\n"),
+            (&web, "web", ""),
+        ],
+    );
+    let out = sandbox.anvil(&["-vv", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    let user = id("-un");
+    assert!(
+        stdout.starts_with(&format!(
+            "▶ local\n  ✘ files[0].owner anvil-other: needs sudo; the login user is {user}\n"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.ends_with("1 ok, 1 failed\n"),
+        "the fake host runs: {stdout}"
+    );
+    assert!(
+        !stdout.contains("▶ local\n  $"),
+        "no step ran on local: {stdout}"
+    );
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), "old\n");
+    assert_eq!(std::fs::read_to_string(&web).unwrap(), "motd\n");
+}
+
+/// A `sudo` needing no password that runs everything as the user, letting
+/// each directory pass as root-only as [`common::FAKE_SUDO`] does; returns
+/// a `PATH` with it first.
+fn nopasswd_sudo(sandbox: &Sandbox) -> String {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = sandbox.root().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(
+        bin.join("sudo"),
+        "#!/bin/sh\ncase $1 in -n) shift ;; esac\n\
+         case $1 in find) printf '%s\\n' \"$2\"; exit 0 ;; esac\nexec \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("sudo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
+}
+
+#[test]
+fn an_unknown_owner_or_group_fails_the_step_and_leaves_dest_unchanged() {
+    let sandbox = Sandbox::new("ao");
+    let path = nopasswd_sudo(&sandbox);
+    let dest = sandbox.root().join("conf");
+    let user = id("-un");
+    let cases = [
+        (
+            "sudo = true\nowner = \"anvil-no-such-user\"\n",
+            "files: owner anvil-no-such-user does not exist on the target".to_owned(),
+        ),
+        (
+            "group = \"anvil-no-such-group\"\n",
+            format!("files: group anvil-no-such-group is not one of {user}'s groups"),
+        ),
+        (
+            "sudo = true\ngroup = \"anvil-no-such-group\"\n",
+            "files: group anvil-no-such-group does not exist on the target".to_owned(),
+        ),
+    ];
+    for (keys, wording) in cases {
+        std::fs::write(&dest, "old\n").unwrap();
+        with_owned_files(&sandbox, &[(&dest, "local", keys)]);
+        let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
+        command.args(["--secret-store", "memory", "apply", "--target", "local"]);
+        let out = command.env("PATH", &path).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{keys}{}", text(&out.stdout));
+        let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+        assert!(shown.contains(&wording), "{keys}{shown}");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "old\n", "{keys}");
+        let left: Vec<_> = std::fs::read_dir(sandbox.root())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".anvil-"))
+            .collect();
+        assert!(left.is_empty(), "{keys}{left:?}");
+    }
+}
+
+#[test]
+fn a_pending_group_refuses_the_in_place_write_of_an_unwritable_directory() {
+    if id("-u") == "0" {
+        eprintln!("skip: root writes any directory");
+        return;
+    }
+    let sandbox = Sandbox::new("ao");
+    let dir = sandbox.root().join("ro");
+    std::fs::create_dir(&dir).unwrap();
+    let dest = dir.join("conf");
+    std::fs::write(&dest, "old\n").unwrap();
+    with_owned_files(
+        &sandbox,
+        &[(&dest, "local", &format!("group = \"{}\"\n", id("-g")))],
+    );
+    common::chmod(&dir, 0o555);
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    common::chmod(&dir, 0o755);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        shown.contains(&format!(
+            "files: {}: owner and group need an atomic write: its directory is not writable",
+            dest.display()
+        )),
+        "{shown}"
+    );
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "old\n");
+}
+
+#[test]
+fn an_owner_and_group_reach_dest_on_the_password_path() {
+    if !common::have_script() {
+        eprintln!("skip: no script(1) for fake-ssh -tt");
+        return;
+    }
+    let (sandbox, secrets, path) = common::sudo_sandbox("ao");
+    std::fs::write(sandbox.config_dir().join("motd.txt"), "motd\n").unwrap();
+    let dest = sandbox.root().join("pw.conf");
+    let (uid, gid) = (id("-u"), id("-g"));
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{secrets}[[files]]\nsrc = \"motd.txt\"\ndest = \"{}\"\nmode = \"0640\"\n\
+             owner = \"{uid}\"\ngroup = \"{gid}\"\n",
+            dest.display()
+        ),
+    );
+    let sudo_log = sandbox.root().join("sudo.log");
+    let out = sandbox
+        .command(env!("CARGO_BIN_EXE_anvil"))
+        .arg("--ssh-program")
+        .arg(common::fixture("fake-ssh.sh"))
+        .args(["apply", "--target", "fake"])
+        .env("PATH", &path)
+        .env("FAKE_SUDO_LOG", &sudo_log)
+        .env("FAKE_SUDO_PW", common::VALUE)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "motd\n");
+    assert_eq!(ids_of(&dest), (uid.clone(), gid.clone()));
+    let sudo = std::fs::read_to_string(&sudo_log).unwrap();
+    let at = |what: &str| {
+        sudo.find(&format!("\n{what}"))
+            .unwrap_or_else(|| panic!("no {what}: {sudo}"))
+    };
+    assert!(
+        at(&format!("chown {uid} ")) < at(&format!("chgrp {gid} ")),
+        "{sudo}"
+    );
+    assert!(at(&format!("chgrp {gid} ")) < at("tee "), "{sudo}");
+}
+
+#[test]
+fn a_mode_drift_is_fixed_and_notifies_and_unchanged_does_not() {
+    let sandbox = Sandbox::new("af");
+    let root = sandbox.root().display().to_string();
+    with_handlers(&sandbox, "");
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(handled(&sandbox, "local"), ["flush"]);
+    let dest = sandbox.root().join("out/local.conf");
+    common::chmod(&dest, 0o600);
+    let before = std::fs::metadata(&dest).unwrap();
+
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let target = &value["targets"][0];
+    let step = &target["steps"][1];
+    assert_eq!(step["changed"], true, "{target}");
+    assert_eq!(
+        step["stdout"],
+        format!("fixed {root}/out/local.conf: mode\n"),
+        "{target}"
+    );
+    assert_eq!(common::mode(&dest) & 0o7777, 0o644);
+    assert_eq!(handled(&sandbox, "local"), ["flush", "flush"]);
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        std::fs::metadata(&dest).unwrap().ino(),
+        before.ino(),
+        "fixed in place, no new file"
+    );
+
+    let out = sandbox.anvil(&["-vv", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(&format!("unchanged {root}/out/local.conf\n")),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("handler flush"), "{stdout}");
+    assert_eq!(handled(&sandbox, "local"), ["flush", "flush"]);
+}
+
+#[test]
+fn a_fix_that_does_not_take_fails_the_step_and_does_not_notify() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new("af");
+    let root = sandbox.root().display().to_string();
+    with_handlers(&sandbox, "");
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let dest = sandbox.root().join("out/local.conf");
+    common::chmod(&dest, 0o600);
+    let bin = sandbox.root().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(bin.join("chmod"), "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(bin.join("chmod"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
+    command.args(["apply", "--target", "local"]);
+    let out = command.env("PATH", &path).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let (uid, gid) = ids_of(&dest);
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        shown.contains(&format!(
+            "files: {root}/out/local.conf: owner, group or mode did not take (now {uid}:{gid} 0600)"
+        )),
+        "{shown}"
+    );
+    assert_eq!(handled(&sandbox, "local"), ["flush"], "no notify");
+}
+
+#[test]
+fn a_group_only_difference_is_fixed_with_the_same_bytes() {
+    let sandbox = Sandbox::new("af");
+    let dest = sandbox.root().join("conf");
+    std::fs::write(&dest, "motd\n").unwrap();
+    common::chmod(&dest, 0o640);
+    let (_, was) = ids_of(&dest);
+    let Some(other) = id("-G")
+        .split(' ')
+        .find(|gid| *gid != was)
+        .map(str::to_owned)
+    else {
+        eprintln!("skip: the user is in one group only");
+        return;
+    };
+    with_owned_files(
+        &sandbox,
+        &[(&dest, "local", &format!("group = \"{other}\"\n"))],
+    );
+    let out = sandbox.anvil(&["-vv", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(&format!("fixed {}: group\n", dest.display())),
+        "{stdout}"
+    );
+    assert_eq!(ids_of(&dest).1, other);
+    assert_eq!(common::mode(&dest) & 0o7777, 0o640);
+    let out = sandbox.anvil(&["-vv", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stdout).contains(&format!("unchanged {}\n", dest.display())),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn a_user_write_cannot_give_the_same_bytes_a_group_it_is_not_in() {
+    if id("-u") == "0" {
+        eprintln!("skip: root may give any group");
+        return;
+    }
+    let sandbox = Sandbox::new("af");
+    let dest = sandbox.root().join("conf");
+    std::fs::write(&dest, "motd\n").unwrap();
+    common::chmod(&dest, 0o644);
+    let mine: Vec<String> = id("-G").split(' ').map(str::to_owned).collect();
+    let (_, was) = ids_of(&dest);
+    let Some(foreign) = (0..100u32)
+        .map(|gid| gid.to_string())
+        .find(|gid| !mine.contains(gid) && *gid != was)
+    else {
+        eprintln!("skip: no group outside the user's");
+        return;
+    };
+    with_owned_files(
+        &sandbox,
+        &[(&dest, "local", &format!("group = \"{foreign}\"\n"))],
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        shown.contains(&format!(
+            "files: group {foreign} is not one of {}'s groups",
+            id("-un")
+        )),
+        "{shown}"
+    );
+    assert_eq!(
+        common::mode(&dest) & 0o7777,
+        0o644,
+        "the narrowed mode is put back"
+    );
+}
+
+#[test]
+fn parents_creates_missing_directories_0755_top_down_on_local_and_the_fake_host() {
+    let sandbox = Sandbox::new("ap");
+    let path = nopasswd_sudo(&sandbox);
+    let out = sandbox.root().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let (local, web, root) = (
+        out.join("l/a/b/motd"),
+        out.join("w/a/b/motd"),
+        out.join("r/a/motd"),
+    );
+    with_owned_files(
+        &sandbox,
+        &[
+            (&local, "local", "parents = true\n"),
+            (&web, "web", "parents = true\n"),
+            (&root, "local", "sudo = true\nparents = true\n"),
+        ],
+    );
+    let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
+    command.args(["--secret-store", "memory", "--ssh-program"]);
+    command.arg(common::fixture("fake-ssh.sh"));
+    let run = command
+        .args(["--json", "apply"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
+    for dest in [&local, &web, &root] {
+        assert_eq!(std::fs::read_to_string(dest).unwrap(), "motd\n");
+        let mut dir = dest.parent().unwrap();
+        while dir != out {
+            assert_eq!(common::mode(dir) & 0o7777, 0o755, "{}", dir.display());
+            dir = dir.parent().unwrap();
+        }
+    }
+    let shown = text(&run.stdout);
+    assert!(!shown.contains("anvil-sudo-"), "{shown}");
+    assert!(!shown.contains(" created "), "{shown}");
+    for target in json(&run)["targets"].as_array().unwrap() {
+        for step in target["steps"].as_array().unwrap() {
+            if step["run"].as_str().unwrap().starts_with("file ") {
+                assert_eq!(step["changed"], true, "{step}");
+                assert!(
+                    step["stdout"].as_str().unwrap().starts_with("wrote "),
+                    "{step}"
+                );
+            }
+        }
+    }
+
+    let created = |dest: &Path, top: &str| {
+        let mut dirs: Vec<String> = dest
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| dir.starts_with(out.join(top)))
+            .map(|dir| dir.display().to_string())
+            .collect();
+        dirs.reverse();
+        serde_json::json!(dirs)
+    };
+    let recorded = |record: &serde_json::Value| {
+        let files = |target: &str| record["targets"][target]["files"].clone();
+        let (local_files, web_files) = (files("local"), files("fake"));
+        assert_eq!(local_files[0]["created_dirs"], created(&local, "l"));
+        assert_eq!(local_files[1]["created_dirs"], created(&root, "r"));
+        assert_eq!(web_files[0]["created_dirs"], created(&web, "w"));
+        assert_eq!(local_files[0]["written_attrs"]["mode"], "0640");
+    };
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["version"], 2);
+    recorded(&record);
+    assert!(!shown.contains("anvil-attrs-"), "{shown}");
+
+    let again = sandbox.anvil(&["apply"], &[("PATH", path.as_str())]);
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again.stdout));
+    assert!(!text(&again.stdout).contains("anvil-sudo-"));
+    // An unchanged rerun keeps the dirs the first apply created.
+    recorded(&sandbox.last_apply().unwrap());
+}
+
+#[test]
+fn parents_refuses_under_a_group_writable_directory_and_creates_nothing() {
+    let sandbox = Sandbox::new("ap");
+    let open = sandbox.root().join("open");
+    std::fs::create_dir(&open).unwrap();
+    common::chmod(&open, 0o775);
+    let dest = open.join("a/motd");
+    with_owned_files(&sandbox, &[(&dest, "local", "parents = true\n")]);
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        shown.contains(&format!(
+            "files: {} is not owned by root or the login user",
+            open.display()
+        )),
+        "{shown}"
+    );
+    assert!(!open.join("a").exists());
+}
+
+#[test]
+fn without_parents_a_missing_directory_fails_the_step_on_local_and_the_fake_host() {
+    let sandbox = Sandbox::new("ap");
+    let (local, web) = (sandbox.root().join("l/motd"), sandbox.root().join("w/motd"));
+    with_owned_files(&sandbox, &[(&local, "local", ""), (&web, "web", "")]);
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let mut failed: Vec<String> = json(&out)["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|target| target["steps"].as_array().unwrap().clone())
+        .filter(|step| step["code"] != 0)
+        .map(|step| step["stderr"].as_str().unwrap().to_owned())
+        .collect();
+    failed.sort();
+    let message = |dir: &str| {
+        format!(
+            "files: {} does not exist; set parents = true to create it\n",
+            sandbox.root().join(dir).display()
+        )
+    };
+    assert_eq!(failed, [message("l"), message("w")]);
+    assert!(!sandbox.root().join("l").exists() && !sandbox.root().join("w").exists());
+}
+
+/// A config with one `[[dirs]]` entry per `(path, tag, extra keys)`, mode
+/// 0750 and `sudo = false` unless the keys say otherwise, each notifying
+/// handler `log`, which appends `log` to `<root>/<tag>.log`; the fake host
+/// is tagged `web`.
+fn with_dirs(sandbox: &Sandbox, dirs: &[(&Path, &str, &str)]) {
+    sandbox.write_config(
+        "inventory.toml",
+        "[hosts.fake]\nhost = \"fakehost\"\ntags = [\"web\"]\n",
+    );
+    let root = sandbox.root().display().to_string();
+    let entries: String = dirs
+        .iter()
+        .map(|(path, tag, keys)| {
+            let sudo = if keys.contains("sudo =") {
+                ""
+            } else {
+                "sudo = false\n"
+            };
+            format!(
+                "[[dirs]]\npath = \"{}\"\nmode = \"0750\"\ntags = [\"{tag}\"]\n\
+                 notify = [\"log\"]\n{sudo}{keys}\n",
+                path.display()
+            )
+        })
+        .collect();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{entries}[[handlers]]\nname = \"log\"\nrun = 'echo log >> {root}/\"$(hostname)\".log'\n"
+        ),
+    );
+}
+
+/// The lines the `log` handler of [`with_dirs`] appended, on any target.
+fn logged(sandbox: &Sandbox) -> usize {
+    std::fs::read_dir(sandbox.root())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".log"))
+        .map(|entry| {
+            std::fs::read_to_string(entry.path())
+                .unwrap()
+                .lines()
+                .count()
+        })
+        .sum()
+}
+
+#[test]
+fn a_dir_is_created_then_fixed_then_left_unchanged_and_only_changes_notify() {
+    let sandbox = Sandbox::new("ad");
+    let path = sandbox.root().join("app");
+    with_dirs(&sandbox, &[(&path, "local", "")]);
+    let shown = path.display().to_string();
+    let step = |out: &std::process::Output| {
+        let value = json(out);
+        let steps = value["targets"][0]["steps"].as_array().unwrap().clone();
+        assert_eq!(steps[0]["run"], format!("dir {shown}"), "{value}");
+        steps[0].clone()
+    };
+
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let first = step(&out);
+    assert_eq!(first["stdout"], format!("created {shown}\n"));
+    assert_eq!(first["changed"], true);
+    assert_eq!(common::mode(&path) & 0o7777, 0o750);
+    assert_eq!(logged(&sandbox), 1);
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["version"], 2);
+    let dirs = &record["targets"]["local"]["dirs"];
+    assert_eq!(dirs[0]["path"], shown);
+    assert_eq!(dirs[0]["previous"], serde_json::Value::Null);
+    assert_eq!(dirs[0]["written_attrs"]["mode"], "0750");
+    assert!(!text(&out.stdout).contains("anvil-attrs-"));
+
+    common::chmod(&path, 0o700);
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let fixed = step(&out);
+    assert_eq!(fixed["stdout"], format!("fixed {shown}: mode\n"));
+    assert_eq!(fixed["changed"], true);
+    assert_eq!(common::mode(&path) & 0o7777, 0o750);
+    assert_eq!(logged(&sandbox), 2);
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["dirs"][0]["previous"]["mode"],
+        "0700"
+    );
+
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let unchanged = step(&out);
+    assert_eq!(unchanged["stdout"], format!("unchanged {shown}\n"));
+    assert_eq!(unchanged["changed"], false);
+    assert_eq!(logged(&sandbox), 2, "unchanged does not notify");
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["dirs"][0]["previous"]["mode"], "0700",
+        "an unchanged run keeps what the fix found"
+    );
+}
+
+#[test]
+fn a_file_at_a_dirs_path_fails_the_step_and_is_left_alone_on_local_and_the_fake_host() {
+    let sandbox = Sandbox::new("ad");
+    let (local, web) = (sandbox.root().join("l"), sandbox.root().join("w"));
+    for path in [&local, &web] {
+        std::fs::write(path, "keep\n").unwrap();
+        common::chmod(path, 0o600);
+    }
+    with_dirs(&sandbox, &[(&local, "local", ""), (&web, "web", "")]);
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let mut failed: Vec<String> = json(&out)["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|target| target["steps"].as_array().unwrap().clone())
+        .filter(|step| step["code"] != 0)
+        .map(|step| step["stderr"].as_str().unwrap().to_owned())
+        .collect();
+    failed.sort();
+    let message = |path: &Path| format!("dirs: {} is not a directory\n", path.display());
+    assert_eq!(failed, [message(&local), message(&web)]);
+    for path in [&local, &web] {
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "keep\n");
+        assert_eq!(common::mode(path) & 0o7777, 0o600);
+    }
+    assert_eq!(logged(&sandbox), 0);
+}
+
+#[test]
+fn a_dir_with_parents_creates_whats_missing_above_and_without_it_fails() {
+    let sandbox = Sandbox::new("ad");
+    let (plain, deep) = (sandbox.root().join("p/app"), sandbox.root().join("q/a/app"));
+    with_dirs(
+        &sandbox,
+        &[(&plain, "local", ""), (&deep, "local", "parents = true\n")],
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let value = json(&out);
+    let steps = value["targets"][0]["steps"].as_array().unwrap();
+    assert_eq!(
+        steps[0]["stderr"],
+        format!(
+            "dirs: {} does not exist; set parents = true to create it\n",
+            sandbox.root().join("p").display()
+        )
+    );
+    assert!(!sandbox.root().join("p").exists());
+
+    // The dir with parents comes second: drop the first.
+    with_dirs(&sandbox, &[(&deep, "local", "parents = true\n")]);
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][0]["stdout"],
+        format!("created {}\n", deep.display())
+    );
+    for dir in [sandbox.root().join("q"), sandbox.root().join("q/a")] {
+        assert_eq!(common::mode(&dir) & 0o7777, 0o755, "{}", dir.display());
+    }
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["dirs"][0]["created_dirs"],
+        serde_json::json!([
+            sandbox.root().join("q").display().to_string(),
+            sandbox.root().join("q/a").display().to_string()
+        ])
+    );
+}
+
+#[test]
+fn a_dir_with_sudo_false_and_another_owner_fails_that_target_before_any_change() {
+    if id("-u") == "0" {
+        eprintln!("skip: root may give any owner");
+        return;
+    }
+    let sandbox = Sandbox::new("ad");
+    let path = sandbox.root().join("app");
+    with_dirs(&sandbox, &[(&path, "local", "owner = \"root\"\n")]);
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        shown.contains(&format!(
+            "dirs[0].owner root: needs sudo; the login user is {}",
+            id("-un")
+        )),
+        "{shown}"
+    );
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_dir_with_sudo_runs_through_sudo_and_is_recorded_so() {
+    let sandbox = Sandbox::new("ad");
+    let sudo = nopasswd_sudo(&sandbox);
+    let path = sandbox.root().join("app");
+    with_dirs(&sandbox, &[(&path, "local", "sudo = true\n")]);
+    let out = sandbox.anvil(
+        &["--json", "apply", "--target", "local"],
+        &[("PATH", sudo.as_str())],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][0]["stdout"],
+        format!("created {}\n", path.display())
+    );
+    assert_eq!(common::mode(&path) & 0o7777, 0o750);
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["targets"]["local"]["dirs"][0]["sudo"], true);
+}
+
+/// A config with one `[[links]]` entry per `(path, target, tag, extra
+/// keys)`, `sudo = false` unless the keys say otherwise, each notifying
+/// handler `log` of [`with_dirs`]; the fake host is tagged `web`.
+fn with_links(sandbox: &Sandbox, links: &[(&Path, &str, &str, &str)]) {
+    sandbox.write_config(
+        "inventory.toml",
+        "[hosts.fake]\nhost = \"fakehost\"\ntags = [\"web\"]\n",
+    );
+    let root = sandbox.root().display().to_string();
+    let entries: String = links
+        .iter()
+        .map(|(path, target, tag, keys)| {
+            let sudo = if keys.contains("sudo =") {
+                ""
+            } else {
+                "sudo = false\n"
+            };
+            format!(
+                "[[links]]\npath = \"{}\"\ntarget = \"{target}\"\ntags = [\"{tag}\"]\n\
+                 notify = [\"log\"]\n{sudo}{keys}\n",
+                path.display()
+            )
+        })
+        .collect();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{entries}[[handlers]]\nname = \"log\"\nrun = 'echo log >> {root}/\"$(hostname)\".log'\n"
+        ),
+    );
+}
+
+#[test]
+fn a_link_is_linked_then_left_then_relinked_and_only_changes_notify() {
+    let sandbox = Sandbox::new("al");
+    let (path, old, new) = (
+        sandbox.root().join("app"),
+        sandbox.root().join("old"),
+        sandbox.root().join("new"),
+    );
+    std::fs::create_dir(&old).unwrap();
+    let shown = path.display().to_string();
+    let step = |out: &std::process::Output| {
+        let value = json(out);
+        value["targets"][0]["steps"][0].clone()
+    };
+    let apply = |target: &Path| {
+        with_links(&sandbox, &[(&path, target.to_str().unwrap(), "local", "")]);
+        let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+        assert!(!text(&out.stdout).contains("anvil-attrs-"));
+        step(&out)
+    };
+
+    let first = apply(&old);
+    assert_eq!(first["run"], format!("link {shown} -> {}", old.display()));
+    assert_eq!(
+        first["stdout"],
+        format!("linked {shown} -> {}\n", old.display())
+    );
+    assert_eq!(first["changed"], true);
+    assert_eq!(std::fs::read_link(&path).unwrap(), old);
+    assert_eq!(logged(&sandbox), 1);
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["version"], 2);
+    let links = &record["targets"]["local"]["links"];
+    assert_eq!(links[0]["path"], shown);
+    assert_eq!(links[0]["previous"], serde_json::json!({"state": "absent"}));
+
+    let same = apply(&old);
+    assert_eq!(same["stdout"], format!("unchanged {shown}\n"));
+    assert_eq!(same["changed"], false);
+    assert_eq!(logged(&sandbox), 1, "unchanged does not notify");
+
+    let relinked = apply(&new);
+    assert_eq!(
+        relinked["stdout"],
+        format!("relinked {shown} -> {}\n", new.display())
+    );
+    assert_eq!(relinked["changed"], true);
+    assert_eq!(std::fs::read_link(&path).unwrap(), new, "dangling is fine");
+    assert_eq!(
+        std::fs::read_dir(&old).unwrap().count(),
+        0,
+        "not moved into"
+    );
+    assert_eq!(logged(&sandbox), 2);
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["links"][0]["previous"],
+        serde_json::json!({"state": "link", "target": old.display().to_string()})
+    );
+}
+
+#[test]
+fn a_file_at_a_links_path_needs_force_and_a_directory_never_goes_on_local_and_the_fake_host() {
+    let sandbox = Sandbox::new("al");
+    let (local, web, dir) = (
+        sandbox.root().join("l"),
+        sandbox.root().join("w"),
+        sandbox.root().join("d"),
+    );
+    for path in [&local, &web] {
+        std::fs::write(path, "keep\n").unwrap();
+    }
+    std::fs::create_dir(&dir).unwrap();
+    with_links(
+        &sandbox,
+        &[(&local, "/opt/a", "local", ""), (&web, "/opt/a", "web", "")],
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let mut failed: Vec<String> = json(&out)["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|target| target["steps"].as_array().unwrap().clone())
+        .filter(|step| step["code"] != 0)
+        .map(|step| step["stderr"].as_str().unwrap().to_owned())
+        .collect();
+    failed.sort();
+    let message = |path: &Path| {
+        format!(
+            "links: {} is a regular file; set force = true to replace it\n",
+            path.display()
+        )
+    };
+    assert_eq!(failed, [message(&local), message(&web)]);
+    for path in [&local, &web] {
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "keep\n");
+    }
+    assert_eq!(logged(&sandbox), 0);
+
+    with_links(
+        &sandbox,
+        &[
+            (&local, "-a", "local", "force = true\n"),
+            (&web, "/opt/a", "web", "force = true\n"),
+        ],
+    );
+    let out = sandbox.anvil(&["--json", "apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(std::fs::read_link(&local).unwrap(), Path::new("-a"));
+    assert_eq!(std::fs::read_link(&web).unwrap(), Path::new("/opt/a"));
+    let record = sandbox.last_apply().unwrap();
+    let previous = &record["targets"]["local"]["links"][0]["previous"];
+    assert_eq!(previous["state"], "file");
+    assert_eq!(previous["text"], "keep\n");
+
+    with_links(&sandbox, &[(&dir, "/opt/a", "local", "force = true\n")]);
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][0]["stderr"],
+        format!("links: {} is a directory\n", dir.display())
+    );
+    assert!(dir.is_dir() && !dir.is_symlink());
+}
+
+#[test]
+fn a_link_with_sudo_runs_through_sudo_and_is_recorded_so() {
+    let sandbox = Sandbox::new("al");
+    let sudo = nopasswd_sudo(&sandbox);
+    let path = sandbox.root().join("app");
+    with_links(&sandbox, &[(&path, "/opt/app", "local", "sudo = true\n")]);
+    let out = sandbox.anvil(
+        &["--json", "apply", "--target", "local"],
+        &[("PATH", sudo.as_str())],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][0]["stdout"],
+        format!("linked {} -> /opt/app\n", path.display())
+    );
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["targets"]["local"]["links"][0]["sudo"], true);
+}
+
+#[test]
+fn a_forced_link_keeps_only_the_hash_of_a_file_a_files_entry_says_rollback_false_for() {
+    let sandbox = Sandbox::new("al");
+    let path = sandbox.root().join("app");
+    std::fs::write(&path, "kept bytes\n").unwrap();
+    common::chmod(&path, 0o644);
+    std::fs::write(sandbox.config_dir().join("app.conf"), "new\n").unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"app.conf\"\ndest = \"{p}\"\nmode = \"0644\"\nsudo = false\n\
+             rollback = false\ntags = [\"web\"]\n\n\
+             [[links]]\npath = \"{p}\"\ntarget = \"/opt/app\"\nforce = true\nsudo = false\n",
+            p = path.display()
+        ),
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(std::fs::read_link(&path).unwrap(), Path::new("/opt/app"));
+    let record = sandbox.last_apply().unwrap();
+    let previous = &record["targets"]["local"]["links"][0]["previous"];
+    assert_eq!(previous["state"], "file", "{record}");
+    assert_eq!(previous["text"], serde_json::Value::Null);
+    assert_eq!(previous["reason"], "rollback = false");
+    assert!(!record.to_string().contains("kept bytes"));
 }

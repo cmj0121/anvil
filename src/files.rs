@@ -30,19 +30,21 @@ use crate::facts::Facts;
 use crate::filestore::{self, StoreError};
 use crate::inventory::{self, Target, TargetKind};
 use crate::record::{
-    FileRecord, NO_ROLLBACK, NOT_WORLD_READABLE, Previous, PreviousFile, Write, is_world_readable,
+    Attrs, FileRecord, NO_ROLLBACK, NOT_WORLD_READABLE, Previous, PreviousFile, Write,
+    is_world_readable,
 };
 use crate::remote::{
-    Bytes, Heredoc, LOGIN_OWNED, ROOT_OWNED, Replacement, is_owned_only, link_removal_checks,
-    login_checks, login_top, not_a_directory, random_hex, refusal, root_checks, root_only_find,
-    sweep, temp_beside, unchecked, zeroizing,
+    Bytes, Heredoc, Ids, LOGIN_OWNED, ROOT_OWNED, Replacement, is_owned_only, link_removal_checks,
+    login_checks, login_top, not_a_directory, random_hex, refusal, refused, root_checks,
+    root_only_find, sweep, temp_beside, unchecked, zeroizing,
 };
 pub(crate) use crate::remote::{REFUSED, quote};
+pub use crate::remote::{Walk, WalkNonce};
 use crate::secret;
 use crate::step::{FileRun, PlannedRun, RunKind, Upload};
 use crate::tasks::{Expanded, Item};
 use crate::template;
-use crate::transport::RUN_TIMEOUT;
+use crate::transport::{Output, RUN_TIMEOUT};
 use crate::trust::{self, TrustError};
 
 /// Each file item's src text, by ordinal.
@@ -238,8 +240,20 @@ pub fn run(
         ));
     }
     let rendered = render_entry(item, entry, &label, sources, i, target, facts)?;
+    let ids = Ownership::of(
+        &label,
+        (entry.owner.as_deref(), entry.group.as_deref()),
+        !root && !entry.sudo,
+        facts,
+    )?;
     let secret =
         sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
+    let create = if entry.parents {
+        Some(WalkNonce::generate()?)
+    } else {
+        None
+    };
+    let mark = WalkNonce::attrs()?;
     let write = match secret {
         Some(name) => {
             log::info!(
@@ -252,19 +266,24 @@ pub fn run(
                 mode: mode.clone(),
                 sudo: "sudo ".to_owned(),
                 checks: root_checks("sudo ", dest),
+                walk: Box::new(Walk::new("files", dest, true, &login_top(), create)),
                 as_root: true,
                 password: true,
                 rendered,
+                ids,
+                mark,
+                parents: entry.parents,
             }
         }
         None => {
             log::info!("{}: {label} {dest}", target.name);
             let sudo = if root || !entry.sudo { "" } else { "sudo -n " };
             let as_root = root || entry.sudo;
+            let top = login_top();
             let checks = if as_root {
                 root_checks(sudo, dest)
             } else {
-                login_checks(dest, &login_top())
+                login_checks(dest, &top)
             };
             FileWrite {
                 ordinal: i,
@@ -272,9 +291,13 @@ pub fn run(
                 mode: mode.clone(),
                 sudo: sudo.to_owned(),
                 checks,
+                walk: Box::new(Walk::new("files", dest, as_root, &top, create)),
                 as_root,
                 password: false,
                 rendered,
+                ids,
+                mark,
+                parents: entry.parents,
             }
         }
     };
@@ -357,6 +380,9 @@ pub struct FileWrite {
     pub sudo: String,
     /// [`root_checks`] or [`login_checks`], by `as_root`.
     pub checks: String,
+    /// The walk of the same directories just before the temp, which with
+    /// `parents = true` creates the missing ones.
+    pub walk: Box<Walk>,
     /// Whether the write runs as root, through sudo or on a root login.
     pub as_root: bool,
     /// Whether the bytes are staged in a temp file and installed by a
@@ -365,6 +391,85 @@ pub struct FileWrite {
     /// The target's rendered text when the entry has `template = true`;
     /// `None` writes the src from [`Sources`] as is.
     pub rendered: Option<Box<Rendered>>,
+    /// The entry's owner and group; `None` when it sets neither, which keeps
+    /// an existing DEST's.
+    pub ids: Option<Ownership>,
+    /// What marks the line with DEST's `ls -lLdn` once the write succeeded
+    /// ([`FileWrite::written_attrs`]).
+    pub mark: WalkNonce,
+    /// The entry's `parents`.
+    pub parents: bool,
+}
+
+/// A write's `owner` and `group`, each by name or numeric id, `None`
+/// keeping an existing DEST's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ownership {
+    pub owner: Option<String>,
+    pub group: Option<String>,
+    /// On a user write, the entry's label and the login user, which word
+    /// its refusals.
+    pub user: Option<(String, String)>,
+}
+
+impl Ownership {
+    /// The `(owner, group)` of the entry `label` for a write, as the login
+    /// user when `by_user`; `None` when it sets neither. A user write may
+    /// not name another user as owner: that needs sudo.
+    pub(crate) fn of(
+        label: &str,
+        (owner, group): (Option<&str>, Option<&str>),
+        by_user: bool,
+        facts: &Facts,
+    ) -> Result<Option<Ownership>, String> {
+        let user = facts.get("user").unwrap_or_default();
+        if let Some(owner) = owner
+            .filter(|owner| by_user && *owner != user && !owner.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(format!(
+                "{label}.owner {owner}: needs sudo; the login user is {user}"
+            ));
+        }
+        Ok((owner.is_some() || group.is_some()).then(|| Ownership {
+            owner: owner.map(str::to_owned),
+            group: group.map(str::to_owned),
+            user: by_user.then(|| (label.to_owned(), user.to_owned())),
+        }))
+    }
+
+    fn ids(&self) -> Ids<'_> {
+        Ids::Set {
+            owner: self.owner.as_deref(),
+            group: self.group.as_deref(),
+            user: self.user.as_ref().map(|(_, user)| user.as_str()),
+        }
+    }
+
+    /// The lines that refuse the write before anything changes: an owner
+    /// name the target does not know, or on a user write a numeric owner
+    /// that is not the login user's id.
+    pub(crate) fn checks(&self, kind: &str) -> String {
+        let Some(owner) = self.owner.as_deref() else {
+            return String::new();
+        };
+        if !owner.bytes().all(|b| b.is_ascii_digit()) {
+            let why = format!("{kind}: owner {owner} does not exist on the target");
+            return format!(
+                "id -u {} >/dev/null 2>&1 || {}\n",
+                quote(owner),
+                refused(&why)
+            );
+        }
+        match &self.user {
+            Some((label, user)) => format!(
+                "[ \"$(id -u)\" -eq {owner} ] 2>/dev/null || {}\n",
+                refused(&format!(
+                    "{label}.owner {owner}: needs sudo; the login user is {user}"
+                ))
+            ),
+            None => String::new(),
+        }
+    }
 }
 
 impl FileWrite {
@@ -402,37 +507,7 @@ impl FileWrite {
             .file(self.ordinal)
             .expect("a write comes from the list it is recorded against");
         let written = self.text(sources).unwrap_or("");
-        let previous = match captured {
-            Captured::Absent => Previous::Absent,
-            Captured::File {
-                mode,
-                uid,
-                gid,
-                sha256,
-                bytes,
-                reason,
-                ..
-            } => {
-                let text = match bytes {
-                    _ if hash_only || !entry.rollback => Err(NO_ROLLBACK),
-                    None => Err(reason.unwrap_or("unreadable")),
-                    Some(bytes) => match std::str::from_utf8(&bytes) {
-                        Err(_) => Err("not UTF-8 text"),
-                        Ok(text) if text.contains('\0') => Err("contains NUL"),
-                        Ok(text) => Ok(Zeroizing::new(text.to_owned())),
-                    },
-                };
-                Previous::File(PreviousFile {
-                    mode,
-                    uid,
-                    gid,
-                    sha256,
-                    kept: text.is_ok(),
-                    reason: text.as_ref().err().map(|why| (*why).to_owned()),
-                    text: text.ok(),
-                })
-            }
-        };
+        let previous = previous_of(captured, hash_only || !entry.rollback);
         FileRecord {
             dest: self.dest.clone(),
             mode: format!("{:0>4}", self.mode),
@@ -440,6 +515,69 @@ impl FileWrite {
             written_sha256: hex(&Sha256::digest(written.as_bytes())),
             write,
             previous,
+            written_attrs: None,
+            created_dirs: Vec::new(),
+        }
+    }
+
+    /// DEST's owner, group and mode from `output`'s marked line, which the
+    /// write prints once it succeeded, those lines taken out of its stdout;
+    /// `None` without one, or when the last does not parse.
+    pub(crate) fn written_attrs(&self, output: &mut Output) -> Option<Attrs> {
+        let mark = format!("{} ", self.mark.as_str());
+        let mut attrs = None;
+        let mut kept = Vec::with_capacity(output.stdout.len());
+        for line in output.stdout.split_inclusive(|&b| b == b'\n') {
+            let body = line.strip_suffix(b"\n").unwrap_or(line);
+            let body = body.strip_suffix(b"\r").unwrap_or(body);
+            match body.strip_prefix(mark.as_bytes()) {
+                Some(ls) => {
+                    attrs = std::str::from_utf8(ls)
+                        .ok()
+                        .and_then(|ls| parse_ls(ls).ok())
+                        .filter(|&(.., kind)| kind == '-')
+                        .map(|(mode, uid, gid, ..)| Attrs { uid, gid, mode });
+                }
+                None => kept.extend_from_slice(line),
+            }
+        }
+        output.stdout = kept;
+        attrs
+    }
+}
+
+/// What `captured` says DEST held, as the record keeps it: a file's bytes
+/// as text unless `hash_only` or they are not text.
+pub(crate) fn previous_of(captured: Captured, hash_only: bool) -> Previous {
+    match captured {
+        Captured::Absent => Previous::Absent,
+        Captured::File {
+            mode,
+            uid,
+            gid,
+            sha256,
+            bytes,
+            reason,
+            ..
+        } => {
+            let text = match bytes {
+                _ if hash_only => Err(NO_ROLLBACK),
+                None => Err(reason.unwrap_or("unreadable")),
+                Some(bytes) => match std::str::from_utf8(&bytes) {
+                    Err(_) => Err("not UTF-8 text"),
+                    Ok(text) if text.contains('\0') => Err("contains NUL"),
+                    Ok(text) => Ok(Zeroizing::new(text.to_owned())),
+                },
+            };
+            Previous::File(PreviousFile {
+                mode,
+                uid,
+                gid,
+                sha256,
+                kept: text.is_ok(),
+                reason: text.as_ref().err().map(|why| (*why).to_owned()),
+                text: text.ok(),
+            })
         }
     }
 }
@@ -467,21 +605,11 @@ pub(crate) fn write_script(
     let i = step.ordinal;
     let text = step.text(sources)?;
     let heredoc = Heredoc::new(text).map_err(|why| format!("files[{i}].src: {why}"))?;
-    let (dest, mode) = (step.dest.as_str(), step.mode.as_str());
     if !step.password {
-        let script = tee_script(
-            &heredoc,
-            dest,
-            mode,
-            &step.sudo,
-            &step.checks,
-            step.as_root,
-            expected,
-        );
-        return script.map(|script| (script, None));
+        return tee_script(&heredoc, step, expected).map(|script| (script, None));
     }
     let (temp, upload) = staged(&heredoc)?;
-    let script = install_script(&temp, text.len(), dest, mode, &step.checks, expected)?;
+    let script = install_script(&temp, text.len(), step, expected)?;
     Ok((script, Some(upload)))
 }
 
@@ -555,9 +683,19 @@ pub(crate) fn skip_run(dest: &str, label: String) -> PlannedRun {
 }
 
 /// One run under `umask 077` that first refuses a `sudo` that fails, then runs
-/// `checks`, then refuses a directory DEST, then the guard; when DEST already
-/// holds the bytes, only the mode, else [`Replacement::replace`].
-fn replace_script(write: &Replacement<'_>, checks: &str, expected: &Expected) -> Zeroizing<String> {
+/// `checks`, then refuses a directory DEST, then the owner checks, the guard
+/// and `walk`; when DEST already holds the bytes, [`fix_script`], else
+/// [`Replacement::replace`]. Once either succeeded, DEST's `ls -lLdn` line
+/// follows `mark` ([`FileWrite::written_attrs`]); every failure before it
+/// exits.
+fn replace_script(
+    write: &Replacement<'_>,
+    checks: &str,
+    walk: &Walk,
+    ids: Option<&Ownership>,
+    expected: &Expected,
+    mark: &WalkNonce,
+) -> Zeroizing<String> {
     let (dest, sudo) = (write.dest, write.sudo);
     let d = quote(dest);
     let guard = guard(sudo, dest, expected);
@@ -569,45 +707,192 @@ fn replace_script(write: &Replacement<'_>, checks: &str, expected: &Expected) ->
             quote(&format!("files: sudo failed; {dest} is unchanged"))
         ),
     };
-    let (unchanged, wrote) = (
-        quote(&format!("unchanged {dest}")),
-        quote(&format!("wrote {dest}")),
-    );
+    let wrote = quote(&format!("wrote {dest}"));
     zeroizing(format_args!(
         "{open}{ready}{checks}{directory} || exit {REFUSED}\n\
-         {guard}{sweep}if {same}; then anvil_mode && echo {unchanged}\n\
+         {owner}{guard}{walk}{sweep}{OCTAL}if {same}; then\n{fix}\
          else {replace}fi\n\
+         anvil_line=$({sudo}ls -lLdn {d} 2>/dev/null) && printf '%s %s\\n' {mark} \"$anvil_line\" || :\n\
          }}\n",
         open = *write.open(),
+        owner = ids.map(|ids| ids.checks("files")).unwrap_or_default(),
+        walk = walk.script(sudo),
         sweep = sweep(sudo, dest),
         same = write.same(),
+        fix = fix_script("files", (dest, sudo, write.mode), ids, false),
         replace = write.replace(&format!("echo {wrote}")),
+        mark = quote(mark.as_str()),
     ))
+}
+
+/// Defines `anvil_octal LS_MODE`, which prints the `ls -l` mode string
+/// LS_MODE as four octal digits.
+pub(crate) const OCTAL: &str = "anvil_octal() { anvil_s=${1#?}; anvil_v=0; anvil_b=256; anvil_x=2048
+while [ \"$anvil_b\" -gt 0 ]; do anvil_c=${anvil_s%\"${anvil_s#?}\"}; anvil_s=${anvil_s#?}
+case $anvil_c in [rwx]) anvil_v=$((anvil_v + anvil_b)) ;; [st]) anvil_v=$((anvil_v + anvil_b + anvil_x)) ;; \
+[ST]) anvil_v=$((anvil_v + anvil_x)) ;; esac
+case $anvil_b in 64 | 8 | 1) anvil_x=$((anvil_x / 2)) ;; esac
+anvil_b=$((anvil_b / 2)); done
+printf '%04o\\n' \"$anvil_v\"; }
+";
+
+/// Defines `anvil_perm OCTAL`, which prints the four octal digits OCTAL
+/// without the setuid and setgid bits, and `anvil_kept MODE`, which prints
+/// the four octal digits MODE, which has neither, with those of
+/// `$anvil_was`: a directory's are left as they are, also where a numeric
+/// `chmod` would clear them.
+pub(crate) const KEEP_SPECIAL: &str = "anvil_perm() { anvil_d=${1%???}; printf '%s%s\\n' $((anvil_d % 2)) \"${1#?}\"; }
+anvil_kept() { anvil_d=${anvil_was%???}; anvil_e=${1%???}; printf '%s%s\\n' $((anvil_d - anvil_d % 2 + anvil_e)) \"${1#?}\"; }
+";
+
+/// The lines for a DEST that already holds the bytes: no temp, and only what
+/// differs from the entry's owner, group and mode is fixed. A new owner or
+/// group goes on after the mode is narrowed to its owner's bits, so that it
+/// never briefly gets access, and the mode is set last; a fix that does not
+/// take fails the run, so it cannot report a change on every run. It prints
+/// `fixed DEST: …` naming what it changed, or `unchanged DEST` and runs
+/// nothing on DEST. It needs [`OCTAL`] and `anvil_mode`, which sets DEST's
+/// mode; `kind`, `files` or `dirs`, starts its messages. With
+/// `keep_special`, for a directory, the setuid and setgid bits are neither
+/// compared nor checked, and it needs [`KEEP_SPECIAL`].
+pub(crate) fn fix_script(
+    kind: &str,
+    (dest, sudo, mode): (&str, &str, &str),
+    ids: Option<&Ownership>,
+    keep_special: bool,
+) -> String {
+    let d = quote(dest);
+    let want = format!("{mode:0>4}");
+    let (owner, group) = ids.map_or((None, None), |ids| {
+        (ids.owner.as_deref(), ids.group.as_deref())
+    });
+    let numeric = |id: &str| id.bytes().all(|b| b.is_ascii_digit());
+    let unread = format!(
+        "{{ echo {} >&2; exit 1; }}",
+        quote(&format!(
+            "{kind}: cannot read {dest}'s owner, group and mode"
+        ))
+    );
+    let wanted_uid = match owner {
+        None => String::new(),
+        Some(owner) if numeric(owner) => format!("anvil_uid={owner}\n"),
+        Some(owner) => format!(
+            "anvil_uid=$(id -u {}) || {}\n",
+            quote(owner),
+            refused(&format!(
+                "{kind}: owner {owner} does not exist on the target"
+            ))
+        ),
+    };
+    let owner_cmp = match owner {
+        None => "",
+        Some(_) => "[ \"$3\" -eq \"$anvil_uid\" ] 2>/dev/null || anvil_o=owner\n",
+    };
+    // A name goes through `find -group`, as `ls -l` may cut it short.
+    let group_cmp = match group {
+        None => String::new(),
+        Some(group) if numeric(group) => {
+            format!("[ \"$4\" -eq {group} ] 2>/dev/null || anvil_g=group\n")
+        }
+        Some(group) => format!(
+            "[ -n \"$({sudo}find {d} -prune -group {} 2>/dev/null)\" ] || anvil_g=group\n",
+            quote(group)
+        ),
+    };
+    let user = ids.and_then(|ids| ids.user.as_ref());
+    let give = match (owner, group) {
+        (Some(o), Some(g)) => Some(format!(
+            "if [ -n \"$anvil_o\" ] && [ -n \"$anvil_g\" ]; then {sudo}chown {og} {d}; \
+             elif [ -n \"$anvil_o\" ]; then {sudo}chown {o} {d}; else {sudo}chgrp {g} {d}; fi",
+            og = quote(&format!("{o}:{g}")),
+            o = quote(o),
+            g = quote(g),
+        )),
+        (Some(o), None) => Some(format!("{sudo}chown {} {d}", quote(o))),
+        (None, Some(g)) => Some(format!("{sudo}chgrp {} {d}", quote(g))),
+        (None, None) => None,
+    };
+    let own = give.map_or_else(String::new, |give| {
+        let foreign = refused(&format!(
+            "{kind}: {dest} cannot be given mode {mode}: only its owner can chmod it"
+        ));
+        let no_owner = owner.map(|o| refused(&format!("{kind}: cannot give {dest} owner {o}")));
+        let no_group = group.map(|g| {
+            refused(&match user {
+                Some((_, user)) => format!("{kind}: group {g} is not one of {user}'s groups"),
+                None => format!("{kind}: group {g} does not exist on the target"),
+            })
+        });
+        let why = match (no_owner, no_group) {
+            (Some(o), Some(g)) => format!("if [ -n \"$anvil_g\" ]; then {g}; else {o}; fi"),
+            (o, g) => o.or(g).expect("an owner or a group"),
+        };
+        let not_mine = match (owner, user) {
+            (Some(o), Some((label, user))) => format!(
+                "[ -z \"$anvil_o\" ] || {}\n",
+                refused(&format!(
+                    "{label}.owner {o}: needs sudo; the login user is {user}"
+                ))
+            ),
+            _ => String::new(),
+        };
+        format!(
+            "if [ -n \"$anvil_o$anvil_g\" ]; then\n{not_mine}\
+             {sudo}chmod go= {d} 2>/dev/null || {foreign}\n\
+             {{ {give}; }} 2>/dev/null || {{ {sudo}chmod \"$anvil_was\" {d} 2>/dev/null; {why}; }}\n\
+             fi\n"
+        )
+    });
+    format!(
+        "{wanted_uid}\
+         anvil_attrs() {{ anvil_line=$({sudo}ls -lLdn {d}) || return 1\nset -- $anvil_line\n\
+         anvil_full=$(anvil_octal \"$1\"); anvil_now=\"$3:$4 {now}\"; anvil_o=; anvil_g=; anvil_m=\n\
+         {owner_cmp}{group_cmp}[ \"${{anvil_now#* }}\" = {want} ] || anvil_m=mode; }}\n\
+         anvil_attrs || {unread}\n\
+         anvil_was=$anvil_full; anvil_what=$anvil_o\n\
+         [ -z \"$anvil_g\" ] || anvil_what=${{anvil_what:+$anvil_what, }}group\n\
+         [ -z \"$anvil_m\" ] || anvil_what=${{anvil_what:+$anvil_what, }}mode\n\
+         if [ -z \"$anvil_what\" ]; then echo {unchanged}\n\
+         else\n\
+         {own}anvil_mode || exit 1\n\
+         anvil_attrs || {unread}\n\
+         [ -z \"$anvil_o$anvil_g$anvil_m\" ] || {{ printf '%s: %s: owner, group or mode did not take (now %s)\\n' \
+         {kind} {d} \"$anvil_now\" >&2; exit 1; }}\n\
+         printf '%s%s\\n' {fixed} \"$anvil_what\"\n\
+         fi\n",
+        unchanged = quote(&format!("unchanged {dest}")),
+        fixed = quote(&format!("fixed {dest}: ")),
+        now = if keep_special {
+            "$(anvil_perm \"$anvil_full\")"
+        } else {
+            "$anvil_full"
+        },
+    )
 }
 
 /// The plain run: a root target, a `sudo = false` entry, or `sudo -n`.
 fn tee_script(
     heredoc: &Heredoc<'_>,
-    dest: &str,
-    mode: &str,
-    sudo: &str,
-    checks: &str,
-    as_root: bool,
+    step: &FileWrite,
     expected: &Expected,
 ) -> Result<Zeroizing<String>, String> {
-    let temp = temp_beside(dest)?;
+    let temp = temp_beside(&step.dest)?;
     Ok(replace_script(
         &Replacement {
-            dest,
-            mode,
-            sudo,
-            as_root,
+            undo: "",
+            dest: &step.dest,
+            mode: &step.mode,
+            sudo: &step.sudo,
+            as_root: step.as_root,
             temp: &temp,
             bytes: Bytes::Inline(heredoc),
-            ids: None,
+            ids: step.ids.as_ref().map_or(Ids::Keep, Ownership::ids),
         },
-        checks,
+        &step.checks,
+        &step.walk,
+        step.ids.as_ref(),
         expected,
+        &step.mark,
     ))
 }
 
@@ -626,24 +911,26 @@ fn stage_script(heredoc: &Heredoc<'_>, temp: &str) -> Zeroizing<String> {
 fn install_script(
     temp: &str,
     len: usize,
-    dest: &str,
-    mode: &str,
-    checks: &str,
+    step: &FileWrite,
     expected: &Expected,
 ) -> Result<Zeroizing<String>, String> {
-    let dest_temp = temp_beside(dest)?;
+    let dest_temp = temp_beside(&step.dest)?;
     Ok(replace_script(
         &Replacement {
-            dest,
-            mode,
+            undo: "",
+            dest: &step.dest,
+            mode: &step.mode,
             sudo: "sudo ",
             as_root: true,
             temp: &dest_temp,
             bytes: Bytes::Staged(temp, len),
-            ids: None,
+            ids: step.ids.as_ref().map_or(Ids::Keep, Ownership::ids),
         },
-        checks,
+        &step.checks,
+        &step.walk,
+        step.ids.as_ref(),
         expected,
+        &step.mark,
     ))
 }
 
@@ -670,7 +957,7 @@ printf '%s\\n' \"${anvil_h%% *}\"
 ";
 
 /// [`HASH`] with `$anvil_sudo` set to `sudo`.
-fn hash_fn(sudo: &str) -> String {
+pub(crate) fn hash_fn(sudo: &str) -> String {
     format!("anvil_sudo={}\n{HASH}", quote(sudo.trim_end()))
 }
 
@@ -1279,7 +1566,7 @@ pub enum Force {
 }
 
 impl Force {
-    fn allows(&self, dest: &str) -> bool {
+    pub(crate) fn allows(&self, dest: &str) -> bool {
         match self {
             Force::None => false,
             Force::Dests(dests) => dests.contains(dest),
@@ -1300,13 +1587,17 @@ pub enum Wording {
 pub(crate) const CONFLICT: i32 = 3;
 
 /// One step per recorded file, last written first, that puts back what
-/// DEST held before the apply: `restore DEST` for a file, `remove DEST` for
-/// one that was absent or a dangling link, or a skip `cannot undo: DEST
-/// (reason)` when its text was not kept. Each takes the write's path again,
-/// from the recorded `sudo` and `target`'s current facts and secret, with
-/// the same root checks. A guard refuses, exit [`CONFLICT`], a DEST that is
-/// neither what the apply wrote nor what was there before, unless the write
-/// failed midway or `force` allows the dest.
+/// DEST held before the apply: `restore DEST` for a file, `restore owner,
+/// group and mode of DEST` for an attrs-only fix, which needs no text,
+/// `remove DEST` for one that was absent or a dangling link, or a skip
+/// `cannot undo: DEST (reason)` when its text was not kept. Each takes the
+/// write's path again, from the recorded `sudo` and `target`'s current facts
+/// and secret, with the same root checks, and then removes the directories
+/// the write created, deepest first, leaving one that is not empty; a
+/// refused write kept for those only removes them. A guard refuses, exit
+/// [`CONFLICT`], a DEST that is neither what the apply wrote (with the
+/// owner, group and mode written, when recorded) nor what was there before,
+/// unless the write failed midway or `force` allows the dest.
 pub(crate) fn restore_runs(
     config: &Config,
     target: &Target,
@@ -1337,8 +1628,10 @@ fn restore_runs_from(
             runs.push(skip(reason));
             continue;
         }
+        // An attrs-only fix needs no text: the bytes stay.
         let previous = match &file.previous {
-            Previous::File(previous) => previous.text.as_deref().map(|text| (previous, text)),
+            Previous::File(previous) if file.attrs_only() => Some((previous, None)),
+            Previous::File(previous) => previous.text.as_deref().map(|text| (previous, Some(text))),
             _ => None,
         };
         if let Some((previous, _)) = previous
@@ -1354,21 +1647,49 @@ fn restore_runs_from(
             None => "sudo -n ",
         };
         let as_root = root || file.sudo;
+        let refused = file.write == Write::Refused;
+        let dirs = file.dirs_deepest_first();
+        // A refused write may have stopped at a created directory that fails
+        // the checks: the path to the deepest one it created must pass, so
+        // that every created directory above it still does, and `rmdir`
+        // does not follow that one.
+        let checked = match dirs.first() {
+            Some(deepest) if refused => deepest,
+            _ => dest,
+        };
         let checks = match (&file.previous, as_root) {
             // Removing the link does not follow it, so a v1 record still rolls back.
-            (Previous::Dangling { .. }, _) => link_removal_checks(sudo, dest, as_root, top),
-            (_, true) => root_checks(sudo, dest),
-            (_, false) => login_checks(dest, top),
+            (Previous::Dangling { .. }, _) => {
+                link_removal_checks("files", sudo, dest, as_root, top)
+            }
+            (_, true) => root_checks(sudo, checked),
+            (_, false) => login_checks(checked, top),
         };
         let restore = Restore {
             dest,
             sudo,
             checks: &checks,
             as_root,
-            guard: restore_guard(sudo, file, force.allows(dest), wording),
+            guard: if refused {
+                String::new()
+            } else {
+                restore_guard(sudo, file, force.allows(dest), wording)
+            },
+            dirs: remove_dirs(sudo, &dirs),
+            link: None,
         };
         let (run, label, upload) = match (previous, &file.previous) {
-            (Some((previous, text)), _) => {
+            _ if refused => (
+                restore.dirs_only().into(),
+                format!("remove the directories made for {dest}"),
+                None,
+            ),
+            (Some((previous, None)), _) => (
+                restore.attrs(previous).into(),
+                format!("restore owner, group and mode of {dest}"),
+                None,
+            ),
+            (Some((previous, Some(text))), _) => {
                 let heredoc = Heredoc::new(text).map_err(|why| format!("files: {dest}: {why}"))?;
                 let label = format!("restore {dest}");
                 match secret {
@@ -1411,11 +1732,82 @@ fn restore_runs_from(
     Ok(runs)
 }
 
+/// The restore of `previous`, the regular file a `[[links]]` step replaced
+/// at `dest` with `force`, from its kept `text`, through `sudo`, after
+/// `checks` (the directory checks only) and `link`, the lines that take
+/// the link away or refuse, with `undo` added to the EXIT trap to put the
+/// link back if the write then fails; then the lines `dirs` from
+/// [`remove_dirs`]. It
+/// writes the file as a restore of a `[[files]]` write does, with the
+/// recorded owner as root, printing `restored DEST`, or `unchanged DEST`
+/// when DEST already holds those bytes. With `password`, the bytes are
+/// staged first: the upload comes back with the script.
+pub(crate) fn restore_replaced(
+    (dest, sudo, as_root): (&str, &str, bool),
+    (checks, link, undo, dirs): (&str, &str, &str, String),
+    previous: &PreviousFile,
+    text: &str,
+    password: bool,
+) -> Result<(Zeroizing<String>, Option<Upload>), String> {
+    let file = FileRecord {
+        dest: dest.to_owned(),
+        mode: previous.mode.clone(),
+        sudo: !sudo.is_empty(),
+        written_sha256: previous.sha256.clone(),
+        write: Write::Written,
+        previous: Previous::File(previous.clone()),
+        written_attrs: None,
+        created_dirs: Vec::new(),
+    };
+    let restore = Restore {
+        dest,
+        sudo,
+        checks,
+        as_root,
+        // `link` refuses a path changed since the apply: this only finds
+        // the bytes already there.
+        guard: restore_guard(sudo, &file, true, Wording::Cli),
+        dirs,
+        link: Some((link, undo)),
+    };
+    let heredoc = Heredoc::new(text).map_err(|why| format!("links: {dest}: {why}"))?;
+    if password {
+        let (temp, upload) = staged(&heredoc)?;
+        Ok((restore.install(&temp, text.len(), previous)?, Some(upload)))
+    } else {
+        Ok((restore.tee(&heredoc, previous)?, None))
+    }
+}
+
+/// The lines that remove each of `deepest` that is still a directory, in
+/// order, through `sudo`; one that is not empty stays, with a warning, and
+/// any other failure is a warning with `rmdir`'s error.
+pub(crate) fn remove_dirs(sudo: &str, deepest: &[&str]) -> String {
+    deepest
+        .iter()
+        .map(|dir| {
+            let q = quote(dir);
+            format!(
+                "if {sudo}test -d {q} && {sudo}test ! -L {q}; then\n\
+                 if anvil_err=$({sudo}rmdir {q} 2>&1); then echo {removed}\n\
+                 elif [ -n \"$({sudo}ls -A {q} 2>/dev/null)\" ]; then echo {left} >&2\n\
+                 else printf '%s: %s\\n' {cannot} \"$anvil_err\" >&2; fi\n\
+                 fi\n",
+                removed = quote(&format!("removed directory {dir}")),
+                left = quote(&format!("rollback: {dir} is not empty; left in place")),
+                cannot = quote(&format!("rollback: cannot remove {dir}")),
+            )
+        })
+        .collect()
+}
+
 /// The lines that set `anvil_same` when DEST already holds `file`'s
 /// previous state, else exit [`CONFLICT`] unless DEST holds what the apply
 /// wrote, the write failed midway, or `forced`. DEST's state is `absent` or
 /// its sha256 through `sudo`; a dangling previous link matches when DEST is
-/// still that link.
+/// still that link. When the record has the owner, group and mode written,
+/// DEST holds what the apply wrote only with those too, and the previous
+/// state of an attrs-only fix is the previous ones.
 fn restore_guard(sudo: &str, file: &FileRecord, forced: bool, wording: Wording) -> String {
     let (dest, d) = (file.dest.as_str(), quote(&file.dest));
     let previous = match &file.previous {
@@ -1431,13 +1823,30 @@ fn restore_guard(sudo: &str, file: &FileRecord, forced: bool, wording: Wording) 
         ),
         _ => String::new(),
     };
+    let attrs_now = |attrs: &Attrs| format!(" && [ \"$anvil_at\" = {} ]", quote(&attrs.shown()));
+    let previous_attrs = match &file.previous {
+        Previous::File(previous) if file.attrs_only() => attrs_now(&previous.attrs()),
+        _ => String::new(),
+    };
     let same = match previous {
         Some(sha) => format!(
-            "[ -n \"$anvil_same\" ] || [ \"$anvil_cur\" = {} ]",
+            "[ -n \"$anvil_same\" ] || {{ [ \"$anvil_cur\" = {} ]{previous_attrs}; }}",
             quote(sha)
         ),
         None => "[ -n \"$anvil_same\" ]".to_owned(),
     };
+    let read_attrs = match &file.written_attrs {
+        Some(_) => format!(
+            "{OCTAL}anvil_at=; anvil_l=$({sudo}ls -lLdn {d} 2>/dev/null) \
+             && {{ set -- $anvil_l; anvil_at=\"$3:$4 $(anvil_octal \"$1\")\"; }}\n"
+        ),
+        None => String::new(),
+    };
+    let written_attrs = file
+        .written_attrs
+        .as_ref()
+        .map(attrs_now)
+        .unwrap_or_default();
     let conflict = if forced || file.write == Write::FailedMidway {
         String::new()
     } else {
@@ -1448,7 +1857,7 @@ fn restore_guard(sudo: &str, file: &FileRecord, forced: bool, wording: Wording) 
         let changed = format!("files: {dest} changed since the last apply; {force} it anyway");
         let no_tool = format!("files: no sha256 tool on the target to check {dest}; {force} it");
         format!(
-            "elif [ \"$anvil_cur\" = {written} ]; then :\n\
+            "elif [ \"$anvil_cur\" = {written} ]{written_attrs}; then :\n\
              elif [ \"$anvil_rc\" -eq 2 ]; then echo {no_tool} >&2; exit {CONFLICT}\n\
              elif [ \"$anvil_rc\" -eq 3 ]; then echo {unchecked} >&2; exit {CONFLICT}\n\
              else echo {changed} >&2; exit {CONFLICT}\n",
@@ -1462,11 +1871,85 @@ fn restore_guard(sudo: &str, file: &FileRecord, forced: bool, wording: Wording) 
         "{hash}anvil_same=\n\
          {link}if {sudo}test ! -e {d}; then anvil_cur=absent; anvil_rc=0\n\
          else anvil_cur=$(anvil_sha256 {d}); anvil_rc=$?; fi\n\
-         if {same}; then anvil_same=1\n\
+         {read_attrs}if {same}; then anvil_same=1\n\
          {conflict}fi\n",
         hash = hash_fn(sudo),
     )
 }
+
+/// The lines that put back `previous`, the owner, group and mode of the
+/// file or directory at `dest`, through `sudo`: its owner and group go back
+/// after its mode is narrowed to its owner's bits so that neither briefly
+/// gets access, then its mode. As root a failed `chown` puts the mode back
+/// and fails; as the user only the group can go back, and a group or owner
+/// that cannot is a warning. It prints what it restored. It defines
+/// [`OCTAL`]. With `keep_special`, for a directory, whose recorded modes
+/// have neither, it keeps the setuid and setgid bits it has now.
+pub(crate) fn restore_attrs(
+    kind: &str,
+    (dest, sudo, as_root): (&str, &str, bool),
+    previous: &Attrs,
+    keep_special: bool,
+) -> String {
+    let kept = |mode: &str| {
+        if keep_special {
+            format!("\"$(anvil_kept {mode})\"")
+        } else {
+            mode.to_owned()
+        }
+    };
+    let d = quote(dest);
+    let ids = format!("{}:{}", previous.uid, previous.gid);
+    let all = quote("owner, group and ");
+    let (own, chmod) = if as_root {
+        let failed = quote(&format!("{kind}: cannot give {dest} owner and group {ids}"));
+        let own = format!(
+            "anvil_what={all}\n\
+                 if [ \"$3:$4\" != {ids} ]; then {sudo}chmod go= {d} || exit 1\n\
+                 {sudo}chown {ids} {d} || {{ {sudo}chmod \"$anvil_was\" {d}; echo {failed} >&2; exit 1; }}\n\
+                 fi\n"
+        );
+        (
+            own,
+            format!("{sudo}chmod {} {d} || exit 1\n", kept(&previous.mode)),
+        )
+    } else {
+        let warning = quote(&format!(
+            "{kind}: {dest} was owned by {ids}; only root can give it back"
+        ));
+        // A group that did not go back never gets the recorded mode's
+        // group bits, not even for a moment: one chmod without them.
+        let mode = &previous.mode;
+        let at = mode.len().saturating_sub(2);
+        let masked = format!("{}0{}", &mode[..at], &mode[at + 1..]);
+        let (mode, masked) = (kept(mode), kept(&masked));
+        let chmod = format!(
+            "if [ -n \"$anvil_g\" ]; then chmod {mode} {d}; else chmod {masked} {d}; fi || exit 1\n"
+        );
+        let own = format!(
+            "anvil_g=1\n\
+                 if [ \"$4\" != {gid} ]; then chmod go= {d} || exit 1\n\
+                 chgrp {gid} {d} 2>/dev/null || anvil_g=\n\
+                 fi\n\
+                 if [ \"$3\" = {uid} ] && [ -n \"$anvil_g\" ]; then anvil_what={all}\n\
+                 else echo {warning} >&2; anvil_what=${{anvil_g:+'group and '}}; fi\n",
+            uid = previous.uid,
+            gid = previous.gid,
+        );
+        (own, chmod)
+    };
+    let special = if keep_special { KEEP_SPECIAL } else { "" };
+    format!(
+        "{OCTAL}{special}anvil_line=$({sudo}ls -lLdn {d}) || exit 1\n\
+         set -- $anvil_line\n\
+         anvil_was=$(anvil_octal \"$1\")\n\
+         {own}{chmod}\
+         printf 'restored %smode of %s\\n' \"$anvil_what\" {d}\n"
+    )
+}
+
+/// What opens a restore script that writes no bytes.
+const PLAIN_OPEN: &str = "{ umask 077; LC_ALL=C; export LC_ALL; set -f\n";
 
 /// What every restore script of one dest shares.
 struct Restore<'a> {
@@ -1477,8 +1960,14 @@ struct Restore<'a> {
     /// [`link_removal_checks`].
     checks: &'a str,
     as_root: bool,
-    /// [`restore_guard`]'s lines.
+    /// [`restore_guard`]'s lines; none for a refused write, which wrote nothing.
     guard: String,
+    /// [`remove_dirs`]' lines, after DEST is restored or removed.
+    dirs: String,
+    /// For a file a `[[links]]` step replaced, the lines that run in place
+    /// of the directory refusal, which would follow the link, and what the
+    /// EXIT trap then adds ([`Replacement::undo`]).
+    link: Option<(&'a str, &'a str)>,
 }
 
 impl Restore<'_> {
@@ -1486,18 +1975,63 @@ impl Restore<'_> {
     /// the guard and the sweep.
     fn head(&self, open: &str) -> Zeroizing<String> {
         let d = quote(self.dest);
-        let ready = match self.sudo {
-            "" => String::new(),
-            sudo => format!("{sudo}true || exit 1\n"),
+        let ready = self.ready();
+        let directory = match self.link {
+            Some((lines, _)) => format!("true || exit 1\n{lines}"),
+            None => format!("{} || exit 1\n", not_a_directory(self.sudo, &d, self.dest)),
         };
-        let directory = not_a_directory(self.sudo, &d, self.dest);
         zeroizing(format_args!(
-            "{open}{ready}{}{directory} || exit 1\n\
-             {}{}",
+            "{open}{ready}{}{directory}{}{}",
             self.checks,
             self.guard,
             sweep(self.sudo, self.dest),
         ))
+    }
+
+    /// After a restore that succeeded, the removal of the directories the
+    /// write created.
+    fn after(&self) -> String {
+        match self.dirs.as_str() {
+            "" => String::new(),
+            dirs => format!("[ $? -eq 0 ] || exit 1\n{dirs}"),
+        }
+    }
+
+    /// The line that exits when `sudo` fails.
+    fn ready(&self) -> String {
+        match self.sudo {
+            "" => String::new(),
+            sudo => format!("{sudo}true || exit 1\n"),
+        }
+    }
+
+    /// A refused write's: after the checks, only the directories it created
+    /// are removed; DEST was never written.
+    fn dirs_only(&self) -> String {
+        format!(
+            "{PLAIN_OPEN}{}{}true || exit 1\n{}}}\n",
+            self.ready(),
+            self.checks,
+            self.dirs
+        )
+    }
+
+    /// An attrs-only fix's: DEST's bytes stay and [`restore_attrs`] puts
+    /// back its owner, group and mode.
+    fn attrs(&self, previous: &PreviousFile) -> String {
+        format!(
+            "{}if [ -n \"$anvil_same\" ]; then echo {unchanged}\n\
+             else\n{}fi\n{after}}}\n",
+            *self.head(PLAIN_OPEN),
+            restore_attrs(
+                "files",
+                (self.dest, self.sudo, self.as_root),
+                &previous.attrs(),
+                false
+            ),
+            unchanged = quote(&format!("unchanged {}", self.dest)),
+            after = self.after(),
+        )
     }
 
     /// As the user, a warning when DEST's owner is not the recorded one;
@@ -1538,13 +2072,18 @@ impl Restore<'_> {
     ) -> Result<Zeroizing<String>, String> {
         let temp = temp_beside(self.dest)?;
         let write = Replacement {
+            undo: self.link.map_or("", |(_, undo)| undo),
             dest: self.dest,
             mode: &previous.mode,
             sudo: self.sudo,
             as_root: self.as_root,
             temp: &temp,
             bytes,
-            ids: Some((previous.uid, previous.gid)),
+            ids: if self.as_root {
+                Ids::Restore(previous.uid, previous.gid)
+            } else {
+                Ids::Keep
+            },
         };
         let (unchanged, restored) = (
             quote(&format!("unchanged {}", self.dest)),
@@ -1554,10 +2093,11 @@ impl Restore<'_> {
         Ok(zeroizing(format_args!(
             "{}if [ -n \"$anvil_same\" ]; then {warning}{same}anvil_mode && echo {unchanged}\n\
              else {replace}fi\n\
-             }}\n",
+             {after}}}\n",
             *self.head(&write.open()),
             same = self.same_owner(previous),
             replace = write.replace(&format!("{warning}echo {restored}")),
+            after = self.after(),
         )))
     }
 
@@ -1587,8 +2127,9 @@ impl Restore<'_> {
         format!(
             "{}if [ -n \"$anvil_same\" ]; then echo {unchanged}\n\
              else {sudo}rm -f {d} && echo {removed}; fi\n\
-             }}\n",
-            *self.head("{ umask 077; LC_ALL=C; export LC_ALL; set -f\n")
+             {}}}\n",
+            *self.head(PLAIN_OPEN),
+            self.after(),
         )
     }
 }
@@ -1622,14 +2163,33 @@ mod tests {
     ) -> Zeroizing<String> {
         super::tee_script(
             heredoc,
-            dest,
-            mode,
-            sudo,
-            checks,
-            !checks.is_empty(),
+            &plain(dest, mode, sudo, checks, !checks.is_empty()),
             expected,
         )
         .unwrap()
+    }
+
+    /// A plain [`FileWrite`] of the first src with no owner or group.
+    fn plain(dest: &str, mode: &str, sudo: &str, checks: &str, as_root: bool) -> FileWrite {
+        FileWrite {
+            ordinal: 0,
+            dest: dest.to_owned(),
+            mode: mode.to_owned(),
+            sudo: sudo.to_owned(),
+            checks: checks.to_owned(),
+            walk: Box::new(Walk {
+                kind: "files",
+                dirs: Vec::new(),
+                owner: ROOT_OWNED.to_owned(),
+                create: None,
+            }),
+            as_root,
+            password: false,
+            rendered: None,
+            ids: None,
+            mark: WalkNonce::attrs().unwrap(),
+            parents: false,
+        }
     }
 
     /// [`super::install_script`] from a staged file of `"new\n"`.
@@ -1640,7 +2200,11 @@ mod tests {
         checks: &str,
         expected: &Expected,
     ) -> String {
-        super::install_script(temp, 4, dest, mode, checks, expected)
+        let step = FileWrite {
+            password: true,
+            ..plain(dest, mode, "sudo ", checks, true)
+        };
+        super::install_script(temp, 4, &step, expected)
             .unwrap()
             .to_string()
     }
@@ -1674,6 +2238,9 @@ mod tests {
             src: src.to_owned(),
             dest: dest.to_owned(),
             mode: Some(ModeValue::Text("0644".to_owned())),
+            owner: None,
+            group: None,
+            parents: false,
             tags: Vec::new(),
             facts: BTreeMap::new(),
             sudo: true,
@@ -2290,15 +2857,46 @@ mod tests {
         };
         super::tee_script(
             &Heredoc::new("new\n").unwrap(),
-            d,
-            "0640",
-            sudo,
-            &checks,
-            !sudo.is_empty(),
+            &plain(d, "0640", sudo, &checks, !sudo.is_empty()),
             &Expected::Unchecked,
         )
         .unwrap()
         .to_string()
+    }
+
+    /// [`replacing`] with an entry's `owner` and `group`; `user` makes it the
+    /// user write of that login user.
+    fn owning(
+        dest: &Path,
+        sudo: &str,
+        (owner, group): (Option<&str>, Option<&str>),
+        user: Option<&str>,
+    ) -> String {
+        let d = dest.to_str().unwrap();
+        let top = dest.parent().unwrap();
+        let checks = match user {
+            Some(_) => login_checks(d, top),
+            None => user_checks(sudo, dest, top),
+        };
+        let step = FileWrite {
+            ids: Some(Ownership {
+                owner: owner.map(str::to_owned),
+                group: group.map(str::to_owned),
+                user: user.map(|user| ("files[0]".to_owned(), user.to_owned())),
+            }),
+            ..plain(d, "0640", sudo, &checks, user.is_none())
+        };
+        super::tee_script(&Heredoc::new("new\n").unwrap(), &step, &Expected::Unchecked)
+            .unwrap()
+            .to_string()
+    }
+
+    /// This process's uid and gid, as numeric strings.
+    fn own_ids() -> (String, String) {
+        (
+            rustix::process::getuid().as_raw().to_string(),
+            rustix::process::getgid().as_raw().to_string(),
+        )
     }
 
     /// A directory holding `dest` with "old\n", and `bin` first on PATH with
@@ -2309,7 +2907,10 @@ mod tests {
             &dir,
             &[],
             &[
-                &[("sudo", "case $1 in -n) shift ;; esac\nexec \"$@\"")],
+                &[(
+                    "sudo",
+                    "case $1 in -n) shift ;; -k) exit 0 ;; esac\nexec \"$@\"",
+                )],
                 scripts,
             ]
             .concat(),
@@ -2785,6 +3386,657 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Logs `TOOL ARGS SIZE`, SIZE being the temp's when an arg is one.
+    fn logging(tool: &str) -> String {
+        format!(
+            "for a; do case $a in *.anvil-*) n=$(/usr/bin/wc -c <\"$a\" | tr -d ' ') ;; esac; done\n\
+             echo \"{tool} $* $n\" >>\"$ANVIL_LOG\"\n{REAL} exec {tool} \"$@\""
+        )
+    }
+
+    /// `script` run with `ANVIL_LOG` set to `log`.
+    fn logged_to(log: &Path, script: &str) -> String {
+        format!(
+            "ANVIL_LOG={}; export ANVIL_LOG\n{script}",
+            quote(log.to_str().unwrap())
+        )
+    }
+
+    #[test]
+    fn an_owner_and_group_reach_the_empty_temp_before_the_bytes() {
+        let (uid, gid) = own_ids();
+        let tools = [
+            ("chown", logging("chown")),
+            ("chgrp", logging("chgrp")),
+            ("chmod", logging("chmod")),
+            ("mv", logging("mv")),
+        ];
+        let tools: Vec<(&str, &str)> = tools.iter().map(|(t, b)| (*t, b.as_str())).collect();
+        let cases = [
+            (
+                (Some(uid.as_str()), Some(gid.as_str())),
+                None,
+                ["chown", "chgrp"].as_slice(),
+            ),
+            ((Some(uid.as_str()), None), None, &["chown", "chgrp"]),
+            ((None, Some(gid.as_str())), None, &["chgrp", "chown"]),
+            (
+                (Some(uid.as_str()), Some(gid.as_str())),
+                Some("me"),
+                &["chgrp"],
+            ),
+        ];
+        for (ids, user, ownership) in cases {
+            let (dir, bin, dest) = write_case("files-owned", &tools);
+            let before = fs::metadata(&dest).unwrap();
+            let log = dir.join("log");
+            let sudo = if user.is_some() { "" } else { "sudo -n " };
+            let out = sh_with(&bin, &logged_to(&log, &owning(&dest, sudo, ids, user)));
+            assert_eq!(String::from_utf8(out.stderr).unwrap(), "", "{ids:?}");
+            assert_eq!(out.code, Some(0), "{ids:?}");
+            let log = fs::read_to_string(&log).unwrap();
+            let on_temp: Vec<(&str, &str)> = log
+                .lines()
+                .filter(|l| l.contains(".anvil-") && !l.starts_with("chmod 600"))
+                .map(|l| (l.split(' ').next().unwrap(), l.rsplit(' ').next().unwrap()))
+                .collect();
+            let tools: Vec<&str> = on_temp.iter().map(|(tool, _)| *tool).collect();
+            assert_eq!(tools, [ownership, &["chmod", "mv"]].concat(), "{log}");
+            for (tool, size) in &on_temp[..ownership.len()] {
+                assert_eq!(*size, "0", "{tool} on the empty temp: {log}");
+            }
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+            let meta = fs::metadata(&dest).unwrap();
+            let want = |set: Option<&str>, was: u32| set.map_or(was.to_string(), str::to_owned);
+            assert_eq!(
+                (meta.uid().to_string(), meta.gid().to_string()),
+                (want(ids.0, before.uid()), want(ids.1, before.gid())),
+                "an unset half keeps DEST's"
+            );
+            assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_password_path_gives_the_temp_its_owner_before_the_bytes() {
+        let (uid, gid) = own_ids();
+        let sudo = "case $1 in -k) exit 0 ;; -n) shift ;; esac\nexec \"$@\"";
+        let (chown, chgrp) = (logging("chown"), logging("chgrp"));
+        let (dir, bin, dest) = write_case(
+            "files-owned-tty",
+            &[("sudo", sudo), ("chown", &chown), ("chgrp", &chgrp)],
+        );
+        let (log, staged) = (dir.join("log"), dir.join("staged"));
+        fs::write(&staged, "new\n").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+        let top = dest.parent().unwrap();
+        let step = FileWrite {
+            password: true,
+            ids: Some(Ownership {
+                owner: Some(uid),
+                group: Some(gid),
+                user: None,
+            }),
+            ..plain(
+                dest.to_str().unwrap(),
+                "0640",
+                "sudo ",
+                &user_checks("sudo ", &dest, top),
+                true,
+            )
+        };
+        let script =
+            super::install_script(staged.to_str().unwrap(), 4, &step, &Expected::Unchecked)
+                .unwrap();
+        let out = sh_with(&bin, &logged_to(&log, &script));
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+        assert_eq!(out.code, Some(0));
+        let log = fs::read_to_string(&log).unwrap();
+        let tools: Vec<&str> = log.lines().map(|l| l.split(' ').next().unwrap()).collect();
+        assert_eq!(tools, ["chown", "chgrp"], "{log}");
+        assert!(log.lines().all(|l| l.ends_with(" 0")), "{log}");
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_owner_the_target_does_not_know_is_refused_before_any_temp() {
+        let (dir, bin, dest) = write_case("files-no-owner", &[]);
+        let ids = (Some("anvil-no-such-user"), None);
+        let out = sh_with(&bin, &owning(&dest, "sudo -n ", ids, None));
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            "files: owner anvil-no-such-user does not exist on the target\n"
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_group_that_cannot_be_set_is_refused_and_removes_the_temp() {
+        let (_, gid) = own_ids();
+        let cases = [
+            (
+                None,
+                "files: group anvil-no-such-group does not exist on the target\n",
+            ),
+            (
+                Some("me"),
+                "files: group anvil-no-such-group is not one of me's groups\n",
+            ),
+        ];
+        for (user, wording) in cases {
+            let (dir, bin, dest) = write_case("files-no-group", &[]);
+            let sudo = if user.is_some() { "" } else { "sudo -n " };
+            let ids = (None, Some("anvil-no-such-group"));
+            let out = sh_with(&bin, &owning(&dest, sudo, ids, user));
+            assert_eq!(out.code, Some(REFUSED), "{user:?}");
+            let stderr = String::from_utf8(out.stderr).unwrap();
+            assert!(stderr.ends_with(wording), "{stderr}");
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+            assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+            let out = sh_with(&bin, &owning(&dest, sudo, (None, Some(&gid)), user));
+            assert_eq!(
+                out.code,
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_numeric_owner_on_a_user_write_must_be_the_login_users_id() {
+        let (uid, _) = own_ids();
+        let other = (rustix::process::getuid().as_raw() + 1).to_string();
+        let (dir, bin, dest) = write_case("files-not-mine", &[]);
+        let out = sh_with(&bin, &owning(&dest, "", (Some(&other), None), Some("me")));
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!("files[0].owner {other}: needs sudo; the login user is me\n")
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        let out = sh_with(&bin, &owning(&dest, "", (Some(&uid), None), Some("me")));
+        assert_eq!(
+            out.code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pending_owner_or_group_refuses_each_in_place_fallback() {
+        let (uid, gid) = own_ids();
+        let refused = |dest: &Path, why: &str| {
+            format!(
+                "files: {}: owner and group need an atomic write: {why}\n",
+                dest.display()
+            )
+        };
+        for sudo in ["", "sudo -n "] {
+            let user = sudo.is_empty().then_some("me");
+            let (dir, bin, dest) = write_case("files-owned-mvfail", &[("mv", "exit 1")]);
+            let out = sh_with(&bin, &owning(&dest, sudo, (None, Some(&gid)), user));
+            assert_eq!(out.code, Some(REFUSED), "{sudo:?}");
+            assert_eq!(
+                String::from_utf8(out.stderr).unwrap(),
+                refused(&dest, "mv failed")
+            );
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+            assert_eq!(mode(&dest), 0o644);
+            assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        let (dir, bin, dest) = write_case("files-owned-mismatch", &[("ls", &foreign_ls(false))]);
+        let out = sh_with(&bin, &owning(&dest, "", (Some(&uid), None), Some("me")));
+        assert_eq!(out.code, Some(REFUSED));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.starts_with(refused(&dest, "it is owned by ").trim_end()),
+            "{stderr}"
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+        fs::remove_dir_all(&dir).unwrap();
+
+        if rustix::process::getuid().is_root() {
+            return;
+        }
+        let (dir, bin, dest) = write_case("files-owned-rodir", &[]);
+        let parent = dest.parent().unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let out = sh_with(&bin, &owning(&dest, "", (None, Some(&gid)), Some("me")));
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            refused(&dest, "its directory is not writable")
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_user_write_with_only_an_owner_keeps_dests_other_group() {
+        let (uid, _) = own_ids();
+        // DEST in group 5678, which a chgrp shim accepts: runs on any user.
+        let chgrp = "echo \"chgrp $*\" >>\"$ANVIL_LOG\"";
+        let (dir, bin, dest) = write_case(
+            "files-other-group-shim",
+            &[("ls", &foreign_ls(false)), ("chgrp", chgrp)],
+        );
+        let log = dir.join("log");
+        let script = owning(&dest, "", (Some(&uid), None), Some("me"));
+        let out = sh_with(&bin, &logged_to(&log, &script));
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+        assert_eq!(out.code, Some(0));
+        let log = fs::read_to_string(&log).unwrap();
+        let temp = format!("chgrp 5678 {}/.anvil-", dest.parent().unwrap().display());
+        assert!(log.starts_with(&temp) && log.lines().count() == 1, "{log}");
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+        fs::remove_dir_all(&dir).unwrap();
+
+        let primary = rustix::process::getgid().as_raw();
+        let groups = text_of(std::process::Command::new("id").arg("-G"));
+        let Some(other) = groups
+            .split_whitespace()
+            .map(|gid| gid.parse::<u32>().unwrap())
+            .find(|gid| *gid != primary)
+        else {
+            return;
+        };
+        let (dir, bin, dest) = write_case("files-other-group", &[]);
+        let chgrp = std::process::Command::new("chgrp")
+            .arg(other.to_string())
+            .arg(&dest)
+            .status()
+            .unwrap();
+        assert!(chgrp.success());
+        let out = sh_with(&bin, &owning(&dest, "", (Some(&uid), None), Some("me")));
+        assert_eq!(
+            out.code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+        assert_eq!(fs::metadata(&dest).unwrap().gid(), other);
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn octal_reads_each_ls_mode_with_its_special_bits() {
+        for (ls, octal) in [
+            ("-rw-r--r--", "0644"),
+            ("-rw-r-----+", "0640"),
+            ("-rwsr-sr-t", "7755"),
+            ("-rwSr-S--T", "7640"),
+            ("----------", "0000"),
+            ("-rwxrwxrwx@", "0777"),
+        ] {
+            let script = format!("{OCTAL}anvil_octal {}\n", quote(ls));
+            assert_eq!(sh(&script), (Some(0), format!("{octal}\n")), "{ls}");
+        }
+    }
+
+    /// [`write_case`] with `dest` already holding the bytes [`owning`]
+    /// writes, in `mode`, and chown, chgrp and chmod logged.
+    fn same_case(tag: &str, mode: u32, more: &[(&str, &str)]) -> (PathBuf, PathBuf, PathBuf) {
+        let tools = [
+            ("chown", logging("chown")),
+            ("chgrp", logging("chgrp")),
+            ("chmod", logging("chmod")),
+        ];
+        let tools: Vec<(&str, &str)> = tools.iter().map(|(t, b)| (*t, b.as_str())).collect();
+        let (dir, bin, dest) = write_case(tag, &[tools.as_slice(), more].concat());
+        fs::write(&dest, "new\n").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(mode)).unwrap();
+        (dir, bin, dest)
+    }
+
+    #[test]
+    fn the_same_bytes_and_attributes_run_nothing_on_dest_and_make_no_temp() {
+        let (uid, _) = own_ids();
+        let (dir, bin, dest) = same_case("files-same", 0o640, &[]);
+        let gid_now = fs::metadata(&dest).unwrap().gid().to_string();
+        let d = dest.to_str().unwrap();
+        let log = dir.join("log");
+        for script in [
+            replacing(&dest, ""),
+            replacing(&dest, "sudo -n "),
+            owning(&dest, "sudo -n ", (Some(&uid), Some(&gid_now)), None),
+            owning(&dest, "", (None, Some(&gid_now)), Some("me")),
+        ] {
+            let parent = fs::metadata(dest.parent().unwrap()).unwrap().mtime_nsec();
+            let ctime = fs::metadata(&dest).unwrap().ctime_nsec();
+            let out = sh_with(&bin, &logged_to(&log, &script));
+            assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+            assert_eq!(
+                (out.code, String::from_utf8(out.stdout).unwrap()),
+                (Some(0), format!("unchanged {d}\n"))
+            );
+            assert!(!log.exists(), "{}", fs::read_to_string(&log).unwrap());
+            assert_eq!(fs::metadata(&dest).unwrap().ctime_nsec(), ctime);
+            assert_eq!(
+                fs::metadata(dest.parent().unwrap()).unwrap().mtime_nsec(),
+                parent,
+                "no temp beside it"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mode_drift_with_the_same_bytes_is_only_a_chmod() {
+        let (dir, bin, dest) = same_case("files-same-mode", 0o664, &[]);
+        let d = dest.to_str().unwrap();
+        let log = dir.join("log");
+        let out = sh_with(&bin, &logged_to(&log, &replacing(&dest, "sudo -n ")));
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+        assert_eq!(
+            (out.code, String::from_utf8(out.stdout).unwrap()),
+            (Some(0), format!("fixed {d}: mode\n"))
+        );
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            format!("chmod 0640 {d} \n")
+        );
+        assert_eq!(mode(&dest), 0o640);
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A group the test user is in that `dest` does not have, by number.
+    fn another_group(dest: &Path) -> Option<String> {
+        let was = fs::metadata(dest).unwrap().gid().to_string();
+        let groups = text_of(std::process::Command::new("id").arg("-G"));
+        groups.split(' ').find(|gid| *gid != was).map(str::to_owned)
+    }
+
+    #[test]
+    fn a_new_group_with_the_same_bytes_narrows_then_chgrps_then_sets_the_mode() {
+        for (was, named) in [(0o664, "group, mode"), (0o640, "group")] {
+            let (dir, bin, dest) = same_case("files-same-group", was, &[]);
+            let Some(other) = another_group(&dest) else {
+                eprintln!("skip: the user is in one group only");
+                return;
+            };
+            let d = dest.to_str().unwrap();
+            let log = dir.join("log");
+            let script = owning(&dest, "sudo -n ", (None, Some(&other)), None);
+            let out = sh_with(&bin, &logged_to(&log, &script));
+            assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+            assert_eq!(
+                (out.code, String::from_utf8(out.stdout).unwrap()),
+                (Some(0), format!("fixed {d}: {named}\n"))
+            );
+            assert_eq!(
+                fs::read_to_string(&log).unwrap(),
+                format!("chmod go= {d} \nchgrp {other} {d} \nchmod 0640 {d} \n")
+            );
+            assert_eq!(fs::metadata(&dest).unwrap().gid().to_string(), other);
+            assert_eq!(mode(&dest), 0o640);
+            let out = sh_with(&bin, &script);
+            assert_eq!(
+                String::from_utf8(out.stdout).unwrap(),
+                format!("unchanged {d}\n"),
+                "then nothing differs"
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_group_name_is_compared_through_find_not_the_name_ls_prints() {
+        let ls = format!(
+            "{REAL}\ncase $1 in -lLd | -l) ls \"$@\" | awk '{{$4=substr($4,1,2); print}}' ;; \
+             *) ls \"$@\" ;; esac"
+        );
+        let (dir, bin, dest) = same_case("files-same-name", 0o640, &[("ls", &ls)]);
+        let d = dest.to_str().unwrap();
+        let line = text_of(std::process::Command::new("ls").args(["-lLd", d]));
+        let name = line.split_whitespace().nth(3).unwrap().to_owned();
+        let out = sh_with(&bin, &owning(&dest, "sudo -n ", (None, Some(&name)), None));
+        assert_eq!(
+            (out.code, String::from_utf8(out.stdout).unwrap()),
+            (Some(0), format!("unchanged {d}\n")),
+            "{name} as ls -l cuts it short"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_user_write_to_another_users_dest_says_it_cannot_chmod_not_the_group() {
+        let chmod = format!("{REAL}\ncase $1 in go=) exit 1 ;; esac\nexec chmod \"$@\"");
+        let (dir, bin, dest) = same_case("files-same-foreign", 0o664, &[("chmod", &chmod)]);
+        let d = dest.to_str().unwrap();
+        let gid = (fs::metadata(&dest).unwrap().gid() + 1).to_string();
+        let log = dir.join("log");
+        let script = owning(&dest, "", (None, Some(&gid)), Some("me"));
+        let out = sh_with(&bin, &logged_to(&log, &script));
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!("files: {d} cannot be given mode 0640: only its owner can chmod it\n")
+        );
+        assert!(
+            !fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("chgrp")
+        );
+        assert_eq!(mode(&dest), 0o664);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_owner_gone_between_the_check_and_the_compare_is_refused() {
+        let id = format!(
+            "{REAL}\necho \"$*\" >>\"$0.ran\"\n[ \"$(wc -l <\"$0.ran\")\" -lt 2 ] || exit 1\nexec id \"$@\""
+        );
+        let (dir, bin, dest) = same_case("files-same-gone", 0o640, &[("id", &id)]);
+        let name = text_of(std::process::Command::new("id").arg("-un"));
+        let out = sh_with(&bin, &owning(&dest, "sudo -n ", (Some(&name), None), None));
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!("files: owner {name} does not exist on the target\n")
+        );
+        assert_eq!(
+            fs::read_to_string(bin.join("id.ran")).unwrap(),
+            format!("-u {name}\n-u {name}\n"),
+            "the check passed, the compare's lookup failed"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attributes_it_cannot_read_fail_with_a_message() {
+        let ls = format!("{REAL}\ncase $1 in -lLdn) exit 1 ;; esac\nexec ls \"$@\"");
+        let (dir, bin, dest) = same_case("files-same-unread", 0o640, &[("ls", &ls)]);
+        let d = dest.to_str().unwrap();
+        let out = sh_with(&bin, &replacing(&dest, "sudo -n "));
+        assert_eq!(out.code, Some(1));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!("files: cannot read {d}'s owner, group and mode\n")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_user_write_whose_dest_has_another_owner_is_refused_without_a_change() {
+        let (uid, _) = own_ids();
+        let ls = format!(
+            "{REAL}\ncase $1 in -lLdn) ls -lLdn \"$2\" | awk '{{$3=1234; print}}' ;; *) ls \"$@\" ;; esac"
+        );
+        let (dir, bin, dest) = same_case("files-same-owner", 0o664, &[("ls", &ls)]);
+        let log = dir.join("log");
+        let script = owning(&dest, "", (Some(&uid), None), Some("me"));
+        let out = sh_with(&bin, &logged_to(&log, &script));
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!("files[0].owner {uid}: needs sudo; the login user is me\n")
+        );
+        assert!(!log.exists());
+        assert_eq!(mode(&dest), 0o664);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_chgrp_that_fails_puts_the_narrowed_mode_back_and_refuses() {
+        let chgrp = format!("{REAL}\nexit 1");
+        let (dir, bin, dest) = same_case("files-same-nogroup", 0o664, &[("chgrp", &chgrp)]);
+        let gid = fs::metadata(&dest).unwrap().gid() + 1;
+        for (user, why) in [
+            (
+                None,
+                format!("files: group {gid} does not exist on the target\n"),
+            ),
+            (
+                Some("me"),
+                format!("files: group {gid} is not one of me's groups\n"),
+            ),
+        ] {
+            let sudo = if user.is_some() { "" } else { "sudo -n " };
+            let script = owning(&dest, sudo, (None, Some(&gid.to_string())), user);
+            let out = sh_with(&bin, &script);
+            assert_eq!(out.code, Some(REFUSED));
+            assert_eq!(String::from_utf8(out.stderr).unwrap(), why);
+            assert_eq!(mode(&dest), 0o664);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_fix_that_does_not_take_fails_and_names_what_dest_has_now() {
+        let chmod = format!("{REAL}\ncase $1 in go=) exec chmod \"$@\" ;; esac\nexit 0");
+        let (dir, bin, dest) = same_case("files-same-stuck", 0o664, &[("chmod", &chmod)]);
+        let d = dest.to_str().unwrap();
+        let meta = fs::metadata(&dest).unwrap();
+        let out = sh_with(&bin, &replacing(&dest, "sudo -n "));
+        assert_eq!(out.code, Some(1));
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "");
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!(
+                "files: {d}: owner, group or mode did not take (now {}:{} 0664)\n",
+                meta.uid(),
+                meta.gid()
+            )
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_password_path_fixes_the_same_bytes_too() {
+        let run = install_script(
+            "/tmp/anvil-00",
+            "/etc/a",
+            "0640",
+            &root_checks("sudo ", "/etc/a"),
+            &Expected::Unchecked,
+        );
+        assert!(
+            run.contains("printf '%s%s\\n' 'fixed /etc/a: ' \"$anvil_what\"\n"),
+            "{run}"
+        );
+        assert!(run.contains("sudo ls -lLdn '/etc/a'"), "{run}");
+    }
+
+    /// The trimmed stdout of `command`.
+    fn text_of(command: &mut std::process::Command) -> String {
+        String::from_utf8(command.output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_chown_of_the_temp_that_fails_after_id_names_the_owner_it_could_not_give() {
+        let user = text_of(std::process::Command::new("id").arg("-un"));
+        let (dir, bin, dest) = write_case("files-chown-fails", &[("chown", "exit 1")]);
+        let out = sh_with(&bin, &owning(&dest, "sudo -n ", (Some(&user), None), None));
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!(
+                "files: cannot give the temp for {} owner {user}\n",
+                dest.display()
+            )
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ids_that_do_not_read_back_as_numbers_fail_before_the_bytes() {
+        let (_, gid) = own_ids();
+        let ls = format!(
+            "{REAL}\ncase $1$2 in -ln*.anvil-*) ls -ln \"$2\" | awk '{{$4=\"x\"; print}}' ;; *) ls \"$@\" ;; esac"
+        );
+        let (dir, bin, dest) = write_case("files-ids-garbled", &[("ls", &ls)]);
+        let out = sh_with(&bin, &owning(&dest, "sudo -n ", (None, Some(&gid)), None));
+        assert_eq!(out.code, Some(1));
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains("cannot write a temp file beside"),
+            "{stderr}"
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old\n");
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sudo_false_with_another_owner_fails_the_target_at_resolve() {
+        let with = |owner: &str, sudo: bool| {
+            let entry = FileEntry {
+                owner: Some(owner.to_owned()),
+                sudo,
+                ..entry("a", "/etc/a")
+            };
+            config_in(Path::new("/c"), vec![entry])
+        };
+        let sources = Sources::of(&["a\n"]);
+        let user = facts(&[("user", "alice"), ("sudo", "nopasswd")]);
+        let root = facts(&[("user", "root")]);
+        let err = runs(&with("bob", false), &sources, &host(&[], None), Some(&user)).unwrap_err();
+        assert_eq!(
+            err,
+            "files[0].owner bob: needs sudo; the login user is alice"
+        );
+        for (owner, sudo, facts) in [
+            ("alice", false, &user),
+            ("1000", false, &user),
+            ("bob", true, &user),
+            ("bob", false, &root),
+        ] {
+            let runs = runs(&with(owner, sudo), &sources, &host(&[], None), Some(facts));
+            let write = written(&runs.unwrap()[0]);
+            assert_eq!(write.ids.unwrap().owner.as_deref(), Some(owner));
+        }
+        let plain = runs(
+            &config_in(Path::new("/c"), vec![entry("a", "/etc/a")]),
+            &sources,
+            &host(&[], None),
+            Some(&user),
+        );
+        assert_eq!(written(&plain.unwrap()[0]).ids, None);
+    }
+
     #[test]
     fn a_temp_gone_when_mv_failed_never_truncates_dest() {
         for sudo in ["", "sudo -n "] {
@@ -2806,11 +4058,13 @@ mod tests {
         let d = dest.to_str().unwrap();
         let script = super::tee_script(
             &Heredoc::new("new\n").unwrap(),
-            d,
-            "0200",
-            "",
-            &login_checks(d, dest.parent().unwrap()),
-            false,
+            &plain(
+                d,
+                "0200",
+                "",
+                &login_checks(d, dest.parent().unwrap()),
+                false,
+            ),
             &Expected::Unchecked,
         )
         .unwrap();
@@ -3125,7 +4379,7 @@ mod tests {
 
     /// Runs `script` with `/bin/sh -s`; its exit code and stdout.
     fn sh(script: &str) -> (Option<i32>, String) {
-        let out = Local.run(script, RUN_TIMEOUT).unwrap();
+        let out = unmarked(Local.run(script, RUN_TIMEOUT).unwrap());
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.is_empty(), "{stderr}");
         (out.code, String::from_utf8(out.stdout).unwrap())
@@ -3198,9 +4452,13 @@ mod tests {
         assert_eq!(mode(&dest), 0o444);
         assert_eq!(
             write("two\n", "0600"),
-            (Some(0), format!("unchanged {dest_str}\n"))
+            (Some(0), format!("fixed {dest_str}: mode\n"))
         );
         assert_eq!(mode(&dest), 0o600);
+        assert_eq!(
+            write("two\n", "0600"),
+            (Some(0), format!("unchanged {dest_str}\n"))
+        );
         fs::set_permissions(&dest, fs::Permissions::from_mode(0o666)).unwrap();
         assert_eq!(
             write("three, longer than two\n", "644"),
@@ -3304,7 +4562,20 @@ mod tests {
             "PATH",
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         );
-        crate::transport::run_with_script(&mut command, script, RUN_TIMEOUT).unwrap()
+        unmarked(crate::transport::run_with_script(&mut command, script, RUN_TIMEOUT).unwrap())
+    }
+
+    /// `out` without the write's attrs line, which [`written_attrs`] tests.
+    ///
+    /// [`written_attrs`]: FileWrite::written_attrs
+    fn unmarked(mut out: crate::transport::Output) -> crate::transport::Output {
+        let lines = out.stdout.split_inclusive(|&b| b == b'\n');
+        out.stdout = lines
+            .filter(|line| !line.starts_with(b"anvil-attrs-"))
+            .flatten()
+            .copied()
+            .collect();
+        out
     }
 
     /// [`checks`] as [`root_checks`] builds them, but over the directories
@@ -3476,6 +4747,47 @@ mod tests {
     }
 
     #[test]
+    fn the_ids_the_temp_ends_with_are_read_back_before_the_bytes() {
+        let (uid, gid) = own_ids();
+        for (owner, group) in [(Some(uid.as_str()), None), (None, Some(gid.as_str()))] {
+            let (dir, bin, dest) = write_case("files-ids-back", &[]);
+            let before = fs::metadata(&dest).unwrap();
+            let heredoc = Heredoc::new("new\n").unwrap();
+            let temp = temp_beside(dest.to_str().unwrap()).unwrap();
+            let write = Replacement {
+                undo: "",
+                dest: dest.to_str().unwrap(),
+                mode: "0640",
+                sudo: "sudo -n ",
+                as_root: true,
+                temp: &temp,
+                bytes: Bytes::Inline(&heredoc),
+                ids: Ids::Set {
+                    owner,
+                    group,
+                    user: None,
+                },
+            };
+            let finish = "echo \"ids $anvil_ids\"";
+            let script = format!("{}{}}}\n", *write.open(), write.replace(finish));
+            let out = sh_with(&bin, &script);
+            assert_eq!(
+                out.code,
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let want = format!(
+                "ids {}:{}\n",
+                owner.map_or(before.uid().to_string(), str::to_owned),
+                group.map_or(before.gid().to_string(), str::to_owned),
+            );
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), want);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
     fn a_temp_or_a_link_already_at_the_temp_path_is_refused_and_kept() {
         for link in [false, true] {
             let (dir, bin, dest) = write_case("files-temp-taken", &[]);
@@ -3489,13 +4801,14 @@ mod tests {
             }
             let heredoc = Heredoc::new("new\n").unwrap();
             let write = Replacement {
+                undo: "",
                 dest: dest.to_str().unwrap(),
                 mode: "0640",
                 sudo: "sudo -n ",
                 as_root: true,
                 temp: temp.to_str().unwrap(),
                 bytes: Bytes::Inline(&heredoc),
-                ids: None,
+                ids: Ids::Keep,
             };
             let script = format!("{}{}}}\n", *write.open(), write.replace("echo done"));
             let out = sh_with(&bin, &script);
@@ -3605,6 +4918,8 @@ mod tests {
             checks: "",
             as_root: true,
             guard: restore_guard("sudo -n ", &file, false, Wording::Cli),
+            dirs: String::new(),
+            link: None,
         };
         let out = sh_with(&bin, &restore.remove(&format!("removed {d}")));
         assert_eq!(out.code, Some(CONFLICT));
@@ -3708,6 +5023,8 @@ mod tests {
             checks: "",
             as_root: true,
             guard: restore_guard("sudo -n ", &file, false, Wording::Cli),
+            dirs: String::new(),
+            link: None,
         };
         let out = sh_with(&bin, &restore.remove(&format!("removed {d}")));
         let stderr = String::from_utf8(out.stderr).unwrap();
@@ -4294,7 +5611,7 @@ mod tests {
     fn sh_only(bin: &Path, script: &str) -> crate::transport::Output {
         let mut command = std::process::Command::new("/bin/sh");
         command.arg("-s").env("PATH", bin);
-        crate::transport::run_with_script(&mut command, script, RUN_TIMEOUT).unwrap()
+        unmarked(crate::transport::run_with_script(&mut command, script, RUN_TIMEOUT).unwrap())
     }
 
     const BASE: [&str; 4] = ["ls", "sh", "readlink", "tr"];
@@ -4889,6 +6206,8 @@ mod tests {
             written_sha256: sha_hex(written.as_bytes()),
             write,
             previous,
+            written_attrs: None,
+            created_dirs: Vec::new(),
         }
     }
 
@@ -4964,6 +6283,351 @@ mod tests {
             0o640,
             "the mode comes back also when unchanged"
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The attrs of `path` now, as the record keeps them.
+    fn attrs_of(path: &Path) -> Attrs {
+        let (uid, gid) = ids(path);
+        Attrs {
+            uid,
+            gid,
+            mode: format!("{:04o}", mode(path)),
+        }
+    }
+
+    /// An attrs-only fix of `dest`, which holds `text`, from `mode`: its
+    /// text was not kept, as a 0640 file's is not.
+    fn attrs_fixed(dest: &Path, text: &str, mode: &str) -> FileRecord {
+        let (uid, gid) = ids(dest);
+        FileRecord {
+            written_attrs: Some(attrs_of(dest)),
+            ..recorded(
+                dest,
+                text,
+                Write::Written,
+                Previous::File(PreviousFile {
+                    mode: mode.to_owned(),
+                    uid,
+                    gid,
+                    sha256: sha_hex(text.as_bytes()),
+                    kept: false,
+                    text: None,
+                    reason: Some(NOT_WORLD_READABLE.to_owned()),
+                }),
+            )
+        }
+    }
+
+    #[test]
+    fn an_attrs_only_fix_puts_the_mode_back_without_any_text() {
+        let dir = dir("files-restore-attrs");
+        let dest = dir.join("conf");
+        fs::write(&dest, "v1\n").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
+        let file = attrs_fixed(&dest, "v1\n", "0640");
+        assert_eq!(file.not_kept(), None);
+        let d = dest.display();
+        assert_eq!(
+            restore(std::slice::from_ref(&file), &Force::None),
+            [ok(format!("restored owner, group and mode of {d}\n"))]
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "v1\n");
+        assert_eq!(mode(&dest), 0o640);
+        assert_eq!(
+            restore(&[file], &Force::None),
+            [ok(format!("unchanged {d}\n"))]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn as_the_user_an_attrs_only_restore_gives_back_the_group_and_names_what_it_restored() {
+        let dir = dir("files-restore-attrs-user");
+        let dest = dir.join("conf");
+        let d = dest.display().to_string();
+        let (uid, gid) = ids(&dir);
+        let text = text_of(std::process::Command::new("id").arg("-G"));
+        let mine: Vec<u32> = text
+            .split_whitespace()
+            .filter_map(|g| g.parse().ok())
+            .collect();
+        let stranger = (60000..65000).find(|g| !mine.contains(g)).unwrap();
+        let warning =
+            |ids: String| format!("files: {d} was owned by {ids}; only root can give it back\n");
+        let fixed_from = |uid: u32, gid: u32| {
+            // Anew, so that it has the directory's group again.
+            let _ = fs::remove_file(&dest);
+            fs::write(&dest, "v1\n").unwrap();
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
+            let mut file = attrs_fixed(&dest, "v1\n", "0640");
+            let Previous::File(previous) = &mut file.previous else {
+                unreachable!()
+            };
+            (previous.uid, previous.gid) = (uid, gid);
+            file
+        };
+        // A group of the user's goes back.
+        if let Some(&other) = mine.iter().find(|&&g| g != gid) {
+            let file = fixed_from(uid, other);
+            assert_eq!(
+                restore(&[file], &Force::None),
+                [ok(format!("restored owner, group and mode of {d}\n"))]
+            );
+            assert_eq!(ids(&dest), (uid, other));
+            assert_eq!(mode(&dest), 0o640);
+        }
+        // One that is not, or another owner, only root can give back.
+        let file = fixed_from(uid, stranger);
+        assert_eq!(
+            restore(&[file], &Force::None),
+            [(
+                Some(0),
+                format!("restored mode of {d}\n"),
+                warning(format!("{uid}:{stranger}"))
+            )]
+        );
+        // The group it kept does not get the recorded mode's group bits.
+        assert_eq!(mode(&dest), 0o600);
+        let file = fixed_from(uid + 1, gid);
+        assert_eq!(
+            restore(&[file], &Force::None),
+            [(
+                Some(0),
+                format!("restored group and mode of {d}\n"),
+                warning(format!("{}:{gid}", uid + 1))
+            )]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn as_root_a_failed_chown_puts_the_mode_back_and_fails() {
+        let (dir, bin, dest) = write_case("files-restore-attrs-chown", &[("chown", "exit 1")]);
+        fs::write(&dest, "v1\n").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut file = attrs_fixed(&dest, "v1\n", "0640");
+        let Previous::File(previous) = &mut file.previous else {
+            unreachable!()
+        };
+        previous.gid += 1;
+        let Previous::File(previous) = &file.previous else {
+            unreachable!()
+        };
+        let restore = Restore {
+            dest: &file.dest,
+            sudo: "sudo -n ",
+            checks: "",
+            as_root: true,
+            guard: restore_guard("sudo -n ", &file, false, Wording::Cli),
+            dirs: String::new(),
+            link: None,
+        };
+        let out = sh_with(&bin, &restore.attrs(previous));
+        assert_eq!(out.code, Some(1));
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!(
+                "files: cannot give {} owner and group {}:{}\n",
+                dest.display(),
+                previous.uid,
+                previous.gid
+            )
+        );
+        assert_eq!(mode(&dest), 0o644, "the mode put back");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attrs_changed_since_the_apply_refuse_the_restore_unless_forced() {
+        let dir = dir("files-restore-attrs-guard");
+        let dest = dir.join("conf");
+        let d = dest.display();
+        let changed = format!(
+            "files: {d} changed since the last apply; anvil rollback --force {d} restores it anyway\n"
+        );
+        fs::write(&dest, "v1\n").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o640)).unwrap();
+        let content = FileRecord {
+            written_attrs: Some(attrs_of(&dest)),
+            ..recorded(
+                &dest,
+                "v1\n",
+                Write::Written,
+                kept_file("v0\n", "0600", &dir),
+            )
+        };
+        let fix = attrs_fixed(&dest, "v1\n", "0600");
+        for file in [content, fix] {
+            fs::write(&dest, "v1\n").unwrap();
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                restore(std::slice::from_ref(&file), &Force::None),
+                [(Some(CONFLICT), String::new(), changed.clone())],
+                "{file:?}"
+            );
+            assert_eq!(mode(&dest), 0o644, "untouched");
+            let [(code, _, stderr)] = &restore(&[file], &Force::All)[..] else {
+                panic!("one run")
+            };
+            assert_eq!((code, stderr.as_str()), (&Some(0), ""));
+            assert_eq!(mode(&dest), 0o600);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_rollback_removes_the_dirs_the_write_created_deepest_first() {
+        let dir = dir("files-restore-dirs");
+        let (a, b) = (dir.join("a"), dir.join("a/b"));
+        fs::create_dir_all(&b).unwrap();
+        let dest = b.join("conf");
+        fs::write(&dest, "v1\n").unwrap();
+        let file = FileRecord {
+            created_dirs: [&a, &b].map(|p| p.display().to_string()).to_vec(),
+            ..recorded(&dest, "v1\n", Write::Written, Previous::Absent)
+        };
+        let top = dir.as_path();
+        let run = |file: &FileRecord| {
+            let runs = restore_runs_from(
+                top,
+                &Config::default(),
+                &host(&[], None),
+                &user_facts("nopasswd"),
+                std::slice::from_ref(file),
+                &Force::None,
+                Wording::Cli,
+            )
+            .unwrap();
+            let out = Local.run(&runs[0].run, RUN_TIMEOUT).unwrap();
+            (
+                out.code,
+                String::from_utf8(out.stdout).unwrap(),
+                String::from_utf8(out.stderr).unwrap(),
+            )
+        };
+        let (d, a_, b_) = (dest.display(), a.display(), b.display());
+        assert_eq!(
+            run(&file),
+            ok(format!(
+                "removed {d}\nremoved directory {b_}\nremoved directory {a_}\n"
+            ))
+        );
+        assert!(!a.exists());
+
+        // Someone else's file keeps its directory, and those above it.
+        fs::create_dir_all(&b).unwrap();
+        fs::write(&dest, "v1\n").unwrap();
+        fs::write(a.join("theirs"), "").unwrap();
+        assert_eq!(
+            run(&file),
+            (
+                Some(0),
+                format!("removed {d}\nremoved directory {b_}\n"),
+                format!("rollback: {a_} is not empty; left in place\n")
+            )
+        );
+        assert!(a.join("theirs").exists() && !b.exists());
+
+        // A refused write only removes the dirs it created.
+        fs::remove_file(a.join("theirs")).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let refused = FileRecord {
+            write: Write::Refused,
+            ..file.clone()
+        };
+        assert_eq!(
+            run(&refused),
+            ok(format!("removed directory {b_}\nremoved directory {a_}\n"))
+        );
+        assert!(!a.exists());
+
+        // A created directory others may now write fails the checks of the
+        // ones below it: nothing is removed through it.
+        fs::create_dir_all(&b).unwrap();
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o777)).unwrap();
+        let (code, stdout, stderr) = run(&refused);
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!((code, stdout.as_str()), (Some(1), ""));
+        assert!(
+            stderr.starts_with(&format!(
+                "files: {a_} is not owned by root or the login user"
+            )),
+            "{stderr}"
+        );
+        assert!(b.exists());
+        fs::remove_dir(&b).unwrap();
+        fs::remove_dir(&a).unwrap();
+
+        // An empty one that cannot go is not called "not empty".
+        let only_b = FileRecord {
+            created_dirs: vec![b.display().to_string()],
+            ..refused
+        };
+        fs::create_dir_all(&b).unwrap();
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o555)).unwrap();
+        let (code, stdout, stderr) = run(&only_b);
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).unwrap();
+        if ids(&dir).0 != 0 {
+            assert_eq!((code, stdout.as_str()), (Some(0), ""));
+            assert!(
+                stderr.starts_with(&format!("rollback: cannot remove {b_}: "))
+                    && stderr.contains("rmdir"),
+                "{stderr}"
+            );
+            assert!(b.exists());
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_marks_the_owner_group_and_mode_it_left() {
+        let dir = dir("files-written-attrs");
+        let dest = dir.join("conf");
+        let step = plain(dest.to_str().unwrap(), "0640", "", "", false);
+        let heredoc = Heredoc::new("new\n").unwrap();
+        for _ in ["wrote", "unchanged"] {
+            let script = super::tee_script(&heredoc, &step, &Expected::Unchecked).unwrap();
+            let mut out = Local.run(&script, RUN_TIMEOUT).unwrap();
+            assert_eq!(
+                out.code,
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(step.written_attrs(&mut out), Some(attrs_of(&dest)));
+            assert!(
+                !String::from_utf8(out.stdout)
+                    .unwrap()
+                    .contains("anvil-attrs-"),
+                "taken out"
+            );
+        }
+        assert_eq!(attrs_of(&dest).mode, "0640");
+
+        let line = |ls: &str| crate::transport::Output {
+            stdout: format!("motd\n{} {ls}\r\nwrote x\n", step.mark.as_str()).into_bytes(),
+            ..Local.run("true", RUN_TIMEOUT).unwrap()
+        };
+        let mut out = line("-rw-r----- 1 0 5 4 Jan 1 00:00 /x");
+        assert_eq!(
+            step.written_attrs(&mut out),
+            Some(Attrs {
+                uid: 0,
+                gid: 5,
+                mode: "0640".to_owned()
+            })
+        );
+        assert_eq!(out.stdout, b"motd\nwrote x\n");
+        for bad in ["drwxr-xr-x 1 0 0 4 Jan 1 00:00 /x", "garbage"] {
+            assert_eq!(step.written_attrs(&mut line(bad)), None, "{bad}");
+        }
+        let other = WalkNonce::attrs().unwrap();
+        let mut forged = crate::transport::Output {
+            stdout: format!("{} -rw-r--r-- 1 0 0 4 x /x\n", other.as_str()).into_bytes(),
+            ..Local.run("true", RUN_TIMEOUT).unwrap()
+        };
+        assert_eq!(step.written_attrs(&mut forged), None, "another nonce");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -5183,6 +6847,8 @@ mod tests {
             checks: &checks,
             as_root: true,
             guard: restore_guard(sudo, file, false, Wording::Cli),
+            dirs: String::new(),
+            link: None,
         };
         match &file.previous {
             Previous::File(previous) => {
@@ -5353,6 +7019,8 @@ mod tests {
             checks: &checks,
             as_root: true,
             guard: restore_guard("sudo ", &file, false, Wording::Cli),
+            dirs: String::new(),
+            link: None,
         };
         let Previous::File(previous) = &file.previous else {
             unreachable!()
@@ -6145,5 +7813,251 @@ mod tests {
             err,
             "files[1].src `a.j2`: template: rendered output exceeds the 1 MiB limit"
         );
+    }
+
+    /// A write of "new\n" to `dest`, as the login user or through `sudo -n`
+    /// as root (`password`: the password path), checked and walked from `top`;
+    /// `create` is the walk's nonce with `parents = true`.
+    fn walking(
+        dest: &Path,
+        top: &Path,
+        sudo: &str,
+        create: Option<WalkNonce>,
+        ids: Option<Ownership>,
+    ) -> String {
+        let d = dest.to_str().unwrap();
+        let (checks, owner) = match sudo {
+            "" => (login_checks(d, top), LOGIN_OWNED.to_owned()),
+            _ => (
+                user_checks(sudo, dest, top),
+                format!("-user {}", fs::metadata(top).unwrap().uid()),
+            ),
+        };
+        let walk = Walk {
+            kind: "files",
+            dirs: crate::remote::path_dirs(d, top)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            owner,
+            create,
+        };
+        let step = FileWrite {
+            walk: Box::new(walk),
+            ids,
+            ..plain(d, "0640", sudo, &checks, !sudo.is_empty())
+        };
+        let heredoc = Heredoc::new("new\n").unwrap();
+        match sudo {
+            "sudo " => {
+                let temp = top.parent().unwrap().join("staged");
+                fs::write(&temp, "new\n").unwrap();
+                let step = FileWrite {
+                    password: true,
+                    ..step
+                };
+                super::install_script(temp.to_str().unwrap(), 4, &step, &Expected::Unchecked)
+            }
+            _ => super::tee_script(&heredoc, &step, &Expected::Unchecked),
+        }
+        .unwrap()
+        .to_string()
+    }
+
+    #[test]
+    fn parents_creates_each_missing_directory_0755_top_down_and_announces_it() {
+        for sudo in ["", "sudo -n ", "sudo "] {
+            let (dir, bin, conf) = write_case("files-parents", &[]);
+            let top = conf.parent().unwrap();
+            let (a, b) = (top.join("a"), top.join("a/b"));
+            let dest = b.join("conf");
+            let nonce = WalkNonce::generate().unwrap();
+            let walk = Walk {
+                kind: "files",
+                dirs: Vec::new(),
+                owner: String::new(),
+                create: Some(nonce.clone()),
+            };
+            let mut out = sh_with(&bin, &walking(&dest, top, sudo, Some(nonce.clone()), None));
+            assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{sudo:?}");
+            assert_eq!(out.code, Some(0), "{sudo:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!(
+                    "{n} created {}\n{n} created {}\nwrote {}\n",
+                    a.display(),
+                    b.display(),
+                    dest.display(),
+                    n = nonce.as_str()
+                ),
+                "{sudo:?}"
+            );
+            assert_eq!(
+                walk.created(&mut out),
+                [a.display().to_string(), b.display().to_string()]
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("wrote {}\n", dest.display())
+            );
+            assert_eq!((mode(&a), mode(&b)), (0o755, 0o755), "{sudo:?}");
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "new\n");
+
+            let mut again = sh_with(&bin, &walking(&dest, top, sudo, Some(nonce.clone()), None));
+            assert_eq!(again.code, Some(0), "{sudo:?}");
+            assert!(walk.created(&mut again).is_empty(), "{sudo:?}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn without_parents_a_missing_directory_fails_the_write_naming_it() {
+        for sudo in ["", "sudo -n ", "sudo "] {
+            let (dir, bin, conf) = write_case("files-no-parents", &[]);
+            let top = conf.parent().unwrap();
+            let dest = top.join("a/b/conf");
+            let out = sh_with(&bin, &walking(&dest, top, sudo, None, None));
+            assert_eq!(out.code, Some(REFUSED), "{sudo:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr),
+                format!(
+                    "files: {} does not exist; set parents = true to create it\n",
+                    top.join("a").display()
+                ),
+                "{sudo:?}"
+            );
+            assert!(out.stdout.is_empty(), "{sudo:?}");
+            assert!(!top.join("a").exists(), "{sudo:?}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn parents_creates_nothing_under_a_directory_that_fails_the_walk() {
+        for sudo in ["", "sudo -n "] {
+            let (dir, bin, conf) = write_case("files-parents-open", &[]);
+            let top = conf.parent().unwrap();
+            let open = top.join("a");
+            fs::create_dir(&open).unwrap();
+            fs::set_permissions(&open, fs::Permissions::from_mode(0o775)).unwrap();
+            let dest = open.join("b/conf");
+            let nonce = WalkNonce::generate().unwrap();
+            let out = sh_with(&bin, &walking(&dest, top, sudo, Some(nonce), None));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.code, Some(REFUSED), "{sudo:?}: {stderr}");
+            assert!(
+                stderr.contains(&format!("files: {} is not", open.display())),
+                "{sudo:?}: {stderr}"
+            );
+            assert!(out.stdout.is_empty(), "{sudo:?}");
+            assert!(!open.join("b").exists(), "{sudo:?}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_created_directory_that_fails_the_recheck_fails_the_write_but_is_announced() {
+        // A default ACL that grants the group write, as a mkdir would see it.
+        let mkdir = format!("{REAL} mkdir \"$@\" && chmod 0775 \"$3\"");
+        let (dir, bin, conf) = write_case("files-parents-acl", &[("mkdir", &mkdir)]);
+        let top = conf.parent().unwrap();
+        let a = top.join("a");
+        let nonce = WalkNonce::generate().unwrap();
+        let walk = Walk {
+            kind: "files",
+            dirs: Vec::new(),
+            owner: String::new(),
+            create: Some(nonce.clone()),
+        };
+        let mut out = sh_with(
+            &bin,
+            &walking(&a.join("b/conf"), top, "", Some(nonce), None),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.code, Some(REFUSED), "{stderr}");
+        assert!(
+            stderr.contains(&format!("files: {} is not owned by root", a.display())),
+            "{stderr}"
+        );
+        assert_eq!(walk.created(&mut out), [a.display().to_string()]);
+        assert!(out.stdout.is_empty());
+        assert!(!a.join("b").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mkdir_that_fails_after_making_the_directory_still_announces_it() {
+        // The directory is made, then its chmod fails.
+        let mkdir = format!("{REAL} mkdir \"$3\" && exit 1");
+        let (dir, bin, conf) = write_case("files-parents-half", &[("mkdir", &mkdir)]);
+        let top = conf.parent().unwrap();
+        let a = top.join("a");
+        let nonce = WalkNonce::generate().unwrap();
+        let walk = Walk {
+            kind: "files",
+            dirs: Vec::new(),
+            owner: String::new(),
+            create: Some(nonce.clone()),
+        };
+        let mut out = sh_with(&bin, &walking(&a.join("conf"), top, "", Some(nonce), None));
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.code, Some(REFUSED), "{stderr}");
+        assert!(
+            stderr.contains(&format!("files: cannot create {}", a.display())),
+            "{stderr}"
+        );
+        assert_eq!(walk.created(&mut out), [a.display().to_string()]);
+        assert!(out.stdout.is_empty());
+        assert!(!a.join("conf").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_owner_refuses_before_parents_creates_anything() {
+        let (dir, bin, conf) = write_case("files-parents-owner", &[]);
+        let top = conf.parent().unwrap();
+        let ids = Ownership {
+            owner: Some("anvil-no-such-user".to_owned()),
+            group: None,
+            user: None,
+        };
+        let nonce = WalkNonce::generate().unwrap();
+        let script = walking(&top.join("a/conf"), top, "sudo -n ", Some(nonce), Some(ids));
+        let out = sh_with(&bin, &script);
+        assert_eq!(out.code, Some(REFUSED));
+        assert!(out.stdout.is_empty());
+        assert!(!top.join("a").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_parents_entry_gets_a_fresh_nonce_and_walks_from_the_top_of_its_checks() {
+        let dir = dir("files-parents-run");
+        let src = dir.join("a.txt");
+        fs::write(&src, "a\n").unwrap();
+        let mut deep = entry("a.txt", "/etc/app/conf.d/a.conf");
+        deep.parents = true;
+        let config = config_in(&dir, vec![deep, entry("a.txt", "/etc/b")]);
+        let sources = load(&config, || Ok(dir.clone())).unwrap();
+        let runs = runs(
+            &config,
+            &sources,
+            &host(&[], None),
+            Some(&user_facts("nopasswd")),
+        )
+        .unwrap();
+        let walk = |n: usize| runs[n].file().unwrap().write.clone().unwrap().walk;
+        assert_eq!(walk(0).dirs, ["/", "/etc", "/etc/app", "/etc/app/conf.d"]);
+        assert_eq!(walk(0).owner, ROOT_OWNED);
+        assert!(walk(0).create.is_some());
+        assert!(walk(1).create.is_none());
+        assert!(runs[0].run.contains("mkdir -m 0755 '/etc/app/conf.d'"));
+        assert!(
+            runs[1]
+                .run
+                .contains("files: /etc does not exist; set parents = true to create it")
+        );
+        assert!(!format!("{:?}", runs[0]).contains(walk(0).create.unwrap().as_str()));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
