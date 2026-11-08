@@ -33,13 +33,14 @@ English | [繁體中文](security.zh-TW.md)
   secret as text on the second apply: use `[[tasks]]` or set `rollback = false` on both. A `[[links]]` entry with
   `force = true` keeps the regular file it replaces under the same rules, and only its sha256 when a `[[files]]` entry
   or file task for that path says `rollback = false`. An `[[absent]]` entry keeps each regular file it removes under the
-  same rules ([Absent](configuration.md#absent)). Never point `$XDG_STATE_HOME`
-  into a dotfiles or other shared repository, and never commit the record. The texts are never printed or logged, and
-  core dumps are turned off before the record is read. Since the record is only a file you own, rollback never trusts it
-  to choose a path: it refuses a record whose dest or mode apply could not have written, and restores only dests the
-  current config's `[[files]]` or file tasks still name, with the same `sudo`, for a target the entry applies to, and
-  likewise only directories, links and removed paths its `[[dirs]]`, `[[links]]` and `[[absent]]` (or dir, link and
-  absent tasks) still name ([anvil rollback](cli.md#anvil-rollback)).
+  same rules ([Absent](configuration.md#absent)). A binary `[[files]]` src keeps no text at all: only the sha256 of what
+  it replaced and of what it wrote, so rollback cannot undo it ([Files](configuration.md#files)). Never point
+  `$XDG_STATE_HOME` into a dotfiles or other shared repository, and never commit the record. The texts are never
+  printed or logged, and core dumps are turned off before the record is read. Since the record is only a file you own,
+  rollback never trusts it to choose a path: it refuses a record whose dest or mode apply could not have written, and
+  restores only dests the current config's `[[files]]` or file tasks still name, with the same `sudo`, for a target
+  the entry applies to, and likewise only directories, links and removed paths its `[[dirs]]`, `[[links]]` and
+  `[[absent]]` (or dir, link and absent tasks) still name ([anvil rollback](cli.md#anvil-rollback)).
 - **The record is trusted as the config is.** It is not signed or authenticated. At a dest the config names, the record
   decides the bytes, owner, group and mode rollback puts back, so whoever can write it can have rollback (through sudo,
   as root) write any text with any owner, group and mode there. Its `created_dirs` also decide which empty directories
@@ -112,6 +113,10 @@ English | [繁體中文](security.zh-TW.md)
   does, so a path under a group- or world-writable directory such as `/tmp` is refused, and removes a symlink as a link,
   never its target. The path itself is not guarded: its owner may change it between the read and the removal, and the
   record then holds what was read ([Absent](configuration.md#absent)).
+- **File bytes stay out of argv.** A text file goes to the target in a heredoc on the script's stdin. A binary file
+  goes in the same script as `printf` lines, and the step refuses, exit 4, before writing anything when the target's
+  `sh` does not run `printf` as a builtin (BSD pdksh, some mksh builds): an external `printf` would put the bytes on a
+  process's command line, where `ps` shows them to every local user ([Files](configuration.md#files)).
 - **One apply or rollback per record.** The record is locked through `last-apply.json.lock` beside it; a second anvil
   fails with `PATH is in use by another anvil` rather than wait. The lock needs `flock`, which NFS may not offer:
   `PATH: the filesystem does not support locking (NFS?); set $XDG_STATE_HOME to a local disk`.

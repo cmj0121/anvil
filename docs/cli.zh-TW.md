@@ -337,7 +337,7 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
 或含 `.` 或 `..` 元件的路徑以 2 結束並顯示 `$/../x: invalid store path`；連續的 `/` 會合併。
 經過儲存區內 symlink 的路徑以 2 結束（`$/link: is a symlink`），因此不會讀寫儲存區以外的東西。
 缺少的資料夾以 0700 建立（包括儲存區本身的資料夾），檔案以 0600 寫入。
-只接受文字檔：不含 NUL、至多 1 MiB 的一般 UTF-8 檔案，與 `[[files]]` 的限制相同；
+只接受文字檔：不含 NUL、至多 1 MiB 的一般 UTF-8 檔案（`[[files]]` 的 src 另可是二進位檔案）；
 其他檔案以 1 結束並顯示 `$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`。錯誤會指名儲存區路徑：
 `$/c: exists; pass --force`、`$/d: is a folder; pass -r`、`$/d/x: is not a folder`、`$/x: not found`。
 
@@ -1058,7 +1058,7 @@ anvil apply --target web1 --drop-pending "reload sshd"
   （`pending_handlers`，以名稱記錄，空時省略），以及 rollback 之後的 `rolled_back`。每個檔案：dest、寫入時的 mode 與 `sudo`、
   寫入位元組的 sha256、寫入如何結束（`write`）、先前的狀態（`previous`）、寫入留下的擁有者、群組與 mode
   （`written_attrs`，形如 `{"uid": 0, "gid": 0, "mode": "0644"}`，寫入成功後才有），以及 `parents` 為它建立的目錄
-  （`created_dirs`，由上而下，空時省略）。每個目錄（`dirs`）、每個連結（`links`）與每個被移除的路徑（`absent`）的內容見下文，空時省略。
+  （`created_dirs`，由上而下，空時省略），src 是[二進位檔案](configuration.zh-TW.md#files)時另有 `binary: true`（false 時省略）。每個目錄（`dirs`）、每個連結（`links`）與每個被移除的路徑（`absent`）的內容見下文，空時省略。
   它絕不保存 secret 的值、step 的腳本或套件清單。
 - **tasks config 上每個 dest 一筆。** 同一次 apply 中兩個 file task 寫入的 dest（拼法相同或只差重複的斜線）只有一筆檔案項目，
   以第一個拼法記錄：`previous` 取自第一次寫入之前，
@@ -1147,7 +1147,7 @@ mode 記錄時不含 setuid 與 setgid 位元，anvil 不動目錄上的這兩�
 ]
 ```
 
-**版本。** 只有當某個 target 有 `dirs`、`links` 或 `absent`，或某個檔案有 `created_dirs`，或是位元組未變、只修正了擁有者、群組或 mode（`fixed DEST: …`）時，紀錄才寫成
+**版本。** 只有當某個 target 有 `dirs`、`links` 或 `absent`，或某個檔案有 `created_dirs`，或是位元組未變、只修正了擁有者、群組或 mode（`fixed DEST: …`），或帶有 `binary` 時，紀錄才寫成
 `"version": 2`；其他情況維持 `"version": 1`（如上例），這個 anvil 兩者都能讀。舊版 anvil 會拒絕 version 2 的紀錄，
 顯示 `apply: PATH: version 2 is not supported`（rollback 時為 `rollback: …`），而不是載入後在下一次儲存時遺失那些欄位；
 請對該紀錄持續使用這個或更新的 anvil。
@@ -1157,8 +1157,9 @@ mode 記錄時不含 setuid 與 setgid 位元，anvil 不動目錄上的這兩�
 其中的錯誤名稱在載入時捨棄並發出警告（[執行中的 handler](#執行中的-handler)）。
 
 **保存或不保存。** 只有在先前的檔案是所有人可讀（mode 含 `0o004`）、文字是不含 NUL 位元組的 UTF-8、最多 256 KiB，
-且項目沒有設定 `rollback = false` 時，才會保存它。否則 `kept` 為 false，`reason` 說明原因：`rollback = false`、
-`not world-readable`、`over 256 KiB`、`not UTF-8 text`、`contains NUL`、`unreadable`、`no od on the target` 或 `record full`。
+項目沒有設定 `rollback = false`，且寫入的 src 不是二進位檔案時，才會保存它。否則 `kept` 為 false，`reason` 說明原因：`rollback = false`、
+`not world-readable`、`over 256 KiB`、`binary`（先前的檔案或 src 不是 UTF-8 或含 NUL 位元組）、`unreadable`、`no od on the target` 或 `record full`。
+`binary` 檔案項目卻保存了先前文字的紀錄，載入時會被拒絕。
 不論哪種情況寫入都會進行；失去的只是它的復原，rollback 會把該檔案顯示為 `cannot undo: DEST (REASON)`。
 `rollback = false` 只保存雜湊：dest 保存 secret 時請使用它（[Files](configuration.zh-TW.md#files)）。
 
@@ -1257,7 +1258,7 @@ secret 由 `anvil doctor` 檢查。
   接著每個 env 值一行 `env.KEY = VALUE (LEVEL)`，顯示方式與 doctor 相同，planned、failed 或 cancelled 的 target 皆然：
   `vars.port = 8080 (tag:web)`、`env.APP_ENV = prod (host)`。值原樣顯示。
 - [`[[tasks]]`](#執行中的-task) config 在每個 step 上方多一行 `PATH  NAME`。
-- 每個 step 是一行 `would $ RUN`（多行的 `run` 顯示第一行加上 `…`）；
+- 每個 step 是一行 `would $ RUN`（多行的 `run` 顯示第一行加上 `…`）；[二進位](configuration.zh-TW.md#files)的檔案 src 後面加上 `(binary)`，表示它的 rollback 會失去；
   apply 會在 sudo 的提示輸入某個 secret 的值時，後面再加上 `(sudo password from secret NAME)`。
 - [範本](configuration.zh-TW.md#templating)檔案 step 在其 `would $ file DEST` 行下方多一行 `rendered N bytes, sha256 HEX`：
   該 target 算繪文字的大小與完整 sha256，也就是 apply 會寫入的位元組。算繪失敗的 target 以 `✘` 加上範本訊息結束
@@ -1594,7 +1595,7 @@ guard 指令自己的 stdout 則被丟棄：
 
 ### File steps
 
-`[[files]]` 項目或 `file` [task](#執行中的-task) 把工作區或檔案儲存區中的一份文字檔複製到每個 tag 與 fact 都符合的選定 target
+`[[files]]` 項目或 `file` [task](#執行中的-task) 把工作區或檔案儲存區中的一份檔案（文字或二進位）複製到每個 tag 與 fact 都符合的選定 target
 （[Files](configuration.zh-TW.md#files)）：
 
 ```toml
@@ -1639,10 +1640,16 @@ facts = { distro = "arch" }
 { "run": "skipped file /etc/motd: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true, "changed": false }
 ```
 
-`anvil plan` 顯示 `would $ file DEST`（apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
+`anvil plan` 顯示 `would $ file DEST`（二進位 src 加上 `(binary)`，表示它的 rollback 會失去；apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
 與 `would $ skipped file DEST: no match`；項目設定了它們時另加 `owner NAME`、`group NAME` 與 `parents` 行，範本檔案另加一行
-`rendered N bytes, sha256 HEX`。在 `plan --json` 中 `run` 是同一個標籤，走密碼路徑時另有 `sudo_secret`，
+`rendered N bytes, sha256 HEX`。在 `plan --json` 中 `run` 是同一個標籤，二進位 src 另有 `binary: true`，走密碼路徑時另有 `sudo_secret`，
 項目設定了它們時另有 `owner`、`group` 與 `parents`（`true`）。
+
+不是 UTF-8、或含 NUL 位元組的 src 是[二進位檔案](configuration.zh-TW.md#files)，會逐位元組複製。
+它以 `printf` 八進位跳脫序列傳到 target，傳輸量最多約為檔案大小的四倍，step 的 30 秒時間限制依傳送量每 MiB 增加 15 秒。
+target 的 `sh` 必須把 `printf` 作為內建指令，否則 step 會在寫入任何東西之前拒絕，以 4 結束：
+`files: printf is not a shell builtin; cannot copy a binary file`。文字檔仍以 heredoc 傳送，位元組不變。
+二進位檔案的寫入無法復原（[`anvil rollback`](#anvil-rollback)）。
 
 每次寫入之前，apply 會讀回 DEST，並把它的內容保存在 [apply 紀錄](#apply-紀錄)中，讓 [`anvil rollback`](#anvil-rollback)
 能把它放回去；接著寫入會拒絕在那次讀取後被改過的 DEST。
@@ -1678,7 +1685,7 @@ target 不認得的 `owner` 或 `group` 會在寫入任何東西之前讓 step �
 （[Files](configuration.zh-TW.md#files)）。
 
 `apply` 與 `plan` 在連線任何 target 之前讀取每個 src。
-src 不存在、位於工作區之外、不是一般檔案、超過 1 MiB 或不是文字時以 2 結束，
+src 不存在、位於工作區之外、不是一般檔案、超過 1 MiB，或是設定 `template = true` 的二進位檔案時以 2 結束，
 而且只要一個 src 有問題，該指令就對每個 target 停止，包括該項目不符合的 target：
 
 ```text
@@ -2054,6 +2061,8 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 - **最後寫入的先處理。** 每個記錄的檔案是一個 step，順序與 apply 寫入時相反：`restore DEST` 印出 `restored DEST`，
   `remove DEST` 印出 `removed DEST`；DEST 已經是 apply 之前的樣子時，兩者都印出 `unchanged DEST`（restore 仍會把擁有者、群組與 mode 設回去）。
   文字沒有保存的檔案是一個略過的 step `cannot undo: DEST (REASON)`，原因取自紀錄（例如 `rollback = false`）。
+- **二進位檔案。** src 是[二進位檔案](configuration.zh-TW.md#files)的檔案一律是 `cannot undo: DEST (binary)`，DEST 保持原狀，
+  apply 之前它不存在、或只改了擁有者、群組或 mode 時也一樣（已知的限制）；`parents = true` 為它建立的目錄也會留下。
 - **只有擁有者、群組與 mode。** apply 印出 `fixed DEST: …` 之後，step 為 `restore owner, group and mode of DEST`。
   它不需要文字，所以 0600 或 0640 的檔案也可以，且不動位元組。它在變更擁有者或群組之前先把 mode 收緊為擁有者的位元，
   最後設定記錄的 mode，並印出 `restored owner, group and mode of DEST`；DEST 已經是那些屬性時印出 `unchanged DEST`。

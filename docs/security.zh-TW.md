@@ -31,6 +31,7 @@
   secret 保存為文字：請改用 `[[tasks]]`，或兩者都設定 `rollback = false`。
   設定 `force = true` 的 `[[links]]` 項目依同樣規則保存它取代的一般檔案；若該路徑的 `[[files]]` 項目或 file task 設定
   `rollback = false`，就只保存其 sha256。`[[absent]]` 項目依同樣規則保存它移除的每個一般檔案（[Absent](configuration.zh-TW.md#absent)）。
+  二進位的 `[[files]]` src 完全不保存文字：只保存它取代的內容與它寫入的內容的 sha256，因此 rollback 無法復原它（[Files](configuration.zh-TW.md#files)）。
   絕不要把 `$XDG_STATE_HOME` 指進 dotfiles 或其他共用的 repository，也絕不要 commit 這份紀錄。
   這些文字絕不會印出或記錄，且讀取紀錄前會先關閉 core dump。紀錄只是你擁有的一個檔案，因此 rollback 絕不讓它決定路徑：
   dest 或 mode 不可能由 apply 寫出的紀錄會被拒絕，且只還原目前 config 的 `[[files]]` 或 file task 仍列出、`sudo` 相同、
@@ -95,6 +96,9 @@
 - **讀取與移除之間的變更**。`[[absent]]` step 會像寫入一樣檢查其路徑之上的目錄，因此位於 group 或其他人可寫的目錄
   （例如 `/tmp`）之下的路徑會被拒絕；symlink 以連結的方式移除，從不碰它的 target。路徑本身沒有防護：它的擁有者可以在讀取與移除之間
   變更它，此時紀錄保存的是讀到的內容（[Absent](configuration.zh-TW.md#absent)）。
+- **檔案位元組不會進入 argv**。文字檔以 heredoc 經由腳本的 stdin 傳到 target。二進位檔案以 `printf` 行放在同一份腳本中；
+  target 的 `sh` 不以內建指令執行 `printf` 時（BSD pdksh、部分 mksh），step 會在寫入任何東西之前拒絕，以 4 結束：
+  外部的 `printf` 會把位元組放上行程的指令列，`ps` 會讓每個本機使用者看到它們（[Files](configuration.zh-TW.md#files)）。
 - **每份紀錄一次只能有一個 apply 或 rollback**。紀錄透過旁邊的 `last-apply.json.lock` 上鎖；第二個 anvil 會直接以
   `PATH is in use by another anvil` 失敗，而不會等待。這個鎖需要 `flock`，NFS 可能不提供：
   `PATH: the filesystem does not support locking (NFS?); set $XDG_STATE_HOME to a local disk`。

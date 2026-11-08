@@ -477,7 +477,7 @@ names = ["HOST_SUDO"]
 
 ## Files
 
-`[[files]]` 項目把一份文字檔複製到每個 tag 與 fact 全部符合的選定 target。沒有 `tags` 也沒有 `facts` 時代表每個選定的 target。
+`[[files]]` 項目把一份檔案（文字或二進位）複製到每個 tag 與 fact 全部符合的選定 target。沒有 `tags` 也沒有 `facts` 時代表每個選定的 target。
 符合的項目依 config 順序執行，排在套件 step 與 [`[[dirs]]`](#dirs) step 之後、[`[[links]]`](#links) step 之前（`file` [task](#tasks) 則在它所在的位置執行）；
 不符合的項目仍是一個 step，回報為略過，該 target 的其他 step 仍會執行（[File steps](cli.zh-TW.md#file-steps)）。
 最多 64 個項目：多一個就以 2 結束並顯示 `files: N entries exceeds the 64 entry limit`（65 個時為 `files: 65 entries exceeds the 64 entry limit`）。
@@ -541,18 +541,42 @@ src 不屬於你或群組與其他人可寫入，或從工作區根目錄到它�
 所有已存在的元件（包含儲存區根目錄）都不可是 symlink；無效路徑與 symlink 以 2 結束：
 ``files[0].src `$/../x`: invalid store path`` 與 ``files[0].src `$/link`: is a symlink``。
 根目錄會被拒絕：``files[0].src `$/`: must name a file in the store``。
-來源仍須是一般文字檔，且至多 1 MiB。
+來源仍須是一般檔案，且至多 1 MiB。
 
-只接受文字，且至多 1 MiB（1048576 位元組；剛好這個大小可以通過），兩者都是目前的限制。
+至多 1 MiB（1048576 位元組；剛好這個大小可以通過），文字或二進位皆可（見下文）。
 以 2 結束，而且第一個這樣的 src 就會讓 `apply` 與 `plan` 對每個 target 停止，在連線任何 target 之前：
 
 - ``files[0].src `big`: exceeds the 1 MiB limit``
-- ``files[0].src `notes`: is not UTF-8 text; [[files]] copies text files only for now``
-- ``files[0].src `notes`: contains a NUL byte; [[files]] copies text files only for now``
+- ``files[0].src `logo.png`: is binary; template = true needs a text file``
 
-檔案中與 heredoc 分隔字串（`ANVIL_EOF_` 加上檔案 sha256 的前 32 位十六進位數字）相同的行，不屬於這項事前檢查。
+文字檔中與 heredoc 分隔字串（`ANVIL_EOF_` 加上檔案 sha256 的前 32 位十六進位數字）相同的行，不屬於這項事前檢查。
 它會讓該 target 失敗（其他 target 仍會執行），並顯示
 `files[0].src: has a line equal to the heredoc delimiter ANVIL_EOF_HEX`，HEX 即那 32 位數字。
+
+**二進位檔案。** 不是 UTF-8、或含 NUL 位元組的 src 就是二進位檔案。anvil 自行判斷，不需要設定任何鍵，
+並像文字檔一樣逐位元組複製它：
+
+```toml
+[[files]]
+src = "files/logo.png"
+dest = "/srv/www/logo.png"
+mode = "0644"
+```
+
+- **傳輸方式。** 文字檔仍以 heredoc 傳到 target，位元組不變。二進位檔案以 `printf` 八進位跳脫序列傳送：
+  只有 `[A-Za-z0-9._/]` 保持原樣，其他每個位元組都變成 `\ooo`，因此傳輸量最多約為檔案大小的四倍，大多為 ASCII 的檔案則少得多。
+  step 的 30 秒時間限制依傳送量每 MiB 增加 15 秒，因此 1 MiB 的二進位檔案（傳輸量最多約 4 MiB）最多多一分鐘。1 MiB 的限制不變。
+- **`printf` 必須是內建指令。** target 的 `sh` 必須以內建指令執行 `printf`，檔案的任何位元組才不會出現在行程的指令列上。
+  dash 與 bash 都是；不是內建指令的 shell（BSD pdksh、部分 mksh）上，step 會在寫入任何東西之前拒絕，以 4 結束：
+  `files: printf is not a shell builtin; cannot copy a binary file`。
+- **其餘相同。** 與 dest 的比較、原子性的 rename、`owner`、`group`、`mode`、`parents`、`sudo` 與密碼路徑都與文字檔相同。
+  `template = true` 需要文字 src：二進位 src 如上所述以 2 結束。
+- **沒有 rollback。** [apply 紀錄](cli.zh-TW.md#apply-紀錄)只保存寫入的位元組與 dest 原內容的 sha256，絕不保存位元組，
+  並把該次寫入標記為 `binary`。[`anvil rollback`](cli.zh-TW.md#anvil-rollback) 顯示 `cannot undo: DEST (binary)` 並保留 dest 原狀，
+  dest 原本不存在、或只改了擁有者、群組或 mode 時也一樣：這是已知的限制。`anvil plan` 會以 `(binary)` 標記該 step
+  （[`anvil plan`](cli.zh-TW.md#anvil-plan)）。
+- **非 UTF-8 的文字也是二進位。** 舊版 anvil 拒絕的 latin-1 或其他非 UTF-8 檔案，現在會以二進位複製，因此沒有 rollback。
+  執行 `anvil plan` 找出 `(binary)`；要保留 rollback，請把這類檔案轉成 UTF-8。
 
 **`tags` 與 `facts`。** 列出的每個 tag 都必須在 target 上，列出的每個 fact 都必須符合。
 tag 採用 inventory 的規則，``files[0].tags[1] `bad tag`: must match [A-Za-z0-9_-]+``；`local` 是允許的。
@@ -783,7 +807,7 @@ file task 的寫法相同：
 `{{ vars.port | default(80) }}` 防護。
 
 **限制。** 一次算繪最多 1,000,000 個引擎步驟（`fuel exhausted`），輸出必須是 UTF-8、不含 NUL 位元組、最多 1 MiB
-（`rendered output exceeds the 1 MiB limit`、`rendered output contains a NUL byte`）。src 本身仍受上述檢查。
+（`rendered output exceeds the 1 MiB limit`、`rendered output contains a NUL byte`）。src 本身仍受上述檢查，且必須是文字（[Files](#files)）。
 
 **失敗時。** 語法錯誤在 `apply` 或 `plan` 讀取 src 時發現，與其他 src 拒絕一樣在任何 target 之前以 2 結束。上面的 `nginx.conf.j2` 少了 `{% endif %}` 那一行時會得到：
 

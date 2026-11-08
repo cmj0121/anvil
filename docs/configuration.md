@@ -494,8 +494,8 @@ names = ["HOST_SUDO"]
 
 ## Files
 
-A `[[files]]` entry copies one text file onto each selected target whose tags and facts all match. No `tags` and no
-`facts` means every selected target. Matching entries run in config order, after the package step and the
+A `[[files]]` entry copies one file, text or binary, onto each selected target whose tags and facts all match. No
+`tags` and no `facts` means every selected target. Matching entries run in config order, after the package step and the
 [`[[dirs]]`](#dirs) steps, and before the [`[[links]]`](#links) steps (a `file` [task](#tasks) runs where it stands
 instead); an entry that does not match is still a step, reported as skipped, and the target's other steps still run
 ([File steps](cli.md#file-steps)). At most 64 entries: one more is exit 2 with
@@ -564,18 +564,43 @@ A `src` starting with `$/` instead reads the [file store](cli.md#anvil-files): `
 separators collapse. Every existing component, including the store root, must not be a symlink. Invalid paths and
 symlinks exit 2: ``files[0].src `$/../x`: invalid store path`` and
 ``files[0].src `$/link`: is a symlink``. The root is rejected as
-``files[0].src `$/`: must name a file in the store``. Store sources have the same regular text file and 1 MiB limits.
+``files[0].src `$/`: must name a file in the store``. Store sources have the same regular file and 1 MiB limits.
 
-Text only, and at most 1 MiB (1048576 bytes; a file of that size passes), both current limits. Exit 2, and the first
-such src stops `apply` and `plan` for every target, before any target is contacted:
+At most 1 MiB (1048576 bytes; a file of that size passes), text or binary (below). Exit 2, and the first such
+src stops `apply` and `plan` for every target, before any target is contacted:
 
 - ``files[0].src `big`: exceeds the 1 MiB limit``
-- ``files[0].src `notes`: is not UTF-8 text; [[files]] copies text files only for now``
-- ``files[0].src `notes`: contains a NUL byte; [[files]] copies text files only for now``
+- ``files[0].src `logo.png`: is binary; template = true needs a text file``
 
-A line of the file equal to the heredoc delimiter (`ANVIL_EOF_` and the first 32 hex digits of the file's sha256) is
+A line of a text file equal to the heredoc delimiter (`ANVIL_EOF_` and the first 32 hex digits of the file's sha256) is
 not part of that preflight. It fails the target, and the others still run, with
 `files[0].src: has a line equal to the heredoc delimiter ANVIL_EOF_HEX`, where HEX is those 32 digits.
+
+**Binary files.** A src that is not UTF-8, or that holds a NUL byte, is binary. anvil tells on its own, with no key
+to set, and copies it byte for byte, as it would a text file:
+
+```toml
+[[files]]
+src = "files/logo.png"
+dest = "/srv/www/logo.png"
+mode = "0644"
+```
+
+- **On the wire.** A text file still goes to the target in a heredoc, its bytes unchanged. A binary file goes as
+  `printf` octal escapes: only `[A-Za-z0-9._/]` stays literal and every other byte becomes `\ooo`, so it takes up to
+  about four times its size on the wire, much less for a mostly-ASCII file. The step's 30 s timeout grows by 15 s per
+  MiB sent, so a 1 MiB binary, up to about 4 MiB on the wire, gets up to a minute more. The 1 MiB limit is the same.
+- **`printf` must be a builtin.** The target's `sh` must run `printf` as a builtin, so no byte of the file reaches a
+  process's command line. dash and bash do; where it does not (BSD pdksh, some mksh builds), the step refuses, exit 4,
+  before anything is written: `files: printf is not a shell builtin; cannot copy a binary file`.
+- **The rest is the same.** The comparison with dest, the atomic rename, `owner`, `group`, `mode`, `parents`, `sudo`
+  and the password path work as for text. `template = true` needs a text src: a binary one is exit 2, as above.
+- **No rollback.** The [apply record](cli.md#the-apply-record) keeps only the sha256 of the bytes written and of what
+  dest held, never the bytes, and marks the write `binary`. [`anvil rollback`](cli.md#anvil-rollback) shows
+  `cannot undo: DEST (binary)` and leaves dest as it is, also when dest did not exist before or only its owner, group
+  or mode changed: a known limit. `anvil plan` marks the step `(binary)` ([`anvil plan`](cli.md#anvil-plan)).
+- **Non-UTF-8 text is binary.** A latin-1 or other non-UTF-8 file that earlier anvil refused is now copied as binary,
+  so it has no rollback. Run `anvil plan` and look for `(binary)`; convert such a file to UTF-8 to keep rollback.
 
 **`tags` and `facts`.** Every listed tag must be on the target, and every listed fact must match. Tags use the inventory
 rule, ``files[0].tags[1] `bad tag`: must match [A-Za-z0-9_-]+``; `local` is allowed. The `local` target carries `local`
@@ -841,7 +866,7 @@ one passed to a filter: ``line 1: undefined variable `vars.db.nope` ``. Guard an
 
 **Limits.** A render takes at most 1,000,000 engine steps (`fuel exhausted`), and its output must be UTF-8, without a
 NUL byte, at most 1 MiB (`rendered output exceeds the 1 MiB limit`, `rendered output contains a NUL byte`). The src
-keeps its own checks above.
+keeps its own checks above, and must be text ([Files](#files)).
 
 **When it fails.** A syntax error is found when `apply` or `plan` reads the src, and is exit 2 before any target, like
 any other src refusal. The `nginx.conf.j2` above without its `{% endif %}` line gives:

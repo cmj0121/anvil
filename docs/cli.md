@@ -348,8 +348,8 @@ path without `$/` (`sub/motd`); `cp` uses `$/` to tell the store side from this 
 (`/x`, `$//x`), holds a NUL byte or has a `.` or `..` component is exit 2 with `$/../x: invalid store path`; repeated
 `/` separators collapse. A path through a symlink inside the store is exit 2 (`$/link: is a symlink`), so nothing reads
 or writes outside it. Missing folders are created as 0700 (the store's own folder too) and files are written as 0600.
-Files are text only: regular UTF-8 files without NUL, at most 1 MiB, the same limits `[[files]]` sets; any other file is
-exit 1 with `$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`. Errors name the store path:
+Files are text only: regular UTF-8 files without NUL, at most 1 MiB (a `[[files]]` src may also be binary); any
+other file is exit 1 with `$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`. Errors name the store path:
 `$/c: exists; pass --force`, `$/d: is a folder; pass -r`, `$/d/x: is not a folder`, `$/x: not found`.
 
 | Action                  | Effect                                                                        |
@@ -1115,7 +1115,8 @@ which [`anvil rollback`](#anvil-rollback) reads. An apply of plain `[[steps]]` o
   dest, the mode and `sudo` it was written with, the sha256 of the bytes written, how the write ended (`write`), what
   was there before (`previous`), the owner, group and mode the write left (`written_attrs`, as
   `{"uid": 0, "gid": 0, "mode": "0644"}`, once the write succeeded) and the directories `parents` created for it
-  (`created_dirs`, top down, left out when empty). Per directory (`dirs`), per link (`links`) and per removed
+  (`created_dirs`, top down, left out when empty), and `binary: true` when the src was
+  [binary](configuration.md#files) (left out when false). Per directory (`dirs`), per link (`links`) and per removed
   path (`absent`), each left out when empty: below. It never keeps a secret value, a step's script or a package list.
 - **One entry per dest on a tasks config.** A dest two file tasks write in one apply, spelled the same or differing only
   by repeated slashes, has one file entry under its first spelling: `previous` from
@@ -1180,8 +1181,8 @@ already created directories for DEST (`parents = true`): it is stored, or the ea
 `created_dirs`, so that rollback can remove them.
 
 **Version.** A record is written as `"version": 2` only when some target has `dirs`, `links` or `absent`, or some file has
-`created_dirs` or is an owner, group or mode fix with the bytes unchanged (`fixed DEST: …`); any other stays
-`"version": 1`, as above, and this anvil reads both. An older anvil refuses a version 2 record, with
+`created_dirs`, is an owner, group or mode fix with the bytes unchanged (`fixed DEST: …`) or has `binary`; any other
+stays `"version": 1`, as above, and this anvil reads both. An older anvil refuses a version 2 record, with
 `apply: PATH: version 2 is not supported` (`rollback: …` for a rollback), rather than load it and lose those fields on
 its next save; keep using this anvil, or a newer one, with that record.
 
@@ -1224,11 +1225,12 @@ carries it over. A record without the field loads as before. Bad names in it are
 ([Handlers in a run](#handlers-in-a-run)).
 
 **Kept or not.** The previous text is kept only when the previous file is world-readable (its mode has `0o004`), the
-text is UTF-8 with no NUL byte and at most 256 KiB, and the entry does not set `rollback = false`. Otherwise `kept` is
-false and `reason` says why: `rollback = false`, `not world-readable`, `over 256 KiB`, `not UTF-8 text`, `contains NUL`,
-`unreadable`, `no od on the target` or `record full`. The write goes ahead either way; only its undo is lost, and
-rollback shows the file as `cannot undo: DEST (REASON)`. `rollback = false` keeps the hash only: use it for a dest that
-holds a secret ([Files](configuration.md#files)).
+text is UTF-8 with no NUL byte and at most 256 KiB, the entry does not set `rollback = false` and the src written is
+not binary. Otherwise `kept` is false and `reason` says why: `rollback = false`, `not world-readable`, `over 256 KiB`,
+`binary` (the previous file or the src is not UTF-8 or holds a NUL byte), `unreadable`, `no od on the target` or
+`record full`. A record that holds a previous text under a `binary` file is refused on load. The write goes ahead
+either way; only its undo is lost, and rollback shows the file as `cannot undo: DEST (REASON)`. `rollback = false` keeps
+the hash only: use it for a dest that holds a secret ([Files](configuration.md#files)).
 
 **Not world-readable.** The bytes of such a file do not leave the target: the capture sends only its `ls` line and its
 sha256, so a target with no hash tool leaves the hash empty and the write unguarded. Apply warns, `apply: DEST on TARGET
@@ -1344,7 +1346,8 @@ secret is set and free of control characters is not checked, so plan can pass wh
   per var, then an `env.KEY = VALUE (LEVEL)` line per env value, shown as doctor shows them, on a planned, failed or
   cancelled target alike: `vars.port = 8080 (tag:web)`, `env.APP_ENV = prod (host)`. Values are shown as is.
 - A [`[[tasks]]`](#tasks-in-a-run) config adds a `PATH  NAME` line above each step.
-- Each step is a `would $ RUN` line (a multi-line `run` shows its first line and `…`), followed by
+- Each step is a `would $ RUN` line (a multi-line `run` shows its first line and `…`), followed by `(binary)` for a
+  [binary](configuration.md#files) file src, whose rollback is lost, and
   `(sudo password from secret NAME)` when apply would type that secret's value at sudo's prompt.
 - A [templated](configuration.md#templating) file step adds `rendered N bytes, sha256 HEX` under its `would $ file DEST`
   line: the size and the full sha256 of that target's rendered text, the bytes apply would write. A target whose render
@@ -1694,8 +1697,8 @@ only the keys that are set:
 
 ### File steps
 
-A `[[files]]` entry, or a `file` [task](#tasks-in-a-run), copies one text file from the workspace or file store onto each
-selected target whose tags and facts match ([Files](configuration.md#files)):
+A `[[files]]` entry, or a `file` [task](#tasks-in-a-run), copies one file, text or binary, from the workspace or
+file store onto each selected target whose tags and facts match ([Files](configuration.md#files)):
 
 ```toml
 [[files]]
@@ -1741,10 +1744,18 @@ In `--json` a file step's `run` is that label. A skipped step has `"skipped": tr
 { "run": "skipped file /etc/motd: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true, "changed": false }
 ```
 
-`anvil plan` shows `would $ file DEST`, with `(sudo password from secret NAME)` when apply would take the password path,
-and `would $ skipped file DEST: no match`; an entry that sets them adds `owner NAME`, `group NAME` and `parents` lines,
-and a templated file its `rendered N bytes, sha256 HEX` line. In `plan --json` the `run` is the same label, with
-`sudo_secret` for the password path and `owner`, `group` and `parents` (`true`) when the entry sets them.
+`anvil plan` shows `would $ file DEST`, with `(binary)` for a binary src, whose rollback is lost, and
+`(sudo password from secret NAME)` when apply would take the password path, and `would $ skipped file DEST: no match`;
+an entry that sets them adds `owner NAME`, `group NAME` and `parents` lines, and a templated file its
+`rendered N bytes, sha256 HEX` line. In `plan --json` the `run` is the same label, with
+`binary: true` for a binary src, `sudo_secret` for the password path and `owner`, `group` and `parents` (`true`) when
+the entry sets them.
+
+A src that is not UTF-8, or holds a NUL byte, is [binary](configuration.md#files) and copied byte for byte. It goes to
+the target as `printf` octal escapes, up to about four times its size on the wire, and the step's 30 s timeout grows by
+15 s per MiB sent. The target's `sh` must have `printf` as a builtin, else the step refuses, exit 4, before anything is
+written: `files: printf is not a shell builtin; cannot copy a binary file`. A text file still goes in a heredoc, its
+bytes unchanged. A binary write cannot be undone ([`anvil rollback`](#anvil-rollback)).
 
 Before each write, apply reads DEST back and keeps what it held in the [apply record](#the-apply-record), so
 [`anvil rollback`](#anvil-rollback) can put it back; the write then refuses a DEST that changed since that read.
@@ -1784,8 +1795,8 @@ owner name fails the target before any step runs on it, exit 1, with
 directory checks ([Files](configuration.md#files)).
 
 `apply` and `plan` read every src before any target is contacted. A src that is missing, outside the workspace, not
-a regular file, over 1 MiB, or not text is exit 2, and one bad src stops the command for every target, those the entry
-does not match included:
+a regular file, over 1 MiB, or binary with `template = true` is exit 2, and one bad src stops the
+command for every target, those the entry does not match included:
 
 ```text
 ERROR anvil: files[0].src `../nope`: cannot read: No such file or directory (os error 2)
@@ -2188,6 +2199,9 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   `restore DEST` prints `restored DEST`, `remove DEST` prints `removed DEST`, and either prints `unchanged DEST` when
   DEST already is what it was before the apply (a restore still sets the owner, group and mode back). A file whose text was not kept
   is a skipped step `cannot undo: DEST (REASON)`, with the reason from the record (`rollback = false`, say).
+- **Binary files.** A file whose src was [binary](configuration.md#files) is always `cannot undo: DEST (binary)`, and
+  DEST is left as it is, also when it did not exist before the apply or only its owner, group or mode changed (a known
+  limit); the directories `parents = true` created for it stay too.
 - **Owner, group and mode only.** After an apply that printed `fixed DEST: …`, the step is
   `restore owner, group and mode of DEST`. It needs no text, so it works for a 0600 or 0640 file too, and leaves the
   bytes alone. It narrows the mode to the owner's bits before it changes the owner or group, sets the recorded mode last
