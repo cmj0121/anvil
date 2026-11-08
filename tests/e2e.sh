@@ -795,6 +795,60 @@ else
   fail "rollback over a 0600 previous: exit $code"
 fi
 
+step "(o) a binary file of every byte 0..255 on arch lands byte for byte; the record keeps only hashes and rollback cannot undo it"
+BIN_STATE="$TMP/state-bin"
+BIN_RECORD="$BIN_STATE/anvil/last-apply.json"
+BIN_DIR="$TMP/binary"
+mkdir -p "$BIN_DIR"
+i=0
+while [ "$i" -lt 256 ]; do
+  # shellcheck disable=SC2059 # the format is the escape of byte $i
+  printf "\\$(printf '%03o' "$i")"
+  i=$((i + 1))
+done >"$BIN_DIR/every.bin"
+cat >"$BIN_DIR/config.toml" <<CONF
+[[files]]
+src = "every.bin"
+dest = "/etc/anvil-e2e-bin"
+mode = "0644"
+CONF
+bin_anvil() {
+  run_env XDG_STATE_HOME="$BIN_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$BIN_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+bin_sha=$( (sha256sum "$BIN_DIR/every.bin" 2>/dev/null || shasum -a 256 "$BIN_DIR/every.bin") | cut -d' ' -f1)
+docker exec "$NAME" sh -c "printf 'previous text\n' >/etc/anvil-e2e-bin && chmod 644 /etc/anvil-e2e-bin"
+bin_anvil plan --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  would $ file /etc/anvil-e2e-bin (binary)' "$TMP/out"; then
+  pass "plan marks the binary src"
+else
+  fail "plan of a binary src: exit $code"
+fi
+bin_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && [ "$(wc -c <"$BIN_DIR/every.bin" | tr -d ' ')" -eq 256 ] \
+  && grep -qxF '  wrote /etc/anvil-e2e-bin' "$TMP/out" \
+  && docker exec "$NAME" cat /etc/anvil-e2e-bin | cmp -s - "$BIN_DIR/every.bin" \
+  && [ "$(docker exec "$NAME" sha256sum /etc/anvil-e2e-bin | cut -d' ' -f1)" = "$bin_sha" ] \
+  && grep -qF '"version":2' "$BIN_RECORD" && grep -qF '"binary":true' "$BIN_RECORD" \
+  && grep -qF "\"written_sha256\":\"$bin_sha\"" "$BIN_RECORD" \
+  && grep -qF '"reason":"binary"' "$BIN_RECORD" && ! grep -qF 'previous text' "$BIN_RECORD"; then
+  pass "the 256-byte file landed byte for byte, record version 2 with binary and hashes only"
+else
+  fail "apply of a binary file: exit $code"
+fi
+bin_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  $ cannot undo: /etc/anvil-e2e-bin (binary)' "$TMP/out" \
+  && grep -qxF '  /etc/anvil-e2e-bin on arch (binary)' "$TMP/out" \
+  && docker exec "$NAME" cat /etc/anvil-e2e-bin | cmp -s - "$BIN_DIR/every.bin"; then
+  pass "rollback says it cannot undo the binary file and leaves it, exit 0"
+else
+  fail "rollback of a binary file: exit $code"
+fi
+docker exec "$NAME" rm -f /etc/anvil-e2e-bin
+
 step "(o) rollback on arch puts back an owner and group fixed in place and removes the directories parents created"
 AR_STATE="$TMP/state-attrs"
 AR_RECORD="$AR_STATE/anvil/last-apply.json"

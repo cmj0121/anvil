@@ -32,7 +32,7 @@ use crate::facts::Facts;
 use crate::filestore::{self, StoreError};
 use crate::inventory::{self, Target, TargetKind};
 use crate::record::{
-    Attrs, FileRecord, NO_ROLLBACK, NOT_WORLD_READABLE, Previous, PreviousFile, Write,
+    Attrs, BINARY, FileRecord, NO_ROLLBACK, NOT_WORLD_READABLE, Previous, PreviousFile, Write,
     is_world_readable,
 };
 use crate::remote::{
@@ -305,6 +305,7 @@ pub fn run(
         None
     };
     let mark = WalkNonce::attrs()?;
+    let binary = rendered.is_none() && sources.0.get(i).is_some_and(|source| source.binary);
     let write = match secret {
         Some(name) => {
             log::info!(
@@ -324,6 +325,7 @@ pub fn run(
                 ids,
                 mark,
                 parents: entry.parents,
+                binary,
             }
         }
         None => {
@@ -349,6 +351,7 @@ pub fn run(
                 ids,
                 mark,
                 parents: entry.parents,
+                binary,
             }
         }
     };
@@ -453,6 +456,9 @@ pub struct FileWrite {
     pub mark: WalkNonce,
     /// The entry's `parents`.
     pub parents: bool,
+    /// Whether the src is binary ([`Source::binary`]): the record keeps only
+    /// hashes, and rollback cannot undo the write.
+    pub binary: bool,
 }
 
 /// A write's `owner` and `group`, each by name or numeric id, `None`
@@ -551,7 +557,8 @@ impl FileWrite {
     /// The record of this write, from what the capture saw before it and
     /// how it ended: `previous` keeps the bytes as text unless the entry
     /// says `rollback = false`, the dest is `hash_only`
-    /// ([`Recorder`](crate::engine::Recorder)), or they are not text.
+    /// ([`Recorder`](crate::engine::Recorder)), they are not text, or the
+    /// src is binary.
     pub(crate) fn record(
         &self,
         expanded: &Expanded,
@@ -565,7 +572,7 @@ impl FileWrite {
             .expect("a write comes from the list it is recorded against");
         let written = self.payload(sources).map_or(&[][..], Payload::bytes);
         let previous = previous_of(captured, hash_only || !entry.rollback);
-        FileRecord {
+        let mut record = FileRecord {
             dest: self.dest.clone(),
             mode: format!("{:0>4}", self.mode),
             sudo: entry.sudo,
@@ -574,7 +581,12 @@ impl FileWrite {
             previous,
             written_attrs: None,
             created_dirs: Vec::new(),
+            binary: false,
+        };
+        if self.binary {
+            record.drop_binary_previous();
         }
+        record
     }
 
     /// DEST's owner, group and mode from `output`'s marked line, which the
@@ -604,7 +616,7 @@ impl FileWrite {
 }
 
 /// What `captured` says DEST held, as the record keeps it: a file's bytes
-/// as text unless `hash_only` or they are not text.
+/// as text unless `hash_only` or they are binary ([`BINARY`]).
 pub(crate) fn previous_of(captured: Captured, hash_only: bool) -> Previous {
     match captured {
         Captured::Absent => Previous::Absent,
@@ -621,9 +633,8 @@ pub(crate) fn previous_of(captured: Captured, hash_only: bool) -> Previous {
                 _ if hash_only => Err(NO_ROLLBACK),
                 None => Err(reason.unwrap_or("unreadable")),
                 Some(bytes) => match std::str::from_utf8(&bytes) {
-                    Err(_) => Err("not UTF-8 text"),
-                    Ok(text) if text.contains('\0') => Err("contains NUL"),
-                    Ok(text) => Ok(Zeroizing::new(text.to_owned())),
+                    Ok(text) if !text.contains('\0') => Ok(Zeroizing::new(text.to_owned())),
+                    _ => Err(BINARY),
                 },
             };
             Previous::File(PreviousFile {
@@ -1839,6 +1850,7 @@ pub(crate) fn restore_replaced(
         previous: Previous::File(previous.clone()),
         written_attrs: None,
         created_dirs: Vec::new(),
+        binary: false,
     };
     let restore = Restore {
         dest,
@@ -2284,6 +2296,7 @@ mod tests {
             ids: None,
             mark: WalkNonce::attrs().unwrap(),
             parents: false,
+            binary: false,
         }
     }
 
@@ -6544,6 +6557,7 @@ mod tests {
             previous,
             written_attrs: None,
             created_dirs: Vec::new(),
+            binary: false,
         }
     }
 
@@ -8101,6 +8115,56 @@ mod tests {
         assert_eq!(write.payload(&sources).unwrap().bytes(), src.as_bytes());
         let (script, _) = write_script(&write, &sources, &Expected::Unchecked).unwrap();
         assert!(script.contains(src), "{}", &*script);
+    }
+
+    #[test]
+    fn a_binary_src_marks_its_step_and_record_and_keeps_the_previous_hash_only() {
+        let config = config_in(
+            Path::new("/c"),
+            vec![entry("a", "/etc/a"), entry("b", "/etc/b")],
+        );
+        let sources = Sources::of(&["text\n", "a\0b"]);
+        let run = runs(
+            &config,
+            &sources,
+            &host_with("web1", &[]),
+            Some(&user_facts("nopasswd")),
+        )
+        .unwrap();
+        assert_eq!(
+            run.iter().map(PlannedRun::binary).collect::<Vec<_>>(),
+            [false, true]
+        );
+        let expanded = legacy(&config);
+        let captured = |bytes: &[u8]| Captured::File {
+            mode: "0644".to_owned(),
+            uid: 0,
+            gid: 0,
+            size: bytes.len() as u64,
+            sha256: hex(&Sha256::digest(bytes)),
+            bytes: Some(Zeroizing::new(bytes.to_vec())),
+            reason: None,
+        };
+        let previous = || captured(b"old\n");
+        let records: Vec<_> = (run.iter().map(written))
+            .map(|write| write.record(&expanded, &sources, previous(), Write::Written, false))
+            .collect();
+        assert!(!records[0].binary);
+        assert_eq!(records[0].not_kept(), None, "a text write keeps the text");
+        assert!(records[1].binary);
+        let Previous::File(p) = &records[1].previous else {
+            panic!("{:?}", records[1].previous);
+        };
+        assert!(!p.kept && p.text.is_none());
+        assert_eq!(p.sha256, hex(&Sha256::digest(b"old\n")));
+        assert_eq!(records[1].not_kept(), Some(BINARY));
+        assert_eq!(records[1].written_sha256, hex(&Sha256::digest(b"a\0b")));
+
+        // A binary previous before a text write keeps its hash only too.
+        let Previous::File(p) = previous_of(captured(&[0xff, 0xfe]), false) else {
+            panic!("a file");
+        };
+        assert_eq!((p.kept, p.reason.as_deref()), (false, Some(BINARY)));
     }
 
     #[test]

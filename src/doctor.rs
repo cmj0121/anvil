@@ -1960,6 +1960,7 @@ mod tests {
                 previous: record::Previous::Absent,
                 written_attrs: None,
                 created_dirs: Vec::new(),
+                binary: false,
             })
             .collect();
         Record {

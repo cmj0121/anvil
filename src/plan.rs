@@ -473,10 +473,12 @@ pub fn render(report: &PlanReport, show_rendered: bool) -> Vec<Line> {
     lines
 }
 
-/// `would $ command`, then the secret whose password it would type and the
-/// plugin that returned it, if any; unescaped but for a task's invisible
-/// characters, since its `run` is config text under review.
+/// `would $ command`, then `(binary)` for a binary src, whose rollback is
+/// lost, the secret whose password it would type and the plugin that
+/// returned it, if any; unescaped but for a task's invisible characters,
+/// since its `run` is config text under review.
 pub fn would_text(step: &PlannedRun) -> String {
+    let binary = if step.binary() { " (binary)" } else { "" };
     let secret = step
         .sudo_secret
         .as_ref()
@@ -486,7 +488,10 @@ pub fn would_text(step: &PlannedRun) -> String {
         .plugin()
         .map(|name| format!(" (from plugin {name})"))
         .unwrap_or_default();
-    let text = format!("would $ {}{secret}{from}", report::command(step.shown()));
+    let text = format!(
+        "would $ {}{binary}{secret}{from}",
+        report::command(step.shown())
+    );
     match step.task {
         Some(_) => escape_invisible(&text),
         None => text,

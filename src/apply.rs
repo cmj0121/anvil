@@ -3854,6 +3854,7 @@ mod tests {
                 previous: record::Previous::Absent,
                 written_attrs: None,
                 created_dirs: Vec::new(),
+                binary: false,
             }]
         );
     }
@@ -3900,10 +3901,7 @@ mod tests {
 
     #[test]
     fn a_binary_previous_file_keeps_only_its_hash() {
-        for (bytes, reason) in [
-            (" ff fe 0a", "not UTF-8 text"),
-            (" 61 00 0a", "contains NUL"),
-        ] {
+        for (bytes, reason) in [(" ff fe 0a", "binary"), (" 61 00 0a", "binary")] {
             let config = with_files(None, vec![file_entry("/etc/a.conf", &[], true)], &[]);
             let capture: &'static str = Box::leak(
                 format!(

@@ -1054,6 +1054,7 @@ mod tests {
             previous,
             written_attrs: None,
             created_dirs: Vec::new(),
+            binary: false,
         }
     }
 
@@ -1455,6 +1456,7 @@ mod tests {
             }),
             written_attrs: None,
             created_dirs: Vec::new(),
+            binary: false,
         };
         // A dest any applying write keeps hash-only is hash-only from the first.
         let mut record = write(first.0, first.1 && later.1);

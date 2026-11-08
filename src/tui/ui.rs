@@ -2640,6 +2640,7 @@ mod tests {
                         ids: None,
                         mark: WalkNonce::generate().unwrap(),
                         parents: false,
+                        binary: false,
                     }),
                 },
             },

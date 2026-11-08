@@ -168,6 +168,10 @@ pub struct FileRecord {
     /// only for these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub created_dirs: Vec<String>,
+    /// Whether the src written was binary: the previous file, if any, is
+    /// kept as its hash only, and rollback cannot undo the write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub binary: bool,
 }
 
 /// A file's owner, group and mode.
@@ -201,6 +205,8 @@ impl PreviousFile {
 pub const NO_ROLLBACK: &str = "rollback = false";
 /// Why the text of a previous file others may not read was not kept.
 pub const NOT_WORLD_READABLE: &str = "not world-readable";
+/// Why a binary file, previous or written, has only its hash in the record.
+pub const BINARY: &str = "binary";
 
 /// Whether others may read a file of this octal `mode`; a mode that does not
 /// parse counts as no.
@@ -244,10 +250,17 @@ impl FileRecord {
         add_unique(&mut self.created_dirs, dirs);
     }
 
-    /// Why a rollback cannot put back this file's previous text, if so; never
-    /// for an attrs-only fix or a refused write, which need none.
+    /// Why a rollback cannot put back this file's previous state, if so:
+    /// always [`BINARY`] after a binary write; else never for an attrs-only
+    /// fix or a refused write, which need no text.
     pub fn not_kept(&self) -> Option<&str> {
-        if self.write == Write::Refused || self.attrs_only() {
+        if self.write == Write::Refused {
+            return None;
+        }
+        if self.binary {
+            return Some(BINARY);
+        }
+        if self.attrs_only() {
             return None;
         }
         match &self.previous {
@@ -274,6 +287,19 @@ impl FileRecord {
         self.written_sha256 = later.written_sha256;
         self.write = later.write;
         self.written_attrs = later.written_attrs;
+        if later.binary {
+            self.drop_binary_previous();
+        }
+    }
+
+    /// Marks the write binary and keeps the previous file's hash only.
+    pub(crate) fn drop_binary_previous(&mut self) {
+        self.binary = true;
+        if let Previous::File(previous) = &mut self.previous
+            && previous.kept
+        {
+            previous.drop_text(BINARY);
+        }
     }
 }
 
@@ -289,6 +315,7 @@ impl fmt::Debug for FileRecord {
             .field("previous", &self.previous)
             .field("written_attrs", &self.written_attrs)
             .field("created_dirs", &self.created_dirs)
+            .field("binary", &self.binary)
             .finish()
     }
 }
@@ -866,15 +893,16 @@ fn is_supported(version: u32) -> bool {
 
 /// The version `record` is saved as: [`VERSION`] when any target has a dir,
 /// a link or an absent step, or any file lists created directories (a
-/// refused write always does) or is an attrs-only fix, which an older anvil
-/// would mishandle, else [`VERSION_1`]. The attrs written alone stay version
+/// refused write always does), is an attrs-only fix or was binary, which an
+/// older anvil would mishandle, else [`VERSION_1`]. The attrs written alone stay version
 /// 1: an older anvil ignores them.
 fn version_of(record: &Record) -> u32 {
     let newer = record.targets.values().any(|target| {
         !target.dirs.is_empty()
             || !target.links.is_empty()
             || !no_absent(&target.absent)
-            || (target.files.iter()).any(|file| !file.created_dirs.is_empty() || file.attrs_only())
+            || (target.files.iter())
+                .any(|file| !file.created_dirs.is_empty() || file.attrs_only() || file.binary)
     });
     if newer { VERSION } else { VERSION_1 }
 }
@@ -953,13 +981,15 @@ impl FileRecord {
     /// passes the config's dest rule, its modes are octal, its hashes are
     /// empty or lowercase hex, each created directory passes the dest rule
     /// and holds DEST, and its write was not `refused` unless it created
-    /// directories. A record
+    /// directories, and a binary write keeps no previous text. A record
     /// edited by hand must not hand rollback, which may run as root, a path
     /// or mode the config would refuse.
     fn is_valid(&self) -> bool {
         let previous = match &self.previous {
             Previous::File(previous) => {
-                is_mode(&previous.mode) && is_sha256_or_empty(&previous.sha256)
+                is_mode(&previous.mode)
+                    && is_sha256_or_empty(&previous.sha256)
+                    && !(self.binary && (previous.kept || previous.text.is_some()))
             }
             Previous::Absent | Previous::Dangling { .. } => true,
         };
@@ -1095,6 +1125,9 @@ impl Session {
                             ..file
                         };
                         kept.add_dirs(file.created_dirs);
+                        if kept.binary {
+                            kept.drop_binary_previous();
+                        }
                         Some(kept)
                     }
                     Some(old) if unchanged && old.written_sha256 == file.written_sha256 => {
@@ -1554,6 +1587,7 @@ mod tests {
             previous,
             written_attrs: None,
             created_dirs: Vec::new(),
+            binary: false,
         }
     }
 
@@ -2800,6 +2834,7 @@ mod tests {
         assert_eq!(raw["version"], 1, "no new field");
         let entry = &raw["targets"]["web1"]["files"][0];
         assert!(entry.get("written_attrs").is_none() && entry.get("created_dirs").is_none());
+        assert!(entry.get("binary").is_none(), "skipped when false");
 
         let new = FileRecord {
             written_attrs: Some(attrs(0, 5, "0640")),
@@ -2840,6 +2875,14 @@ mod tests {
                 VERSION,
             ),
             ("attrs-only", fixed(attrs(0, 5, "0640")), VERSION),
+            (
+                "binary",
+                FileRecord {
+                    binary: true,
+                    ..plain.clone()
+                },
+                VERSION,
+            ),
             ("unchanged attrs", fixed(attrs(0, 0, "0644")), VERSION_1),
         ] {
             let record = Record {
@@ -2848,6 +2891,82 @@ mod tests {
             };
             assert_eq!(version_of(&record), version, "{what}");
         }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_binary_write_keeps_only_hashes_saves_version_2_and_cannot_be_undone() {
+        let (path, root) = record_path("record-binary");
+        let mut binary = file(
+            "/etc/app/a",
+            &sha('b'),
+            Write::Written,
+            previous(&sha('a'), Some("before")),
+        );
+        binary.drop_binary_previous();
+        let Previous::File(p) = &binary.previous else {
+            panic!("{:?}", binary.previous);
+        };
+        assert!(!p.kept && p.text.is_none(), "the previous text is dropped");
+        assert_eq!(p.reason.as_deref(), Some(BINARY));
+        assert_eq!(p.sha256, sha('a'), "its hash stays");
+        assert_eq!(binary.not_kept(), Some(BINARY));
+
+        let mut session = Session::open(&path).unwrap();
+        session.merge("web1", target(1, true, vec![binary.clone()]));
+        session.save().unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["version"], 2);
+        let entry = &raw["targets"]["web1"]["files"][0];
+        assert_eq!(entry["binary"], true);
+        assert!(!raw.to_string().contains("before"));
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.targets["web1"].files, [binary.clone()]);
+
+        // An attrs-only fix or a dest absent before cannot be undone either;
+        // a refused write still needs nothing.
+        for (what, previous, write, expected) in [
+            (
+                "attrs-only",
+                previous(&sha('b'), None),
+                Write::Written,
+                Some(BINARY),
+            ),
+            (
+                "absent before",
+                Previous::Absent,
+                Write::Written,
+                Some(BINARY),
+            ),
+            ("refused", Previous::Absent, Write::Refused, None),
+        ] {
+            let record = FileRecord {
+                previous,
+                write,
+                written_attrs: Some(attrs(0, 5, "0600")),
+                ..binary.clone()
+            };
+            assert_eq!(record.not_kept(), expected, "{what}");
+        }
+
+        // Written again as binary drops a text kept from the first write.
+        let mut again = file(
+            "/etc/app/a",
+            &sha('a'),
+            Write::Written,
+            previous(&sha('c'), Some("before")),
+        );
+        again.written_again(binary.clone());
+        assert!(again.binary);
+        assert_eq!(again.not_kept(), Some(BINARY));
+
+        // A hand-edited binary entry that holds a previous text is refused.
+        let mut edited = raw.clone();
+        edited["targets"]["web1"]["files"][0]["previous"]["kept"] = json!(true);
+        edited["targets"]["web1"]["files"][0]["previous"]["text"] = json!("before");
+        plant(&path, edited.to_string().as_bytes());
+        let err = load(&path).unwrap_err();
+        assert!(err.ends_with(": cannot parse"), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
 

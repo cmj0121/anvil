@@ -1983,3 +1983,80 @@ fn a_removal_recorded_as_another_kind_than_its_type_is_refused() {
     );
     assert!(std::fs::symlink_metadata(&link).is_err());
 }
+
+#[test]
+fn a_binary_write_keeps_only_hashes_and_rollback_cannot_undo_it() {
+    let sandbox = Sandbox::new("rb");
+    let bytes: Vec<u8> = (0..=255).collect();
+    std::fs::write(sandbox.config_dir().join("blob.bin"), &bytes).unwrap();
+    let dir = sandbox.root().join("out");
+    std::fs::create_dir(&dir).unwrap();
+    let (over, new) = (dir.join("over.bin"), dir.join("new.bin"));
+    let (over, new) = (over.display().to_string(), new.display().to_string());
+    std::fs::write(&over, PREVIOUS).unwrap();
+    std::fs::set_permissions(&over, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let entry = |dest: &str| {
+        format!(
+            "[[files]]\nsrc = \"blob.bin\"\ndest = \"{dest}\"\nmode = \"0644\"\nsudo = false\n\n"
+        )
+    };
+    sandbox.write_config("config.toml", &format!("{}{}", entry(&over), entry(&new)));
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read(&over).unwrap(), bytes);
+    let raw = std::fs::read_to_string(sandbox.state_home().join("anvil/last-apply.json")).unwrap();
+    assert!(
+        !raw.contains(PREVIOUS.trim_end()),
+        "the previous text is not kept"
+    );
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["version"], 2);
+    let files = record["targets"]["local"]["files"].as_array().unwrap();
+    for file in files {
+        assert_eq!(file["binary"], true, "{file}");
+        assert!(file["previous"].get("text").is_none(), "{file}");
+    }
+    assert_eq!(files[0]["previous"]["reason"], "binary");
+
+    let out = sandbox.anvil(&["-vv", "rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let shown = text(&out.stdout);
+    for line in [
+        format!("  $ cannot undo: {over} (binary)\n"),
+        format!("  ⚠ not restored: {over} (binary)\n"),
+        format!("  {new} on local (binary)\n"),
+    ] {
+        assert!(shown.contains(&line), "{line}: {shown}");
+    }
+    let out = sandbox.anvil(&["--json", "rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let runs: Vec<_> = (value["targets"][0]["steps"].as_array().unwrap().iter())
+        .map(|step| step["run"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        runs,
+        [
+            format!("cannot undo: {new} (binary)"),
+            format!("cannot undo: {over} (binary)"),
+            "cannot undo: step 1".to_owned(),
+        ]
+    );
+    assert_eq!(
+        value["not_restored"],
+        serde_json::json!([
+            {"target": "local", "dest": over, "reason": "binary"},
+            {"target": "local", "dest": new, "reason": "binary"},
+        ])
+    );
+    assert_eq!(std::fs::read(&over).unwrap(), bytes, "dest left alone");
+    assert_eq!(std::fs::read(&new).unwrap(), bytes, "dest left alone");
+
+    let out = sandbox.anvil(&["rollback", "--dry-run"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains(&format!("  cannot undo: {over} (binary)\n")),
+        "{}",
+        text(&out.stdout)
+    );
+}

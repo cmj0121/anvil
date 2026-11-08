@@ -268,6 +268,11 @@ impl PlannedRun {
         self.file()?.write.as_ref()?.rendered.as_deref()
     }
 
+    /// Whether a file step writes a binary src, whose rollback is lost.
+    pub fn binary(&self) -> bool {
+        (self.file().and_then(|run| run.write.as_ref())).is_some_and(|write| write.binary)
+    }
+
     /// A dir step's mode, a file or dir step's `owner` and `group`, each
     /// `None` when unset, a link step's target and `force`, and a file, dir
     /// or link step's `parents`; all unset for any other step.
@@ -379,6 +384,8 @@ impl Serialize for PlannedRun {
             r#type: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             rendered: Option<RenderedShown<'a>>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            binary: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             mode: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -424,6 +431,7 @@ impl Serialize for PlannedRun {
             path: absent.map(|(path, _)| path),
             r#type: absent.and_then(|(_, r#type)| r#type),
             rendered,
+            binary: self.binary(),
             mode,
             owner,
             group,

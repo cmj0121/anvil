@@ -974,3 +974,39 @@ fn a_link_shows_its_target_force_and_parents() {
     assert!(!sandbox.root().join("new").exists(), "nothing created");
     assert!(!sandbox.root().join("plain").exists());
 }
+
+#[test]
+fn a_binary_src_is_marked_so_its_lost_rollback_shows() {
+    let sandbox = Sandbox::new("pl");
+    // Latin-1 text, not UTF-8: now copied as binary.
+    std::fs::write(sandbox.config_dir().join("latin1.txt"), b"caf\xe9\n").unwrap();
+    std::fs::write(sandbox.config_dir().join("motd.txt"), "text\n").unwrap();
+    let dir = sandbox.root().display().to_string();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"latin1.txt\"\ndest = \"{dir}/latin1\"\nmode = \"0644\"\nsudo = false\n\n\
+             [[files]]\nsrc = \"motd.txt\"\ndest = \"{dir}/motd\"\nmode = \"0644\"\nsudo = false\n"
+        ),
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  would $ file {dir}/latin1 (binary)\n  would $ file {dir}/motd\n  \
+             would $ hostname\n  ✔ 3 steps\n\n1 target, nothing executed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"],
+        serde_json::json!([
+            {"run": format!("file {dir}/latin1"), "binary": true},
+            {"run": format!("file {dir}/motd")},
+            {"run": "hostname"},
+        ])
+    );
+    assert!(!sandbox.root().join("latin1").exists(), "nothing written");
+}
