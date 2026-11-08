@@ -22,8 +22,9 @@ use crate::cancel::{AbortReason, Cancel};
 use crate::config::Config;
 use crate::engine::{self, Unresolved};
 use crate::error::{Failure, print_json};
+use crate::facts::Facts;
 use crate::fanout::{self, Event};
-use crate::files::Sources;
+use crate::files::{MAX_KEPT, Sources};
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
@@ -49,6 +50,10 @@ pub enum PlanReport {
         #[serde(skip_serializing_if = "Shown::is_empty")]
         env: Shown,
         steps: Vec<PlannedRun>,
+        /// Each `recursive = true` entry's tree whose steps are in `steps`,
+        /// in step order.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        trees: Vec<TreeShown>,
         /// The `[[handlers]]` the local record lists pending on the target,
         /// in config order.
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -117,9 +122,96 @@ pub struct Plan {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rendered: Vec<RenderedText>,
     /// What loading the record warned of: the targets whose bad pending
-    /// handlers it dropped.
+    /// handlers it dropped; then each tree whose previous texts may not fit
+    /// in the record ([`record_full_warnings`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+/// A `recursive = true` entry's tree as plan shows it, never its bytes:
+/// `step` indexes the target's `steps` at the tree's first, its dest
+/// directory, which the next `items.len() - 1` steps follow. `entry` is
+/// `files[N]` or a task's `PATH.file`; `size` is the bytes of all its files.
+/// `items` are the tree's items in step order, the dest itself first with
+/// `path` `""`, each `path` relative to `dest`, with `kind` `"dir"` or
+/// `"file"`, its `size` in bytes (0 for a directory) and whether it is
+/// `binary`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TreeShown {
+    pub step: usize,
+    pub entry: String,
+    pub src: String,
+    pub dest: String,
+    pub size: u64,
+    pub items: Vec<TreeItemShown>,
+}
+
+/// One item of a [`TreeShown`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TreeItemShown {
+    pub path: String,
+    pub kind: &'static str,
+    pub size: u64,
+    pub binary: bool,
+}
+
+impl TreeShown {
+    /// `ENTRY SRC -> DEST (tree: N items, SIZE bytes)`, invisible
+    /// characters escaped, since `src` and `dest` are config text.
+    fn text(&self) -> String {
+        let plural = if self.items.len() == 1 { "" } else { "s" };
+        escape_invisible(&format!(
+            "{} {} -> {} (tree: {} item{plural}, {} bytes)",
+            self.entry,
+            self.src,
+            self.dest,
+            self.items.len(),
+            self.size
+        ))
+    }
+}
+
+/// The trees of `steps`, which [`engine::resolve`] built from `expanded`
+/// for `target`: each tree's dest step, in order, belongs to the next
+/// recursive entry that matches `target`, as only those yield one.
+fn trees_of(
+    steps: &[PlannedRun],
+    expanded: &Expanded,
+    sources: &Sources,
+    target: &Target,
+    facts: &Facts,
+) -> Vec<TreeShown> {
+    let entries = expanded.files().filter_map(|(item, entry, i)| {
+        let tree = sources.tree(i).filter(|_| item.matches(target, facts))?;
+        Some((item.label("files", i), entry, tree))
+    });
+    let firsts = (steps.iter().enumerate())
+        .filter(|(_, step)| step.dir().is_some_and(|dir| dir.tree_dest))
+        .map(|(step, _)| step);
+    firsts
+        .zip(entries)
+        .map(|(step, (label, entry, tree))| TreeShown {
+            step,
+            entry: label,
+            src: entry.src.clone(),
+            dest: entry.dest.clone(),
+            size: tree.size(),
+            items: (tree.items.iter())
+                .map(|item| {
+                    let (kind, size, binary) = match item.source() {
+                        Some(source) => ("file", source.bytes.len() as u64, source.binary),
+                        None => ("dir", 0, false),
+                    };
+                    TreeItemShown {
+                        path: item.rel.clone(),
+                        kind,
+                        size,
+                        binary,
+                    }
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// One target's rendered text of one templated file; `step` indexes that
@@ -202,7 +294,34 @@ pub fn run_targets(prepared: &Prepared, on: &mut dyn FnMut(Progress<'_>)) -> Pla
         on,
     );
     plan.warnings = warnings;
+    plan.warnings
+        .extend(record_full_warnings(&prepared.expanded, &prepared.sources));
     plan
+}
+
+/// One warning per `recursive = true` entry with `rollback` whose text
+/// files' previous texts, each kept up to [`MAX_KEPT`], could together pass
+/// the record's [`record::MAX_RECORD`]: rollback may then not undo every
+/// item. Binary files keep only hashes, so they do not count.
+fn record_full_warnings(expanded: &Expanded, sources: &Sources) -> Vec<String> {
+    let budget = record::MAX_RECORD as u64;
+    expanded
+        .files()
+        .filter(|(_, entry, _)| entry.rollback)
+        .filter_map(|(item, entry, i)| {
+            let tree = sources.tree(i)?;
+            let texts = (tree.items.iter().filter_map(|item| item.source()))
+                .filter(|source| !source.binary)
+                .count() as u64;
+            (texts.saturating_mul(MAX_KEPT) > budget).then(|| {
+                escape_invisible(&format!(
+                    "{} {}: rollback may not keep every previous text (record full)",
+                    item.label("files", i),
+                    entry.dest
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Each of `targets`' handlers pending from the last apply, by target, as
@@ -343,7 +462,7 @@ fn plan_target(
         .map_err(|err| Unresolved::Failed(err.to_string()))
         .and_then(|transport| engine::probe(transport.as_ref(), expanded))
         .and_then(|facts| {
-            engine::resolve(
+            let steps = engine::resolve(
                 target,
                 Some(&facts),
                 config,
@@ -351,16 +470,19 @@ fn plan_target(
                 sources,
                 plugins,
                 cancel,
-            )
+            )?;
+            let trees = trees_of(&steps, expanded, sources, target, &facts);
+            Ok((steps, trees))
         });
     match runs {
-        Ok(steps) => {
+        Ok((steps, trees)) => {
             log::info!("plan {}: {} steps", target.name, steps.len());
             PlanReport::Planned {
                 target: target.name.clone(),
                 vars: report::shown_vars(target),
                 env: report::shown_env(target),
                 steps,
+                trees,
                 pending_handlers,
                 ok: true,
             }
@@ -419,7 +541,8 @@ pub fn run(out: Output, opts: &Options, show_rendered: bool) -> Result<(), Failu
 /// per resolved var and env value, a `PATH  NAME` line per task and a
 /// `would $ command` line per step and a line per guard ([`guard_texts`]) and file attribute ([`attr_texts`]), then `✔ N steps`, `✘ reason` or `⊘ cancelled` (or its abort
 /// reason), then a blank line. A templated file step's would line is followed
-/// by its [`rendered_text`] and, with `show_rendered`, the text itself.
+/// by its [`rendered_text`] and, with `show_rendered`, the text itself. A
+/// tree's first step is preceded by its [`TreeShown::text`] line.
 pub fn render(report: &PlanReport, show_rendered: bool) -> Vec<Line> {
     let mut lines = vec![Line::header(report.target())];
     let (vars, env) = report.values();
@@ -429,14 +552,18 @@ pub fn render(report: &PlanReport, show_rendered: bool) -> Vec<Line> {
     let end = match report {
         PlanReport::Planned {
             steps,
+            trees,
             pending_handlers,
             ..
         } => {
-            for step in steps {
+            for (i, step) in steps.iter().enumerate() {
                 lines.extend(
                     step.title()
                         .map(|title| Line::out(title, Escape::Always, None)),
                 );
+                if let Some(tree) = trees.iter().find(|tree| tree.step == i) {
+                    lines.push(Line::out(tree.text(), Escape::Always, None));
+                }
                 lines.push(Line::out(would_text(step), Escape::Always, Some(DIM)));
                 for text in guard_texts(step).into_iter().chain(attr_texts(step)) {
                     lines.push(Line::out(format!("  {text}"), Escape::Always, Some(DIM)));
@@ -852,6 +979,146 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_shows_its_items_and_size_before_its_steps_and_lists_them_in_json() {
+        use crate::config::{FileEntry, ModeValue};
+
+        let dir = std::fs::canonicalize(crate::test_util::temp_dir("plan-tree")).unwrap();
+        for (src, bin) in [("web", "w.bin"), ("conf", "c.bin")] {
+            std::fs::create_dir_all(dir.join(src).join("sub")).unwrap();
+            std::fs::write(dir.join(src).join("a.conf"), "a = 1\n").unwrap();
+            std::fs::write(dir.join(src).join("sub").join(bin), b"\xff\0x").unwrap();
+        }
+        let tree = |src: &str, tags: &[&str]| FileEntry {
+            src: src.to_owned(),
+            dest: "/srv/app".to_owned(),
+            mode: Some(ModeValue::Text("0640".to_owned())),
+            owner: None,
+            group: None,
+            parents: false,
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            facts: Default::default(),
+            sudo: false,
+            rollback: true,
+            template: false,
+            notify: Vec::new(),
+            recursive: true,
+            dir_mode: Some("0750".to_owned()),
+        };
+        // The skipped entry shares the dest, so the tree shown must be the
+        // matching one's.
+        let config = Config {
+            files: vec![tree("web", &["web"]), tree("conf", &[])],
+            path: Some(dir.join("config.toml")),
+            ..Config::default()
+        };
+        let sources = crate::files::load(&legacy(&config), || Ok(dir.clone())).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let plan = plan_targets(
+            &[target("local")],
+            NonZeroU8::MIN,
+            |_| {
+                Ok(Box::new(Recorder {
+                    log: Arc::clone(&log),
+                    probe: MAC,
+                }))
+            },
+            &config,
+            &sources,
+            &FakePlugins::none(),
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        assert_eq!(*log.lock().unwrap(), [facts::PROBE], "no step ran");
+        assert_eq!(
+            screen(&plan.targets[0]),
+            "▶ local\n  would $ skipped file /srv/app: no match\n  \
+             files[1] conf -> /srv/app (tree: 4 items, 9 bytes)\n  \
+             would $ dir /srv/app\n    mode 0750\n  would $ file /srv/app/a.conf\n  \
+             would $ dir /srv/app/sub\n    mode 0750\n  \
+             would $ file /srv/app/sub/c.bin (binary)\n  would $ hostname\n  ✔ 6 steps\n\n"
+        );
+        let target = &json(&plan)["targets"][0];
+        assert_eq!(
+            target["trees"],
+            serde_json::json!([{
+                "step": 1,
+                "entry": "files[1]",
+                "src": "conf",
+                "dest": "/srv/app",
+                "size": 9,
+                "items": [
+                    {"path": "", "kind": "dir", "size": 0, "binary": false},
+                    {"path": "a.conf", "kind": "file", "size": 6, "binary": false},
+                    {"path": "sub", "kind": "dir", "size": 0, "binary": false},
+                    {"path": "sub/c.bin", "kind": "file", "size": 3, "binary": true},
+                ],
+            }])
+        );
+        assert_eq!(
+            target["steps"][4],
+            serde_json::json!({"run": "file /srv/app/sub/c.bin", "binary": true})
+        );
+        assert!(!target.to_string().contains("a = 1"), "no bytes: {target}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_plan_without_a_tree_has_no_trees_in_json() {
+        let (plan, _) = plan(&["local"], None, MAC, &config(None, &["one"]), false);
+        assert_eq!(keys(&json(&plan)["targets"][0]), ["ok", "steps", "target"]);
+    }
+
+    #[test]
+    fn a_tree_whose_kept_texts_may_pass_the_record_budget_is_warned_of() {
+        use crate::config::{FileEntry, ModeValue};
+
+        let fit = (record::MAX_RECORD as u64 / MAX_KEPT) as usize;
+        let dir = std::fs::canonicalize(crate::test_util::temp_dir("plan-full")).unwrap();
+        for (src, texts, binaries) in [("full", fit + 1, 0), ("edge", fit, 3)] {
+            std::fs::create_dir_all(dir.join(src)).unwrap();
+            for k in 0..texts {
+                std::fs::write(dir.join(src).join(format!("t{k}")), "x\n").unwrap();
+            }
+            for k in 0..binaries {
+                std::fs::write(dir.join(src).join(format!("b{k}")), b"\0").unwrap();
+            }
+        }
+        let tree = |src: &str, dest: &str, rollback: bool| FileEntry {
+            src: src.to_owned(),
+            dest: dest.to_owned(),
+            mode: Some(ModeValue::Text("0640".to_owned())),
+            owner: None,
+            group: None,
+            parents: false,
+            tags: Vec::new(),
+            facts: Default::default(),
+            sudo: false,
+            rollback,
+            template: false,
+            notify: Vec::new(),
+            recursive: true,
+            dir_mode: Some("0750".to_owned()),
+        };
+        let config = Config {
+            files: vec![
+                tree("full", "/srv/full", true),
+                tree("edge", "/srv/edge", true),
+                tree("full", "/srv/off", false),
+            ],
+            path: Some(dir.join("config.toml")),
+            ..Config::default()
+        };
+        let expanded = legacy(&config);
+        let sources = crate::files::load(&expanded, || Ok(dir.clone())).unwrap();
+        assert_eq!(
+            record_full_warnings(&expanded, &sources),
+            ["files[0] /srv/full: rollback may not keep every previous text (record full)"],
+            "binaries and rollback = false keep no text"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn each_file_is_a_step_after_packages_and_its_bytes_never_show() {
         use crate::config::{FileEntry, ModeValue};
 
@@ -959,6 +1226,7 @@ mod tests {
                  -z \"$a\" ] || sudo -n pacman -S --noconfirm --needed $a; }";
         let local = PlanReport::Planned {
             target: "local".to_owned(),
+            trees: Vec::new(),
             vars: Default::default(),
             env: Default::default(),
             steps: vec![

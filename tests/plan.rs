@@ -1010,3 +1010,95 @@ fn a_binary_src_is_marked_so_its_lost_rollback_shows() {
     );
     assert!(!sandbox.root().join("latin1").exists(), "nothing written");
 }
+
+#[test]
+fn a_tree_shows_its_item_count_and_size_and_json_lists_each_item() {
+    let sandbox = Sandbox::new("pl");
+    let conf = sandbox.config_dir().join("conf");
+    std::fs::create_dir_all(conf.join("empty")).unwrap();
+    std::fs::write(conf.join("a.conf"), "a = 1\n").unwrap();
+    std::fs::write(conf.join("logo.png"), b"\x89PNG\0").unwrap();
+    let dest = sandbox.root().join("app");
+    let dest = dest.display();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[tasks]]\nname = \"App\"\nfile = {{ src = \"conf\", dest = \"{dest}\", recursive = true, \
+             mode = \"0644\", dir_mode = \"0755\", sudo = false }}\n"
+        ),
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  tasks[0]  App\n  tasks[0].file conf -> {dest} (tree: 4 items, 11 bytes)\n  \
+             would $ dir {dest}\n    mode 0755\n  tasks[0]  App\n  would $ file {dest}/a.conf\n  \
+             tasks[0]  App\n  would $ dir {dest}/empty\n    mode 0755\n  \
+             tasks[0]  App\n  would $ file {dest}/logo.png (binary)\n  \
+             ✔ 4 steps\n\n1 target, nothing executed\n"
+        )
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let target = &json(&out)["targets"][0];
+    assert_eq!(keys(target), ["ok", "steps", "target", "trees"]);
+    assert_eq!(
+        target["trees"],
+        serde_json::json!([{
+            "step": 0,
+            "entry": "tasks[0].file",
+            "src": "conf",
+            "dest": dest.to_string(),
+            "size": 11,
+            "items": [
+                {"path": "", "kind": "dir", "size": 0, "binary": false},
+                {"path": "a.conf", "kind": "file", "size": 6, "binary": false},
+                {"path": "empty", "kind": "dir", "size": 0, "binary": false},
+                {"path": "logo.png", "kind": "file", "size": 5, "binary": true},
+            ],
+        }])
+    );
+    assert_eq!(target["steps"].as_array().unwrap().len(), 4, "one per item");
+    assert_eq!(target["steps"][3]["binary"], true);
+    assert!(!sandbox.root().join("app").exists(), "nothing written");
+}
+
+#[test]
+fn a_tree_whose_kept_texts_may_fill_the_record_warns_in_text_and_json() {
+    // 65 text files of up to 256 KiB kept each pass the 16 MiB record.
+    let sandbox = Sandbox::new("pl");
+    let many = sandbox.config_dir().join("many");
+    std::fs::create_dir_all(&many).unwrap();
+    for k in 0..65 {
+        std::fs::write(many.join(format!("f{k:02}")), "x\n").unwrap();
+    }
+    let dest = sandbox.root().join("many");
+    let dest = dest.display();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"many\"\ndest = \"{dest}\"\nrecursive = true\nmode = \"0644\"\n\
+             dir_mode = \"0755\"\nsudo = false\n"
+        ),
+    );
+    let warning =
+        format!("files[0] {dest}: rollback may not keep every previous text (record full)");
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains(&format!("WARNING: {warning}\n")),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(
+        text(&out.stdout).contains(&format!(
+            "files[0] many -> {dest} (tree: 66 items, 130 bytes)\n"
+        )),
+        "{}",
+        text(&out.stdout)
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(json(&out)["warnings"], serde_json::json!([warning]));
+}

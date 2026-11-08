@@ -2585,6 +2585,7 @@ mod tests {
         ));
         let plan = plan_block(&PlanReport::Planned {
             target: "local".to_owned(),
+            trees: Vec::new(),
             vars: Default::default(),
             env: Default::default(),
             steps: vec![PlannedRun {
@@ -2659,6 +2660,7 @@ mod tests {
         };
         let plan = plan_block(&PlanReport::Planned {
             target: "local".to_owned(),
+            trees: Vec::new(),
             vars: Default::default(),
             env: Default::default(),
             steps: vec![file(Some(rendered)), file(None)],
@@ -2752,6 +2754,7 @@ mod tests {
             RunResult::Plan {
                 targets: done(vec![PlanReport::Planned {
                     target: "local".to_owned(),
+                    trees: Vec::new(),
                     vars: Default::default(),
                     env: Default::default(),
                     steps: vec![PlannedRun {
@@ -2791,6 +2794,7 @@ mod tests {
                 targets: done(vec![
                     PlanReport::Planned {
                         target: "local".to_owned(),
+                        trees: Vec::new(),
                         vars: Default::default(),
                         env: Default::default(),
                         steps: vec![

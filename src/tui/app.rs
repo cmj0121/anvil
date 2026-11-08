@@ -2276,6 +2276,7 @@ pub mod tests {
             0,
             plan::PlanReport::Planned {
                 target: "local".to_owned(),
+                trees: Vec::new(),
                 vars: Default::default(),
                 env: Default::default(),
                 steps: Vec::new(),
