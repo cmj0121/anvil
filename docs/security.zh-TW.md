@@ -99,6 +99,14 @@
 - **檔案位元組不會進入 argv**。文字檔以 heredoc 經由腳本的 stdin 傳到 target。二進位檔案以 `printf` 行放在同一份腳本中；
   target 的 `sh` 不以內建指令執行 `printf` 時（BSD pdksh、部分 mksh），step 會在寫入任何東西之前拒絕，以 4 結束：
   外部的 `printf` 會把位元組放上行程的指令列，`ps` 會讓每個本機使用者看到它們（[Files](configuration.zh-TW.md#files)）。
+- **遞迴複製不跟隨任何 symlink**。`recursive = true` 的 src 在連線任何 target 之前走訪一次，
+  其中任何位置的 symlink（包括根目錄）、特殊檔案、不是 UTF-8 或含控制位元組的名稱，以及其他人可寫入的檔案或資料夾，都會被拒絕，以 2 結束。
+  工作區的走訪在每一層都不跟隨 symlink 地開啟，並透過開啟的描述子讀取每個檔案，因此期間被換成的連結也會被拒絕。
+  在 target 上每個目錄都只建立不修改：既有的保持不動，路徑上的 symlink 或檔案會被拒絕，絕不跟隨。
+  建立的目錄維持寫入身分的擁有者，並取得不能讓群組或其他人寫入的 `dir_mode`，因此其下每個檔案仍受只有 root 能寫入的規則保護。
+  每個檔案都與單一檔案一樣寫入與記錄，因此 `rollback = false` 讓每個項目都只保存雜湊。
+  rollback 會重新從 src 讀取這棵樹，只還原它仍以相同種類、相同 `sudo` 持有的項目；其 dest 之下其他記錄的路徑會被拒絕，
+  樹已不再持有的則保持原狀（[Recursive copy](configuration.zh-TW.md#recursive-copy)）。
 - **每份紀錄一次只能有一個 apply 或 rollback**。紀錄透過旁邊的 `last-apply.json.lock` 上鎖；第二個 anvil 會直接以
   `PATH is in use by another anvil` 失敗，而不會等待。這個鎖需要 `flock`，NFS 可能不提供：
   `PATH: the filesystem does not support locking (NFS?); set $XDG_STATE_HOME to a local disk`。

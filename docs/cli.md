@@ -216,6 +216,9 @@ stdout is only a unified diff (three lines of context), one section per changed 
 - a [templated](configuration.md#templating) src, which harden neither judges nor changes:
   `harden: review ssh.root-login: files[0]: src $/sshd.conf.j2 is a template, not judged; check it sets PermitRootLogin no`
   (`does not contradict` for another file of that service, such as `/etc/ssh/sshd_config`);
+- a [recursive copy](configuration.md#recursive-copy) whose dest is, or holds, such a file:
+  `harden: review ssh.root-login: …` with
+  `files[0]: src $/ssh is a recursive copy, its files not judged; check them does not contradict PermitRootLogin no`;
 - with nothing to suggest, no review, and nothing printed on stdout:
   `config carries every harden rule; anvil plan / apply bring the hosts to it`;
 - for a legacy YAML config: `harden: config.yaml is shown as the TOML anvil config would migrate it to`, and the diff
@@ -268,7 +271,7 @@ behind it, `diff` the same text the preview prints, and `written` whether `--wri
 ```
 
 `action` is `add`, `change` or `remove`; `warnings` holds the `--strict` text without the `harden: warning` prefix. A
-config with a templated src adds `review`, one object per src to check by hand, left out when empty:
+config with a templated src or such a recursive copy adds `review`, one object per src to check by hand, left out when empty:
 
 ```json
 {
@@ -1219,6 +1222,14 @@ next try, and a failed apply keeps the paths it did not reach):
 ]
 ```
 
+**Trees.** A [recursive copy](configuration.md#recursive-copy) keeps no entry of its own. Each file item it changed is a
+file entry at `DEST/rel`, its previous text kept or not under the rules below, and each directory it created is a dir
+entry with `previous` null; an item the tree's check found unchanged is not captured, and a directory that was already
+there is not recorded. The changed items are saved in batches, up to 16 items or 1 MiB of kept text, before the batch
+writes, and a directory as soon as it is created, so a killed apply leaves each item already written in the record. With
+many text files a tree can pass the 16 MiB limit below, and the texts dropped are lost for rollback;
+[`anvil plan`](#anvil-plan) warns of such a tree.
+
 **Pending handlers.** `pending_handlers` is saved as each notify happens and as each handler succeeds, so it outlives a
 failed, cancelled or killed apply. A new apply's entry and a rollback keep it, and a target whose entry is replaced
 carries it over. A record without the field loads as before. Bad names in it are dropped on load, with a warning
@@ -1359,6 +1370,15 @@ secret is set and free of control characters is not checked, so plan can pass wh
   lines. plan reads no dest, so it cannot tell whether apply would write, fix or leave it unchanged, and it creates no
   directory. A `sudo = false` owner other than the login user fails the target in plan as in apply
   (`✘ files[0].owner NAME: needs sudo; the login user is USER`).
+- A [recursive copy](configuration.md#recursive-copy) on a target it matches adds a header line before its first step,
+  `files[N] SRC -> DEST (tree: N items, SIZE bytes)` (`PATH.file` for a task), where the count includes dest itself and
+  SIZE is the bytes of all its files. Then each item is its own line: `would $ dir PATH` with `mode DIR_MODE`,
+  `group NAME` when set and `parents` on dest when set, and `would $ file PATH` with `(binary)` for a binary file and
+  `owner` and `group` lines when set. The TUI's plan view shows these steps but not the header line.
+- A recursive entry with `rollback` whose text files could keep more previous text than the record holds is a warning
+  on stderr, `WARNING: files[N] DEST: rollback may not keep every previous text (record full)`. It is an estimate: the
+  tree's text files times 256 KiB, the most kept for one file, against the 16 MiB record, counted per entry, not per
+  target it matches; binary files keep only hashes and do not count ([The apply record](#the-apply-record)).
 - A dir step is `would $ dir PATH`, with `mode MODE`, then `owner NAME`, `group NAME` and `parents` for those its entry
   sets. A link step is `would $ link PATH -> TARGET` (control and invisible characters in TARGET escaped), with `force`
   and `parents` when set. An absent step is `would $ absent PATH`, with `type TYPE` when set. plan looks at none of
@@ -1416,6 +1436,46 @@ lines:
 
 A target a cancel skipped is `{"target": "pi", "ok": false}`, with `"abort": "terminated"` or `"hung_up"` when a first
 SIGTERM or SIGHUP did it ([Ctrl-C](#ctrl-c)).
+
+**Recursive copies.** A tree's steps are its items, so plan shows what apply would run, never whether an item would
+change; plan reads no dest. With a `[[files]]` entry `src = "conf"`, `dest = "/srv/app"`, `mode = "0640"`,
+`recursive = true` and `dir_mode = "0750"`, whose src holds `a.conf` (6 bytes) and `sub/c.bin` (3 bytes, binary):
+
+```text
+▶ local
+  files[0] conf -> /srv/app (tree: 4 items, 9 bytes)
+  would $ dir /srv/app
+    mode 0750
+  would $ file /srv/app/a.conf
+  would $ dir /srv/app/sub
+    mode 0750
+  would $ file /srv/app/sub/c.bin (binary)
+  ✔ 4 steps
+```
+
+In `--json` a planned target with a tree has `trees`, left out when there is none: per tree, `step` (the index in
+`steps` of its first step, dest's), `entry`, `src`, `dest`, `size`, and `items` in step order, each
+`{path, kind, size, binary}` with `path` relative to dest (`""` for dest itself), `kind` `dir` or `file` and `size` 0
+for a directory. The bytes are never in it. The record warning above is in the top-level `warnings`, without the
+`WARNING:` prefix.
+
+```json
+"trees": [
+  {
+    "step": 0,
+    "entry": "files[0]",
+    "src": "conf",
+    "dest": "/srv/app",
+    "size": 9,
+    "items": [
+      { "path": "", "kind": "dir", "size": 0, "binary": false },
+      { "path": "a.conf", "kind": "file", "size": 6, "binary": false },
+      { "path": "sub", "kind": "dir", "size": 0, "binary": false },
+      { "path": "sub/c.bin", "kind": "file", "size": 3, "binary": true }
+    ]
+  }
+]
+```
 
 **Templated files.** plan never reads a dest, so it cannot diff; it shows what each target would get instead. Without
 a flag that is the `rendered N bytes, sha256 HEX` line, and no file bytes are printed. `--show-rendered` also prints
@@ -1757,6 +1817,29 @@ the target as `printf` octal escapes, up to about four times its size on the wir
 written: `files: printf is not a shell builtin; cannot copy a binary file`. A text file still goes in a heredoc, its
 bytes unchanged. A binary write cannot be undone ([`anvil rollback`](#anvil-rollback)).
 
+An entry with [`recursive = true`](configuration.md#recursive-copy) copies a directory tree, and is one step per item
+on a target that matches, in sorted path order: `$ dir PATH` for dest and each directory, `$ file PATH` for each file,
+each printing what it did as above. A directory is create-only: a missing one prints `created PATH`, an existing one is
+left as it is and prints `unchanged PATH`, and a symlink, file or anything else at its path fails the step, exit 4, with
+`dirs: PATH is not a directory`, never followed. Files in dest that the tree does not hold are kept. Before the first
+item one check run looks at the whole tree, and each item already as the tree has it runs nothing and prints
+`unchanged PATH`; on the sudo password path there is no check run. The entry's `notify` fires once when any item
+changed. A target the entry does not match has the one skipped step, `$ skipped file DEST: no match`. With `-vv`, on a
+second apply after one file changed in src:
+
+```text
+▶ web1
+  $ dir /etc/nginx
+  unchanged /etc/nginx
+  $ file /etc/nginx/nginx.conf
+  wrote /etc/nginx/nginx.conf
+  $ dir /etc/nginx/sites
+  unchanged /etc/nginx/sites
+  $ file /etc/nginx/sites/default
+  unchanged /etc/nginx/sites/default
+  ✔ ok · 4 steps
+```
+
 Before each write, apply reads DEST back and keeps what it held in the [apply record](#the-apply-record), so
 [`anvil rollback`](#anvil-rollback) can put it back; the write then refuses a DEST that changed since that read.
 
@@ -1800,6 +1883,13 @@ command for every target, those the entry does not match included:
 
 ```text
 ERROR anvil: files[0].src `../nope`: cannot read: No such file or directory (os error 2)
+```
+
+A [recursive](configuration.md#recursive-copy) src is walked whole at that point, and a symlink or special file in it,
+a bad name, a tree nested too deep or one past the tree limits is exit 2 the same way:
+
+```text
+ERROR anvil: files[0].src `conf`: sub/link: is a symlink; a recursive copy refuses symlinks
 ```
 
 The refusals, the matching rules and what lands on the target (owner and group, symlinks, missing parent directories) are in
@@ -2225,6 +2315,12 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   with `dirs: PATH is not a directory`, forced or not. The directories `parents = true` created above PATH are removed
   after it, as for a file. A refused step kept only for those directories is the step
   `remove the directories made for PATH`, which only removes them.
+- **Trees.** The items of a [recursive copy](configuration.md#recursive-copy) roll back as files and directories do:
+  a file gets its kept text back, or is removed when the apply created it, and a binary file or one with
+  `rollback = false` (which holds for every item) is `cannot undo: PATH (REASON)`. The directories the tree created
+  come after its files and are removed deepest first, each only when empty, so one that holds a file the tree did not
+  write stays, with the warning `rollback: PATH is not empty; left in place`. An item whose previous text the record
+  limit dropped is `cannot undo: PATH (record full)`. The entry's `notify` is queued once.
 - **Links.** A link the step created is `remove link PATH`, printing `removed link PATH`, or `unchanged PATH` when it is
   already gone. A link it replaced is `restore link PATH -> OLD`, which puts the old link back in one rename, as apply
   relinks, and prints `restored link PATH -> OLD`, or `unchanged PATH` when PATH already points at OLD. A regular file
@@ -2288,6 +2384,18 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   entry back to roll that target back. A record whose dest, mode or sha256 apply could not have written (a relative
   dest, a `..`, a leading `-`, a mode that is not octal) fails with `rollback: PATH: cannot parse`, as a bad record
   does.
+- **Tree items.** Rollback reads each recursive entry's src again, as apply does (a single file's src is not read), and
+  a recorded file or directory at or under that entry's dest counts only when the loaded tree holds it as an item of
+  the same kind, with the same `sudo`, for a target the entry applies to. A tree that no longer loads is exit 2,
+  before any target:
+  ``rollback: files[0].src `conf`: REASON; …``, ending in
+  `the config decides which files may be restored: fix or restore what it names, then run rollback again`.
+  An item the src no longer holds is the skipped step `cannot undo: PATH (no longer in the tree)`, also under
+  `--dry-run`, and is left as it is; rollback goes on with the rest. Anything else fails the target, as above:
+  `rollback: PATH is a directory of a recursive entry's tree in [[files]], not a file; refusing to restore it`,
+  `rollback: PATH is a file of a recursive entry's tree in [[files]], not a directory; refusing to restore it`, the
+  `sudo` message, `has directories created for it` for a tree file (only dest itself may have them, with
+  `parents = true`), and the `is not in` messages for a path under no dest the config names.
 - **The guard.** Before it changes DEST, the step hashes it. It goes ahead when DEST holds the bytes apply wrote or what
   was there before. When the record has `written_attrs`, DEST must also have the owner, group and mode apply left, so a
   `chown` or `chmod` since the apply counts as a change; after an owner, group or mode fix, what was there before is the
@@ -2358,7 +2466,7 @@ Exit codes:
   failed restore or connection); the record cannot be read (`rollback: PATH: REASON`, as for apply), is locked by
   another anvil or cannot be saved; no state directory ([The apply record](#the-apply-record)).
 - **2**: a bad flag (`--force` with `--force-all`), a `--force DEST` not in the record, an unknown `--target`, or an
-  invalid config or inventory, including a task or include that does not expand.
+  invalid config or inventory, including a task or include that does not expand or a recursive src that does not load.
 
 ### `anvil run [--timeout SECS] <FILE|->`
 

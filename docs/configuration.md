@@ -518,6 +518,8 @@ sudo = false                     # optional; default true. false: write as the c
 rollback = false                 # optional; default true. false: the apply record keeps the hash only
 template = true                  # optional; default false. true: render src per target (see Templating)
 notify = ["reload sshd"]         # optional; the [[handlers]] to run when the step writes (see Handlers)
+recursive = true                 # optional; default false. true: src is a directory, copied as a tree (see Recursive copy)
+dir_mode = "0755"                # required with recursive = true, else refused: the mode of each directory it creates
 ```
 
 **`mode`.** Required, and a quoted string. Three or four octal digits, at most `0777` plus the sticky bit, so `644`,
@@ -898,6 +900,110 @@ therefore shows as `wrote DEST` on the next apply, and rollback restores what de
 **Known limit.** String concatenation (`~`) and a large repetition (`*`) can use a lot of memory on the controller
 before the 1 MiB limit applies (MiniJinja caps one repetition at 100 MB). A template is trusted like the config: whoever
 can edit it can already run any step on the targets.
+
+### Recursive copy
+
+`recursive = true` on a `[[files]]` entry, or on a task `file`, copies a directory and everything under it to `dest`:
+the dest directory itself, then each directory and file below it, one step per item. It needs `dir_mode`:
+
+```toml
+[[files]]
+src = "$/nginx"                  # a directory in the store or the workspace
+dest = "/etc/nginx"
+mode = "0644"                    # each file's mode
+recursive = true
+dir_mode = "0755"                # each directory it creates
+```
+
+A file task takes the same keys:
+`file = { src = "$/nginx", dest = "/etc/nginx", mode = "0644", recursive = true, dir_mode = "0755" }`.
+
+**Keys.** `dir_mode` follows the rules of `mode` (quoted, 3 or 4 octal digits, no setuid or setgid) and also refuses
+group and world write, which the [directory rule](#files) would refuse to write under. Exit 2, naming the entry
+(`tasks[0].file.dir_mode: …` for a task):
+
+- `files[0].dir_mode: required with recursive = true`
+- `files[0].dir_mode: only with recursive = true`
+- `files[0].template: not with recursive = true`
+- ``files[0].dir_mode `0775`: group or world write is refused`` (`0757` too)
+- ``files[0].dir_mode `4755`: setuid and setgid are refused``
+
+The other keys apply to each item:
+
+- **`mode`** is each file's mode, and `dir_mode` each created directory's.
+- **`owner`** applies to files only. A created directory gets `group` and `dir_mode`, but keeps the owner of the
+  write's identity: root for a write as root, the login user with `sudo = false`. That is what lets the files below it
+  be written: the [directory rule](#files) refuses to write under a directory owned by anyone else, so a directory
+  given another owner would stop the walk to every file in it.
+- **`parents = true`** creates the missing directories above dest only, as for a single file. The directories inside
+  the tree are its own items.
+- **`sudo`, `rollback`, `tags`, `facts` and `notify`** work as for a single file, on every item.
+
+**What src may hold.** src names a directory in the workspace (`conf`, `conf/`) or in the store (`$/conf`). The tree is
+read once, before any target is contacted, and every refusal is exit 2 for every target, naming the entry, as for a
+single src:
+
+- a src that is the workspace itself: ``files[0].src `.`: must name a directory below the workspace``; the store root:
+  ``files[0].src `$/`: must name a folder below the store``;
+- a src that is a symlink: ``files[0].src `link`: is a symlink; recursive = true needs the real directory``
+  (``files[0].src `$/link`: is a symlink`` in the store); one that is not a directory:
+  ``files[0].src `motd`: is not a directory; recursive = true needs one`` (`is not a folder` in the store);
+- a symlink anywhere below it: ``files[0].src `conf`: sub/link: is a symlink; a recursive copy refuses symlinks``;
+- a FIFO, socket or device: ``files[0].src `conf`: sub/fifo: is not a regular file or directory; a recursive copy refuses it``;
+- a name that is not UTF-8 (`sub/…: its name is not UTF-8`), holds a control character
+  (`sub/a\x07: its name holds a control character`) or is over 255 bytes (`PATH: its name exceeds the 255 byte limit`),
+  or a `DEST/rel` that fails the [`dest`](#files) rules
+  (``sub/a b: dest `/etc/app/sub/a b`: must match [A-Za-z0-9._/@+-]``);
+- a tree nested deeper than 64 folders: `PATH: nested deeper than 64 folders`
+  (`$/conf/PATH nested deeper than 64 folders` in the store);
+- each file and folder under the rules of a single src: yours, not writable by its group or others
+  (`sub: mode 775 lets others write to it; …`), each file at most 1 MiB (`sub/big: exceeds the 1 MiB limit`,
+  `$/conf/sub/big exceeds the 1 MiB limit` in the store), text or [binary](#files);
+- and the limits below.
+
+PATH is the item's path below src. The workspace walk opens each level without following symlinks and reads each file
+through what it opened, so a symlink swapped in during the walk is refused too.
+
+| Limit                                                     | Exit 2 with                                                     |
+| --------------------------------------------------------- | --------------------------------------------------------------- |
+| 1024 files in one tree                                    | `PATH: the tree holds more than 1024 files, its limit`          |
+| 16 MiB of files in one tree                               | `PATH: the tree holds more than 16 MiB, its limit`              |
+| 4096 items in all trees, each directory and dest included | `PATH: the trees hold more than 4096 items in all, their limit` |
+| 64 MiB of files in all trees                              | `PATH: the trees hold more than 64 MiB in all, their limit`     |
+
+A store tree is checked against these from its listing, before any file is read. A tree counts as one entry towards
+the 64 entry limit (and the 64 file tasks of a tasks config).
+
+**What lands on the target.** Each item is its own step, in sorted path order, so a directory comes before what it holds:
+
+- **A directory** is a dir step, `$ dir PATH`, and is create-only. A missing one is made with `group` and `dir_mode` and
+  prints `created PATH`. An existing one is left as it is, its owner, group and mode included, and prints
+  `unchanged PATH`; use a [`[[dirs]]`](#dirs) entry to fix one. A symlink, a file or anything else at the path fails the
+  step, exit 4, with `dirs: PATH is not a directory`; it is never followed, and nothing below it is written.
+- **A file** is a file step to `DEST/rel`, written and compared as a single file is, and prints `wrote`, `fixed` or
+  `unchanged` the same way ([File steps](cli.md#file-steps)).
+- **Nothing is removed.** Files in dest that the tree does not hold are kept; there is no purge.
+- **One check per tree.** Before the first item, one run hashes the tree's files on the target, reads their owner,
+  group and mode and sees which of its directories exist, all without following symlinks. An item already as the tree
+  has it runs nothing and prints `unchanged PATH`, so an unchanged tree costs one run. On the sudo password path there
+  is no check run, and every item runs its own step.
+- **`notify`** fires once when any item changed, and not when none did.
+
+**Record and rollback.** Each changed file item is kept in the [apply record](cli.md#the-apply-record) as a file is,
+under the same rules for its previous text, and each directory the tree created as a directory with `previous` null;
+an existing directory is not recorded. `rollback = false` applies to every item. The items are saved in batches of up to
+16, or 1 MiB of kept text, before the batch writes, and a created directory at once, so a killed apply leaves every item
+already written in the record. [`anvil rollback`](cli.md#anvil-rollback) reads the tree from src again, and undoes an
+item only while the tree still holds it as the same kind, with the same `sudo`. A tree of many text files can outgrow
+the 16 MiB record; [`anvil plan`](cli.md#anvil-plan) warns of that.
+
+[`config --harden`](#harden) does not judge a tree's files: a tree whose dest is, or holds, an sshd or sysctl config
+file is reported for review.
+
+**Known limits.** A tree never deletes: there is no recursive delete and no purge. `template = true` is not allowed in a
+tree, special files are refused, and a hard link is copied as a separate file. `anvil files cp` takes text files only,
+so a binary file in a store tree must be put under `files/` another way. The TUI's plan view shows a tree's item steps,
+but not its header line ([`anvil plan`](cli.md#anvil-plan)).
 
 ## Dirs
 
@@ -1642,7 +1748,8 @@ rewritten, so you may edit it.
 
 A [templated](#templating) src is neither judged nor changed, since what it sets shows only once rendered. harden
 reports it for review instead, naming what to check, and never says the config carries every rule while one is open
-([`anvil config --harden`](cli.md#anvil-config---harden)).
+([`anvil config --harden`](cli.md#anvil-config---harden)). A [recursive copy](#recursive-copy) whose dest is, or holds,
+one of those files is reported for review the same way, its files not judged.
 
 On a [`[[tasks]]`](#tasks) config the rules suggest tasks instead of sections, and only the main file's top-level tasks are
 written. An entry already in an include or a nested task counts as present; one there that needs changing is left to

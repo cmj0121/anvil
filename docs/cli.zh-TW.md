@@ -209,6 +209,9 @@ stdout 只有一份 unified diff（三行上下文），每個變更的檔案一
 - [範本](configuration.zh-TW.md#templating) src，harden 既不評斷也不修改：
   `harden: review ssh.root-login: files[0]: src $/sshd.conf.j2 is a template, not judged; check it sets PermitRootLogin no`
   （同一服務的其他檔案，例如 `/etc/ssh/sshd_config`，則為 `does not contradict`）；
+- dest 本身是、或底下含有這類檔案的[遞迴複製](configuration.zh-TW.md#recursive-copy)：
+  `harden: review ssh.root-login: …` 加上
+  `files[0]: src $/ssh is a recursive copy, its files not judged; check them does not contradict PermitRootLogin no`；
 - 沒有任何建議、沒有待檢查項目時（stdout 不印任何東西）：
   `config carries every harden rule; anvil plan / apply bring the hosts to it`；
 - 舊版 YAML config：`harden: config.yaml is shown as the TOML anvil config would migrate it to`，diff 以該 TOML 為準。
@@ -260,7 +263,7 @@ stdout 只有一份 unified diff（三行上下文），每個變更的檔案一
 ```
 
 `action` 為 `add`、`change` 或 `remove`；`warnings` 存放 `--strict` 的文字，不含 `harden: warning` 前綴。
-含有範本 src 的 config 另加 `review`，每個要手動檢查的 src 一個物件，空時省略：
+含有範本 src 或上述遞迴複製的 config 另加 `review`，每個要手動檢查的 src 一個物件，空時省略：
 
 ```json
 {
@@ -1147,6 +1150,13 @@ mode 記錄時不含 setuid 與 setgid 位元，anvil 不動目錄上的這兩�
 ]
 ```
 
+**目錄樹。** [遞迴複製](configuration.zh-TW.md#recursive-copy)本身沒有自己的項目。
+它變更的每個檔案項目是 `DEST/rel` 的一筆檔案紀錄，先前的文字依下述規則保存或不保存；它建立的每個目錄是一筆 `previous` 為 null 的目錄紀錄。
+樹的檢查發現未變的項目不會擷取，原本就存在的目錄也不會記錄。
+變更的項目分批儲存，每批最多 16 個項目或 1 MiB 的保存文字，在該批寫入之前儲存；目錄則在建立後立即儲存，
+因此被終止的 apply 會把已寫入的每個項目留在紀錄中。文字檔很多的樹可能超過下述 16 MiB 上限，被捨棄的文字就無法 rollback；
+[`anvil plan`](#anvil-plan) 會對這樣的樹發出警告。
+
 **版本。** 只有當某個 target 有 `dirs`、`links` 或 `absent`，或某個檔案有 `created_dirs`，或是位元組未變、只修正了擁有者、群組或 mode（`fixed DEST: …`），或帶有 `binary` 時，紀錄才寫成
 `"version": 2`；其他情況維持 `"version": 1`（如上例），這個 anvil 兩者都能讀。舊版 anvil 會拒絕 version 2 的紀錄，
 顯示 `apply: PATH: version 2 is not supported`（rollback 時為 `rollback: …`），而不是載入後在下一次儲存時遺失那些欄位；
@@ -1268,6 +1278,14 @@ secret 由 `anvil doctor` 檢查。
 - file step 為其項目設定的 `owner`、`group` 與 `parents` 各多一行 `owner NAME`、`group NAME`、`parents`，位於 guard 行之後。
   plan 不讀取 dest，因此無法得知 apply 會寫入、修正或保持不變，也不建立任何目錄。
   不是登入使用者的 `sudo = false` owner 在 plan 中與 apply 一樣讓 target 失敗（`✘ files[0].owner NAME: needs sudo; the login user is USER`）。
+- [遞迴複製](configuration.zh-TW.md#recursive-copy)在它符合的 target 上，於第一個 step 之前多一行標頭
+  `files[N] SRC -> DEST (tree: N items, SIZE bytes)`（task 則為 `PATH.file`），項目數包含 dest 本身，SIZE 是所有檔案的位元組數。
+  接著每個項目各一行：`would $ dir PATH` 加上 `mode DIR_MODE`、設定了時的 `group NAME`，以及設定了時 dest 上的 `parents`；
+  `would $ file PATH` 則在二進位檔案加上 `(binary)`，設定了時另有 `owner` 與 `group` 行。TUI 的 plan 檢視顯示這些 step，但不顯示標頭行。
+- 設定 `rollback` 的遞迴項目，若其文字檔可能保存的先前文字超過紀錄所能容納，會在 stderr 發出警告
+  `WARNING: files[N] DEST: rollback may not keep every previous text (record full)`。
+  這是估算：樹中的文字檔數乘以單一檔案最多保存的 256 KiB，與 16 MiB 的紀錄相比，以項目計算，不依它符合哪些 target 篩選；
+  二進位檔案只保存雜湊，不計入（[apply 紀錄](#apply-紀錄)）。
 - dir step 為 `would $ dir PATH`，接著是 `mode MODE`，以及項目設定了的 `owner NAME`、`group NAME` 與 `parents`。
   link step 為 `would $ link PATH -> TARGET`（TARGET 中的控制與不可見字元會跳脫），設定了時另有 `force` 與 `parents`。
   absent step 為 `would $ absent PATH`，設定了時另有 `type TYPE`。
@@ -1323,6 +1341,45 @@ link step 的 `target`、`force`（`true`）與 `parents`、absent step 的 `pat
 
 被取消而略過的 target 為 `{"target": "pi", "ok": false}`，由第一個 SIGTERM 或 SIGHUP 造成時另帶
 `"abort": "terminated"` 或 `"hung_up"`（[Ctrl-C](#ctrl-c)）。
+
+**遞迴複製。** 樹的 step 就是它的項目，因此 plan 顯示 apply 會執行什麼，從不顯示某個項目是否會變更；plan 不讀取 dest。
+以 `src = "conf"`、`dest = "/srv/app"`、`mode = "0640"`、`recursive = true` 與 `dir_mode = "0750"` 的 `[[files]]` 項目為例，
+其 src 含 `a.conf`（6 位元組）與 `sub/c.bin`（3 位元組，二進位）：
+
+```text
+▶ local
+  files[0] conf -> /srv/app (tree: 4 items, 9 bytes)
+  would $ dir /srv/app
+    mode 0750
+  would $ file /srv/app/a.conf
+  would $ dir /srv/app/sub
+    mode 0750
+  would $ file /srv/app/sub/c.bin (binary)
+  ✔ 4 steps
+```
+
+在 `--json` 中，含有樹的已規劃 target 另有 `trees`，沒有時省略：每棵樹有 `step`（它第一個 step，即 dest 的 step，在 `steps` 中的索引）、
+`entry`、`src`、`dest`、`size`，以及依 step 順序排列的 `items`，每個為 `{path, kind, size, binary}`：
+`path` 相對於 dest（dest 本身為 `""`），`kind` 為 `dir` 或 `file`，目錄的 `size` 為 0。其中絕不含位元組。
+上述紀錄警告位於最上層的 `warnings`，不含 `WARNING:` 前綴。
+
+```json
+"trees": [
+  {
+    "step": 0,
+    "entry": "files[0]",
+    "src": "conf",
+    "dest": "/srv/app",
+    "size": 9,
+    "items": [
+      { "path": "", "kind": "dir", "size": 0, "binary": false },
+      { "path": "a.conf", "kind": "file", "size": 6, "binary": false },
+      { "path": "sub", "kind": "dir", "size": 0, "binary": false },
+      { "path": "sub/c.bin", "kind": "file", "size": 3, "binary": true }
+    ]
+  }
+]
+```
 
 **範本檔案。** plan 從不讀取 dest，因此無法做 diff；改為顯示每個 target 會得到什麼。不加旗標時就是
 `rendered N bytes, sha256 HEX` 這一行，不印出任何檔案位元組。`--show-rendered` 另外在該行下方印出每個 target 的算繪文字，
@@ -1651,6 +1708,27 @@ target 的 `sh` 必須把 `printf` 作為內建指令，否則 step 會在寫入
 `files: printf is not a shell builtin; cannot copy a binary file`。文字檔仍以 heredoc 傳送，位元組不變。
 二進位檔案的寫入無法復原（[`anvil rollback`](#anvil-rollback)）。
 
+設定 [`recursive = true`](configuration.zh-TW.md#recursive-copy) 的項目複製整個目錄樹，在符合的 target 上每個項目一個 step，依路徑排序：
+dest 與每個目錄為 `$ dir PATH`，每個檔案為 `$ file PATH`，各自如上印出它做了什麼。
+目錄只建立不修改：不存在的會印出 `created PATH`，已存在的保持原狀並印出 `unchanged PATH`，
+路徑上若是 symlink、檔案或其他東西，step 會失敗，以 4 結束，並顯示 `dirs: PATH is not a directory`，絕不跟隨。
+dest 中不屬於這棵樹的檔案會保留。第一個項目之前會有一次檢查執行檢視整棵樹，已與樹相同的項目不執行任何東西並印出 `unchanged PATH`；
+走 sudo 密碼路徑時沒有檢查執行。只要有任何項目變更，項目的 `notify` 就觸發一次。
+不符合的 target 只有一個略過的 step：`$ skipped file DEST: no match`。以 `-vv`，在 src 中改了一個檔案之後的第二次 apply：
+
+```text
+▶ web1
+  $ dir /etc/nginx
+  unchanged /etc/nginx
+  $ file /etc/nginx/nginx.conf
+  wrote /etc/nginx/nginx.conf
+  $ dir /etc/nginx/sites
+  unchanged /etc/nginx/sites
+  $ file /etc/nginx/sites/default
+  unchanged /etc/nginx/sites/default
+  ✔ ok · 4 steps
+```
+
 每次寫入之前，apply 會讀回 DEST，並把它的內容保存在 [apply 紀錄](#apply-紀錄)中，讓 [`anvil rollback`](#anvil-rollback)
 能把它放回去；接著寫入會拒絕在那次讀取後被改過的 DEST。
 
@@ -1690,6 +1768,13 @@ src 不存在、位於工作區之外、不是一般檔案、超過 1 MiB，或�
 
 ```text
 ERROR anvil: files[0].src `../nope`: cannot read: No such file or directory (os error 2)
+```
+
+[遞迴](configuration.zh-TW.md#recursive-copy) src 在同一時點整個走訪，其中的 symlink 或特殊檔案、不合規則的名稱、
+過深的巢狀，或超過樹的上限，都同樣以 2 結束：
+
+```text
+ERROR anvil: files[0].src `conf`: sub/link: is a symlink; a recursive copy refuses symlinks
 ```
 
 拒絕條件、比對規則，以及寫到 target 上的結果（擁有者與群組、symlink、不存在的上層目錄）見 [Files](configuration.zh-TW.md#files)。
@@ -2083,6 +2168,11 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   已不是目錄的路徑不論是否強制，都以 `dirs: PATH is not a directory` 失敗。
   `parents = true` 在 PATH 之上建立的目錄隨後移除，與檔案相同。
   只因這些目錄而保存的被拒絕 step，為 `remove the directories made for PATH` step，只移除那些目錄。
+- **目錄樹。** [遞迴複製](configuration.zh-TW.md#recursive-copy)的項目與檔案、目錄一樣 rollback：
+  檔案取回保存的文字，或在 apply 建立它時移除；二進位檔案，或 `rollback = false`（對每個項目都成立）的檔案，為 `cannot undo: PATH (REASON)`。
+  樹建立的目錄在它的檔案之後處理，由最深的開始移除，且只在空的時候移除，因此含有不是這棵樹寫入之檔案的目錄會留下，
+  並警告 `rollback: PATH is not empty; left in place`。先前文字被紀錄上限捨棄的項目為 `cannot undo: PATH (record full)`。
+  項目的 `notify` 只排入一次。
 - **連結。** step 建立的連結為 `remove link PATH`，印出 `removed link PATH`，已經不在時印出 `unchanged PATH`。
   step 取代的連結為 `restore link PATH -> OLD`，與 apply 重新連結一樣以一次改名放回舊連結，印出 `restored link PATH -> OLD`，
   PATH 已指向 OLD 時印出 `unchanged PATH`。`force` 取代的一般檔案為 `restore PATH`：移除連結，依檔案還原的方式寫回該檔案
@@ -2134,6 +2224,17 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   `rollback: PATH has a replaced file in the record but no force = true in [[links]]; refusing to restore it`。
   把項目加回 config 才能 rollback 該 target。dest、mode 或 sha256 不可能由 apply 寫出的紀錄（相對路徑的 dest、`..`、
   開頭的 `-`、不是八進位的 mode）與其他錯誤的紀錄一樣，以 `rollback: PATH: cannot parse` 失敗。
+- **樹的項目。** rollback 會像 apply 一樣重新讀取每個遞迴項目的 src（單一檔案的 src 不讀取），
+  位於該項目 dest 或其下的記錄檔案或目錄，只有在載入的樹仍以相同種類、相同 `sudo` 持有它，且該項目適用於該 target 時才算數。
+  無法再載入的樹會在任何 target 之前以 2 結束：
+  ``rollback: files[0].src `conf`: REASON; …``，結尾為
+  `the config decides which files may be restored: fix or restore what it names, then run rollback again`。
+  src 已不再持有的項目為略過的 step `cannot undo: PATH (no longer in the tree)`（`--dry-run` 也是），保持原狀，rollback 繼續處理其餘部分。
+  其他情況都如上讓 target 失敗：
+  `rollback: PATH is a directory of a recursive entry's tree in [[files]], not a file; refusing to restore it`、
+  `rollback: PATH is a file of a recursive entry's tree in [[files]], not a directory; refusing to restore it`、
+  `sudo` 的訊息、樹中檔案的 `has directories created for it`（只有 dest 本身在 `parents = true` 時可以有），
+  以及不在 config 任何 dest 之下的路徑的 `is not in` 訊息。
 - **防護。** 變更 DEST 之前，step 會先雜湊它。DEST 是 apply 寫入的位元組或先前的內容時才會繼續。
   紀錄有 `written_attrs` 時，DEST 還必須保有 apply 留下的擁有者、群組與 mode，因此 apply 之後的 `chown` 或 `chmod` 也算變更；
   只修正擁有者、群組或 mode 的項目，其先前的內容就是記錄的擁有者、群組與 mode。
@@ -2196,7 +2297,7 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   （被拒絕的 dest、不在 `[[files]]` 中的 dest、不在 `[[dirs]]`、`[[links]]` 或 `[[absent]]` 中的路徑、`sudo` 不同者、host 改變、還原或連線失敗）；
   紀錄無法讀取（`rollback: PATH: REASON`，與 apply 相同）、被另一個 anvil 鎖住或無法儲存；找不到狀態目錄（[apply 紀錄](#apply-紀錄)）。
 - **2**：錯誤的旗標（`--force` 與 `--force-all` 並用）、不在紀錄中的 `--force DEST`、未知的 `--target`，
-  或無效的 config 或 inventory，包括無法展開的 task 或 include。
+  或無效的 config 或 inventory，包括無法展開的 task 或 include，或無法載入的遞迴 src。
 
 ### `anvil run [--timeout SECS] <FILE|->`
 

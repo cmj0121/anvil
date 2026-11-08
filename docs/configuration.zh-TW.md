@@ -498,6 +498,8 @@ sudo = false                     # optional; default true. false: write as the c
 rollback = false                 # optional; default true. false: the apply record keeps the hash only
 template = true                  # optional; default false. true: render src per target (see Templating)
 notify = ["reload sshd"]         # optional; the [[handlers]] to run when the step writes (see Handlers)
+recursive = true                 # optional; default false. true: src is a directory, copied as a tree (see Recursive copy)
+dir_mode = "0755"                # required with recursive = true, else refused: the mode of each directory it creates
 ```
 
 **`mode`。** 必填，且必須是加引號的字串。三或四位八進位數字，最大為 `0777` 加上 sticky bit，
@@ -835,6 +837,96 @@ drift 檢查，全都使用該 target 的算繪文字。因此 var 改變後，�
 
 **已知限制。** 字串串接（`~`）與大量重複（`*`）可能在 1 MiB 上限生效之前就在控制端用掉大量記憶體
 （MiniJinja 把單次重複限制在 100 MB）。範本與 config 一樣被信任：能編輯它的人本來就能在 target 上執行任何 step。
+
+### Recursive copy
+
+`[[files]]` 項目或 task `file` 上的 `recursive = true` 會把一個目錄連同其下的一切複製到 `dest`：
+先是 dest 目錄本身，再是其下的每個目錄與檔案，每個項目一個 step。它需要 `dir_mode`：
+
+```toml
+[[files]]
+src = "$/nginx"                  # a directory in the store or the workspace
+dest = "/etc/nginx"
+mode = "0644"                    # each file's mode
+recursive = true
+dir_mode = "0755"                # each directory it creates
+```
+
+file task 使用相同的鍵：
+`file = { src = "$/nginx", dest = "/etc/nginx", mode = "0644", recursive = true, dir_mode = "0755" }`。
+
+**鍵。** `dir_mode` 遵循 `mode` 的規則（加引號、3 或 4 位八進位數字、不可有 setuid 或 setgid），
+另外拒絕群組與其他人的寫入權限，因為[目錄規則](#files)會拒絕在這樣的目錄之下寫入。以 2 結束並指出該項目（task 則為 `tasks[0].file.dir_mode: …`）：
+
+- `files[0].dir_mode: required with recursive = true`
+- `files[0].dir_mode: only with recursive = true`
+- `files[0].template: not with recursive = true`
+- ``files[0].dir_mode `0775`: group or world write is refused``（`0757` 也是）
+- ``files[0].dir_mode `4755`: setuid and setgid are refused``
+
+其他鍵套用到每個項目：
+
+- **`mode`** 是每個檔案的 mode，`dir_mode` 則是每個建立的目錄的 mode。
+- **`owner`** 只套用到檔案。建立的目錄取得 `group` 與 `dir_mode`，但擁有者維持寫入身分：以 root 寫入時為 root，`sudo = false` 時為登入使用者。
+  這樣其下的檔案才寫得進去：[目錄規則](#files)拒絕在屬於其他任何人的目錄之下寫入，
+  因此給了其他擁有者的目錄會擋住通往其中每個檔案的路徑檢查。
+- **`parents = true`** 只建立 dest 之上不存在的目錄，與單一檔案相同。樹內的目錄是它自己的項目。
+- **`sudo`、`rollback`、`tags`、`facts` 與 `notify`** 與單一檔案相同，作用於每個項目。
+
+**src 可以含有什麼。** src 指向工作區中的目錄（`conf`、`conf/`）或儲存區中的目錄（`$/conf`）。
+這棵樹在連線任何 target 之前讀取一次，任何拒絕都與單一 src 一樣，對每個 target 以 2 結束並指出該項目：
+
+- src 是工作區本身：``files[0].src `.`: must name a directory below the workspace``；儲存區根目錄：
+  ``files[0].src `$/`: must name a folder below the store``；
+- src 是 symlink：``files[0].src `link`: is a symlink; recursive = true needs the real directory``
+  （儲存區中為 ``files[0].src `$/link`: is a symlink``）；不是目錄：
+  ``files[0].src `motd`: is not a directory; recursive = true needs one``（儲存區中為 `is not a folder`）；
+- 其下任何位置的 symlink：``files[0].src `conf`: sub/link: is a symlink; a recursive copy refuses symlinks``；
+- FIFO、socket 或裝置：``files[0].src `conf`: sub/fifo: is not a regular file or directory; a recursive copy refuses it``；
+- 不是 UTF-8 的名稱（`sub/…: its name is not UTF-8`）、含控制字元的名稱（`sub/a\x07: its name holds a control character`）、
+  超過 255 位元組的名稱（`PATH: its name exceeds the 255 byte limit`），或不符合 [`dest`](#files) 規則的 `DEST/rel`
+  （``sub/a b: dest `/etc/app/sub/a b`: must match [A-Za-z0-9._/@+-]``）；
+- 巢狀超過 64 層資料夾的樹：`PATH: nested deeper than 64 folders`（儲存區中為 `$/conf/PATH nested deeper than 64 folders`）；
+- 每個檔案與資料夾都依單一 src 的規則：屬於你、其群組與其他人不能寫入（`sub: mode 775 lets others write to it; …`），
+  每個檔案至多 1 MiB（`sub/big: exceeds the 1 MiB limit`，儲存區中為 `$/conf/sub/big exceeds the 1 MiB limit`），
+  文字或[二進位](#files)皆可；
+- 以及下列上限。
+
+PATH 是該項目在 src 之下的路徑。工作區的走訪在每一層都不跟隨 symlink 地開啟，並透過開啟的描述子讀取每個檔案，
+因此走訪期間被換成 symlink 的也會被拒絕。
+
+| 上限                                    | 以 2 結束並顯示                                                 |
+| --------------------------------------- | --------------------------------------------------------------- |
+| 一棵樹 1024 個檔案                      | `PATH: the tree holds more than 1024 files, its limit`          |
+| 一棵樹的檔案共 16 MiB                   | `PATH: the tree holds more than 16 MiB, its limit`              |
+| 所有樹共 4096 個項目，含每個目錄與 dest | `PATH: the trees hold more than 4096 items in all, their limit` |
+| 所有樹的檔案共 64 MiB                   | `PATH: the trees hold more than 64 MiB in all, their limit`     |
+
+儲存區的樹在讀取任何檔案之前，就依它的清單檢查這些上限。一棵樹在 64 個 `[[files]]` 項目的上限中只算一個（tasks config 的 64 個 file task 也是）。
+
+**寫到 target 上的結果。** 每個項目都是自己的 step，依路徑排序，因此目錄排在它所含的東西之前：
+
+- **目錄**是 dir step，`$ dir PATH`，只建立不修改。不存在的以 `group` 與 `dir_mode` 建立並印出 `created PATH`。
+  已存在的保持原狀（包括擁有者、群組與 mode）並印出 `unchanged PATH`；要修正它請用 [`[[dirs]]`](#dirs) 項目。
+  路徑上若是 symlink、檔案或其他東西，step 會失敗，以 4 結束，並顯示 `dirs: PATH is not a directory`；絕不跟隨，其下也不寫入任何東西。
+- **檔案**是寫到 `DEST/rel` 的 file step，與單一檔案相同地寫入與比較，同樣印出 `wrote`、`fixed` 或 `unchanged`（[File steps](cli.zh-TW.md#file-steps)）。
+- **不移除任何東西。** dest 中不屬於這棵樹的檔案會保留；沒有清除（purge）。
+- **每棵樹一次檢查。** 第一個項目之前，一次執行在 target 上雜湊樹中的檔案、讀取它們的擁有者、群組與 mode，並查看哪些目錄存在，
+  全程不跟隨 symlink。已與樹相同的項目不執行任何東西並印出 `unchanged PATH`，因此未變的樹只花一次執行。
+  走 sudo 密碼路徑時沒有檢查執行，每個項目都執行自己的 step。
+- **`notify`** 在任何項目變更時觸發一次，沒有項目變更時不觸發。
+
+**紀錄與 rollback。** 每個變更的檔案項目與檔案一樣保存在 [apply 紀錄](cli.zh-TW.md#apply-紀錄)中，先前文字依相同規則保存；
+樹建立的每個目錄則記錄為 `previous` 為 null 的目錄；既有的目錄不記錄。`rollback = false` 套用到每個項目。
+項目在該批寫入之前分批儲存，每批最多 16 個或 1 MiB 的保存文字，建立的目錄則立即儲存，因此被終止的 apply 會把已寫入的每個項目留在紀錄中。
+[`anvil rollback`](cli.zh-TW.md#anvil-rollback) 會重新從 src 讀取這棵樹，只有在樹仍以相同種類、相同 `sudo` 持有某個項目時才復原它。
+文字檔很多的樹可能超過 16 MiB 的紀錄；[`anvil plan`](cli.zh-TW.md#anvil-plan) 會對此發出警告。
+
+[`config --harden`](#harden) 不評斷樹中的檔案：dest 本身是、或底下含有 sshd 或 sysctl 設定檔的樹會列為待檢查。
+
+**已知限制。** 樹從不刪除：沒有遞迴刪除，也沒有清除。樹中不允許 `template = true`，特殊檔案會被拒絕，hard link 會被複製為各自獨立的檔案。
+`anvil files cp` 只接受文字檔，因此儲存區樹中的二進位檔案必須以其他方式放進 `files/`。
+TUI 的 plan 檢視顯示樹的各個項目 step，但不顯示它的標頭行（[`anvil plan`](cli.zh-TW.md#anvil-plan)）。
 
 ## Dirs
 
@@ -1528,6 +1620,7 @@ skip = ["updates.auto"]          # rule ids config --harden never suggests; defa
 
 [範本](#templating) src 既不評斷也不修改，因為它設定了什麼要算繪後才知道。harden 改為把它列為待檢查並指出要檢查的內容，
 只要還有待檢查項目，就絕不會說 config 已包含每條規則（[`anvil config --harden`](cli.zh-TW.md#anvil-config---harden)）。
+dest 本身是、或底下含有這些檔案的[遞迴複製](#recursive-copy)同樣列為待檢查，其中的檔案不予評斷。
 
 在 [`[[tasks]]`](#tasks) config 上，規則建議的是 task 而非區段，且只寫入主檔案的頂層 task。
 已在 include 或巢狀 task 中的項目視為存在；其中需要變更的項目留給你處理（[在 tasks config 上](cli.zh-TW.md#在-tasks-config-上)）。

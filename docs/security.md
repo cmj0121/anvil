@@ -117,6 +117,16 @@ English | [繁體中文](security.zh-TW.md)
   goes in the same script as `printf` lines, and the step refuses, exit 4, before writing anything when the target's
   `sh` does not run `printf` as a builtin (BSD pdksh, some mksh builds): an external `printf` would put the bytes on a
   process's command line, where `ps` shows them to every local user ([Files](configuration.md#files)).
+- **A recursive copy follows no symlink.** A `recursive = true` src is walked once, before any target is contacted,
+  and a symlink anywhere in it, its root included, a special file, a name that is not UTF-8 or holds a control
+  byte, and each file or folder others can write are refused, exit 2. The workspace walk opens each level without
+  following symlinks and reads each file through what it opened, so a link swapped in meanwhile is refused too. On the
+  target each directory is create-only: an existing one is left alone, and a symlink or file at its path is refused,
+  never followed. A created directory keeps the write identity's owner and gets a `dir_mode` that cannot be group or
+  world writable, so the root-only rule still holds for every file below it. Each file is written, and recorded, as a
+  single file is, so `rollback = false` keeps only hashes for every item. Rollback reads the tree from src again and
+  restores only items it still holds as the same kind with the same `sudo`; any other recorded path under its dest is
+  refused, or left alone when the tree no longer holds it ([Recursive copy](configuration.md#recursive-copy)).
 - **One apply or rollback per record.** The record is locked through `last-apply.json.lock` beside it; a second anvil
   fails with `PATH is in use by another anvil` rather than wait. The lock needs `flock`, which NFS may not offer:
   `PATH: the filesystem does not support locking (NFS?); set $XDG_STATE_HOME to a local disk`.
