@@ -171,6 +171,12 @@ pub struct FileRun {
 pub struct DirRun {
     pub skip: bool,
     pub write: Option<dirs::DirWrite>,
+    /// On the dest directory of a `recursive = true` entry, the look at the
+    /// whole tree that runs before it, so that unchanged items run nothing.
+    pub check: Option<Box<files::TreeCheck>>,
+    /// Whether it is the dest directory of a `recursive = true` entry, the
+    /// first of its tree's steps.
+    pub tree_dest: bool,
 }
 
 /// A `[[links]]` step: whether the entry matched no tag or fact of the

@@ -334,7 +334,7 @@ impl fmt::Debug for WalkNonce {
 /// identity and must then pass the same test. Each created directory is
 /// announced at once on its own stdout line, marked with `create`. Its
 /// messages start with `kind`: `files`, `dirs`, `links` or `absent`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Walk {
     /// The step kind its messages name.
     pub kind: &'static str,

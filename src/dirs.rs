@@ -25,8 +25,8 @@ use std::path::Path;
 use crate::config::{Config, DirEntry, ModeValue, is_mode};
 use crate::facts::Facts;
 use crate::files::{
-    CONFLICT, Force, KEEP_SPECIAL, OCTAL, Ownership, Wording, fix_script, parse_ls, remove_dirs,
-    restore_attrs, sudo_secret_for,
+    CONFLICT, Force, KEEP_SPECIAL, OCTAL, Ownership, TreeCheck, Wording, fix_script, parse_ls,
+    remove_dirs, restore_attrs, sudo_secret_for,
 };
 use crate::inventory::Target;
 use crate::record::{Attrs, DirRecord, Write};
@@ -54,6 +54,9 @@ pub struct DirWrite {
     pub mark: WalkNonce,
     /// The entry's `parents`.
     pub parents: bool,
+    /// A directory of a `recursive = true` entry: a missing one is created,
+    /// an existing one left as it is (`unchanged PATH`).
+    pub create_only: bool,
 }
 
 /// What a dir step's marked lines said.
@@ -113,8 +116,10 @@ impl DirWrite {
     /// The record of this step from what it said and how it ended; `None`
     /// when it created no directory above `path` and either did not look at
     /// it or refused.
+    /// A create-only step records only a directory it created.
     pub(crate) fn record(&self, seen: Seen, write: Write) -> Option<DirRecord> {
-        if seen.created.is_empty() && (seen.previous.is_none() || write == Write::Refused) {
+        let kept = seen.previous.is_some() && (!self.create_only || seen.previous == Some(None));
+        if seen.created.is_empty() && (!kept || write == Write::Refused) {
             return None;
         }
         Some(DirRecord {
@@ -134,8 +139,9 @@ impl DirWrite {
     /// that fails, then an owner the target does not know, then walks the
     /// directories above `path`. A missing `path` is created `0700` and
     /// given its owner, group and mode, and removed again when that fails;
-    /// a directory is fixed; anything else is refused. Failures before any
-    /// change exit [`REFUSED`].
+    /// a directory is fixed, or left as it is when `create_only`; anything
+    /// else, a symlink included, is refused, never followed. Failures before
+    /// any change exit [`REFUSED`].
     fn script(&self) -> String {
         let (path, sudo, mode) = (self.path.as_str(), self.sudo.as_str(), self.mode.as_str());
         let p = quote(path);
@@ -151,6 +157,15 @@ impl DirWrite {
             "dirs: {path} cannot be given mode {mode}: only its owner can chmod it"
         ));
         let fix = fix_script("dirs", (path, sudo, mode), self.ids.as_ref(), true);
+        let existing = if self.create_only {
+            format!("echo {}\n", quote(&format!("unchanged {path}")))
+        } else {
+            format!(
+                "anvil_line=$({sudo}ls -ldn {p}) || {unread}\n\
+                 printf '%s was %s\\n' {mark} \"$anvil_line\"\n{fix}",
+                unread = refused(&format!("dirs: cannot read {path}'s owner, group and mode")),
+            )
+        };
         let want = format!("{mode:0>4}");
         format!(
             "{{ umask 077; LC_ALL=C; export LC_ALL; set -f\n\
@@ -165,10 +180,7 @@ impl DirWrite {
              ( {fix} ) >/dev/null || {{ anvil_rc=$?; {sudo}rmdir {p} 2>/dev/null || anvil_rc=1; exit $anvil_rc; }}\n\
              echo {created}\n\
              elif {sudo}test -L {p} || {sudo}test ! -d {p}; then {not_dir}\n\
-             else\n\
-             anvil_line=$({sudo}ls -ldn {p}) || {unread}\n\
-             printf '%s was %s\\n' {mark} \"$anvil_line\"\n\
-             {fix}\
+             else\n{existing}\
              fi\n\
              anvil_line=$({sudo}ls -ldn {p} 2>/dev/null) && printf '%s now %s\\n' {mark} \"$anvil_line\" || :\n\
              }}\n",
@@ -181,7 +193,6 @@ impl DirWrite {
             cannot = refused(&format!("dirs: cannot create {path}")),
             created = quote(&format!("created {path}")),
             not_dir = refused(&format!("dirs: {path} is not a directory")),
-            unread = refused(&format!("dirs: cannot read {path}'s owner, group and mode")),
         )
     }
 }
@@ -256,6 +267,7 @@ pub fn run(
         ids,
         mark: WalkNonce::attrs()?,
         parents: entry.parents,
+        create_only: false,
     };
     Ok(dir_run(
         path,
@@ -264,6 +276,29 @@ pub fn run(
         secret,
         Some(write),
     ))
+}
+
+/// The create-only step of `write`, a directory of a `recursive = true`
+/// entry, typing the password from `secret`; `tree_dest` on the dest
+/// directory itself, which carries its tree's `check`.
+pub(crate) fn create_run(
+    write: DirWrite,
+    secret: Option<&str>,
+    (tree_dest, check): (bool, Option<Box<TreeCheck>>),
+) -> PlannedRun {
+    let path = write.path.clone();
+    let mut planned = dir_run(
+        &path,
+        write.script(),
+        format!("dir {path}"),
+        secret,
+        Some(write),
+    );
+    if let RunKind::Dir { run, .. } = &mut planned.kind {
+        run.check = check;
+        run.tree_dest = tree_dest;
+    }
+    planned
 }
 
 /// A dir step at `path`, shown as `label`: a skip when `run` is empty.
@@ -284,6 +319,8 @@ fn dir_run(
             run: DirRun {
                 skip: run.is_empty(),
                 write,
+                check: None,
+                tree_dest: false,
             },
         },
         task: None,
@@ -463,6 +500,7 @@ mod tests {
             }),
             mark: WalkNonce::attrs().unwrap(),
             parents,
+            create_only: false,
         }
     }
 
@@ -595,6 +633,58 @@ mod tests {
         assert_eq!(mode(&file), 0o600);
         assert_eq!(mode(&real), 0o700, "the link was not followed");
         assert!(!top.join("nowhere").exists());
+    }
+
+    #[test]
+    fn a_create_only_dir_is_created_with_group_and_mode_and_an_existing_one_left_alone() {
+        let top = sandbox("dirs-create-only");
+        let path = top.join("app");
+        let group = fs::metadata(&top).unwrap().gid().to_string();
+        let create = DirWrite {
+            create_only: true,
+            ..write(&path, "0750", Some(&group), false, &top)
+        };
+        let (code, stdout, stderr, seen) = applied(&create, None);
+        assert_eq!(code, Some(0), "{stderr}");
+        assert_eq!(stdout, format!("created {}\n", path.display()));
+        assert_eq!(mode(&path), 0o750);
+        assert_eq!(fs::metadata(&path).unwrap().gid().to_string(), group);
+        assert_eq!(create.record(seen, Write::Written).unwrap().previous, None);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let ctime = fs::metadata(&path).unwrap().ctime_nsec();
+        let (code, stdout, _, seen) = applied(&create, None);
+        assert_eq!(code, Some(0));
+        assert_eq!(stdout, format!("unchanged {}\n", path.display()));
+        assert_eq!(mode(&path), 0o700, "an existing directory keeps its mode");
+        assert_eq!(fs::metadata(&path).unwrap().ctime_nsec(), ctime);
+        assert!(
+            create.record(seen, Write::Written).is_none(),
+            "nothing to undo"
+        );
+
+        let real = top.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = top.join("link");
+        symlink(&real, &link).unwrap();
+        let file = top.join("file");
+        fs::write(&file, "x").unwrap();
+        for path in [&link, &file] {
+            let refused = DirWrite {
+                create_only: true,
+                ..write(path, "0750", None, false, &top)
+            };
+            let (code, stdout, stderr, seen) = applied(&refused, None);
+            assert_eq!(code, Some(REFUSED), "{}", path.display());
+            assert_eq!(stdout, "");
+            assert_eq!(
+                stderr,
+                format!("dirs: {} is not a directory\n", path.display())
+            );
+            assert!(refused.record(seen, Write::Refused).is_none());
+        }
+        assert_eq!(mode(&real), 0o700, "the link was not followed");
     }
 
     #[test]

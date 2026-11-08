@@ -899,26 +899,6 @@ mod tests {
     }
 
     #[test]
-    fn an_apply_refuses_a_tree_before_anything_is_sent() {
-        let ws = Workspace::new();
-        ws.write("t/f", b"f\n");
-        let config: Config = toml::from_str(
-            "[[files]]\nsrc = \"t\"\ndest = \"/etc/app\"\nmode = \"0644\"\n\
-             recursive = true\ndir_mode = \"0755\"\n",
-        )
-        .unwrap();
-        let expanded = crate::tasks::legacy(&config);
-        let sources = files::load(&expanded, || Ok(ws.0.clone())).unwrap();
-        let err = files::refuse_trees(&expanded, &sources).unwrap_err();
-        assert_eq!(err.code, 2);
-        assert_eq!(
-            err.message,
-            "files[0]: recursive copy is not supported yet by this anvil"
-        );
-        assert!(files::refuse_trees(&expanded, &Sources::of(&["x"])).is_ok());
-    }
-
-    #[test]
     fn a_store_tree_trusts_every_folder_and_names_one_below_the_store() {
         let ws = Workspace::new();
         let store = ws.store();

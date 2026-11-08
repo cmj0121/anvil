@@ -6,7 +6,9 @@
 //! match, else a script that compares the bytes with DEST and writes them
 //! only when they differ. The bytes travel on the script's stdin, never on
 //! argv, in a heredoc for text and `printf` lines for a binary file
-//! ([`Printf`]), and `Debug` never shows them.
+//! ([`Printf`]), and `Debug` never shows them. A `recursive = true` entry
+//! turns into one step per item of its [`Tree`] ([`tree_runs`]), its dest's
+//! step carrying a [`TreeCheck`] so that unchanged items run nothing.
 //!
 //! A root target, a `sudo = false` entry, or sudo without a password writes
 //! the bytes to a temp file beside DEST and renames it over DEST
@@ -26,6 +28,7 @@ use zeroize::Zeroizing;
 
 use crate::bytes::hex;
 use crate::config::{Config, FileEntry, ModeValue, is_mode, is_sha256};
+use crate::dirs::{self, DirWrite};
 use crate::document;
 use crate::error::Failure;
 use crate::facts::Facts;
@@ -47,7 +50,7 @@ use crate::step::{FileRun, PlannedRun, RunKind, Upload};
 use crate::tasks::{Expanded, Item};
 use crate::template;
 use crate::transport::{Output, RUN_TIMEOUT};
-use crate::tree::{self, Tree};
+use crate::tree::{self, Tree, TreeItem};
 use crate::trust::{self, TrustError};
 
 /// Each file item's src, by ordinal.
@@ -219,21 +222,6 @@ fn file_source(entry: &FileEntry, bytes: Vec<u8>) -> Result<Source, Failure> {
     Ok(source)
 }
 
-/// Refuses a run that would write a recursive entry: until its items run as
-/// steps, an apply must fail before anything is sent.
-pub fn refuse_trees(expanded: &Expanded, sources: &Sources) -> Result<(), Failure> {
-    match expanded
-        .files()
-        .find(|(_, _, i)| sources.tree(*i).is_some())
-    {
-        Some((item, _, i)) => Err(Failure::usage(item.shown_message(format!(
-            "{}: recursive copy is not supported yet by this anvil",
-            item.label("files", i)
-        )))),
-        None => Ok(()),
-    }
-}
-
 /// `why` the src of the file entry `item` was not read, naming the entry.
 pub(crate) fn src_message(item: &Item, i: usize, src: &str, why: &str) -> String {
     item.shown_message(format!(
@@ -331,9 +319,10 @@ pub fn sudo_secret_for<'a>(config: &'a Config, target: &'a Target) -> Option<&'a
         .map_or(target.sudo_secret.as_deref(), |p| p.sudo_secret_for(target))
 }
 
-/// The step of file `item` for `target`: a skip when it does not match, else
-/// the tee script, or the password path's when sudo asks for a password and a
-/// secret holds it.
+/// The steps of file `item` for `target`: a skip when it does not match,
+/// else the tee script, or the password path's when sudo asks for a password
+/// and a secret holds it; a `recursive = true` entry has one per item of its
+/// tree ([`tree_runs`]).
 pub fn run(
     config: &Config,
     item: &Item,
@@ -341,24 +330,17 @@ pub fn run(
     sources: &Sources,
     target: &Target,
     facts: Option<&Facts>,
-) -> Result<PlannedRun, String> {
+) -> Result<Vec<PlannedRun>, String> {
     let facts = facts.ok_or("files: the probe has not run")?;
     let root = facts.is_root();
     let label = item.label("files", i);
     let dest = &entry.dest;
     if !item.matches(target, facts) {
         log::info!("{}: {label} {dest}: no match", target.name);
-        return Ok(skip_run(dest, format!("skipped file {dest}: no match")));
-    }
-    if let Some(tree) = sources.tree(i) {
-        let (items, size) = (tree.items.len(), tree.size());
-        return Ok(skip_run(
+        return Ok(vec![skip_run(
             dest,
-            format!(
-                "skipped tree {dest}: {items} items, {size} bytes; \
-                 recursive copy is not supported yet by this anvil"
-            ),
-        ));
+            format!("skipped file {dest}: no match"),
+        )]);
     }
     let Some(ModeValue::Text(mode)) = &entry.mode else {
         return Err(format!("{label}.mode: required"));
@@ -378,66 +360,59 @@ pub fn run(
     )?;
     let secret =
         sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
-    let create = if entry.parents {
-        Some(WalkNonce::generate()?)
-    } else {
-        None
-    };
-    let mark = WalkNonce::attrs()?;
-    let binary = rendered.is_none() && sources.file(i).is_some_and(|source| source.binary);
-    let write = match secret {
+    let (sudo, password) = match secret {
         Some(name) => {
             log::info!(
                 "{}: {label} {dest}, sudo password from secret {name}",
                 target.name
             );
-            FileWrite {
-                ordinal: i,
-                dest: dest.clone(),
-                mode: mode.clone(),
-                sudo: "sudo ".to_owned(),
-                checks: root_checks("sudo ", dest),
-                walk: Box::new(Walk::new("files", dest, true, &login_top(), create)),
-                as_root: true,
-                password: true,
-                rendered,
-                ids,
-                mark,
-                parents: entry.parents,
-                binary,
-            }
+            ("sudo ", true)
         }
         None => {
             log::info!("{}: {label} {dest}", target.name);
-            let sudo = if root || !entry.sudo { "" } else { "sudo -n " };
-            let as_root = root || entry.sudo;
-            let top = login_top();
-            let checks = if as_root {
-                root_checks(sudo, dest)
-            } else {
-                login_checks(dest, &top)
-            };
-            FileWrite {
-                ordinal: i,
-                dest: dest.clone(),
-                mode: mode.clone(),
-                sudo: sudo.to_owned(),
-                checks,
-                walk: Box::new(Walk::new("files", dest, as_root, &top, create)),
-                as_root,
-                password: false,
-                rendered,
-                ids,
-                mark,
-                parents: entry.parents,
-                binary,
-            }
+            (if root || !entry.sudo { "" } else { "sudo -n " }, false)
         }
     };
+    let base = FileWrite {
+        ordinal: i,
+        dest: String::new(),
+        mode: mode.clone(),
+        sudo: sudo.to_owned(),
+        checks: String::new(),
+        walk: Box::default(),
+        as_root: password || root || entry.sudo,
+        password,
+        rendered,
+        ids,
+        mark: WalkNonce::attrs()?,
+        parents: entry.parents,
+        binary: false,
+        item: None,
+    };
+    if let Some(tree) = sources.tree(i) {
+        return tree_runs((entry, &label), tree, base, secret, facts, sources);
+    }
+    let create = if entry.parents {
+        Some(WalkNonce::generate()?)
+    } else {
+        None
+    };
+    let binary = base.rendered.is_none() && sources.file(i).is_some_and(|source| source.binary);
+    let write = FileWrite { binary, ..base }.aimed(dest, create)?;
+    Ok(vec![write_run(write, sources, secret)?])
+}
+
+/// The step that writes `write`, typing the password from `secret`.
+fn write_run(
+    write: FileWrite,
+    sources: &Sources,
+    secret: Option<&str>,
+) -> Result<PlannedRun, String> {
     let (script, upload) = write_script(&write, sources, &Expected::Unchecked)?;
     let wire = script.len() + upload.as_ref().map_or(0, |upload| upload.stage.len());
+    let dest = write.dest.clone();
     let mut planned = file_run(
-        dest,
+        &dest,
         script,
         format!("file {dest}"),
         secret.map(str::to_owned),
@@ -449,6 +424,80 @@ pub fn run(
     );
     planned.timeout = write_timeout(wire);
     Ok(planned)
+}
+
+/// The steps of a `recursive = true` entry, one per item of `tree` in its
+/// order: each directory a create-only dir step ([`dirs::create_run`]) with
+/// the entry's `group` and `dir_mode`, its owner the write's identity, the
+/// dest's own parents created with `parents = true`; each file a file step
+/// to `DEST/rel` built from `base`. Unless sudo asks for a password, the
+/// dest's step carries the tree's [`TreeCheck`].
+fn tree_runs(
+    (entry, label): (&FileEntry, &str),
+    tree: &Tree,
+    base: FileWrite,
+    secret: Option<&str>,
+    facts: &Facts,
+    sources: &Sources,
+) -> Result<Vec<PlannedRun>, String> {
+    let dir_mode = entry
+        .dir_mode
+        .as_deref()
+        .ok_or_else(|| format!("{label}.dir_mode: required"))?;
+    let dir_ids = Ownership::of(label, (None, entry.group.as_deref()), !base.as_root, facts)?;
+    let mut runs = Vec::with_capacity(tree.items.len());
+    let mut look = (Vec::new(), Vec::new());
+    for (k, item) in tree.items.iter().enumerate() {
+        let dest = item.dest(&entry.dest);
+        let root = item.rel.is_empty();
+        let create = if root && entry.parents {
+            Some(WalkNonce::generate()?)
+        } else {
+            None
+        };
+        match item.source() {
+            None => {
+                look.1.push(dest.clone());
+                let write = DirWrite {
+                    walk: Box::new(Walk::new("dirs", &dest, base.as_root, &login_top(), create)),
+                    path: dest,
+                    mode: dir_mode.to_owned(),
+                    sudo: base.sudo.clone(),
+                    entry_sudo: entry.sudo,
+                    ids: dir_ids.clone(),
+                    mark: WalkNonce::attrs()?,
+                    parents: root && entry.parents,
+                    create_only: true,
+                };
+                runs.push(dirs::create_run(write, secret, (root, None)));
+            }
+            Some(source) => {
+                look.0
+                    .push((dest.clone(), hex(&Sha256::digest(&source.bytes))));
+                let write = FileWrite {
+                    binary: source.binary,
+                    item: Some(k),
+                    parents: false,
+                    ..base.clone()
+                }
+                .aimed(&dest, None)?;
+                runs.push(write_run(write, sources, secret)?);
+            }
+        }
+    }
+    if !base.password {
+        let (files, dirs) = look;
+        let script = tree_script(&files, &dirs, &base)?;
+        let check = TreeCheck {
+            script,
+            files,
+            dirs,
+        };
+        if let Some(RunKind::Dir { run, .. }) = runs.first_mut().map(|run| &mut run.kind) {
+            run.check = Some(Box::new(check));
+        }
+    }
+    Ok(runs)
 }
 
 /// `target`'s render of the templated `entry`, or `None` when it is not
@@ -538,6 +587,9 @@ pub struct FileWrite {
     /// Whether the src is binary ([`Source::binary`]): the record keeps only
     /// hashes, and rollback cannot undo the write.
     pub binary: bool,
+    /// For an item of a `recursive = true` entry, its index among the
+    /// tree's items, which holds its src.
+    pub item: Option<usize>,
 }
 
 /// A write's `owner` and `group`, each by name or numeric id, `None`
@@ -612,15 +664,38 @@ impl Ownership {
 }
 
 impl FileWrite {
-    /// The bytes this write puts at DEST: `rendered`, else the src.
-    /// The only place a write reads its bytes.
+    /// This write aimed at `dest`: its checks, and its walk, which with
+    /// `create` creates the missing directories, under a fresh mark.
+    fn aimed(self, dest: &str, create: Option<WalkNonce>) -> Result<FileWrite, String> {
+        let top = login_top();
+        let checks = if self.as_root {
+            root_checks(&self.sudo, dest)
+        } else {
+            login_checks(dest, &top)
+        };
+        Ok(FileWrite {
+            dest: dest.to_owned(),
+            checks,
+            walk: Box::new(Walk::new("files", dest, self.as_root, &top, create)),
+            mark: WalkNonce::attrs()?,
+            ..self
+        })
+    }
+
+    /// The bytes this write puts at DEST: `rendered`, else the src, a tree
+    /// item's from its tree. The only place a write reads its bytes.
     pub(crate) fn payload<'a>(&'a self, sources: &'a Sources) -> Result<Payload<'a>, String> {
         if let Some(rendered) = &self.rendered {
             return Ok(Payload::Text(rendered.text.as_str()));
         }
-        let source = sources
-            .file(self.ordinal)
-            .ok_or_else(|| format!("files[{}]: src was not loaded", self.ordinal))?;
+        let source = match self.item {
+            Some(k) => (sources.tree(self.ordinal))
+                .and_then(|tree| tree.items.get(k))
+                .and_then(TreeItem::source),
+            None => sources.file(self.ordinal),
+        };
+        let source =
+            source.ok_or_else(|| format!("files[{}]: src was not loaded", self.ordinal))?;
         Ok(match source.text() {
             Some(text) => Payload::Text(text),
             None => Payload::Binary(&source.bytes),
@@ -1662,6 +1737,152 @@ pub(crate) fn parse_hashes(
         .collect()
 }
 
+/// A tree's look before any of its writes: one run that says which of its
+/// files already hold their bytes, owner, group and mode, and which of its
+/// directories exist, so that their steps run nothing. `files` are the file
+/// items' dests with their src's sha256, `dirs` the directory items'.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeCheck {
+    pub script: String,
+    pub files: Vec<(String, String)>,
+    pub dirs: Vec<String>,
+}
+
+/// What a [`TreeCheck`] found: the dests already as the tree has them, and
+/// the files it found absent.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TreeLook {
+    pub same: BTreeSet<String>,
+    pub absent: BTreeSet<String>,
+}
+
+/// The lines [`tree_script`] prints before the hashes start with these.
+const SAME_MARK: &str = "anvil-same ";
+const DIR_MARK: &str = "anvil-dir ";
+
+impl TreeCheck {
+    /// What the check's stdout says; an error when its hashes do not parse.
+    /// A dest is the same only when every tree directory from the tree's
+    /// dest down to it was marked, so a step under a planted directory runs
+    /// and its walk refuses it.
+    pub(crate) fn look(&self, stdout: &[u8]) -> Result<TreeLook, String> {
+        let states = parse_hashes(self.files.len(), stdout)?;
+        let text = String::from_utf8_lossy(stdout);
+        let marked = |mark: &str| -> BTreeSet<usize> {
+            (text.lines())
+                .take_while(|line| !line.starts_with(HASH_MARK))
+                .filter_map(|line| line.strip_prefix(mark)?.parse().ok())
+                .collect()
+        };
+        let (kept, dirs) = (marked(SAME_MARK), marked(DIR_MARK));
+        let unsafe_dirs: BTreeSet<&str> = (self.dirs.iter().enumerate())
+            .filter(|(i, _)| !dirs.contains(i))
+            .map(|(_, dir)| dir.as_str())
+            .collect();
+        let safe = |dest: &str| {
+            (Path::new(dest).ancestors())
+                .filter_map(Path::to_str)
+                .all(|dir| !unsafe_dirs.contains(dir))
+        };
+        let mut look = TreeLook::default();
+        for (i, ((dest, sha256), (state, hex))) in self.files.iter().zip(states).enumerate() {
+            match state {
+                FileState::File
+                    if hex.as_ref() == Some(sha256) && kept.contains(&i) && safe(dest) =>
+                {
+                    look.same.insert(dest.clone());
+                }
+                FileState::Absent => {
+                    look.absent.insert(dest.clone());
+                }
+                _ => {}
+            }
+        }
+        for i in dirs {
+            if let Some(dir) = self.dirs.get(i).filter(|dir| safe(dir)) {
+                look.same.insert(dir.clone());
+            }
+        }
+        Ok(look)
+    }
+}
+
+/// The run of a [`TreeCheck`] as `write`, a tree's file items' write: first,
+/// through its `sudo` as one `sh -s` reading a heredoc, a `anvil-same I`
+/// line for each of `files` that is a regular file, not a symlink, with the
+/// write's mode,
+/// and its owner and group when set, and a `anvil-dir I` line for each of
+/// `dirs` that is a directory, not a symlink, that passes the owner test of
+/// [`root_checks`] or [`login_checks`], by `as_root`, and that group and
+/// others cannot write; then [`hash_script`] over `files`. A dest is only
+/// ever a quoted argument, never printed.
+fn tree_script(
+    files: &[(String, String)],
+    dirs: &[String],
+    write: &FileWrite,
+) -> Result<String, String> {
+    let numeric = |id: &str| id.bytes().all(|b| b.is_ascii_digit());
+    let (owner, group) = write.ids.as_ref().map_or((None, None), |ids| {
+        (ids.owner.as_deref(), ids.group.as_deref())
+    });
+    let uid = match owner {
+        None => String::new(),
+        Some(owner) if numeric(owner) => format!("anvil_uid={owner}\n"),
+        Some(owner) => format!("anvil_uid=$(id -u {}) || anvil_uid=-\n", quote(owner)),
+    };
+    let owner_cmp = match owner {
+        None => "",
+        Some(_) => "[ \"$5\" -eq \"$anvil_uid\" ] 2>/dev/null || return 0\n",
+    };
+    let group_cmp = match group {
+        None => String::new(),
+        Some(group) if numeric(group) => {
+            format!("[ \"$6\" -eq {group} ] 2>/dev/null || return 0\n")
+        }
+        Some(group) => format!(
+            "[ -n \"$(find \"$2\" -prune -group {} 2>/dev/null)\" ] || return 0\n",
+            quote(group)
+        ),
+    };
+    let mut body = format!(
+        "umask 077; LC_ALL=C; export LC_ALL; set -f\n{OCTAL}{uid}\
+         anvil_same() {{ anvil_l=$(ls -ldn \"$2\") || return 0\n\
+         set -- \"$1\" \"$2\" $anvil_l\n\
+         case $3 in -*) ;; *) return 0 ;; esac\n\
+         [ \"$(anvil_octal \"$3\")\" = {mode:0>4} ] || return 0\n\
+         {owner_cmp}{group_cmp}echo \"{SAME_MARK}$1\"; }}\n\
+         anvil_dir() {{ if test -d \"$2\" && test ! -L \"$2\" \
+         && [ -n \"$(find \"$2\" {found})\" ]; then echo \"{DIR_MARK}$1\"; fi; }}\n",
+        mode = write.mode,
+        found = root_only_find(if write.as_root {
+            ROOT_OWNED
+        } else {
+            LOGIN_OWNED
+        }),
+    );
+    for (i, (dest, _)) in files.iter().enumerate() {
+        body += &format!("anvil_same {i} {}\n", quote(dest));
+    }
+    for (i, dir) in dirs.iter().enumerate() {
+        body += &format!("anvil_dir {i} {}\n", quote(dir));
+    }
+    let heredoc = Heredoc::new(&body).map_err(|why| format!("files: the tree check {why}"))?;
+    let hashes: Vec<HashDest> = (files.iter())
+        .map(|(dest, _)| HashDest {
+            dest,
+            as_root: write.as_root,
+        })
+        .collect();
+    Ok(format!(
+        "{{ exec 2>/dev/null; anvil_look() {{\n{sudo}sh -s <<'{delimiter}'\n{body}}}\n\
+         anvil_look\n}}\n{hash}",
+        sudo = write.sudo,
+        delimiter = heredoc.delimiter,
+        body = heredoc.body(),
+        hash = hash_script(&hashes, &write.sudo)?,
+    ))
+}
+
 /// The first five fields of an `ls -ln` line: the mode as 4 octal digits,
 /// uid, gid, size, and the type character (`-` for a regular file). The
 /// permissions may end in one `@`, `+` or `.`; `s`/`S` and `t`/`T` are the
@@ -2375,6 +2596,7 @@ mod tests {
             mark: WalkNonce::attrs().unwrap(),
             parents: false,
             binary: false,
+            item: None,
         }
     }
 
@@ -2414,7 +2636,8 @@ mod tests {
         expanded
             .files()
             .map(|(item, entry, i)| super::run(config, item, (entry, i), sources, target, facts))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map(|runs| runs.into_iter().flatten().collect())
     }
 
     const SECRET_TEXT: &str = "token = hunter2-file-content\n";
@@ -3003,34 +3226,146 @@ mod tests {
     }
 
     #[test]
-    fn a_tree_plans_as_a_skip_naming_its_items_and_size() {
-        let dir = fs::canonicalize(dir("files-tree-plan")).unwrap();
+    fn a_tree_runs_one_step_per_item_in_order_and_the_dest_carries_the_check() {
+        let dir = fs::canonicalize(dir("files-tree-runs")).unwrap();
         fs::create_dir_all(dir.join("conf/sub")).unwrap();
         fs::write(dir.join("conf/sub/a"), "abc").unwrap();
+        fs::write(dir.join("conf/b"), b"\xff\0").unwrap();
         let tree = FileEntry {
             recursive: true,
-            dir_mode: Some("0755".to_owned()),
+            dir_mode: Some("0750".to_owned()),
+            group: Some("app".to_owned()),
+            owner: Some("app".to_owned()),
+            parents: true,
             ..entry("conf", "/etc/app")
         };
         let config = config_in(&dir, vec![tree]);
         let sources = load(&config, || Ok(dir.clone())).unwrap();
-        let run = runs(
-            &config,
-            &sources,
-            &host(&[], None),
-            Some(&user_facts("nopasswd")),
-        )
-        .unwrap()
-        .remove(0);
-        assert_eq!(
-            run.label.as_deref(),
-            Some(
-                "skipped tree /etc/app: 3 items, 3 bytes; \
-                 recursive copy is not supported yet by this anvil"
+        let plan = |secret, sudo| {
+            runs(
+                &config,
+                &sources,
+                &host(&[], secret),
+                Some(&user_facts(sudo)),
             )
+            .unwrap()
+        };
+        let steps = plan(None, "nopasswd");
+        let shown: Vec<_> = steps.iter().map(PlannedRun::shown).collect();
+        assert_eq!(
+            shown,
+            [
+                "dir /etc/app",
+                "file /etc/app/b",
+                "dir /etc/app/sub",
+                "file /etc/app/sub/a"
+            ]
         );
-        assert!(run.file().unwrap().skip && run.run.is_empty());
+        let dirs: Vec<_> = (steps.iter())
+            .filter_map(|run| run.dir()?.write.as_ref())
+            .collect();
+        assert!(dirs.iter().all(|dir| dir.create_only && dir.mode == "0750"));
+        assert_eq!(
+            dirs.iter().map(|dir| dir.parents).collect::<Vec<_>>(),
+            [true, false],
+            "parents = true creates the dest's own parents only"
+        );
+        let ids = dirs[0].ids.as_ref().unwrap();
+        assert_eq!(
+            (ids.owner.as_deref(), ids.group.as_deref()),
+            (None, Some("app"))
+        );
+        let files: Vec<_> = (steps.iter())
+            .filter_map(|run| run.file()?.write.as_ref())
+            .collect();
+        assert_eq!(
+            (files.iter())
+                .map(|write| (
+                    write.dest.as_str(),
+                    write.item,
+                    write.binary,
+                    write.walk.create.is_some()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("/etc/app/b", Some(1), true, false),
+                ("/etc/app/sub/a", Some(3), false, false)
+            ]
+        );
+        assert!(
+            files
+                .iter()
+                .all(|write| write.mode == "0644" && write.sudo == "sudo -n ")
+        );
+        assert_eq!(files[0].ids.as_ref().unwrap().owner.as_deref(), Some("app"));
+        assert_eq!(files[1].payload(&sources).unwrap().bytes(), b"abc");
+        let check = steps[0]
+            .dir()
+            .unwrap()
+            .check
+            .as_ref()
+            .expect("the dest's check");
+        assert_eq!(
+            check.files,
+            [
+                ("/etc/app/b".to_owned(), hex(&Sha256::digest(b"\xff\0"))),
+                ("/etc/app/sub/a".to_owned(), hex(&Sha256::digest(b"abc"))),
+            ]
+        );
+        assert_eq!(check.dirs, ["/etc/app", "/etc/app/sub"]);
+        assert!(check.script.contains("sudo -n sh -s <<'ANVIL_EOF_"));
+        assert!(!check.script.contains("abc"), "the check carries no bytes");
+        assert!(
+            steps[1..]
+                .iter()
+                .all(|run| run.dir().is_none_or(|dir| dir.check.is_none()))
+        );
+
+        let password = plan(Some("pw"), "binary");
+        assert!(
+            password[0].dir().unwrap().check.is_none(),
+            "no check types the password"
+        );
+        assert_eq!(password[1].sudo_secret.as_deref(), Some("pw"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_tree_look_keeps_files_with_the_bytes_and_attrs_and_dirs_that_are_there() {
+        let sha = |text: &str| hex(&Sha256::digest(text.as_bytes()));
+        let check = TreeCheck {
+            script: String::new(),
+            files: ["a", "b", "c", "d", "u/e"]
+                .iter()
+                .map(|name| (format!("/t/{name}"), sha(name)))
+                .collect(),
+            dirs: ["/t", "/t/s", "/t/u"].map(str::to_owned).into(),
+        };
+        let out = format!(
+            "anvil-same 0\nanvil-same 1\nanvil-same 4\nanvil-dir 0\nanvil-dir 1\nanvil-same 9\n\
+             anvil-hash 0 file {}\nanvil-hash 1 file {}\nanvil-hash 2 file {}\nanvil-hash 3 absent\n\
+             anvil-hash 4 file {}\n",
+            sha("a"),
+            sha("other"),
+            sha("c"),
+            sha("u/e"),
+        );
+        let look = check.look(out.as_bytes()).unwrap();
+        assert_eq!(
+            look,
+            TreeLook {
+                same: ["/t", "/t/a", "/t/s"].map(str::to_owned).into(),
+                absent: ["/t/d"].map(str::to_owned).into(),
+            },
+            "b's bytes and c's attrs differ, /t/u fails the owner test, so u/e is not the same"
+        );
+        let unmarked = out.replace("anvil-dir 0\n", "");
+        assert_eq!(
+            check.look(unmarked.as_bytes()).unwrap().same,
+            BTreeSet::new(),
+            "nothing under an unmarked /t is the same"
+        );
+        assert!(check.look(b"anvil-same 0\n").is_err(), "no hashes");
     }
 
     #[test]

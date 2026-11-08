@@ -2645,6 +2645,7 @@ mod tests {
                         mark: WalkNonce::generate().unwrap(),
                         parents: false,
                         binary: false,
+                        item: None,
                     }),
                 },
             },
