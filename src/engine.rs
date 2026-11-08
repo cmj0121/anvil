@@ -6,8 +6,9 @@ use std::num::NonZeroU8;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use crate::absent;
 use crate::cancel::{AbortReason, Cancel};
-use crate::config::{Config, Handler, Step, StepKind};
+use crate::config::{Config, FileEntry, Handler, Step, StepKind};
 use crate::dirs;
 use crate::error::Failure;
 use crate::facts::{self, Facts};
@@ -18,7 +19,7 @@ use crate::inventory::Target;
 use crate::links;
 use crate::packages::{self, Packages};
 use crate::plugin::{Plugins, Request};
-use crate::record::{self, DirRecord, FileRecord, LinkRecord, Session, TargetRecord};
+use crate::record::{self, AbsentRecord, DirRecord, FileRecord, LinkRecord, Session, TargetRecord};
 use crate::remote::env_prefix;
 use crate::report::{Progress, Report, StepReport, TargetReport, cancelled, failed};
 use crate::secret::Store;
@@ -29,6 +30,7 @@ use crate::tasks::{Expanded, Item, ItemKind};
 use crate::transport::{
     Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
 };
+use crate::tree;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Sudo passwords by secret name; a name that is not set is absent.
@@ -284,8 +286,8 @@ impl Books {
 }
 
 /// The record of a target the probe reached; `wrote`: a `[[files]]` write
-/// or a `[[dirs]]` or `[[links]]` step started on it, so `record` replaces
-/// its entry, else only refreshes it.
+/// or a `[[dirs]]`, `[[links]]` or `[[absent]]` step started on it, so
+/// `record` replaces its entry, else only refreshes it.
 #[derive(Clone)]
 pub(crate) struct Reached {
     pub(crate) record: TargetRecord,
@@ -331,21 +333,23 @@ pub(crate) fn for_each_target(
     }
 }
 
-/// What a target's `[[files]]`, `[[dirs]]` and `[[links]]` steps did, for
-/// the record.
+/// What a target's `[[files]]`, `[[dirs]]`, `[[links]]` and `[[absent]]`
+/// steps did, for the record.
 pub(crate) struct Recorder<'a> {
     expanded: &'a Expanded,
     sources: &'a Sources,
     files: Vec<FileRecord>,
     dirs: Vec<DirRecord>,
     links: Vec<LinkRecord>,
-    /// On a tasks config, the dests with a `rollback = false` file item that
-    /// applies to this target. Known before any write, since one kept text
+    /// What each absent step captured, or that it found its path missing.
+    absent: Vec<AbsentRecord>,
+    /// On a tasks config, the ordinals of the `rollback = false` file items
+    /// that apply to this target. Known before any write, since one kept text
     /// could already be that item's bytes from the last apply, and the item
     /// may never run to drop it.
-    hash_only: Vec<&'a str>,
+    hash_only: Vec<usize>,
     /// Whether a write started: its capture ran, then the write did, or a
-    /// dir or link step ran.
+    /// dir, link or absent step ran.
     wrote: bool,
     target: &'a str,
     facts: Option<&'a Facts>,
@@ -374,7 +378,7 @@ impl<'a> Recorder<'a> {
             Some(facts) => expanded
                 .files()
                 .filter(|(item, entry, _)| !entry.rollback && item.matches(target, facts))
-                .map(|(_, entry, _)| entry.dest.as_str())
+                .map(|(.., i)| i)
                 .collect(),
             None => Vec::new(),
         };
@@ -384,6 +388,7 @@ impl<'a> Recorder<'a> {
             files: Vec::new(),
             dirs: Vec::new(),
             links: Vec::new(),
+            absent: Vec::new(),
             hash_only,
             wrote: false,
             target: &target.name,
@@ -435,34 +440,42 @@ impl<'a> Recorder<'a> {
             files,
             dirs: self.dirs.clone(),
             links: self.links.clone(),
+            absent: self.absent.clone(),
             cannot_undo,
             rolled_back: None,
             pending_handlers: self.pending.clone(),
         }
     }
 
-    /// Whether `dest` is to keep its previous file's hash only.
+    /// Whether `dest` is to keep its previous file's hash only: one of the
+    /// `hash_only` items has a file there ([`tree::at`]).
     fn is_hash_only(&self, dest: &str) -> bool {
-        (self.hash_only.iter()).any(|hash_only| self.expanded.same_dest(hash_only, dest))
+        (self.expanded.files())
+            .any(|(_, entry, i)| self.hash_only.contains(&i) && self.file_at((entry, i), dest))
     }
 
     /// Whether a regular file a forced link replaces at `path` is to keep
-    /// its hash only: a file item for the same dest, on any target, says
+    /// its hash only: a file item with a file there, on any target, says
     /// `rollback = false`.
     fn link_hash_only(&self, path: &str) -> bool {
         (self.expanded.files())
-            .any(|(_, entry, _)| !entry.rollback && self.expanded.same_dest(&entry.dest, path))
+            .any(|(_, entry, i)| !entry.rollback && self.file_at((entry, i), path))
     }
 
-    /// Saves what the target did so far, with `intent`, a write about to
-    /// start, as though it failed midway; `steps` are the steps that ended.
-    /// False when the save failed, which has stopped the run.
-    fn snapshot(&self, intent: Option<&FileRecord>, steps: &[StepReport]) -> bool {
+    /// Whether the file item `entry` with ordinal `i` has a file at `path`.
+    fn file_at(&self, entry: (&FileEntry, usize), path: &str) -> bool {
+        tree::at(self.expanded, self.sources, entry, path) == tree::At::File
+    }
+
+    /// Saves what the target did so far, with `intents`, writes about to
+    /// start, as though they failed midway; `steps` are the steps that
+    /// ended. False when the save failed, which has stopped the run.
+    fn snapshot(&self, intents: &[FileRecord], steps: &[StepReport]) -> bool {
         let (Some(journal), Some(facts)) = (self.journal, self.facts) else {
             return true;
         };
         let mut files = self.files.clone();
-        if let Some(intent) = intent {
+        for intent in intents {
             keep(self.expanded, &mut files, intent.clone());
         }
         let record = self.stamped(facts, false, files, cannot_undo(steps));
@@ -509,6 +522,16 @@ fn keep_link(expanded: &Expanded, links: &mut Vec<LinkRecord>, link: LinkRecord)
     }
 }
 
+/// `absent` into `absents`: a path stepped on again in the same apply
+/// keeps the first capture, as only that one saw what was there before.
+fn keep_absent(absents: &mut Vec<AbsentRecord>, absent: AbsentRecord) {
+    match (absents.iter_mut()).find(|kept| kept.path == absent.path) {
+        Some(kept) if kept.is_recorded() => {}
+        Some(kept) => *kept = absent,
+        None => absents.push(absent),
+    }
+}
+
 /// How a write step that ended with `output` ended, for the record; not
 /// `staged`, the password path's stage failed. Only a write that may have
 /// changed DEST failed midway: a failed stage, a refusal (root checks, hash
@@ -544,9 +567,14 @@ pub(crate) fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
         .iter()
         .filter(|step| !step.skipped && step.reason.is_none())
         .filter_map(|step| match (&step.entry, &step.task) {
-            (Entry::File { .. } | Entry::Dir { .. } | Entry::Link { .. } | Entry::Script, _) => {
-                None
-            }
+            (
+                Entry::File { .. }
+                | Entry::Dir { .. }
+                | Entry::Link { .. }
+                | Entry::Absent { .. }
+                | Entry::Script,
+                _,
+            ) => None,
             (_, Some(path)) => Some(path.clone()),
             (Entry::Packages, None) => Some("packages".to_owned()),
             (Entry::Service { name }, None) => Some(format!("service {name}")),
@@ -563,8 +591,14 @@ pub(crate) fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
 /// [`send_file`]. With a `recorder`, each file step first captures DEST
 /// ([`capture`]), then saves an intent entry (`FailedMidway`), so that a kill
 /// during the write keeps what it captured, then writes only if DEST still
-/// holds that, then saves how the write ended. A failed intent save writes
-/// nothing: the target ends as cancelled, with the run stopped. With a
+/// holds that, then saves how the write ended. A tree's dest step first runs
+/// its [`files::TreeCheck`]: an item it found as the tree has it runs nothing
+/// and shows `unchanged PATH`; the other file items are captured and saved
+/// in batches ([`captures`]), so that one save keeps the intents of up to
+/// [`JOURNAL_ITEMS`] writes and the next their results; every save while a
+/// batch waits keeps its intents, and each directory a tree step created is
+/// saved at once. A failed intent save
+/// writes nothing: the target ends as cancelled, with the run stopped. With a
 /// `recorder`, a step that changed something ([`changed`]) adds its
 /// `notify` names to the target's pending handlers, saved at once.
 pub(crate) fn execute(
@@ -595,6 +629,7 @@ fn execute_inner(
     let mut reports = Vec::with_capacity(runs.len());
     let mut ok = true;
     let of = runs.len();
+    let mut tree = TreeRun::default();
     // Only an apply, which records, says whether a step changed anything.
     let apply = recorder.is_some();
     for (n, planned) in runs.iter().enumerate() {
@@ -606,6 +641,7 @@ fn execute_inner(
             RunKind::File { .. } => ("files", "files"),
             RunKind::Dir { .. } => ("dirs", "dirs"),
             RunKind::Link { .. } => ("links", "links"),
+            RunKind::Absent { .. } => ("absent", "absent"),
             RunKind::Service { .. } => ("services", "services"),
             RunKind::Packages { .. } => ("packages", "packages"),
             RunKind::Step { .. } | RunKind::Skip | RunKind::Script => ("packages", "step"),
@@ -616,12 +652,42 @@ fn execute_inner(
         if planned.file().is_some_and(|file| file.skip)
             || planned.dir().is_some_and(|dir| dir.skip)
             || planned.link().is_some_and(|link| link.skip)
+            || planned.absent().is_some_and(|absent| absent.skip)
             || planned.service().is_some_and(|service| service.skip)
             || matches!(planned.kind, RunKind::Skip)
         {
             let report = StepReport::skipped(label, entry).of(planned);
             reports.push(noted(report, apply, false));
             continue;
+        }
+        if planned.dir().is_some_and(|dir| dir.tree_dest) {
+            tree.look = None;
+        }
+        if let Some(check) = planned.dir().and_then(|dir| dir.check.as_deref()) {
+            match transport.run(&check.script, RUN_TIMEOUT) {
+                Ok(output) => match check.look(&output.stdout) {
+                    Ok(look) => tree.look = Some(look),
+                    Err(error) => return failed(command, target, reports, error).at(planned),
+                },
+                Err(TransportError::Cancelled) => {
+                    return cancelled(command, target, reports, cancel).at(planned);
+                }
+                Err(err) => return failed(command, target, reports, err.to_string()).at(planned),
+            }
+        }
+        match tree_item(planned) {
+            None => tree.look = None,
+            Some(dest) if (tree.look.as_ref()).is_some_and(|look| look.same.contains(dest)) => {
+                let output = Output {
+                    code: Some(0),
+                    stdout: format!("unchanged {dest}\n").into_bytes(),
+                    ..Output::default()
+                };
+                let report = StepReport::from_output(label, output, entry).of(planned);
+                reports.push(noted(report, apply, false));
+                continue;
+            }
+            Some(_) => {}
         }
         let password = match planned.sudo_secret.as_deref() {
             None => None,
@@ -632,70 +698,78 @@ fn execute_inner(
         };
         let (mut run, timeout) = (planned.run.as_str(), planned.timeout);
         let mut upload = (planned.file().and_then(|file| file.upload.as_ref()))
-            .or_else(|| planned.link().and_then(|link| link.upload.as_ref()));
+            .or_else(|| planned.link().and_then(|link| link.upload.as_ref()))
+            .or_else(|| planned.absent().and_then(|absent| absent.upload.as_ref()));
         let write = planned.file().and_then(|file| file.write.as_ref());
         let dir = planned.dir().and_then(|dir| dir.write.as_ref());
         let link = planned.link().and_then(|link| link.write.as_ref());
+        let absent = planned.absent().and_then(|absent| absent.write.as_ref());
         if let Some(recorder) = recorder.as_deref_mut()
-            && (dir.is_some() || link.is_some())
+            && (dir.is_some() || link.is_some() || absent.is_some())
         {
             recorder.wrote = true;
         }
         let rebuilt;
         let mut captured = None;
         if let (Some(recorder), Some(write)) = (recorder.as_deref_mut(), write) {
-            let found = match capture(target, transport, write, password.map(|(_, p)| p)) {
-                Ok(found) => found,
-                Err(Uncaptured::Step { code, stderr }) => {
-                    reports.push(noted(
-                        StepReport {
-                            run: label.to_owned(),
-                            code,
-                            stdout: String::new(),
-                            stderr,
-                            skipped: false,
-                            reason: None,
-                            entry,
-                            task: None,
-                            name: None,
-                            changed: None,
-                            handler: None,
-                        }
-                        .of(planned),
-                        apply,
-                        false,
-                    ));
-                    ok = false;
-                    break;
-                }
-                Err(Uncaptured::Transport(TransportError::Cancelled)) => {
+            if !tree.ahead.contains_key(&n) {
+                let found = captures(
+                    target,
+                    transport,
+                    (runs, n),
+                    tree.look.as_ref(),
+                    password.map(|(_, p)| p),
+                    recorder,
+                );
+                let found = match found {
+                    Ok(found) => found,
+                    Err(Uncaptured::Step { code, stderr }) => {
+                        reports.push(noted(
+                            StepReport {
+                                run: label.to_owned(),
+                                code,
+                                stdout: String::new(),
+                                stderr,
+                                skipped: false,
+                                reason: None,
+                                entry,
+                                task: None,
+                                name: None,
+                                changed: None,
+                                handler: None,
+                            }
+                            .of(planned),
+                            apply,
+                            false,
+                        ));
+                        ok = false;
+                        break;
+                    }
+                    Err(Uncaptured::Transport(TransportError::Cancelled)) => {
+                        return cancelled(command, target, reports, cancel).at(planned);
+                    }
+                    Err(Uncaptured::Transport(err)) => {
+                        let error = step_error(&err, password.map(|(name, _)| name), prefix);
+                        return failed(command, target, reports, error).at(planned);
+                    }
+                };
+                if cancel.is_set() {
                     return cancelled(command, target, reports, cancel).at(planned);
                 }
-                Err(Uncaptured::Transport(err)) => {
-                    let error = step_error(&err, password.map(|(name, _)| name), prefix);
-                    return failed(command, target, reports, error).at(planned);
+                recorder.wrote = true;
+                let intents: Vec<FileRecord> =
+                    found.iter().map(|(_, intent, _)| intent.clone()).collect();
+                if !recorder.snapshot(&intents, &reports) {
+                    return cancelled(command, target, reports, cancel).at(planned);
                 }
-            };
-            if cancel.is_set() {
-                return cancelled(command, target, reports, cancel).at(planned);
+                (tree.ahead).extend(found.into_iter().map(|(m, intent, at)| (m, (intent, at))));
             }
-            rebuilt = match files::write_script(write, recorder.sources, &found.expected()) {
+            let (intent, expected) = tree.ahead.remove(&n).expect("captured above");
+            rebuilt = match files::write_script(write, recorder.sources, &expected) {
                 Ok(rebuilt) => rebuilt,
                 Err(error) => return failed(command, target, reports, error).at(planned),
             };
             (run, upload) = (rebuilt.0.as_str(), rebuilt.1.as_ref());
-            recorder.wrote = true;
-            let hash_only = recorder.is_hash_only(&write.dest);
-            let intent = write.record(
-                recorder.expanded,
-                recorder.sources,
-                found,
-                record::Write::FailedMidway,
-                hash_only,
-            );
-            if !recorder.snapshot(Some(&intent), &reports) {
-                return cancelled(command, target, reports, cancel).at(planned);
-            }
             captured = Some(intent);
         }
         let mut staged = true;
@@ -759,6 +833,19 @@ fn execute_inner(
             ) => Some(link.seen(output, hash_only)),
             _ => None,
         };
+        // Never hash only: config refuses an absent path that is, holds or
+        // sits under any files dest, so no `rollback = false` file shares it.
+        let seen_absent = match (absent, &mut output) {
+            (Some(absent), Ok(output)) => absent.seen(output, false),
+            (
+                Some(absent),
+                Err(TransportError::Timeout {
+                    output: Some(output),
+                    ..
+                }),
+            ) => absent.seen(output, false),
+            _ => None,
+        };
         let created_above = (seen.as_ref().map(|seen| &seen.created))
             .or(seen_link.as_ref().map(|seen| &seen.created))
             .unwrap_or(&created);
@@ -769,13 +856,17 @@ fn execute_inner(
             && let Some(record) = link.record(seen, write_end(&output, true))
         {
             keep_link(recorder.expanded, &mut recorder.links, record);
-            recorder.snapshot(None, &reports);
+            recorder.snapshot(&tree.intents(), &reports);
+        }
+        if let (Some(recorder), Some(record)) = (recorder.as_deref_mut(), seen_absent) {
+            keep_absent(&mut recorder.absent, record);
+            recorder.snapshot(&tree.intents(), &reports);
         }
         if let (Some(recorder), Some(dir), Some(seen)) = (recorder.as_deref_mut(), dir, seen)
             && let Some(record) = dir.record(seen, write_end(&output, true))
         {
             keep_dir(recorder.expanded, &mut recorder.dirs, record);
-            recorder.snapshot(None, &reports);
+            recorder.snapshot(&tree.intents(), &reports);
         }
         if let (Some(recorder), Some(mut file)) = (recorder.as_deref_mut(), captured) {
             file.write = write_end(&output, staged);
@@ -784,8 +875,11 @@ fn execute_inner(
             }
             file.created_dirs = created;
             keep(recorder.expanded, &mut recorder.files, file);
-            // A failure has set the cancel token: the next step does not start.
-            recorder.snapshot(None, &reports);
+            // A failure has set the cancel token: the next step does not
+            // start. A tree's files are saved once their batch has run.
+            if tree.ahead.is_empty() {
+                recorder.snapshot(&[], &reports);
+            }
         }
         let mut output = match output {
             Ok(output) => output,
@@ -1044,6 +1138,108 @@ enum Uncaptured {
     Transport(TransportError),
 }
 
+/// The most changed file items of a tree whose intents one save keeps.
+const JOURNAL_ITEMS: usize = 16;
+/// The most kept previous bytes of a tree's files after which a save ends
+/// the batch.
+const JOURNAL_KEPT: u64 = 1 << 20;
+
+/// What a target's run knows of the tree whose items it is running.
+#[derive(Default)]
+struct TreeRun {
+    /// What the tree's check found; `None` without one.
+    look: Option<files::TreeLook>,
+    /// The captured intents of the file items still to run, by step index,
+    /// with what each write must find at DEST.
+    ahead: BTreeMap<usize, (FileRecord, files::Expected)>,
+}
+
+impl TreeRun {
+    /// The intents of `ahead`, which every save while they wait must keep:
+    /// a save replaces the target's whole entry.
+    fn intents(&self) -> Vec<FileRecord> {
+        self.ahead
+            .values()
+            .map(|(intent, _)| intent.clone())
+            .collect()
+    }
+}
+
+/// The dest of a tree's item step: a file item's or a create-only dir's.
+fn tree_item(planned: &PlannedRun) -> Option<&str> {
+    if let Some(write) = planned.file().and_then(|file| file.write.as_ref()) {
+        return write.item.map(|_| write.dest.as_str());
+    }
+    let write = planned.dir()?.write.as_ref()?;
+    write.create_only.then_some(write.path.as_str())
+}
+
+/// The intents of `runs[n]`'s write, and for a tree's file item those of
+/// the next changed items of its tree too, up to [`JOURNAL_ITEMS`] or
+/// [`JOURNAL_KEPT`] kept bytes, each with what its write must find at DEST.
+/// Each is captured ([`capture`]), but a file the tree's `look` found
+/// absent, which its write's guard refuses if it appears. The batch crosses
+/// a tree's directory only with a `look`, and ends before an item whose
+/// capture fails; only `runs[n]`'s failure is an error.
+fn captures(
+    target: &Target,
+    transport: &dyn Transport,
+    (runs, n): (&[PlannedRun], usize),
+    look: Option<&files::TreeLook>,
+    password: Option<&[u8]>,
+    recorder: &Recorder<'_>,
+) -> Result<Vec<(usize, FileRecord, files::Expected)>, Uncaptured> {
+    let mut found = Vec::new();
+    let mut kept = 0;
+    let first = runs[n].file().and_then(|file| file.write.as_ref());
+    let tree = first
+        .filter(|write| write.item.is_some())
+        .map(|write| write.ordinal);
+    for (m, planned) in runs.iter().enumerate().skip(n) {
+        let write = match planned.file().and_then(|file| file.write.as_ref()) {
+            Some(write) if m == n => write,
+            Some(write)
+                if tree.is_some() && write.item.is_some() && Some(write.ordinal) == tree =>
+            {
+                write
+            }
+            None if tree.is_some() && look.is_some() && tree_item(planned).is_some() => continue,
+            _ => break,
+        };
+        if look.is_some_and(|look| look.same.contains(&write.dest)) {
+            continue;
+        }
+        let captured = if look.is_some_and(|look| look.absent.contains(&write.dest)) {
+            files::Captured::Absent
+        } else {
+            match capture(target, transport, write, password) {
+                Ok(captured) => captured,
+                Err(err) if m == n => return Err(err),
+                Err(_) => break,
+            }
+        };
+        if let files::Captured::File {
+            bytes: Some(bytes), ..
+        } = &captured
+        {
+            kept += bytes.len() as u64;
+        }
+        let expected = captured.expected();
+        let intent = write.record(
+            recorder.expanded,
+            recorder.sources,
+            captured,
+            record::Write::FailedMidway,
+            recorder.is_hash_only(&write.dest),
+        );
+        found.push((m, intent, expected));
+        if tree.is_none() || found.len() >= JOURNAL_ITEMS || kept >= JOURNAL_KEPT {
+            break;
+        }
+    }
+    Ok(found)
+}
+
 /// Runs `write`'s capture of DEST through the write's own path: on a
 /// terminal typing `password` on the password path, else plainly. Turns
 /// core dumps off first. Its stdout holds DEST's bytes, so it is parsed and
@@ -1206,6 +1402,10 @@ fn changed(planned: &PlannedRun, output: &Output) -> bool {
                 line.starts_with(linked.as_bytes()) || line.starts_with(relinked.as_bytes())
             })
         }
+        RunKind::Absent { path, .. } => {
+            let removed = format!("removed {path}");
+            lines.any(|line| line == removed.as_bytes())
+        }
         RunKind::Service { name, .. } => {
             let unchanged = format!("unchanged service {name}");
             let not_running = format!("service {name} is not running; not reloaded");
@@ -1291,14 +1491,16 @@ impl From<TransportError> for Unresolved {
 /// The steps apply runs on `target`, one per item of `expanded` in order: a
 /// package item as the step that installs and upgrades with the target's
 /// package manager (none when its script is empty), a file item copying its
-/// src from `sources`, a service item bringing it to its state, a step item as
-/// its command or the script its plugin returns. An item the target does not
+/// src from `sources` (a tree as one step per item), a service item bringing
+/// it to its state, a step item as its command or the script its plugin
+/// returns. An item the target does not
 /// match is a skip and resolves nothing. Runs nothing on the target, but each
 /// plugin on the controller, in order, `cancel` checked before each. `facts`,
 /// from [`probe`], is required when [`needs_facts`] says so; being one probe,
 /// no step can change what a later item sees. A failure is
 /// `packages: <reason>`, `files…`, `services: <reason>`, `dirs…`,
-/// `links…` or `plugin <name>: <reason>`; the first one ends the list.
+/// `links…`, `absent…` or `plugin <name>: <reason>`; the first one ends the
+/// list.
 pub fn resolve(
     target: &Target,
     facts: Option<&Facts>,
@@ -1312,31 +1514,31 @@ pub fn resolve(
     let mut services = services::Builder::new(config, target, facts);
     let mut number = 0;
     for item in &expanded.items {
-        let run = match &item.kind {
-            ItemKind::Packages(packages) => package_run(target, facts, item, packages)?,
-            ItemKind::File { entry, ordinal } => Some(files::run(
-                config,
-                item,
-                (entry, *ordinal),
-                sources,
-                target,
-                facts,
-            )?),
-            ItemKind::Service(entry) => Some(services.run(item, entry)?),
+        let steps = match &item.kind {
+            ItemKind::Packages(packages) => package_run(target, facts, item, packages)?
+                .into_iter()
+                .collect(),
+            ItemKind::File { entry, ordinal } => {
+                files::run(config, item, (entry, *ordinal), sources, target, facts)?
+            }
+            ItemKind::Service(entry) => vec![services.run(item, entry)?],
             ItemKind::Dir { entry, ordinal } => {
-                Some(dirs::run(config, item, (entry, *ordinal), target, facts)?)
+                vec![dirs::run(config, item, (entry, *ordinal), target, facts)?]
             }
             ItemKind::Link { entry, ordinal } => {
-                Some(links::run(config, item, (entry, *ordinal), target, facts)?)
+                vec![links::run(config, item, (entry, *ordinal), target, facts)?]
+            }
+            ItemKind::Absent { entry, ordinal } => {
+                vec![absent::run(config, item, (entry, *ordinal), target, facts)?]
             }
             ItemKind::Step(step) => {
                 number += 1;
-                Some(step_run(
+                vec![step_run(
                     target, facts, item, step, number, plugins, cancel,
-                )?)
+                )?]
             }
         };
-        runs.extend(run.map(|run| PlannedRun {
+        runs.extend(steps.into_iter().map(|run| PlannedRun {
             task: item.path.clone(),
             name: item.name.clone(),
             notify: item.notify.clone(),
@@ -1525,6 +1727,77 @@ mod tests {
     use super::*;
     use crate::test_util::{FakePlugins, target};
 
+    /// Answers a tree check with every dir there, and logs each other run.
+    struct Looks(Mutex<Vec<String>>);
+
+    impl Transport for Looks {
+        fn name(&self) -> &str {
+            "looks"
+        }
+
+        fn run(&self, script: &str, _: Duration) -> Result<Output, TransportError> {
+            let stdout = if script.contains("anvil_look") {
+                b"anvil-dir 0\n".to_vec()
+            } else {
+                self.0.lock().unwrap().push(script.to_owned());
+                Vec::new()
+            };
+            Ok(Output {
+                code: Some(0),
+                stdout,
+                ..Output::default()
+            })
+        }
+
+        fn run_tty(&self, _: &str, _: &[u8], _: Duration) -> Result<Output, TransportError> {
+            unreachable!("no step types a password")
+        }
+    }
+
+    #[test]
+    fn a_trees_dest_step_drops_the_look_of_the_tree_before_it() {
+        let dest = |check: bool| {
+            let write = dirs::DirWrite {
+                path: "/t".to_owned(),
+                mode: "0755".to_owned(),
+                sudo: String::new(),
+                entry_sudo: false,
+                walk: Box::default(),
+                ids: None,
+                mark: crate::remote::WalkNonce::attrs().unwrap(),
+                parents: false,
+                create_only: true,
+            };
+            let check = check.then(|| {
+                Box::new(files::TreeCheck {
+                    script: "anvil_look".to_owned(),
+                    files: Vec::new(),
+                    dirs: vec!["/t".to_owned()],
+                })
+            });
+            dirs::create_run(write, None, (true, check))
+        };
+        let looks = Looks(Mutex::new(Vec::new()));
+        let report = execute(
+            "apply",
+            &target("local"),
+            &looks,
+            &[dest(true), dest(false)],
+            &Passwords::new(),
+            &Cancel::new(),
+            None,
+        );
+        let shown: Vec<_> = (report.steps().iter())
+            .map(|step| step.stdout.as_str())
+            .collect();
+        assert_eq!(shown, ["unchanged /t\n", ""]);
+        assert_eq!(
+            looks.0.lock().unwrap().len(),
+            1,
+            "the second tree, with no check, runs its step"
+        );
+    }
+
     #[test]
     fn saves_report_the_first_error_and_the_targets_still_unrecorded() {
         let cancel = Cancel::new();
@@ -1707,6 +1980,8 @@ mod tests {
             run: crate::step::DirRun {
                 skip: false,
                 write: None,
+                check: None,
+                tree_dest: false,
             },
         };
         assert!(ended(dir(), Some(0), "created /etc/d\n"));

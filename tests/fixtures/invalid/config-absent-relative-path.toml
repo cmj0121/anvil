@@ -1,0 +1,6 @@
+[[absent]]
+path = "/etc/nginx/sites-enabled/default"
+type = "link"
+
+[[absent]]
+path = "etc/motd"

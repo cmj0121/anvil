@@ -1,11 +1,14 @@
-//! `[[files]]`: a text file in the workspace or store, copied to `dest` on each
+//! `[[files]]`: a file in the workspace or store, copied to `dest` on each
 //! target whose tags and facts all match.
 //!
 //! [`load`] reads every src once, before any target runs. [`run`] turns
 //! each entry into one step per target: a skip when the entry does not
 //! match, else a script that compares the bytes with DEST and writes them
-//! only when they differ. The bytes travel in a heredoc on the script's
-//! stdin, never on argv, and `Debug` never shows them.
+//! only when they differ. The bytes travel on the script's stdin, never on
+//! argv, in a heredoc for text and `printf` lines for a binary file
+//! ([`Printf`]), and `Debug` never shows them. A `recursive = true` entry
+//! turns into one step per item of its [`Tree`] ([`tree_runs`]), its dest's
+//! step carrying a [`TreeCheck`] so that unchanged items run nothing.
 //!
 //! A root target, a `sudo = false` entry, or sudo without a password writes
 //! the bytes to a temp file beside DEST and renames it over DEST
@@ -17,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -24,19 +28,20 @@ use zeroize::Zeroizing;
 
 use crate::bytes::hex;
 use crate::config::{Config, FileEntry, ModeValue, is_mode, is_sha256};
+use crate::dirs::{self, DirWrite};
 use crate::document;
 use crate::error::Failure;
 use crate::facts::Facts;
 use crate::filestore::{self, StoreError};
 use crate::inventory::{self, Target, TargetKind};
 use crate::record::{
-    Attrs, FileRecord, NO_ROLLBACK, NOT_WORLD_READABLE, Previous, PreviousFile, Write,
+    Attrs, BINARY, FileRecord, NO_ROLLBACK, NOT_WORLD_READABLE, Previous, PreviousFile, Write,
     is_world_readable,
 };
 use crate::remote::{
-    Bytes, Heredoc, Ids, LOGIN_OWNED, ROOT_OWNED, Replacement, is_owned_only, link_removal_checks,
-    login_checks, login_top, not_a_directory, random_hex, refusal, refused, root_checks,
-    root_only_find, sweep, temp_beside, unchecked, zeroizing,
+    Bytes, Heredoc, Ids, LOGIN_OWNED, PRINTF_BUILTIN, Printf, ROOT_OWNED, Replacement,
+    is_owned_only, link_removal_checks, login_checks, login_top, not_a_directory, random_hex,
+    refusal, refused, root_checks, root_only_find, sweep, temp_beside, unchecked, zeroizing,
 };
 pub(crate) use crate::remote::{REFUSED, quote};
 pub use crate::remote::{Walk, WalkNonce};
@@ -45,46 +50,137 @@ use crate::step::{FileRun, PlannedRun, RunKind, Upload};
 use crate::tasks::{Expanded, Item};
 use crate::template;
 use crate::transport::{Output, RUN_TIMEOUT};
+use crate::tree::{self, Tree, TreeItem};
 use crate::trust::{self, TrustError};
 
-/// Each file item's src text, by ordinal.
+/// Each file item's src, by ordinal.
 #[derive(Debug, Default)]
-pub struct Sources(Vec<Source>);
+pub struct Sources(Vec<Loaded>);
 
-#[cfg(test)]
+/// One file item's src: a file, or the tree of a `recursive = true` entry.
+#[derive(Debug)]
+pub enum Loaded {
+    File(Source),
+    Tree(Tree),
+    /// A single file's src that [`load_trees`] did not read.
+    Unread,
+}
+
+impl Loaded {
+    /// The src of a single file entry.
+    pub fn file(&self) -> Option<&Source> {
+        match self {
+            Loaded::File(source) => Some(source),
+            Loaded::Tree(_) | Loaded::Unread => None,
+        }
+    }
+}
+
 impl Sources {
+    /// The src of the single file entry with ordinal `i`.
+    pub(crate) fn file(&self, i: usize) -> Option<&Source> {
+        self.0.get(i).and_then(Loaded::file)
+    }
+
+    /// The tree of the recursive entry with ordinal `i`.
+    pub fn tree(&self, i: usize) -> Option<&Tree> {
+        match self.0.get(i) {
+            Some(Loaded::Tree(tree)) => Some(tree),
+            _ => None,
+        }
+    }
+
     /// Each entry's src text, as [`load`] would read it.
+    #[cfg(test)]
     pub fn of(texts: &[&str]) -> Sources {
         Sources(
             texts
                 .iter()
-                .map(|text| Source {
-                    text: (*text).to_owned(),
-                })
+                .map(|text| Loaded::File(Source::of(text.as_bytes().to_vec())))
                 .collect(),
         )
     }
 }
 
-/// One src's text: UTF-8, no NUL, at most [`document::MAX_BYTES`].
+/// One src's bytes, at most [`document::MAX_BYTES`]: `binary` when they are
+/// not UTF-8 or hold a NUL.
 pub struct Source {
-    pub text: String,
+    pub bytes: Vec<u8>,
+    pub binary: bool,
 }
 
-/// By hand: only the length, never the text.
-impl fmt::Debug for Source {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Source(<{} bytes>)", self.text.len())
+impl Source {
+    pub(crate) fn of(bytes: Vec<u8>) -> Source {
+        let binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
+        Source { bytes, binary }
+    }
+
+    /// The bytes as text, unless they are binary.
+    fn text(&self) -> Option<&str> {
+        std::str::from_utf8(&self.bytes)
+            .ok()
+            .filter(|_| !self.binary)
     }
 }
 
-/// Reads every src from the store or workspace; source errors name the entry.
-/// Returns [`Sources::default`] without resolving the workspace when there are no files.
+/// By hand: only the length, never the bytes.
+impl fmt::Debug for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Source(<{} bytes>)", self.bytes.len())
+    }
+}
+
+/// What a write puts at DEST: text goes in a heredoc, binary in `printf` lines.
+#[derive(Clone, Copy)]
+pub(crate) enum Payload<'a> {
+    Text(&'a str),
+    Binary(&'a [u8]),
+}
+
+impl<'a> Payload<'a> {
+    pub(crate) fn bytes(self) -> &'a [u8] {
+        match self {
+            Payload::Text(text) => text.as_bytes(),
+            Payload::Binary(bytes) => bytes,
+        }
+    }
+}
+
+/// The step timeout for a write that sends `wire` bytes in its runs:
+/// `RUN_TIMEOUT + PER_MIB * wire / 1 MiB`, the allowance counted in whole
+/// seconds, rounded down, so a small file keeps [`RUN_TIMEOUT`].
+pub(crate) fn write_timeout(wire: usize) -> Duration {
+    const PER_MIB_SECS: u64 = 15;
+    const MIB: u64 = 1024 * 1024;
+    RUN_TIMEOUT + Duration::from_secs(wire as u64 * PER_MIB_SECS / MIB)
+}
+
+/// Reads every src from the store or workspace, a recursive entry's as its
+/// [`Tree`] ([`tree::expand_workspace`], [`tree::expand_store`]); source
+/// errors name the entry. Returns [`Sources::default`] without resolving the
+/// workspace when there are no files.
 pub fn load(
     expanded: &Expanded,
     workspace: impl FnOnce() -> Result<PathBuf, Failure>,
 ) -> Result<Sources, Failure> {
-    if expanded.files().next().is_none() {
+    load_where(expanded, workspace, false)
+}
+
+/// [`load`] of the recursive entries only, as rollback ties tree items back
+/// to their entries; a single file's src is left [`Loaded::Unread`].
+pub fn load_trees(
+    expanded: &Expanded,
+    workspace: impl FnOnce() -> Result<PathBuf, Failure>,
+) -> Result<Sources, Failure> {
+    load_where(expanded, workspace, true)
+}
+
+fn load_where(
+    expanded: &Expanded,
+    workspace: impl FnOnce() -> Result<PathBuf, Failure>,
+    trees_only: bool,
+) -> Result<Sources, Failure> {
+    if !(expanded.files()).any(|(_, entry, _)| entry.recursive || !trees_only) {
         return Ok(Sources::default());
     }
     let workspace = workspace()?;
@@ -92,30 +188,59 @@ pub fn load(
     let canonical = std::cell::LazyCell::new(|| {
         fs::canonicalize(&workspace).map_err(|err| format!("cannot read: {err}"))
     });
-    let sources = expanded.files().map(|(item, entry, i)| {
-        let text = if filestore::is_store_path(&entry.src) {
-            store.read_trusted(&entry.src).map_err(|err| Failure {
-                refused: matches!(err, StoreError::Untrusted(_, _)),
-                ..Failure::usage(store_reason(&entry.src, &err))
-            })
-        } else {
-            canonical
-                .as_ref()
-                .map_err(|err| Failure::usage(err.clone()))
-                .and_then(|dir| read_src(dir, &entry.src))
-        };
-        text.and_then(|text| {
-            if entry.template {
-                template::check(&text).map_err(|why| Failure::usage(format!("template: {why}")))?;
+    let dir = || {
+        canonical
+            .as_ref()
+            .map(PathBuf::as_path)
+            .map_err(|err| Failure::usage(err.clone()))
+    };
+    let mut budget = tree::Budget::default();
+    let mut sources = Vec::new();
+    for (item, entry, i) in expanded.files() {
+        let store_path = filestore::is_store_path(&entry.src);
+        let loaded = if trees_only && !entry.recursive {
+            Ok(Loaded::Unread)
+        } else if entry.recursive {
+            if store_path {
+                tree::expand_store(&store, (i, &entry.src, &entry.dest), &mut budget)
+            } else {
+                dir().and_then(|dir| {
+                    tree::expand_workspace(dir, (i, &entry.src, &entry.dest), &mut budget)
+                })
             }
-            Ok(Source { text })
-        })
-        .map_err(|err| Failure {
+            .map(Loaded::Tree)
+        } else {
+            let bytes = if store_path {
+                store.read_trusted_bytes(&entry.src).map_err(|err| Failure {
+                    refused: matches!(err, StoreError::Untrusted(_, _)),
+                    ..Failure::usage(store_reason(&entry.src, &err))
+                })
+            } else {
+                dir().and_then(|dir| read_src_bytes(dir, &entry.src))
+            };
+            bytes
+                .and_then(|bytes| file_source(entry, bytes))
+                .map(Loaded::File)
+        };
+        sources.push(loaded.map_err(|err| Failure {
             message: src_message(item, i, &entry.src, &err.message),
             ..err
-        })
-    });
-    Ok(Sources(sources.collect::<Result<_, _>>()?))
+        })?);
+    }
+    Ok(Sources(sources))
+}
+
+/// The src of a single file `entry` from its `bytes`, a templated one
+/// checked to be text that parses.
+fn file_source(entry: &FileEntry, bytes: Vec<u8>) -> Result<Source, Failure> {
+    let source = Source::of(bytes);
+    if entry.template {
+        let text = source
+            .text()
+            .ok_or_else(|| Failure::usage("is binary; template = true needs a text file"))?;
+        template::check(text).map_err(|why| Failure::usage(format!("template: {why}")))?;
+    }
+    Ok(source)
 }
 
 /// `why` the src of the file entry `item` was not read, naming the entry.
@@ -133,6 +258,16 @@ pub(crate) fn src_message(item: &Item, i: usize, src: &str, why: &str) -> String
 /// is checked.
 pub(crate) fn read_src(dir: &Path, src: &str) -> Result<String, Failure> {
     const TEXT_ONLY: &str = "[[files]] copies text files only for now";
+    let text = String::from_utf8(read_src_bytes(dir, src)?)
+        .map_err(|_| Failure::usage(format!("is not UTF-8 text; {TEXT_ONLY}")))?;
+    if text.contains('\0') {
+        return Err(Failure::usage(format!("contains a NUL byte; {TEXT_ONLY}")));
+    }
+    Ok(text)
+}
+
+/// [`read_src`] for any bytes, text or not.
+pub(crate) fn read_src_bytes(dir: &Path, src: &str) -> Result<Vec<u8>, Failure> {
     let unreadable = |err: std::io::Error| Failure::usage(format!("cannot read: {err}"));
     let path = fs::canonicalize(dir.join(src)).map_err(unreadable)?;
     if !path.starts_with(dir) {
@@ -151,13 +286,7 @@ pub(crate) fn read_src(dir: &Path, src: &str) -> Result<String, Failure> {
     for folder in path.ancestors().skip(1).take_while(|a| a.starts_with(dir)) {
         trust::check_dir(folder, trust::INPUT).map_err(trust_error)?;
     }
-    let bytes = trust::load(&path, document::MAX_BYTES).map_err(trust_error)?;
-    let text = String::from_utf8(bytes)
-        .map_err(|_| Failure::usage(format!("is not UTF-8 text; {TEXT_ONLY}")))?;
-    if text.contains('\0') {
-        return Err(Failure::usage(format!("contains a NUL byte; {TEXT_ONLY}")));
-    }
-    Ok(text)
+    trust::load(&path, document::MAX_BYTES).map_err(trust_error)
 }
 
 /// Retains a failing store component when it differs from the source.
@@ -211,9 +340,10 @@ pub fn sudo_secret_for<'a>(config: &'a Config, target: &'a Target) -> Option<&'a
         .map_or(target.sudo_secret.as_deref(), |p| p.sudo_secret_for(target))
 }
 
-/// The step of file `item` for `target`: a skip when it does not match, else
-/// the tee script, or the password path's when sudo asks for a password and a
-/// secret holds it.
+/// The steps of file `item` for `target`: a skip when it does not match,
+/// else the tee script, or the password path's when sudo asks for a password
+/// and a secret holds it; a `recursive = true` entry has one per item of its
+/// tree ([`tree_runs`]).
 pub fn run(
     config: &Config,
     item: &Item,
@@ -221,14 +351,17 @@ pub fn run(
     sources: &Sources,
     target: &Target,
     facts: Option<&Facts>,
-) -> Result<PlannedRun, String> {
+) -> Result<Vec<PlannedRun>, String> {
     let facts = facts.ok_or("files: the probe has not run")?;
     let root = facts.is_root();
     let label = item.label("files", i);
     let dest = &entry.dest;
     if !item.matches(target, facts) {
         log::info!("{}: {label} {dest}: no match", target.name);
-        return Ok(skip_run(dest, format!("skipped file {dest}: no match")));
+        return Ok(vec![skip_run(
+            dest,
+            format!("skipped file {dest}: no match"),
+        )]);
     }
     let Some(ModeValue::Text(mode)) = &entry.mode else {
         return Err(format!("{label}.mode: required"));
@@ -248,62 +381,59 @@ pub fn run(
     )?;
     let secret =
         sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
-    let create = if entry.parents {
-        Some(WalkNonce::generate()?)
-    } else {
-        None
-    };
-    let mark = WalkNonce::attrs()?;
-    let write = match secret {
+    let (sudo, password) = match secret {
         Some(name) => {
             log::info!(
                 "{}: {label} {dest}, sudo password from secret {name}",
                 target.name
             );
-            FileWrite {
-                ordinal: i,
-                dest: dest.clone(),
-                mode: mode.clone(),
-                sudo: "sudo ".to_owned(),
-                checks: root_checks("sudo ", dest),
-                walk: Box::new(Walk::new("files", dest, true, &login_top(), create)),
-                as_root: true,
-                password: true,
-                rendered,
-                ids,
-                mark,
-                parents: entry.parents,
-            }
+            ("sudo ", true)
         }
         None => {
             log::info!("{}: {label} {dest}", target.name);
-            let sudo = if root || !entry.sudo { "" } else { "sudo -n " };
-            let as_root = root || entry.sudo;
-            let top = login_top();
-            let checks = if as_root {
-                root_checks(sudo, dest)
-            } else {
-                login_checks(dest, &top)
-            };
-            FileWrite {
-                ordinal: i,
-                dest: dest.clone(),
-                mode: mode.clone(),
-                sudo: sudo.to_owned(),
-                checks,
-                walk: Box::new(Walk::new("files", dest, as_root, &top, create)),
-                as_root,
-                password: false,
-                rendered,
-                ids,
-                mark,
-                parents: entry.parents,
-            }
+            (if root || !entry.sudo { "" } else { "sudo -n " }, false)
         }
     };
+    let base = FileWrite {
+        ordinal: i,
+        dest: String::new(),
+        mode: mode.clone(),
+        sudo: sudo.to_owned(),
+        checks: String::new(),
+        walk: Box::default(),
+        as_root: password || root || entry.sudo,
+        password,
+        rendered,
+        ids,
+        mark: WalkNonce::attrs()?,
+        parents: entry.parents,
+        binary: false,
+        item: None,
+    };
+    if let Some(tree) = sources.tree(i) {
+        return tree_runs((entry, &label), tree, base, secret, facts, sources);
+    }
+    let create = if entry.parents {
+        Some(WalkNonce::generate()?)
+    } else {
+        None
+    };
+    let binary = base.rendered.is_none() && sources.file(i).is_some_and(|source| source.binary);
+    let write = FileWrite { binary, ..base }.aimed(dest, create)?;
+    Ok(vec![write_run(write, sources, secret)?])
+}
+
+/// The step that writes `write`, typing the password from `secret`.
+fn write_run(
+    write: FileWrite,
+    sources: &Sources,
+    secret: Option<&str>,
+) -> Result<PlannedRun, String> {
     let (script, upload) = write_script(&write, sources, &Expected::Unchecked)?;
-    Ok(file_run(
-        dest,
+    let wire = script.len() + upload.as_ref().map_or(0, |upload| upload.stage.len());
+    let dest = write.dest.clone();
+    let mut planned = file_run(
+        &dest,
         script,
         format!("file {dest}"),
         secret.map(str::to_owned),
@@ -312,7 +442,83 @@ pub fn run(
             skip: false,
             write: Some(write),
         },
-    ))
+    );
+    planned.timeout = write_timeout(wire);
+    Ok(planned)
+}
+
+/// The steps of a `recursive = true` entry, one per item of `tree` in its
+/// order: each directory a create-only dir step ([`dirs::create_run`]) with
+/// the entry's `group` and `dir_mode`, its owner the write's identity, the
+/// dest's own parents created with `parents = true`; each file a file step
+/// to `DEST/rel` built from `base`. Unless sudo asks for a password, the
+/// dest's step carries the tree's [`TreeCheck`].
+fn tree_runs(
+    (entry, label): (&FileEntry, &str),
+    tree: &Tree,
+    base: FileWrite,
+    secret: Option<&str>,
+    facts: &Facts,
+    sources: &Sources,
+) -> Result<Vec<PlannedRun>, String> {
+    let dir_mode = entry
+        .dir_mode
+        .as_deref()
+        .ok_or_else(|| format!("{label}.dir_mode: required"))?;
+    let dir_ids = Ownership::of(label, (None, entry.group.as_deref()), !base.as_root, facts)?;
+    let mut runs = Vec::with_capacity(tree.items.len());
+    let mut look = (Vec::new(), Vec::new());
+    for (k, item) in tree.items.iter().enumerate() {
+        let dest = item.dest(&entry.dest);
+        let root = item.rel.is_empty();
+        let create = if root && entry.parents {
+            Some(WalkNonce::generate()?)
+        } else {
+            None
+        };
+        match item.source() {
+            None => {
+                look.1.push(dest.clone());
+                let write = DirWrite {
+                    walk: Box::new(Walk::new("dirs", &dest, base.as_root, &login_top(), create)),
+                    path: dest,
+                    mode: dir_mode.to_owned(),
+                    sudo: base.sudo.clone(),
+                    entry_sudo: entry.sudo,
+                    ids: dir_ids.clone(),
+                    mark: WalkNonce::attrs()?,
+                    parents: root && entry.parents,
+                    create_only: true,
+                };
+                runs.push(dirs::create_run(write, secret, (root, None)));
+            }
+            Some(source) => {
+                look.0
+                    .push((dest.clone(), hex(&Sha256::digest(&source.bytes))));
+                let write = FileWrite {
+                    binary: source.binary,
+                    item: Some(k),
+                    parents: false,
+                    ..base.clone()
+                }
+                .aimed(&dest, None)?;
+                runs.push(write_run(write, sources, secret)?);
+            }
+        }
+    }
+    if !base.password {
+        let (files, dirs) = look;
+        let script = tree_script(&files, &dirs, &base)?;
+        let check = TreeCheck {
+            script,
+            files,
+            dirs,
+        };
+        if let Some(RunKind::Dir { run, .. }) = runs.first_mut().map(|run| &mut run.kind) {
+            run.check = Some(Box::new(check));
+        }
+    }
+    Ok(runs)
 }
 
 /// `target`'s render of the templated `entry`, or `None` when it is not
@@ -329,7 +535,7 @@ fn render_entry(
     if !entry.template {
         return Ok(None);
     }
-    let Some(Source { text }) = sources.0.get(i) else {
+    let Some(text) = sources.file(i).and_then(Source::text) else {
         return Err(format!("files[{i}]: src was not loaded"));
     };
     let rendered = template::render(text, &target.vars, facts).and_then(|text| {
@@ -399,6 +605,12 @@ pub struct FileWrite {
     pub mark: WalkNonce,
     /// The entry's `parents`.
     pub parents: bool,
+    /// Whether the src is binary ([`Source::binary`]): the record keeps only
+    /// hashes, and rollback cannot undo the write.
+    pub binary: bool,
+    /// For an item of a `recursive = true` entry, its index among the
+    /// tree's items, which holds its src.
+    pub item: Option<usize>,
 }
 
 /// A write's `owner` and `group`, each by name or numeric id, `None`
@@ -473,17 +685,42 @@ impl Ownership {
 }
 
 impl FileWrite {
-    /// The bytes this write puts at DEST: `rendered`, else the src.
-    /// The only place a write reads its bytes.
-    pub(crate) fn text<'a>(&'a self, sources: &'a Sources) -> Result<&'a str, String> {
-        match &self.rendered {
-            Some(rendered) => Ok(rendered.text.as_str()),
-            None => sources
-                .0
-                .get(self.ordinal)
-                .map(|source| source.text.as_str())
-                .ok_or_else(|| format!("files[{}]: src was not loaded", self.ordinal)),
+    /// This write aimed at `dest`: its checks, and its walk, which with
+    /// `create` creates the missing directories, under a fresh mark.
+    fn aimed(self, dest: &str, create: Option<WalkNonce>) -> Result<FileWrite, String> {
+        let top = login_top();
+        let checks = if self.as_root {
+            root_checks(&self.sudo, dest)
+        } else {
+            login_checks(dest, &top)
+        };
+        Ok(FileWrite {
+            dest: dest.to_owned(),
+            checks,
+            walk: Box::new(Walk::new("files", dest, self.as_root, &top, create)),
+            mark: WalkNonce::attrs()?,
+            ..self
+        })
+    }
+
+    /// The bytes this write puts at DEST: `rendered`, else the src, a tree
+    /// item's from its tree. The only place a write reads its bytes.
+    pub(crate) fn payload<'a>(&'a self, sources: &'a Sources) -> Result<Payload<'a>, String> {
+        if let Some(rendered) = &self.rendered {
+            return Ok(Payload::Text(rendered.text.as_str()));
         }
+        let source = match self.item {
+            Some(k) => (sources.tree(self.ordinal))
+                .and_then(|tree| tree.items.get(k))
+                .and_then(TreeItem::source),
+            None => sources.file(self.ordinal),
+        };
+        let source =
+            source.ok_or_else(|| format!("files[{}]: src was not loaded", self.ordinal))?;
+        Ok(match source.text() {
+            Some(text) => Payload::Text(text),
+            None => Payload::Binary(&source.bytes),
+        })
     }
 
     /// The run before the write that reports what DEST holds.
@@ -494,7 +731,8 @@ impl FileWrite {
     /// The record of this write, from what the capture saw before it and
     /// how it ended: `previous` keeps the bytes as text unless the entry
     /// says `rollback = false`, the dest is `hash_only`
-    /// ([`Recorder`](crate::engine::Recorder)), or they are not text.
+    /// ([`Recorder`](crate::engine::Recorder)), they are not text, or the
+    /// src is binary.
     pub(crate) fn record(
         &self,
         expanded: &Expanded,
@@ -506,18 +744,23 @@ impl FileWrite {
         let entry = expanded
             .file(self.ordinal)
             .expect("a write comes from the list it is recorded against");
-        let written = self.text(sources).unwrap_or("");
+        let written = self.payload(sources).map_or(&[][..], Payload::bytes);
         let previous = previous_of(captured, hash_only || !entry.rollback);
-        FileRecord {
+        let mut record = FileRecord {
             dest: self.dest.clone(),
             mode: format!("{:0>4}", self.mode),
             sudo: entry.sudo,
-            written_sha256: hex(&Sha256::digest(written.as_bytes())),
+            written_sha256: hex(&Sha256::digest(written)),
             write,
             previous,
             written_attrs: None,
             created_dirs: Vec::new(),
+            binary: false,
+        };
+        if self.binary {
+            record.drop_binary_previous();
         }
+        record
     }
 
     /// DEST's owner, group and mode from `output`'s marked line, which the
@@ -547,7 +790,7 @@ impl FileWrite {
 }
 
 /// What `captured` says DEST held, as the record keeps it: a file's bytes
-/// as text unless `hash_only` or they are not text.
+/// as text unless `hash_only` or they are binary ([`BINARY`]).
 pub(crate) fn previous_of(captured: Captured, hash_only: bool) -> Previous {
     match captured {
         Captured::Absent => Previous::Absent,
@@ -564,9 +807,8 @@ pub(crate) fn previous_of(captured: Captured, hash_only: bool) -> Previous {
                 _ if hash_only => Err(NO_ROLLBACK),
                 None => Err(reason.unwrap_or("unreadable")),
                 Some(bytes) => match std::str::from_utf8(&bytes) {
-                    Err(_) => Err("not UTF-8 text"),
-                    Ok(text) if text.contains('\0') => Err("contains NUL"),
-                    Ok(text) => Ok(Zeroizing::new(text.to_owned())),
+                    Ok(text) if !text.contains('\0') => Ok(Zeroizing::new(text.to_owned())),
+                    _ => Err(BINARY),
                 },
             };
             Previous::File(PreviousFile {
@@ -593,32 +835,48 @@ pub(crate) enum Expected {
     Sha256(String),
 }
 
-/// The write script of `step` from its bytes ([`FileWrite::text`]: the rendered
-/// text of a templated entry, else its src in `sources`), refusing to write
-/// when DEST no longer holds what `expected` says; with the password path's
-/// stage and cleanup around it, under a fresh temp name.
+/// The write script of `step` from its bytes ([`FileWrite::payload`]: the
+/// rendered text of a templated entry, else its src in `sources`), refusing to
+/// write when DEST no longer holds what `expected` says; with the password
+/// path's stage and cleanup around it, under a fresh temp name. Text travels
+/// in a heredoc, binary in `printf` lines; either way only in a plain run.
 pub(crate) fn write_script(
     step: &FileWrite,
     sources: &Sources,
     expected: &Expected,
 ) -> Result<(Zeroizing<String>, Option<Upload>), String> {
     let i = step.ordinal;
-    let text = step.text(sources)?;
-    let heredoc = Heredoc::new(text).map_err(|why| format!("files[{i}].src: {why}"))?;
+    let payload = step.payload(sources)?;
+    let (heredoc, printf);
+    let bytes = match payload {
+        Payload::Text(text) => {
+            heredoc = Heredoc::new(text).map_err(|why| format!("files[{i}].src: {why}"))?;
+            Bytes::Inline(&heredoc)
+        }
+        Payload::Binary(bytes) => {
+            printf = Printf::new(bytes);
+            Bytes::Printf(&printf)
+        }
+    };
     if !step.password {
-        return tee_script(&heredoc, step, expected).map(|script| (script, None));
+        return tee_script(bytes, step, expected).map(|script| (script, None));
     }
-    let (temp, upload) = staged(&heredoc)?;
-    let script = install_script(&temp, text.len(), step, expected)?;
+    let (temp, upload) = staged_bytes(&bytes)?;
+    let script = install_script(&temp, bytes.len(), step, expected)?;
     Ok((script, Some(upload)))
 }
 
 /// The password path's upload of `heredoc`: a fresh temp name, the stage
 /// that writes the bytes there and the cleanup that removes it.
-fn staged(heredoc: &Heredoc<'_>) -> Result<(String, Upload), String> {
+pub(crate) fn staged(heredoc: &Heredoc<'_>) -> Result<(String, Upload), String> {
+    staged_bytes(&Bytes::Inline(heredoc))
+}
+
+/// [`staged`] of inline `bytes`, a heredoc or `printf` lines.
+fn staged_bytes(bytes: &Bytes<'_>) -> Result<(String, Upload), String> {
     let temp = temp_path()?;
     let upload = Upload {
-        stage: stage_script(heredoc, &temp),
+        stage: stage_script(bytes, &temp),
         cleanup: format!("rm -f {}", quote(&temp)),
     };
     Ok((temp, upload))
@@ -872,7 +1130,7 @@ pub(crate) fn fix_script(
 
 /// The plain run: a root target, a `sudo = false` entry, or `sudo -n`.
 fn tee_script(
-    heredoc: &Heredoc<'_>,
+    bytes: Bytes<'_>,
     step: &FileWrite,
     expected: &Expected,
 ) -> Result<Zeroizing<String>, String> {
@@ -885,7 +1143,7 @@ fn tee_script(
             sudo: &step.sudo,
             as_root: step.as_root,
             temp: &temp,
-            bytes: Bytes::Inline(heredoc),
+            bytes,
             ids: step.ids.as_ref().map_or(Ids::Keep, Ownership::ids),
         },
         &step.checks,
@@ -896,14 +1154,22 @@ fn tee_script(
     ))
 }
 
-/// The password path's plain stage: the bytes into a new 0600 `temp`.
-fn stage_script(heredoc: &Heredoc<'_>, temp: &str) -> Zeroizing<String> {
-    zeroizing(format_args!(
-        "{{ umask 077; set -C; {} >{}\n{}}}\n",
-        heredoc.head(),
-        quote(temp),
-        heredoc.body()
-    ))
+/// The password path's plain stage: the inline bytes into a new 0600 `temp`.
+fn stage_script(bytes: &Bytes<'_>, temp: &str) -> Zeroizing<String> {
+    match bytes {
+        Bytes::Inline(heredoc) => zeroizing(format_args!(
+            "{{ umask 077; set -C; {} >{}\n{}}}\n",
+            heredoc.head(),
+            quote(temp),
+            heredoc.body()
+        )),
+        Bytes::Printf(printf) => zeroizing(format_args!(
+            "{{ umask 077; set -C; {PRINTF_BUILTIN}{{\n{}}} >{}\n}}\n",
+            *printf.lines,
+            quote(temp)
+        )),
+        Bytes::Staged(..) => unreachable!("only inline bytes are staged"),
+    }
 }
 
 /// The password path's terminal run, one brace group so a failed `sudo -v`
@@ -1492,6 +1758,152 @@ pub(crate) fn parse_hashes(
         .collect()
 }
 
+/// A tree's look before any of its writes: one run that says which of its
+/// files already hold their bytes, owner, group and mode, and which of its
+/// directories exist, so that their steps run nothing. `files` are the file
+/// items' dests with their src's sha256, `dirs` the directory items'.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeCheck {
+    pub script: String,
+    pub files: Vec<(String, String)>,
+    pub dirs: Vec<String>,
+}
+
+/// What a [`TreeCheck`] found: the dests already as the tree has them, and
+/// the files it found absent.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TreeLook {
+    pub same: BTreeSet<String>,
+    pub absent: BTreeSet<String>,
+}
+
+/// The lines [`tree_script`] prints before the hashes start with these.
+const SAME_MARK: &str = "anvil-same ";
+const DIR_MARK: &str = "anvil-dir ";
+
+impl TreeCheck {
+    /// What the check's stdout says; an error when its hashes do not parse.
+    /// A dest is the same only when every tree directory from the tree's
+    /// dest down to it was marked, so a step under a planted directory runs
+    /// and its walk refuses it.
+    pub(crate) fn look(&self, stdout: &[u8]) -> Result<TreeLook, String> {
+        let states = parse_hashes(self.files.len(), stdout)?;
+        let text = String::from_utf8_lossy(stdout);
+        let marked = |mark: &str| -> BTreeSet<usize> {
+            (text.lines())
+                .take_while(|line| !line.starts_with(HASH_MARK))
+                .filter_map(|line| line.strip_prefix(mark)?.parse().ok())
+                .collect()
+        };
+        let (kept, dirs) = (marked(SAME_MARK), marked(DIR_MARK));
+        let unsafe_dirs: BTreeSet<&str> = (self.dirs.iter().enumerate())
+            .filter(|(i, _)| !dirs.contains(i))
+            .map(|(_, dir)| dir.as_str())
+            .collect();
+        let safe = |dest: &str| {
+            (Path::new(dest).ancestors())
+                .filter_map(Path::to_str)
+                .all(|dir| !unsafe_dirs.contains(dir))
+        };
+        let mut look = TreeLook::default();
+        for (i, ((dest, sha256), (state, hex))) in self.files.iter().zip(states).enumerate() {
+            match state {
+                FileState::File
+                    if hex.as_ref() == Some(sha256) && kept.contains(&i) && safe(dest) =>
+                {
+                    look.same.insert(dest.clone());
+                }
+                FileState::Absent => {
+                    look.absent.insert(dest.clone());
+                }
+                _ => {}
+            }
+        }
+        for i in dirs {
+            if let Some(dir) = self.dirs.get(i).filter(|dir| safe(dir)) {
+                look.same.insert(dir.clone());
+            }
+        }
+        Ok(look)
+    }
+}
+
+/// The run of a [`TreeCheck`] as `write`, a tree's file items' write: first,
+/// through its `sudo` as one `sh -s` reading a heredoc, a `anvil-same I`
+/// line for each of `files` that is a regular file, not a symlink, with the
+/// write's mode,
+/// and its owner and group when set, and a `anvil-dir I` line for each of
+/// `dirs` that is a directory, not a symlink, that passes the owner test of
+/// [`root_checks`] or [`login_checks`], by `as_root`, and that group and
+/// others cannot write; then [`hash_script`] over `files`. A dest is only
+/// ever a quoted argument, never printed.
+fn tree_script(
+    files: &[(String, String)],
+    dirs: &[String],
+    write: &FileWrite,
+) -> Result<String, String> {
+    let numeric = |id: &str| id.bytes().all(|b| b.is_ascii_digit());
+    let (owner, group) = write.ids.as_ref().map_or((None, None), |ids| {
+        (ids.owner.as_deref(), ids.group.as_deref())
+    });
+    let uid = match owner {
+        None => String::new(),
+        Some(owner) if numeric(owner) => format!("anvil_uid={owner}\n"),
+        Some(owner) => format!("anvil_uid=$(id -u {}) || anvil_uid=-\n", quote(owner)),
+    };
+    let owner_cmp = match owner {
+        None => "",
+        Some(_) => "[ \"$5\" -eq \"$anvil_uid\" ] 2>/dev/null || return 0\n",
+    };
+    let group_cmp = match group {
+        None => String::new(),
+        Some(group) if numeric(group) => {
+            format!("[ \"$6\" -eq {group} ] 2>/dev/null || return 0\n")
+        }
+        Some(group) => format!(
+            "[ -n \"$(find \"$2\" -prune -group {} 2>/dev/null)\" ] || return 0\n",
+            quote(group)
+        ),
+    };
+    let mut body = format!(
+        "umask 077; LC_ALL=C; export LC_ALL; set -f\n{OCTAL}{uid}\
+         anvil_same() {{ anvil_l=$(ls -ldn \"$2\") || return 0\n\
+         set -- \"$1\" \"$2\" $anvil_l\n\
+         case $3 in -*) ;; *) return 0 ;; esac\n\
+         [ \"$(anvil_octal \"$3\")\" = {mode:0>4} ] || return 0\n\
+         {owner_cmp}{group_cmp}echo \"{SAME_MARK}$1\"; }}\n\
+         anvil_dir() {{ if test -d \"$2\" && test ! -L \"$2\" \
+         && [ -n \"$(find \"$2\" {found})\" ]; then echo \"{DIR_MARK}$1\"; fi; }}\n",
+        mode = write.mode,
+        found = root_only_find(if write.as_root {
+            ROOT_OWNED
+        } else {
+            LOGIN_OWNED
+        }),
+    );
+    for (i, (dest, _)) in files.iter().enumerate() {
+        body += &format!("anvil_same {i} {}\n", quote(dest));
+    }
+    for (i, dir) in dirs.iter().enumerate() {
+        body += &format!("anvil_dir {i} {}\n", quote(dir));
+    }
+    let heredoc = Heredoc::new(&body).map_err(|why| format!("files: the tree check {why}"))?;
+    let hashes: Vec<HashDest> = (files.iter())
+        .map(|(dest, _)| HashDest {
+            dest,
+            as_root: write.as_root,
+        })
+        .collect();
+    Ok(format!(
+        "{{ exec 2>/dev/null; anvil_look() {{\n{sudo}sh -s <<'{delimiter}'\n{body}}}\n\
+         anvil_look\n}}\n{hash}",
+        sudo = write.sudo,
+        delimiter = heredoc.delimiter,
+        body = heredoc.body(),
+        hash = hash_script(&hashes, &write.sudo)?,
+    ))
+}
+
 /// The first five fields of an `ls -ln` line: the mode as 4 octal digits,
 /// uid, gid, size, and the type character (`-` for a regular file). The
 /// permissions may end in one `@`, `+` or `.`; `s`/`S` and `t`/`T` are the
@@ -1758,6 +2170,7 @@ pub(crate) fn restore_replaced(
         previous: Previous::File(previous.clone()),
         written_attrs: None,
         created_dirs: Vec::new(),
+        binary: false,
     };
     let restore = Restore {
         dest,
@@ -1891,6 +2304,17 @@ pub(crate) fn restore_attrs(
     previous: &Attrs,
     keep_special: bool,
 ) -> String {
+    restore_attrs_as(kind, (dest, dest, sudo, as_root), previous, keep_special)
+}
+
+/// [`restore_attrs`] on `dest` whose messages name `shown` instead: a temp
+/// that becomes `shown` once renamed.
+pub(crate) fn restore_attrs_as(
+    kind: &str,
+    (dest, shown, sudo, as_root): (&str, &str, &str, bool),
+    previous: &Attrs,
+    keep_special: bool,
+) -> String {
     let kept = |mode: &str| {
         if keep_special {
             format!("\"$(anvil_kept {mode})\"")
@@ -1902,7 +2326,9 @@ pub(crate) fn restore_attrs(
     let ids = format!("{}:{}", previous.uid, previous.gid);
     let all = quote("owner, group and ");
     let (own, chmod) = if as_root {
-        let failed = quote(&format!("{kind}: cannot give {dest} owner and group {ids}"));
+        let failed = quote(&format!(
+            "{kind}: cannot give {shown} owner and group {ids}"
+        ));
         let own = format!(
             "anvil_what={all}\n\
                  if [ \"$3:$4\" != {ids} ]; then {sudo}chmod go= {d} || exit 1\n\
@@ -1915,7 +2341,7 @@ pub(crate) fn restore_attrs(
         )
     } else {
         let warning = quote(&format!(
-            "{kind}: {dest} was owned by {ids}; only root can give it back"
+            "{kind}: {shown} was owned by {ids}; only root can give it back"
         ));
         // A group that did not go back never gets the recorded mode's
         // group bits, not even for a moment: one chmod without them.
@@ -1944,7 +2370,8 @@ pub(crate) fn restore_attrs(
          set -- $anvil_line\n\
          anvil_was=$(anvil_octal \"$1\")\n\
          {own}{chmod}\
-         printf 'restored %smode of %s\\n' \"$anvil_what\" {d}\n"
+         printf 'restored %smode of %s\\n' \"$anvil_what\" {}\n",
+        quote(shown)
     )
 }
 
@@ -2162,7 +2589,7 @@ mod tests {
         expected: &Expected,
     ) -> Zeroizing<String> {
         super::tee_script(
-            heredoc,
+            Bytes::Inline(heredoc),
             &plain(dest, mode, sudo, checks, !checks.is_empty()),
             expected,
         )
@@ -2189,6 +2616,8 @@ mod tests {
             ids: None,
             mark: WalkNonce::attrs().unwrap(),
             parents: false,
+            binary: false,
+            item: None,
         }
     }
 
@@ -2228,7 +2657,8 @@ mod tests {
         expanded
             .files()
             .map(|(item, entry, i)| super::run(config, item, (entry, i), sources, target, facts))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map(|runs| runs.into_iter().flatten().collect())
     }
 
     const SECRET_TEXT: &str = "token = hunter2-file-content\n";
@@ -2247,6 +2677,8 @@ mod tests {
             rollback: true,
             template: false,
             notify: Vec::new(),
+            recursive: false,
+            dir_mode: None,
         }
     }
 
@@ -2380,7 +2812,7 @@ mod tests {
         std::os::unix::fs::symlink("real/src.txt", root.join("link.txt")).unwrap();
         let config = config_in(&root, vec![entry("link.txt", "/etc/x")]);
         let Sources(loaded) = load(&config, || Ok(root.clone())).unwrap();
-        assert_eq!(loaded[0].text, "text");
+        assert_eq!(loaded[0].file().and_then(Source::text), Some("text"));
         assert_src_refused(&root, "link.txt", &root.join("real"), 0o775, 0o755);
         assert_src_refused(&root, "link.txt", &root.join("real/src.txt"), 0o664, 0o644);
         fs::remove_dir_all(&dir).unwrap();
@@ -2485,8 +2917,8 @@ mod tests {
         );
         let Sources(loaded) = load(&config, || Ok(dir.clone())).unwrap();
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].text, SECRET_TEXT);
-        assert_eq!(loaded[1].text, "");
+        assert_eq!(loaded[0].file().and_then(Source::text), Some(SECRET_TEXT));
+        assert_eq!(loaded[1].file().and_then(Source::text), Some(""));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2542,7 +2974,12 @@ mod tests {
         fs::write(dir.join("big"), "a".repeat(limit + 1)).unwrap();
         let config = config_in(&dir, vec![entry("fits", "/etc/fits")]);
         assert_eq!(
-            load(&config, || Ok(dir.clone())).unwrap().0[0].text.len(),
+            load(&config, || Ok(dir.clone()))
+                .unwrap()
+                .file(0)
+                .unwrap()
+                .bytes
+                .len(),
             limit
         );
         assert_eq!(
@@ -2553,18 +2990,59 @@ mod tests {
     }
 
     #[test]
-    fn load_refuses_binary_as_a_current_limit() {
+    fn load_reads_a_binary_src_and_refuses_one_with_template() {
         let dir = dir("files-binary");
         fs::write(dir.join("ok.txt"), "ok").unwrap();
         fs::write(dir.join("latin1"), b"caf\xe9\n").unwrap();
         fs::write(dir.join("nul"), b"a\0b").unwrap();
-        assert_eq!(
-            load_err(&dir, "latin1"),
-            "files[1].src `latin1`: is not UTF-8 text; [[files]] copies text files only for now"
+        let config = config_in(
+            &dir,
+            vec![
+                entry("latin1", "/etc/a"),
+                entry("nul", "/etc/b"),
+                entry("ok.txt", "/etc/c"),
+            ],
         );
+        let loaded = load(&config, || Ok(dir.clone())).unwrap().0;
+        let shown: Vec<_> = loaded
+            .iter()
+            .filter_map(Loaded::file)
+            .map(|source| (source.bytes.as_slice(), source.binary))
+            .collect();
         assert_eq!(
-            load_err(&dir, "nul"),
-            "files[1].src `nul`: contains a NUL byte; [[files]] copies text files only for now"
+            shown,
+            [
+                (&b"caf\xe9\n"[..], true),
+                (&b"a\0b"[..], true),
+                (&b"ok"[..], false)
+            ]
+        );
+        for src in ["latin1", "nul"] {
+            let templated = FileEntry {
+                template: true,
+                ..entry(src, "/etc/x")
+            };
+            let config = config_in(&dir, vec![entry("ok.txt", "/etc/ok"), templated]);
+            let err = load(&config, || Ok(dir.clone())).unwrap_err();
+            assert_eq!(
+                err,
+                format!("files[1].src `{src}`: is binary; template = true needs a text file")
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_binary_store_src_is_read_as_bytes() {
+        let dir = dir("files-binary-store");
+        fs::create_dir(dir.join("files")).unwrap();
+        fs::write(dir.join("files/blob"), b"\xff\0\x01").unwrap();
+        let config = config_in(&dir, vec![entry("$/blob", "/etc/blob")]);
+        let loaded = load(&config, || Ok(dir.clone())).unwrap();
+        let loaded = loaded.file(0).unwrap();
+        assert_eq!(
+            (loaded.bytes.as_slice(), loaded.binary),
+            (&b"\xff\0\x01"[..], true)
         );
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2721,6 +3199,282 @@ mod tests {
         runs.remove(0)
     }
 
+    /// `script` with every run of 16 or more lowercase hex digits, the
+    /// random temp names and nonces among them, as `<hex>`.
+    fn without_random(script: &str) -> String {
+        let mut out = String::with_capacity(script.len());
+        let mut run = String::new();
+        let flush = |run: &mut String, out: &mut String| {
+            if run.len() >= 16 {
+                out.push_str("<hex>");
+            } else {
+                out.push_str(run);
+            }
+            run.clear();
+        };
+        for c in script.chars() {
+            if matches!(c, '0'..='9' | 'a'..='f') {
+                run.push(c);
+            } else {
+                flush(&mut run, &mut out);
+                out.push(c);
+            }
+        }
+        flush(&mut run, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_text_files_scripts_stay_byte_for_byte_what_they_were() {
+        let plain = only_run(true, None, &user_facts("nopasswd"));
+        let password = only_run(true, Some("WEB"), &user_facts("binary"));
+        let upload = password.file().unwrap().upload.as_ref().unwrap();
+        let scripts = [&plain.run, &password.run, &upload.stage].map(|s| without_random(s));
+        let pins: Vec<_> = scripts
+            .iter()
+            .map(|script| hex(&Sha256::digest(script.as_bytes())))
+            .collect();
+        // From 6a8a76f, before binary files: a text file's bytes on the wire
+        // must not change.
+        assert_eq!(
+            pins,
+            [
+                "310ba260a58ae637fb22f0dffc985901dd00f71352468c7e34bd7695fd680902",
+                "cef1f267c65a72fe1ac12484eb37c4f0d6c1050c4bfdbb239e2a347363646d91",
+                "7156c8dda7596c1cad7d8264874c43364be0ca980c30f801ee294b28e1ab106c",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tree_runs_one_step_per_item_in_order_and_the_dest_carries_the_check() {
+        let dir = fs::canonicalize(dir("files-tree-runs")).unwrap();
+        fs::create_dir_all(dir.join("conf/sub")).unwrap();
+        fs::write(dir.join("conf/sub/a"), "abc").unwrap();
+        fs::write(dir.join("conf/b"), b"\xff\0").unwrap();
+        let tree = FileEntry {
+            recursive: true,
+            dir_mode: Some("0750".to_owned()),
+            group: Some("app".to_owned()),
+            owner: Some("app".to_owned()),
+            parents: true,
+            ..entry("conf", "/etc/app")
+        };
+        let config = config_in(&dir, vec![tree]);
+        let sources = load(&config, || Ok(dir.clone())).unwrap();
+        let plan = |secret, sudo| {
+            runs(
+                &config,
+                &sources,
+                &host(&[], secret),
+                Some(&user_facts(sudo)),
+            )
+            .unwrap()
+        };
+        let steps = plan(None, "nopasswd");
+        let shown: Vec<_> = steps.iter().map(PlannedRun::shown).collect();
+        assert_eq!(
+            shown,
+            [
+                "dir /etc/app",
+                "file /etc/app/b",
+                "dir /etc/app/sub",
+                "file /etc/app/sub/a"
+            ]
+        );
+        let dirs: Vec<_> = (steps.iter())
+            .filter_map(|run| run.dir()?.write.as_ref())
+            .collect();
+        assert!(dirs.iter().all(|dir| dir.create_only && dir.mode == "0750"));
+        assert_eq!(
+            dirs.iter().map(|dir| dir.parents).collect::<Vec<_>>(),
+            [true, false],
+            "parents = true creates the dest's own parents only"
+        );
+        let ids = dirs[0].ids.as_ref().unwrap();
+        assert_eq!(
+            (ids.owner.as_deref(), ids.group.as_deref()),
+            (None, Some("app"))
+        );
+        let files: Vec<_> = (steps.iter())
+            .filter_map(|run| run.file()?.write.as_ref())
+            .collect();
+        assert_eq!(
+            (files.iter())
+                .map(|write| (
+                    write.dest.as_str(),
+                    write.item,
+                    write.binary,
+                    write.walk.create.is_some()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("/etc/app/b", Some(1), true, false),
+                ("/etc/app/sub/a", Some(3), false, false)
+            ]
+        );
+        assert!(
+            files
+                .iter()
+                .all(|write| write.mode == "0644" && write.sudo == "sudo -n ")
+        );
+        assert_eq!(files[0].ids.as_ref().unwrap().owner.as_deref(), Some("app"));
+        assert_eq!(files[1].payload(&sources).unwrap().bytes(), b"abc");
+        let check = steps[0]
+            .dir()
+            .unwrap()
+            .check
+            .as_ref()
+            .expect("the dest's check");
+        assert_eq!(
+            check.files,
+            [
+                ("/etc/app/b".to_owned(), hex(&Sha256::digest(b"\xff\0"))),
+                ("/etc/app/sub/a".to_owned(), hex(&Sha256::digest(b"abc"))),
+            ]
+        );
+        assert_eq!(check.dirs, ["/etc/app", "/etc/app/sub"]);
+        assert!(check.script.contains("sudo -n sh -s <<'ANVIL_EOF_"));
+        assert!(!check.script.contains("abc"), "the check carries no bytes");
+        assert!(
+            steps[1..]
+                .iter()
+                .all(|run| run.dir().is_none_or(|dir| dir.check.is_none()))
+        );
+
+        let password = plan(Some("pw"), "binary");
+        assert!(
+            password[0].dir().unwrap().check.is_none(),
+            "no check types the password"
+        );
+        assert_eq!(password[1].sudo_secret.as_deref(), Some("pw"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_tree_look_keeps_files_with_the_bytes_and_attrs_and_dirs_that_are_there() {
+        let sha = |text: &str| hex(&Sha256::digest(text.as_bytes()));
+        let check = TreeCheck {
+            script: String::new(),
+            files: ["a", "b", "c", "d", "u/e"]
+                .iter()
+                .map(|name| (format!("/t/{name}"), sha(name)))
+                .collect(),
+            dirs: ["/t", "/t/s", "/t/u"].map(str::to_owned).into(),
+        };
+        let out = format!(
+            "anvil-same 0\nanvil-same 1\nanvil-same 4\nanvil-dir 0\nanvil-dir 1\nanvil-same 9\n\
+             anvil-hash 0 file {}\nanvil-hash 1 file {}\nanvil-hash 2 file {}\nanvil-hash 3 absent\n\
+             anvil-hash 4 file {}\n",
+            sha("a"),
+            sha("other"),
+            sha("c"),
+            sha("u/e"),
+        );
+        let look = check.look(out.as_bytes()).unwrap();
+        assert_eq!(
+            look,
+            TreeLook {
+                same: ["/t", "/t/a", "/t/s"].map(str::to_owned).into(),
+                absent: ["/t/d"].map(str::to_owned).into(),
+            },
+            "b's bytes and c's attrs differ, /t/u fails the owner test, so u/e is not the same"
+        );
+        let unmarked = out.replace("anvil-dir 0\n", "");
+        assert_eq!(
+            check.look(unmarked.as_bytes()).unwrap().same,
+            BTreeSet::new(),
+            "nothing under an unmarked /t is the same"
+        );
+        assert!(check.look(b"anvil-same 0\n").is_err(), "no hashes");
+    }
+
+    #[test]
+    fn a_binary_src_travels_in_printf_lines_only_in_plain_runs() {
+        let config = config_in(Path::new("/c"), vec![entry("a", "/etc/a")]);
+        let mut bytes: Vec<u8> = (0..=255).collect();
+        bytes.extend_from_slice(b"hunter2\0");
+        let sources = Sources(vec![Loaded::File(Source::of(bytes.clone()))]);
+        let printf = Printf::new(&bytes);
+        let plain = runs(
+            &config,
+            &sources,
+            &host(&[], None),
+            Some(&user_facts("nopasswd")),
+        )
+        .unwrap()
+        .remove(0);
+        assert!(
+            plain.run.contains(&*printf.lines),
+            "the bytes in the tee run"
+        );
+        assert!(plain.run.contains(&format!("[ \"$5\" = {} ]", bytes.len())));
+        assert!(!plain.run.contains("<<'ANVIL_EOF_"), "no heredoc");
+
+        let password = runs(
+            &config,
+            &sources,
+            &host(&[], Some("WEB")),
+            Some(&user_facts("binary")),
+        )
+        .unwrap()
+        .remove(0);
+        let upload = password.file().unwrap().upload.as_ref().unwrap();
+        let temp = upload.cleanup.strip_prefix("rm -f ").unwrap();
+        assert_eq!(
+            *upload.stage,
+            format!(
+                "{{ umask 077; set -C; {PRINTF_BUILTIN}{{\n{}}} >{temp}\n}}\n",
+                *printf.lines
+            )
+        );
+        assert!(
+            !password.run.contains("hunter2"),
+            "the tty run carries paths only"
+        );
+        assert!(
+            password
+                .run
+                .contains(&format!("anvil_bytes() {{ cat {temp}; }}"))
+        );
+        assert!(
+            password
+                .run
+                .contains(&format!("[ \"$5\" = {} ]", bytes.len()))
+        );
+    }
+
+    #[test]
+    fn the_write_timeout_grows_by_15_s_per_mib_on_the_wire() {
+        assert_eq!(write_timeout(0), RUN_TIMEOUT);
+        assert_eq!(write_timeout(64 * 1024), RUN_TIMEOUT);
+        assert_eq!(
+            write_timeout(1024 * 1024),
+            RUN_TIMEOUT + Duration::from_secs(15)
+        );
+        assert_eq!(
+            write_timeout(4 * 1024 * 1024),
+            RUN_TIMEOUT + Duration::from_secs(60)
+        );
+        let config = config_in(Path::new("/c"), vec![entry("a", "/etc/a")]);
+        let bytes = vec![0xff; document::MAX_BYTES as usize];
+        let sources = Sources(vec![Loaded::File(Source::of(bytes))]);
+        let run = runs(
+            &config,
+            &sources,
+            &host(&[], None),
+            Some(&user_facts("nopasswd")),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(run.timeout, write_timeout(run.run.len()));
+        assert!(
+            run.timeout >= RUN_TIMEOUT + Duration::from_secs(60),
+            "{:?}",
+            run.timeout
+        );
+    }
+
     #[test]
     fn runs_picks_tee_or_the_password_path() {
         let root = facts(&[("user", "root"), ("sudo", "binary")]);
@@ -2856,7 +3610,7 @@ mod tests {
             _ => user_checks(sudo, dest, top),
         };
         super::tee_script(
-            &Heredoc::new("new\n").unwrap(),
+            Bytes::Inline(&Heredoc::new("new\n").unwrap()),
             &plain(d, "0640", sudo, &checks, !sudo.is_empty()),
             &Expected::Unchecked,
         )
@@ -2886,9 +3640,13 @@ mod tests {
             }),
             ..plain(d, "0640", sudo, &checks, user.is_none())
         };
-        super::tee_script(&Heredoc::new("new\n").unwrap(), &step, &Expected::Unchecked)
-            .unwrap()
-            .to_string()
+        super::tee_script(
+            Bytes::Inline(&Heredoc::new("new\n").unwrap()),
+            &step,
+            &Expected::Unchecked,
+        )
+        .unwrap()
+        .to_string()
     }
 
     /// This process's uid and gid, as numeric strings.
@@ -2934,6 +3692,71 @@ mod tests {
     }
 
     const REAL: &str = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
+
+    /// `script` on `bash -s`, `printf` its builtin unless `external`, when
+    /// `enable -n` leaves only the one on `PATH`.
+    fn bash_with(bin: &Path, script: &str, external: bool) -> crate::transport::Output {
+        let mut command = std::process::Command::new("bash");
+        command.arg("-s").env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        );
+        let disable = if external { "enable -n printf\n" } else { "" };
+        let script = format!("{disable}{script}");
+        unmarked(crate::transport::run_with_script(&mut command, &script, RUN_TIMEOUT).unwrap())
+    }
+
+    #[test]
+    fn a_binary_write_refuses_a_printf_that_is_not_a_builtin_before_any_byte() {
+        let found = std::process::Command::new("sh")
+            .args(["-c", "command -v bash >/dev/null"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !found {
+            eprintln!("skip: no bash");
+            return;
+        }
+        assert!(PRINTF_BUILTIN.contains(&format!("exit {REFUSED} ")));
+        let bytes = b"\xff\0bin\n";
+        let printf = Printf::new(bytes);
+        let refusal = "files: printf is not a shell builtin; cannot copy a binary file\n";
+        let (dir, bin, dest) = write_case("files-printf-builtin", &[]);
+        let d = dest.to_str().unwrap();
+        let checks = login_checks(d, dest.parent().unwrap());
+        let write = plain(d, "0640", "", &checks, false);
+        let script =
+            super::tee_script(Bytes::Printf(&printf), &write, &Expected::Unchecked).unwrap();
+        let out = bash_with(&bin, &script, true);
+        assert_eq!(String::from_utf8_lossy(&out.stderr), refusal);
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(fs::read(&dest).unwrap(), b"old\n", "dest untouched");
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+
+        let staged = dir.join("staged");
+        let stage = stage_script(&Bytes::Printf(&printf), staged.to_str().unwrap());
+        let out = bash_with(&bin, &stage, true);
+        assert_eq!(String::from_utf8_lossy(&out.stderr), refusal);
+        assert_eq!(out.code, Some(REFUSED));
+        assert!(!staged.exists(), "nothing staged");
+
+        let out = bash_with(&bin, &stage, false);
+        assert_eq!(
+            out.code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(fs::read(&staged).unwrap(), bytes);
+        let out = bash_with(&bin, &script, false);
+        assert_eq!(
+            out.code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(fs::read(&dest).unwrap(), bytes);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_write_replaces_dest_by_a_new_file_and_leaves_no_temp() {
@@ -4057,7 +4880,7 @@ mod tests {
         let (dir, bin, dest) = write_case("files-0200", &[("mv", "exit 1")]);
         let d = dest.to_str().unwrap();
         let script = super::tee_script(
-            &Heredoc::new("new\n").unwrap(),
+            Bytes::Inline(&Heredoc::new("new\n").unwrap()),
             &plain(
                 d,
                 "0200",
@@ -5382,7 +6205,7 @@ mod tests {
         let temp = dir.join("stage");
         let temp_str = temp.to_str().unwrap();
         for text in ["", "\n", "a", "a\n"] {
-            let script = stage_script(&Heredoc::new(text).unwrap(), temp_str);
+            let script = stage_script(&Bytes::Inline(&Heredoc::new(text).unwrap()), temp_str);
             assert_eq!(sh(&script), (Some(0), String::new()), "{text:?}");
             assert_eq!(fs::read(&temp).unwrap(), text.as_bytes(), "{text:?}");
             assert_eq!(mode(&temp), 0o600);
@@ -6208,6 +7031,7 @@ mod tests {
             previous,
             written_attrs: None,
             created_dirs: Vec::new(),
+            binary: false,
         }
     }
 
@@ -6587,7 +7411,8 @@ mod tests {
         let step = plain(dest.to_str().unwrap(), "0640", "", "", false);
         let heredoc = Heredoc::new("new\n").unwrap();
         for _ in ["wrote", "unchanged"] {
-            let script = super::tee_script(&heredoc, &step, &Expected::Unchecked).unwrap();
+            let script =
+                super::tee_script(Bytes::Inline(&heredoc), &step, &Expected::Unchecked).unwrap();
             let mut out = Local.run(&script, RUN_TIMEOUT).unwrap();
             assert_eq!(
                 out.code,
@@ -7030,7 +7855,7 @@ mod tests {
             .unwrap();
         for expected in ["restored", "unchanged"] {
             let stage = stage_script(
-                &Heredoc::new(SECRET_TEXT).unwrap(),
+                &Bytes::Inline(&Heredoc::new(SECRET_TEXT).unwrap()),
                 local_temp.to_str().unwrap(),
             );
             assert_eq!(sh(&stage), (Some(0), String::new()));
@@ -7169,9 +7994,7 @@ mod tests {
 
     #[test]
     fn debug_never_shows_the_content() {
-        let source = Source {
-            text: SECRET_TEXT.to_owned(),
-        };
+        let source = Source::of(SECRET_TEXT.as_bytes().to_vec());
         assert_eq!(
             format!("{source:?}"),
             format!("Source(<{} bytes>)", SECRET_TEXT.len())
@@ -7670,7 +8493,11 @@ mod tests {
             vec![entry("bad.j2", "/etc/plain"), templated("ok.j2", "/etc/ok")],
         );
         let Sources(loaded) = load(&config, || Ok(dir.clone())).unwrap();
-        assert_eq!(loaded[0].text, "a\n{% if %}\n", "a plain src is not parsed");
+        assert_eq!(
+            loaded[0].file().and_then(Source::text),
+            Some("a\n{% if %}\n"),
+            "a plain src is not parsed"
+        );
         let config = config_in(&dir, vec![templated("bad.j2", "/etc/x")]);
         let err = super::load(&legacy(&config), || Ok(dir.clone())).unwrap_err();
         assert_eq!(err.code, 2);
@@ -7718,7 +8545,7 @@ mod tests {
             let rendered = write.rendered.as_ref().unwrap();
             assert_eq!(rendered.text.as_str(), text);
             assert_eq!(rendered.sha256, hex(&Sha256::digest(text.as_bytes())));
-            assert_eq!(write.text(&sources).unwrap(), text);
+            assert_eq!(write.payload(&sources).unwrap().bytes(), text.as_bytes());
             let (script, _) = write_script(write, &sources, &Expected::Unchecked).unwrap();
             assert!(
                 script.contains(text) && !script.contains("{{"),
@@ -7759,9 +8586,59 @@ mod tests {
         .unwrap();
         let write = written(&run[0]);
         assert_eq!(write.rendered, None);
-        assert_eq!(write.text(&sources).unwrap(), src);
+        assert_eq!(write.payload(&sources).unwrap().bytes(), src.as_bytes());
         let (script, _) = write_script(&write, &sources, &Expected::Unchecked).unwrap();
         assert!(script.contains(src), "{}", &*script);
+    }
+
+    #[test]
+    fn a_binary_src_marks_its_step_and_record_and_keeps_the_previous_hash_only() {
+        let config = config_in(
+            Path::new("/c"),
+            vec![entry("a", "/etc/a"), entry("b", "/etc/b")],
+        );
+        let sources = Sources::of(&["text\n", "a\0b"]);
+        let run = runs(
+            &config,
+            &sources,
+            &host_with("web1", &[]),
+            Some(&user_facts("nopasswd")),
+        )
+        .unwrap();
+        assert_eq!(
+            run.iter().map(PlannedRun::binary).collect::<Vec<_>>(),
+            [false, true]
+        );
+        let expanded = legacy(&config);
+        let captured = |bytes: &[u8]| Captured::File {
+            mode: "0644".to_owned(),
+            uid: 0,
+            gid: 0,
+            size: bytes.len() as u64,
+            sha256: hex(&Sha256::digest(bytes)),
+            bytes: Some(Zeroizing::new(bytes.to_vec())),
+            reason: None,
+        };
+        let previous = || captured(b"old\n");
+        let records: Vec<_> = (run.iter().map(written))
+            .map(|write| write.record(&expanded, &sources, previous(), Write::Written, false))
+            .collect();
+        assert!(!records[0].binary);
+        assert_eq!(records[0].not_kept(), None, "a text write keeps the text");
+        assert!(records[1].binary);
+        let Previous::File(p) = &records[1].previous else {
+            panic!("{:?}", records[1].previous);
+        };
+        assert!(!p.kept && p.text.is_none());
+        assert_eq!(p.sha256, hex(&Sha256::digest(b"old\n")));
+        assert_eq!(records[1].not_kept(), Some(BINARY));
+        assert_eq!(records[1].written_sha256, hex(&Sha256::digest(b"a\0b")));
+
+        // A binary previous before a text write keeps its hash only too.
+        let Previous::File(p) = previous_of(captured(&[0xff, 0xfe]), false) else {
+            panic!("a file");
+        };
+        assert_eq!((p.kept, p.reason.as_deref()), (false, Some(BINARY)));
     }
 
     #[test]
@@ -7858,7 +8735,7 @@ mod tests {
                 };
                 super::install_script(temp.to_str().unwrap(), 4, &step, &Expected::Unchecked)
             }
-            _ => super::tee_script(&heredoc, &step, &Expected::Unchecked),
+            _ => super::tee_script(Bytes::Inline(&heredoc), &step, &Expected::Unchecked),
         }
         .unwrap()
         .to_string()

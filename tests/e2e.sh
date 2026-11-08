@@ -795,6 +795,60 @@ else
   fail "rollback over a 0600 previous: exit $code"
 fi
 
+step "(o) a binary file of every byte 0..255 on arch lands byte for byte; the record keeps only hashes and rollback cannot undo it"
+BIN_STATE="$TMP/state-bin"
+BIN_RECORD="$BIN_STATE/anvil/last-apply.json"
+BIN_DIR="$TMP/binary"
+mkdir -p "$BIN_DIR"
+i=0
+while [ "$i" -lt 256 ]; do
+  # shellcheck disable=SC2059 # the format is the escape of byte $i
+  printf "\\$(printf '%03o' "$i")"
+  i=$((i + 1))
+done >"$BIN_DIR/every.bin"
+cat >"$BIN_DIR/config.toml" <<CONF
+[[files]]
+src = "every.bin"
+dest = "/etc/anvil-e2e-bin"
+mode = "0644"
+CONF
+bin_anvil() {
+  run_env XDG_STATE_HOME="$BIN_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$BIN_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+bin_sha=$( (sha256sum "$BIN_DIR/every.bin" 2>/dev/null || shasum -a 256 "$BIN_DIR/every.bin") | cut -d' ' -f1)
+docker exec "$NAME" sh -c "printf 'previous text\n' >/etc/anvil-e2e-bin && chmod 644 /etc/anvil-e2e-bin"
+bin_anvil plan --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  would $ file /etc/anvil-e2e-bin (binary)' "$TMP/out"; then
+  pass "plan marks the binary src"
+else
+  fail "plan of a binary src: exit $code"
+fi
+bin_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && [ "$(wc -c <"$BIN_DIR/every.bin" | tr -d ' ')" -eq 256 ] \
+  && grep -qxF '  wrote /etc/anvil-e2e-bin' "$TMP/out" \
+  && docker exec "$NAME" cat /etc/anvil-e2e-bin | cmp -s - "$BIN_DIR/every.bin" \
+  && [ "$(docker exec "$NAME" sha256sum /etc/anvil-e2e-bin | cut -d' ' -f1)" = "$bin_sha" ] \
+  && grep -qF '"version":2' "$BIN_RECORD" && grep -qF '"binary":true' "$BIN_RECORD" \
+  && grep -qF "\"written_sha256\":\"$bin_sha\"" "$BIN_RECORD" \
+  && grep -qF '"reason":"binary"' "$BIN_RECORD" && ! grep -qF 'previous text' "$BIN_RECORD"; then
+  pass "the 256-byte file landed byte for byte, record version 2 with binary and hashes only"
+else
+  fail "apply of a binary file: exit $code"
+fi
+bin_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  $ cannot undo: /etc/anvil-e2e-bin (binary)' "$TMP/out" \
+  && grep -qxF '  /etc/anvil-e2e-bin on arch (binary)' "$TMP/out" \
+  && docker exec "$NAME" cat /etc/anvil-e2e-bin | cmp -s - "$BIN_DIR/every.bin"; then
+  pass "rollback says it cannot undo the binary file and leaves it, exit 0"
+else
+  fail "rollback of a binary file: exit $code"
+fi
+docker exec "$NAME" rm -f /etc/anvil-e2e-bin
+
 step "(o) rollback on arch puts back an owner and group fixed in place and removes the directories parents created"
 AR_STATE="$TMP/state-attrs"
 AR_RECORD="$AR_STATE/anvil/last-apply.json"
@@ -957,6 +1011,138 @@ else
   docker exec "$NAME" readlink /etc/anvil-e2e-dl-link | od -c
 fi
 docker exec "$NAME" rm -f /etc/anvil-e2e-dl-link
+
+step "(w) [[absent]] on arch (NOPASSWD): a file, a link and an empty dir removed; rollback recreates them with their owner, group and mode"
+AB_STATE="$TMP/state-absent"
+AB_RECORD="$AB_STATE/anvil/last-apply.json"
+AB_DIR="$TMP/absent"
+mkdir -p "$AB_DIR"
+cat >"$AB_DIR/config.toml" <<CONF
+[[absent]]
+path = "/etc/anvil-e2e-ab-file"
+
+[[absent]]
+path = "/etc/anvil-e2e-ab-link"
+type = "link"
+
+[[absent]]
+path = "/etc/anvil-e2e-ab-dir"
+type = "dir"
+CONF
+ab_anvil() {
+  run_env XDG_STATE_HOME="$AB_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$AB_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+# Owned root:key, so the rollback must give the group back as root.
+docker exec "$NAME" sh -c 'rm -rf /etc/anvil-e2e-ab-file /etc/anvil-e2e-ab-link /etc/anvil-e2e-ab-dir \
+  && printf "absent file\n" >/etc/anvil-e2e-ab-file && chown root:key /etc/anvil-e2e-ab-file \
+  && chmod 604 /etc/anvil-e2e-ab-file && ln -s /etc/hostname /etc/anvil-e2e-ab-link \
+  && mkdir /etc/anvil-e2e-ab-dir && chown root:key /etc/anvil-e2e-ab-dir && chmod 750 /etc/anvil-e2e-ab-dir'
+ab_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  removed /etc/anvil-e2e-ab-file' "$TMP/out" \
+  && grep -qxF '  removed /etc/anvil-e2e-ab-link' "$TMP/out" \
+  && grep -qxF '  removed /etc/anvil-e2e-ab-dir' "$TMP/out" \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-ab-file \
+  && ! docker exec "$NAME" test -L /etc/anvil-e2e-ab-link \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-ab-dir \
+  && docker exec "$NAME" test -f /etc/hostname \
+  && grep -qF '"absent":[' "$AB_RECORD"; then
+  pass "apply removed the file, the link (its target kept) and the empty dir, and recorded them"
+else
+  fail "apply of absent: exit $code"
+fi
+ab_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  restored directory /etc/anvil-e2e-ab-dir' "$TMP/out" \
+  && grep -qxF '  restored link /etc/anvil-e2e-ab-link -> /etc/hostname' "$TMP/out" \
+  && grep -qxF '  restored /etc/anvil-e2e-ab-file' "$TMP/out" \
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-ab-file)" = 'absent file' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G %F' /etc/anvil-e2e-ab-file)" = '604 root:key regular file' ] \
+  && [ "$(docker exec "$NAME" readlink /etc/anvil-e2e-ab-link)" = /etc/hostname ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G %F' /etc/anvil-e2e-ab-dir)" = '750 root:key directory' ] \
+  && [ -z "$(docker exec "$NAME" sh -c 'ls -A /etc | grep "^\.anvil-"')" ]; then
+  pass "rollback recreated the dir, the link and the file with its bytes, owner, group and mode"
+else
+  fail "rollback of absent: exit $code"
+fi
+ab_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-ab-file' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-ab-link' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-ab-dir' "$TMP/out"; then
+  pass "a second rollback leaves the recreated paths alone"
+else
+  fail "second rollback of absent: exit $code"
+fi
+docker exec "$NAME" rm -rf /etc/anvil-e2e-ab-file /etc/anvil-e2e-ab-link /etc/anvil-e2e-ab-dir
+
+step "(x) a recursive [[files]] tree on arch (NOPASSWD): owner, group, mode and dir_mode on a nested tree into an existing dir; rollback removes what it created"
+TR_STATE="$TMP/state-tree"
+TR_DIR="$TMP/tree"
+TR_DEST=/etc/anvil-e2e-tree
+mkdir -p "$TR_DIR/conf/sub/deep"
+printf 'a = 1\n' >"$TR_DIR/conf/a.conf"
+printf 'b = 2\n' >"$TR_DIR/conf/sub/b.conf"
+printf 'c = 3\n' >"$TR_DIR/conf/sub/deep/c.conf"
+printf '\000\001\377' >"$TR_DIR/conf/blob.bin"
+cat >"$TR_DIR/config.toml" <<CONF
+[[files]]
+src = "conf"
+dest = "$TR_DEST"
+recursive = true
+mode = "0640"
+dir_mode = "0750"
+owner = "pw"
+group = "key"
+CONF
+tr_anvil() {
+  run_env XDG_STATE_HOME="$TR_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$TR_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+# The dest exists, 0755 root:root, with a file the tree does not hold.
+docker exec "$NAME" sh -c "rm -rf $TR_DEST && mkdir $TR_DEST && chmod 755 $TR_DEST && printf 'mine\n' >$TR_DEST/extra"
+tr_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF "  unchanged $TR_DEST" "$TMP/out" \
+  && grep -qxF "  created $TR_DEST/sub/deep" "$TMP/out" \
+  && grep -qxF "  wrote $TR_DEST/sub/deep/c.conf" "$TMP/out" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST")" = '755 root:root' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST/sub")" = '750 root:key' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST/sub/deep")" = '750 root:key' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST/a.conf")" = '640 pw:key' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST/sub/deep/c.conf")" = '640 pw:key' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST/blob.bin")" = '640 pw:key' ] \
+  && docker exec "$NAME" cat "$TR_DEST/blob.bin" | cmp -s - "$TR_DIR/conf/blob.bin" \
+  && [ "$(docker exec "$NAME" cat "$TR_DEST/extra")" = mine ]; then
+  pass "apply copied the nested tree, files pw:key 0640, created dirs root:key 0750, the existing dest and its extra file kept"
+else
+  fail "apply of a tree: exit $code"
+fi
+tr_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF "  removed $TR_DEST/a.conf" "$TMP/out" \
+  && grep -qxF "  removed $TR_DEST/sub/deep/c.conf" "$TMP/out" \
+  && grep -qxF "  \$ cannot undo: $TR_DEST/blob.bin (binary)" "$TMP/out" \
+  && [ "$(grep -F "removed directory $TR_DEST" "$TMP/out")" = "$(printf '%s\n' \
+    "  removed directory $TR_DEST/sub/deep" "  removed directory $TR_DEST/sub")" ] \
+  && [ "$(docker exec "$NAME" ls -A "$TR_DEST" | tr '\n' ' ')" = 'blob.bin extra ' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST")" = '755 root:root' ] \
+  && [ "$(docker exec "$NAME" cat "$TR_DEST/extra")" = mine ]; then
+  pass "rollback removed the tree's files and created dirs deepest first, left the binary item, the extra file and the existing dest"
+else
+  fail "rollback of a tree: exit $code"
+fi
+tr_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && ! grep -qF 'removed' "$TMP/out" \
+  && [ "$(docker exec "$NAME" ls -A "$TR_DEST" | tr '\n' ' ')" = 'blob.bin extra ' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST")" = '755 root:root' ]; then
+  pass "a second rollback of the tree is unchanged"
+else
+  fail "second rollback of a tree: exit $code"
+fi
+docker exec "$NAME" rm -rf "$TR_DEST"
 
 step "(u) a timed-out plain run dies on arch, without timeout(1) there; a step reading stdin ends at once"
 U_DIR="$TMP/remote-kill"

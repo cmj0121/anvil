@@ -1586,6 +1586,8 @@ mod tests {
             rollback: true,
             template: false,
             notify: Vec::new(),
+            recursive: false,
+            dir_mode: None,
         };
         let config = Config {
             packages: Some(Packages {
@@ -1666,6 +1668,8 @@ mod tests {
                 rollback: true,
                 template: false,
                 notify: Vec::new(),
+                recursive: false,
+                dir_mode: None,
             }],
             services: vec![service("sshd", "local"), service("cron", "web")],
             steps: vec![Step::script("hostname")],
@@ -2581,6 +2585,7 @@ mod tests {
         ));
         let plan = plan_block(&PlanReport::Planned {
             target: "local".to_owned(),
+            trees: Vec::new(),
             vars: Default::default(),
             env: Default::default(),
             steps: vec![PlannedRun {
@@ -2640,6 +2645,8 @@ mod tests {
                         ids: None,
                         mark: WalkNonce::generate().unwrap(),
                         parents: false,
+                        binary: false,
+                        item: None,
                     }),
                 },
             },
@@ -2653,6 +2660,7 @@ mod tests {
         };
         let plan = plan_block(&PlanReport::Planned {
             target: "local".to_owned(),
+            trees: Vec::new(),
             vars: Default::default(),
             env: Default::default(),
             steps: vec![file(Some(rendered)), file(None)],
@@ -2746,6 +2754,7 @@ mod tests {
             RunResult::Plan {
                 targets: done(vec![PlanReport::Planned {
                     target: "local".to_owned(),
+                    trees: Vec::new(),
                     vars: Default::default(),
                     env: Default::default(),
                     steps: vec![PlannedRun {
@@ -2785,6 +2794,7 @@ mod tests {
                 targets: done(vec![
                     PlanReport::Planned {
                         target: "local".to_owned(),
+                        trees: Vec::new(),
                         vars: Default::default(),
                         env: Default::default(),
                         steps: vec![

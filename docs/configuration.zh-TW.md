@@ -62,11 +62,14 @@ mode = "0644"              # required, quoted
 tags = ["linode"]          # optional; the target must carry every tag
 facts = { distro = "arch" } # optional; pkg matches by list membership
 
-[[links]]                  # optional; after [[files]], before [[services]]; see Links
+[[links]]                  # optional; after [[files]], before [[absent]]; see Links
 path = "/usr/local/bin/app" # the symlink
 target = "/opt/app/bin/app" # what it points at; need not exist
 
-[[services]]               # optional; after links, before [[steps]]; see Services
+[[absent]]                 # optional; after [[links]], before [[services]]; see Absent
+path = "/etc/nginx/sites-enabled/default" # the file, symlink or empty directory to remove
+
+[[services]]               # optional; after absent, before [[steps]]; see Services
 name = "sshd"              # the unit, OpenRC service or launchd label
 state = "started"          # required: started | stopped
 enabled = true             # optional; omit to leave enablement alone
@@ -333,6 +336,10 @@ path = "/usr/local/bin/app" # required: absolute path on the target, the dest ru
 target = "/opt/app/bin/app" # required: absolute or relative, at most 4096 bytes; need not exist
 force = false              # optional; default false. true replaces a regular file at path
 
+[[absent]]                 # optional; one file, symlink or empty directory removed per matching target; see Absent
+path = "/etc/nginx/sites-enabled/default" # required: absolute path on the target, the dest rules
+type = "link"              # optional: file | dir | link; also tags, facts, sudo, notify as on [[files]]
+
 [[services]]               # optional; one service brought to a state per matching target; see Services
 name = "sshd"              # required: [A-Za-z0-9:_@.-]+, at most 255 bytes
 state = "started"          # required: "started" | "stopped" ("restarted" | "reloaded" only in a handler)
@@ -403,7 +410,7 @@ symlink 視為存在，即使是懸空的。一個 step 可設定多個 guard；
 plugin step 的訊息改以 `skipped plugin NAME:` 開頭（`skipped plugin harden: /etc/x exists`）。
 被略過的 step 不會讓 target 失敗，下一個 step 照常執行；其輸出見 [Guarded steps](cli.zh-TW.md#guarded-steps)。
 
-guard 可寫在 `[[steps]]` 項目以及 `run` 與 `plugin` [task](#tasks) 上。`[[dirs]]`、`[[files]]`、`[[links]]`、`[[services]]` 與 `[packages]`
+guard 可寫在 `[[steps]]` 項目以及 `run` 與 `plugin` [task](#tasks) 上。`[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]`、`[[services]]` 與 `[packages]`
 沒有這些鍵，會以解析器的 `unknown field` 訊息拒絕；其他 task 上的 guard 也以 2 結束（[Tasks](#tasks)）。
 這些種類本身已會收斂，或沒有單一指令可守衛。
 
@@ -426,8 +433,8 @@ guard 隨 step 自己的腳本送出，因此有 guard 的 step 仍只需一次�
 每個名稱都必須是某個 `[[handlers]]` 項目的名稱，否則以 2 結束並顯示
 ``steps[0].notify[0] `reload ssh`: names no [[handlers]] entry``。
 
-上述區段依固定順序執行：套件、目錄、檔案、連結、服務、step，最後是 handler。要自行決定順序，請改用 [`[[tasks]]`](#tasks)，
-取代 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[services]]`、`[[steps]]` 與 `[packages]` 中的清單。
+上述區段依固定順序執行：套件、目錄、檔案、連結、absent、服務、step，最後是 handler。要自行決定順序，請改用 [`[[tasks]]`](#tasks)，
+取代 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]`、`[[services]]`、`[[steps]]` 與 `[packages]` 中的清單。
 
 沒有 `[secrets]` 時，backend（後端）在 macOS 上是 keychain（其他平台不支援）。
 只有被選中的 backend 的區段是必要的且會被檢查：缺少該區段、未知的 backend，或在非 macOS 上使用 `keychain`，
@@ -470,7 +477,7 @@ names = ["HOST_SUDO"]
 
 ## Files
 
-`[[files]]` 項目把一份文字檔複製到每個 tag 與 fact 全部符合的選定 target。沒有 `tags` 也沒有 `facts` 時代表每個選定的 target。
+`[[files]]` 項目把一份檔案（文字或二進位）複製到每個 tag 與 fact 全部符合的選定 target。沒有 `tags` 也沒有 `facts` 時代表每個選定的 target。
 符合的項目依 config 順序執行，排在套件 step 與 [`[[dirs]]`](#dirs) step 之後、[`[[links]]`](#links) step 之前（`file` [task](#tasks) 則在它所在的位置執行）；
 不符合的項目仍是一個 step，回報為略過，該 target 的其他 step 仍會執行（[File steps](cli.zh-TW.md#file-steps)）。
 最多 64 個項目：多一個就以 2 結束並顯示 `files: N entries exceeds the 64 entry limit`（65 個時為 `files: 65 entries exceeds the 64 entry limit`）。
@@ -491,6 +498,8 @@ sudo = false                     # optional; default true. false: write as the c
 rollback = false                 # optional; default true. false: the apply record keeps the hash only
 template = true                  # optional; default false. true: render src per target (see Templating)
 notify = ["reload sshd"]         # optional; the [[handlers]] to run when the step writes (see Handlers)
+recursive = true                 # optional; default false. true: src is a directory, copied as a tree (see Recursive copy)
+dir_mode = "0755"                # required with recursive = true, else refused: the mode of each directory it creates
 ```
 
 **`mode`。** 必填，且必須是加引號的字串。三或四位八進位數字，最大為 `0777` 加上 sticky bit，
@@ -534,18 +543,42 @@ src 不屬於你或群組與其他人可寫入，或從工作區根目錄到它�
 所有已存在的元件（包含儲存區根目錄）都不可是 symlink；無效路徑與 symlink 以 2 結束：
 ``files[0].src `$/../x`: invalid store path`` 與 ``files[0].src `$/link`: is a symlink``。
 根目錄會被拒絕：``files[0].src `$/`: must name a file in the store``。
-來源仍須是一般文字檔，且至多 1 MiB。
+來源仍須是一般檔案，且至多 1 MiB。
 
-只接受文字，且至多 1 MiB（1048576 位元組；剛好這個大小可以通過），兩者都是目前的限制。
+至多 1 MiB（1048576 位元組；剛好這個大小可以通過），文字或二進位皆可（見下文）。
 以 2 結束，而且第一個這樣的 src 就會讓 `apply` 與 `plan` 對每個 target 停止，在連線任何 target 之前：
 
 - ``files[0].src `big`: exceeds the 1 MiB limit``
-- ``files[0].src `notes`: is not UTF-8 text; [[files]] copies text files only for now``
-- ``files[0].src `notes`: contains a NUL byte; [[files]] copies text files only for now``
+- ``files[0].src `logo.png`: is binary; template = true needs a text file``
 
-檔案中與 heredoc 分隔字串（`ANVIL_EOF_` 加上檔案 sha256 的前 32 位十六進位數字）相同的行，不屬於這項事前檢查。
+文字檔中與 heredoc 分隔字串（`ANVIL_EOF_` 加上檔案 sha256 的前 32 位十六進位數字）相同的行，不屬於這項事前檢查。
 它會讓該 target 失敗（其他 target 仍會執行），並顯示
 `files[0].src: has a line equal to the heredoc delimiter ANVIL_EOF_HEX`，HEX 即那 32 位數字。
+
+**二進位檔案。** 不是 UTF-8、或含 NUL 位元組的 src 就是二進位檔案。anvil 自行判斷，不需要設定任何鍵，
+並像文字檔一樣逐位元組複製它：
+
+```toml
+[[files]]
+src = "files/logo.png"
+dest = "/srv/www/logo.png"
+mode = "0644"
+```
+
+- **傳輸方式。** 文字檔仍以 heredoc 傳到 target，位元組不變。二進位檔案以 `printf` 八進位跳脫序列傳送：
+  只有 `[A-Za-z0-9._/]` 保持原樣，其他每個位元組都變成 `\ooo`，因此傳輸量最多約為檔案大小的四倍，大多為 ASCII 的檔案則少得多。
+  step 的 30 秒時間限制依傳送量每 MiB 增加 15 秒，因此 1 MiB 的二進位檔案（傳輸量最多約 4 MiB）最多多一分鐘。1 MiB 的限制不變。
+- **`printf` 必須是內建指令。** target 的 `sh` 必須以內建指令執行 `printf`，檔案的任何位元組才不會出現在行程的指令列上。
+  dash 與 bash 都是；不是內建指令的 shell（BSD pdksh、部分 mksh）上，step 會在寫入任何東西之前拒絕，以 4 結束：
+  `files: printf is not a shell builtin; cannot copy a binary file`。
+- **其餘相同。** 與 dest 的比較、原子性的 rename、`owner`、`group`、`mode`、`parents`、`sudo` 與密碼路徑都與文字檔相同。
+  `template = true` 需要文字 src：二進位 src 如上所述以 2 結束。
+- **沒有 rollback。** [apply 紀錄](cli.zh-TW.md#apply-紀錄)只保存寫入的位元組與 dest 原內容的 sha256，絕不保存位元組，
+  並把該次寫入標記為 `binary`。[`anvil rollback`](cli.zh-TW.md#anvil-rollback) 顯示 `cannot undo: DEST (binary)` 並保留 dest 原狀，
+  dest 原本不存在、或只改了擁有者、群組或 mode 時也一樣：這是已知的限制。`anvil plan` 會以 `(binary)` 標記該 step
+  （[`anvil plan`](cli.zh-TW.md#anvil-plan)）。
+- **非 UTF-8 的文字也是二進位。** 舊版 anvil 拒絕的 latin-1 或其他非 UTF-8 檔案，現在會以二進位複製，因此沒有 rollback。
+  執行 `anvil plan` 找出 `(binary)`；要保留 rollback，請把這類檔案轉成 UTF-8。
 
 **`tags` 與 `facts`。** 列出的每個 tag 都必須在 target 上，列出的每個 fact 都必須符合。
 tag 採用 inventory 的規則，``files[0].tags[1] `bad tag`: must match [A-Za-z0-9_-]+``；`local` 是允許的。
@@ -776,7 +809,7 @@ file task 的寫法相同：
 `{{ vars.port | default(80) }}` 防護。
 
 **限制。** 一次算繪最多 1,000,000 個引擎步驟（`fuel exhausted`），輸出必須是 UTF-8、不含 NUL 位元組、最多 1 MiB
-（`rendered output exceeds the 1 MiB limit`、`rendered output contains a NUL byte`）。src 本身仍受上述檢查。
+（`rendered output exceeds the 1 MiB limit`、`rendered output contains a NUL byte`）。src 本身仍受上述檢查，且必須是文字（[Files](#files)）。
 
 **失敗時。** 語法錯誤在 `apply` 或 `plan` 讀取 src 時發現，與其他 src 拒絕一樣在任何 target 之前以 2 結束。上面的 `nginx.conf.j2` 少了 `{% endif %}` 那一行時會得到：
 
@@ -804,6 +837,96 @@ drift 檢查，全都使用該 target 的算繪文字。因此 var 改變後，�
 
 **已知限制。** 字串串接（`~`）與大量重複（`*`）可能在 1 MiB 上限生效之前就在控制端用掉大量記憶體
 （MiniJinja 把單次重複限制在 100 MB）。範本與 config 一樣被信任：能編輯它的人本來就能在 target 上執行任何 step。
+
+### Recursive copy
+
+`[[files]]` 項目或 task `file` 上的 `recursive = true` 會把一個目錄連同其下的一切複製到 `dest`：
+先是 dest 目錄本身，再是其下的每個目錄與檔案，每個項目一個 step。它需要 `dir_mode`：
+
+```toml
+[[files]]
+src = "$/nginx"                  # a directory in the store or the workspace
+dest = "/etc/nginx"
+mode = "0644"                    # each file's mode
+recursive = true
+dir_mode = "0755"                # each directory it creates
+```
+
+file task 使用相同的鍵：
+`file = { src = "$/nginx", dest = "/etc/nginx", mode = "0644", recursive = true, dir_mode = "0755" }`。
+
+**鍵。** `dir_mode` 遵循 `mode` 的規則（加引號、3 或 4 位八進位數字、不可有 setuid 或 setgid），
+另外拒絕群組與其他人的寫入權限，因為[目錄規則](#files)會拒絕在這樣的目錄之下寫入。以 2 結束並指出該項目（task 則為 `tasks[0].file.dir_mode: …`）：
+
+- `files[0].dir_mode: required with recursive = true`
+- `files[0].dir_mode: only with recursive = true`
+- `files[0].template: not with recursive = true`
+- ``files[0].dir_mode `0775`: group or world write is refused``（`0757` 也是）
+- ``files[0].dir_mode `4755`: setuid and setgid are refused``
+
+其他鍵套用到每個項目：
+
+- **`mode`** 是每個檔案的 mode，`dir_mode` 則是每個建立的目錄的 mode。
+- **`owner`** 只套用到檔案。建立的目錄取得 `group` 與 `dir_mode`，但擁有者維持寫入身分：以 root 寫入時為 root，`sudo = false` 時為登入使用者。
+  這樣其下的檔案才寫得進去：[目錄規則](#files)拒絕在屬於其他任何人的目錄之下寫入，
+  因此給了其他擁有者的目錄會擋住通往其中每個檔案的路徑檢查。
+- **`parents = true`** 只建立 dest 之上不存在的目錄，與單一檔案相同。樹內的目錄是它自己的項目。
+- **`sudo`、`rollback`、`tags`、`facts` 與 `notify`** 與單一檔案相同，作用於每個項目。
+
+**src 可以含有什麼。** src 指向工作區中的目錄（`conf`、`conf/`）或儲存區中的目錄（`$/conf`）。
+這棵樹在連線任何 target 之前讀取一次，任何拒絕都與單一 src 一樣，對每個 target 以 2 結束並指出該項目：
+
+- src 是工作區本身：``files[0].src `.`: must name a directory below the workspace``；儲存區根目錄：
+  ``files[0].src `$/`: must name a folder below the store``；
+- src 是 symlink：``files[0].src `link`: is a symlink; recursive = true needs the real directory``
+  （儲存區中為 ``files[0].src `$/link`: is a symlink``）；不是目錄：
+  ``files[0].src `motd`: is not a directory; recursive = true needs one``（儲存區中為 `is not a folder`）；
+- 其下任何位置的 symlink：``files[0].src `conf`: sub/link: is a symlink; a recursive copy refuses symlinks``；
+- FIFO、socket 或裝置：``files[0].src `conf`: sub/fifo: is not a regular file or directory; a recursive copy refuses it``；
+- 不是 UTF-8 的名稱（`sub/…: its name is not UTF-8`）、含控制字元的名稱（`sub/a\x07: its name holds a control character`）、
+  超過 255 位元組的名稱（`PATH: its name exceeds the 255 byte limit`），或不符合 [`dest`](#files) 規則的 `DEST/rel`
+  （``sub/a b: dest `/etc/app/sub/a b`: must match [A-Za-z0-9._/@+-]``）；
+- 巢狀超過 64 層資料夾的樹：`PATH: nested deeper than 64 folders`（儲存區中為 `$/conf/PATH nested deeper than 64 folders`）；
+- 每個檔案與資料夾都依單一 src 的規則：屬於你、其群組與其他人不能寫入（`sub: mode 775 lets others write to it; …`），
+  每個檔案至多 1 MiB（`sub/big: exceeds the 1 MiB limit`，儲存區中為 `$/conf/sub/big exceeds the 1 MiB limit`），
+  文字或[二進位](#files)皆可；
+- 以及下列上限。
+
+PATH 是該項目在 src 之下的路徑。工作區的走訪在每一層都不跟隨 symlink 地開啟，並透過開啟的描述子讀取每個檔案，
+因此走訪期間被換成 symlink 的也會被拒絕。
+
+| 上限                                    | 以 2 結束並顯示                                                 |
+| --------------------------------------- | --------------------------------------------------------------- |
+| 一棵樹 1024 個檔案                      | `PATH: the tree holds more than 1024 files, its limit`          |
+| 一棵樹的檔案共 16 MiB                   | `PATH: the tree holds more than 16 MiB, its limit`              |
+| 所有樹共 4096 個項目，含每個目錄與 dest | `PATH: the trees hold more than 4096 items in all, their limit` |
+| 所有樹的檔案共 64 MiB                   | `PATH: the trees hold more than 64 MiB in all, their limit`     |
+
+儲存區的樹在讀取任何檔案之前，就依它的清單檢查這些上限。一棵樹在 64 個 `[[files]]` 項目的上限中只算一個（tasks config 的 64 個 file task 也是）。
+
+**寫到 target 上的結果。** 每個項目都是自己的 step，依路徑排序，因此目錄排在它所含的東西之前：
+
+- **目錄**是 dir step，`$ dir PATH`，只建立不修改。不存在的以 `group` 與 `dir_mode` 建立並印出 `created PATH`。
+  已存在的保持原狀（包括擁有者、群組與 mode）並印出 `unchanged PATH`；要修正它請用 [`[[dirs]]`](#dirs) 項目。
+  路徑上若是 symlink、檔案或其他東西，step 會失敗，以 4 結束，並顯示 `dirs: PATH is not a directory`；絕不跟隨，其下也不寫入任何東西。
+- **檔案**是寫到 `DEST/rel` 的 file step，與單一檔案相同地寫入與比較，同樣印出 `wrote`、`fixed` 或 `unchanged`（[File steps](cli.zh-TW.md#file-steps)）。
+- **不移除任何東西。** dest 中不屬於這棵樹的檔案會保留；沒有清除（purge）。
+- **每棵樹一次檢查。** 第一個項目之前，一次執行在 target 上雜湊樹中的檔案、讀取它們的擁有者、群組與 mode，並查看哪些目錄存在，
+  全程不跟隨 symlink。已與樹相同的項目不執行任何東西並印出 `unchanged PATH`，因此未變的樹只花一次執行。
+  走 sudo 密碼路徑時沒有檢查執行，每個項目都執行自己的 step。
+- **`notify`** 在任何項目變更時觸發一次，沒有項目變更時不觸發。
+
+**紀錄與 rollback。** 每個變更的檔案項目與檔案一樣保存在 [apply 紀錄](cli.zh-TW.md#apply-紀錄)中，先前文字依相同規則保存；
+樹建立的每個目錄則記錄為 `previous` 為 null 的目錄；既有的目錄不記錄。`rollback = false` 套用到每個項目。
+項目在該批寫入之前分批儲存，每批最多 16 個或 1 MiB 的保存文字，建立的目錄則立即儲存，因此被終止的 apply 會把已寫入的每個項目留在紀錄中。
+[`anvil rollback`](cli.zh-TW.md#anvil-rollback) 會重新從 src 讀取這棵樹，只有在樹仍以相同種類、相同 `sudo` 持有某個項目時才復原它。
+文字檔很多的樹可能超過 16 MiB 的紀錄；[`anvil plan`](cli.zh-TW.md#anvil-plan) 會對此發出警告。
+
+[`config --harden`](#harden) 不評斷樹中的檔案：dest 本身是、或底下含有 sshd 或 sysctl 設定檔的樹會列為待檢查。
+
+**已知限制。** 樹從不刪除：沒有遞迴刪除，也沒有清除。樹中不允許 `template = true`，特殊檔案會被拒絕，hard link 會被複製為各自獨立的檔案。
+`anvil files cp` 只接受文字檔，因此儲存區樹中的二進位檔案必須以其他方式放進 `files/`。
+TUI 的 plan 檢視顯示樹的各個項目 step，但不顯示它的標頭行（[`anvil plan`](cli.zh-TW.md#anvil-plan)）。
 
 ## Dirs
 
@@ -872,7 +995,7 @@ sudo 無法執行的檢查為 `dirs: sudo could not check DIR; nothing was chang
 ## Links
 
 `[[links]]` 項目在每個 tag 與 fact 全部符合的選定 target 上，讓 `path` 成為指向 `target` 的 symlink。
-符合的項目依 config 順序執行，排在 `[[files]]` 之後、`[[services]]` 之前（`link` [task](#tasks) 則在它所在的位置執行）。
+符合的項目依 config 順序執行，排在 `[[files]]` 之後、`[[absent]]` 之前（`link` [task](#tasks) 則在它所在的位置執行）。
 不符合的項目仍是一個 step，回報為 `skipped link PATH: no match`（[Link steps](cli.zh-TW.md#link-steps)）。
 
 ```toml
@@ -942,11 +1065,77 @@ sudo 失敗時為 `links: sudo failed; PATH is unchanged`。`path` 之上的每�
 受限的 sudo 規則需要 `true`、`test`、`find`、`readlink`、`ln`、`mv` 與 `rm`，`parents` 另需 `mkdir`，
 移除所建立目錄的 rollback 另需 `rmdir`，讀取 `force` 取代的檔案另需 `ls` 與 `od`。
 
+## Absent
+
+`[[absent]]` 項目在每個 tag 與 fact 全部符合的選定 target 上，移除 `path` 上的檔案、symlink 或空目錄：
+過時的 vhost 連結、套件留下的 unit 檔、舊的設定檔。符合的項目依 config 順序執行，排在 `[[links]]` 之後、
+`[[services]]` 之前（`absent` [task](#tasks) 則在它所在的位置執行），因此 unit 檔會在服務啟動前移除。
+不符合的項目仍是一個 step，回報為 `skipped absent PATH: no match`，該 target 的其他 step 仍會執行。
+
+```toml
+[[absent]]
+path = "/etc/nginx/sites-enabled/default" # required: absolute path on the target, the dest rules of [[files]]
+type = "link"                    # optional: file | dir | link. Set: a path of another type fails the step
+tags = ["web"]                   # optional; every one must be on the target
+facts = { distro = "arch" }      # optional; a probe key, equal to that fact
+sudo = false                     # optional; default true. false: work as the connecting user
+notify = ["reload nginx"]        # optional; the [[handlers]] to run when the step removes it
+```
+
+`path`、`tags`、`facts`、`sudo` 與 `notify` 遵循 [Files](#files) 的規則與訊息，前綴為 `absent[I]`
+（``absent[0].path `etc/x`: must be an absolute path``、``absent[0].notify[0] `gone`: names no [[handlers]] entry``）。
+`type` 接受 `file`、`dir` 或 `link`；其他值與其他鍵（例如 `mode`、`recursive`）都以 2 結束並顯示解析器的訊息。
+最多 64 個項目，與其他區段分開計算：`absent: 65 entries exceeds the 64 entry limit`。
+
+**移除什麼。** step 檢視 `path` 時不跟隨它：
+
+- symlink，不論是否懸空：以連結的方式移除（`rm -f --`），從不碰它指向的東西。step 印出 `removed PATH`。
+- 一般檔案：以同樣方式移除，`removed PATH`。
+- 空目錄：以 `rmdir` 移除，`removed PATH`。絕不遞迴。
+- 什麼都沒有，或其上的某個目錄不存在：`unchanged PATH`。
+- 不是空的目錄：step 以 `absent: PATH is not empty` 失敗。
+- 與 `type` 不同類型的路徑：step 以 `absent: PATH is a dir, not file`（或 `link`、`file`）失敗。
+- 其他東西（FIFO、socket、裝置）：`absent: PATH is not a file, dir or link`。
+
+每次失敗都讓 `path` 保持原樣。目前 target 無法記入紀錄的連結也一樣：
+`absent: PATH points at a target anvil cannot record; anvil will not remove it`。其他失敗，各自指名 PATH：
+`absent: cannot read PATH's link`、`absent: cannot read PATH before removing it`、
+`absent: cannot read PATH's owner, group and mode` 與 `absent: cannot remove PATH`。
+
+**它不能抵銷其他項目。** absent 路徑若就是、位於其下或包含某個 `[[files]]` dest、`[[dirs]]` path 或 `[[links]]` path，
+不論兩邊的 tag 與 fact 為何，都會在任何 target 開始前以 2 結束，對應的 task 也一樣：
+``absent[0].path `/etc/app/f`: is files[0].dest `/etc/app/f`; an absent path cannot overlap it``（或 `sits under`、`holds`）。
+重複的斜線不算數，因此 `/srv//app/old` 位於 `/srv/app` 之下。
+
+**誰移除，以及其上的目錄。** 與 [`[[dirs]]`](#dirs) 相同，前綴為 `absent`：預設透過 sudo 以 root，`sudo = false` 時為連線使用者，
+sudo 失敗時為 `absent: sudo failed; PATH is unchanged`。`path` 之上的每個目錄都必須通過檔案 dest 的 root-only 規則
+（`absent: DIR is not root-only; root will not write under it`、
+`absent: DIR is not owned by root or the login user, or others can write it; anvil will not write under it`），
+因此位於 group 或其他人可寫的目錄（例如 `/tmp`）之下的路徑會被拒絕。從不建立任何目錄。這項檢查只保護其上的目錄：
+`path` 本身的擁有者仍可在讀取與移除之間置換它，此時紀錄保存的是讀到的內容。
+
+**`notify`。** step 印出 `removed PATH` 時要執行的 handler；`unchanged PATH` 不通知任何東西（[Handlers](#handlers)）。
+
+**紀錄與 rollback。** 移除 `path` 之前，step 會把原本的東西保存在 [apply 紀錄](cli.zh-TW.md#apply-紀錄)中：
+連結的 target；檔案以檔案先前文字的方式保存（其他人可讀、UTF-8 且最多 256 KiB 時保存文字，否則只保存 sha256），
+連同其擁有者、群組與 mode；目錄的擁有者、群組與 mode。被移除檔案的文字計入紀錄的 16 MiB。
+之後的 apply 發現 `path` 已不存在時，保留先前的紀錄。`anvil rollback` 依移除的相反順序，在 links、files 與 dirs 之前，
+只在 `path` 不存在時把每個被移除的路徑放回去：`restored PATH`、`restored link PATH -> TARGET` 或
+`restored directory PATH`；檔案與目錄會取回擁有者、群組與 mode。它從不建立 `path` 之上的目錄
+（`absent: DIR does not exist; PATH is not restored`）。路徑又是被移除時的那種東西時為 `unchanged PATH`；
+是其他種類時，即使加上 `--force` 也拒絕：
+`absent: PATH is a link now, not the file the apply removed; rollback will not replace it`。
+文字未保存的檔案為 `cannot undo: PATH (reason)`。rollback 只放回 config 的 `[[absent]]` 項目或 absent task 仍指名、
+且 `sudo` 相同的路徑。
+
+受限的 sudo 規則需要 `true`、`test`、`find`、`readlink`、`ls`、`od`、`sha256sum` 或 `shasum`、`rm` 與 `rmdir`，
+rollback 也會用到 `true`、`test`、`find`、`readlink`、`ls` 與 `rm`，另需 `ln`、`mkdir`、`sh`、`tee`、`mv`、`chmod` 與 `chown`。
+
 ## Services
 
 `[[services]]` 項目在每個 tag 與 fact 全部符合的選定 target 上，把一個服務帶到指定的狀態；設定了 `enabled` 時，也帶到該啟用狀態。
 它先詢問 target 的 init，只變更不同之處，因此服務已在該狀態時再次執行會印出 `unchanged service NAME`。
-符合的項目依 config 順序執行，排在 `[[links]]` step 之後、`[[steps]]` 之前（`service` [task](#tasks) 則在它所在的位置執行）；
+符合的項目依 config 順序執行，排在 `[[absent]]` step 之後、`[[steps]]` 之前（`service` [task](#tasks) 則在它所在的位置執行）；
 不符合的項目仍是一個 step，回報為 `skipped service NAME: no match`，該 target 的其他 step 仍會執行
 （[Service steps](cli.zh-TW.md#service-steps)）。
 
@@ -1050,7 +1239,7 @@ launchd 的變更是以替身工具測試的，而非實際的 launchd；只有 
 ## Tasks
 
 `[[tasks]]` 清單在每個 target 上由上而下，依你寫的順序執行。
-當設定需要舊版區段固定順序（套件、目錄、檔案、連結、服務、step）以外的順序時就用它：
+當設定需要舊版區段固定順序（套件、目錄、檔案、連結、absent、服務、step）以外的順序時就用它：
 在兩個檔案之間執行一個 step，或在檔案與讀取它的服務之間執行 migration。
 task 可以巢狀，也可以 include [檔案儲存區](cli.zh-TW.md#anvil-files)中的 task 檔。沒有 `[[tasks]]` 的 config 行為完全不變。
 
@@ -1096,7 +1285,7 @@ facts = { os = "Linux" }           # ANDed with the parent's tags
 
 **種類。** 每個 task 恰有下列其中一種，另可設定 `name`、`tags` 與 `facts`。未知的鍵以 2 結束並顯示解析器的訊息。
 兩種以上以 2 結束並顯示 `tasks[0]: has run and include; keep one`，都沒有時為
-`tasks[0]: needs one of run, plugin, packages, file, service, dir, link, include, tasks`。
+`tasks[0]: needs one of run, plugin, packages, file, service, dir, link, absent, include, tasks`。
 
 | 種類       | 作用                                                                             |
 | ---------- | -------------------------------------------------------------------------------- |
@@ -1107,29 +1296,31 @@ facts = { os = "Linux" }           # ANDed with the parent's tags
 | `service`  | `name`、`state` 與 `enabled`，與 [`[[services]]`](#services) 相同                |
 | `dir`      | [`[[dirs]]`](#dirs) 的鍵，但 `tags`、`facts` 與 `notify` 寫在 task 上            |
 | `link`     | [`[[links]]`](#links) 的鍵，但 `tags`、`facts` 與 `notify` 寫在 task 上          |
+| `absent`   | [`[[absent]]`](#absent) 的鍵，但 `tags`、`facts` 與 `notify` 寫在 task 上        |
 | `include`  | `$/…` task 檔，就地展開                                                          |
 | `tasks`    | 子 task，寫成 `[[tasks.tasks]]` 或 inline array                                  |
 
-`tags` 與 `facts` 寫在 task 上，不寫在 `file`、`service`、`dir` 或 `link` 裡：否則以 2 結束並顯示
-`tasks[0].file: tags and facts belong on the task, not the file`（`… not the dir`、`… not the link`）。
+`tags` 與 `facts` 寫在 task 上，不寫在 `file`、`service`、`dir`、`link` 或 `absent` 裡：否則以 2 結束並顯示
+`tasks[0].file: tags and facts belong on the task, not the file`（`… not the dir`、`… not the link`、`… not the absent entry`）。
 selector 不符合的 task 仍是一個 step，回報為略過（`skipped run: no match`、`skipped packages: no match`），
 該 target 的其他 step 仍會執行。失敗的 task 會結束該 target；其他 target 繼續。
 沒有要做任何事的 `packages` task、空的 `tasks` 與沒有 task 的 include 都不產生 step。
-每個 file、dir、link 與 service task 都是自己的 step，可以重複：[`[[services]]` 的重複規則](#services)不適用，
+每個 file、dir、link、absent 與 service task 都是自己的 step，可以重複：[`[[services]]` 的重複規則](#services)不適用，
 因為停止、migration、啟動就是這樣寫的。含 `[[tasks]]` 的 config 沒有預設的 `hostname` step。
 
 **Guard。** `run` 或 `plugin` task 也可設定 [guard](#config) `creates`、`removes`、`onlyif` 與 `unless`，
-規則與 `[[steps]]` 相同。在 `packages`、`file`、`service`、`dir`、`link`、`include` 或 `tasks` task 上，guard 在任何深度都以 2 結束，
+規則與 `[[steps]]` 相同。在 `packages`、`file`、`service`、`dir`、`link`、`absent`、`include` 或 `tasks` task 上，guard 在任何深度都以 2 結束，
 並依上述順序指名第一個設定的 guard：`tasks[0].creates: only on a run or plugin task`、
 `tasks[0].tasks[0].onlyif: only on a run or plugin task`。
 
-**`notify`。** `run`、`plugin`、`file`、`service`、`dir` 或 `link` task 可以設定 [`notify`](#handlers)，寫在 task 上，
-而不是 `file`、`service`、`dir` 或 `link` 裡面。
+**`notify`。** `run`、`plugin`、`file`、`service`、`dir`、`link` 或 `absent` task 可以設定 [`notify`](#handlers)，寫在 task 上，
+而不是 `file`、`service`、`dir`、`link` 或 `absent` 裡面。
 以 2 結束：`tasks[0].notify: not on a packages task; packages give no change signal`、
-`tasks[0].notify: only on a run, plugin, file, service, dir or link task`（`include` 或 `tasks` 群組）、
+`tasks[0].notify: only on a run, plugin, file, service, dir, link or absent task`（`include` 或 `tasks` 群組）、
 `tasks[0].file: notify belongs on the task, not the file`、
 `tasks[0].service: notify belongs on the task, not the service`、
-`tasks[0].dir: notify belongs on the task, not the dir` 與 `tasks[0].link: notify belongs on the task, not the link`。
+`tasks[0].dir: notify belongs on the task, not the dir`、`tasks[0].link: notify belongs on the task, not the link` 與
+`tasks[0].absent: notify belongs on the task, not the absent entry`。
 `[[handlers]]` 留在主檔案中：含有它的 include 以 2 結束並顯示解析器的訊息。
 
 **巢狀。** 子 task 繼承 `tags` 與 `facts`，每一層都必須符合：target 必須帶有鏈上的每個 tag，fact 以 AND 結合。
@@ -1165,9 +1356,10 @@ include 受儲存區的限制（不含 NUL 的一般 UTF-8 文字檔，最多 1 
 | 64 個 service task                       | `PATH: more than 64 service tasks after expansion`    |
 | 64 個 dir task                           | `PATH: more than 64 dir tasks after expansion`        |
 | 64 個 link task                          | `PATH: more than 64 link tasks after expansion`       |
+| 64 個 absent task                        | `PATH: more than 64 absent tasks after expansion`     |
 | 走訪 4096 個 task，群組與 include 也計入 | `PATH: more than 4096 tasks visited during expansion` |
 
-**混用。** `[[tasks]]` 與 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[services]]`、`[[steps]]`，
+**混用。** `[[tasks]]` 與 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]`、`[[services]]`、`[[steps]]`，
 或 `[packages]` 的 `install`、`pin`、`remove`、`upgrade` 並用時，以 2 結束並顯示 `[[tasks]] cannot be mixed with [[steps]]; move it into a task`。沒有自動遷移。
 `[packages.alias]` 與其他 `[packages]` 設定（`manager`、`local`、`local_sudo_secret`、`timeout`）維持全域，可與 `[[tasks]]` 並用，
 `[[handlers]]`、`[plugins]`、`[secrets]`、`[harden]` 與 `[anvil]` 也一樣。
@@ -1233,10 +1425,10 @@ run = "fc-cache -f"
 - handler 本身的 `tags`、`facts`、`notify`、guard、`plugin` 或任何其他鍵：解析器的 `unknown field` 訊息。
   handler 只在被通知的地方執行，且 handler 不會通知 handler。
 
-**`notify`。** 一串 handler 名稱，可寫在 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[services]]` 與 `[[steps]]` 項目上，
-以及 `run`、`plugin`、`file`、`service`、`dir` 與 `link` [task](#tasks) 上。列出兩次的名稱只算一次。
+**`notify`。** 一串 handler 名稱，可寫在 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]`、`[[services]]` 與 `[[steps]]` 項目上，
+以及 `run`、`plugin`、`file`、`service`、`dir`、`link` 與 `absent` [task](#tasks) 上。列出兩次的名稱只算一次。
 沒有對應 handler 的名稱以 2 結束並指名該項目：
-``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry``（或 `dirs[I]`、`files[I]`、`links[I]`、`services[I]`、`tasks[I]`）。
+``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry``（或 `dirs[I]`、`files[I]`、`links[I]`、`absent[I]`、`services[I]`、`tasks[I]`）。
 
 **step 何時通知。** 只有在 target 上執行、以 0 結束且改變了東西的 step：
 
@@ -1245,6 +1437,7 @@ run = "fc-cache -f"
 | file          | 印出 `wrote DEST` 或 `fixed DEST: …` | 印出 `unchanged DEST`         |
 | dir           | 印出 `created DIR` 或 `fixed DIR: …` | 印出 `unchanged DIR`          |
 | link          | 印出 `linked …` 或 `relinked …`      | 印出 `unchanged PATH`         |
+| absent        | 印出 `removed PATH`                  | 印出 `unchanged PATH`         |
 | service       | 印出任何變更行                       | 印出 `unchanged service NAME` |
 | run 或 plugin | 執行且以 0 結束                      | 被 [guard](#config) 略過      |
 | 任何          |                                      | 以 no match 略過，或失敗      |
@@ -1427,6 +1620,7 @@ skip = ["updates.auto"]          # rule ids config --harden never suggests; defa
 
 [範本](#templating) src 既不評斷也不修改，因為它設定了什麼要算繪後才知道。harden 改為把它列為待檢查並指出要檢查的內容，
 只要還有待檢查項目，就絕不會說 config 已包含每條規則（[`anvil config --harden`](cli.zh-TW.md#anvil-config---harden)）。
+dest 本身是、或底下含有這些檔案的[遞迴複製](#recursive-copy)同樣列為待檢查，其中的檔案不予評斷。
 
 在 [`[[tasks]]`](#tasks) config 上，規則建議的是 task 而非區段，且只寫入主檔案的頂層 task。
 已在 include 或巢狀 task 中的項目視為存在；其中需要變更的項目留給你處理（[在 tasks config 上](cli.zh-TW.md#在-tasks-config-上)）。

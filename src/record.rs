@@ -16,7 +16,10 @@
 //! the directories created above it; per `[[links]]` step that changed
 //! something, the target it wrote and what was at the path before (nothing,
 //! a link's target, or a regular file replaced with `force`, kept as a
-//! file's previous text is), and the directories created above it.
+//! file's previous text is), and the directories created above it; per
+//! `[[absent]]` step that started a removal, what was at the path (a file
+//! kept as a file's previous text is, a link's target, or an empty
+//! directory's owner, group and mode).
 //!
 //! An apply holds a [`Session`] (the lock on `<record>.lock`, then the
 //! loaded record) and merges a target's snapshot before and after each file
@@ -46,7 +49,7 @@ use crate::private::{self, LockError};
 use crate::trust::{self, TrustError};
 
 /// The record's newest format version: a record holding created directories,
-/// an attrs-only fix, a dir or a link is saved as it, any other as
+/// an attrs-only fix, a dir, a link or an absent step is saved as it, any other as
 /// [`VERSION_1`], so an older anvil refuses only what it would lose fields
 /// of. Any other is refused.
 pub const VERSION: u32 = 2;
@@ -104,6 +107,15 @@ pub struct TargetRecord {
     /// directories above one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<LinkRecord>,
+    /// The `[[absent]]` steps that captured what was at their path and
+    /// started removing it; a step that found the path missing is merged
+    /// in memory ([`AbsentRecord::previous`] `None`) but never saved.
+    #[serde(
+        default,
+        skip_serializing_if = "no_absent",
+        serialize_with = "recorded_absent"
+    )]
+    pub absent: Vec<AbsentRecord>,
     #[serde(default)]
     pub cannot_undo: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +168,10 @@ pub struct FileRecord {
     /// only for these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub created_dirs: Vec<String>,
+    /// Whether the src written was binary: the previous file, if any, is
+    /// kept as its hash only, and rollback cannot undo the write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub binary: bool,
 }
 
 /// A file's owner, group and mode.
@@ -189,6 +205,8 @@ impl PreviousFile {
 pub const NO_ROLLBACK: &str = "rollback = false";
 /// Why the text of a previous file others may not read was not kept.
 pub const NOT_WORLD_READABLE: &str = "not world-readable";
+/// Why a binary file, previous or written, has only its hash in the record.
+pub const BINARY: &str = "binary";
 
 /// Whether others may read a file of this octal `mode`; a mode that does not
 /// parse counts as no.
@@ -232,10 +250,17 @@ impl FileRecord {
         add_unique(&mut self.created_dirs, dirs);
     }
 
-    /// Why a rollback cannot put back this file's previous text, if so; never
-    /// for an attrs-only fix or a refused write, which need none.
+    /// Why a rollback cannot put back this file's previous state, if so:
+    /// always [`BINARY`] after a binary write; else never for an attrs-only
+    /// fix or a refused write, which need no text.
     pub fn not_kept(&self) -> Option<&str> {
-        if self.write == Write::Refused || self.attrs_only() {
+        if self.write == Write::Refused {
+            return None;
+        }
+        if self.binary {
+            return Some(BINARY);
+        }
+        if self.attrs_only() {
             return None;
         }
         match &self.previous {
@@ -262,6 +287,19 @@ impl FileRecord {
         self.written_sha256 = later.written_sha256;
         self.write = later.write;
         self.written_attrs = later.written_attrs;
+        if later.binary {
+            self.drop_binary_previous();
+        }
+    }
+
+    /// Marks the write binary and keeps the previous file's hash only.
+    pub(crate) fn drop_binary_previous(&mut self) {
+        self.binary = true;
+        if let Previous::File(previous) = &mut self.previous
+            && previous.kept
+        {
+            previous.drop_text(BINARY);
+        }
     }
 }
 
@@ -277,6 +315,7 @@ impl fmt::Debug for FileRecord {
             .field("previous", &self.previous)
             .field("written_attrs", &self.written_attrs)
             .field("created_dirs", &self.created_dirs)
+            .field("binary", &self.binary)
             .finish()
     }
 }
@@ -409,22 +448,120 @@ impl LinkRecord {
 
     /// Whether a loaded entry is one apply could have written, as
     /// [`FileRecord::is_valid`] asks of a file: a previous link's target is
-    /// what `readlink` can print and apply records, 1 to 4096 bytes with
-    /// no NUL or newline.
+    /// what `readlink` can print and apply records ([`is_link_target`]).
     fn is_valid(&self) -> bool {
-        let target_ok = |t: &str| !t.is_empty() && t.len() <= 4096 && !t.contains(['\0', '\n']);
         let previous = match &self.previous {
             LinkPrevious::Absent => true,
-            LinkPrevious::Link { target } => target_ok(target),
+            LinkPrevious::Link { target } => is_link_target(target),
             LinkPrevious::File(p) => is_mode(&p.mode) && is_sha256_or_empty(&p.sha256),
-            LinkPrevious::Unknown { reason } => target_ok(reason),
+            LinkPrevious::Unknown { reason } => is_link_target(reason),
         };
         (self.write != Write::Refused || !self.created_dirs.is_empty())
             && check_dest(&self.path).is_ok()
-            && target_ok(&self.target)
+            && is_link_target(&self.target)
             && previous
             && (self.created_dirs.iter()).all(|dir| holds(dir, &self.path))
     }
+}
+
+/// One path an `[[absent]]` step started removing, and what was there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbsentRecord {
+    pub path: String,
+    pub sudo: bool,
+    /// What the step captured just before it removed `path`; `None` only
+    /// in memory, for a step that found `path` missing.
+    pub previous: Option<AbsentPrevious>,
+}
+
+/// What an `[[absent]]` step removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum AbsentPrevious {
+    /// A regular file, kept as a file's previous text is.
+    File(PreviousFile),
+    /// A symlink to `target`, as `readlink` printed it.
+    Link { target: String },
+    /// An empty directory's owner, group and mode.
+    Dir(Attrs),
+    /// Something the step removed but could not record, and `reason` why,
+    /// so that a rollback says it cannot undo it.
+    Unknown { reason: String },
+}
+
+impl AbsentRecord {
+    /// Whether the step captured something, which the record keeps.
+    pub fn is_recorded(&self) -> bool {
+        self.previous.is_some()
+    }
+
+    /// Why a rollback cannot put `path` back: a removed file whose text was
+    /// not kept, or a removal the step could not record.
+    pub fn not_kept(&self) -> Option<&str> {
+        match &self.previous {
+            Some(AbsentPrevious::File(p)) if !p.kept || p.text.is_none() => {
+                Some(p.reason.as_deref().unwrap_or("not kept"))
+            }
+            Some(AbsentPrevious::Unknown { reason }) => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// Whether a loaded entry is one apply could have written, as
+    /// [`LinkRecord::is_valid`] asks of a link: modes are four octal
+    /// digits without setuid or setgid.
+    fn is_valid(&self) -> bool {
+        let mode_ok = |mode: &str| {
+            mode.len() == 4 && u32::from_str_radix(mode, 8).is_ok_and(|mode| mode & 0o6000 == 0)
+        };
+        let previous = match &self.previous {
+            None => false,
+            Some(AbsentPrevious::File(p)) => mode_ok(&p.mode) && is_sha256_or_empty(&p.sha256),
+            Some(AbsentPrevious::Link { target }) => is_link_target(target),
+            Some(AbsentPrevious::Dir(attrs)) => mode_ok(&attrs.mode),
+            Some(AbsentPrevious::Unknown { reason }) => is_link_target(reason),
+        };
+        check_dest(&self.path).is_ok() && previous
+    }
+}
+
+/// Whether `target` is a link target apply records: what `readlink` can
+/// print, 1 to 4096 bytes with no NUL or newline.
+fn is_link_target(target: &str) -> bool {
+    !target.is_empty() && target.len() <= 4096 && !target.contains(['\0', '\n'])
+}
+
+/// Whether `absent` holds nothing the record keeps.
+fn no_absent(absent: &[AbsentRecord]) -> bool {
+    !absent.iter().any(AbsentRecord::is_recorded)
+}
+
+/// `absent` without the steps that found their path missing.
+fn recorded_absent<S: serde::Serializer>(
+    absent: &[AbsentRecord],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(absent.iter().filter(|a| a.is_recorded()))
+}
+
+/// `now`, the absent steps of an apply, merged with `earlier`, the entry's
+/// as loaded: a step that captured its path replaces the earlier entry; one
+/// that found it missing keeps the earlier entry, if any, or has none; and
+/// when the target failed (`ok` false), every earlier path it did not touch
+/// is kept too.
+fn merge_absent(earlier: Vec<AbsentRecord>, now: Vec<AbsentRecord>, ok: bool) -> Vec<AbsentRecord> {
+    let mut earlier: BTreeMap<String, AbsentRecord> =
+        (earlier.into_iter()).map(|a| (a.path.clone(), a)).collect();
+    let mut steps: Vec<AbsentRecord> = (now.into_iter())
+        .filter_map(|step| {
+            let old = earlier.remove(&step.path);
+            if step.is_recorded() { Some(step) } else { old }
+        })
+        .collect();
+    if !ok {
+        steps.extend(earlier.into_values());
+    }
+    steps
 }
 
 /// A dir or link step's record, as [`merge_steps`] and [`written_again`]
@@ -730,6 +867,7 @@ pub fn load_warned(path: &Path) -> Result<(Option<Record>, Vec<String>), String>
         target.files.iter().any(|file| !file.is_valid())
             || target.dirs.iter().any(|dir| !dir.is_valid())
             || target.links.iter().any(|link| !link.is_valid())
+            || target.absent.iter().any(|absent| !absent.is_valid())
     });
     if bad {
         return Err(cannot_parse());
@@ -753,15 +891,18 @@ fn is_supported(version: u32) -> bool {
     version == VERSION_1 || version == VERSION
 }
 
-/// The version `record` is saved as: [`VERSION`] when any target has a dir
-/// or a link, or any file lists created directories (a refused write always does) or
-/// is an attrs-only fix, which an older anvil would mishandle, else [`VERSION_1`]. The attrs
-/// written alone stay version 1: an older anvil ignores them.
+/// The version `record` is saved as: [`VERSION`] when any target has a dir,
+/// a link or an absent step, or any file lists created directories (a
+/// refused write always does), is an attrs-only fix or was binary, which an
+/// older anvil would mishandle, else [`VERSION_1`]. The attrs written alone stay version
+/// 1: an older anvil ignores them.
 fn version_of(record: &Record) -> u32 {
     let newer = record.targets.values().any(|target| {
         !target.dirs.is_empty()
             || !target.links.is_empty()
-            || (target.files.iter()).any(|file| !file.created_dirs.is_empty() || file.attrs_only())
+            || !no_absent(&target.absent)
+            || (target.files.iter())
+                .any(|file| !file.created_dirs.is_empty() || file.attrs_only() || file.binary)
     });
     if newer { VERSION } else { VERSION_1 }
 }
@@ -840,13 +981,15 @@ impl FileRecord {
     /// passes the config's dest rule, its modes are octal, its hashes are
     /// empty or lowercase hex, each created directory passes the dest rule
     /// and holds DEST, and its write was not `refused` unless it created
-    /// directories. A record
+    /// directories, and a binary write keeps no previous text. A record
     /// edited by hand must not hand rollback, which may run as root, a path
     /// or mode the config would refuse.
     fn is_valid(&self) -> bool {
         let previous = match &self.previous {
             Previous::File(previous) => {
-                is_mode(&previous.mode) && is_sha256_or_empty(&previous.sha256)
+                is_mode(&previous.mode)
+                    && is_sha256_or_empty(&previous.sha256)
+                    && !(self.binary && (previous.kept || previous.text.is_some()))
             }
             Previous::Absent | Previous::Dangling { .. } => true,
         };
@@ -883,6 +1026,21 @@ pub struct Session {
     warnings: Vec<String>,
 }
 
+/// Debug builds only: a smaller byte limit for the record's saves.
+#[cfg(debug_assertions)]
+const LIMIT_VAR: &str = "ANVIL_DEBUG_RECORD_LIMIT";
+
+/// The most bytes a save writes: [`MAX_RECORD`]. A debug build reads
+/// [`LIMIT_VAR`], so that a test can fill the record; a release build
+/// compiles the variable out.
+fn record_limit() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var(LIMIT_VAR).ok().and_then(|v| v.parse().ok()) {
+        return limit;
+    }
+    MAX_RECORD
+}
+
 impl Session {
     /// Creates the record's directory 0700 when missing and checks it,
     /// takes the lock (another anvil holding it is an error, not a wait),
@@ -908,7 +1066,7 @@ impl Session {
             merged: Vec::new(),
             base: BTreeMap::new(),
             dropped: BTreeSet::new(),
-            limit: MAX_RECORD,
+            limit: record_limit(),
             warnings,
         })
     }
@@ -950,9 +1108,9 @@ impl Session {
         let old = (self.base.entry(name.to_owned()))
             .or_insert_with(|| current.cloned())
             .clone();
-        let (old_files, old_dirs, old_links) = match old {
-            Some(old) => (Some(old.files), old.dirs, old.links),
-            None => (None, Vec::new(), Vec::new()),
+        let (old_files, old_dirs, old_links, old_absent) = match old {
+            Some(old) => (Some(old.files), old.dirs, old.links, old.absent),
+            None => (None, Vec::new(), Vec::new(), Vec::new()),
         };
         let mut earlier: BTreeMap<String, FileRecord> = (old_files.into_iter().flatten())
             .map(|f| (f.dest.clone(), f))
@@ -982,6 +1140,9 @@ impl Session {
                             ..file
                         };
                         kept.add_dirs(file.created_dirs);
+                        if kept.binary {
+                            kept.drop_binary_previous();
+                        }
                         Some(kept)
                     }
                     Some(old) if unchanged && old.written_sha256 == file.written_sha256 => {
@@ -1013,6 +1174,7 @@ impl Session {
             .collect();
         target.dirs = merge_steps(old_dirs, std::mem::take(&mut target.dirs), target.ok);
         target.links = merge_steps(old_links, std::mem::take(&mut target.links), target.ok);
+        target.absent = merge_absent(old_absent, std::mem::take(&mut target.absent), target.ok);
         if !target.ok {
             target.files.extend(
                 earlier
@@ -1147,6 +1309,11 @@ impl Session {
                     p.drop_text(RECORD_FULL);
                 }
             }
+            for absent in target.absent.iter_mut().filter(|a| &a.path == dest) {
+                if let Some(AbsentPrevious::File(p)) = &mut absent.previous {
+                    p.drop_text(RECORD_FULL);
+                }
+            }
         }
         let mut newly = Vec::new();
         let mut warnings = Vec::new();
@@ -1237,10 +1404,11 @@ fn text_cost(file: &PreviousFile) -> usize {
 enum Slot {
     File(usize),
     Link(usize),
+    Absent(usize),
 }
 
 /// The kept texts of `name`'s files, then of the files its links replaced,
-/// in `record`: where and cost.
+/// then of the files its absent steps removed, in `record`: where and cost.
 fn texts(record: &Record, name: &str) -> Vec<(Slot, usize)> {
     let target = &record.targets[name];
     let files = target
@@ -1259,7 +1427,18 @@ fn texts(record: &Record, name: &str) -> Vec<(Slot, usize)> {
             LinkPrevious::File(p) if p.text.is_some() => Some((Slot::Link(i), text_cost(p))),
             _ => None,
         });
-    files.chain(links).collect()
+    let absent =
+        target
+            .absent
+            .iter()
+            .enumerate()
+            .filter_map(|(i, absent)| match &absent.previous {
+                Some(AbsentPrevious::File(p)) if p.text.is_some() => {
+                    Some((Slot::Absent(i), text_cost(p)))
+                }
+                _ => None,
+            });
+    files.chain(links).chain(absent).collect()
 }
 
 /// The dest or path of `slot` in `name`'s entry.
@@ -1268,6 +1447,7 @@ fn slot_dest(record: &Record, name: &str, slot: Slot) -> String {
     match slot {
         Slot::File(i) => target.files[i].dest.clone(),
         Slot::Link(i) => target.links[i].path.clone(),
+        Slot::Absent(i) => target.absent[i].path.clone(),
     }
 }
 
@@ -1290,6 +1470,14 @@ fn drop_text(record: &mut Record, name: &str, slot: Slot) -> String {
                 _ => None,
             };
             (previous, &link.path)
+        }
+        Slot::Absent(i) => {
+            let absent = &mut target.absent[i];
+            let previous = match &mut absent.previous {
+                Some(AbsentPrevious::File(p)) => Some(p),
+                _ => None,
+            };
+            (previous, &absent.path)
         }
     };
     if let Some(p) = previous {
@@ -1414,6 +1602,7 @@ mod tests {
             previous,
             written_attrs: None,
             created_dirs: Vec::new(),
+            binary: false,
         }
     }
 
@@ -1457,6 +1646,7 @@ mod tests {
             files,
             dirs: Vec::new(),
             links: Vec::new(),
+            absent: Vec::new(),
             cannot_undo: vec!["packages".to_owned(), "step 4".to_owned()],
             rolled_back: None,
             pending_handlers: Vec::new(),
@@ -2659,6 +2849,7 @@ mod tests {
         assert_eq!(raw["version"], 1, "no new field");
         let entry = &raw["targets"]["web1"]["files"][0];
         assert!(entry.get("written_attrs").is_none() && entry.get("created_dirs").is_none());
+        assert!(entry.get("binary").is_none(), "skipped when false");
 
         let new = FileRecord {
             written_attrs: Some(attrs(0, 5, "0640")),
@@ -2699,6 +2890,14 @@ mod tests {
                 VERSION,
             ),
             ("attrs-only", fixed(attrs(0, 5, "0640")), VERSION),
+            (
+                "binary",
+                FileRecord {
+                    binary: true,
+                    ..plain.clone()
+                },
+                VERSION,
+            ),
             ("unchanged attrs", fixed(attrs(0, 0, "0644")), VERSION_1),
         ] {
             let record = Record {
@@ -2707,6 +2906,82 @@ mod tests {
             };
             assert_eq!(version_of(&record), version, "{what}");
         }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_binary_write_keeps_only_hashes_saves_version_2_and_cannot_be_undone() {
+        let (path, root) = record_path("record-binary");
+        let mut binary = file(
+            "/etc/app/a",
+            &sha('b'),
+            Write::Written,
+            previous(&sha('a'), Some("before")),
+        );
+        binary.drop_binary_previous();
+        let Previous::File(p) = &binary.previous else {
+            panic!("{:?}", binary.previous);
+        };
+        assert!(!p.kept && p.text.is_none(), "the previous text is dropped");
+        assert_eq!(p.reason.as_deref(), Some(BINARY));
+        assert_eq!(p.sha256, sha('a'), "its hash stays");
+        assert_eq!(binary.not_kept(), Some(BINARY));
+
+        let mut session = Session::open(&path).unwrap();
+        session.merge("web1", target(1, true, vec![binary.clone()]));
+        session.save().unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["version"], 2);
+        let entry = &raw["targets"]["web1"]["files"][0];
+        assert_eq!(entry["binary"], true);
+        assert!(!raw.to_string().contains("before"));
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.targets["web1"].files, [binary.clone()]);
+
+        // An attrs-only fix or a dest absent before cannot be undone either;
+        // a refused write still needs nothing.
+        for (what, previous, write, expected) in [
+            (
+                "attrs-only",
+                previous(&sha('b'), None),
+                Write::Written,
+                Some(BINARY),
+            ),
+            (
+                "absent before",
+                Previous::Absent,
+                Write::Written,
+                Some(BINARY),
+            ),
+            ("refused", Previous::Absent, Write::Refused, None),
+        ] {
+            let record = FileRecord {
+                previous,
+                write,
+                written_attrs: Some(attrs(0, 5, "0600")),
+                ..binary.clone()
+            };
+            assert_eq!(record.not_kept(), expected, "{what}");
+        }
+
+        // Written again as binary drops a text kept from the first write.
+        let mut again = file(
+            "/etc/app/a",
+            &sha('a'),
+            Write::Written,
+            previous(&sha('c'), Some("before")),
+        );
+        again.written_again(binary.clone());
+        assert!(again.binary);
+        assert_eq!(again.not_kept(), Some(BINARY));
+
+        // A hand-edited binary entry that holds a previous text is refused.
+        let mut edited = raw.clone();
+        edited["targets"]["web1"]["files"][0]["previous"]["kept"] = json!(true);
+        edited["targets"]["web1"]["files"][0]["previous"]["text"] = json!("before");
+        plant(&path, edited.to_string().as_bytes());
+        let err = load(&path).unwrap_err();
+        assert!(err.ends_with(": cannot parse"), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -3317,6 +3592,190 @@ mod tests {
                 .not_kept()
                 .is_none(),
             "kept in memory"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn with_absent(at: u64, ok: bool, absent: Vec<AbsentRecord>) -> TargetRecord {
+        TargetRecord {
+            absent,
+            ..target(at, ok, Vec::new())
+        }
+    }
+
+    fn removed(path: &str, previous: Option<AbsentPrevious>) -> AbsentRecord {
+        AbsentRecord {
+            path: path.to_owned(),
+            sudo: true,
+            previous,
+        }
+    }
+
+    fn removed_file(mode: &str, text: Option<&str>) -> AbsentPrevious {
+        match previous(&sha('a'), text) {
+            Previous::File(p) => AbsentPrevious::File(PreviousFile {
+                mode: mode.to_owned(),
+                ..p
+            }),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn absent_steps_round_trip_need_version_2_and_a_missing_path_keeps_the_earlier() {
+        let (path, root) = record_path("record-absent");
+        let mut session = Session::open(&path).unwrap();
+        let file = removed("/etc/app.conf", Some(removed_file("0644", Some("old\n"))));
+        let link = removed(
+            "/usr/local/bin/app",
+            Some(AbsentPrevious::Link {
+                target: "/opt/app".to_owned(),
+            }),
+        );
+        let dir = removed(
+            "/srv/empty",
+            Some(AbsentPrevious::Dir(Attrs {
+                uid: 0,
+                gid: 0,
+                mode: "0750".to_owned(),
+            })),
+        );
+        session.merge(
+            "w",
+            with_absent(
+                1,
+                true,
+                vec![
+                    file.clone(),
+                    link.clone(),
+                    dir.clone(),
+                    removed("/nothing", None),
+                ],
+            ),
+        );
+        session.save().unwrap();
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.version, VERSION);
+        assert_eq!(
+            loaded.targets["w"].absent,
+            [file.clone(), link.clone(), dir.clone()]
+        );
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["targets"]["w"]["absent"][1]["previous"],
+            json!({"kind": "link", "target": "/opt/app"})
+        );
+        assert_eq!(
+            raw["targets"]["w"]["absent"][0]["previous"]["text"],
+            "old\n"
+        );
+
+        // A later apply that found the paths missing keeps the earlier
+        // entries; a new capture replaces one; an untouched one goes.
+        drop(session);
+        let mut session = Session::open(&path).unwrap();
+        let again = removed("/srv/empty", Some(removed_file("0600", None)));
+        session.merge(
+            "w",
+            with_absent(2, true, vec![removed("/etc/app.conf", None), again.clone()]),
+        );
+        assert_eq!(session.record().targets["w"].absent, [file.clone(), again]);
+
+        // A failed target keeps what it did not touch.
+        session.merge("w", with_absent(3, false, vec![removed("/x", None)]));
+        assert_eq!(session.record().targets["w"].absent.len(), 3);
+
+        // Only missing paths and no earlier entry: nothing kept, version 1.
+        drop(session);
+        fs::remove_file(&path).unwrap();
+        let mut session = Session::open(&path).unwrap();
+        session.set_pending("w", Vec::new(), || {
+            with_absent(4, true, vec![removed("/x", None)])
+        });
+        session.save().unwrap();
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.version, VERSION_1);
+        assert!(loaded.targets["w"].absent.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn load_refuses_an_absent_step_rollback_could_not_trust() {
+        let (path, root) = record_path("record-absent-bad");
+        let with = |absent: AbsentRecord| {
+            let record = Record {
+                version: VERSION,
+                targets: BTreeMap::from([("w".to_owned(), with_absent(1, true, vec![absent]))]),
+            };
+            plant(&path, &serde_json::to_vec(&record).unwrap());
+            load(&path)
+        };
+        let dir = |mode: &str| {
+            Some(AbsentPrevious::Dir(Attrs {
+                uid: 0,
+                gid: 0,
+                mode: mode.to_owned(),
+            }))
+        };
+        let link = |target: &str| {
+            Some(AbsentPrevious::Link {
+                target: target.to_owned(),
+            })
+        };
+        for (what, bad) in [
+            ("a relative path", removed("etc/app", dir("0755"))),
+            ("a 3-digit mode", removed("/etc/app", dir("755"))),
+            ("a setgid dir", removed("/etc/app", dir("2755"))),
+            (
+                "a setuid file",
+                removed("/etc/app", Some(removed_file("4755", None))),
+            ),
+            ("an empty target", removed("/etc/app", link(""))),
+            (
+                "a target with a newline",
+                removed("/etc/app", link("/a\n/b")),
+            ),
+        ] {
+            assert!(with(bad).unwrap_err().ends_with("cannot parse"), "{what}");
+        }
+        let mut raw = serde_json::to_value(Record {
+            version: VERSION,
+            targets: BTreeMap::from([("w".to_owned(), target(1, true, Vec::new()))]),
+        })
+        .unwrap();
+        raw["targets"]["w"]["absent"] =
+            json!([{"path": "/etc/app", "sudo": true, "previous": null}]);
+        plant(&path, &serde_json::to_vec(&raw).unwrap());
+        assert!(
+            load(&path).unwrap_err().ends_with("cannot parse"),
+            "no previous"
+        );
+        assert!(with(removed("/etc/app", dir("1777"))).unwrap().is_some());
+        assert!(with(removed("/etc/app", link("../a b"))).unwrap().is_some());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_removed_files_text_shares_the_record_budget() {
+        let mut web1 = target(2, true, Vec::new());
+        let text = "r".repeat(4000);
+        web1.absent = vec![removed("/etc/app", Some(removed_file("0644", Some(&text))))];
+        let mut all = Record::default();
+        all.targets.insert("web1".to_owned(), web1.clone());
+        let (mut session, root) = session_with("record-absent-text", Vec::new());
+        session.limit = encoded_len(&all) - 1000;
+        session.merge("web1", web1);
+        assert_eq!(
+            session.save().unwrap(),
+            ["apply: last-apply.json is full; /etc/app on web1 cannot be rolled back"]
+        );
+        let saved = load(&session.path).unwrap().unwrap();
+        let Some(AbsentPrevious::File(p)) = &saved.targets["web1"].absent[0].previous else {
+            panic!("not a file");
+        };
+        assert_eq!(
+            (p.text.is_none(), p.reason.as_deref()),
+            (true, Some(RECORD_FULL))
         );
         fs::remove_dir_all(&root).unwrap();
     }

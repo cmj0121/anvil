@@ -161,11 +161,11 @@ run = "hostname"
 
 `[anvil]` 一律完整顯示，包含 `workspace`（未設定時為解析後的預設值）。
 config 已有的每個區段都會補上有預設值的鍵：`[packages]` 的 `manager`、`install`、`remove`、`pin`、`upgrade` 與 `timeout`，
-`[secrets.keychain]` 的 `service`，每個 `[[files]]` 項目的 `sudo` 與 `rollback`，每個 `[[dirs]]` 與 `[[links]]` 項目的 `sudo`，
+`[secrets.keychain]` 的 `service`，每個 `[[files]]` 項目的 `sudo` 與 `rollback`，每個 `[[dirs]]`、`[[links]]` 與 `[[absent]]` 項目的 `sudo`，
 每個 `[plugins.NAME]` 的 `on`。
 `[harden]` 一律顯示，未設定時為 `skip = []`（[`--harden`](#anvil-config---harden)）。
 config 沒用到的每個選用區段都以註解範例附在後面（`# [secrets]`、`# [packages]`、`# [[files]]`、`# [[dirs]]`、`# [[links]]`、
-`# [[services]]`、`# [[handlers]]` 與 `# [plugins.NAME]`；`[[tasks]]` config 不能有那四個項目區段，因此從不附上它們），
+`# [[absent]]`、`# [[services]]`、`# [[handlers]]` 與 `# [plugins.NAME]`；`[[tasks]]` config 不能有那五個項目區段，因此從不附上它們），
 以編輯格式呈現，所以 `--format yaml --full` 會以 YAML 寫出這些註解。
 `editor` 未設定時，其註解範例會放在 `[anvil]` 內。取消範例的註解即可使用。
 
@@ -209,6 +209,9 @@ stdout 只有一份 unified diff（三行上下文），每個變更的檔案一
 - [範本](configuration.zh-TW.md#templating) src，harden 既不評斷也不修改：
   `harden: review ssh.root-login: files[0]: src $/sshd.conf.j2 is a template, not judged; check it sets PermitRootLogin no`
   （同一服務的其他檔案，例如 `/etc/ssh/sshd_config`，則為 `does not contradict`）；
+- dest 本身是、或底下含有這類檔案的[遞迴複製](configuration.zh-TW.md#recursive-copy)：
+  `harden: review ssh.root-login: …` 加上
+  `files[0]: src $/ssh is a recursive copy, its files not judged; check them does not contradict PermitRootLogin no`；
 - 沒有任何建議、沒有待檢查項目時（stdout 不印任何東西）：
   `config carries every harden rule; anvil plan / apply bring the hosts to it`；
 - 舊版 YAML config：`harden: config.yaml is shown as the TOML anvil config would migrate it to`，diff 以該 TOML 為準。
@@ -260,7 +263,7 @@ stdout 只有一份 unified diff（三行上下文），每個變更的檔案一
 ```
 
 `action` 為 `add`、`change` 或 `remove`；`warnings` 存放 `--strict` 的文字，不含 `harden: warning` 前綴。
-含有範本 src 的 config 另加 `review`，每個要手動檢查的 src 一個物件，空時省略：
+含有範本 src 或上述遞迴複製的 config 另加 `review`，每個要手動檢查的 src 一個物件，空時省略：
 
 ```json
 {
@@ -337,7 +340,7 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
 或含 `.` 或 `..` 元件的路徑以 2 結束並顯示 `$/../x: invalid store path`；連續的 `/` 會合併。
 經過儲存區內 symlink 的路徑以 2 結束（`$/link: is a symlink`），因此不會讀寫儲存區以外的東西。
 缺少的資料夾以 0700 建立（包括儲存區本身的資料夾），檔案以 0600 寫入。
-只接受文字檔：不含 NUL、至多 1 MiB 的一般 UTF-8 檔案，與 `[[files]]` 的限制相同；
+只接受文字檔：不含 NUL、至多 1 MiB 的一般 UTF-8 檔案（`[[files]]` 的 src 另可是二進位檔案）；
 其他檔案以 1 結束並顯示 `$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`。錯誤會指名儲存區路徑：
 `$/c: exists; pass --force`、`$/d: is a folder; pass -r`、`$/d/x: is not a folder`、`$/x: not found`。
 
@@ -651,7 +654,7 @@ tag 讓所有雜湊都不出現在請求與 doctor 的輸出中：任何雜湊�
 - `sudo` fact 從不比對：它讀的是當下 sudo 的快取，因此即使沒有漂移也會改變。
 - 在 `sudo -n` 被拒或需要密碼的 target 上，僅 root 可寫的檔案為 `no_sudo`：doctor 從不輸入 sudo 密碼，即使有 `sudo_secret` 也一樣。
 - 只比對位元組，不比對檔案的 mode 或擁有者，也只比對紀錄中列出的 dest。
-- 紀錄列出的目錄與連結（`dirs` 與 `links`）不會比對：doctor 與 doctor plugin 收到的請求目前都不涵蓋它們。
+- 紀錄列出的目錄、連結與被移除的路徑（`dirs`、`links` 與 `absent`）不會比對：doctor 與 doctor plugin 收到的請求目前都不涵蓋它們。
 
 ### `anvil apply`
 
@@ -661,7 +664,7 @@ tag 讓所有雜湊都不出現在請求與 doctor 的輸出中：任何雜湊�
 每個 target 上的每個 step 都以 0 結束時以 0 結束，否則為 1。
 apply 直接執行：不印出計畫，也不詢問確認；想先看它會執行什麼，請先執行 [`anvil plan`](#anvil-plan)。
 
-本節其餘部分說明舊版區段，其順序固定：套件、目錄、檔案、連結、服務、step，最後是 handler。`[[tasks]]` config 依你寫的順序執行（[執行中的 task](#執行中的-task)）。
+本節其餘部分說明舊版區段，其順序固定：套件、目錄、檔案、連結、absent、服務、step，最後是 handler。`[[tasks]]` config 依你寫的順序執行（[執行中的 task](#執行中的-task)）。
 
 當 `[packages]` 有事可做（`install`、`pin` 或 `remove` 非空，或 `upgrade = true`）時，每個 target 會先透過同一個傳輸執行
 facts 探測、解析其套件管理器，並將產生的腳本作為 step 1 執行，排在 `[[steps]]` 之前。
@@ -673,7 +676,7 @@ facts 探測、解析其套件管理器，並將產生的腳本作為 step 1 執
 當 target 的 sudo 要求密碼且它有 sudo secret 時，該 step 在終端機上執行，
 anvil 會在 sudo 的提示處輸入密碼（[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)）；
 其 `$` 行仍是那行一行式腳本。沒有 `[packages]`，或沒有要安裝、升級、鎖定或移除的東西時，不會執行探測，apply 只執行 `[[steps]]`，
-除非有 step 指定 plugin（[Plugin steps](#plugin-steps)），或 config 含有 `[[dirs]]`、`[[files]]`、`[[links]]` 或 `[[services]]`。
+除非有 step 指定 plugin（[Plugin steps](#plugin-steps)），或 config 含有 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]` 或 `[[services]]`。
 
 在舊版 config 中，每個 `[[dirs]]` 項目在每個 target 上都是一個 step，排在套件 step 之後、file step 之前：
 target 的 tag 與 fact 符合時建立或修正目錄，不符合時顯示為略過（[Dir steps](#dir-steps)）。
@@ -681,10 +684,13 @@ target 的 tag 與 fact 符合時建立或修正目錄，不符合時顯示為�
 在舊版 config 中，每個 `[[files]]` 項目在每個 target 上都是一個 step，排在 dir step 之後、link step 之前：
 target 的 tag 與 fact 符合時複製檔案，不符合時顯示為略過（[File steps](#file-steps)）。
 
-在舊版 config 中，每個 `[[links]]` 項目在每個 target 上都是一個 step，排在 file step 之後、service step 之前：
+在舊版 config 中，每個 `[[links]]` 項目在每個 target 上都是一個 step，排在 file step 之後、absent step 之前：
 target 的 tag 與 fact 符合時建立、重新連結或保留 symlink，不符合時顯示為略過（[Link steps](#link-steps)）。
 
-在舊版 config 中，每個 `[[services]]` 項目在每個 target 上都是一個 step，排在 link step 之後、`[[steps]]` 之前：
+在舊版 config 中，每個 `[[absent]]` 項目在每個 target 上都是一個 step，排在 link step 之後、service step 之前：
+target 的 tag 與 fact 符合時移除檔案、symlink 或空目錄，不符合時顯示為略過（[Absent steps](#absent-steps)）。
+
+在舊版 config 中，每個 `[[services]]` 項目在每個 target 上都是一個 step，排在 absent step 之後、`[[steps]]` 之前：
 target 的 tag 與 fact 符合時以 target 的 init 把服務帶到其狀態，不符合時顯示為略過（[Service steps](#service-steps)）。
 
 帶有 guard（`creates`、`removes`、`onlyif`、`unless`）的 `run` 或 plugin step 會先在 target 上檢查它們，
@@ -801,7 +807,7 @@ upgrade = true
 target 要嘛執行了它的 step（`steps` 與 `ok`；失敗的 step 會顯示其 `code`，且 `ok` 為 false），
 要嘛在傳輸中失敗（`error`、`ok: false`，只有在錯誤前已完成某些 step 時才有 `steps`）。
 step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 的最後一項，與 `error` 並列。
-`changed` 表示 step 是否改變了東西，因而觸發了它的 `notify`：出現在 file、dir、link、service、`run` 與 plugin step 上（包括略過的，為 `false`），
+`changed` 表示 step 是否改變了東西，因而觸發了它的 `notify`：出現在 file、dir、link、absent、service、`run` 與 plugin step 上（包括略過的，為 `false`），
 以及 handler 上；套件 step 沒有它（[執行中的 handler](#執行中的-handler)）。
 
 套件 step 的未知名稱會從輸出取出，放入 target 的 `warnings: Vec<String>`（JSON 為字串陣列，空時省略）。
@@ -823,7 +829,7 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 #### 執行中的 task
 
 [`[[tasks]]`](configuration.zh-TW.md#tasks) config 依所寫的順序執行，而非上述的固定順序：
-`packages`、`file`、`dir`、`link`、`service`、`run` 或 `plugin` task 不論位置，行為都與該種 step 相同。
+`packages`、`file`、`dir`、`link`、`absent`、`service`、`run` 或 `plugin` task 不論位置，行為都與該種 step 相同。
 `plan` 與 `apply` 的順序相同。使用這份 config 時，在 `local` 上的 `anvil plan` 印出：
 
 ```toml
@@ -878,7 +884,7 @@ include = "$/roles/web.toml"   # Validate config, then Start nginx with tags = [
 
 - **失敗。** `✘ step N exited C` 依執行順序計算該 target 的 step，略過的也計入，因此 `N` 是在展開清單中的位置。
   失敗會停止該 target 其餘的 task。
-- **探測。** 清單中有 `packages`、`file`、`dir`、`link`、`service` 或 `plugin` task，或有帶 `facts` 的 task，或 config 有 doctor plugin 時，
+- **探測。** 清單中有 `packages`、`file`、`dir`、`link`、`absent`、`service` 或 `plugin` task，或有帶 `facts` 的 task，或 config 有 doctor plugin 時，
   apply 會探測 target。探測在第一個 task 之前執行一次（[單次探測](configuration.zh-TW.md#tasks)）。
   任何 task 需要的 sudo 密碼都在執行開始前讀取。
 - **Rollback。** `cannot undo` 以路徑指名 `run`、`plugin`、`packages` 或 `service` task，`--dry-run` 也一樣：
@@ -958,7 +964,7 @@ service = { name = "sshd", state = "reloaded" }
   並在 stderr（任何 `-v` 等級）與最上層的 `warnings` 顯示 `PATH: TARGET: dropped N bad pending_handlers entries`。
   兩者都不會讓 apply 失敗。傳遞是至少一次（[Handlers](configuration.zh-TW.md#handlers)）。
 - **Rollback。** 執行過的 handler 無法復原：rollback 把它列為 `cannot undo: handler NAME`，
-  並把它放回的檔案、目錄與連結的 handler 排入佇列（[`anvil rollback`](#anvil-rollback)）。
+  並把它放回的檔案、目錄、連結與被移除路徑的 handler 排入佇列（[`anvil rollback`](#anvil-rollback)）。
 
 `--json` 以 `handler`（handler 的名稱）標示每個 handler 的報告，並給每個 step `changed`：印出 `wrote DEST` 或 `fixed DEST: …` 的 file step、
 印出 `created DIR` 或 `fixed DIR: …` 的 dir step、印出 `linked PATH -> TARGET` 或 `relinked PATH -> TARGET` 的 link step、
@@ -1013,7 +1019,7 @@ anvil apply --target web1 --drop-pending "reload sshd"
   每個尚未啟動的 target 以沒有 step 的 `⊘ cancelled` 結束。摘要與 `--json` 照常印出，指令以 1 結束。
   plan 執行中的探測也同樣會跑完。
 - **`--parallel 1` 也會等待。** 以前 Ctrl-C 會立刻停止 anvil，現在第一次按下會等目前的 step 結束，最多等到該 step 的逾時
-  （`[[steps]]`、`[[dirs]]`、`[[files]]`、`[[links]]` 或 plugin step 為 30 秒（使用密碼的 `[[files]]` step 最多可能花上三個 30 秒）、
+  （`[[steps]]`、`[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]` 或 plugin step 為 30 秒（使用密碼的 `[[files]]` step 最多可能花上三個 30 秒）、
   套件 step 為 `[packages].timeout`、service step 120 秒、`anvil run` 為 `--timeout`）。
   再按一次即立刻停止。
 - **第二次按下會立刻停止一切。** anvil 終止所有仍在執行的 step，記錄 `ERROR anvil::interrupt: interrupted`，
@@ -1036,7 +1042,7 @@ anvil apply --target web1 --drop-pending "reload sshd"
 
 #### apply 紀錄
 
-會探測 target 的 apply（有工作的 `[packages]`、plugin step、`[[dirs]]`、`[[files]]`、`[[links]]`、`[[services]]` 或 `[[handlers]]`，
+會探測 target 的 apply（有工作的 `[packages]`、plugin step、`[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]`、`[[services]]` 或 `[[handlers]]`，
 或在 tasks config 上[如執行中的 task 所述](#執行中的-task)）會保存
 `last-apply.json`，供 [`anvil rollback`](#anvil-rollback) 讀取。只有一般 `[[steps]]` 的 apply 不會開啟它。
 
@@ -1047,15 +1053,15 @@ anvil apply --target web1 --drop-pending "reload sshd"
   兩個變數都沒設定時，指令在任何 target 之前以 1 結束失敗，訊息為
   `apply: neither $XDG_STATE_HOME nor $HOME is set: cannot find the state directory`（rollback 時為 `rollback: …`）。
 - **每個 target 一筆。** 每個 target 一結束就合併進紀錄並儲存（以原子性的 rename）。只有在某個 target 上開始了
-  `[[files]]` 寫入，或執行了 dir 或 link step 時，才會取代該 target 的項目。apply 有連到但兩者皆無的 target
-  會保留它的檔案、目錄與連結，並更新為新的 facts。
+  `[[files]]` 寫入，或執行了 dir、link 或 absent step 時，才會取代該 target 的項目。apply 有連到但兩者皆無的 target
+  會保留它的檔案、目錄、連結與被移除的路徑，並更新為新的 facts。
   這次 apply 沒有選到的 target 保留各自的項目。
 - **保存的內容。** 每個 target：時間（`at`）、anvil 版本、每個 step 是否都通過（`ok`）、探測得到的 facts、寫入的每個檔案、
   無法復原的 step（`cannot_undo`，執行過的 handler 記為 `handler NAME`）、仍待執行的 handler
   （`pending_handlers`，以名稱記錄，空時省略），以及 rollback 之後的 `rolled_back`。每個檔案：dest、寫入時的 mode 與 `sudo`、
   寫入位元組的 sha256、寫入如何結束（`write`）、先前的狀態（`previous`）、寫入留下的擁有者、群組與 mode
   （`written_attrs`，形如 `{"uid": 0, "gid": 0, "mode": "0644"}`，寫入成功後才有），以及 `parents` 為它建立的目錄
-  （`created_dirs`，由上而下，空時省略）。每個目錄（`dirs`）與每個連結（`links`）的內容見下文，空時省略。
+  （`created_dirs`，由上而下，空時省略），src 是[二進位檔案](configuration.zh-TW.md#files)時另有 `binary: true`（false 時省略）。每個目錄（`dirs`）、每個連結（`links`）與每個被移除的路徑（`absent`）的內容見下文，空時省略。
   它絕不保存 secret 的值、step 的腳本或套件清單。
 - **tasks config 上每個 dest 一筆。** 同一次 apply 中兩個 file task 寫入的 dest（拼法相同或只差重複的斜線）只有一筆檔案項目，
   以第一個拼法記錄：`previous` 取自第一次寫入之前，
@@ -1144,7 +1150,14 @@ mode 記錄時不含 setuid 與 setgid 位元，anvil 不動目錄上的這兩�
 ]
 ```
 
-**版本。** 只有當某個 target 有 `dirs` 或 `links`，或某個檔案有 `created_dirs`，或是位元組未變、只修正了擁有者、群組或 mode（`fixed DEST: …`）時，紀錄才寫成
+**目錄樹。** [遞迴複製](configuration.zh-TW.md#recursive-copy)本身沒有自己的項目。
+它變更的每個檔案項目是 `DEST/rel` 的一筆檔案紀錄，先前的文字依下述規則保存或不保存；它建立的每個目錄是一筆 `previous` 為 null 的目錄紀錄。
+樹的檢查發現未變的項目不會擷取，原本就存在的目錄也不會記錄。
+變更的項目分批儲存，每批最多 16 個項目或 1 MiB 的保存文字，在該批寫入之前儲存；目錄則在建立後立即儲存，
+因此被終止的 apply 會把已寫入的每個項目留在紀錄中。文字檔很多的樹可能超過下述 16 MiB 上限，被捨棄的文字就無法 rollback；
+[`anvil plan`](#anvil-plan) 會對這樣的樹發出警告。
+
+**版本。** 只有當某個 target 有 `dirs`、`links` 或 `absent`，或某個檔案有 `created_dirs`，或是位元組未變、只修正了擁有者、群組或 mode（`fixed DEST: …`），或帶有 `binary` 時，紀錄才寫成
 `"version": 2`；其他情況維持 `"version": 1`（如上例），這個 anvil 兩者都能讀。舊版 anvil 會拒絕 version 2 的紀錄，
 顯示 `apply: PATH: version 2 is not supported`（rollback 時為 `rollback: …`），而不是載入後在下一次儲存時遺失那些欄位；
 請對該紀錄持續使用這個或更新的 anvil。
@@ -1154,8 +1167,9 @@ mode 記錄時不含 setuid 與 setgid 位元，anvil 不動目錄上的這兩�
 其中的錯誤名稱在載入時捨棄並發出警告（[執行中的 handler](#執行中的-handler)）。
 
 **保存或不保存。** 只有在先前的檔案是所有人可讀（mode 含 `0o004`）、文字是不含 NUL 位元組的 UTF-8、最多 256 KiB，
-且項目沒有設定 `rollback = false` 時，才會保存它。否則 `kept` 為 false，`reason` 說明原因：`rollback = false`、
-`not world-readable`、`over 256 KiB`、`not UTF-8 text`、`contains NUL`、`unreadable`、`no od on the target` 或 `record full`。
+項目沒有設定 `rollback = false`，且寫入的 src 不是二進位檔案時，才會保存它。否則 `kept` 為 false，`reason` 說明原因：`rollback = false`、
+`not world-readable`、`over 256 KiB`、`binary`（先前的檔案或 src 不是 UTF-8 或含 NUL 位元組）、`unreadable`、`no od on the target` 或 `record full`。
+`binary` 檔案項目卻保存了先前文字的紀錄，載入時會被拒絕。
 不論哪種情況寫入都會進行；失去的只是它的復原，rollback 會把該檔案顯示為 `cannot undo: DEST (REASON)`。
 `rollback = false` 只保存雜湊：dest 保存 secret 時請使用它（[Files](configuration.zh-TW.md#files)）。
 
@@ -1208,9 +1222,9 @@ rollback 只放回擁有者、群組與 mode。中途失敗的寫入在下一次
 
 寫入前的儲存失敗時，執行會停止且該檔案不會寫入：target 以 `aborted: a record save failed` 結束。
 
-**已知限制。** dir 或 link step 在結束後才依它印出的行儲存，而不像檔案寫入那樣在開始前儲存。
-因此 dir 或 link step 若在印出任何東西之前就失去連線，或 anvil 被終止，它就不在紀錄中，rollback 也無法復原它在那裡可能做的事。
-`anvil doctor` 的 drift 檢查，以及 [doctor plugin](#doctor-plugins-drift-since-the-last-apply) 收到的紀錄，目前都不涵蓋 `dirs` 與 `links`。
+**已知限制。** dir、link 或 absent step 在結束後才依它印出的行儲存，而不像檔案寫入那樣在開始前儲存。
+因此 dir、link 或 absent step 若在印出任何東西之前就失去連線，或 anvil 被終止，它就不在紀錄中，rollback 也無法復原它在那裡可能做的事。
+`anvil doctor` 的 drift 檢查，以及 [doctor plugin](#doctor-plugins-drift-since-the-last-apply) 收到的紀錄，目前都不涵蓋 `dirs`、`links` 與 `absent`。
 
 **先讀取 DEST。** 每次 `[[files]]` 寫入之前，會另外執行一次，經由與寫入相同的路徑讀取 DEST（`ls -lLdn` 與 `od`）。
 它的輸出絕不會印出或記錄。不是一般檔案的 dest 會以 `files: DEST is not a regular file` 讓 step 失敗，讀回不完整時則以
@@ -1224,8 +1238,8 @@ rollback 只放回擁有者、群組與 mode。中途失敗的寫入在下一次
 列出 `anvil apply` 會在每個選定 target 上執行的 step，但一個都不執行。
 每個 target 都會透過其傳輸執行探測，即使 `[packages]` 沒有事可做也一樣，因此無法連線的 target 在這裡就會像在 apply 中一樣失敗。
 接著由 apply 使用的同一個解析函式列出 step：`[packages]` 有事可做時先是套件 step，再依序是每個 `[[dirs]]`、`[[files]]`、
-`[[links]]`、`[[services]]` 與 `[[steps]]` 項目。
-不會執行任何套件指令、不會寫入任何檔案、不會變更任何目錄或連結、不會執行任何服務指令，也不會執行任何 `[[steps]]` 腳本。
+`[[links]]`、`[[absent]]`、`[[services]]` 與 `[[steps]]` 項目。
+不會執行任何套件指令、不會寫入任何檔案、不會變更任何目錄或連結、不會移除任何東西、不會執行任何服務指令，也不會執行任何 `[[steps]]` 腳本。
 無法連線、探測或解析的 target 會以與 apply 相同的原因失敗（探測、套件管理器，以及在 brew、apt 或 apk 上的 `pin` 為
 `packages: REASON`，例如 `packages: pin is not one-shot on brew: vim`；`[packages]` 沒有事可做時，探測失敗為 `probe: REASON`），
 其他 target 仍會繼續規劃。plan 會像 apply 一樣，在控制端執行每個 plugin step 的 plugin，以列出它回傳的腳本
@@ -1254,7 +1268,7 @@ secret 由 `anvil doctor` 檢查。
   接著每個 env 值一行 `env.KEY = VALUE (LEVEL)`，顯示方式與 doctor 相同，planned、failed 或 cancelled 的 target 皆然：
   `vars.port = 8080 (tag:web)`、`env.APP_ENV = prod (host)`。值原樣顯示。
 - [`[[tasks]]`](#執行中的-task) config 在每個 step 上方多一行 `PATH  NAME`。
-- 每個 step 是一行 `would $ RUN`（多行的 `run` 顯示第一行加上 `…`）；
+- 每個 step 是一行 `would $ RUN`（多行的 `run` 顯示第一行加上 `…`）；[二進位](configuration.zh-TW.md#files)的檔案 src 後面加上 `(binary)`，表示它的 rollback 會失去；
   apply 會在 sudo 的提示輸入某個 secret 的值時，後面再加上 `(sudo password from secret NAME)`。
 - [範本](configuration.zh-TW.md#templating)檔案 step 在其 `would $ file DEST` 行下方多一行 `rendered N bytes, sha256 HEX`：
   該 target 算繪文字的大小與完整 sha256，也就是 apply 會寫入的位元組。算繪失敗的 target 以 `✘` 加上範本訊息結束
@@ -1264,9 +1278,18 @@ secret 由 `anvil doctor` 檢查。
 - file step 為其項目設定的 `owner`、`group` 與 `parents` 各多一行 `owner NAME`、`group NAME`、`parents`，位於 guard 行之後。
   plan 不讀取 dest，因此無法得知 apply 會寫入、修正或保持不變，也不建立任何目錄。
   不是登入使用者的 `sudo = false` owner 在 plan 中與 apply 一樣讓 target 失敗（`✘ files[0].owner NAME: needs sudo; the login user is USER`）。
+- [遞迴複製](configuration.zh-TW.md#recursive-copy)在它符合的 target 上，於第一個 step 之前多一行標頭
+  `files[N] SRC -> DEST (tree: N items, SIZE bytes)`（task 則為 `PATH.file`），項目數包含 dest 本身，SIZE 是所有檔案的位元組數。
+  接著每個項目各一行：`would $ dir PATH` 加上 `mode DIR_MODE`、設定了時的 `group NAME`，以及設定了時 dest 上的 `parents`；
+  `would $ file PATH` 則在二進位檔案加上 `(binary)`，設定了時另有 `owner` 與 `group` 行。TUI 的 plan 檢視顯示這些 step，但不顯示標頭行。
+- 設定 `rollback` 的遞迴項目，若其文字檔可能保存的先前文字超過紀錄所能容納，會在 stderr 發出警告
+  `WARNING: files[N] DEST: rollback may not keep every previous text (record full)`。
+  這是估算：樹中的文字檔數乘以單一檔案最多保存的 256 KiB，與 16 MiB 的紀錄相比，以項目計算，不依它符合哪些 target 篩選；
+  二進位檔案只保存雜湊，不計入（[apply 紀錄](#apply-紀錄)）。
 - dir step 為 `would $ dir PATH`，接著是 `mode MODE`，以及項目設定了的 `owner NAME`、`group NAME` 與 `parents`。
   link step 為 `would $ link PATH -> TARGET`（TARGET 中的控制與不可見字元會跳脫），設定了時另有 `force` 與 `parents`。
-  plan 不檢視這兩種路徑，因此無法得知 apply 會建立、修正、連結、重新連結或保持不變。
+  absent step 為 `would $ absent PATH`，設定了時另有 `type TYPE`。
+  plan 不檢視這些路徑，因此無法得知 apply 會建立、修正、連結、重新連結、移除或保持不變。
 - 帶有 `notify` 的 step 在其 `would $`、guard 與 file 行之後多一行 `notifies NAME, NAME`：它可能通知的 handler。
   handler 從不是 `would $` 行，因為它們只在被通知時執行。step 之後，若 target 在本機 [apply 紀錄](#apply-紀錄)中的項目列有待執行的
   handler，會顯示 `pending from last apply: NAME, …`，也就是下一次 apply 會執行的。紀錄只讀取一次且不上鎖；plan 不會為此多連線，
@@ -1280,7 +1303,7 @@ secret 由 `anvil doctor` 檢查。
 `--json` 是 apply 的文件，最前面加上 `"executed": false`；
 step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`、tasks config 上的 `task` 與 `name`、
 設定了它們的 file step 的 `owner`、`group` 與 `parents`（`true`）、dir step 的 `mode` 與這三個鍵、
-link step 的 `target`、`force`（`true`）與 `parents`、有 guard 的 step 的
+link step 的 `target`、`force`（`true`）與 `parents`、absent step 的 `path` 與 `type`（設定了時）、有 guard 的 step 的
 `guards`，以及帶有 `notify` 的 step 的 `notify`（名稱），絕不會有 `code`、`stdout` 或 `stderr`。
 有待執行 handler 的已規劃 target 另有 `pending_handlers`，空時省略；紀錄的載入警告則是最上層的 `warnings` 陣列，文字相同但不含 `WARNING:` 前綴，空時省略。
 有 vars 或 env 的 target 另有 `vars` 與 `env`，與 doctor 的 `--json` 相同
@@ -1318,6 +1341,45 @@ link step 的 `target`、`force`（`true`）與 `parents`、有 guard 的 step �
 
 被取消而略過的 target 為 `{"target": "pi", "ok": false}`，由第一個 SIGTERM 或 SIGHUP 造成時另帶
 `"abort": "terminated"` 或 `"hung_up"`（[Ctrl-C](#ctrl-c)）。
+
+**遞迴複製。** 樹的 step 就是它的項目，因此 plan 顯示 apply 會執行什麼，從不顯示某個項目是否會變更；plan 不讀取 dest。
+以 `src = "conf"`、`dest = "/srv/app"`、`mode = "0640"`、`recursive = true` 與 `dir_mode = "0750"` 的 `[[files]]` 項目為例，
+其 src 含 `a.conf`（6 位元組）與 `sub/c.bin`（3 位元組，二進位）：
+
+```text
+▶ local
+  files[0] conf -> /srv/app (tree: 4 items, 9 bytes)
+  would $ dir /srv/app
+    mode 0750
+  would $ file /srv/app/a.conf
+  would $ dir /srv/app/sub
+    mode 0750
+  would $ file /srv/app/sub/c.bin (binary)
+  ✔ 4 steps
+```
+
+在 `--json` 中，含有樹的已規劃 target 另有 `trees`，沒有時省略：每棵樹有 `step`（它第一個 step，即 dest 的 step，在 `steps` 中的索引）、
+`entry`、`src`、`dest`、`size`，以及依 step 順序排列的 `items`，每個為 `{path, kind, size, binary}`：
+`path` 相對於 dest（dest 本身為 `""`），`kind` 為 `dir` 或 `file`，目錄的 `size` 為 0。其中絕不含位元組。
+上述紀錄警告位於最上層的 `warnings`，不含 `WARNING:` 前綴。
+
+```json
+"trees": [
+  {
+    "step": 0,
+    "entry": "files[0]",
+    "src": "conf",
+    "dest": "/srv/app",
+    "size": 9,
+    "items": [
+      { "path": "", "kind": "dir", "size": 0, "binary": false },
+      { "path": "a.conf", "kind": "file", "size": 6, "binary": false },
+      { "path": "sub", "kind": "dir", "size": 0, "binary": false },
+      { "path": "sub/c.bin", "kind": "file", "size": 3, "binary": true }
+    ]
+  }
+]
+```
 
 **範本檔案。** plan 從不讀取 dest，因此無法做 diff；改為顯示每個 target 會得到什麼。不加旗標時就是
 `rendered N bytes, sha256 HEX` 這一行，不印出任何檔案位元組。`--show-rendered` 另外在該行下方印出每個 target 的算繪文字，
@@ -1590,7 +1652,7 @@ guard 指令自己的 stdout 則被丟棄：
 
 ### File steps
 
-`[[files]]` 項目或 `file` [task](#執行中的-task) 把工作區或檔案儲存區中的一份文字檔複製到每個 tag 與 fact 都符合的選定 target
+`[[files]]` 項目或 `file` [task](#執行中的-task) 把工作區或檔案儲存區中的一份檔案（文字或二進位）複製到每個 tag 與 fact 都符合的選定 target
 （[Files](configuration.zh-TW.md#files)）：
 
 ```toml
@@ -1635,10 +1697,37 @@ facts = { distro = "arch" }
 { "run": "skipped file /etc/motd: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true, "changed": false }
 ```
 
-`anvil plan` 顯示 `would $ file DEST`（apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
+`anvil plan` 顯示 `would $ file DEST`（二進位 src 加上 `(binary)`，表示它的 rollback 會失去；apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
 與 `would $ skipped file DEST: no match`；項目設定了它們時另加 `owner NAME`、`group NAME` 與 `parents` 行，範本檔案另加一行
-`rendered N bytes, sha256 HEX`。在 `plan --json` 中 `run` 是同一個標籤，走密碼路徑時另有 `sudo_secret`，
+`rendered N bytes, sha256 HEX`。在 `plan --json` 中 `run` 是同一個標籤，二進位 src 另有 `binary: true`，走密碼路徑時另有 `sudo_secret`，
 項目設定了它們時另有 `owner`、`group` 與 `parents`（`true`）。
+
+不是 UTF-8、或含 NUL 位元組的 src 是[二進位檔案](configuration.zh-TW.md#files)，會逐位元組複製。
+它以 `printf` 八進位跳脫序列傳到 target，傳輸量最多約為檔案大小的四倍，step 的 30 秒時間限制依傳送量每 MiB 增加 15 秒。
+target 的 `sh` 必須把 `printf` 作為內建指令，否則 step 會在寫入任何東西之前拒絕，以 4 結束：
+`files: printf is not a shell builtin; cannot copy a binary file`。文字檔仍以 heredoc 傳送，位元組不變。
+二進位檔案的寫入無法復原（[`anvil rollback`](#anvil-rollback)）。
+
+設定 [`recursive = true`](configuration.zh-TW.md#recursive-copy) 的項目複製整個目錄樹，在符合的 target 上每個項目一個 step，依路徑排序：
+dest 與每個目錄為 `$ dir PATH`，每個檔案為 `$ file PATH`，各自如上印出它做了什麼。
+目錄只建立不修改：不存在的會印出 `created PATH`，已存在的保持原狀並印出 `unchanged PATH`，
+路徑上若是 symlink、檔案或其他東西，step 會失敗，以 4 結束，並顯示 `dirs: PATH is not a directory`，絕不跟隨。
+dest 中不屬於這棵樹的檔案會保留。第一個項目之前會有一次檢查執行檢視整棵樹，已與樹相同的項目不執行任何東西並印出 `unchanged PATH`；
+走 sudo 密碼路徑時沒有檢查執行。只要有任何項目變更，項目的 `notify` 就觸發一次。
+不符合的 target 只有一個略過的 step：`$ skipped file DEST: no match`。以 `-vv`，在 src 中改了一個檔案之後的第二次 apply：
+
+```text
+▶ web1
+  $ dir /etc/nginx
+  unchanged /etc/nginx
+  $ file /etc/nginx/nginx.conf
+  wrote /etc/nginx/nginx.conf
+  $ dir /etc/nginx/sites
+  unchanged /etc/nginx/sites
+  $ file /etc/nginx/sites/default
+  unchanged /etc/nginx/sites/default
+  ✔ ok · 4 steps
+```
 
 每次寫入之前，apply 會讀回 DEST，並把它的內容保存在 [apply 紀錄](#apply-紀錄)中，讓 [`anvil rollback`](#anvil-rollback)
 能把它放回去；接著寫入會拒絕在那次讀取後被改過的 DEST。
@@ -1674,11 +1763,18 @@ target 不認得的 `owner` 或 `group` 會在寫入任何東西之前讓 step �
 （[Files](configuration.zh-TW.md#files)）。
 
 `apply` 與 `plan` 在連線任何 target 之前讀取每個 src。
-src 不存在、位於工作區之外、不是一般檔案、超過 1 MiB 或不是文字時以 2 結束，
+src 不存在、位於工作區之外、不是一般檔案、超過 1 MiB，或是設定 `template = true` 的二進位檔案時以 2 結束，
 而且只要一個 src 有問題，該指令就對每個 target 停止，包括該項目不符合的 target：
 
 ```text
 ERROR anvil: files[0].src `../nope`: cannot read: No such file or directory (os error 2)
+```
+
+[遞迴](configuration.zh-TW.md#recursive-copy) src 在同一時點整個走訪，其中的 symlink 或特殊檔案、不合規則的名稱、
+過深的巢狀，或超過樹的上限，都同樣以 2 結束：
+
+```text
+ERROR anvil: files[0].src `conf`: sub/link: is a symlink; a recursive copy refuses symlinks
 ```
 
 拒絕條件、比對規則，以及寫到 target 上的結果（擁有者與群組、symlink、不存在的上層目錄）見 [Files](configuration.zh-TW.md#files)。
@@ -1793,6 +1889,46 @@ PATH 之上的目錄要通過 root-only 檢查，訊息以 `links:` 開頭，`pa
 每個 link step 都連同 PATH 先前的狀態（什麼都沒有、舊連結的 target，或 `force` 取代的檔案的文字，依檔案的規則保存）記在
 [apply 紀錄](#apply-紀錄)中，讓 [`anvil rollback`](#anvil-rollback) 移除建立的連結、把被取代的連結指回舊的 target，或把被取代的檔案寫回去。
 
+### Absent steps
+
+`[[absent]]` 項目或 `absent` [task](#執行中的-task) 在每個 tag 與 fact 都符合的選定 target 上，移除 PATH 上的檔案、symlink 或空目錄
+（[Absent](configuration.zh-TW.md#absent)）：
+
+```toml
+[[absent]]
+path = "/etc/nginx/sites-enabled/default"
+type = "link"
+```
+
+每個 `[[absent]]` 項目在每個 target 上都是一個 step，依 config 順序排在 link step 之後、service step 之前；`absent` task 則是在它所在位置的同樣 step。
+在符合的 target 上，該 step 顯示為 `$ absent PATH`，並印出下列其中之一：
+
+- `removed PATH`：移除了檔案、symlink（從不碰它指向的東西）或空目錄。
+- `unchanged PATH`：那裡什麼都沒有，或 PATH 之上的某個目錄不存在。
+
+`removed` 算作有變更並觸發該 step 的 `notify`；`unchanged` 則不會。使用 `-vv`：
+
+```text
+▶ linode1
+  $ absent /etc/nginx/sites-enabled/default
+  removed /etc/nginx/sites-enabled/default
+  ✔ ok · 1 step
+```
+
+下列情況會讓 step 失敗並讓 PATH 保持原樣（step 內以 4 結束，target 失敗，以 1 結束）：
+
+- `absent: PATH is not empty`：目錄絕不遞迴移除
+- `absent: PATH is a dir, not link`（或 `file`、`link`、`dir`）：PATH 不是項目的 `type`
+- `absent: PATH is not a file, dir or link`
+- `absent: PATH points at a target anvil cannot record; anvil will not remove it`：紀錄無法保存連結的 target，
+  因此 rollback 無法把它放回去
+
+PATH 之上的目錄要通過 root-only 檢查，訊息帶有 `absent:`，因此位於 group 或其他人可寫的目錄（例如 `/tmp`）之下的路徑會被拒絕；
+從不建立任何目錄。在不符合的 target 上為 `$ skipped absent PATH: no match`。`--json` 中的 `run` 為 `absent PATH`。
+
+每次移除都連同 PATH 原本的狀態（連結的 target、依檔案規則保存的檔案、目錄的擁有者、群組與 mode）記在
+[apply 紀錄](#apply-紀錄)中，讓 [`anvil rollback`](#anvil-rollback) 把它放回去。
+
 ### Service steps
 
 `[[services]]` 項目在每個 tag 與 fact 都符合的選定 target 上，以其 `distro` fact 指定的 init，把一個服務帶到指定的狀態
@@ -1811,8 +1947,8 @@ state = "stopped"
 tags = ["web"]
 ```
 
-每個 `[[services]]` 項目在每個 target 上都是一個 step，依 config 順序排在 `[[links]]` step 之後、`[[steps]]` 之前，
-因此順序是套件、目錄、檔案、連結、服務、step；`service` task 則是在它所在位置的同樣 step。在符合的 target 上，該 step 顯示為 `$ service NAME`。
+每個 `[[services]]` 項目在每個 target 上都是一個 step，依 config 順序排在 `[[absent]]` step 之後、`[[steps]]` 之前，
+因此順序是套件、目錄、檔案、連結、absent、服務、step；`service` task 則是在它所在位置的同樣 step。在符合的 target 上，該 step 顯示為 `$ service NAME`。
 它先詢問 init，只變更不同之處，並依變更的順序每項變更印出一行：`enabled service NAME`、
 `disabled service NAME`、`started service NAME`、`stopped service NAME`。沒有要變更的東西時印出
 `unchanged service NAME`，因此再次執行不會有任何動作。在不符合的 target 上，它是沒有輸出的
@@ -1966,10 +2102,10 @@ launchd 的 bootstrap 在 job 已停用時被拒絕，訊息為 `services: NAME 
 anvil rollback [--force DEST]... [--force-all] [--allow-host-change] [--dry-run]
 ```
 
-在每個選定的 target 上，從 [apply 紀錄](#apply-紀錄)把上次 apply 在那裡變更的檔案、目錄與連結放回去。每個檔案取回先前的文字、owner、group 與 mode；
+在每個選定的 target 上，從 [apply 紀錄](#apply-紀錄)把上次 apply 在那裡變更的檔案、目錄、連結與被移除的路徑放回去。每個檔案取回先前的文字、owner、group 與 mode；
 先前不存在的 dest 會被移除；apply 沒有動位元組、只修正了擁有者、群組或 mode 的檔案，取回這些屬性；
 `[[dirs]]` 建立的目錄在為空時移除，修正過的目錄取回擁有者、群組與 mode；`[[links]]` 建立的連結被移除，
-被取代的連結重新指向舊的 target，`force` 取代的檔案被寫回去；`parents = true` 建立的目錄在為空時會被移除。它直接執行，不詢問確認；`--dry-run` 會先顯示它要做的事：
+被取代的連結重新指向舊的 target，`force` 取代的檔案被寫回去；`[[absent]]` 移除的路徑在不存在時重新建立；`parents = true` 建立的目錄在為空時會被移除。它直接執行，不詢問確認；`--dry-run` 會先顯示它要做的事：
 
 ```sh
 anvil rollback --dry-run --target web1    # read the record only: connect to nothing
@@ -2005,11 +2141,13 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 2 ok, 0 failed
 ```
 
-- **順序。** 先處理連結，再處理檔案，最後處理目錄，各自從最後寫入的開始，因此連結或檔案會在容納它的目錄之前處理；
+- **順序。** 先處理被移除的路徑，再處理連結、檔案，最後處理目錄，各自從最後寫入的開始，因此連結或檔案會在容納它的目錄之前處理；
   接著是無法復原的 step。
 - **最後寫入的先處理。** 每個記錄的檔案是一個 step，順序與 apply 寫入時相反：`restore DEST` 印出 `restored DEST`，
   `remove DEST` 印出 `removed DEST`；DEST 已經是 apply 之前的樣子時，兩者都印出 `unchanged DEST`（restore 仍會把擁有者、群組與 mode 設回去）。
   文字沒有保存的檔案是一個略過的 step `cannot undo: DEST (REASON)`，原因取自紀錄（例如 `rollback = false`）。
+- **二進位檔案。** src 是[二進位檔案](configuration.zh-TW.md#files)的檔案一律是 `cannot undo: DEST (binary)`，DEST 保持原狀，
+  apply 之前它不存在、或只改了擁有者、群組或 mode 時也一樣（已知的限制）；`parents = true` 為它建立的目錄也會留下。
 - **只有擁有者、群組與 mode。** apply 印出 `fixed DEST: …` 之後，step 為 `restore owner, group and mode of DEST`。
   它不需要文字，所以 0600 或 0640 的檔案也可以，且不動位元組。它在變更擁有者或群組之前先把 mode 收緊為擁有者的位元，
   最後設定記錄的 mode，並印出 `restored owner, group and mode of DEST`；DEST 已經是那些屬性時印出 `unchanged DEST`。
@@ -2030,6 +2168,11 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   已不是目錄的路徑不論是否強制，都以 `dirs: PATH is not a directory` 失敗。
   `parents = true` 在 PATH 之上建立的目錄隨後移除，與檔案相同。
   只因這些目錄而保存的被拒絕 step，為 `remove the directories made for PATH` step，只移除那些目錄。
+- **目錄樹。** [遞迴複製](configuration.zh-TW.md#recursive-copy)的項目與檔案、目錄一樣 rollback：
+  檔案取回保存的文字，或在 apply 建立它時移除；二進位檔案，或 `rollback = false`（對每個項目都成立）的檔案，為 `cannot undo: PATH (REASON)`。
+  樹建立的目錄在它的檔案之後處理，由最深的開始移除，且只在空的時候移除，因此含有不是這棵樹寫入之檔案的目錄會留下，
+  並警告 `rollback: PATH is not empty; left in place`。先前文字被紀錄上限捨棄的項目為 `cannot undo: PATH (record full)`。
+  項目的 `notify` 只排入一次。
 - **連結。** step 建立的連結為 `remove link PATH`，印出 `removed link PATH`，已經不在時印出 `unchanged PATH`。
   step 取代的連結為 `restore link PATH -> OLD`，與 apply 重新連結一樣以一次改名放回舊連結，印出 `restored link PATH -> OLD`，
   PATH 已指向 OLD 時印出 `unchanged PATH`。`force` 取代的一般檔案為 `restore PATH`：移除連結，依檔案還原的方式寫回該檔案
@@ -2040,6 +2183,14 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   （`cannot undo: PATH (old target is not UTF-8)`）。PATH 從不被跟隨：那裡是目錄時以 `links: PATH is a directory` 失敗，
   另外兩種 step 中其他不是連結的東西以 `links: PATH is not a symlink` 失敗，不論是否強制。
   只因在 PATH 之上建立了目錄而保存的被拒絕 step，為 `remove the directories made for PATH` step，只移除那些目錄。
+- **被移除的路徑。** `[[absent]]` step 移除的路徑只在不存在時放回去：`restore PATH` 把檔案保存的文字寫到它旁邊的暫存檔，
+  給它擁有者、群組與 mode，再改名到 PATH 上，印出 `restored PATH`；`restore link PATH -> TARGET` 印出
+  `restored link PATH -> TARGET`；`restore directory PATH` 建立目錄並給它擁有者、群組與 mode，印出 `restored directory PATH`。
+  PATH 之上的目錄要通過與 apply 相同的檢查，且容納它的目錄必須存在：從不建立任何目錄
+  （`absent: DIR does not exist; PATH is not restored`）。PATH 又是被移除時的那種東西時印出 `unchanged PATH`，`--force` 在那裡不改變任何事。
+  是其他種類時，不論是否強制，都以
+  `absent: PATH is a link now, not the file the apply removed; rollback will not replace it` 失敗；目錄從不被移除。
+  文字沒有保存的檔案，或 step 無法記錄的移除，為 `cannot undo: PATH (REASON)`。
 - **未還原。** 每個這樣的檔案，不論原因，也會在 target 的區塊與 `warnings` 中顯示為 `⚠ not restored: DEST (REASON)`，
   摘要也不算乾淨的 ok：它是 `2 ok, 0 failed, 1 not restored`，接著每個檔案一行 `DEST on TARGET (REASON)`；`--json`
   以 `"not_restored":[{"target","dest","reason"}]` 列出，沒有時省略。結束碼仍為 0，所以重複 rollback 保持冪等。
@@ -2048,7 +2199,7 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   `cannot undo: service NAME` 與 `cannot undo: step N`（第 N 個 `[[steps]]` 項目），在 tasks config 上則為 `cannot undo: PATH`
   （[執行中的 task](#執行中的-task)），執行過的 handler 則為 `cannot undo: handler NAME`。
   rollback 絕不執行套件管理器、service 指令、step 或 handler。
-- **排入的 handler。** 對它放回的每個檔案、目錄或連結，rollback 把該路徑的項目中適用於該 target 者（以紀錄保存的 fact 比對，而不是探測的 fact）
+- **排入的 handler。** 對它放回的每個檔案、目錄、連結或被移除的路徑，rollback 把該路徑的項目中適用於該 target 者（以紀錄保存的 fact 比對，而不是探測的 fact）
   的 `notify` 名稱，依 `[[handlers]]` 順序、各一次地加入該 target 的 `pending_handlers`，讓下一次 apply 執行它們。
   每個排入的 handler 都是 target 區塊中的一則警告 `⚠ pending handler NAME queued for the next apply`，也在它的 `warnings` 中。
   紀錄中的錯誤待執行名稱在載入時捨棄，並在 stderr 與最上層的 `warnings` 發出警告，與 apply 相同。
@@ -2068,10 +2219,22 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   `rollback: DEST has directories created for it in the record but no parents = true in [[files]]; refusing to restore it`
   （tasks config 上為 `in the config`）。每個記錄的目錄與連結也必須以同樣方式是某個 `[[dirs]]` 或 `[[links]]` 項目的 `path`，
   訊息相同但指名 `[[dirs]]` 或 `[[links]]`（`rollback: PATH is not in [[links]]; refusing to restore it`，tasks config 上為
-  `no dir task for PATH applies to TARGET`）；紀錄保存了 `force` 取代之檔案的連結，該項目必須設定 `force = true`：
+  `no dir task for PATH applies to TARGET`）；每個被移除的路徑也必須是 `sudo` 相同的 `[[absent]]` 項目或 absent task 的 `path`
+  （`rollback: PATH is not in [[absent]]; refusing to restore it`）；紀錄保存了 `force` 取代之檔案的連結，該項目必須設定 `force = true`：
   `rollback: PATH has a replaced file in the record but no force = true in [[links]]; refusing to restore it`。
   把項目加回 config 才能 rollback 該 target。dest、mode 或 sha256 不可能由 apply 寫出的紀錄（相對路徑的 dest、`..`、
   開頭的 `-`、不是八進位的 mode）與其他錯誤的紀錄一樣，以 `rollback: PATH: cannot parse` 失敗。
+- **樹的項目。** rollback 會像 apply 一樣重新讀取每個遞迴項目的 src（單一檔案的 src 不讀取），
+  位於該項目 dest 或其下的記錄檔案或目錄，只有在載入的樹仍以相同種類、相同 `sudo` 持有它，且該項目適用於該 target 時才算數。
+  無法再載入的樹會在任何 target 之前以 2 結束：
+  ``rollback: files[0].src `conf`: REASON; …``，結尾為
+  `the config decides which files may be restored: fix or restore what it names, then run rollback again`。
+  src 已不再持有的項目為略過的 step `cannot undo: PATH (no longer in the tree)`（`--dry-run` 也是），保持原狀，rollback 繼續處理其餘部分。
+  其他情況都如上讓 target 失敗：
+  `rollback: PATH is a directory of a recursive entry's tree in [[files]], not a file; refusing to restore it`、
+  `rollback: PATH is a file of a recursive entry's tree in [[files]], not a directory; refusing to restore it`、
+  `sudo` 的訊息、樹中檔案的 `has directories created for it`（只有 dest 本身在 `parents = true` 時可以有），
+  以及不在 config 任何 dest 之下的路徑的 `is not in` 訊息。
 - **防護。** 變更 DEST 之前，step 會先雜湊它。DEST 是 apply 寫入的位元組或先前的內容時才會繼續。
   紀錄有 `written_attrs` 時，DEST 還必須保有 apply 留下的擁有者、群組與 mode，因此 apply 之後的 `chown` 或 `chmod` 也算變更；
   只修正擁有者、群組或 mode 的項目，其先前的內容就是記錄的擁有者、群組與 mode。
@@ -2096,7 +2259,7 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   現在這樣的 dest 會被拒絕。當時的紀錄仍可 rollback，因為 `rm` 不會跟隨連結。rollback 只移除連結，它所建立的檔案會留下：`removed link DEST; the file it pointed to was kept`。
 - **`rolled_back`。** 每個 target 結束後，它還原、移除或發現未變更的 dest 會以 `rolled_back`（`at` 與 `dests`）存進它的項目。
   這與排入的 handler 是 rollback 對紀錄僅有的變更，所以第二次 rollback 會再次還原相同的位元組，或印出 `unchanged DEST`。
-  下一次在該 target 上寫入檔案，或執行 dir 或 link step 的 apply 會取代這個項目。
+  下一次在該 target 上寫入檔案，或執行 dir、link 或 absent step 的 apply 會取代這個項目。
 - **Target。** 紀錄中沒有項目的選定 target 顯示 `nothing recorded`，並算作成功。已不在 inventory 中的 target 的項目不會被 rollback。
 - **鎖。** rollback 在整個執行期間持有紀錄的鎖，與 apply 相同（[apply 紀錄](#apply-紀錄)）；儲存失敗為
   `rollback: cannot write last-apply.json: REASON`，並以 `; not recorded: …` 列出 `rolled_back` 沒有儲存的 target。
@@ -2106,8 +2269,9 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 `would restore owner, group and mode of DEST`、`would remove DEST`、`would remove directory DIR when empty`（在其 dest 之後，由最深的開始）、
 連結的 `would remove link PATH`、`would restore link PATH -> OLD` 或 `would restore PATH`、
 目錄的 `would remove directory PATH when empty` 或 `would restore owner, group and mode of PATH`、
+被移除路徑的 `would restore PATH`、`would restore link PATH -> TARGET` 或 `would restore directory PATH`、
 `cannot undo: …` 與 `nothing recorded`，順序與 rollback 執行時相同，最後印出 `N targets, nothing executed`。
-它做與 rollback 相同的 `[[files]]`、`[[dirs]]` 與 `[[links]]` 檢查，
+它做與 rollback 相同的 `[[files]]`、`[[dirs]]`、`[[links]]` 與 `[[absent]]` 檢查，
 以紀錄中的 facts 代替探測：rollback 會拒絕的 target 顯示 `✘ rollback: …`（`--json` 中為 `"error"`），摘要為
 `N targets, M failed, nothing executed`，並以 1 結束：
 
@@ -2130,10 +2294,10 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 
 - **0**：每個選定的 target 都完成 rollback，或沒有任何紀錄；文字沒有保存的檔案會被指名，但不算失敗。
 - **1**：`rollback: no apply recorded`（沒有紀錄，或紀錄中沒有任何項目；不執行任何東西）；某個 target 失敗
-  （被拒絕的 dest、不在 `[[files]]` 中的 dest、不在 `[[dirs]]` 或 `[[links]]` 中的路徑、`sudo` 不同者、host 改變、還原或連線失敗）；
+  （被拒絕的 dest、不在 `[[files]]` 中的 dest、不在 `[[dirs]]`、`[[links]]` 或 `[[absent]]` 中的路徑、`sudo` 不同者、host 改變、還原或連線失敗）；
   紀錄無法讀取（`rollback: PATH: REASON`，與 apply 相同）、被另一個 anvil 鎖住或無法儲存；找不到狀態目錄（[apply 紀錄](#apply-紀錄)）。
 - **2**：錯誤的旗標（`--force` 與 `--force-all` 並用）、不在紀錄中的 `--force DEST`、未知的 `--target`，
-  或無效的 config 或 inventory，包括無法展開的 task 或 include。
+  或無效的 config 或 inventory，包括無法展開的 task 或 include，或無法載入的遞迴 src。
 
 ### `anvil run [--timeout SECS] <FILE|->`
 

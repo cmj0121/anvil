@@ -1,0 +1,5 @@
+dirs:
+  - path: /srv/app
+    mode: "0755"
+absent:
+  - path: /srv/app/old

@@ -2,8 +2,8 @@
 
 [English](README.md) | 繁體中文
 
-維護一台遠端 host：升級、pin、移除、一個設定目錄、`/etc` 下 root 擁有的檔案、一個執行中的服務、帶 guard 的 step，
-以及 handler。
+維護一台遠端 host：升級、pin、移除、一個設定目錄、`/etc` 下 root 擁有的檔案（其中一個是二進位檔，還有一整個資料夾）、
+一個執行中的服務、帶 guard 的 step，以及 handler。
 
 - `[packages]`：`upgrade = true` 先升級所有已安裝套件，`pin = ["vim"]` 在缺少時安裝 vim 並在該次升級中略過它，
   `remove = ["nano"]` 在已安裝時移除 nano。pin 只在 pacman 與 dnf 上有效；在 brew、apt 或 apk 上，任何 `pin`
@@ -16,6 +16,15 @@
 - 第二個 `[[files]]` 項目以 `root:wheel 0640` 寫入 `files/app.conf`：root 寫入，`wheel`（Arch 內建的群組）中的管理員
   可讀，其他人不可讀。內容相同而只有 owner、group 或 mode 不符時，它印出 `fixed /etc/app/conf.d/app.conf: …`，
   並像寫入一樣通知 `log app config change`（[`owner` 與 `group`](../../docs/configuration.zh-TW.md#files)）。
+- 第三個 `[[files]]` 項目把 `files/upstream.der`（app 固定使用的 DER 憑證）複製到 `/etc/app/upstream.der`。
+  它不是 UTF-8，所以 anvil 不需設定任何鍵就以二進位檔案逐位元組複製；`plan` 會把該 step 標為 `(binary)`，
+  而 `anvil rollback` 無法還原它：apply 紀錄只保留它的 sha256（[二進位檔案](../../docs/configuration.zh-TW.md#files)）。
+- 第四個 `[[files]]` 項目設有 `recursive = true`：它把資料夾 `files/app.d` 複製到 `/etc/app/app.d`，每個項目一個
+  step，目錄在前。每個檔案依 `mode`、`owner` 與 `group` 成為 `root:wheel 0640`；它建立的每個目錄取得 `group` 與
+  `dir_mode = "0750"`（`recursive` 必須搭配它，且不得讓群組或其他人可寫入），擁有者則維持 root，因為 `owner` 只套用到
+  檔案。`parents = true` 會建立其上缺少的 `/etc/app`。已存在的目錄維持原樣，`/etc/app/app.d` 中資料夾沒有的檔案也
+  永遠不會被移除。任何項目改變時，`log app config change` 執行一次
+  （[Recursive copy](../../docs/configuration.zh-TW.md#recursive-copy)）。
 - 兩個 `[[steps]]` 帶有 [guard](../../docs/configuration.zh-TW.md#config)，重跑時不會再動它們：`/var/tmp/anvil-provisioned`
   存在後 `creates` 就略過第一個；`grep -qx 'managed by anvil' /var/tmp/anvil-note` 結束碼為 0 時 `unless` 就略過第二個。
   `[[steps]]` 不接受 tags，所以兩者在每個 target 上都會執行。
@@ -50,4 +59,4 @@ anvil --inventory examples/server/inventory.toml \
 `yaml/` 放的是同樣兩份文件的 YAML 版本，也就是 `anvil inventory --format yaml` 與 `anvil config --format yaml`
 編輯時使用的格式（該編輯畫面還會多出一個 `anvil:` 區塊，且不保留註解）：貼進那個編輯器，anvil 會以 TOML 儲存。
 不要把 `yaml/` 複製到 `~/.config/anvil/`：放在那裡的 YAML 檔會被當作舊版文件讀取，
-並在下次編輯時改寫成 TOML；同名的 TOML 與 YAML 檔則會因為不明確而結束（exit 2）。要採用這個範例，請複製 `.toml` 檔。
+並在下次編輯時改寫成 TOML；同名的 TOML 與 YAML 檔則會因為不明確而結束（exit 2）。要採用這個範例，請複製 `.toml` 檔與 `files/`。

@@ -165,13 +165,13 @@ run = "hostname"
 
 `[anvil]` is always shown in full, `workspace` included (the resolved default when unset). Every section the config
 already has gets its defaulted keys: `[packages]` `manager`, `install`, `remove`, `pin`, `upgrade` and `timeout`,
-`[secrets.keychain]` `service`, each `[[files]]` entry's `sudo` and `rollback`, each `[[dirs]]` and `[[links]]` entry's
-`sudo`, each `[plugins.NAME]`'s `on`. `[harden]` is always shown, as `skip = []` when unset
+`[secrets.keychain]` `service`, each `[[files]]` entry's `sudo` and `rollback`, each `[[dirs]]`, `[[links]]` and `[[absent]]`
+entry's `sudo`, each `[plugins.NAME]`'s `on`. `[harden]` is always shown, as `skip = []` when unset
 ([`--harden`](#anvil-config---harden)). Each optional section the config does not use is appended as a commented example
-(`# [secrets]`, `# [packages]`, `# [[files]]`, `# [[dirs]]`, `# [[links]]`, `# [[services]]`, `# [[handlers]]` and
-`# [plugins.NAME]`; never the four entry sections on a `[[tasks]]` config, which cannot have them), in the edit format,
-so `--format yaml --full` comments them as YAML. When `editor` is unset, its commented example appears inside `[anvil]`.
-Uncomment an example to use it.
+(`# [secrets]`, `# [packages]`, `# [[files]]`, `# [[dirs]]`, `# [[links]]`, `# [[absent]]`, `# [[services]]`,
+`# [[handlers]]` and `# [plugins.NAME]`; never the five entry sections on a `[[tasks]]` config, which cannot have them),
+in the edit format, so `--format yaml --full` comments them as YAML. When `editor` is unset, its commented example
+appears inside `[anvil]`. Uncomment an example to use it.
 
 Saving validates and retries as without `--full`, then drops every key whose value is its default, also one you wrote
 yourself; a `workspace` that resolves to the default (`"."`, say) is dropped too. Sections stay even when all their keys
@@ -216,6 +216,9 @@ stdout is only a unified diff (three lines of context), one section per changed 
 - a [templated](configuration.md#templating) src, which harden neither judges nor changes:
   `harden: review ssh.root-login: files[0]: src $/sshd.conf.j2 is a template, not judged; check it sets PermitRootLogin no`
   (`does not contradict` for another file of that service, such as `/etc/ssh/sshd_config`);
+- a [recursive copy](configuration.md#recursive-copy) whose dest is, or holds, such a file:
+  `harden: review ssh.root-login: …` with
+  `files[0]: src $/ssh is a recursive copy, its files not judged; check them does not contradict PermitRootLogin no`;
 - with nothing to suggest, no review, and nothing printed on stdout:
   `config carries every harden rule; anvil plan / apply bring the hosts to it`;
 - for a legacy YAML config: `harden: config.yaml is shown as the TOML anvil config would migrate it to`, and the diff
@@ -268,7 +271,7 @@ behind it, `diff` the same text the preview prints, and `written` whether `--wri
 ```
 
 `action` is `add`, `change` or `remove`; `warnings` holds the `--strict` text without the `harden: warning` prefix. A
-config with a templated src adds `review`, one object per src to check by hand, left out when empty:
+config with a templated src or such a recursive copy adds `review`, one object per src to check by hand, left out when empty:
 
 ```json
 {
@@ -348,8 +351,8 @@ path without `$/` (`sub/motd`); `cp` uses `$/` to tell the store side from this 
 (`/x`, `$//x`), holds a NUL byte or has a `.` or `..` component is exit 2 with `$/../x: invalid store path`; repeated
 `/` separators collapse. A path through a symlink inside the store is exit 2 (`$/link: is a symlink`), so nothing reads
 or writes outside it. Missing folders are created as 0700 (the store's own folder too) and files are written as 0600.
-Files are text only: regular UTF-8 files without NUL, at most 1 MiB, the same limits `[[files]]` sets; any other file is
-exit 1 with `$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`. Errors name the store path:
+Files are text only: regular UTF-8 files without NUL, at most 1 MiB (a `[[files]]` src may also be binary); any
+other file is exit 1 with `$/x: not a regular UTF-8 text file without NUL, at most 1 MiB`. Errors name the store path:
 `$/c: exists; pass --force`, `$/d: is a folder; pass -r`, `$/d/x: is not a folder`, `$/x: not found`.
 
 | Action                  | Effect                                                                        |
@@ -675,8 +678,8 @@ Its limits:
 - Root-only files on a target whose `sudo -n` is refused or asks for a password are `no_sudo`: doctor never types the
   sudo password, not even from `sudo_secret`.
 - Only the bytes are compared, not a file's mode or owner, and only dests the record lists.
-- The directories and links the record lists (`dirs` and `links`) are not compared: neither doctor nor the request a
-  doctor plugin gets covers them yet.
+- The directories, links and removed paths the record lists (`dirs`, `links` and `absent`) are not compared: neither
+  doctor nor the request a doctor plugin gets covers them yet.
 
 ### `anvil apply`
 
@@ -685,8 +688,8 @@ wrapper on the target ([SSH behaviour](#ssh-behaviour); `/bin/sh -s` for `local`
 that target; the other targets still run. Exit 0 when every step on every target exited 0, else 1. apply runs directly:
 it prints no plan and asks for no confirmation; run [`anvil plan`](#anvil-plan) first to see what it would run.
 
-The rest of this section describes the legacy sections, whose order is fixed: packages, dirs, files, links, services,
-steps, then the handlers. A `[[tasks]]` config runs in the order you write ([Tasks in a run](#tasks-in-a-run)).
+The rest of this section describes the legacy sections, whose order is fixed: packages, dirs, files, links, absent,
+services, steps, then the handlers. A `[[tasks]]` config runs in the order you write ([Tasks in a run](#tasks-in-a-run)).
 
 With `[packages]` that has work to do (a non-empty `install`, `pin` or `remove`, or `upgrade = true`), each target first
 runs the facts probe over the same transport, resolves its package manager and runs the generated script as step 1,
@@ -698,7 +701,8 @@ steps (see [Packages](packages.md)). When the target's sudo asks for a password 
 on a terminal and anvil types the password at sudo's prompt ([Typing the sudo
 password](packages.md#typing-the-sudo-password)); its `$` line is still the one-line script. Without `[packages]`, or
 with nothing to install, upgrade, pin or remove, no probe runs and apply runs only the `[[steps]]`, unless a step names
-a plugin ([Plugin steps](#plugin-steps)) or the config has `[[dirs]]`, `[[files]]`, `[[links]]` or `[[services]]`.
+a plugin ([Plugin steps](#plugin-steps)) or the config has `[[dirs]]`, `[[files]]`, `[[links]]`, `[[absent]]` or
+`[[services]]`.
 
 In a legacy config, each `[[dirs]]` entry is one step on every target, after the package step and before the file steps:
 it creates or fixes the directory when the target's tags and facts match and shows as skipped when they do not ([Dir
@@ -708,11 +712,15 @@ In a legacy config, each `[[files]]` entry is one step on every target, after th
 it copies the file when the target's tags and facts match and shows as skipped when they do not ([File
 steps](#file-steps)).
 
-In a legacy config, each `[[links]]` entry is one step on every target, after the file steps and before the service
+In a legacy config, each `[[links]]` entry is one step on every target, after the file steps and before the absent
 steps: it links, relinks or leaves the symlink when the target's tags and facts match and shows as skipped when they do
 not ([Link steps](#link-steps)).
 
-In a legacy config, each `[[services]]` entry is one step on every target, after the link steps and before the
+In a legacy config, each `[[absent]]` entry is one step on every target, after the link steps and before the service
+steps: it removes the file, symlink or empty directory when the target's tags and facts match and shows as skipped when
+they do not ([Absent steps](#absent-steps)).
+
+In a legacy config, each `[[services]]` entry is one step on every target, after the absent steps and before the
 `[[steps]]`: it brings the service to its state under the target's init when the target's tags and facts match, and
 shows as skipped when they do not ([Service steps](#service-steps)).
 
@@ -835,7 +843,8 @@ The default, below `-vv`, shows only the steps that need a look:
 A target either ran its steps (`steps` and `ok`; a failed step shows its `code`, and `ok` is false) or failed in the
 transport (`error`, `ok: false`, and `steps` only when some steps completed before the error). `code` is `null` when the
 step was killed by a signal or timed out; a timed-out step is the last `steps` entry, next to `error`. `changed` says
-whether the step changed something, and so fired its `notify`: on file, dir, link, service, `run` and plugin steps,
+whether the step changed something, and so fired its `notify`: on file, dir, link, absent, service, `run` and plugin
+steps,
 skipped ones (`false`) included, and on handlers; the package step has none ([Handlers in a run](#handlers-in-a-run)).
 
 Unknown names from the package step are removed from captured output and collected in each target's
@@ -861,7 +870,7 @@ first reason counts: a SIGTERM after a failed save leaves `save_failed`.
 #### Tasks in a run
 
 A [`[[tasks]]`](configuration.md#tasks) config runs in the order written, not the fixed order above: a `packages`,
-`file`, `dir`, `link`, `service`, `run` or `plugin` task behaves as that kind of step does, wherever it stands. `plan`
+`file`, `dir`, `link`, `absent`, `service`, `run` or `plugin` task behaves as that kind of step does, wherever it stands. `plan`
 and `apply` run the same order. With this config, `anvil plan` on `local` prints:
 
 ```toml
@@ -917,7 +926,8 @@ include = "$/roles/web.toml"   # Validate config, then Start nginx with tags = [
 
 - **Failure.** `✘ step N exited C` counts the target's steps in run order, skipped ones included, so `N` is the place in
   the expanded list. A failure stops that target's remaining tasks.
-- **Probe.** apply probes a target when the list has a `packages`, `file`, `dir`, `link`, `service` or `plugin` task, or
+- **Probe.** apply probes a target when the list has a `packages`, `file`, `dir`, `link`, `absent`, `service` or
+  `plugin` task, or
   a task with `facts`, or the config has a doctor plugin. The probe runs once, before the first task ([One
   probe](configuration.md#tasks)). A sudo password any task needs is read before the run starts.
 - **Rollback.** `cannot undo` names a `run`, `plugin`, `packages` or `service` task by its path, on `--dry-run` as well:
@@ -1001,7 +1011,7 @@ service = { name = "sshd", state = "reloaded" }
   `PATH: TARGET: dropped N bad pending_handlers entries` on stderr, at any `-v`, and in the top-level `warnings`.
   Neither fails the apply. Delivery is at least once ([Handlers](configuration.md#handlers)).
 - **Rollback.** A handler that ran cannot be undone: rollback lists it as `cannot undo: handler NAME`, and queues the
-  handlers of the files, dirs and links it puts back ([`anvil rollback`](#anvil-rollback)).
+  handlers of the files, dirs, links and removed paths it puts back ([`anvil rollback`](#anvil-rollback)).
 
 `--json` marks each handler's report with `handler`, the handler's name, and gives every step `changed`: `true` for a
 file step that printed `wrote DEST` or `fixed DEST: …`, a dir step that printed `created DIR` or `fixed DIR: …`, a link
@@ -1059,7 +1069,7 @@ targets and its doctor plugins ([Doctor plugins](#doctor-plugins-drift-since-the
   target starts, and each target not started yet ends as `⊘ cancelled` with no steps. The summary and `--json` are
   printed as usual and the command exits 1. plan's running probes finish the same way.
 - **`--parallel 1` waits too.** Where Ctrl-C used to stop anvil at once, the first press now waits for the current step,
-  up to that step's timeout (30 s for a `[[steps]]`, `[[dirs]]`, `[[files]]`, `[[links]]` or plugin step (a password
+  up to that step's timeout (30 s for a `[[steps]]`, `[[dirs]]`, `[[files]]`, `[[links]]`, `[[absent]]` or plugin step (a password
   `[[files]]` step can take up to three of those), `[packages].timeout` for the package step, 120 s for a service step,
   `--timeout` for `anvil run`). Press again to stop at once.
 - **The second press stops everything at once.** anvil kills every step still running, logs
@@ -1088,7 +1098,7 @@ targets and its doctor plugins ([Doctor plugins](#doctor-plugins-drift-since-the
 #### The apply record
 
 An apply that probes its targets (`[packages]` with work, a plugin step, `[[dirs]]`, `[[files]]`, `[[links]]`,
-`[[services]]` or `[[handlers]]`, or on a tasks config [as in Tasks in a run](#tasks-in-a-run)) keeps `last-apply.json`,
+`[[absent]]`, `[[services]]` or `[[handlers]]`, or on a tasks config [as in Tasks in a run](#tasks-in-a-run)) keeps `last-apply.json`,
 which [`anvil rollback`](#anvil-rollback) reads. An apply of plain `[[steps]]` only does not open it.
 
 - **Where.** `$XDG_STATE_HOME/anvil/last-apply.json`, else `~/.local/state/anvil/last-apply.json`; an empty or relative
@@ -1099,17 +1109,18 @@ which [`anvil rollback`](#anvil-rollback) reads. An apply of plain `[[steps]]` o
   `apply: neither $XDG_STATE_HOME nor $HOME is set: cannot find the state directory` (`rollback: …` for a rollback),
   before any target.
 - **One entry per target.** Each target is merged into the record and saved as soon as it ends, by an atomic rename. A
-  target's entry is replaced only when a `[[files]]` write started there or a dir or link step ran there. A target the
-  apply reached without either keeps its files, dirs and links and gets the new facts. Targets this apply did not select
-  keep their entries.
+  target's entry is replaced only when a `[[files]]` write started there or a dir, link or absent step ran there. A
+  target the apply reached without either keeps its files, dirs, links and removed paths and gets the new facts. Targets
+  this apply did not select keep their entries.
 - **What it keeps.** Per target: when (`at`), the anvil version, whether every step passed (`ok`), the probe's facts,
   each file written, the steps that cannot be undone (`cannot_undo`, a handler that ran as `handler NAME`), the handlers
   still pending (`pending_handlers`, by name, left out when empty) and, after a rollback, `rolled_back`. Per file: the
   dest, the mode and `sudo` it was written with, the sha256 of the bytes written, how the write ended (`write`), what
   was there before (`previous`), the owner, group and mode the write left (`written_attrs`, as
   `{"uid": 0, "gid": 0, "mode": "0644"}`, once the write succeeded) and the directories `parents` created for it
-  (`created_dirs`, top down, left out when empty). Per directory (`dirs`) and per link (`links`), each left out when
-  empty: below. It never keeps a secret value, a step's script or a package list.
+  (`created_dirs`, top down, left out when empty), and `binary: true` when the src was
+  [binary](configuration.md#files) (left out when false). Per directory (`dirs`), per link (`links`) and per removed
+  path (`absent`), each left out when empty: below. It never keeps a secret value, a step's script or a package list.
 - **One entry per dest on a tasks config.** A dest two file tasks write in one apply, spelled the same or differing only
   by repeated slashes, has one file entry under its first spelling: `previous` from
   before the first write, and the mode, sha256 and `write` of the last, so doctor compares against the final bytes and
@@ -1172,9 +1183,9 @@ is not stored: the dest keeps its entry from the apply before, if any. The excep
 already created directories for DEST (`parents = true`): it is stored, or the earlier entry gains its
 `created_dirs`, so that rollback can remove them.
 
-**Version.** A record is written as `"version": 2` only when some target has `dirs` or `links`, or some file has
-`created_dirs` or is an owner, group or mode fix with the bytes unchanged (`fixed DEST: …`); any other stays
-`"version": 1`, as above, and this anvil reads both. An older anvil refuses a version 2 record, with
+**Version.** A record is written as `"version": 2` only when some target has `dirs`, `links` or `absent`, or some file has
+`created_dirs`, is an owner, group or mode fix with the bytes unchanged (`fixed DEST: …`) or has `binary`; any other
+stays `"version": 1`, as above, and this anvil reads both. An older anvil refuses a version 2 record, with
 `apply: PATH: version 2 is not supported` (`rollback: …` for a rollback), rather than load it and lose those fields on
 its next save; keep using this anvil, or a newer one, with that record.
 
@@ -1211,17 +1222,26 @@ next try, and a failed apply keeps the paths it did not reach):
 ]
 ```
 
+**Trees.** A [recursive copy](configuration.md#recursive-copy) keeps no entry of its own. Each file item it changed is a
+file entry at `DEST/rel`, its previous text kept or not under the rules below, and each directory it created is a dir
+entry with `previous` null; an item the tree's check found unchanged is not captured, and a directory that was already
+there is not recorded. The changed items are saved in batches, up to 16 items or 1 MiB of kept text, before the batch
+writes, and a directory as soon as it is created, so a killed apply leaves each item already written in the record. With
+many text files a tree can pass the 16 MiB limit below, and the texts dropped are lost for rollback;
+[`anvil plan`](#anvil-plan) warns of such a tree.
+
 **Pending handlers.** `pending_handlers` is saved as each notify happens and as each handler succeeds, so it outlives a
 failed, cancelled or killed apply. A new apply's entry and a rollback keep it, and a target whose entry is replaced
 carries it over. A record without the field loads as before. Bad names in it are dropped on load, with a warning
 ([Handlers in a run](#handlers-in-a-run)).
 
 **Kept or not.** The previous text is kept only when the previous file is world-readable (its mode has `0o004`), the
-text is UTF-8 with no NUL byte and at most 256 KiB, and the entry does not set `rollback = false`. Otherwise `kept` is
-false and `reason` says why: `rollback = false`, `not world-readable`, `over 256 KiB`, `not UTF-8 text`, `contains NUL`,
-`unreadable`, `no od on the target` or `record full`. The write goes ahead either way; only its undo is lost, and
-rollback shows the file as `cannot undo: DEST (REASON)`. `rollback = false` keeps the hash only: use it for a dest that
-holds a secret ([Files](configuration.md#files)).
+text is UTF-8 with no NUL byte and at most 256 KiB, the entry does not set `rollback = false` and the src written is
+not binary. Otherwise `kept` is false and `reason` says why: `rollback = false`, `not world-readable`, `over 256 KiB`,
+`binary` (the previous file or the src is not UTF-8 or holds a NUL byte), `unreadable`, `no od on the target` or
+`record full`. A record that holds a previous text under a `binary` file is refused on load. The write goes ahead
+either way; only its undo is lost, and rollback shows the file as `cannot undo: DEST (REASON)`. `rollback = false` keeps
+the hash only: use it for a dest that holds a secret ([Files](configuration.md#files)).
 
 **Not world-readable.** The bytes of such a file do not leave the target: the capture sends only its `ls` line and its
 sha256, so a target with no hash tool leaves the hash empty and the write unguarded. Apply warns, `apply: DEST on TARGET
@@ -1287,10 +1307,11 @@ overwritten by rollback without `--force`. Such an untouched file whose previous
 A save that fails before a write stops the run with that file unwritten: the target ends
 `aborted: a record save failed`.
 
-**Known limits.** A dir or link step is saved after it ends, from the lines it printed, not before it starts as a file
-write is. A dir or link step whose connection is lost, or whose anvil is killed, before it printed anything is therefore
-not in the record, and rollback cannot undo what it may have done there. `anvil doctor`'s drift checks and the record a
-[doctor plugin](#doctor-plugins-drift-since-the-last-apply) gets do not cover `dirs` and `links` yet.
+**Known limits.** A dir, link or absent step is saved after it ends, from the lines it printed, not before it starts
+as a file write is. A dir, link or absent step whose connection is lost, or whose anvil is killed, before it printed
+anything is therefore not in the record, and rollback cannot undo what it may have done there. `anvil doctor`'s drift
+checks and the record a [doctor plugin](#doctor-plugins-drift-since-the-last-apply) gets do not cover `dirs`, `links`
+and `absent` yet.
 
 **Reading DEST first.** Before each `[[files]]` write, a separate run reads DEST through the same path as the write
 (`ls -lLdn` and `od`). Its output is never printed or logged. A dest that is not a regular file fails the step with
@@ -1306,12 +1327,12 @@ overwritten and the record holds what was read.
 Shows the steps `anvil apply` would run on every selected target, and runs none of them. Each target is probed over its
 transport, even without `[packages]` work, so a target that cannot be reached fails here as it would under apply. Its
 steps then come from the same resolver apply uses: the package step when `[packages]` has work, then each `[[dirs]]`,
-`[[files]]`, `[[links]]`, `[[services]]` and `[[steps]]` entry, in that order. No package command, no file write, no
-directory or link change, no service command and no `[[steps]]` script runs. A target that cannot be reached, probed or
-resolved fails with the same reason apply gives (`packages: REASON` for the probe, the manager and a `pin` on brew, apt
-or apk, such as `packages: pin is not one-shot on brew: vim`; without `[packages]` work a failed probe reads
-`probe: REASON`), and the other targets are still planned. plan runs each plugin step's plugin on the controller, as
-apply would, to list the script it returns ([Plugin steps](#plugin-steps)).
+`[[files]]`, `[[links]]`, `[[absent]]`, `[[services]]` and `[[steps]]` entry, in that order. No package command, no
+file write, no directory or link change, no removal, no service command and no `[[steps]]` script runs. A target that
+cannot be reached, probed or resolved fails with the same reason apply gives (`packages: REASON` for the probe, the
+manager and a `pin` on brew, apt or apk, such as `packages: pin is not one-shot on brew: vim`; without `[packages]` work
+a failed probe reads `probe: REASON`), and the other targets are still planned. plan runs each plugin step's plugin on
+the controller, as apply would, to list the script it returns ([Plugin steps](#plugin-steps)).
 
 plan never opens the secret store. A step that would type a sudo password says which secret it would use; whether that
 secret is set and free of control characters is not checked, so plan can pass where apply then fails with
@@ -1336,7 +1357,8 @@ secret is set and free of control characters is not checked, so plan can pass wh
   per var, then an `env.KEY = VALUE (LEVEL)` line per env value, shown as doctor shows them, on a planned, failed or
   cancelled target alike: `vars.port = 8080 (tag:web)`, `env.APP_ENV = prod (host)`. Values are shown as is.
 - A [`[[tasks]]`](#tasks-in-a-run) config adds a `PATH  NAME` line above each step.
-- Each step is a `would $ RUN` line (a multi-line `run` shows its first line and `…`), followed by
+- Each step is a `would $ RUN` line (a multi-line `run` shows its first line and `…`), followed by `(binary)` for a
+  [binary](configuration.md#files) file src, whose rollback is lost, and
   `(sudo password from secret NAME)` when apply would type that secret's value at sudo's prompt.
 - A [templated](configuration.md#templating) file step adds `rendered N bytes, sha256 HEX` under its `would $ file DEST`
   line: the size and the full sha256 of that target's rendered text, the bytes apply would write. A target whose render
@@ -1348,10 +1370,19 @@ secret is set and free of control characters is not checked, so plan can pass wh
   lines. plan reads no dest, so it cannot tell whether apply would write, fix or leave it unchanged, and it creates no
   directory. A `sudo = false` owner other than the login user fails the target in plan as in apply
   (`✘ files[0].owner NAME: needs sudo; the login user is USER`).
+- A [recursive copy](configuration.md#recursive-copy) on a target it matches adds a header line before its first step,
+  `files[N] SRC -> DEST (tree: N items, SIZE bytes)` (`PATH.file` for a task), where the count includes dest itself and
+  SIZE is the bytes of all its files. Then each item is its own line: `would $ dir PATH` with `mode DIR_MODE`,
+  `group NAME` when set and `parents` on dest when set, and `would $ file PATH` with `(binary)` for a binary file and
+  `owner` and `group` lines when set. The TUI's plan view shows these steps but not the header line.
+- A recursive entry with `rollback` whose text files could keep more previous text than the record holds is a warning
+  on stderr, `WARNING: files[N] DEST: rollback may not keep every previous text (record full)`. It is an estimate: the
+  tree's text files times 256 KiB, the most kept for one file, against the 16 MiB record, counted per entry, not per
+  target it matches; binary files keep only hashes and do not count ([The apply record](#the-apply-record)).
 - A dir step is `would $ dir PATH`, with `mode MODE`, then `owner NAME`, `group NAME` and `parents` for those its entry
   sets. A link step is `would $ link PATH -> TARGET` (control and invisible characters in TARGET escaped), with `force`
-  and `parents` when set. plan looks at neither path, so it cannot tell whether apply would create, fix, link, relink or
-  leave it unchanged.
+  and `parents` when set. An absent step is `would $ absent PATH`, with `type TYPE` when set. plan looks at none of
+  these paths, so it cannot tell whether apply would create, fix, link, relink, remove or leave it unchanged.
 - A step with `notify` adds `notifies NAME, NAME` after its `would $`, guard and file lines: the handlers it may notify.
   Handlers are never `would $` lines, since they run only when notified. After the steps, a target whose entry in the
   local [apply record](#the-apply-record) lists pending handlers shows `pending from last apply: NAME, …`, which the
@@ -1366,11 +1397,12 @@ secret is set and free of control characters is not checked, so plan can pass wh
 `--json` is apply's document with `"executed": false` first; a step has its `run` and, when apply would type a sudo
 password, its `sudo_secret`, plus `task` and `name` on a tasks config, `owner`, `group` and `parents` (`true`) on a file
 step that sets them, `mode` and those three on a dir step, `target`, `force` (`true`) and `parents` on a link step,
-`guards` on a guarded step and `notify` (the names) on a step with `notify`, but never `code`, `stdout` or `stderr`. A
-planned target with pending handlers has `pending_handlers`, left out when empty, and the record's load warnings are a
-top-level `warnings` array, the same text without the `WARNING:` prefix, left out when empty. A target with vars or env
-also has `vars` and `env`, as in doctor's `--json` (`"vars": {"port": {"value": 8080, "level": "tag:web"}}`), and a
-step's `run` is the script as written, without the env lines:
+`path` and `type` (when set) on an absent step, `guards` on a guarded step and `notify` (the names) on a step with
+`notify`, but never `code`, `stdout` or `stderr`. A planned target with pending handlers has `pending_handlers`, left
+out when empty, and the record's load warnings are a top-level `warnings` array, the same text without the `WARNING:`
+prefix, left out when empty. A target with vars or env also has `vars` and `env`, as in doctor's `--json`
+(`"vars": {"port": {"value": 8080, "level": "tag:web"}}`), and a step's `run` is the script as written, without the env
+lines:
 
 ```json
 {
@@ -1404,6 +1436,46 @@ step's `run` is the script as written, without the env lines:
 
 A target a cancel skipped is `{"target": "pi", "ok": false}`, with `"abort": "terminated"` or `"hung_up"` when a first
 SIGTERM or SIGHUP did it ([Ctrl-C](#ctrl-c)).
+
+**Recursive copies.** A tree's steps are its items, so plan shows what apply would run, never whether an item would
+change; plan reads no dest. With a `[[files]]` entry `src = "conf"`, `dest = "/srv/app"`, `mode = "0640"`,
+`recursive = true` and `dir_mode = "0750"`, whose src holds `a.conf` (6 bytes) and `sub/c.bin` (3 bytes, binary):
+
+```text
+▶ local
+  files[0] conf -> /srv/app (tree: 4 items, 9 bytes)
+  would $ dir /srv/app
+    mode 0750
+  would $ file /srv/app/a.conf
+  would $ dir /srv/app/sub
+    mode 0750
+  would $ file /srv/app/sub/c.bin (binary)
+  ✔ 4 steps
+```
+
+In `--json` a planned target with a tree has `trees`, left out when there is none: per tree, `step` (the index in
+`steps` of its first step, dest's), `entry`, `src`, `dest`, `size`, and `items` in step order, each
+`{path, kind, size, binary}` with `path` relative to dest (`""` for dest itself), `kind` `dir` or `file` and `size` 0
+for a directory. The bytes are never in it. The record warning above is in the top-level `warnings`, without the
+`WARNING:` prefix.
+
+```json
+"trees": [
+  {
+    "step": 0,
+    "entry": "files[0]",
+    "src": "conf",
+    "dest": "/srv/app",
+    "size": 9,
+    "items": [
+      { "path": "", "kind": "dir", "size": 0, "binary": false },
+      { "path": "a.conf", "kind": "file", "size": 6, "binary": false },
+      { "path": "sub", "kind": "dir", "size": 0, "binary": false },
+      { "path": "sub/c.bin", "kind": "file", "size": 3, "binary": true }
+    ]
+  }
+]
+```
 
 **Templated files.** plan never reads a dest, so it cannot diff; it shows what each target would get instead. Without
 a flag that is the `rendered N bytes, sha256 HEX` line, and no file bytes are printed. `--show-rendered` also prints
@@ -1685,8 +1757,8 @@ only the keys that are set:
 
 ### File steps
 
-A `[[files]]` entry, or a `file` [task](#tasks-in-a-run), copies one text file from the workspace or file store onto each
-selected target whose tags and facts match ([Files](configuration.md#files)):
+A `[[files]]` entry, or a `file` [task](#tasks-in-a-run), copies one file, text or binary, from the workspace or
+file store onto each selected target whose tags and facts match ([Files](configuration.md#files)):
 
 ```toml
 [[files]]
@@ -1732,10 +1804,41 @@ In `--json` a file step's `run` is that label. A skipped step has `"skipped": tr
 { "run": "skipped file /etc/motd: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true, "changed": false }
 ```
 
-`anvil plan` shows `would $ file DEST`, with `(sudo password from secret NAME)` when apply would take the password path,
-and `would $ skipped file DEST: no match`; an entry that sets them adds `owner NAME`, `group NAME` and `parents` lines,
-and a templated file its `rendered N bytes, sha256 HEX` line. In `plan --json` the `run` is the same label, with
-`sudo_secret` for the password path and `owner`, `group` and `parents` (`true`) when the entry sets them.
+`anvil plan` shows `would $ file DEST`, with `(binary)` for a binary src, whose rollback is lost, and
+`(sudo password from secret NAME)` when apply would take the password path, and `would $ skipped file DEST: no match`;
+an entry that sets them adds `owner NAME`, `group NAME` and `parents` lines, and a templated file its
+`rendered N bytes, sha256 HEX` line. In `plan --json` the `run` is the same label, with
+`binary: true` for a binary src, `sudo_secret` for the password path and `owner`, `group` and `parents` (`true`) when
+the entry sets them.
+
+A src that is not UTF-8, or holds a NUL byte, is [binary](configuration.md#files) and copied byte for byte. It goes to
+the target as `printf` octal escapes, up to about four times its size on the wire, and the step's 30 s timeout grows by
+15 s per MiB sent. The target's `sh` must have `printf` as a builtin, else the step refuses, exit 4, before anything is
+written: `files: printf is not a shell builtin; cannot copy a binary file`. A text file still goes in a heredoc, its
+bytes unchanged. A binary write cannot be undone ([`anvil rollback`](#anvil-rollback)).
+
+An entry with [`recursive = true`](configuration.md#recursive-copy) copies a directory tree, and is one step per item
+on a target that matches, in sorted path order: `$ dir PATH` for dest and each directory, `$ file PATH` for each file,
+each printing what it did as above. A directory is create-only: a missing one prints `created PATH`, an existing one is
+left as it is and prints `unchanged PATH`, and a symlink, file or anything else at its path fails the step, exit 4, with
+`dirs: PATH is not a directory`, never followed. Files in dest that the tree does not hold are kept. Before the first
+item one check run looks at the whole tree, and each item already as the tree has it runs nothing and prints
+`unchanged PATH`; on the sudo password path there is no check run. The entry's `notify` fires once when any item
+changed. A target the entry does not match has the one skipped step, `$ skipped file DEST: no match`. With `-vv`, on a
+second apply after one file changed in src:
+
+```text
+▶ web1
+  $ dir /etc/nginx
+  unchanged /etc/nginx
+  $ file /etc/nginx/nginx.conf
+  wrote /etc/nginx/nginx.conf
+  $ dir /etc/nginx/sites
+  unchanged /etc/nginx/sites
+  $ file /etc/nginx/sites/default
+  unchanged /etc/nginx/sites/default
+  ✔ ok · 4 steps
+```
 
 Before each write, apply reads DEST back and keeps what it held in the [apply record](#the-apply-record), so
 [`anvil rollback`](#anvil-rollback) can put it back; the write then refuses a DEST that changed since that read.
@@ -1775,11 +1878,18 @@ owner name fails the target before any step runs on it, exit 1, with
 directory checks ([Files](configuration.md#files)).
 
 `apply` and `plan` read every src before any target is contacted. A src that is missing, outside the workspace, not
-a regular file, over 1 MiB, or not text is exit 2, and one bad src stops the command for every target, those the entry
-does not match included:
+a regular file, over 1 MiB, or binary with `template = true` is exit 2, and one bad src stops the
+command for every target, those the entry does not match included:
 
 ```text
 ERROR anvil: files[0].src `../nope`: cannot read: No such file or directory (os error 2)
+```
+
+A [recursive](configuration.md#recursive-copy) src is walked whole at that point, and a symlink or special file in it,
+a bad name, a tree nested too deep or one past the tree limits is exit 2 the same way:
+
+```text
+ERROR anvil: files[0].src `conf`: sub/link: is a symlink; a recursive copy refuses symlinks
 ```
 
 The refusals, the matching rules and what lands on the target (owner and group, symlinks, missing parent directories) are in
@@ -1901,6 +2011,48 @@ Each link step is kept in the [apply record](#the-apply-record) with what PATH w
 target, or the text of a file `force` replaced, under the file rules), so that [`anvil rollback`](#anvil-rollback)
 removes a created link, points a replaced one back at its old target, or writes the replaced file back.
 
+### Absent steps
+
+An `[[absent]]` entry, or an `absent` [task](#tasks-in-a-run), removes the file, symlink or empty directory at PATH on
+each selected target whose tags and facts match ([Absent](configuration.md#absent)):
+
+```toml
+[[absent]]
+path = "/etc/nginx/sites-enabled/default"
+type = "link"
+```
+
+Every `[[absent]]` entry is one step on every target, in config order, after the link steps and before the service
+steps; an `absent` task is the same step where it stands. On a target that matches, the step shows as `$ absent PATH`
+and prints one of:
+
+- `removed PATH`: a file, a symlink (never what it points at) or an empty directory was removed.
+- `unchanged PATH`: nothing was there, or a directory above PATH is missing.
+
+`removed` counts as changed and fires the step's `notify`; `unchanged` does not. With `-vv`:
+
+```text
+▶ linode1
+  $ absent /etc/nginx/sites-enabled/default
+  removed /etc/nginx/sites-enabled/default
+  ✔ ok · 1 step
+```
+
+These fail the step and leave PATH as it is (exit 4 inside the step, the target fails, exit 1):
+
+- `absent: PATH is not empty`: a directory is never removed recursively
+- `absent: PATH is a dir, not link` (or `file`, `link`, `dir`): PATH is not the entry's `type`
+- `absent: PATH is not a file, dir or link`
+- `absent: PATH points at a target anvil cannot record; anvil will not remove it`: the record could not keep the
+  link's target, so a rollback could not put it back
+
+The directories above PATH pass the root-only checks with `absent:` in the messages, so a path under a group- or
+world-writable directory such as `/tmp` is refused; none is ever created. On a target that does not match, it is
+`$ skipped absent PATH: no match`. In `--json` the `run` is `absent PATH`.
+
+Each removal is kept in the [apply record](#the-apply-record) with what PATH was (a link's target, a file under the
+file rules, a directory's owner, group and mode), so that [`anvil rollback`](#anvil-rollback) puts it back.
+
 ### Service steps
 
 A `[[services]]` entry brings one service to a state on each selected target whose tags and facts match, under the
@@ -1919,8 +2071,8 @@ state = "stopped"
 tags = ["web"]
 ```
 
-Every `[[services]]` entry is one step on every target, in config order, after the `[[links]]` steps and before the
-`[[steps]]`, so the order is packages, dirs, files, links, services, steps; a `service` task is the same step where it
+Every `[[services]]` entry is one step on every target, in config order, after the `[[absent]]` steps and before the
+`[[steps]]`, so the order is packages, dirs, files, links, absent, services, steps; a `service` task is the same step where it
 stands. On a target that matches, the step shows as `$ service NAME`. It asks the init first, changes only what differs
 and prints one line per change, in the order made: `enabled service NAME`, `disabled service NAME`,
 `started service NAME`, `stopped service NAME`. With nothing to change it prints `unchanged service NAME`, so a rerun is
@@ -2087,12 +2239,14 @@ launchd and crashed OpenRC paths are tested against stand-in tools.
 anvil rollback [--force DEST]... [--force-all] [--allow-host-change] [--dry-run]
 ```
 
-Puts back, on every selected target, the files, directories and links the last apply changed there, from the [apply
+Puts back, on every selected target, the files, directories, links and removed paths the last apply changed there,
+from the [apply
 record](#the-apply-record). Each file gets its previous text, owner, group and mode back; a dest that did not exist
 before is removed; a file whose bytes apply left alone, fixing only its owner, group or mode, gets those back; a
 directory `[[dirs]]` created is removed when empty, and one it fixed gets its owner, group and mode back; a link
 `[[links]]` created is removed, one it replaced points at its old target again, and a file `force` replaced is written
-back; and the directories `parents = true` created are removed when empty. It runs at once, with no confirmation;
+back; a path `[[absent]]` removed is made again while it is missing; and the directories `parents = true` created are
+removed when empty. It runs at once, with no confirmation;
 `--dry-run` shows first what it would do:
 
 ```sh
@@ -2129,12 +2283,15 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 2 ok, 0 failed
 ```
 
-- **Order.** Links come first, then files, then directories, each last written first, so a link or file goes before the
-  directory that holds it; then the steps that cannot be undone.
+- **Order.** Removed paths come first, then links, then files, then directories, each last written first, so a link or
+  file goes before the directory that holds it; then the steps that cannot be undone.
 - **Last written first.** Each recorded file is one step, in the reverse of the order apply wrote them:
   `restore DEST` prints `restored DEST`, `remove DEST` prints `removed DEST`, and either prints `unchanged DEST` when
   DEST already is what it was before the apply (a restore still sets the owner, group and mode back). A file whose text was not kept
   is a skipped step `cannot undo: DEST (REASON)`, with the reason from the record (`rollback = false`, say).
+- **Binary files.** A file whose src was [binary](configuration.md#files) is always `cannot undo: DEST (binary)`, and
+  DEST is left as it is, also when it did not exist before the apply or only its owner, group or mode changed (a known
+  limit); the directories `parents = true` created for it stay too.
 - **Owner, group and mode only.** After an apply that printed `fixed DEST: …`, the step is
   `restore owner, group and mode of DEST`. It needs no text, so it works for a 0600 or 0640 file too, and leaves the
   bytes alone. It narrows the mode to the owner's bits before it changes the owner or group, sets the recorded mode last
@@ -2158,6 +2315,12 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   with `dirs: PATH is not a directory`, forced or not. The directories `parents = true` created above PATH are removed
   after it, as for a file. A refused step kept only for those directories is the step
   `remove the directories made for PATH`, which only removes them.
+- **Trees.** The items of a [recursive copy](configuration.md#recursive-copy) roll back as files and directories do:
+  a file gets its kept text back, or is removed when the apply created it, and a binary file or one with
+  `rollback = false` (which holds for every item) is `cannot undo: PATH (REASON)`. The directories the tree created
+  come after its files and are removed deepest first, each only when empty, so one that holds a file the tree did not
+  write stays, with the warning `rollback: PATH is not empty; left in place`. An item whose previous text the record
+  limit dropped is `cannot undo: PATH (record full)`. The entry's `notify` is queued once.
 - **Links.** A link the step created is `remove link PATH`, printing `removed link PATH`, or `unchanged PATH` when it is
   already gone. A link it replaced is `restore link PATH -> OLD`, which puts the old link back in one rename, as apply
   relinks, and prints `restored link PATH -> OLD`, or `unchanged PATH` when PATH already points at OLD. A regular file
@@ -2170,6 +2333,15 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   there fails with `links: PATH is a directory`, and for the other two steps anything else that is not a link fails with
   `links: PATH is not a symlink`, forced or not. A refused step kept only for the directories it created above PATH is
   the step `remove the directories made for PATH`, which only removes them.
+- **Removed paths.** A path an `[[absent]]` step removed is put back only while it is missing: `restore PATH` writes a
+  file's kept text to a temp beside it, gives it its owner, group and mode and renames it onto PATH, printing
+  `restored PATH`; `restore link PATH -> TARGET` prints `restored link PATH -> TARGET`; `restore directory PATH` makes
+  it and gives it its owner, group and mode, printing `restored directory PATH`. The directories above PATH pass the
+  same checks as on apply, and the one holding it must exist: none is made
+  (`absent: DIR does not exist; PATH is not restored`). A PATH that is again the kind removed prints `unchanged PATH`,
+  and `--force` changes nothing there. One of another kind fails, forced or not, with
+  `absent: PATH is a link now, not the file the apply removed; rollback will not replace it`; a directory is never
+  removed. A file whose text was not kept, or a removal the step could not record, is `cannot undo: PATH (REASON)`.
 - **Not restored.** Each such file, whatever the reason, also shows as `⚠ not restored: DEST (REASON)` in its target's
   block and in `warnings`, and the summary is not a clean ok: it reads `2 ok, 0 failed, 1 not restored`, then
   `DEST on TARGET (REASON)` per file; `--json` lists them as `"not_restored":[{"target","dest","reason"}]`, left out when
@@ -2179,11 +2351,11 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   steps: `cannot undo: packages`, `cannot undo: service NAME` and `cannot undo: step N` (the Nth `[[steps]]` entry), or
   on a tasks config `cannot undo: PATH` ([Tasks in a run](#tasks-in-a-run)), and `cannot undo: handler NAME` for a
   handler that ran. Rollback never runs a package manager, a service command, a step or a handler.
-- **Handlers queued.** For each file, directory or link it put back, rollback adds the `notify` names of the entries for
-  that path that apply to the target, matched with the facts the record saved, not the probe's, to the target's
-  `pending_handlers`, in `[[handlers]]` order and once each, so the next apply runs them. Each one queued is a warning
-  in the target's block, `⚠ pending handler NAME queued for the next apply`, and in its `warnings`. Bad pending names in
-  the record are dropped on load with a warning on stderr and in the top-level `warnings`, as for apply.
+- **Handlers queued.** For each file, directory, link or removed path it put back, rollback adds the `notify` names of
+  the entries for that path that apply to the target, matched with the facts the record saved, not the probe's, to the
+  target's `pending_handlers`, in `[[handlers]]` order and once each, so the next apply runs them. Each one queued is a
+  warning in the target's block, `⚠ pending handler NAME queued for the next apply`, and in its `warnings`. Bad pending
+  names in the record are dropped on load with a warning on stderr and in the top-level `warnings`, as for apply.
 - **The same path as the write.** Each file is restored as apply wrote it, from the recorded `sudo` and the target's
   current facts: through `sudo -n`, as root, as the connecting user, or on the password path, which stages the text in
   a 0600 `/tmp/anvil-` file and replaces DEST from it through `sudo`, with the recorded owner and mode. The sudo
@@ -2205,11 +2377,25 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   (`in the config` on a tasks config). Each recorded directory and link must be the `path` of a `[[dirs]]` or
   `[[links]]` entry the same way, with the same messages naming `[[dirs]]` or `[[links]]`
   (`rollback: PATH is not in [[links]]; refusing to restore it`, `no dir task for PATH applies to TARGET` on a tasks
-  config), and a link whose record keeps a file `force` replaced needs that entry to say `force = true`:
+  config), each removed path the `path` of an `[[absent]]` entry or absent task with the same `sudo`
+  (`rollback: PATH is not in [[absent]]; refusing to restore it`), and a link whose record keeps a file `force` replaced
+  needs that entry to say `force = true`:
   `rollback: PATH has a replaced file in the record but no force = true in [[links]]; refusing to restore it`. Put the
   entry back to roll that target back. A record whose dest, mode or sha256 apply could not have written (a relative
   dest, a `..`, a leading `-`, a mode that is not octal) fails with `rollback: PATH: cannot parse`, as a bad record
   does.
+- **Tree items.** Rollback reads each recursive entry's src again, as apply does (a single file's src is not read), and
+  a recorded file or directory at or under that entry's dest counts only when the loaded tree holds it as an item of
+  the same kind, with the same `sudo`, for a target the entry applies to. A tree that no longer loads is exit 2,
+  before any target:
+  ``rollback: files[0].src `conf`: REASON; …``, ending in
+  `the config decides which files may be restored: fix or restore what it names, then run rollback again`.
+  An item the src no longer holds is the skipped step `cannot undo: PATH (no longer in the tree)`, also under
+  `--dry-run`, and is left as it is; rollback goes on with the rest. Anything else fails the target, as above:
+  `rollback: PATH is a directory of a recursive entry's tree in [[files]], not a file; refusing to restore it`,
+  `rollback: PATH is a file of a recursive entry's tree in [[files]], not a directory; refusing to restore it`, the
+  `sudo` message, `has directories created for it` for a tree file (only dest itself may have them, with
+  `parents = true`), and the `is not in` messages for a path under no dest the config names.
 - **The guard.** Before it changes DEST, the step hashes it. It goes ahead when DEST holds the bytes apply wrote or what
   was there before. When the record has `written_attrs`, DEST must also have the owner, group and mode apply left, so a
   `chown` or `chmod` since the apply counts as a change; after an owner, group or mode fix, what was there before is the
@@ -2239,7 +2425,7 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 - **`rolled_back`.** After each target, the dests it restored, removed or found unchanged are saved in its entry as
   `rolled_back` (`at` and `dests`). That and the queued handlers are the only changes rollback makes to the record, so a
   second rollback restores the same bytes again, or prints `unchanged DEST`. The next apply that writes a file, or runs
-  a dir or link step, on the target replaces the entry.
+  a dir, link or absent step, on the target replaces the entry.
 - **Targets.** A selected target with no entry in the record shows `nothing recorded` and is ok. An entry for a target
   no longer in the inventory is not rolled back.
 - **The lock.** Rollback holds the record's lock for its whole run, as apply does
@@ -2250,10 +2436,11 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 `--dry-run` reads the record without the lock and connects to nothing. It prints `would restore DEST`,
 `would restore owner, group and mode of DEST`, `would remove DEST`, `would remove directory DIR when empty` (after its
 dest, deepest first), for a link `would remove link PATH`, `would restore link PATH -> OLD` or `would restore PATH`, for
-a directory `would remove directory PATH when empty` or `would restore owner, group and mode of PATH`, `cannot undo: …`
+a directory `would remove directory PATH when empty` or `would restore owner, group and mode of PATH`, for a removed
+path `would restore PATH`, `would restore link PATH -> TARGET` or `would restore directory PATH`, `cannot undo: …`
 and `nothing recorded` per target, in the order a rollback runs, then `N targets, nothing executed`. It makes the same
-`[[files]]`, `[[dirs]]` and `[[links]]` checks as a rollback, with the record's facts in place of a probe: a target a
-rollback would refuse shows `✘ rollback: …` (`"error"` in `--json`), the summary reads
+`[[files]]`, `[[dirs]]`, `[[links]]` and `[[absent]]` checks as a rollback, with the record's facts in place of a probe:
+a target a rollback would refuse shows `✘ rollback: …` (`"error"` in `--json`), the summary reads
 `N targets, M failed, nothing executed`, and the exit is 1:
 
 ```text
@@ -2275,11 +2462,11 @@ Exit codes:
 
 - **0**: every selected target rolled back, or had nothing recorded; files whose text was not kept are named, not failed.
 - **1**: `rollback: no apply recorded` (no record, or one with no entry; nothing runs); a target failed (a refused dest,
-  a dest not in `[[files]]`, a path not in `[[dirs]]` or `[[links]]`, or one with another `sudo`, a host change, a
+  a dest not in `[[files]]`, a path not in `[[dirs]]`, `[[links]]` or `[[absent]]`, or one with another `sudo`, a host change, a
   failed restore or connection); the record cannot be read (`rollback: PATH: REASON`, as for apply), is locked by
   another anvil or cannot be saved; no state directory ([The apply record](#the-apply-record)).
 - **2**: a bad flag (`--force` with `--force-all`), a `--force DEST` not in the record, an unknown `--target`, or an
-  invalid config or inventory, including a task or include that does not expand.
+  invalid config or inventory, including a task or include that does not expand or a recursive src that does not load.
 
 ### `anvil run [--timeout SECS] <FILE|->`
 

@@ -552,6 +552,76 @@ fn rollback_through_sudo_with_a_password_installs_the_previous_owner_and_mode() 
 }
 
 #[test]
+fn rollback_through_sudo_with_a_password_recreates_a_removed_file_from_a_staged_copy() {
+    if !common::have_script() {
+        eprintln!("skip: no script(1) for fake-ssh -tt");
+        return;
+    }
+    let (sandbox, secrets, path) = common::sudo_sandbox("rb");
+    let conf = sandbox.root().join("conf");
+    std::fs::write(&conf, PREVIOUS).unwrap();
+    std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o604)).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!("{secrets}[[absent]]\npath = \"{}\"\n", conf.display()),
+    );
+    let sudo_log = sandbox.root().join("sudo.log");
+    let run = |args: &[&str]| {
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .arg("--ssh-program")
+            .arg(common::fixture("fake-ssh.sh"))
+            .args(args)
+            .args(["--target", "fake"])
+            .env("PATH", &path)
+            .env("FAKE_SUDO_LOG", &sudo_log)
+            .env("FAKE_SUDO_PW", common::VALUE)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["apply"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(!conf.exists());
+
+    let _ = std::fs::remove_file(&sudo_log);
+    let out = run(&["-vv", "rollback"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    common::assert_no_value(&out);
+    for shown in [text(&out.stdout), text(&out.stderr)] {
+        assert!(!shown.contains(PREVIOUS.trim_end()), "{shown}");
+    }
+    assert!(
+        text(&out.stdout).contains(&format!("restored {}\n", conf.display())),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(std::fs::read_to_string(&conf).unwrap(), PREVIOUS);
+    assert_eq!(mode(&conf), 0o604);
+    let sudo = std::fs::read_to_string(&sudo_log).unwrap();
+    assert!(
+        sudo.lines().any(|line| line == "-v"),
+        "the password was typed: {sudo}"
+    );
+    // The bytes came from the staged copy, which is gone, as is the temp.
+    let staged = (sudo.split_whitespace())
+        .find(|word| word.starts_with("/tmp/anvil-"))
+        .unwrap_or_else(|| panic!("no staged copy in {sudo}"));
+    assert!(!Path::new(staged).exists(), "{staged}");
+    let names: Vec<_> = std::fs::read_dir(sandbox.root())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".anvil-"))
+        .collect();
+    assert!(names.is_empty(), "{names:?}");
+}
+
+#[test]
 fn a_failed_restore_stops_the_target_and_records_only_the_earlier_ones() {
     let sandbox = Sandbox::new("rb");
     std::fs::create_dir(sandbox.root().join("out")).unwrap();
@@ -1676,4 +1746,688 @@ fn a_recorded_replaced_file_needs_force_in_the_config() {
         "{shown}"
     );
     assert!(std::fs::symlink_metadata(&file).unwrap().is_symlink());
+}
+
+/// A config of three `[[absent]]` on local, `sudo = false`, each notifying
+/// `flush`: `<root>/conf` (a 0604 text file), `<root>/link` (a link to
+/// `/nowhere/app`) and `<root>/empty` (a 0750 empty directory); applied
+/// once, so all three are gone. Returns the three paths.
+fn absent_applied(sandbox: &Sandbox) -> [String; 3] {
+    let root = sandbox.root().display().to_string();
+    let [conf, link, empty] = ["conf", "link", "empty"].map(|p| format!("{root}/{p}"));
+    std::fs::write(&conf, "kept text\n").unwrap();
+    std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o604)).unwrap();
+    std::os::unix::fs::symlink("/nowhere/app", &link).unwrap();
+    std::fs::create_dir(&empty).unwrap();
+    std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let absent = |path: &str| {
+        format!("[[absent]]\npath = \"{path}\"\nsudo = false\nnotify = [\"flush\"]\n\n")
+    };
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}{}{}[[handlers]]\nname = \"flush\"\nrun = \"true\"\n",
+            absent(&conf),
+            absent(&link),
+            absent(&empty)
+        ),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    for path in [&conf, &link, &empty] {
+        assert!(std::fs::symlink_metadata(path).is_err(), "{path}");
+    }
+    [conf, link, empty]
+}
+
+#[test]
+fn rollback_recreates_a_removed_file_link_and_empty_dir_last_removed_first() {
+    let sandbox = Sandbox::new("ra");
+    let [conf, link, empty] = absent_applied(&sandbox);
+
+    let out = sandbox.anvil(&["rollback", "--dry-run", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  would restore directory {empty}\n  \
+             would restore link {link} -> /nowhere/app\n  \
+             would restore {conf}\n  \
+             cannot undo: step 1\n  cannot undo: handler flush\n  ✔ 5 steps\n\n\
+             1 target, nothing executed\n"
+        )
+    );
+
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let value = json(&out);
+    let steps = value["targets"][0]["steps"].as_array().unwrap();
+    let shown: Vec<(&str, &str)> = steps[..3]
+        .iter()
+        .map(|s| (s["run"].as_str().unwrap(), s["stdout"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (
+                format!("restore directory {empty}").as_str(),
+                format!("restored directory {empty}\n").as_str()
+            ),
+            (
+                format!("restore link {link} -> /nowhere/app").as_str(),
+                format!("restored link {link} -> /nowhere/app\n").as_str()
+            ),
+            (
+                format!("restore {conf}").as_str(),
+                format!("restored {conf}\n").as_str()
+            ),
+        ]
+    );
+    assert_eq!(std::fs::read_to_string(&conf).unwrap(), "kept text\n");
+    assert_eq!(mode(Path::new(&conf)), 0o604);
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        Path::new("/nowhere/app")
+    );
+    assert!(Path::new(&empty).is_dir());
+    assert_eq!(mode(Path::new(&empty)), 0o750);
+    let record = sandbox.last_apply().unwrap();
+    let target = &record["targets"]["local"];
+    assert_eq!(
+        target["rolled_back"]["dests"],
+        serde_json::json!([empty, link, conf])
+    );
+    assert_eq!(target["pending_handlers"], serde_json::json!(["flush"]));
+
+    // Back again: each is what was removed, so it is left alone.
+    std::fs::write(&conf, "edited since\n").unwrap();
+    let out = sandbox.anvil(&["-vv", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let shown = text(&out.stdout);
+    for path in [&conf, &link, &empty] {
+        assert!(shown.contains(&format!("unchanged {path}\n")), "{shown}");
+    }
+    assert_eq!(std::fs::read_to_string(&conf).unwrap(), "edited since\n");
+}
+
+#[test]
+fn a_removed_path_now_of_another_kind_is_refused_even_forced_by_path_or_all() {
+    let sandbox = Sandbox::new("ra");
+    let [conf, ..] = absent_applied(&sandbox);
+    std::fs::create_dir(&conf).unwrap();
+    for force in [
+        &[][..],
+        &["--force-all"][..],
+        &["--force", conf.as_str()][..],
+    ] {
+        let args = [&["rollback", "--target", "local"][..], force].concat();
+        let out = sandbox.anvil(&args, &[]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+        let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+        assert!(
+            shown.contains(&format!(
+                "absent: {conf} is a directory now, not the file the apply removed; \
+                 rollback will not replace it"
+            )),
+            "{shown}"
+        );
+        assert!(Path::new(&conf).is_dir());
+    }
+}
+
+#[test]
+fn a_hash_only_removal_cannot_be_undone_and_exits_zero() {
+    let sandbox = Sandbox::new("ra");
+    let secret = sandbox.root().join("secret").display().to_string();
+    std::fs::write(&secret, "private\n").unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!("[[absent]]\npath = \"{secret}\"\nsudo = false\n"),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stdout).contains(&format!("not restored: {secret} (not world-readable)")),
+        "{}",
+        text(&out.stdout)
+    );
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][0]["run"],
+        format!("cannot undo: {secret} (not world-readable)")
+    );
+    assert!(!Path::new(&secret).exists());
+}
+
+#[test]
+fn a_hand_edited_removal_the_config_never_names_is_refused() {
+    let sandbox = Sandbox::new("ra");
+    let [conf, ..] = absent_applied(&sandbox);
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let original = sandbox.last_apply().unwrap();
+    let elsewhere = sandbox.root().join("elsewhere").display().to_string();
+    type Tamper = Box<dyn Fn(&mut serde_json::Value)>;
+    let cases: [(Tamper, String); 2] = [
+        (
+            Box::new({
+                let elsewhere = elsewhere.clone();
+                move |absent| absent["path"] = elsewhere.clone().into()
+            }),
+            format!("rollback: {elsewhere} is not in [[absent]]; refusing to restore it"),
+        ),
+        (
+            Box::new(|absent| absent["sudo"] = true.into()),
+            format!(
+                "rollback: {conf} has sudo = false in [[absent]] but sudo = true in the record; \
+                 refusing to restore it"
+            ),
+        ),
+    ];
+    for (tamper, message) in &cases {
+        let mut record = original.clone();
+        tamper(&mut record["targets"]["local"]["absent"][0]);
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let out = sandbox.anvil(&["rollback", "--target", "local", "--force-all"], &[]);
+        assert_eq!(out.status.code(), Some(1), "{message}");
+        assert!(
+            text(&out.stdout).contains(message.as_str()),
+            "{}",
+            text(&out.stdout)
+        );
+        assert!(!Path::new(&elsewhere).exists());
+        assert!(!Path::new(&conf).exists());
+    }
+}
+
+#[test]
+fn a_removal_recorded_as_another_kind_than_its_type_is_refused() {
+    let sandbox = Sandbox::new("ra");
+    let [conf, link, empty] = absent_applied(&sandbox);
+    let absent = |path: &str, kind: &str| {
+        format!("[[absent]]\npath = \"{path}\"\ntype = \"{kind}\"\nsudo = false\n\n")
+    };
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}{}{}",
+            absent(&conf, "file"),
+            absent(&link, "link"),
+            absent(&empty, "dir")
+        ),
+    );
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    let removed = record["targets"]["local"]["absent"].as_array_mut().unwrap();
+    let file = removed.iter().find(|a| a["path"] == conf.as_str()).unwrap()["previous"].clone();
+    let forged = removed
+        .iter_mut()
+        .find(|a| a["path"] == link.as_str())
+        .unwrap();
+    forged["previous"] = file;
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    let out = sandbox.anvil(&["rollback", "--target", "local", "--force-all"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let message = format!(
+        "rollback: {link} has type = \"link\" in [[absent]] but is a file in the record; \
+         refusing to restore it"
+    );
+    assert!(
+        text(&out.stdout).contains(&message),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(std::fs::symlink_metadata(&link).is_err());
+}
+
+#[test]
+fn a_binary_write_keeps_only_hashes_and_rollback_cannot_undo_it() {
+    let sandbox = Sandbox::new("rb");
+    let bytes: Vec<u8> = (0..=255).collect();
+    std::fs::write(sandbox.config_dir().join("blob.bin"), &bytes).unwrap();
+    let dir = sandbox.root().join("out");
+    std::fs::create_dir(&dir).unwrap();
+    let (over, new) = (dir.join("over.bin"), dir.join("new.bin"));
+    let (over, new) = (over.display().to_string(), new.display().to_string());
+    std::fs::write(&over, PREVIOUS).unwrap();
+    std::fs::set_permissions(&over, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let entry = |dest: &str| {
+        format!(
+            "[[files]]\nsrc = \"blob.bin\"\ndest = \"{dest}\"\nmode = \"0644\"\nsudo = false\n\n"
+        )
+    };
+    sandbox.write_config("config.toml", &format!("{}{}", entry(&over), entry(&new)));
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read(&over).unwrap(), bytes);
+    let raw = std::fs::read_to_string(sandbox.state_home().join("anvil/last-apply.json")).unwrap();
+    assert!(
+        !raw.contains(PREVIOUS.trim_end()),
+        "the previous text is not kept"
+    );
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(record["version"], 2);
+    let files = record["targets"]["local"]["files"].as_array().unwrap();
+    for file in files {
+        assert_eq!(file["binary"], true, "{file}");
+        assert!(file["previous"].get("text").is_none(), "{file}");
+    }
+    assert_eq!(files[0]["previous"]["reason"], "binary");
+
+    let out = sandbox.anvil(&["-vv", "rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let shown = text(&out.stdout);
+    for line in [
+        format!("  $ cannot undo: {over} (binary)\n"),
+        format!("  ⚠ not restored: {over} (binary)\n"),
+        format!("  {new} on local (binary)\n"),
+    ] {
+        assert!(shown.contains(&line), "{line}: {shown}");
+    }
+    let out = sandbox.anvil(&["--json", "rollback"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let runs: Vec<_> = (value["targets"][0]["steps"].as_array().unwrap().iter())
+        .map(|step| step["run"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        runs,
+        [
+            format!("cannot undo: {new} (binary)"),
+            format!("cannot undo: {over} (binary)"),
+            "cannot undo: step 1".to_owned(),
+        ]
+    );
+    assert_eq!(
+        value["not_restored"],
+        serde_json::json!([
+            {"target": "local", "dest": over, "reason": "binary"},
+            {"target": "local", "dest": new, "reason": "binary"},
+        ])
+    );
+    assert_eq!(std::fs::read(&over).unwrap(), bytes, "dest left alone");
+    assert_eq!(std::fs::read(&new).unwrap(), bytes, "dest left alone");
+
+    let out = sandbox.anvil(&["rollback", "--dry-run"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains(&format!("  cannot undo: {over} (binary)\n")),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+/// A `conf` tree in the workspace: `a.conf`, `blob.bin` (binary),
+/// `sub/b.conf` and `sub/deep/c.conf`; and one `recursive = true` entry
+/// copying it to `<root>/app`, which already holds `a.conf` ([`PREVIOUS`])
+/// and `extra`, notifying `flush`, with `keys` added; applied on local.
+/// Returns the dest.
+fn tree_applied(sandbox: &Sandbox, keys: &str) -> String {
+    let conf = sandbox.config_dir().join("conf");
+    std::fs::create_dir_all(conf.join("sub/deep")).unwrap();
+    std::fs::write(conf.join("a.conf"), "a = 1\n").unwrap();
+    std::fs::write(conf.join("blob.bin"), [0u8, 1, 255]).unwrap();
+    std::fs::write(conf.join("sub/b.conf"), "b = 2\n").unwrap();
+    std::fs::write(conf.join("sub/deep/c.conf"), "c = 3\n").unwrap();
+    let dest = sandbox.root().join("app");
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(dest.join("a.conf"), PREVIOUS).unwrap();
+    std::fs::set_permissions(dest.join("a.conf"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(dest.join("extra"), "mine\n").unwrap();
+    let dest = dest.display().to_string();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"conf\"\ndest = \"{dest}\"\nrecursive = true\nmode = \"0640\"\n\
+             dir_mode = \"0750\"\nsudo = false\nnotify = [\"flush\"]\n{keys}\n\
+             [[handlers]]\nname = \"flush\"\nrun = \"true\"\n"
+        ),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        std::fs::read_to_string(format!("{dest}/sub/deep/c.conf")).unwrap(),
+        "c = 3\n"
+    );
+    dest
+}
+
+/// The `run` of each step of `out`'s first target.
+fn runs(out: &std::process::Output) -> Vec<String> {
+    (json(out)["targets"][0]["steps"].as_array().unwrap().iter())
+        .map(|step| step["run"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_tree_rolls_back_its_files_and_removes_its_created_dirs_deepest_first() {
+    let sandbox = Sandbox::new("rt");
+    let d = tree_applied(&sandbox, "");
+    let record = sandbox.last_apply().unwrap();
+    let dirs: Vec<_> = (record["targets"]["local"]["dirs"]
+        .as_array()
+        .unwrap()
+        .iter())
+    .map(|dir| dir["path"].as_str().unwrap().to_owned())
+    .collect();
+    assert_eq!(dirs, [format!("{d}/sub"), format!("{d}/sub/deep")]);
+
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let runs = runs(&out);
+    let at = |run: &str| {
+        (runs.iter().position(|r| r == run)).unwrap_or_else(|| panic!("{run}: {runs:?}"))
+    };
+    assert!(at(&format!("cannot undo: {d}/blob.bin (binary)")) < runs.len());
+    let files = at(&format!("restore {d}/a.conf"));
+    assert!(
+        files > at(&format!("remove {d}/sub/b.conf")),
+        "last written first"
+    );
+    assert!(at(&format!("remove {d}/sub/b.conf")) > at(&format!("remove {d}/sub/deep/c.conf")));
+    let (deep, sub) = (
+        at(&format!("remove {d}/sub/deep")),
+        at(&format!("remove {d}/sub")),
+    );
+    assert!(files < deep && deep < sub, "{runs:?}");
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+        PREVIOUS
+    );
+    assert_eq!(mode(Path::new(&format!("{d}/a.conf"))), 0o644);
+    assert!(!Path::new(&format!("{d}/sub")).exists());
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/extra")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(
+        std::fs::read(format!("{d}/blob.bin")).unwrap(),
+        [0, 1, 255],
+        "a binary item cannot be undone"
+    );
+    assert_eq!(
+        json(&out)["targets"][0]["warnings"],
+        serde_json::json!([
+            format!("not restored: {d}/blob.bin (binary)"),
+            "pending handler flush queued for the next apply"
+        ]),
+        "the entry's notify, once"
+    );
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["pending_handlers"],
+        serde_json::json!(["flush"])
+    );
+
+    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+        PREVIOUS
+    );
+    assert!(!Path::new(&format!("{d}/sub")).exists());
+}
+
+#[test]
+fn a_hand_edited_tree_record_naming_a_path_outside_of_another_kind_or_sudo_is_refused() {
+    let sandbox = Sandbox::new("rt");
+    let d = tree_applied(&sandbox, "");
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let original = sandbox.last_apply().unwrap();
+    let outside = sandbox.root().join("elsewhere").display().to_string();
+    type Tamper = Box<dyn Fn(&mut serde_json::Value)>;
+    let set = |list: &'static str, key: &'static str, value: serde_json::Value| -> Tamper {
+        Box::new(move |entry| entry[list][0][key] = value.clone())
+    };
+    let refusing = |why: String| format!("rollback: {why}; refusing to restore it");
+    let cases: [(Tamper, String); 7] = [
+        (
+            set("files", "dest", outside.clone().into()),
+            refusing(format!("{outside} is not in [[files]]")),
+        ),
+        (
+            set("files", "dest", format!("{d}/sub").into()),
+            refusing(format!(
+                "{d}/sub is a directory of a recursive entry's tree in [[files]], not a file"
+            )),
+        ),
+        (
+            set("files", "sudo", true.into()),
+            refusing(format!(
+                "{d}/a.conf has sudo = false in [[files]] but sudo = true in the record"
+            )),
+        ),
+        (
+            set("files", "created_dirs", serde_json::json!([d])),
+            refusing(format!(
+                "{d}/a.conf has directories created for it in the record but no parents = true in [[files]]"
+            )),
+        ),
+        (
+            set("dirs", "path", outside.clone().into()),
+            refusing(format!("{outside} is not in [[dirs]]")),
+        ),
+        (
+            set("dirs", "path", format!("{d}/a.conf").into()),
+            refusing(format!(
+                "{d}/a.conf is a file of a recursive entry's tree in [[files]], not a directory"
+            )),
+        ),
+        (
+            set("dirs", "sudo", true.into()),
+            refusing(format!(
+                "{d}/sub has sudo = false in [[files]] but sudo = true in the record"
+            )),
+        ),
+    ];
+    for (tamper, message) in &cases {
+        let mut record = original.clone();
+        tamper(&mut record["targets"]["local"]);
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        for args in [
+            ["rollback", "--target", "local", "--force-all"].as_slice(),
+            ["rollback", "--dry-run", "--target", "local"].as_slice(),
+        ] {
+            let out = sandbox.anvil(args, &[]);
+            assert_eq!(out.status.code(), Some(1), "{message}");
+            assert!(
+                text(&out.stdout).contains(message.as_str()),
+                "{message}: {}",
+                text(&out.stdout)
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+            "a = 1\n",
+            "{message}"
+        );
+        assert!(Path::new(&format!("{d}/sub/b.conf")).exists(), "{message}");
+    }
+
+    // A rel climbing out of the dest is not even a dest the record may hold.
+    let mut record = original.clone();
+    record["targets"]["local"]["files"][0]["dest"] = format!("{d}/../elsewhere").into();
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let out = sandbox.anvil(&["rollback", "--target", "local", "--force-all"], &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty(), "nothing ran: {}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains(&format!("rollback: {}: cannot parse", path.display())),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!sandbox.root().join("elsewhere").exists());
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+        "a = 1\n"
+    );
+}
+
+#[test]
+fn a_file_no_longer_in_the_tree_keeps_a_dirs_entry_at_the_same_path() {
+    let sandbox = Sandbox::new("rt");
+    let root = sandbox.root().display().to_string();
+    let old = format!("{root}/app/old");
+    let d = tree_applied(
+        &sandbox,
+        &format!("\n[[dirs]]\npath = \"{old}\"\nmode = \"0750\"\nsudo = false\n"),
+    );
+    assert!(Path::new(&old).is_dir());
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    let mut forged = record["targets"]["local"]["files"][0].clone();
+    forged["dest"] = old.clone().into();
+    (record["targets"]["local"]["files"].as_array_mut().unwrap()).push(forged);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let runs = runs(&out);
+    assert!(
+        runs.contains(&format!("cannot undo: {old} (no longer in the tree)")),
+        "{runs:?}"
+    );
+    assert!(runs.contains(&format!("remove {old}")), "{runs:?}");
+    assert!(
+        !Path::new(&old).exists(),
+        "the [[dirs]] record still rolls back"
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+        PREVIOUS
+    );
+}
+
+#[test]
+fn a_tree_item_whose_text_the_record_limit_dropped_cannot_be_undone_by_name() {
+    let sandbox = Sandbox::new("rt");
+    let d = tree_applied(&sandbox, "");
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let limit = std::fs::metadata(&path).unwrap().len().to_string();
+    let a = format!("{d}/a.conf");
+    std::fs::write(&a, "x".repeat(8192)).unwrap();
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = sandbox.anvil(
+        &["apply", "--target", "local"],
+        &[("ANVIL_DEBUG_RECORD_LIMIT", &limit)],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let record = sandbox.last_apply().unwrap();
+    let files = record["targets"]["local"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "only a.conf changed: {files:?}");
+    assert_eq!(
+        files[0]["previous"]["reason"], "record full",
+        "{}",
+        files[0]
+    );
+
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(
+        runs(&out).contains(&format!("cannot undo: {a} (record full)")),
+        "{:?}",
+        runs(&out)
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "a = 1\n");
+}
+
+#[test]
+fn a_tree_item_no_longer_in_the_tree_cannot_be_undone_and_the_rest_rolls_back() {
+    let sandbox = Sandbox::new("rt");
+    let d = tree_applied(&sandbox, "");
+    std::fs::remove_dir_all(sandbox.config_dir().join("conf/sub/deep")).unwrap();
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    let mut forged = record["targets"]["local"]["files"][0].clone();
+    forged["dest"] = format!("{d}/never").into();
+    (record["targets"]["local"]["files"].as_array_mut().unwrap()).push(forged);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    std::fs::write(format!("{d}/never"), "theirs\n").unwrap();
+
+    let out = sandbox.anvil(&["rollback", "--dry-run", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let gone = [
+        format!("cannot undo: {d}/sub/deep/c.conf (no longer in the tree)"),
+        format!("cannot undo: {d}/never (no longer in the tree)"),
+        format!("cannot undo: {d}/sub/deep (no longer in the tree)"),
+    ];
+    for line in &gone {
+        assert!(
+            text(&out.stdout).contains(&format!("  {line}\n")),
+            "{line}: {}",
+            text(&out.stdout)
+        );
+    }
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let runs = runs(&out);
+    for line in &gone {
+        assert!(runs.contains(line), "{line}: {runs:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+        PREVIOUS
+    );
+    assert!(!Path::new(&format!("{d}/sub/b.conf")).exists());
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/sub/deep/c.conf")).unwrap(),
+        "c = 3\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/never")).unwrap(),
+        "theirs\n"
+    );
+}
+
+#[test]
+fn rollback_false_on_a_tree_keeps_its_items_hashes_only() {
+    let sandbox = Sandbox::new("rt");
+    let d = tree_applied(&sandbox, "rollback = false\n");
+    let record = sandbox.last_apply().unwrap();
+    let a = &record["targets"]["local"]["files"][0];
+    assert_eq!(a["dest"], format!("{d}/a.conf"));
+    assert_eq!(a["previous"]["reason"], "rollback = false", "{a}");
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(
+        runs(&out).contains(&format!("cannot undo: {d}/a.conf (rollback = false)")),
+        "{:?}",
+        runs(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+        "a = 1\n"
+    );
+
+    let sandbox = Sandbox::new("rt");
+    let conf = sandbox.config_dir().join("conf");
+    std::fs::create_dir_all(&conf).unwrap();
+    std::fs::write(conf.join("a.conf"), "a = 1\n").unwrap();
+    let out = task_dest(&sandbox, "x");
+    let dest = Path::new(&out).parent().unwrap().join("app");
+    std::fs::create_dir(&dest).unwrap();
+    let a = dest.join("a.conf").display().to_string();
+    std::fs::write(&a, PREVIOUS).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}[[tasks]]\nfile = {{ src = \"conf\", dest = \"{}\", recursive = true, \
+             mode = \"0640\", dir_mode = \"0750\", sudo = false, rollback = false }}\n",
+            file_task("a.txt", &a),
+            dest.display()
+        ),
+    );
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let record = sandbox.last_apply().unwrap();
+    let previous = &record["targets"]["local"]["files"][0]["previous"];
+    assert!(previous["text"].is_null(), "{previous}");
+    assert_eq!(
+        previous["reason"], "rollback = false",
+        "the tree's item drops the text an earlier task kept"
+    );
 }

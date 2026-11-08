@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::config::Guards;
+use crate::absent;
+use crate::config::{AbsentType, Guards};
 use crate::dirs;
 use crate::files;
 use crate::links;
@@ -49,6 +50,8 @@ pub enum RunKind {
     /// A `[[links]]` step; also a rollback restore of one, whose `run` may
     /// carry a replaced file's bytes.
     Link { path: String, run: LinkRun },
+    /// An `[[absent]]` step.
+    Absent { path: String, run: AbsentRun },
     /// A `[[services]]` step.
     Service { name: String, run: ServiceRun },
     /// A `[[steps]]` entry, 1-based among them, the plugin that returned it,
@@ -90,6 +93,7 @@ impl RunKind {
             RunKind::File { dest, .. } => Entry::File { dest: dest.clone() },
             RunKind::Dir { path, .. } => Entry::Dir { path: path.clone() },
             RunKind::Link { path, .. } => Entry::Link { path: path.clone() },
+            RunKind::Absent { path, .. } => Entry::Absent { path: path.clone() },
             RunKind::Service { name, .. } => Entry::Service { name: name.clone() },
             RunKind::Step { number, .. } => Entry::Step { number: *number },
             RunKind::Skip | RunKind::Script => Entry::Script,
@@ -109,6 +113,9 @@ pub enum Entry {
         path: String,
     },
     Link {
+        path: String,
+    },
+    Absent {
         path: String,
     },
     Service {
@@ -164,6 +171,12 @@ pub struct FileRun {
 pub struct DirRun {
     pub skip: bool,
     pub write: Option<dirs::DirWrite>,
+    /// On the dest directory of a `recursive = true` entry, the look at the
+    /// whole tree that runs before it, so that unchanged items run nothing.
+    pub check: Option<Box<files::TreeCheck>>,
+    /// Whether it is the dest directory of a `recursive = true` entry, the
+    /// first of its tree's steps.
+    pub tree_dest: bool,
 }
 
 /// A `[[links]]` step: whether the entry matched no tag or fact of the
@@ -173,6 +186,18 @@ pub struct DirRun {
 pub struct LinkRun {
     pub skip: bool,
     pub write: Option<links::LinkWrite>,
+    pub upload: Option<Upload>,
+}
+
+/// An `[[absent]]` step: whether the entry matched no tag or fact of the
+/// target, the type the path must have, when set, and how it runs; `None`
+/// for a skip or a rollback restore, whose password path may stage a
+/// removed file's bytes (`upload`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbsentRun {
+    pub skip: bool,
+    pub r#type: Option<AbsentType>,
+    pub write: Option<absent::AbsentWrite>,
     pub upload: Option<Upload>,
 }
 
@@ -249,6 +274,11 @@ impl PlannedRun {
         self.file()?.write.as_ref()?.rendered.as_deref()
     }
 
+    /// Whether a file step writes a binary src, whose rollback is lost.
+    pub fn binary(&self) -> bool {
+        (self.file().and_then(|run| run.write.as_ref())).is_some_and(|write| write.binary)
+    }
+
     /// A dir step's mode, a file or dir step's `owner` and `group`, each
     /// `None` when unset, a link step's target and `force`, and a file, dir
     /// or link step's `parents`; all unset for any other step.
@@ -304,6 +334,24 @@ impl PlannedRun {
         }
     }
 
+    pub(crate) fn absent(&self) -> Option<&AbsentRun> {
+        match &self.kind {
+            RunKind::Absent { run, .. } => Some(run),
+            _ => None,
+        }
+    }
+
+    /// An absent step's path and its `type`, when set; `None` for a skip
+    /// or any other step.
+    pub fn absent_shown(&self) -> Option<(&str, Option<&'static str>)> {
+        match &self.kind {
+            RunKind::Absent { path, run } if !run.skip => {
+                Some((path, run.r#type.map(AbsentType::as_str)))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn service(&self) -> Option<&ServiceRun> {
         match &self.kind {
             RunKind::Service { run, .. } => Some(run),
@@ -337,7 +385,13 @@ impl Serialize for PlannedRun {
             #[serde(skip_serializing_if = "Option::is_none")]
             name: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            path: Option<&'a str>,
+            #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+            r#type: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             rendered: Option<RenderedShown<'a>>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            binary: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             mode: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -373,13 +427,17 @@ impl Serialize for PlannedRun {
             force,
             parents,
         } = self.attrs();
+        let absent = self.absent_shown();
         Shown {
             run: self.shown(),
             sudo_secret: self.sudo_secret.as_deref(),
             plugin: self.plugin(),
             task: self.task.as_deref(),
             name: self.name.as_deref(),
+            path: absent.map(|(path, _)| path),
+            r#type: absent.and_then(|(_, r#type)| r#type),
             rendered,
+            binary: self.binary(),
             mode,
             owner,
             group,

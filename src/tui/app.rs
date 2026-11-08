@@ -562,12 +562,12 @@ pub fn load_steps(opts: &Options) -> Result<Vec<StepRow>, String> {
 }
 
 /// The steps apply runs for `expanded`, in its order: `packages`, `dir <path>`,
-/// `file <dest>`, `link <path> -> <target>`, `service <name>` (each a step on
-/// every target, skipped where it does not match), each step's command as its
-/// `$` line shows it, or `plugin <name>` for a plugin step, whose script is
-/// known only once it has run. A task's row is `NAME  PATH`, or `<that label>
-/// PATH` without a name: the pane is narrow and a row is cut at its end, and an
-/// include's path alone can fill it.
+/// `file <dest>`, `link <path> -> <target>`, `absent <path>`, `service <name>`
+/// (each a step on every target, skipped where it does not match), each step's
+/// command as its `$` line shows it, or `plugin <name>` for a plugin step, whose
+/// script is known only once it has run. A task's row is `NAME  PATH`, or
+/// `<that label> PATH` without a name: the pane is narrow and a row is cut at
+/// its end, and an include's path alone can fill it.
 pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
     expanded
         .items
@@ -578,6 +578,7 @@ pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
                 ItemKind::Dir { entry, .. } => format!("dir {}", entry.path),
                 ItemKind::File { entry, .. } => format!("file {}", entry.dest),
                 ItemKind::Link { entry, .. } => format!("link {} -> {}", entry.path, entry.target),
+                ItemKind::Absent { entry, .. } => format!("absent {}", entry.path),
                 ItemKind::Service(entry) => format!("service {}", entry.name),
                 ItemKind::Step(step) => match step.kind() {
                     StepKind::Plugin(name) => format!("plugin {name}"),
@@ -2275,6 +2276,7 @@ pub mod tests {
             0,
             plan::PlanReport::Planned {
                 target: "local".to_owned(),
+                trees: Vec::new(),
                 vars: Default::default(),
                 env: Default::default(),
                 steps: Vec::new(),

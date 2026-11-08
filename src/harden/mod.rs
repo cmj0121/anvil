@@ -15,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Serialize;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use crate::config::Config;
+use crate::config::{Config, FileEntry};
 use crate::error::Failure;
 use crate::files;
 use crate::filestore::{self, StoreError};
@@ -251,6 +251,17 @@ impl Syntax {
         }
     }
 
+    /// Whether a recursive copy to `dest` may write a file this syntax's
+    /// daemon reads: `dest` is one, or a directory above one.
+    fn may_hold(self, dest: &str) -> bool {
+        let read = match self {
+            Syntax::Sshd => ["/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d/"],
+            Syntax::Sysctl => ["/etc/sysctl.conf", "/etc/sysctl.d/"],
+        };
+        let under = format!("{}/", dest.trim_end_matches('/'));
+        self.shares(dest) || read.iter().any(|path| path.starts_with(&under))
+    }
+
     /// Whether `dest` is a file this syntax's daemon also reads.
     fn shares(self, dest: &str) -> bool {
         match self {
@@ -423,8 +434,9 @@ impl<'a> Run<'a> {
             .files()
             .find(|(_, file, _)| expanded.same_dest(&file.dest, drop_in.dest));
         let entry = found.map(|(item, _, i)| (item, i));
-        if let Some((item, file, i)) = found.filter(|(_, file, _)| file.template) {
-            self.review(drop_in, item, i, &file.src, "sets");
+        if let Some((item, file, i)) = found.filter(|(_, file, _)| file.template || file.recursive)
+        {
+            self.review(drop_in, item, i, file, "sets");
             self.contradictions(drop_in, Some(i))?;
             return self.step(&ids, drop_in.marker, drop_in.script);
         }
@@ -495,11 +507,21 @@ impl<'a> Run<'a> {
     fn contradictions(&mut self, drop_in: &DropIn, entry: Option<usize>) -> Result<(), Failure> {
         let expanded = self.input.expanded;
         for (item, file, i) in expanded.files() {
-            if Some(i) == entry || !drop_in.syntax.shares(&expanded.spelled_dest(&file.dest)) {
+            if Some(i) == entry {
+                continue;
+            }
+            let dest = expanded.spelled_dest(&file.dest);
+            if file.recursive {
+                if drop_in.syntax.may_hold(&dest) {
+                    self.review(drop_in, item, i, file, "does not contradict");
+                }
+                continue;
+            }
+            if !drop_in.syntax.shares(&dest) {
                 continue;
             }
             if file.template {
-                self.review(drop_in, item, i, &file.src, "does not contradict");
+                self.review(drop_in, item, i, file, "does not contradict");
                 continue;
             }
             match self.text(&file.src) {
@@ -546,17 +568,31 @@ impl<'a> Run<'a> {
 
     /// Reports the templated `src` of entry `i` for review: `check` says
     /// what to check it does with every directive of `drop_in`.
-    fn review(&mut self, drop_in: &DropIn, item: &tasks::Item, i: usize, src: &str, check: &str) {
+    /// A review of `file`, a template or a recursive copy harden does not
+    /// judge, asking that it be checked to `check` the drop-in's lines.
+    fn review(
+        &mut self,
+        drop_in: &DropIn,
+        item: &tasks::Item,
+        i: usize,
+        file: &FileEntry,
+        check: &str,
+    ) {
         let lines: Vec<String> = drop_in
             .rules
             .iter()
             .flat_map(|(_, directives)| directives.iter())
             .map(|(key, value)| drop_in.syntax.line(key, value))
             .collect();
+        let unjudged = if file.recursive {
+            "is a recursive copy, its files not judged; check them"
+        } else {
+            "is a template, not judged; check it"
+        };
         let what = item.shown_message(format!(
-            "{}: src {} is a template, not judged; check it {check} {}",
+            "{}: src {} {unjudged} {check} {}",
             item.label("files", i),
-            secret::shown_name(&Sources::shown(src)),
+            secret::shown_name(&Sources::shown(&file.src)),
             lines.join("; ")
         ));
         self.review.push(Review {
@@ -1418,5 +1454,35 @@ install = [\"telnet\", \"git\"] # trailing
             err.message,
             "files[0].src `link/x.conf`: leaves the workspace"
         );
+    }
+
+    #[test]
+    fn a_tree_that_may_hold_a_daemon_file_is_reviewed_not_judged() {
+        let ws = Workspace::new();
+        let tree = |dest: &str| {
+            format!(
+                "{}[[files]]\nsrc = \"$/ssh\"\ndest = \"{dest}\"\nmode = \"0644\"\n\
+                 recursive = true\ndir_mode = \"0755\"\n",
+                only(ROOT_LOGIN)
+            )
+        };
+        for dest in [
+            "/etc/ssh",
+            "/etc/ssh/sshd_config.d",
+            "/etc/ssh/sshd_config.d/a",
+        ] {
+            let out = ws.suggest(&tree(dest), "", false);
+            let what: Vec<_> = out.review.iter().map(|r| r.what.as_str()).collect();
+            assert_eq!(
+                what,
+                [
+                    "files[0]: src $/ssh is a recursive copy, its files not judged; \
+                  check them does not contradict PermitRootLogin no"
+                ],
+                "{dest}"
+            );
+        }
+        let out = ws.suggest(&tree("/srv/app"), "", false);
+        assert!(out.review.is_empty(), "{:?}", out.review);
     }
 }
