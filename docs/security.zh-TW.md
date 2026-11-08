@@ -30,16 +30,17 @@
   同一 dest 重複的舊式 `[[files]]` 項目，若第一個使用預設 rollback、後面的設定 `rollback = false`，第二次 apply 時仍會把後面項目的
   secret 保存為文字：請改用 `[[tasks]]`，或兩者都設定 `rollback = false`。
   設定 `force = true` 的 `[[links]]` 項目依同樣規則保存它取代的一般檔案；若該路徑的 `[[files]]` 項目或 file task 設定
-  `rollback = false`，就只保存其 sha256。
+  `rollback = false`，就只保存其 sha256。`[[absent]]` 項目依同樣規則保存它移除的每個一般檔案（[Absent](configuration.zh-TW.md#absent)）。
   絕不要把 `$XDG_STATE_HOME` 指進 dotfiles 或其他共用的 repository，也絕不要 commit 這份紀錄。
   這些文字絕不會印出或記錄，且讀取紀錄前會先關閉 core dump。紀錄只是你擁有的一個檔案，因此 rollback 絕不讓它決定路徑：
   dest 或 mode 不可能由 apply 寫出的紀錄會被拒絕，且只還原目前 config 的 `[[files]]` 或 file task 仍列出、`sudo` 相同、
-  且該項目適用於該 target 的 dest；目錄與連結也一樣，只還原 `[[dirs]]` 與 `[[links]]`（或 dir 與 link task）仍列出的 path
+  且該項目適用於該 target 的 dest；目錄、連結與被移除的路徑也一樣，只還原 `[[dirs]]`、`[[links]]` 與 `[[absent]]`（或 dir、link 與 absent task）仍列出的 path
   （[anvil rollback](cli.zh-TW.md#anvil-rollback)）。
 - **紀錄與 config 受到同等的信任**。它沒有簽章，也沒有驗證。在 config 列出的 dest 上，rollback 放回的位元組、owner、group
   與 mode 由紀錄決定，因此能寫入紀錄的人，就能讓 rollback（透過 sudo、以 root）在那裡寫入任意文字、任意 owner、group 與 mode。
   當該項目設定 `parents = true` 時，紀錄的 `created_dirs` 也決定 rollback 會移除這種 dest 路徑上的哪些空目錄。
-  在 config 列出的目錄或連結 path 上，目錄放回的 owner、group 與 mode，以及連結重新指向的 target，也由紀錄決定。
+  在 config 列出的目錄或連結 path 上，目錄放回的 owner、group 與 mode，以及連結重新指向的 target，也由紀錄決定；
+  在 absent 路徑上，路徑不存在時放回的檔案文字、owner、group 與 mode 也由紀錄決定。
   請讓它與 config 一樣私密：同一個使用者、0700 的狀態目錄，不要有共用或同步的副本。
 - **include 與 config 受到同等的信任**。[`[[tasks]]` include](configuration.zh-TW.md#tasks) 決定 target 上執行什麼，
   task 使用 sudo 時也包含在內，因此能寫入它的人就能在那裡執行任何東西。請讓它與 config 一樣私密。
@@ -91,6 +92,9 @@
   `files: DEST changed while anvil was writing it; re-run apply`。這項檢查需要 target 上有 `sha256sum` 或 `shasum`。
   兩者都沒有時就沒有檢查，因此在讀取與寫入之間做的變更會被覆寫，而紀錄保存的是較舊的狀態。
   rollback 無法判斷 DEST 是否改變，因此除非強制，否則會拒絕這樣的檔案（除非它的寫入中途失敗）（[anvil rollback](cli.zh-TW.md#anvil-rollback)）。
+- **讀取與移除之間的變更**。`[[absent]]` step 會像寫入一樣檢查其路徑之上的目錄，因此位於 group 或其他人可寫的目錄
+  （例如 `/tmp`）之下的路徑會被拒絕；symlink 以連結的方式移除，從不碰它的 target。路徑本身沒有防護：它的擁有者可以在讀取與移除之間
+  變更它，此時紀錄保存的是讀到的內容（[Absent](configuration.zh-TW.md#absent)）。
 - **每份紀錄一次只能有一個 apply 或 rollback**。紀錄透過旁邊的 `last-apply.json.lock` 上鎖；第二個 anvil 會直接以
   `PATH is in use by another anvil` 失敗，而不會等待。這個鎖需要 `flock`，NFS 可能不提供：
   `PATH: the filesystem does not support locking (NFS?); set $XDG_STATE_HOME to a local disk`。

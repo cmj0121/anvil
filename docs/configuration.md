@@ -62,11 +62,14 @@ mode = "0644"              # required, quoted
 tags = ["linode"]          # optional; the target must carry every tag
 facts = { distro = "arch" } # optional; pkg matches by list membership
 
-[[links]]                  # optional; after [[files]], before [[services]]; see Links
+[[links]]                  # optional; after [[files]], before [[absent]]; see Links
 path = "/usr/local/bin/app" # the symlink
 target = "/opt/app/bin/app" # what it points at; need not exist
 
-[[services]]               # optional; after links, before [[steps]]; see Services
+[[absent]]                 # optional; after [[links]], before [[services]]; see Absent
+path = "/etc/nginx/sites-enabled/default" # the file, symlink or empty directory to remove
+
+[[services]]               # optional; after absent, before [[steps]]; see Services
 name = "sshd"              # the unit, OpenRC service or launchd label
 state = "started"          # required: started | stopped
 enabled = true             # optional; omit to leave enablement alone
@@ -345,6 +348,10 @@ path = "/usr/local/bin/app" # required: absolute path on the target, the dest ru
 target = "/opt/app/bin/app" # required: absolute or relative, at most 4096 bytes; need not exist
 force = false              # optional; default false. true replaces a regular file at path
 
+[[absent]]                 # optional; one file, symlink or empty directory removed per matching target; see Absent
+path = "/etc/nginx/sites-enabled/default" # required: absolute path on the target, the dest rules
+type = "link"              # optional: file | dir | link; also tags, facts, sudo, notify as on [[files]]
+
 [[services]]               # optional; one service brought to a state per matching target; see Services
 name = "sshd"              # required: [A-Za-z0-9:_@.-]+, at most 255 bytes
 state = "started"          # required: "started" | "stopped" ("restarted" | "reloaded" only in a handler)
@@ -419,8 +426,8 @@ the guard commands after it do not run. A plugin step's message starts with `ski
 is in [Guarded steps](cli.md#guarded-steps).
 
 Guards go on `[[steps]]` entries and on `run` and `plugin` [tasks](#tasks). `[[dirs]]`, `[[files]]`, `[[links]]`,
-`[[services]]` and `[packages]` have no such keys and refuse them with the parser's `unknown field` message; a guard on
-any other task is exit 2 too ([Tasks](#tasks)). Those kinds already converge, or have no single command to guard.
+`[[absent]]`, `[[services]]` and `[packages]` have no such keys and refuse them with the parser's `unknown field`
+message; a guard on any other task is exit 2 too ([Tasks](#tasks)). Those kinds already converge, or have no single command to guard.
 
 `creates` and `removes` follow the [`dest` rules](#files): absolute, every character in `[A-Za-z0-9._/@+-]`, no `.` or
 `..` component, not ending with `/`, at most 4096 bytes. A violation is exit 2 naming the step, such as
@@ -442,9 +449,9 @@ guards runs and prints exactly as before.
 skipped it notifies nothing. Each name must be a `[[handlers]]` entry's, else exit 2 with
 ``steps[0].notify[0] `reload ssh`: names no [[handlers]] entry``.
 
-The sections above run in a fixed order: packages, dirs, files, links, services, steps, then the handlers. To choose the
-order, use [`[[tasks]]`](#tasks) instead of `[[dirs]]`, `[[files]]`, `[[links]]`, `[[services]]`, `[[steps]]` and the
-lists in `[packages]`.
+The sections above run in a fixed order: packages, dirs, files, links, absent, services, steps, then the handlers.
+To choose the order, use [`[[tasks]]`](#tasks) instead of `[[dirs]]`, `[[files]]`, `[[links]]`, `[[absent]]`,
+`[[services]]`, `[[steps]]` and the lists in `[packages]`.
 
 Without `[secrets]` the backend is the keychain on macOS (and unsupported elsewhere). Only the selected backend's section
 is required and checked: a missing section, an unknown backend or `keychain` off macOS is a config error (exit 2). A
@@ -941,7 +948,7 @@ A restricted sudo rule needs `true`, `test`, `find`, `ls`, `mkdir` and `chmod`, 
 ## Links
 
 A `[[links]]` entry makes `path` a symlink to `target` on each selected target whose tags and facts all match. Matching
-entries run in config order, after `[[files]]` and before `[[services]]` (a `link` [task](#tasks) runs where it stands
+entries run in config order, after `[[files]]` and before `[[absent]]` (a `link` [task](#tasks) runs where it stands
 instead). An entry that does not match is still a step, reported as `skipped link PATH: no match` ([Link
 steps](cli.md#link-steps)).
 
@@ -1018,11 +1025,85 @@ at are never checked.
 A restricted sudo rule needs `true`, `test`, `find`, `readlink`, `ln`, `mv` and `rm`, plus `mkdir` for `parents`,
 `rmdir` for a rollback that removes the directories it created, and `ls` and `od` to read a file `force` replaces.
 
+## Absent
+
+An `[[absent]]` entry removes the file, symlink or empty directory at `path` on each selected target whose tags and
+facts all match: a stale vhost link, a unit file a package left behind, an old config. Matching entries run in config
+order, after `[[links]]` and before `[[services]]` (an `absent` [task](#tasks) runs where it stands instead), so a unit
+file is gone before the services start. An entry that does not match is still a step, reported as
+`skipped absent PATH: no match`, and the target's other steps still run.
+
+```toml
+[[absent]]
+path = "/etc/nginx/sites-enabled/default" # required: absolute path on the target, the dest rules of [[files]]
+type = "link"                    # optional: file | dir | link. Set: a path of another type fails the step
+tags = ["web"]                   # optional; every one must be on the target
+facts = { distro = "arch" }      # optional; a probe key, equal to that fact
+sudo = false                     # optional; default true. false: work as the connecting user
+notify = ["reload nginx"]        # optional; the [[handlers]] to run when the step removes it
+```
+
+`path`, `tags`, `facts`, `sudo` and `notify` follow the [Files](#files) rules and messages with the prefix
+`absent[I]` (``absent[0].path `etc/x`: must be an absolute path``,
+``absent[0].notify[0] `gone`: names no [[handlers]] entry``). `type` takes `file`, `dir` or `link`; any other value,
+and any other key (`mode`, `recursive` say), is exit 2 with the parser's message. At most 64 entries, counted apart
+from the other sections: `absent: 65 entries exceeds the 64 entry limit`.
+
+**What is removed.** The step looks at `path` without following it:
+
+- A symlink, dangling or not: removed as a link (`rm -f --`); what it points at is never touched. The step prints
+  `removed PATH`.
+- A regular file: removed the same way, `removed PATH`.
+- An empty directory: removed with `rmdir`, `removed PATH`. Never recursive.
+- Nothing there, or a missing directory above it: `unchanged PATH`.
+- A directory that is not empty: the step fails with `absent: PATH is not empty`.
+- A path of another type than `type` says: the step fails with `absent: PATH is a dir, not file` (or `link`, `file`).
+- Anything else (a FIFO, a socket, a device): `absent: PATH is not a file, dir or link`.
+
+Each failure leaves `path` as it is. So does a link whose target the record could not keep:
+`absent: PATH points at a target anvil cannot record; anvil will not remove it`. The other failures, each naming PATH:
+`absent: cannot read PATH's link`, `absent: cannot read PATH before removing it`,
+`absent: cannot read PATH's owner, group and mode` and `absent: cannot remove PATH`.
+
+**It cannot undo another entry.** An absent path that is, sits under or holds a `[[files]]` dest, a `[[dirs]]` path or
+a `[[links]]` path is exit 2 before any target starts, whatever the tags and facts of either entry, as are the same
+tasks: ``absent[0].path `/etc/app/f`: is files[0].dest `/etc/app/f`; an absent path cannot overlap it`` (or
+`sits under`, `holds`). Repeated slashes do not count, so `/srv//app/old` sits under `/srv/app`.
+
+**Who removes, and the directories above it.** As for [`[[dirs]]`](#dirs), with the prefix `absent`: root through sudo
+by default, the connecting user with `sudo = false`, `absent: sudo failed; PATH is unchanged` for a sudo that fails.
+Every directory above `path` must pass the root-only rule of a file's dest
+(`absent: DIR is not root-only; root will not write under it`,
+`absent: DIR is not owned by root or the login user, or others can write it; anvil will not write under it`), so a
+path under a group- or world-writable directory such as `/tmp` is refused. None is ever created. That walk protects
+only the directories above: the owner of `path` itself may still swap it between the read and the removal, and the
+record then holds what was read.
+
+**`notify`.** The handlers to run when the step prints `removed PATH`; `unchanged PATH` notifies nothing
+([Handlers](#handlers)).
+
+**The record and rollback.** Right before it removes `path`, the step keeps what was there in the
+[apply record](cli.md#the-apply-record): a link's target; a file as a file's previous text is kept (its text when
+others can read it, it is UTF-8 and at most 256 KiB, else only its sha256), with its owner, group and mode; a
+directory's owner, group and mode. A removed file's text counts toward the record's 16 MiB. A later apply that finds
+`path` already missing keeps the earlier record. `anvil rollback` puts each removed path back, last removed first and
+before the links, files and dirs, only while `path` is missing: `restored PATH`, `restored link PATH -> TARGET` or
+`restored directory PATH`; a file and a directory get their owner, group and mode back. It never creates a directory above `path`
+(`absent: DIR does not exist; PATH is not restored`). A path that is again the kind removed is `unchanged PATH`; one of
+another kind is refused, even with `--force`:
+`absent: PATH is a link now, not the file the apply removed; rollback will not replace it`. A file whose text was not
+kept is `cannot undo: PATH (reason)`. Rollback restores only paths the config's `[[absent]]` entries or absent tasks
+still name, with the same `sudo`.
+
+A restricted sudo rule needs `true`, `test`, `find`, `readlink`, `ls`, `od`, `sha256sum` or `shasum`, `rm` and
+`rmdir`. A rollback uses `true`, `test`, `find`, `readlink`, `ls` and `rm` too, plus `ln`, `mkdir`, `sh`, `tee`, `mv`,
+`chmod` and `chown`.
+
 ## Services
 
 A `[[services]]` entry brings one service to a state, and to an enablement when `enabled` is set, on each selected
 target whose tags and facts all match. It asks the target's init first and changes only what differs, so a rerun on a
-service already there prints `unchanged service NAME`. Matching entries run in config order, after the `[[links]]` steps
+service already there prints `unchanged service NAME`. Matching entries run in config order, after the `[[absent]]` steps
 and before `[[steps]]` (a `service` [task](#tasks) runs where it stands instead); an entry that does not match is still
 a step, reported as `skipped service NAME: no match`, and the target's other steps still run ([Service
 steps](cli.md#service-steps)).
@@ -1136,7 +1217,7 @@ What each init runs, and the messages of a service it cannot find, are in [Servi
 ## Tasks
 
 A `[[tasks]]` list runs top to bottom on each target, in the order you write. It replaces the legacy sections' fixed
-order (packages, dirs, files, links, services, steps) when a setup needs another one: a step between two files, a
+order (packages, dirs, files, links, absent, services, steps) when a setup needs another one: a step between two files, a
 migration between a file and the service that reads it. Tasks can nest, and can include task files from the [file
 store](cli.md#anvil-files). A config without `[[tasks]]` behaves exactly as before.
 
@@ -1182,41 +1263,44 @@ facts = { os = "Linux" }           # ANDed with the parent's tags
 
 **Kinds.** A task has exactly one of these, and may also set `name`, `tags` and `facts`. An unknown key is exit 2 with
 the parser's message. Two kinds are exit 2 with `tasks[0]: has run and include; keep one`, none with
-`tasks[0]: needs one of run, plugin, packages, file, service, dir, link, include, tasks`.
+`tasks[0]: needs one of run, plugin, packages, file, service, dir, link, absent, include, tasks`.
 
-| Kind       | What it does                                                                             |
-| ---------- | ---------------------------------------------------------------------------------------- |
-| `run`      | a POSIX sh script, at most 4 KiB, as in `[[steps]]`                                      |
-| `plugin`   | a `[plugins]` entry, with optional `args`, as in [Plugin steps](cli.md#plugin-steps)     |
-| `packages` | only `install`, `pin`, `remove` and `upgrade`, as in `[packages]`                        |
-| `file`     | the keys of [`[[files]]`](#files) but `tags`, `facts` and `notify`, which go on the task |
-| `service`  | `name`, `state` and `enabled`, as in [`[[services]]`](#services)                         |
-| `dir`      | the keys of [`[[dirs]]`](#dirs) but `tags`, `facts` and `notify`, which go on the task   |
-| `link`     | the keys of [`[[links]]`](#links) but `tags`, `facts` and `notify`, which go on the task |
-| `include`  | a `$/…` task file, expanded in place                                                     |
-| `tasks`    | child tasks, written as `[[tasks.tasks]]` or an inline array                             |
+| Kind       | What it does                                                                               |
+| ---------- | ------------------------------------------------------------------------------------------ |
+| `run`      | a POSIX sh script, at most 4 KiB, as in `[[steps]]`                                        |
+| `plugin`   | a `[plugins]` entry, with optional `args`, as in [Plugin steps](cli.md#plugin-steps)       |
+| `packages` | only `install`, `pin`, `remove` and `upgrade`, as in `[packages]`                          |
+| `file`     | the keys of [`[[files]]`](#files) but `tags`, `facts` and `notify`, which go on the task   |
+| `service`  | `name`, `state` and `enabled`, as in [`[[services]]`](#services)                           |
+| `dir`      | the keys of [`[[dirs]]`](#dirs) but `tags`, `facts` and `notify`, which go on the task     |
+| `link`     | the keys of [`[[links]]`](#links) but `tags`, `facts` and `notify`, which go on the task   |
+| `absent`   | the keys of [`[[absent]]`](#absent) but `tags`, `facts` and `notify`, which go on the task |
+| `include`  | a `$/…` task file, expanded in place                                                       |
+| `tasks`    | child tasks, written as `[[tasks.tasks]]` or an inline array                               |
 
-`tags` and `facts` go on the task, not inside `file`, `service`, `dir` or `link`: that is exit 2 with
-`tasks[0].file: tags and facts belong on the task, not the file` (`… not the dir`, `… not the link`). A task whose
+`tags` and `facts` go on the task, not inside `file`, `service`, `dir`, `link` or `absent`: that is exit 2 with
+`tasks[0].file: tags and facts belong on the task, not the file` (`… not the dir`, `… not the link`,
+`… not the absent entry`). A task whose
 selector does not match is still a step, reported as skipped (`skipped run: no match`, `skipped packages: no match`),
 and the target's other steps still run. A failed task ends that target; the other targets go on. A `packages` task that
-asks for nothing, an empty `tasks` and an include with no tasks add no step. Every file, dir, link and service task is
+asks for nothing, an empty `tasks` and an include with no tasks add no step. Every file, dir, link, absent and service task is
 its own step, and repeats are allowed: the [`[[services]]` duplicate rule](#services) does not apply, because stop,
 migrate, start is how a migration is written. A config with `[[tasks]]` has no default `hostname` step.
 
 **Guards.** A `run` or `plugin` task may also set the [guards](#config) `creates`, `removes`, `onlyif` and `unless`,
-with the same rules as on `[[steps]]`. On a `packages`, `file`, `service`, `dir`, `link`, `include` or `tasks` task a
+with the same rules as on `[[steps]]`. On a `packages`, `file`, `service`, `dir`, `link`, `absent`, `include` or `tasks` task a
 guard is exit 2 naming the first one set, in that order, at any depth: `tasks[0].creates: only on a run or plugin task`,
 `tasks[0].tasks[0].onlyif: only on a run or plugin task`.
 
-**`notify`.** A `run`, `plugin`, `file`, `service`, `dir` or `link` task may set [`notify`](#handlers), on the task, not
-inside `file`, `service`, `dir` or `link`. Exit 2:
+**`notify`.** A `run`, `plugin`, `file`, `service`, `dir`, `link` or `absent` task may set [`notify`](#handlers), on the
+task, not inside `file`, `service`, `dir`, `link` or `absent`. Exit 2:
 `tasks[0].notify: not on a packages task; packages give no change signal`,
-`tasks[0].notify: only on a run, plugin, file, service, dir or link task` (an `include` or `tasks` group),
+`tasks[0].notify: only on a run, plugin, file, service, dir, link or absent task` (an `include` or `tasks` group),
 `tasks[0].file: notify belongs on the task, not the file`,
-`tasks[0].service: notify belongs on the task, not the service`, `tasks[0].dir: notify belongs on the task, not the dir`
-and `tasks[0].link: notify belongs on the task, not the link`. `[[handlers]]` stays in the main file: an include with it
-is exit 2 with the parser's message.
+`tasks[0].service: notify belongs on the task, not the service`, `tasks[0].dir: notify belongs on the task, not the dir`,
+`tasks[0].link: notify belongs on the task, not the link` and
+`tasks[0].absent: notify belongs on the task, not the absent entry`. `[[handlers]]` stays in the main file: an include
+with it is exit 2 with the parser's message.
 
 **Nesting.** Children inherit `tags` and `facts`, and every level must match: a target must carry every tag along the chain,
 facts are ANDed. The same
@@ -1253,9 +1337,10 @@ Including one file from two places, with no cycle, is allowed.
 | 64 service tasks                              | `PATH: more than 64 service tasks after expansion`    |
 | 64 dir tasks                                  | `PATH: more than 64 dir tasks after expansion`        |
 | 64 link tasks                                 | `PATH: more than 64 link tasks after expansion`       |
+| 64 absent tasks                               | `PATH: more than 64 absent tasks after expansion`     |
 | 4096 tasks visited, groups and includes too   | `PATH: more than 4096 tasks visited during expansion` |
 
-**Mixing.** `[[tasks]]` with `[[dirs]]`, `[[files]]`, `[[links]]`, `[[services]]`, `[[steps]]`, or `[packages]`
+**Mixing.** `[[tasks]]` with `[[dirs]]`, `[[files]]`, `[[links]]`, `[[absent]]`, `[[services]]`, `[[steps]]`, or `[packages]`
 `install`, `pin`, `remove` or `upgrade` is exit 2 with `[[tasks]] cannot be mixed with [[steps]]; move it into a task`.
 There is no automatic migration. `[packages.alias]` and the other `[packages]` settings (`manager`, `local`,
 `local_sudo_secret`, `timeout`) stay global and work with `[[tasks]]`, as do `[[handlers]]`, `[plugins]`, `[secrets]`,
@@ -1325,10 +1410,11 @@ only, never in an [include](#tasks), and work with the legacy sections and with 
 - `tags`, `facts`, `notify`, a guard, `plugin` or any other key on the handler itself: the parser's `unknown field`
   message. A handler runs only where it was notified, and handlers do not notify handlers.
 
-**`notify`.** A list of handler names, on `[[dirs]]`, `[[files]]`, `[[links]]`, `[[services]]` and `[[steps]]` entries
-and on `run`, `plugin`, `file`, `service`, `dir` and `link` [tasks](#tasks). A name listed twice counts once. A name no
-handler has is exit 2, naming the entry: ``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry`` (or `dirs[I]`,
-`files[I]`, `links[I]`, `services[I]`, `tasks[I]`).
+**`notify`.** A list of handler names, on `[[dirs]]`, `[[files]]`, `[[links]]`, `[[absent]]`, `[[services]]` and
+`[[steps]]` entries and on `run`, `plugin`, `file`, `service`, `dir`, `link` and `absent` [tasks](#tasks). A name
+listed twice counts once. A name no handler has is exit 2, naming the entry:
+``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry`` (or `dirs[I]`, `files[I]`, `links[I]`, `absent[I]`,
+`services[I]`, `tasks[I]`).
 
 **When a step notifies.** Only a step that ran on the target, exited 0 and changed something:
 
@@ -1337,6 +1423,7 @@ handler has is exit 2, naming the entry: ``steps[1].notify[0] `reload ssh`: name
 | file          | prints `wrote DEST` or `fixed DEST: …` | prints `unchanged DEST`          |
 | dir           | prints `created DIR` or `fixed DIR: …` | prints `unchanged DIR`           |
 | link          | prints `linked …` or `relinked …`      | prints `unchanged PATH`          |
+| absent        | prints `removed PATH`                  | prints `unchanged PATH`          |
 | service       | prints any change line                 | prints `unchanged service NAME`  |
 | run or plugin | runs and exits 0                       | is skipped by a [guard](#config) |
 | any           |                                        | is skipped as no match, or fails |

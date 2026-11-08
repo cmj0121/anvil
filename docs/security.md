@@ -32,18 +32,20 @@ English | [繁體中文](security.zh-TW.md)
   one dest, the first with the default rollback and a later one with `rollback = false`, still keep the later entry's
   secret as text on the second apply: use `[[tasks]]` or set `rollback = false` on both. A `[[links]]` entry with
   `force = true` keeps the regular file it replaces under the same rules, and only its sha256 when a `[[files]]` entry
-  or file task for that path says `rollback = false`. Never point `$XDG_STATE_HOME`
+  or file task for that path says `rollback = false`. An `[[absent]]` entry keeps each regular file it removes under the
+  same rules ([Absent](configuration.md#absent)). Never point `$XDG_STATE_HOME`
   into a dotfiles or other shared repository, and never commit the record. The texts are never printed or logged, and
   core dumps are turned off before the record is read. Since the record is only a file you own, rollback never trusts it
   to choose a path: it refuses a record whose dest or mode apply could not have written, and restores only dests the
   current config's `[[files]]` or file tasks still name, with the same `sudo`, for a target the entry applies to, and
-  likewise only directories and links its `[[dirs]]` and `[[links]]` (or dir and link tasks) still name ([anvil
-  rollback](cli.md#anvil-rollback)).
+  likewise only directories, links and removed paths its `[[dirs]]`, `[[links]]` and `[[absent]]` (or dir, link and
+  absent tasks) still name ([anvil rollback](cli.md#anvil-rollback)).
 - **The record is trusted as the config is.** It is not signed or authenticated. At a dest the config names, the record
   decides the bytes, owner, group and mode rollback puts back, so whoever can write it can have rollback (through sudo,
   as root) write any text with any owner, group and mode there. Its `created_dirs` also decide which empty directories
   on such a dest's path rollback removes, when that entry says `parents = true`. At a directory or link path the config
-  names it decides the owner, group and mode a directory gets back and the target a link points at again. Keep it as
+  names it decides the owner, group and mode a directory gets back and the target a link points at again, and at an
+  absent path the text, owner, group and mode of a file it puts back while the path is missing. Keep it as
   private as the config: the same user, the 0700 state directory, no shared or synced copy.
 - **An include is trusted as the config is.** A [`[[tasks]]` include](configuration.md#tasks) decides what runs on your
   targets, with sudo where a task uses it, so whoever can write one can run anything there. Keep it as private as the
@@ -106,6 +108,10 @@ English | [繁體中文](security.zh-TW.md)
   `sha256sum` or `shasum` on the target. Without either there is no check, so a change made between the read and the
   write is overwritten and the record holds the older state. Rollback refuses such a file (unless its write failed
   midway) without `--force`, since it cannot tell whether DEST changed ([anvil rollback](cli.md#anvil-rollback)).
+- **A change between the read and the removal.** An `[[absent]]` step checks the directories above its path as a write
+  does, so a path under a group- or world-writable directory such as `/tmp` is refused, and removes a symlink as a link,
+  never its target. The path itself is not guarded: its owner may change it between the read and the removal, and the
+  record then holds what was read ([Absent](configuration.md#absent)).
 - **One apply or rollback per record.** The record is locked through `last-apply.json.lock` beside it; a second anvil
   fails with `PATH is in use by another anvil` rather than wait. The lock needs `flock`, which NFS may not offer:
   `PATH: the filesystem does not support locking (NFS?); set $XDG_STATE_HOME to a local disk`.

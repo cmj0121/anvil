@@ -6,15 +6,16 @@ English | [繁體中文](README.zh-TW.md)
 
 anvil is a secure, single-binary Rust tool that sets up the local machine and remote hosts, for humans and agents.
 It is agentless: a target needs only POSIX `sh`, and remote hosts are reached through the system OpenSSH client.
-An inventory says where (the hosts) and a config says what (packages, directories, files, links, services, steps),
+An inventory says where (the hosts) and a config says what (packages, directories, files, links, removals, services, steps),
 both stored as TOML in `$XDG_CONFIG_HOME/anvil` or `~/.config/anvil`.
 
 ## How it works
 
-- By default apply works in a fixed order on each target: packages, directories, files, links, services, then steps.
+- By default apply works in a fixed order on each target: packages, directories, files, links, removals, services, then
+  steps.
   An ordered [`[[tasks]]`](docs/configuration.md#tasks) list, with nesting and `$/` includes, runs in the order you
   write instead.
-- Rollback undoes files, directories and links only; packages, services and steps cannot be undone. A file others
+- Rollback undoes files, directories, links and removals only; packages, services and steps cannot be undone. A file others
   could not read keeps only its hash in the record, so apply warns and rollback names it instead of restoring it.
 - With no files yet, the inventory is only `local` and the config runs `hostname`, so `doctor` and `apply` already pass.
 
@@ -31,7 +32,7 @@ Requires Rust 1.89 or newer and `ssh` on `PATH`. Pre-built binaries and install 
 
 ```sh
 anvil inventory            # edit the hosts (opens $EDITOR)
-anvil config               # edit the packages, dirs, files, links, services and steps
+anvil config               # edit the packages, dirs, files, links, absent, services and steps
 anvil config --harden      # the Linux hardening the config lacks, as a diff; --write adds it
 anvil files cp motd '$/'   # keep a file in the store, for [[files]] src = "$/motd"
 anvil secret NAME          # store a secret
@@ -54,7 +55,7 @@ works on up to N targets at once ([Running in parallel](docs/cli.md#running-in-p
 ## Highlights
 
 - Packages on brew, pacman, apt, dnf and apk, with per-manager aliases, pin and remove ([Packages](docs/packages.md)).
-- Directories, files, links, services and steps, each matched per target by tags and facts ([Configuration](docs/configuration.md)).
+- Directories, files, links, removals, services and steps, each matched per target by tags and facts ([Configuration](docs/configuration.md)).
 - Vars and env per host, tag or globally; steps get the env, and a file with `template = true` is rendered per target
   with MiniJinja ([Vars and env](docs/configuration.md#vars-and-env), [Templating](docs/configuration.md#templating)).
 - Plugins write a step's script; drift is a doctor plugin, not a command

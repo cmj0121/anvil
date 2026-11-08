@@ -46,7 +46,8 @@ apply removes it from step output and shows a yellow warning before the target's
   ✔ ok · 4 steps
 ```
 
-Unknown names do not fail the target: its dirs, files, links, services and steps continue. A run with all targets ok exits 0,
+Unknown names do not fail the target: its dirs, files, links, absent paths, services and steps continue. A run with all
+targets ok exits 0,
 even with warnings. Actual installation, refresh or sudo failures still fail the target.
 Use `[packages.alias.NAME]` to supply the right name; anvil does not guess replacements.
 
