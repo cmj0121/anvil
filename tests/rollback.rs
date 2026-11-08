@@ -2060,3 +2060,374 @@ fn a_binary_write_keeps_only_hashes_and_rollback_cannot_undo_it() {
         text(&out.stdout)
     );
 }
+
+/// A `conf` tree in the workspace: `a.conf`, `blob.bin` (binary),
+/// `sub/b.conf` and `sub/deep/c.conf`; and one `recursive = true` entry
+/// copying it to `<root>/app`, which already holds `a.conf` ([`PREVIOUS`])
+/// and `extra`, notifying `flush`, with `keys` added; applied on local.
+/// Returns the dest.
+fn tree_applied(sandbox: &Sandbox, keys: &str) -> String {
+    let conf = sandbox.config_dir().join("conf");
+    std::fs::create_dir_all(conf.join("sub/deep")).unwrap();
+    std::fs::write(conf.join("a.conf"), "a = 1\n").unwrap();
+    std::fs::write(conf.join("blob.bin"), [0u8, 1, 255]).unwrap();
+    std::fs::write(conf.join("sub/b.conf"), "b = 2\n").unwrap();
+    std::fs::write(conf.join("sub/deep/c.conf"), "c = 3\n").unwrap();
+    let dest = sandbox.root().join("app");
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(dest.join("a.conf"), PREVIOUS).unwrap();
+    std::fs::set_permissions(dest.join("a.conf"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(dest.join("extra"), "mine\n").unwrap();
+    let dest = dest.display().to_string();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[files]]\nsrc = \"conf\"\ndest = \"{dest}\"\nrecursive = true\nmode = \"0640\"\n\
+             dir_mode = \"0750\"\nsudo = false\nnotify = [\"flush\"]\n{keys}\n\
+             [[handlers]]\nname = \"flush\"\nrun = \"true\"\n"
+        ),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        std::fs::read_to_string(format!("{dest}/sub/deep/c.conf")).unwrap(),
+        "c = 3\n"
+    );
+    dest
+}
+
+/// The `run` of each step of `out`'s first target.
+fn runs(out: &std::process::Output) -> Vec<String> {
+    (json(out)["targets"][0]["steps"].as_array().unwrap().iter())
+        .map(|step| step["run"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_tree_rolls_back_its_files_and_removes_its_created_dirs_deepest_first() {
+    let sandbox = Sandbox::new("rt");
+    let d = tree_applied(&sandbox, "");
+    let record = sandbox.last_apply().unwrap();
+    let dirs: Vec<_> = (record["targets"]["local"]["dirs"]
+        .as_array()
+        .unwrap()
+        .iter())
+    .map(|dir| dir["path"].as_str().unwrap().to_owned())
+    .collect();
+    assert_eq!(dirs, [format!("{d}/sub"), format!("{d}/sub/deep")]);
+
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let runs = runs(&out);
+    let at = |run: &str| {
+        (runs.iter().position(|r| r == run)).unwrap_or_else(|| panic!("{run}: {runs:?}"))
+    };
+    assert!(at(&format!("cannot undo: {d}/blob.bin (binary)")) < runs.len());
+    let files = at(&format!("restore {d}/a.conf"));
+    assert!(
+        files > at(&format!("remove {d}/sub/b.conf")),
+        "last written first"
+    );
+    assert!(at(&format!("remove {d}/sub/b.conf")) > at(&format!("remove {d}/sub/deep/c.conf")));
+    let (deep, sub) = (
+        at(&format!("remove {d}/sub/deep")),
+        at(&format!("remove {d}/sub")),
+    );
+    assert!(files < deep && deep < sub, "{runs:?}");
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+        PREVIOUS
+    );
+    assert_eq!(mode(Path::new(&format!("{d}/a.conf"))), 0o644);
+    assert!(!Path::new(&format!("{d}/sub")).exists());
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/extra")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(
+        std::fs::read(format!("{d}/blob.bin")).unwrap(),
+        [0, 1, 255],
+        "a binary item cannot be undone"
+    );
+    assert_eq!(
+        json(&out)["targets"][0]["warnings"],
+        serde_json::json!([
+            format!("not restored: {d}/blob.bin (binary)"),
+            "pending handler flush queued for the next apply"
+        ]),
+        "the entry's notify, once"
+    );
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["pending_handlers"],
+        serde_json::json!(["flush"])
+    );
+
+    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+        PREVIOUS
+    );
+    assert!(!Path::new(&format!("{d}/sub")).exists());
+}
+
+#[test]
+fn a_hand_edited_tree_record_naming_a_path_outside_of_another_kind_or_sudo_is_refused() {
+    let sandbox = Sandbox::new("rt");
+    let d = tree_applied(&sandbox, "");
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let original = sandbox.last_apply().unwrap();
+    let outside = sandbox.root().join("elsewhere").display().to_string();
+    type Tamper = Box<dyn Fn(&mut serde_json::Value)>;
+    let set = |list: &'static str, key: &'static str, value: serde_json::Value| -> Tamper {
+        Box::new(move |entry| entry[list][0][key] = value.clone())
+    };
+    let refusing = |why: String| format!("rollback: {why}; refusing to restore it");
+    let cases: [(Tamper, String); 7] = [
+        (
+            set("files", "dest", outside.clone().into()),
+            refusing(format!("{outside} is not in [[files]]")),
+        ),
+        (
+            set("files", "dest", format!("{d}/sub").into()),
+            refusing(format!(
+                "{d}/sub is a directory of a recursive entry's tree in [[files]], not a file"
+            )),
+        ),
+        (
+            set("files", "sudo", true.into()),
+            refusing(format!(
+                "{d}/a.conf has sudo = false in [[files]] but sudo = true in the record"
+            )),
+        ),
+        (
+            set("files", "created_dirs", serde_json::json!([d])),
+            refusing(format!(
+                "{d}/a.conf has directories created for it in the record but no parents = true in [[files]]"
+            )),
+        ),
+        (
+            set("dirs", "path", outside.clone().into()),
+            refusing(format!("{outside} is not in [[dirs]]")),
+        ),
+        (
+            set("dirs", "path", format!("{d}/a.conf").into()),
+            refusing(format!(
+                "{d}/a.conf is a file of a recursive entry's tree in [[files]], not a directory"
+            )),
+        ),
+        (
+            set("dirs", "sudo", true.into()),
+            refusing(format!(
+                "{d}/sub has sudo = false in [[files]] but sudo = true in the record"
+            )),
+        ),
+    ];
+    for (tamper, message) in &cases {
+        let mut record = original.clone();
+        tamper(&mut record["targets"]["local"]);
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        for args in [
+            ["rollback", "--target", "local", "--force-all"].as_slice(),
+            ["rollback", "--dry-run", "--target", "local"].as_slice(),
+        ] {
+            let out = sandbox.anvil(args, &[]);
+            assert_eq!(out.status.code(), Some(1), "{message}");
+            assert!(
+                text(&out.stdout).contains(message.as_str()),
+                "{message}: {}",
+                text(&out.stdout)
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+            "a = 1\n",
+            "{message}"
+        );
+        assert!(Path::new(&format!("{d}/sub/b.conf")).exists(), "{message}");
+    }
+
+    // A rel climbing out of the dest is not even a dest the record may hold.
+    let mut record = original.clone();
+    record["targets"]["local"]["files"][0]["dest"] = format!("{d}/../elsewhere").into();
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let out = sandbox.anvil(&["rollback", "--target", "local", "--force-all"], &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty(), "nothing ran: {}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains(&format!("rollback: {}: cannot parse", path.display())),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!sandbox.root().join("elsewhere").exists());
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+        "a = 1\n"
+    );
+}
+
+#[test]
+fn a_file_no_longer_in_the_tree_keeps_a_dirs_entry_at_the_same_path() {
+    let sandbox = Sandbox::new("rt");
+    let root = sandbox.root().display().to_string();
+    let old = format!("{root}/app/old");
+    let d = tree_applied(
+        &sandbox,
+        &format!("\n[[dirs]]\npath = \"{old}\"\nmode = \"0750\"\nsudo = false\n"),
+    );
+    assert!(Path::new(&old).is_dir());
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    let mut forged = record["targets"]["local"]["files"][0].clone();
+    forged["dest"] = old.clone().into();
+    (record["targets"]["local"]["files"].as_array_mut().unwrap()).push(forged);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let runs = runs(&out);
+    assert!(
+        runs.contains(&format!("cannot undo: {old} (no longer in the tree)")),
+        "{runs:?}"
+    );
+    assert!(runs.contains(&format!("remove {old}")), "{runs:?}");
+    assert!(
+        !Path::new(&old).exists(),
+        "the [[dirs]] record still rolls back"
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+        PREVIOUS
+    );
+}
+
+#[test]
+fn a_tree_item_whose_text_the_record_limit_dropped_cannot_be_undone_by_name() {
+    let sandbox = Sandbox::new("rt");
+    let d = tree_applied(&sandbox, "");
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let limit = std::fs::metadata(&path).unwrap().len().to_string();
+    let a = format!("{d}/a.conf");
+    std::fs::write(&a, "x".repeat(8192)).unwrap();
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = sandbox.anvil(
+        &["apply", "--target", "local"],
+        &[("ANVIL_DEBUG_RECORD_LIMIT", &limit)],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let record = sandbox.last_apply().unwrap();
+    let files = record["targets"]["local"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "only a.conf changed: {files:?}");
+    assert_eq!(
+        files[0]["previous"]["reason"], "record full",
+        "{}",
+        files[0]
+    );
+
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(
+        runs(&out).contains(&format!("cannot undo: {a} (record full)")),
+        "{:?}",
+        runs(&out)
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "a = 1\n");
+}
+
+#[test]
+fn a_tree_item_no_longer_in_the_tree_cannot_be_undone_and_the_rest_rolls_back() {
+    let sandbox = Sandbox::new("rt");
+    let d = tree_applied(&sandbox, "");
+    std::fs::remove_dir_all(sandbox.config_dir().join("conf/sub/deep")).unwrap();
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    let mut forged = record["targets"]["local"]["files"][0].clone();
+    forged["dest"] = format!("{d}/never").into();
+    (record["targets"]["local"]["files"].as_array_mut().unwrap()).push(forged);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    std::fs::write(format!("{d}/never"), "theirs\n").unwrap();
+
+    let out = sandbox.anvil(&["rollback", "--dry-run", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let gone = [
+        format!("cannot undo: {d}/sub/deep/c.conf (no longer in the tree)"),
+        format!("cannot undo: {d}/never (no longer in the tree)"),
+        format!("cannot undo: {d}/sub/deep (no longer in the tree)"),
+    ];
+    for line in &gone {
+        assert!(
+            text(&out.stdout).contains(&format!("  {line}\n")),
+            "{line}: {}",
+            text(&out.stdout)
+        );
+    }
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let runs = runs(&out);
+    for line in &gone {
+        assert!(runs.contains(line), "{line}: {runs:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+        PREVIOUS
+    );
+    assert!(!Path::new(&format!("{d}/sub/b.conf")).exists());
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/sub/deep/c.conf")).unwrap(),
+        "c = 3\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/never")).unwrap(),
+        "theirs\n"
+    );
+}
+
+#[test]
+fn rollback_false_on_a_tree_keeps_its_items_hashes_only() {
+    let sandbox = Sandbox::new("rt");
+    let d = tree_applied(&sandbox, "rollback = false\n");
+    let record = sandbox.last_apply().unwrap();
+    let a = &record["targets"]["local"]["files"][0];
+    assert_eq!(a["dest"], format!("{d}/a.conf"));
+    assert_eq!(a["previous"]["reason"], "rollback = false", "{a}");
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(
+        runs(&out).contains(&format!("cannot undo: {d}/a.conf (rollback = false)")),
+        "{:?}",
+        runs(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{d}/a.conf")).unwrap(),
+        "a = 1\n"
+    );
+
+    let sandbox = Sandbox::new("rt");
+    let conf = sandbox.config_dir().join("conf");
+    std::fs::create_dir_all(&conf).unwrap();
+    std::fs::write(conf.join("a.conf"), "a = 1\n").unwrap();
+    let out = task_dest(&sandbox, "x");
+    let dest = Path::new(&out).parent().unwrap().join("app");
+    std::fs::create_dir(&dest).unwrap();
+    let a = dest.join("a.conf").display().to_string();
+    std::fs::write(&a, PREVIOUS).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}[[tasks]]\nfile = {{ src = \"conf\", dest = \"{}\", recursive = true, \
+             mode = \"0640\", dir_mode = \"0750\", sudo = false, rollback = false }}\n",
+            file_task("a.txt", &a),
+            dest.display()
+        ),
+    );
+    let out = sandbox.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let record = sandbox.last_apply().unwrap();
+    let previous = &record["targets"]["local"]["files"][0]["previous"];
+    assert!(previous["text"].is_null(), "{previous}");
+    assert_eq!(
+        previous["reason"], "rollback = false",
+        "the tree's item drops the text an earlier task kept"
+    );
+}

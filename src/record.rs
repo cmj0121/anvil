@@ -1026,6 +1026,21 @@ pub struct Session {
     warnings: Vec<String>,
 }
 
+/// Debug builds only: a smaller byte limit for the record's saves.
+#[cfg(debug_assertions)]
+const LIMIT_VAR: &str = "ANVIL_DEBUG_RECORD_LIMIT";
+
+/// The most bytes a save writes: [`MAX_RECORD`]. A debug build reads
+/// [`LIMIT_VAR`], so that a test can fill the record; a release build
+/// compiles the variable out.
+fn record_limit() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(limit) = std::env::var(LIMIT_VAR).ok().and_then(|v| v.parse().ok()) {
+        return limit;
+    }
+    MAX_RECORD
+}
+
 impl Session {
     /// Creates the record's directory 0700 when missing and checks it,
     /// takes the lock (another anvil holding it is an error, not a wait),
@@ -1051,7 +1066,7 @@ impl Session {
             merged: Vec::new(),
             base: BTreeMap::new(),
             dropped: BTreeSet::new(),
-            limit: MAX_RECORD,
+            limit: record_limit(),
             warnings,
         })
     }

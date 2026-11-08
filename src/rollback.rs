@@ -26,7 +26,11 @@
 //! the config with the same `sudo`, each dir a `[[dirs]]` path, each
 //! link a `[[links]]` path and each removed path an `[[absent]]` path, so
 //! that a record edited by hand cannot
-//! make rollback write, perhaps as root, a path the config never names. The
+//! make rollback write, perhaps as root, a path the config never names. A
+//! file or dir a `recursive = true` entry wrote counts when it is an item of
+//! that kind in the entry's tree, loaded again from its src ([`tree::at`]);
+//! one under the entry's dest that the tree no longer holds is shown as
+//! `cannot undo: PATH (no longer in the tree)` and the rest goes on. The
 //! sudo passwords come from the record's `sudo` flags. The only changes a
 //! rollback makes to the record are `rolled_back`, the dests it put back, so
 //! a second rollback restores the same bytes, and the `notify` names of the
@@ -36,6 +40,7 @@
 //! JSON report, yet the exit stays 0, so that a repeat rollback stays
 //! idempotent.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::num::NonZeroU8;
 use std::sync::Arc;
@@ -44,13 +49,13 @@ use serde::Serialize;
 
 use crate::absent;
 use crate::cancel::Cancel;
-use crate::config::{AbsentEntry, AbsentType, Config};
+use crate::config::{AbsentEntry, AbsentType, Config, FileEntry};
 use crate::dirs;
 use crate::engine::{self, Passwords, Unresolved};
 use crate::error::{Failure, print_json};
 use crate::facts::Facts;
 use crate::fanout::{self, Event};
-use crate::files::{self, Force, Wording};
+use crate::files::{self, Force, Sources, Wording};
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::links;
@@ -67,6 +72,7 @@ use crate::status;
 use crate::step::{Entry, PlannedRun, shown_text};
 use crate::tasks::{Expanded, Item};
 use crate::transport::{Transport, TransportError};
+use crate::tree::{self, At};
 
 /// What a selected target with no entry in the record shows.
 const NOTHING: &str = "nothing recorded";
@@ -121,6 +127,20 @@ pub fn load(opts: &Options) -> Result<(Config, Expanded), Failure> {
         ..failure
     })?;
     Ok((config, expanded))
+}
+
+/// The trees of `expanded`'s recursive entries, loaded as apply loads them
+/// ([`files::load_trees`]), which tie a recorded tree item to its entry; a
+/// tree that does not load is exit 2, saying how to recover.
+fn trees(opts: &Options, config: &Config, expanded: &Expanded) -> Result<Sources, Failure> {
+    files::load_trees(expanded, || opts.workspace(config)).map_err(|failure| Failure {
+        message: format!(
+            "rollback: {}; the config decides which files may be restored: \
+                 fix or restore what it names, then run rollback again",
+            failure.message
+        ),
+        ..failure
+    })
 }
 
 /// The record, refused when there is none or it has no entry. Core dumps
@@ -180,13 +200,15 @@ pub fn run_targets(
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Report, Failure> {
     let targets = opts.targets_for(&config)?;
+    let sources = trees(opts, &config, &expanded)?;
     let path = record::path().map_err(|err| Failure::failed(format!("rollback: {err}")))?;
     // This read, before the lock, only refuses a missing record or an
     // unknown --force dest; the session reads the record again under it.
     check_force(&recorded(&path)?, &targets, force)?;
     let mut session = engine::open_record("rollback")?;
     let warnings = session.take_warnings();
-    let prepared = Prepared::rollback(opts, config, expanded, targets, &session, cancel)?;
+    let mut prepared = Prepared::rollback(opts, config, expanded, targets, &session, cancel)?;
+    prepared.sources = sources;
     let targets = &prepared.targets;
     let entries: Vec<Option<TargetRecord>> = targets
         .iter()
@@ -208,7 +230,7 @@ pub fn run_targets(
                 target,
                 prepared.transport(target),
                 &prepared.config,
-                &prepared.expanded,
+                (&prepared.expanded, &prepared.sources),
                 entry,
                 force,
                 host,
@@ -348,7 +370,7 @@ fn roll_back(
     target: &Target,
     transport: Result<Box<dyn Transport>, TransportError>,
     config: &Config,
-    expanded: &Expanded,
+    (expanded, sources): (&Expanded, &Sources),
     entry: &TargetRecord,
     force: &Force,
     host: HostCheck,
@@ -358,7 +380,7 @@ fn roll_back(
     log::info!("rollback {}: start", target.name);
     let failed =
         |error: String| RolledTarget::report(report::failed("rollback", target, Vec::new(), error));
-    if let Err(error) = check_files(expanded, target, None, entry) {
+    if let Err(error) = check_files(expanded, sources, target, None, entry) {
         return failed(error);
     }
     let transport = match transport {
@@ -381,9 +403,11 @@ fn roll_back(
     {
         return failed(error);
     }
-    if let Err(error) = check_files(expanded, target, Some(&facts), entry) {
-        return failed(error);
-    }
+    let gone = match check_files(expanded, sources, target, Some(&facts), entry) {
+        Ok(gone) => gone,
+        Err(error) => return failed(error),
+    };
+    let entry = &*without(entry, &gone);
     let mut runs = match absent::restore_runs(config, target, &facts, &entry.absent) {
         Ok(runs) => runs,
         Err(error) => return failed(error),
@@ -404,6 +428,10 @@ fn roll_back(
         force,
         host.wording,
     ));
+    runs.extend(
+        gone.paths()
+            .map(|path| cannot_undo(&no_longer_in_the_tree(path))),
+    );
     runs.extend(entry.cannot_undo.iter().map(|what| cannot_undo(what)));
     let mut report = engine::execute(
         "rollback",
@@ -433,7 +461,7 @@ fn roll_back(
                 || (entry.absent.iter()).any(|absent| &absent.path == dest)
         })
         .collect();
-    let queued = queued(config, expanded, target, &entry.facts, &dests);
+    let queued = queued(config, (expanded, sources), target, &entry.facts, &dests);
     for name in &queued {
         report.warn(format!("pending handler {name} queued for the next apply"));
     }
@@ -449,20 +477,27 @@ fn roll_back(
 }
 
 /// The `[[handlers]]` names, in their order, that the file, dir, link and
-/// absent items restored here notify: those whose dest or path is one of `dests` and that apply to
+/// absent items restored here notify, each once: those with a file or tree
+/// item ([`tree::at`]) or a path at one of `dests` and that apply to
 /// `target` by `facts`, the ones the record saved, as rollback never runs
 /// a handler or probes for one.
 fn queued(
     config: &Config,
-    expanded: &Expanded,
+    (expanded, sources): (&Expanded, &Sources),
     target: &Target,
     facts: &Facts,
     dests: &[String],
 ) -> Vec<String> {
     let notified: Vec<&String> = expanded
         .files()
-        .filter(|(item, entry, _)| {
-            item.matches(target, facts) && dests.iter().any(|d| expanded.same_dest(&entry.dest, d))
+        .filter(|(item, entry, i)| {
+            item.matches(target, facts)
+                && (dests.iter()).any(|d| {
+                    matches!(
+                        tree::at(expanded, sources, (entry, *i), d),
+                        At::File | At::Dir
+                    )
+                })
         })
         .flat_map(|(item, _, _)| &item.notify)
         .chain(
@@ -516,35 +551,48 @@ fn restored(steps: &[StepReport]) -> Vec<String> {
         .collect()
 }
 
-/// Refuses `entry` unless each of its files is the dest of a file item of
-/// `expanded` with the same `sudo` that applies to `target` (its
+/// Refuses `entry` unless each of its files is a file of a file item of
+/// `expanded` ([`tree::at`]: its dest, or a file of its tree in `sources`)
+/// with the same `sudo` that applies to `target` (its
 /// tags, and its facts when `facts` is given) and, for a file whose text
 /// the record keeps, does not say `rollback = false`, and for a file with
-/// created directories says `parents = true`. The record is only a
+/// created directories is a single entry saying `parents = true`; and so on
+/// for its dirs, links and removed paths. The record is only a
 /// file the user owns, and must not choose what rollback writes, or as whom.
+///
+/// A file or dir under a recursive entry's dest that its tree no longer
+/// holds is not refused: its path comes back in [`Gone`], for rollback to name as
+/// `cannot undo: PATH (no longer in the tree)` and leave alone. One the tree
+/// holds as the other kind is refused, as is one under no recursive dest.
 fn check_files(
     expanded: &Expanded,
+    sources: &Sources,
     target: &Target,
     facts: Option<&Facts>,
     entry: &TargetRecord,
-) -> Result<(), String> {
+) -> Result<Gone, String> {
     let (section, entry_word) = if expanded.from_tasks {
         ("the config", "file task")
     } else {
         ("[[files]]", "[[files]] entry")
     };
+    let mut gone = Vec::new();
     for file in &entry.files {
         let dest = file.dest.as_str();
         let refuse = |why: String| Err(format!("rollback: {why}; refusing to restore it"));
-        let named = || {
-            expanded
-                .files()
-                .filter(move |(_, f, _)| expanded.same_dest(&f.dest, dest))
-                .map(|(item, f, _)| (item, f))
-        };
+        let named = || files_at(expanded, sources, dest, At::File);
         let same = || named().filter(|(_, f)| f.sudo == file.sudo);
         let selected = |item: &Item| item.may_match(target, facts);
         let Some((_, first)) = named().next() else {
+            if files_at(expanded, sources, dest, At::Dir).next().is_some() {
+                return refuse(format!(
+                    "{dest} is a directory of a recursive entry's tree in {section}, not a file"
+                ));
+            }
+            if files_at(expanded, sources, dest, At::Gone).next().is_some() {
+                gone.push(file.dest.clone());
+                continue;
+            }
             return refuse(format!("{dest} is not in {section}"));
         };
         if same().next().is_none() {
@@ -559,7 +607,8 @@ fn check_files(
                 target.name
             ));
         }
-        if !file.created_dirs.is_empty() && !same().any(|(item, f)| selected(item) && f.parents) {
+        let parents = |f: &FileEntry| f.parents && !f.recursive;
+        if !file.created_dirs.is_empty() && !same().any(|(item, f)| selected(item) && parents(f)) {
             return refuse(format!(
                 "{dest} has directories created for it in the record but no parents = true in {section}"
             ));
@@ -583,53 +632,110 @@ fn check_files(
             ));
         }
     }
-    check_dirs(expanded, target, facts, entry)?;
+    let dirs = check_dirs(expanded, sources, target, facts, entry)?;
     check_links(expanded, target, facts, entry)?;
-    check_absent(expanded, target, facts, entry)
+    check_absent(expanded, target, facts, entry)?;
+    Ok(Gone { files: gone, dirs })
+}
+
+/// The recorded tree files and dirs [`check_files`] found no longer in
+/// their trees, each list kept apart so that a file at a path never drops a
+/// dir record there, nor a dir a file.
+#[derive(Debug, Default)]
+struct Gone {
+    files: Vec<String>,
+    dirs: Vec<String>,
+}
+
+impl Gone {
+    /// The files, then the dirs.
+    fn paths(&self) -> impl Iterator<Item = &String> {
+        self.files.iter().chain(&self.dirs)
+    }
+}
+
+/// The file items of `expanded`, each with its entry, that have `want` at
+/// `path` ([`tree::at`]).
+fn files_at<'a>(
+    expanded: &'a Expanded,
+    sources: &'a Sources,
+    path: &'a str,
+    want: At,
+) -> impl Iterator<Item = (&'a Item, &'a FileEntry)> {
+    (expanded.files())
+        .filter(move |(_, f, i)| tree::at(expanded, sources, (f, *i), path) == want)
+        .map(|(item, f, _)| (item, f))
 }
 
 /// [`check_files`] for `entry`'s dirs: each path is the path of a dir item
-/// of `expanded` with the same `sudo` that applies to `target`, and says
-/// `parents = true` when the record lists directories created above it.
+/// of `expanded`, or a directory of a recursive file item's tree, with the
+/// same `sudo` that applies to `target`, and says `parents = true` when the
+/// record lists directories created above it, which only a tree's dest
+/// itself may. The paths its trees no longer hold come back.
 fn check_dirs(
     expanded: &Expanded,
+    sources: &Sources,
     target: &Target,
     facts: Option<&Facts>,
     entry: &TargetRecord,
-) -> Result<(), String> {
-    let (section, entry_word) = if expanded.from_tasks {
-        ("the config", "dir task")
-    } else {
-        ("[[dirs]]", "[[dirs]] entry")
+) -> Result<Vec<String>, String> {
+    let words = |tree: bool| match (expanded.from_tasks, tree) {
+        (true, false) => ("the config", "dir task"),
+        (true, true) => ("the config", "file task"),
+        (false, false) => ("[[dirs]]", "[[dirs]] entry"),
+        (false, true) => ("[[files]]", "[[files]] entry"),
     };
+    let mut gone = Vec::new();
     for dir in &entry.dirs {
         let path = dir.path.as_str();
         let refuse = |why: String| Err(format!("rollback: {why}; refusing to restore it"));
-        let named = || (expanded.dirs()).filter(move |(_, d)| expanded.same_dest(&d.path, path));
-        let same = || named().filter(|(_, d)| d.sudo == dir.sudo);
+        // Each as (item, sudo, parents, from a tree).
+        let named: Vec<(&Item, bool, bool, bool)> = (expanded.dirs())
+            .filter(|(_, d)| expanded.same_dest(&d.path, path))
+            .map(|(item, d)| (item, d.sudo, d.parents, false))
+            .chain(files_at(expanded, sources, path, At::Dir).map(|(item, f)| {
+                let root = expanded.same_dest(&f.dest, path);
+                (item, f.sudo, f.parents && root, true)
+            }))
+            .collect();
+        let same = || named.iter().filter(|(_, sudo, ..)| *sudo == dir.sudo);
         let selected = |item: &Item| item.may_match(target, facts);
-        let Some((_, first)) = named().next() else {
-            return refuse(format!("{path} is not in {section}"));
+        let Some(&(_, first_sudo, _, tree)) = named.first() else {
+            let (section, _) = words(true);
+            let tree_file = files_at(expanded, sources, path, At::File).any(|(_, f)| f.recursive);
+            if tree_file {
+                return refuse(format!(
+                    "{path} is a file of a recursive entry's tree in {section}, not a directory"
+                ));
+            }
+            if files_at(expanded, sources, path, At::Gone).next().is_some() {
+                gone.push(dir.path.clone());
+                continue;
+            }
+            return refuse(format!("{path} is not in {}", words(false).0));
         };
+        let (section, entry_word) = words(tree);
         if same().next().is_none() {
             return refuse(format!(
-                "{path} has sudo = {} in {section} but sudo = {} in the record",
-                first.sudo, dir.sudo
+                "{path} has sudo = {first_sudo} in {section} but sudo = {} in the record",
+                dir.sudo
             ));
         }
-        if !same().any(|(item, _)| selected(item)) {
+        if !same().any(|(item, ..)| selected(item)) {
             return refuse(format!(
                 "no {entry_word} for {path} applies to {}",
                 target.name
             ));
         }
-        if !dir.created_dirs.is_empty() && !same().any(|(item, d)| selected(item) && d.parents) {
+        if !dir.created_dirs.is_empty()
+            && !same().any(|(item, _, parents, _)| selected(item) && *parents)
+        {
             return refuse(format!(
                 "{path} has directories created for it in the record but no parents = true in {section}"
             ));
         }
     }
-    Ok(())
+    Ok(gone)
 }
 
 /// [`check_files`] for `entry`'s links: each path is the path of a link
@@ -738,6 +844,22 @@ fn check_absent(
     Ok(())
 }
 
+/// `entry` without the files at `gone.files` and the dirs at `gone.dirs`.
+fn without<'a>(entry: &'a TargetRecord, gone: &Gone) -> Cow<'a, TargetRecord> {
+    if gone.paths().next().is_none() {
+        return Cow::Borrowed(entry);
+    }
+    let mut kept = entry.clone();
+    kept.files.retain(|file| !gone.files.contains(&file.dest));
+    kept.dirs.retain(|dir| !gone.dirs.contains(&dir.path));
+    Cow::Owned(kept)
+}
+
+/// What rollback shows for a recorded tree item its tree no longer holds.
+fn no_longer_in_the_tree(path: &str) -> String {
+    format!("{path} (no longer in the tree)")
+}
+
 /// A step that only shows `cannot undo: WHAT`.
 fn cannot_undo(what: &str) -> PlannedRun {
     files::skip_run("", format!("cannot undo: {what}"))
@@ -796,10 +918,11 @@ struct DryRun {
 /// What a rollback of `entry` would do: its removals put back, last first,
 /// then its links, files and dirs, last written first, then its steps that
 /// cannot be undone.
-fn would(entry: Option<&TargetRecord>) -> Vec<String> {
+fn would(entry: Option<&TargetRecord>, gone: &Gone) -> Vec<String> {
     let Some(entry) = entry else {
         return vec![NOTHING.to_owned()];
     };
+    let entry = &*without(entry, gone);
     let files = entry.files.iter().rev().flat_map(|file| {
         let dest = match (file.not_kept(), &file.previous) {
             _ if file.write == Write::Refused => None,
@@ -865,10 +988,9 @@ fn would(entry: Option<&TargetRecord>) -> Vec<String> {
             AbsentPrevious::Unknown { .. } => None,
         }
     });
-    let rest = entry
-        .cannot_undo
-        .iter()
-        .map(|what| format!("cannot undo: {what}"));
+    let gone = gone.paths().map(|path| no_longer_in_the_tree(path));
+    let rest =
+        (gone.chain(entry.cannot_undo.iter().cloned())).map(|what| format!("cannot undo: {what}"));
     absent
         .chain(links)
         .chain(files)
@@ -879,12 +1001,21 @@ fn would(entry: Option<&TargetRecord>) -> Vec<String> {
 
 /// What `--dry-run` shows for `target`: what a rollback of its entry would
 /// do, or the refusal the real run would fail it with ([`check_files`]).
-fn dry_target(expanded: &Expanded, target: &Target, entry: Option<&TargetRecord>) -> DryTarget {
+fn dry_target(
+    (expanded, sources): (&Expanded, &Sources),
+    target: &Target,
+    entry: Option<&TargetRecord>,
+) -> DryTarget {
     // The record's facts stand in for the probe a real run makes.
-    let refused =
-        entry.and_then(|entry| check_files(expanded, target, Some(&entry.facts), entry).err());
+    let checked =
+        entry.map(|entry| check_files(expanded, sources, target, Some(&entry.facts), entry));
+    let (gone, refused) = match checked {
+        Some(Ok(gone)) => (gone, None),
+        Some(Err(refused)) => (Gone::default(), Some(refused)),
+        None => (Gone::default(), None),
+    };
     let steps = refused.is_none().then(|| {
-        would(entry)
+        would(entry, &gone)
             .into_iter()
             .map(|run| DryStep { run })
             .collect()
@@ -908,12 +1039,19 @@ fn print_dry_run(
     force: &Force,
 ) -> Result<(), Failure> {
     let targets = opts.targets_for(config)?;
+    let sources = trees(opts, config, expanded)?;
     let path = record::path().map_err(|err| Failure::failed(format!("rollback: {err}")))?;
     let record = recorded(&path)?;
     check_force(&record, &targets, force)?;
     let dry: Vec<DryTarget> = targets
         .iter()
-        .map(|target| dry_target(expanded, target, record.targets.get(&target.name)))
+        .map(|target| {
+            dry_target(
+                (expanded, &sources),
+                target,
+                record.targets.get(&target.name),
+            )
+        })
         .collect();
     let failed = dry.iter().filter(|target| !target.ok).count();
     let total = dry.len();
@@ -969,6 +1107,16 @@ mod tests {
     use super::*;
     use crate::record::{FileRecord, PreviousFile, Write};
 
+    /// [`super::check_files`] with no trees, its gone paths dropped.
+    fn checked(
+        expanded: &Expanded,
+        target: &Target,
+        facts: Option<&Facts>,
+        entry: &TargetRecord,
+    ) -> Result<(), String> {
+        super::check_files(expanded, &Sources::default(), target, facts, entry).map(drop)
+    }
+
     /// [`super::check_files`] on a legacy config's list.
     fn check_files(
         config: &Config,
@@ -976,7 +1124,7 @@ mod tests {
         facts: Option<&Facts>,
         entry: &TargetRecord,
     ) -> Result<(), String> {
-        super::check_files(&legacy(config), target, facts, entry)
+        checked(&legacy(config), target, facts, entry)
     }
 
     fn facts(pairs: &[(&str, &str)]) -> Facts {
@@ -1093,7 +1241,7 @@ mod tests {
     #[test]
     fn a_dry_run_lists_the_files_last_written_first_then_what_cannot_be_undone() {
         assert_eq!(
-            would(Some(&entry())),
+            would(Some(&entry()), &Gone::default()),
             [
                 "cannot undo: /etc/c (over 256 KiB)",
                 "would remove /etc/b",
@@ -1102,7 +1250,7 @@ mod tests {
                 "cannot undo: step 2",
             ]
         );
-        assert_eq!(would(None), [NOTHING]);
+        assert_eq!(would(None, &Gone::default()), [NOTHING]);
     }
 
     #[test]
@@ -1494,11 +1642,7 @@ mod tests {
                 pending_handlers: Vec::new(),
             };
             for facts in [None, Some(&Facts::default())] {
-                assert_eq!(
-                    super::check_files(&config, &web, facts, &entry),
-                    Ok(()),
-                    "{facts:?}"
-                );
+                assert_eq!(checked(&config, &web, facts, &entry), Ok(()), "{facts:?}");
             }
         }
     }
@@ -1523,13 +1667,10 @@ mod tests {
         };
         let known = Facts::default();
         let (tasks, _) = two_writes((false, true), (false, true));
-        assert_eq!(
-            super::check_files(&tasks, &web, Some(&known), &entry),
-            Ok(())
-        );
+        assert_eq!(checked(&tasks, &web, Some(&known), &entry), Ok(()));
         let (forbids, _) = two_writes((false, true), (false, false));
         assert!(
-            super::check_files(&forbids, &web, Some(&known), &entry)
+            checked(&forbids, &web, Some(&known), &entry)
                 .unwrap_err()
                 .contains("rollback = false")
         );
@@ -1538,7 +1679,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            super::check_files(&crate::tasks::legacy(&config), &web, Some(&known), &entry)
+            checked(&crate::tasks::legacy(&config), &web, Some(&known), &entry)
                 .unwrap_err()
                 .contains("/etc//a is not in [[files]]")
         );
@@ -1566,21 +1707,15 @@ mod tests {
             pending_handlers: Vec::new(),
         };
         assert!(record.sudo);
-        assert_eq!(
-            super::check_files(&mixed, &web, None, &entry(&record)),
-            Ok(())
-        );
+        assert_eq!(checked(&mixed, &web, None, &entry(&record)), Ok(()));
         let known = Facts::default();
         assert!(
-            super::check_files(&mixed, &web, Some(&known), &entry(&record))
+            checked(&mixed, &web, Some(&known), &entry(&record))
                 .unwrap_err()
                 .contains("rollback = false")
         );
         mixed = two_writes((false, true), (true, true)).0;
-        assert_eq!(
-            super::check_files(&mixed, &web, Some(&known), &entry(&record)),
-            Ok(())
-        );
+        assert_eq!(checked(&mixed, &web, Some(&known), &entry(&record)), Ok(()));
     }
 
     #[test]
@@ -1603,7 +1738,7 @@ mod tests {
             pending_handlers: Vec::new(),
         };
         assert_eq!(
-            super::check_files(&expanded, &web1(), None, &entry),
+            checked(&expanded, &web1(), None, &entry),
             Err("rollback: /etc/a is not in the config; refusing to restore it".to_owned())
         );
     }

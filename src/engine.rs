@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::absent;
 use crate::cancel::{AbortReason, Cancel};
-use crate::config::{Config, Handler, Step, StepKind};
+use crate::config::{Config, FileEntry, Handler, Step, StepKind};
 use crate::dirs;
 use crate::error::Failure;
 use crate::facts::{self, Facts};
@@ -30,6 +30,7 @@ use crate::tasks::{Expanded, Item, ItemKind};
 use crate::transport::{
     Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
 };
+use crate::tree;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Sudo passwords by secret name; a name that is not set is absent.
@@ -342,11 +343,11 @@ pub(crate) struct Recorder<'a> {
     links: Vec<LinkRecord>,
     /// What each absent step captured, or that it found its path missing.
     absent: Vec<AbsentRecord>,
-    /// On a tasks config, the dests with a `rollback = false` file item that
-    /// applies to this target. Known before any write, since one kept text
+    /// On a tasks config, the ordinals of the `rollback = false` file items
+    /// that apply to this target. Known before any write, since one kept text
     /// could already be that item's bytes from the last apply, and the item
     /// may never run to drop it.
-    hash_only: Vec<&'a str>,
+    hash_only: Vec<usize>,
     /// Whether a write started: its capture ran, then the write did, or a
     /// dir, link or absent step ran.
     wrote: bool,
@@ -377,7 +378,7 @@ impl<'a> Recorder<'a> {
             Some(facts) => expanded
                 .files()
                 .filter(|(item, entry, _)| !entry.rollback && item.matches(target, facts))
-                .map(|(_, entry, _)| entry.dest.as_str())
+                .map(|(.., i)| i)
                 .collect(),
             None => Vec::new(),
         };
@@ -446,17 +447,24 @@ impl<'a> Recorder<'a> {
         }
     }
 
-    /// Whether `dest` is to keep its previous file's hash only.
+    /// Whether `dest` is to keep its previous file's hash only: one of the
+    /// `hash_only` items has a file there ([`tree::at`]).
     fn is_hash_only(&self, dest: &str) -> bool {
-        (self.hash_only.iter()).any(|hash_only| self.expanded.same_dest(hash_only, dest))
+        (self.expanded.files())
+            .any(|(_, entry, i)| self.hash_only.contains(&i) && self.file_at((entry, i), dest))
     }
 
     /// Whether a regular file a forced link replaces at `path` is to keep
-    /// its hash only: a file item for the same dest, on any target, says
+    /// its hash only: a file item with a file there, on any target, says
     /// `rollback = false`.
     fn link_hash_only(&self, path: &str) -> bool {
         (self.expanded.files())
-            .any(|(_, entry, _)| !entry.rollback && self.expanded.same_dest(&entry.dest, path))
+            .any(|(_, entry, i)| !entry.rollback && self.file_at((entry, i), path))
+    }
+
+    /// Whether the file item `entry` with ordinal `i` has a file at `path`.
+    fn file_at(&self, entry: (&FileEntry, usize), path: &str) -> bool {
+        tree::at(self.expanded, self.sources, entry, path) == tree::At::File
     }
 
     /// Saves what the target did so far, with `intents`, writes about to

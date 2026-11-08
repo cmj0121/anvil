@@ -24,12 +24,13 @@ use rustix::fs::{self as at, AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::bytes::{self, CappedError};
-use crate::config::check_dest;
+use crate::config::{FileEntry, check_dest};
 use crate::document;
 use crate::error::Failure;
-use crate::files::{Source, store_reason};
+use crate::files::{Source, Sources, store_reason};
 use crate::filestore::{self, Kind, Root, StoreError};
 use crate::logger::escape_line;
+use crate::tasks::Expanded;
 use crate::trust::{self, TrustError};
 
 /// The most files one tree holds.
@@ -102,6 +103,77 @@ impl TreeItem {
             TreeKind::File(source) => Some(source),
             TreeKind::Dir => None,
         }
+    }
+}
+
+/// What a file item has at a record's path: the one matcher apply and
+/// rollback tie a recorded file or directory back to its entry with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum At {
+    /// Not its dest, nor under a recursive entry's dest.
+    Outside,
+    /// Its dest, or a file of its tree.
+    File,
+    /// A directory of its tree, the dest itself included.
+    Dir,
+    /// Under its dest, but no longer an item of its tree.
+    Gone,
+}
+
+/// What `entry`, the file item of `expanded` with ordinal `i`, has at
+/// `path`: a single entry its dest ([`Expanded::same_dest`]); a recursive
+/// one the item of its tree in `sources` whose `rel` is `path` under its
+/// dest, read as `same_dest` reads a dest. A tree `sources` lacks holds
+/// nothing.
+pub fn at(
+    expanded: &Expanded,
+    sources: &Sources,
+    (entry, i): (&FileEntry, usize),
+    path: &str,
+) -> At {
+    if !entry.recursive {
+        return if expanded.same_dest(&entry.dest, path) {
+            At::File
+        } else {
+            At::Outside
+        };
+    }
+    let (Some(rel), Some(tree)) = (rel_under(expanded, &entry.dest, path), sources.tree(i)) else {
+        return At::Outside;
+    };
+    match tree
+        .items
+        .iter()
+        .find(|item| item.rel == rel)
+        .map(|item| &item.kind)
+    {
+        Some(TreeKind::File(_)) => At::File,
+        Some(TreeKind::Dir) => At::Dir,
+        None => At::Gone,
+    }
+}
+
+/// `path` relative to `dest`, empty for `dest` itself; `None` when it is
+/// not `dest` or under it. On a tasks config repeated slashes count as one.
+fn rel_under(expanded: &Expanded, dest: &str, path: &str) -> Option<String> {
+    if expanded.from_tasks {
+        let parts = |p: &str| {
+            p.split('/')
+                .filter(|part| !part.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let (dest, path) = (parts(dest), parts(path));
+        return path
+            .starts_with(&dest)
+            .then(|| path[dest.len()..].join("/"));
+    }
+    match path.strip_prefix(dest)? {
+        "" => Some(String::new()),
+        rest => rest
+            .strip_prefix('/')
+            .filter(|rel| !rel.is_empty())
+            .map(str::to_owned),
     }
 }
 

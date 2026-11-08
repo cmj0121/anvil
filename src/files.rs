@@ -62,6 +62,8 @@ pub struct Sources(Vec<Loaded>);
 pub enum Loaded {
     File(Source),
     Tree(Tree),
+    /// A single file's src that [`load_trees`] did not read.
+    Unread,
 }
 
 impl Loaded {
@@ -69,7 +71,7 @@ impl Loaded {
     pub fn file(&self) -> Option<&Source> {
         match self {
             Loaded::File(source) => Some(source),
-            Loaded::Tree(_) => None,
+            Loaded::Tree(_) | Loaded::Unread => None,
         }
     }
 }
@@ -161,7 +163,24 @@ pub fn load(
     expanded: &Expanded,
     workspace: impl FnOnce() -> Result<PathBuf, Failure>,
 ) -> Result<Sources, Failure> {
-    if expanded.files().next().is_none() {
+    load_where(expanded, workspace, false)
+}
+
+/// [`load`] of the recursive entries only, as rollback ties tree items back
+/// to their entries; a single file's src is left [`Loaded::Unread`].
+pub fn load_trees(
+    expanded: &Expanded,
+    workspace: impl FnOnce() -> Result<PathBuf, Failure>,
+) -> Result<Sources, Failure> {
+    load_where(expanded, workspace, true)
+}
+
+fn load_where(
+    expanded: &Expanded,
+    workspace: impl FnOnce() -> Result<PathBuf, Failure>,
+    trees_only: bool,
+) -> Result<Sources, Failure> {
+    if !(expanded.files()).any(|(_, entry, _)| entry.recursive || !trees_only) {
         return Ok(Sources::default());
     }
     let workspace = workspace()?;
@@ -179,7 +198,9 @@ pub fn load(
     let mut sources = Vec::new();
     for (item, entry, i) in expanded.files() {
         let store_path = filestore::is_store_path(&entry.src);
-        let loaded = if entry.recursive {
+        let loaded = if trees_only && !entry.recursive {
+            Ok(Loaded::Unread)
+        } else if entry.recursive {
             if store_path {
                 tree::expand_store(&store, (i, &entry.src, &entry.dest), &mut budget)
             } else {

@@ -1077,6 +1077,73 @@ else
 fi
 docker exec "$NAME" rm -rf /etc/anvil-e2e-ab-file /etc/anvil-e2e-ab-link /etc/anvil-e2e-ab-dir
 
+step "(x) a recursive [[files]] tree on arch (NOPASSWD): owner, group, mode and dir_mode on a nested tree into an existing dir; rollback removes what it created"
+TR_STATE="$TMP/state-tree"
+TR_DIR="$TMP/tree"
+TR_DEST=/etc/anvil-e2e-tree
+mkdir -p "$TR_DIR/conf/sub/deep"
+printf 'a = 1\n' >"$TR_DIR/conf/a.conf"
+printf 'b = 2\n' >"$TR_DIR/conf/sub/b.conf"
+printf 'c = 3\n' >"$TR_DIR/conf/sub/deep/c.conf"
+printf '\000\001\377' >"$TR_DIR/conf/blob.bin"
+cat >"$TR_DIR/config.toml" <<CONF
+[[files]]
+src = "conf"
+dest = "$TR_DEST"
+recursive = true
+mode = "0640"
+dir_mode = "0750"
+owner = "pw"
+group = "key"
+CONF
+tr_anvil() {
+  run_env XDG_STATE_HOME="$TR_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$TR_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+# The dest exists, 0755 root:root, with a file the tree does not hold.
+docker exec "$NAME" sh -c "rm -rf $TR_DEST && mkdir $TR_DEST && chmod 755 $TR_DEST && printf 'mine\n' >$TR_DEST/extra"
+tr_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF "  unchanged $TR_DEST" "$TMP/out" \
+  && grep -qxF "  created $TR_DEST/sub/deep" "$TMP/out" \
+  && grep -qxF "  wrote $TR_DEST/sub/deep/c.conf" "$TMP/out" \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST")" = '755 root:root' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST/sub")" = '750 root:key' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST/sub/deep")" = '750 root:key' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST/a.conf")" = '640 pw:key' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST/sub/deep/c.conf")" = '640 pw:key' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST/blob.bin")" = '640 pw:key' ] \
+  && docker exec "$NAME" cat "$TR_DEST/blob.bin" | cmp -s - "$TR_DIR/conf/blob.bin" \
+  && [ "$(docker exec "$NAME" cat "$TR_DEST/extra")" = mine ]; then
+  pass "apply copied the nested tree, files pw:key 0640, created dirs root:key 0750, the existing dest and its extra file kept"
+else
+  fail "apply of a tree: exit $code"
+fi
+tr_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF "  removed $TR_DEST/a.conf" "$TMP/out" \
+  && grep -qxF "  removed $TR_DEST/sub/deep/c.conf" "$TMP/out" \
+  && grep -qxF "  \$ cannot undo: $TR_DEST/blob.bin (binary)" "$TMP/out" \
+  && [ "$(grep -F "removed directory $TR_DEST" "$TMP/out")" = "$(printf '%s\n' \
+    "  removed directory $TR_DEST/sub/deep" "  removed directory $TR_DEST/sub")" ] \
+  && [ "$(docker exec "$NAME" ls -A "$TR_DEST" | tr '\n' ' ')" = 'blob.bin extra ' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST")" = '755 root:root' ] \
+  && [ "$(docker exec "$NAME" cat "$TR_DEST/extra")" = mine ]; then
+  pass "rollback removed the tree's files and created dirs deepest first, left the binary item, the extra file and the existing dest"
+else
+  fail "rollback of a tree: exit $code"
+fi
+tr_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && ! grep -qF 'removed' "$TMP/out" \
+  && [ "$(docker exec "$NAME" ls -A "$TR_DEST" | tr '\n' ' ')" = 'blob.bin extra ' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST")" = '755 root:root' ]; then
+  pass "a second rollback of the tree is unchanged"
+else
+  fail "second rollback of a tree: exit $code"
+fi
+docker exec "$NAME" rm -rf "$TR_DEST"
+
 step "(u) a timed-out plain run dies on arch, without timeout(1) there; a step reading stdin ends at once"
 U_DIR="$TMP/remote-kill"
 U_STATE="$TMP/state-u"
