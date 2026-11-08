@@ -82,6 +82,8 @@ pub enum StoreError {
     IsDir(String),
     NotDir(String),
     NotText(String),
+    TooLarge(String),
+    NotRegular(String),
     TooDeep(String),
     Untrusted(String, String),
     Io(String, io::Error),
@@ -109,6 +111,8 @@ impl StoreError {
             | Self::NotDir(path)
             | Self::TooDeep(path)
             | Self::NotText(path)
+            | Self::TooLarge(path)
+            | Self::NotRegular(path)
             | Self::Untrusted(path, _)
             | Self::Io(path, _)
             | Self::Host(path, _) => path,
@@ -127,6 +131,8 @@ impl StoreError {
             Self::NotDir(_) => "is not a folder",
             Self::TooDeep(_) => return format!("nested deeper than {MAX_DEPTH} folders"),
             Self::NotText(_) => "not a regular UTF-8 text file without NUL, at most 1 MiB",
+            Self::TooLarge(_) => "exceeds the 1 MiB limit",
+            Self::NotRegular(_) => "is not a regular file",
             Self::Untrusted(_, why) => return why.clone(),
             Self::Io(_, err) | Self::Host(_, err) => return err.to_string(),
         }
@@ -244,6 +250,17 @@ impl Root {
             StoreError::IsDir(rel) => StoreError::NotText(rel),
             err => err,
         })
+    }
+
+    /// [`Root::read_trusted`] for any bytes, text or not: a regular file of
+    /// at most 1 MiB.
+    pub fn read_trusted_bytes(&self, rel: &str) -> Result<Vec<u8>, StoreError> {
+        let rel = parse(rel)?;
+        let (parent, name) = split_parent(&rel);
+        let dir = self.trusted_directory(parent)?;
+        let file = open_file(&dir, name, &rel)?;
+        check_trusted(&file, &rel)?;
+        read_file_bytes(file, &rel)
     }
 
     /// Writes atomically as 0600, creating missing parents as 0700.
@@ -836,6 +853,23 @@ fn open_file(dir: &File, name: &str, rel: &str) -> Result<File, StoreError> {
 }
 
 fn read_file(file: File, rel: &str) -> Result<String, StoreError> {
+    let bytes = read_capped(file, rel)?;
+    text(&bytes, rel).map(str::to_owned)
+}
+
+fn read_file_bytes(file: File, rel: &str) -> Result<Vec<u8>, StoreError> {
+    let bytes = read_capped(file, rel).map_err(|err| match err {
+        StoreError::IsDir(rel) | StoreError::NotText(rel) => StoreError::NotRegular(rel),
+        err => err,
+    })?;
+    if bytes.len() as u64 > document::MAX_BYTES {
+        return Err(StoreError::TooLarge(rel.to_owned()));
+    }
+    Ok(bytes)
+}
+
+/// A regular file's bytes, up to one past [`document::MAX_BYTES`].
+fn read_capped(file: File, rel: &str) -> Result<Vec<u8>, StoreError> {
     let meta = file.metadata().map_err(|e| io_error(rel, e))?;
     if !meta.is_file() {
         return Err(if meta.is_dir() {
@@ -846,7 +880,7 @@ fn read_file(file: File, rel: &str) -> Result<String, StoreError> {
     }
     let mut bytes = Vec::new();
     document::read_capped_from(file, &mut bytes).map_err(|e| io_error(rel, e))?;
-    text(&bytes, rel).map(str::to_owned)
+    Ok(bytes)
 }
 
 fn check_at(dir: &File, name: &str, rel: &str, force: bool) -> Result<(), StoreError> {
@@ -955,6 +989,35 @@ mod tests {
             assert_eq!(err.to_string(), shown);
         }
         assert_eq!(store.1.read_text("role.toml").unwrap(), "tasks = []");
+    }
+
+    #[test]
+    fn read_trusted_bytes_reads_any_bytes_but_keeps_the_checks() {
+        let store = Store::new();
+        store.1.write("role.toml", b"tasks = []").unwrap();
+        let path = store.1.path().join("blob");
+        fs::write(&path, b"\xff\0\x01").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(store.1.read_trusted_bytes("$/blob").unwrap(), b"\xff\0\x01");
+        assert!(matches!(
+            store.1.read_trusted("$/blob"),
+            Err(StoreError::NotText(_))
+        ));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        let err = store.1.read_trusted_bytes("$/blob").unwrap_err();
+        assert!(matches!(err, StoreError::Untrusted(_, _)), "{err}");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&path, vec![0; document::MAX_BYTES as usize + 1]).unwrap();
+        let err = store.1.read_trusted_bytes("$/blob").unwrap_err();
+        assert_eq!(err.to_string(), "$/blob: exceeds the 1 MiB limit");
+        fs::create_dir(store.1.path().join("dir")).unwrap();
+        let fifo = store.1.path().join("fifo");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.unwrap().success());
+        for rel in ["$/dir", "$/fifo"] {
+            let err = store.1.read_trusted_bytes(rel).unwrap_err();
+            assert_eq!(err.to_string(), format!("{rel}: is not a regular file"));
+        }
     }
 
     #[test]

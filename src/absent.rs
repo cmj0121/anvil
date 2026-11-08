@@ -594,12 +594,14 @@ impl Restore<'_> {
                 "{sudo}sh -c 'tee \"$1\" <\"$2\" >/dev/null' sh {t} {}",
                 quote(staged)
             ),
-            Bytes::Inline(_) => format!("anvil_bytes | {sudo}tee {t} >/dev/null"),
+            Bytes::Inline(_) | Bytes::Printf(_) => {
+                format!("anvil_bytes | {sudo}tee {t} >/dev/null")
+            }
         };
         let trap = temp_trap("absent", &remove, bytes);
         let open = format!("{{ umask 077; LC_ALL=C; export LC_ALL; set -f\nanvil_t=\n{trap}");
         let defs = match bytes {
-            Bytes::Inline(_) => {
+            Bytes::Inline(_) | Bytes::Printf(_) => {
                 zeroizing(format_args!("{}{}", *bytes.definition(), sweep(sudo, path)))
             }
             Bytes::Staged(..) => zeroizing(format_args!("{}", sweep(sudo, path))),

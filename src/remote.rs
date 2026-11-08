@@ -78,6 +78,52 @@ impl fmt::Display for Body<'_> {
     }
 }
 
+/// The bytes of a binary file per `printf` line of a [`Printf`].
+pub(crate) const PRINTF_CHUNK: usize = 256;
+
+/// Refuses, exit [`REFUSED`], a shell whose `printf` is not a builtin, so
+/// that no [`Printf`] line, which carries the bytes, reaches a process's argv.
+pub(crate) const PRINTF_BUILTIN: &str = "case $(command -v printf) in printf) ;; \
+     *) echo 'files: printf is not a shell builtin; cannot copy a binary file' >&2; exit 4 ;; esac\n";
+
+/// Bytes that are not text, as `printf` lines of [`PRINTF_CHUNK`] bytes each,
+/// which need only `sh` and its `printf` on the target. A byte in
+/// `[A-Za-z0-9._/]` stays as it is; every other one, and the first of every
+/// line so that no format starts with `-`, is `\ooo` with exactly three octal
+/// digits, so neither `%`, `\` nor `'` reaches `printf` or the quotes as it is.
+pub(crate) struct Printf {
+    pub(crate) lines: Zeroizing<String>,
+    pub(crate) len: usize,
+}
+
+impl Printf {
+    pub(crate) fn new(bytes: &[u8]) -> Self {
+        use std::fmt::Write as _;
+        const OPEN: &str = "printf '";
+        const CLOSE: &str = "'\n";
+        let count = bytes.len().div_ceil(PRINTF_CHUNK);
+        // Sized for the longest body up front, so no copy is left unzeroed.
+        let mut lines = Zeroizing::new(String::with_capacity(
+            4 * bytes.len() + count * (OPEN.len() + CLOSE.len()),
+        ));
+        for chunk in bytes.chunks(PRINTF_CHUNK) {
+            lines.push_str(OPEN);
+            for (k, &b) in chunk.iter().enumerate() {
+                if k > 0 && (b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/')) {
+                    lines.push(char::from(b));
+                } else {
+                    write!(lines, "\\{b:03o}").expect("a String takes every write");
+                }
+            }
+            lines.push_str(CLOSE);
+        }
+        Printf {
+            lines,
+            len: bytes.len(),
+        }
+    }
+}
+
 /// `s` in single quotes for `sh`.
 pub(crate) fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -458,6 +504,8 @@ pub(crate) fn temp_beside(dest: &str) -> Result<String, String> {
 pub(crate) enum Bytes<'a> {
     /// In the script, a heredoc.
     Inline(&'a Heredoc<'a>),
+    /// In the script, `printf` lines: a binary file's.
+    Printf(&'a Printf),
     /// A 0600 file of the user's holding this many bytes, on the password path.
     Staged(&'a str, usize),
 }
@@ -466,6 +514,7 @@ impl Bytes<'_> {
     pub(crate) fn len(&self) -> usize {
         match self {
             Bytes::Inline(heredoc) => heredoc.text.len(),
+            Bytes::Printf(printf) => printf.len,
             Bytes::Staged(_, len) => *len,
         }
     }
@@ -478,6 +527,10 @@ impl Bytes<'_> {
                 "anvil_bytes() {{\n{}\n{}}}\n",
                 heredoc.head(),
                 heredoc.body()
+            )),
+            Bytes::Printf(printf) => zeroizing(format_args!(
+                "{PRINTF_BUILTIN}anvil_bytes() {{\n{}}}\n",
+                *printf.lines
             )),
             Bytes::Staged(staged, _) => {
                 zeroizing(format_args!("anvil_bytes() {{ cat {}; }}\n", quote(staged)))
@@ -503,7 +556,7 @@ pub(crate) fn temp_trap(kind: &str, remove: &str, bytes: &Bytes<'_>) -> String {
                 quote(&format!("{kind}: temp file check failed")),
             )
         }
-        Bytes::Inline(_) => format!(
+        Bytes::Inline(_) | Bytes::Printf(_) => format!(
             "trap {} EXIT\ntrap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM\n",
             quote(remove)
         ),
@@ -594,7 +647,9 @@ impl Replacement<'_> {
         let (d, sudo) = (quote(self.dest), self.sudo);
         let has_cmp = has_cmp(sudo);
         match &self.bytes {
-            Bytes::Inline(_) => format!("anvil_bytes | {{ {has_cmp} && {sudo}cmp -s - {d}; }}"),
+            Bytes::Inline(_) | Bytes::Printf(_) => {
+                format!("anvil_bytes | {{ {has_cmp} && {sudo}cmp -s - {d}; }}")
+            }
             Bytes::Staged(..) => format!("{has_cmp} && {}", self.compare()),
         }
     }
@@ -603,7 +658,7 @@ impl Replacement<'_> {
     fn compare(&self) -> String {
         let (d, sudo) = (quote(self.dest), self.sudo);
         match &self.bytes {
-            Bytes::Inline(_) => format!("anvil_bytes | {sudo}cmp -s - {d}"),
+            Bytes::Inline(_) | Bytes::Printf(_) => format!("anvil_bytes | {sudo}cmp -s - {d}"),
             Bytes::Staged(staged, _) => format!("{sudo}cmp -s {} {d}", quote(staged)),
         }
     }
@@ -644,7 +699,9 @@ impl Replacement<'_> {
         let tee_from =
             |file: &str| format!("{sudo}sh -c 'tee \"$1\" <\"$2\" >/dev/null' sh {d} {file}");
         let tee_bytes = match &self.bytes {
-            Bytes::Inline(_) => format!("anvil_bytes | {sudo}tee {d} >/dev/null"),
+            Bytes::Inline(_) | Bytes::Printf(_) => {
+                format!("anvil_bytes | {sudo}tee {d} >/dev/null")
+            }
             Bytes::Staged(staged, _) => tee_from(&quote(staged)),
         };
         let tee_temp = tee_from(&t);
@@ -844,6 +901,122 @@ pub(crate) fn sweep(sudo: &str, dest: &str) -> String {
 mod tests {
     use super::*;
     use crate::inventory::Level;
+
+    /// Every byte value, a NUL run, and a second chunk that starts with `-`
+    /// and holds what `printf` or the quotes would take as syntax.
+    fn every_byte() -> Vec<u8> {
+        let mut bytes: Vec<u8> = (0..=255).collect();
+        assert_eq!(bytes.len(), PRINTF_CHUNK);
+        bytes.extend_from_slice(b"-n\0\0-e %s %% \\ \\n ' \" $(x) `y` 1234567\n");
+        bytes.extend((0..=255u8).rev());
+        bytes
+    }
+
+    #[test]
+    fn printf_keeps_only_the_safe_set_and_escapes_each_lines_first_byte() {
+        let printf = Printf::new(b"-ab.c_/9-%\\'\0Z");
+        assert_eq!(
+            *printf.lines,
+            "printf '\\055ab.c_/9\\055\\045\\134\\047\\000Z'\n"
+        );
+        assert_eq!(printf.len, 14);
+        let mut bytes = vec![b'a'; PRINTF_CHUNK];
+        bytes.extend_from_slice(b"-a");
+        let printf = Printf::new(&bytes);
+        let lines: Vec<_> = printf.lines.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            format!("printf '\\141{}'", "a".repeat(PRINTF_CHUNK - 1))
+        );
+        assert_eq!(lines[1], "printf '\\055a'");
+        assert_eq!(printf.len, PRINTF_CHUNK + 2);
+        for line in Printf::new(&every_byte()).lines.lines() {
+            let format = line
+                .strip_prefix("printf '")
+                .unwrap()
+                .strip_suffix('\'')
+                .unwrap();
+            assert!(format.starts_with('\\'), "{line}");
+            assert!(
+                format
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._/\\".contains(&b)),
+                "{line}"
+            );
+            let mut rest = format;
+            while let Some(at) = rest.find('\\') {
+                let octal = &rest[at + 1..at + 4];
+                assert!(octal.bytes().all(|b| (b'0'..=b'7').contains(&b)), "{line}");
+                rest = &rest[at + 4..];
+            }
+        }
+    }
+
+    /// Each of `dash`, `bash`, `busybox sh` and `sh` found on this machine,
+    /// as its argv.
+    fn shells() -> Vec<Vec<&'static str>> {
+        let found = |name: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", "command -v \"$1\" >/dev/null", "sh", name])
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let mut shells = Vec::new();
+        for argv in [
+            vec!["dash"],
+            vec!["bash"],
+            vec!["busybox", "sh"],
+            vec!["sh"],
+        ] {
+            if found(argv[0]) {
+                shells.push(argv);
+            } else {
+                eprintln!("skip: no {}", argv.join(" "));
+            }
+        }
+        shells
+    }
+
+    /// What `anvil_bytes` of `printf` prints under the shell `argv`, the
+    /// script on its stdin.
+    fn printed(argv: &[&str], printf: &Printf) -> Vec<u8> {
+        use std::io::Write as _;
+        let script = format!("{}anvil_bytes\n", *Bytes::Printf(printf).definition());
+        let mut child = std::process::Command::new(argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
+        let out = child.wait_with_output().unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(out.status.success(), "{argv:?}: {out:?}");
+        out.stdout
+    }
+
+    #[test]
+    fn printf_lines_print_every_byte_under_each_shell() {
+        let bytes = every_byte();
+        let printf = Printf::new(&bytes);
+        for argv in shells() {
+            assert_eq!(printed(&argv, &printf), bytes, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn printf_lines_of_one_mib_of_random_bytes_print_back_under_each_shell() {
+        let mut bytes = vec![0; 1024 * 1024];
+        fill_random(&mut bytes).unwrap();
+        let printf = Printf::new(&bytes);
+        for argv in shells() {
+            let start = std::time::Instant::now();
+            assert!(printed(&argv, &printf) == bytes, "{argv:?}");
+            eprintln!("1 MiB under {}: {:?}", argv.join(" "), start.elapsed());
+        }
+    }
 
     #[test]
     fn no_env_is_no_prefix() {

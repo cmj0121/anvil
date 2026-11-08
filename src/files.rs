@@ -1,11 +1,12 @@
-//! `[[files]]`: a text file in the workspace or store, copied to `dest` on each
+//! `[[files]]`: a file in the workspace or store, copied to `dest` on each
 //! target whose tags and facts all match.
 //!
 //! [`load`] reads every src once, before any target runs. [`run`] turns
 //! each entry into one step per target: a skip when the entry does not
 //! match, else a script that compares the bytes with DEST and writes them
-//! only when they differ. The bytes travel in a heredoc on the script's
-//! stdin, never on argv, and `Debug` never shows them.
+//! only when they differ. The bytes travel on the script's stdin, never on
+//! argv, in a heredoc for text and `printf` lines for a binary file
+//! ([`Printf`]), and `Debug` never shows them.
 //!
 //! A root target, a `sudo = false` entry, or sudo without a password writes
 //! the bytes to a temp file beside DEST and renames it over DEST
@@ -17,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -34,9 +36,9 @@ use crate::record::{
     is_world_readable,
 };
 use crate::remote::{
-    Bytes, Heredoc, Ids, LOGIN_OWNED, ROOT_OWNED, Replacement, is_owned_only, link_removal_checks,
-    login_checks, login_top, not_a_directory, random_hex, refusal, refused, root_checks,
-    root_only_find, sweep, temp_beside, unchecked, zeroizing,
+    Bytes, Heredoc, Ids, LOGIN_OWNED, PRINTF_BUILTIN, Printf, ROOT_OWNED, Replacement,
+    is_owned_only, link_removal_checks, login_checks, login_top, not_a_directory, random_hex,
+    refusal, refused, root_checks, root_only_find, sweep, temp_beside, unchecked, zeroizing,
 };
 pub(crate) use crate::remote::{REFUSED, quote};
 pub use crate::remote::{Walk, WalkNonce};
@@ -58,24 +60,63 @@ impl Sources {
         Sources(
             texts
                 .iter()
-                .map(|text| Source {
-                    text: (*text).to_owned(),
-                })
+                .map(|text| Source::of(text.as_bytes().to_vec()))
                 .collect(),
         )
     }
 }
 
-/// One src's text: UTF-8, no NUL, at most [`document::MAX_BYTES`].
+/// One src's bytes, at most [`document::MAX_BYTES`]: `binary` when they are
+/// not UTF-8 or hold a NUL.
 pub struct Source {
-    pub text: String,
+    pub bytes: Vec<u8>,
+    pub binary: bool,
 }
 
-/// By hand: only the length, never the text.
+impl Source {
+    fn of(bytes: Vec<u8>) -> Source {
+        let binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
+        Source { bytes, binary }
+    }
+
+    /// The bytes as text, unless they are binary.
+    fn text(&self) -> Option<&str> {
+        std::str::from_utf8(&self.bytes)
+            .ok()
+            .filter(|_| !self.binary)
+    }
+}
+
+/// By hand: only the length, never the bytes.
 impl fmt::Debug for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Source(<{} bytes>)", self.text.len())
+        write!(f, "Source(<{} bytes>)", self.bytes.len())
     }
+}
+
+/// What a write puts at DEST: text goes in a heredoc, binary in `printf` lines.
+#[derive(Clone, Copy)]
+pub(crate) enum Payload<'a> {
+    Text(&'a str),
+    Binary(&'a [u8]),
+}
+
+impl<'a> Payload<'a> {
+    pub(crate) fn bytes(self) -> &'a [u8] {
+        match self {
+            Payload::Text(text) => text.as_bytes(),
+            Payload::Binary(bytes) => bytes,
+        }
+    }
+}
+
+/// The step timeout for a write that sends `wire` bytes in its runs:
+/// `RUN_TIMEOUT + PER_MIB * wire / 1 MiB`, the allowance counted in whole
+/// seconds, rounded down, so a small file keeps [`RUN_TIMEOUT`].
+pub(crate) fn write_timeout(wire: usize) -> Duration {
+    const PER_MIB_SECS: u64 = 15;
+    const MIB: u64 = 1024 * 1024;
+    RUN_TIMEOUT + Duration::from_secs(wire as u64 * PER_MIB_SECS / MIB)
 }
 
 /// Reads every src from the store or workspace; source errors name the entry.
@@ -93,8 +134,8 @@ pub fn load(
         fs::canonicalize(&workspace).map_err(|err| format!("cannot read: {err}"))
     });
     let sources = expanded.files().map(|(item, entry, i)| {
-        let text = if filestore::is_store_path(&entry.src) {
-            store.read_trusted(&entry.src).map_err(|err| Failure {
+        let bytes = if filestore::is_store_path(&entry.src) {
+            store.read_trusted_bytes(&entry.src).map_err(|err| Failure {
                 refused: matches!(err, StoreError::Untrusted(_, _)),
                 ..Failure::usage(store_reason(&entry.src, &err))
             })
@@ -102,18 +143,24 @@ pub fn load(
             canonical
                 .as_ref()
                 .map_err(|err| Failure::usage(err.clone()))
-                .and_then(|dir| read_src(dir, &entry.src))
+                .and_then(|dir| read_src_bytes(dir, &entry.src))
         };
-        text.and_then(|text| {
-            if entry.template {
-                template::check(&text).map_err(|why| Failure::usage(format!("template: {why}")))?;
-            }
-            Ok(Source { text })
-        })
-        .map_err(|err| Failure {
-            message: src_message(item, i, &entry.src, &err.message),
-            ..err
-        })
+        bytes
+            .and_then(|bytes| {
+                let source = Source::of(bytes);
+                if entry.template {
+                    let text = source.text().ok_or_else(|| {
+                        Failure::usage("is binary; template = true needs a text file")
+                    })?;
+                    template::check(text)
+                        .map_err(|why| Failure::usage(format!("template: {why}")))?;
+                }
+                Ok(source)
+            })
+            .map_err(|err| Failure {
+                message: src_message(item, i, &entry.src, &err.message),
+                ..err
+            })
     });
     Ok(Sources(sources.collect::<Result<_, _>>()?))
 }
@@ -133,6 +180,16 @@ pub(crate) fn src_message(item: &Item, i: usize, src: &str, why: &str) -> String
 /// is checked.
 pub(crate) fn read_src(dir: &Path, src: &str) -> Result<String, Failure> {
     const TEXT_ONLY: &str = "[[files]] copies text files only for now";
+    let text = String::from_utf8(read_src_bytes(dir, src)?)
+        .map_err(|_| Failure::usage(format!("is not UTF-8 text; {TEXT_ONLY}")))?;
+    if text.contains('\0') {
+        return Err(Failure::usage(format!("contains a NUL byte; {TEXT_ONLY}")));
+    }
+    Ok(text)
+}
+
+/// [`read_src`] for any bytes, text or not.
+pub(crate) fn read_src_bytes(dir: &Path, src: &str) -> Result<Vec<u8>, Failure> {
     let unreadable = |err: std::io::Error| Failure::usage(format!("cannot read: {err}"));
     let path = fs::canonicalize(dir.join(src)).map_err(unreadable)?;
     if !path.starts_with(dir) {
@@ -151,13 +208,7 @@ pub(crate) fn read_src(dir: &Path, src: &str) -> Result<String, Failure> {
     for folder in path.ancestors().skip(1).take_while(|a| a.starts_with(dir)) {
         trust::check_dir(folder, trust::INPUT).map_err(trust_error)?;
     }
-    let bytes = trust::load(&path, document::MAX_BYTES).map_err(trust_error)?;
-    let text = String::from_utf8(bytes)
-        .map_err(|_| Failure::usage(format!("is not UTF-8 text; {TEXT_ONLY}")))?;
-    if text.contains('\0') {
-        return Err(Failure::usage(format!("contains a NUL byte; {TEXT_ONLY}")));
-    }
-    Ok(text)
+    trust::load(&path, document::MAX_BYTES).map_err(trust_error)
 }
 
 /// Retains a failing store component when it differs from the source.
@@ -302,7 +353,8 @@ pub fn run(
         }
     };
     let (script, upload) = write_script(&write, sources, &Expected::Unchecked)?;
-    Ok(file_run(
+    let wire = script.len() + upload.as_ref().map_or(0, |upload| upload.stage.len());
+    let mut planned = file_run(
         dest,
         script,
         format!("file {dest}"),
@@ -312,7 +364,9 @@ pub fn run(
             skip: false,
             write: Some(write),
         },
-    ))
+    );
+    planned.timeout = write_timeout(wire);
+    Ok(planned)
 }
 
 /// `target`'s render of the templated `entry`, or `None` when it is not
@@ -329,7 +383,7 @@ fn render_entry(
     if !entry.template {
         return Ok(None);
     }
-    let Some(Source { text }) = sources.0.get(i) else {
+    let Some(text) = sources.0.get(i).and_then(Source::text) else {
         return Err(format!("files[{i}]: src was not loaded"));
     };
     let rendered = template::render(text, &target.vars, facts).and_then(|text| {
@@ -475,15 +529,18 @@ impl Ownership {
 impl FileWrite {
     /// The bytes this write puts at DEST: `rendered`, else the src.
     /// The only place a write reads its bytes.
-    pub(crate) fn text<'a>(&'a self, sources: &'a Sources) -> Result<&'a str, String> {
-        match &self.rendered {
-            Some(rendered) => Ok(rendered.text.as_str()),
-            None => sources
-                .0
-                .get(self.ordinal)
-                .map(|source| source.text.as_str())
-                .ok_or_else(|| format!("files[{}]: src was not loaded", self.ordinal)),
+    pub(crate) fn payload<'a>(&'a self, sources: &'a Sources) -> Result<Payload<'a>, String> {
+        if let Some(rendered) = &self.rendered {
+            return Ok(Payload::Text(rendered.text.as_str()));
         }
+        let source = sources
+            .0
+            .get(self.ordinal)
+            .ok_or_else(|| format!("files[{}]: src was not loaded", self.ordinal))?;
+        Ok(match source.text() {
+            Some(text) => Payload::Text(text),
+            None => Payload::Binary(&source.bytes),
+        })
     }
 
     /// The run before the write that reports what DEST holds.
@@ -506,13 +563,13 @@ impl FileWrite {
         let entry = expanded
             .file(self.ordinal)
             .expect("a write comes from the list it is recorded against");
-        let written = self.text(sources).unwrap_or("");
+        let written = self.payload(sources).map_or(&[][..], Payload::bytes);
         let previous = previous_of(captured, hash_only || !entry.rollback);
         FileRecord {
             dest: self.dest.clone(),
             mode: format!("{:0>4}", self.mode),
             sudo: entry.sudo,
-            written_sha256: hex(&Sha256::digest(written.as_bytes())),
+            written_sha256: hex(&Sha256::digest(written)),
             write,
             previous,
             written_attrs: None,
@@ -593,32 +650,48 @@ pub(crate) enum Expected {
     Sha256(String),
 }
 
-/// The write script of `step` from its bytes ([`FileWrite::text`]: the rendered
-/// text of a templated entry, else its src in `sources`), refusing to write
-/// when DEST no longer holds what `expected` says; with the password path's
-/// stage and cleanup around it, under a fresh temp name.
+/// The write script of `step` from its bytes ([`FileWrite::payload`]: the
+/// rendered text of a templated entry, else its src in `sources`), refusing to
+/// write when DEST no longer holds what `expected` says; with the password
+/// path's stage and cleanup around it, under a fresh temp name. Text travels
+/// in a heredoc, binary in `printf` lines; either way only in a plain run.
 pub(crate) fn write_script(
     step: &FileWrite,
     sources: &Sources,
     expected: &Expected,
 ) -> Result<(Zeroizing<String>, Option<Upload>), String> {
     let i = step.ordinal;
-    let text = step.text(sources)?;
-    let heredoc = Heredoc::new(text).map_err(|why| format!("files[{i}].src: {why}"))?;
+    let payload = step.payload(sources)?;
+    let (heredoc, printf);
+    let bytes = match payload {
+        Payload::Text(text) => {
+            heredoc = Heredoc::new(text).map_err(|why| format!("files[{i}].src: {why}"))?;
+            Bytes::Inline(&heredoc)
+        }
+        Payload::Binary(bytes) => {
+            printf = Printf::new(bytes);
+            Bytes::Printf(&printf)
+        }
+    };
     if !step.password {
-        return tee_script(&heredoc, step, expected).map(|script| (script, None));
+        return tee_script(bytes, step, expected).map(|script| (script, None));
     }
-    let (temp, upload) = staged(&heredoc)?;
-    let script = install_script(&temp, text.len(), step, expected)?;
+    let (temp, upload) = staged_bytes(&bytes)?;
+    let script = install_script(&temp, bytes.len(), step, expected)?;
     Ok((script, Some(upload)))
 }
 
 /// The password path's upload of `heredoc`: a fresh temp name, the stage
 /// that writes the bytes there and the cleanup that removes it.
 pub(crate) fn staged(heredoc: &Heredoc<'_>) -> Result<(String, Upload), String> {
+    staged_bytes(&Bytes::Inline(heredoc))
+}
+
+/// [`staged`] of inline `bytes`, a heredoc or `printf` lines.
+fn staged_bytes(bytes: &Bytes<'_>) -> Result<(String, Upload), String> {
     let temp = temp_path()?;
     let upload = Upload {
-        stage: stage_script(heredoc, &temp),
+        stage: stage_script(bytes, &temp),
         cleanup: format!("rm -f {}", quote(&temp)),
     };
     Ok((temp, upload))
@@ -872,7 +945,7 @@ pub(crate) fn fix_script(
 
 /// The plain run: a root target, a `sudo = false` entry, or `sudo -n`.
 fn tee_script(
-    heredoc: &Heredoc<'_>,
+    bytes: Bytes<'_>,
     step: &FileWrite,
     expected: &Expected,
 ) -> Result<Zeroizing<String>, String> {
@@ -885,7 +958,7 @@ fn tee_script(
             sudo: &step.sudo,
             as_root: step.as_root,
             temp: &temp,
-            bytes: Bytes::Inline(heredoc),
+            bytes,
             ids: step.ids.as_ref().map_or(Ids::Keep, Ownership::ids),
         },
         &step.checks,
@@ -896,14 +969,22 @@ fn tee_script(
     ))
 }
 
-/// The password path's plain stage: the bytes into a new 0600 `temp`.
-fn stage_script(heredoc: &Heredoc<'_>, temp: &str) -> Zeroizing<String> {
-    zeroizing(format_args!(
-        "{{ umask 077; set -C; {} >{}\n{}}}\n",
-        heredoc.head(),
-        quote(temp),
-        heredoc.body()
-    ))
+/// The password path's plain stage: the inline bytes into a new 0600 `temp`.
+fn stage_script(bytes: &Bytes<'_>, temp: &str) -> Zeroizing<String> {
+    match bytes {
+        Bytes::Inline(heredoc) => zeroizing(format_args!(
+            "{{ umask 077; set -C; {} >{}\n{}}}\n",
+            heredoc.head(),
+            quote(temp),
+            heredoc.body()
+        )),
+        Bytes::Printf(printf) => zeroizing(format_args!(
+            "{{ umask 077; set -C; {PRINTF_BUILTIN}{{\n{}}} >{}\n}}\n",
+            *printf.lines,
+            quote(temp)
+        )),
+        Bytes::Staged(..) => unreachable!("only inline bytes are staged"),
+    }
 }
 
 /// The password path's terminal run, one brace group so a failed `sudo -v`
@@ -2176,7 +2257,7 @@ mod tests {
         expected: &Expected,
     ) -> Zeroizing<String> {
         super::tee_script(
-            heredoc,
+            Bytes::Inline(heredoc),
             &plain(dest, mode, sudo, checks, !checks.is_empty()),
             expected,
         )
@@ -2394,7 +2475,7 @@ mod tests {
         std::os::unix::fs::symlink("real/src.txt", root.join("link.txt")).unwrap();
         let config = config_in(&root, vec![entry("link.txt", "/etc/x")]);
         let Sources(loaded) = load(&config, || Ok(root.clone())).unwrap();
-        assert_eq!(loaded[0].text, "text");
+        assert_eq!(loaded[0].text(), Some("text"));
         assert_src_refused(&root, "link.txt", &root.join("real"), 0o775, 0o755);
         assert_src_refused(&root, "link.txt", &root.join("real/src.txt"), 0o664, 0o644);
         fs::remove_dir_all(&dir).unwrap();
@@ -2499,8 +2580,8 @@ mod tests {
         );
         let Sources(loaded) = load(&config, || Ok(dir.clone())).unwrap();
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].text, SECRET_TEXT);
-        assert_eq!(loaded[1].text, "");
+        assert_eq!(loaded[0].text(), Some(SECRET_TEXT));
+        assert_eq!(loaded[1].text(), Some(""));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2556,7 +2637,7 @@ mod tests {
         fs::write(dir.join("big"), "a".repeat(limit + 1)).unwrap();
         let config = config_in(&dir, vec![entry("fits", "/etc/fits")]);
         assert_eq!(
-            load(&config, || Ok(dir.clone())).unwrap().0[0].text.len(),
+            load(&config, || Ok(dir.clone())).unwrap().0[0].bytes.len(),
             limit
         );
         assert_eq!(
@@ -2567,18 +2648,57 @@ mod tests {
     }
 
     #[test]
-    fn load_refuses_binary_as_a_current_limit() {
+    fn load_reads_a_binary_src_and_refuses_one_with_template() {
         let dir = dir("files-binary");
         fs::write(dir.join("ok.txt"), "ok").unwrap();
         fs::write(dir.join("latin1"), b"caf\xe9\n").unwrap();
         fs::write(dir.join("nul"), b"a\0b").unwrap();
-        assert_eq!(
-            load_err(&dir, "latin1"),
-            "files[1].src `latin1`: is not UTF-8 text; [[files]] copies text files only for now"
+        let config = config_in(
+            &dir,
+            vec![
+                entry("latin1", "/etc/a"),
+                entry("nul", "/etc/b"),
+                entry("ok.txt", "/etc/c"),
+            ],
         );
+        let loaded = load(&config, || Ok(dir.clone())).unwrap().0;
+        let shown: Vec<_> = loaded
+            .iter()
+            .map(|source| (source.bytes.as_slice(), source.binary))
+            .collect();
         assert_eq!(
-            load_err(&dir, "nul"),
-            "files[1].src `nul`: contains a NUL byte; [[files]] copies text files only for now"
+            shown,
+            [
+                (&b"caf\xe9\n"[..], true),
+                (&b"a\0b"[..], true),
+                (&b"ok"[..], false)
+            ]
+        );
+        for src in ["latin1", "nul"] {
+            let templated = FileEntry {
+                template: true,
+                ..entry(src, "/etc/x")
+            };
+            let config = config_in(&dir, vec![entry("ok.txt", "/etc/ok"), templated]);
+            let err = load(&config, || Ok(dir.clone())).unwrap_err();
+            assert_eq!(
+                err,
+                format!("files[1].src `{src}`: is binary; template = true needs a text file")
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_binary_store_src_is_read_as_bytes() {
+        let dir = dir("files-binary-store");
+        fs::create_dir(dir.join("files")).unwrap();
+        fs::write(dir.join("files/blob"), b"\xff\0\x01").unwrap();
+        let config = config_in(&dir, vec![entry("$/blob", "/etc/blob")]);
+        let loaded = load(&config, || Ok(dir.clone())).unwrap().0;
+        assert_eq!(
+            (loaded[0].bytes.as_slice(), loaded[0].binary),
+            (&b"\xff\0\x01"[..], true)
         );
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2735,6 +2855,139 @@ mod tests {
         runs.remove(0)
     }
 
+    /// `script` with every run of 16 or more lowercase hex digits, the
+    /// random temp names and nonces among them, as `<hex>`.
+    fn without_random(script: &str) -> String {
+        let mut out = String::with_capacity(script.len());
+        let mut run = String::new();
+        let flush = |run: &mut String, out: &mut String| {
+            if run.len() >= 16 {
+                out.push_str("<hex>");
+            } else {
+                out.push_str(run);
+            }
+            run.clear();
+        };
+        for c in script.chars() {
+            if matches!(c, '0'..='9' | 'a'..='f') {
+                run.push(c);
+            } else {
+                flush(&mut run, &mut out);
+                out.push(c);
+            }
+        }
+        flush(&mut run, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_text_files_scripts_stay_byte_for_byte_what_they_were() {
+        let plain = only_run(true, None, &user_facts("nopasswd"));
+        let password = only_run(true, Some("WEB"), &user_facts("binary"));
+        let upload = password.file().unwrap().upload.as_ref().unwrap();
+        let scripts = [&plain.run, &password.run, &upload.stage].map(|s| without_random(s));
+        let pins: Vec<_> = scripts
+            .iter()
+            .map(|script| hex(&Sha256::digest(script.as_bytes())))
+            .collect();
+        // From 6a8a76f, before binary files: a text file's bytes on the wire
+        // must not change.
+        assert_eq!(
+            pins,
+            [
+                "310ba260a58ae637fb22f0dffc985901dd00f71352468c7e34bd7695fd680902",
+                "cef1f267c65a72fe1ac12484eb37c4f0d6c1050c4bfdbb239e2a347363646d91",
+                "7156c8dda7596c1cad7d8264874c43364be0ca980c30f801ee294b28e1ab106c",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_binary_src_travels_in_printf_lines_only_in_plain_runs() {
+        let config = config_in(Path::new("/c"), vec![entry("a", "/etc/a")]);
+        let mut bytes: Vec<u8> = (0..=255).collect();
+        bytes.extend_from_slice(b"hunter2\0");
+        let sources = Sources(vec![Source::of(bytes.clone())]);
+        let printf = Printf::new(&bytes);
+        let plain = runs(
+            &config,
+            &sources,
+            &host(&[], None),
+            Some(&user_facts("nopasswd")),
+        )
+        .unwrap()
+        .remove(0);
+        assert!(
+            plain.run.contains(&*printf.lines),
+            "the bytes in the tee run"
+        );
+        assert!(plain.run.contains(&format!("[ \"$5\" = {} ]", bytes.len())));
+        assert!(!plain.run.contains("<<'ANVIL_EOF_"), "no heredoc");
+
+        let password = runs(
+            &config,
+            &sources,
+            &host(&[], Some("WEB")),
+            Some(&user_facts("binary")),
+        )
+        .unwrap()
+        .remove(0);
+        let upload = password.file().unwrap().upload.as_ref().unwrap();
+        let temp = upload.cleanup.strip_prefix("rm -f ").unwrap();
+        assert_eq!(
+            *upload.stage,
+            format!(
+                "{{ umask 077; set -C; {PRINTF_BUILTIN}{{\n{}}} >{temp}\n}}\n",
+                *printf.lines
+            )
+        );
+        assert!(
+            !password.run.contains("hunter2"),
+            "the tty run carries paths only"
+        );
+        assert!(
+            password
+                .run
+                .contains(&format!("anvil_bytes() {{ cat {temp}; }}"))
+        );
+        assert!(
+            password
+                .run
+                .contains(&format!("[ \"$5\" = {} ]", bytes.len()))
+        );
+    }
+
+    #[test]
+    fn the_write_timeout_grows_by_15_s_per_mib_on_the_wire() {
+        assert_eq!(write_timeout(0), RUN_TIMEOUT);
+        assert_eq!(write_timeout(64 * 1024), RUN_TIMEOUT);
+        assert_eq!(
+            write_timeout(1024 * 1024),
+            RUN_TIMEOUT + Duration::from_secs(15)
+        );
+        assert_eq!(
+            write_timeout(4 * 1024 * 1024),
+            RUN_TIMEOUT + Duration::from_secs(60)
+        );
+        let config = config_in(Path::new("/c"), vec![entry("a", "/etc/a")]);
+        let bytes = vec![0xff; document::MAX_BYTES as usize];
+        let sources = Sources(vec![Source::of(bytes)]);
+        let run = runs(
+            &config,
+            &sources,
+            &host(&[], None),
+            Some(&user_facts("nopasswd")),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(run.timeout, write_timeout(run.run.len()));
+        assert!(
+            run.timeout >= RUN_TIMEOUT + Duration::from_secs(60),
+            "{:?}",
+            run.timeout
+        );
+    }
+
     #[test]
     fn runs_picks_tee_or_the_password_path() {
         let root = facts(&[("user", "root"), ("sudo", "binary")]);
@@ -2870,7 +3123,7 @@ mod tests {
             _ => user_checks(sudo, dest, top),
         };
         super::tee_script(
-            &Heredoc::new("new\n").unwrap(),
+            Bytes::Inline(&Heredoc::new("new\n").unwrap()),
             &plain(d, "0640", sudo, &checks, !sudo.is_empty()),
             &Expected::Unchecked,
         )
@@ -2900,9 +3153,13 @@ mod tests {
             }),
             ..plain(d, "0640", sudo, &checks, user.is_none())
         };
-        super::tee_script(&Heredoc::new("new\n").unwrap(), &step, &Expected::Unchecked)
-            .unwrap()
-            .to_string()
+        super::tee_script(
+            Bytes::Inline(&Heredoc::new("new\n").unwrap()),
+            &step,
+            &Expected::Unchecked,
+        )
+        .unwrap()
+        .to_string()
     }
 
     /// This process's uid and gid, as numeric strings.
@@ -2948,6 +3205,71 @@ mod tests {
     }
 
     const REAL: &str = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
+
+    /// `script` on `bash -s`, `printf` its builtin unless `external`, when
+    /// `enable -n` leaves only the one on `PATH`.
+    fn bash_with(bin: &Path, script: &str, external: bool) -> crate::transport::Output {
+        let mut command = std::process::Command::new("bash");
+        command.arg("-s").env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        );
+        let disable = if external { "enable -n printf\n" } else { "" };
+        let script = format!("{disable}{script}");
+        unmarked(crate::transport::run_with_script(&mut command, &script, RUN_TIMEOUT).unwrap())
+    }
+
+    #[test]
+    fn a_binary_write_refuses_a_printf_that_is_not_a_builtin_before_any_byte() {
+        let found = std::process::Command::new("sh")
+            .args(["-c", "command -v bash >/dev/null"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !found {
+            eprintln!("skip: no bash");
+            return;
+        }
+        assert!(PRINTF_BUILTIN.contains(&format!("exit {REFUSED} ")));
+        let bytes = b"\xff\0bin\n";
+        let printf = Printf::new(bytes);
+        let refusal = "files: printf is not a shell builtin; cannot copy a binary file\n";
+        let (dir, bin, dest) = write_case("files-printf-builtin", &[]);
+        let d = dest.to_str().unwrap();
+        let checks = login_checks(d, dest.parent().unwrap());
+        let write = plain(d, "0640", "", &checks, false);
+        let script =
+            super::tee_script(Bytes::Printf(&printf), &write, &Expected::Unchecked).unwrap();
+        let out = bash_with(&bin, &script, true);
+        assert_eq!(String::from_utf8_lossy(&out.stderr), refusal);
+        assert_eq!(out.code, Some(REFUSED));
+        assert_eq!(fs::read(&dest).unwrap(), b"old\n", "dest untouched");
+        assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+
+        let staged = dir.join("staged");
+        let stage = stage_script(&Bytes::Printf(&printf), staged.to_str().unwrap());
+        let out = bash_with(&bin, &stage, true);
+        assert_eq!(String::from_utf8_lossy(&out.stderr), refusal);
+        assert_eq!(out.code, Some(REFUSED));
+        assert!(!staged.exists(), "nothing staged");
+
+        let out = bash_with(&bin, &stage, false);
+        assert_eq!(
+            out.code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(fs::read(&staged).unwrap(), bytes);
+        let out = bash_with(&bin, &script, false);
+        assert_eq!(
+            out.code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(fs::read(&dest).unwrap(), bytes);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_write_replaces_dest_by_a_new_file_and_leaves_no_temp() {
@@ -4071,7 +4393,7 @@ mod tests {
         let (dir, bin, dest) = write_case("files-0200", &[("mv", "exit 1")]);
         let d = dest.to_str().unwrap();
         let script = super::tee_script(
-            &Heredoc::new("new\n").unwrap(),
+            Bytes::Inline(&Heredoc::new("new\n").unwrap()),
             &plain(
                 d,
                 "0200",
@@ -5396,7 +5718,7 @@ mod tests {
         let temp = dir.join("stage");
         let temp_str = temp.to_str().unwrap();
         for text in ["", "\n", "a", "a\n"] {
-            let script = stage_script(&Heredoc::new(text).unwrap(), temp_str);
+            let script = stage_script(&Bytes::Inline(&Heredoc::new(text).unwrap()), temp_str);
             assert_eq!(sh(&script), (Some(0), String::new()), "{text:?}");
             assert_eq!(fs::read(&temp).unwrap(), text.as_bytes(), "{text:?}");
             assert_eq!(mode(&temp), 0o600);
@@ -6601,7 +6923,8 @@ mod tests {
         let step = plain(dest.to_str().unwrap(), "0640", "", "", false);
         let heredoc = Heredoc::new("new\n").unwrap();
         for _ in ["wrote", "unchanged"] {
-            let script = super::tee_script(&heredoc, &step, &Expected::Unchecked).unwrap();
+            let script =
+                super::tee_script(Bytes::Inline(&heredoc), &step, &Expected::Unchecked).unwrap();
             let mut out = Local.run(&script, RUN_TIMEOUT).unwrap();
             assert_eq!(
                 out.code,
@@ -7044,7 +7367,7 @@ mod tests {
             .unwrap();
         for expected in ["restored", "unchanged"] {
             let stage = stage_script(
-                &Heredoc::new(SECRET_TEXT).unwrap(),
+                &Bytes::Inline(&Heredoc::new(SECRET_TEXT).unwrap()),
                 local_temp.to_str().unwrap(),
             );
             assert_eq!(sh(&stage), (Some(0), String::new()));
@@ -7183,9 +7506,7 @@ mod tests {
 
     #[test]
     fn debug_never_shows_the_content() {
-        let source = Source {
-            text: SECRET_TEXT.to_owned(),
-        };
+        let source = Source::of(SECRET_TEXT.as_bytes().to_vec());
         assert_eq!(
             format!("{source:?}"),
             format!("Source(<{} bytes>)", SECRET_TEXT.len())
@@ -7684,7 +8005,11 @@ mod tests {
             vec![entry("bad.j2", "/etc/plain"), templated("ok.j2", "/etc/ok")],
         );
         let Sources(loaded) = load(&config, || Ok(dir.clone())).unwrap();
-        assert_eq!(loaded[0].text, "a\n{% if %}\n", "a plain src is not parsed");
+        assert_eq!(
+            loaded[0].text(),
+            Some("a\n{% if %}\n"),
+            "a plain src is not parsed"
+        );
         let config = config_in(&dir, vec![templated("bad.j2", "/etc/x")]);
         let err = super::load(&legacy(&config), || Ok(dir.clone())).unwrap_err();
         assert_eq!(err.code, 2);
@@ -7732,7 +8057,7 @@ mod tests {
             let rendered = write.rendered.as_ref().unwrap();
             assert_eq!(rendered.text.as_str(), text);
             assert_eq!(rendered.sha256, hex(&Sha256::digest(text.as_bytes())));
-            assert_eq!(write.text(&sources).unwrap(), text);
+            assert_eq!(write.payload(&sources).unwrap().bytes(), text.as_bytes());
             let (script, _) = write_script(write, &sources, &Expected::Unchecked).unwrap();
             assert!(
                 script.contains(text) && !script.contains("{{"),
@@ -7773,7 +8098,7 @@ mod tests {
         .unwrap();
         let write = written(&run[0]);
         assert_eq!(write.rendered, None);
-        assert_eq!(write.text(&sources).unwrap(), src);
+        assert_eq!(write.payload(&sources).unwrap().bytes(), src.as_bytes());
         let (script, _) = write_script(&write, &sources, &Expected::Unchecked).unwrap();
         assert!(script.contains(src), "{}", &*script);
     }
@@ -7872,7 +8197,7 @@ mod tests {
                 };
                 super::install_script(temp.to_str().unwrap(), 4, &step, &Expected::Unchecked)
             }
-            _ => super::tee_script(&heredoc, &step, &Expected::Unchecked),
+            _ => super::tee_script(Bytes::Inline(&heredoc), &step, &Expected::Unchecked),
         }
         .unwrap()
         .to_string()

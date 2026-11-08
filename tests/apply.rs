@@ -4185,3 +4185,158 @@ fn a_file_then_its_emptied_dir_are_removed_and_a_second_apply_is_all_unchanged()
     );
     assert_eq!(logged(&sandbox), 1);
 }
+
+/// Every byte value, NUL runs, and a second `printf` chunk that starts with
+/// `-` and holds what `printf` or the quotes would take as syntax.
+fn every_byte() -> Vec<u8> {
+    let mut bytes: Vec<u8> = (0..=255).collect();
+    bytes.extend_from_slice(b"-n\0\0-e %s %% \\ \\n ' \" $(x) `y`\n");
+    bytes.extend((0..=255u8).rev());
+    bytes
+}
+
+#[test]
+fn a_binary_src_lands_byte_for_byte_on_local_and_the_fake_host_with_and_without_sudo() {
+    let sandbox = Sandbox::new("ab");
+    let path = nopasswd_sudo(&sandbox);
+    sandbox.write_config(
+        "inventory.toml",
+        "[hosts.fake]\nhost = \"fakehost\"\ntags = [\"web\"]\n",
+    );
+    let out = sandbox.root().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let bytes = every_byte();
+    std::fs::write(sandbox.config_dir().join("blob.bin"), &bytes).unwrap();
+    let cases = [
+        ("local", "sudo = false"),
+        ("local", "sudo = true"),
+        ("web", "sudo = false"),
+        ("web", "sudo = true"),
+    ];
+    let dests: Vec<_> = (0..cases.len())
+        .map(|i| out.join(format!("blob{i}")))
+        .collect();
+    let entries: String = cases
+        .iter()
+        .zip(&dests)
+        .map(|((tag, sudo), dest)| {
+            format!(
+                "[[files]]\nsrc = \"blob.bin\"\ndest = \"{}\"\nmode = \"0640\"\n\
+                 tags = [\"{tag}\"]\n{sudo}\n\n",
+                dest.display()
+            )
+        })
+        .collect();
+    sandbox.write_config("config.toml", &entries);
+    let apply = || {
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", "--ssh-program"])
+            .arg(common::fixture("fake-ssh.sh"))
+            .args(["--json", "apply"])
+            .env("PATH", &path)
+            .output()
+            .unwrap()
+    };
+    let changed = |run: &std::process::Output| -> Vec<bool> {
+        json(run)["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|target| target["steps"].as_array().unwrap().clone())
+            .filter(|step| step["skipped"] != true)
+            .filter(|step| step["run"].as_str().unwrap().starts_with("file "))
+            .map(|step| step["changed"].as_bool().unwrap())
+            .collect()
+    };
+    let run = apply();
+    assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
+    assert_eq!(changed(&run), [true; 4]);
+    for dest in &dests {
+        assert_eq!(std::fs::read(dest).unwrap(), bytes, "{}", dest.display());
+        assert_eq!(common::mode(dest) & 0o7777, 0o640, "{}", dest.display());
+    }
+    let left: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".anvil-"))
+        .collect();
+    assert!(left.is_empty(), "no temp beside dest: {left:?}");
+
+    let run = apply();
+    assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
+    assert_eq!(changed(&run), [false; 4], "the same bytes compare equal");
+}
+
+#[test]
+fn a_binary_src_through_sudo_with_a_password_is_staged_and_installed() {
+    if !common::have_script() {
+        eprintln!("skip: no script(1) for fake-ssh -tt");
+        return;
+    }
+    let (sandbox, secrets, path) = common::sudo_sandbox("ab");
+    let bytes = every_byte();
+    std::fs::write(sandbox.config_dir().join("blob.bin"), &bytes).unwrap();
+    let dest = sandbox.root().join("pw.bin");
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{secrets}[[files]]\nsrc = \"blob.bin\"\ndest = \"{}\"\nmode = \"0640\"\n",
+            dest.display()
+        ),
+    );
+    let sudo_log = sandbox.root().join("sudo.log");
+    let apply = || {
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .arg("--ssh-program")
+            .arg(common::fixture("fake-ssh.sh"))
+            .args(["-vv", "apply", "--target", "fake"])
+            .env("PATH", &path)
+            .env("FAKE_SUDO_LOG", &sudo_log)
+            .env("FAKE_SUDO_PW", common::VALUE)
+            .output()
+            .unwrap()
+    };
+    let out = apply();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let shown = dest.display();
+    assert!(
+        text(&out.stdout).contains(&format!("  wrote {shown}\n")),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    assert_eq!(common::mode(&dest) & 0o7777, 0o640);
+    let sudo = std::fs::read_to_string(&sudo_log).unwrap();
+    assert!(sudo.contains("\nmv -f "), "{sudo}");
+
+    let out = apply();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains(&format!("  unchanged {shown}\n")),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn a_binary_src_with_template_exits_two_naming_the_entry() {
+    let sandbox = Sandbox::new("ab");
+    std::fs::write(sandbox.config_dir().join("blob.bin"), b"\xff\0").unwrap();
+    sandbox.write_config(
+        "config.toml",
+        "[[files]]\nsrc = \"blob.bin\"\ndest = \"/tmp/anvil-never\"\nmode = \"0644\"\n\
+         template = true\n",
+    );
+    for command in ["apply", "plan"] {
+        let out = sandbox.anvil(&[command], &[]);
+        assert_eq!(out.status.code(), Some(2), "{command}");
+        assert!(
+            text(&out.stderr)
+                .contains("files[0].src `blob.bin`: is binary; template = true needs a text file"),
+            "{command}: {}",
+            text(&out.stderr)
+        );
+    }
+}
