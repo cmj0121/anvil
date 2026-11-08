@@ -552,6 +552,76 @@ fn rollback_through_sudo_with_a_password_installs_the_previous_owner_and_mode() 
 }
 
 #[test]
+fn rollback_through_sudo_with_a_password_recreates_a_removed_file_from_a_staged_copy() {
+    if !common::have_script() {
+        eprintln!("skip: no script(1) for fake-ssh -tt");
+        return;
+    }
+    let (sandbox, secrets, path) = common::sudo_sandbox("rb");
+    let conf = sandbox.root().join("conf");
+    std::fs::write(&conf, PREVIOUS).unwrap();
+    std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o604)).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!("{secrets}[[absent]]\npath = \"{}\"\n", conf.display()),
+    );
+    let sudo_log = sandbox.root().join("sudo.log");
+    let run = |args: &[&str]| {
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .arg("--ssh-program")
+            .arg(common::fixture("fake-ssh.sh"))
+            .args(args)
+            .args(["--target", "fake"])
+            .env("PATH", &path)
+            .env("FAKE_SUDO_LOG", &sudo_log)
+            .env("FAKE_SUDO_PW", common::VALUE)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["apply"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(!conf.exists());
+
+    let _ = std::fs::remove_file(&sudo_log);
+    let out = run(&["-vv", "rollback"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    common::assert_no_value(&out);
+    for shown in [text(&out.stdout), text(&out.stderr)] {
+        assert!(!shown.contains(PREVIOUS.trim_end()), "{shown}");
+    }
+    assert!(
+        text(&out.stdout).contains(&format!("restored {}\n", conf.display())),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(std::fs::read_to_string(&conf).unwrap(), PREVIOUS);
+    assert_eq!(mode(&conf), 0o604);
+    let sudo = std::fs::read_to_string(&sudo_log).unwrap();
+    assert!(
+        sudo.lines().any(|line| line == "-v"),
+        "the password was typed: {sudo}"
+    );
+    // The bytes came from the staged copy, which is gone, as is the temp.
+    let staged = (sudo.split_whitespace())
+        .find(|word| word.starts_with("/tmp/anvil-"))
+        .unwrap_or_else(|| panic!("no staged copy in {sudo}"));
+    assert!(!Path::new(staged).exists(), "{staged}");
+    let names: Vec<_> = std::fs::read_dir(sandbox.root())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".anvil-"))
+        .collect();
+    assert!(names.is_empty(), "{names:?}");
+}
+
+#[test]
 fn a_failed_restore_stops_the_target_and_records_only_the_earlier_ones() {
     let sandbox = Sandbox::new("rb");
     std::fs::create_dir(sandbox.root().join("out")).unwrap();
@@ -1676,4 +1746,240 @@ fn a_recorded_replaced_file_needs_force_in_the_config() {
         "{shown}"
     );
     assert!(std::fs::symlink_metadata(&file).unwrap().is_symlink());
+}
+
+/// A config of three `[[absent]]` on local, `sudo = false`, each notifying
+/// `flush`: `<root>/conf` (a 0604 text file), `<root>/link` (a link to
+/// `/nowhere/app`) and `<root>/empty` (a 0750 empty directory); applied
+/// once, so all three are gone. Returns the three paths.
+fn absent_applied(sandbox: &Sandbox) -> [String; 3] {
+    let root = sandbox.root().display().to_string();
+    let [conf, link, empty] = ["conf", "link", "empty"].map(|p| format!("{root}/{p}"));
+    std::fs::write(&conf, "kept text\n").unwrap();
+    std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o604)).unwrap();
+    std::os::unix::fs::symlink("/nowhere/app", &link).unwrap();
+    std::fs::create_dir(&empty).unwrap();
+    std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let absent = |path: &str| {
+        format!("[[absent]]\npath = \"{path}\"\nsudo = false\nnotify = [\"flush\"]\n\n")
+    };
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}{}{}[[handlers]]\nname = \"flush\"\nrun = \"true\"\n",
+            absent(&conf),
+            absent(&link),
+            absent(&empty)
+        ),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    for path in [&conf, &link, &empty] {
+        assert!(std::fs::symlink_metadata(path).is_err(), "{path}");
+    }
+    [conf, link, empty]
+}
+
+#[test]
+fn rollback_recreates_a_removed_file_link_and_empty_dir_last_removed_first() {
+    let sandbox = Sandbox::new("ra");
+    let [conf, link, empty] = absent_applied(&sandbox);
+
+    let out = sandbox.anvil(&["rollback", "--dry-run", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  would restore directory {empty}\n  \
+             would restore link {link} -> /nowhere/app\n  \
+             would restore {conf}\n  \
+             cannot undo: step 1\n  cannot undo: handler flush\n  ✔ 5 steps\n\n\
+             1 target, nothing executed\n"
+        )
+    );
+
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let value = json(&out);
+    let steps = value["targets"][0]["steps"].as_array().unwrap();
+    let shown: Vec<(&str, &str)> = steps[..3]
+        .iter()
+        .map(|s| (s["run"].as_str().unwrap(), s["stdout"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (
+                format!("restore directory {empty}").as_str(),
+                format!("restored directory {empty}\n").as_str()
+            ),
+            (
+                format!("restore link {link} -> /nowhere/app").as_str(),
+                format!("restored link {link} -> /nowhere/app\n").as_str()
+            ),
+            (
+                format!("restore {conf}").as_str(),
+                format!("restored {conf}\n").as_str()
+            ),
+        ]
+    );
+    assert_eq!(std::fs::read_to_string(&conf).unwrap(), "kept text\n");
+    assert_eq!(mode(Path::new(&conf)), 0o604);
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        Path::new("/nowhere/app")
+    );
+    assert!(Path::new(&empty).is_dir());
+    assert_eq!(mode(Path::new(&empty)), 0o750);
+    let record = sandbox.last_apply().unwrap();
+    let target = &record["targets"]["local"];
+    assert_eq!(
+        target["rolled_back"]["dests"],
+        serde_json::json!([empty, link, conf])
+    );
+    assert_eq!(target["pending_handlers"], serde_json::json!(["flush"]));
+
+    // Back again: each is what was removed, so it is left alone.
+    std::fs::write(&conf, "edited since\n").unwrap();
+    let out = sandbox.anvil(&["-vv", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let shown = text(&out.stdout);
+    for path in [&conf, &link, &empty] {
+        assert!(shown.contains(&format!("unchanged {path}\n")), "{shown}");
+    }
+    assert_eq!(std::fs::read_to_string(&conf).unwrap(), "edited since\n");
+}
+
+#[test]
+fn a_removed_path_now_of_another_kind_is_refused_even_forced_by_path_or_all() {
+    let sandbox = Sandbox::new("ra");
+    let [conf, ..] = absent_applied(&sandbox);
+    std::fs::create_dir(&conf).unwrap();
+    for force in [
+        &[][..],
+        &["--force-all"][..],
+        &["--force", conf.as_str()][..],
+    ] {
+        let args = [&["rollback", "--target", "local"][..], force].concat();
+        let out = sandbox.anvil(&args, &[]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+        let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+        assert!(
+            shown.contains(&format!(
+                "absent: {conf} is a directory now, not the file the apply removed; \
+                 rollback will not replace it"
+            )),
+            "{shown}"
+        );
+        assert!(Path::new(&conf).is_dir());
+    }
+}
+
+#[test]
+fn a_hash_only_removal_cannot_be_undone_and_exits_zero() {
+    let sandbox = Sandbox::new("ra");
+    let secret = sandbox.root().join("secret").display().to_string();
+    std::fs::write(&secret, "private\n").unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    sandbox.write_config(
+        "config.toml",
+        &format!("[[absent]]\npath = \"{secret}\"\nsudo = false\n"),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stdout).contains(&format!("not restored: {secret} (not world-readable)")),
+        "{}",
+        text(&out.stdout)
+    );
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][0]["run"],
+        format!("cannot undo: {secret} (not world-readable)")
+    );
+    assert!(!Path::new(&secret).exists());
+}
+
+#[test]
+fn a_hand_edited_removal_the_config_never_names_is_refused() {
+    let sandbox = Sandbox::new("ra");
+    let [conf, ..] = absent_applied(&sandbox);
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let original = sandbox.last_apply().unwrap();
+    let elsewhere = sandbox.root().join("elsewhere").display().to_string();
+    type Tamper = Box<dyn Fn(&mut serde_json::Value)>;
+    let cases: [(Tamper, String); 2] = [
+        (
+            Box::new({
+                let elsewhere = elsewhere.clone();
+                move |absent| absent["path"] = elsewhere.clone().into()
+            }),
+            format!("rollback: {elsewhere} is not in [[absent]]; refusing to restore it"),
+        ),
+        (
+            Box::new(|absent| absent["sudo"] = true.into()),
+            format!(
+                "rollback: {conf} has sudo = false in [[absent]] but sudo = true in the record; \
+                 refusing to restore it"
+            ),
+        ),
+    ];
+    for (tamper, message) in &cases {
+        let mut record = original.clone();
+        tamper(&mut record["targets"]["local"]["absent"][0]);
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let out = sandbox.anvil(&["rollback", "--target", "local", "--force-all"], &[]);
+        assert_eq!(out.status.code(), Some(1), "{message}");
+        assert!(
+            text(&out.stdout).contains(message.as_str()),
+            "{}",
+            text(&out.stdout)
+        );
+        assert!(!Path::new(&elsewhere).exists());
+        assert!(!Path::new(&conf).exists());
+    }
+}
+
+#[test]
+fn a_removal_recorded_as_another_kind_than_its_type_is_refused() {
+    let sandbox = Sandbox::new("ra");
+    let [conf, link, empty] = absent_applied(&sandbox);
+    let absent = |path: &str, kind: &str| {
+        format!("[[absent]]\npath = \"{path}\"\ntype = \"{kind}\"\nsudo = false\n\n")
+    };
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}{}{}",
+            absent(&conf, "file"),
+            absent(&link, "link"),
+            absent(&empty, "dir")
+        ),
+    );
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    let removed = record["targets"]["local"]["absent"].as_array_mut().unwrap();
+    let file = removed.iter().find(|a| a["path"] == conf.as_str()).unwrap()["previous"].clone();
+    let forged = removed
+        .iter_mut()
+        .find(|a| a["path"] == link.as_str())
+        .unwrap();
+    forged["previous"] = file;
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    let out = sandbox.anvil(&["rollback", "--target", "local", "--force-all"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let message = format!(
+        "rollback: {link} has type = \"link\" in [[absent]] but is a file in the record; \
+         refusing to restore it"
+    );
+    assert!(
+        text(&out.stdout).contains(&message),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(std::fs::symlink_metadata(&link).is_err());
 }

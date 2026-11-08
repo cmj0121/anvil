@@ -468,6 +468,18 @@ impl AbsentRecord {
         self.previous.is_some()
     }
 
+    /// Why a rollback cannot put `path` back: a removed file whose text was
+    /// not kept, or a removal the step could not record.
+    pub fn not_kept(&self) -> Option<&str> {
+        match &self.previous {
+            Some(AbsentPrevious::File(p)) if !p.kept || p.text.is_none() => {
+                Some(p.reason.as_deref().unwrap_or("not kept"))
+            }
+            Some(AbsentPrevious::Unknown { reason }) => Some(reason),
+            _ => None,
+        }
+    }
+
     /// Whether a loaded entry is one apply could have written, as
     /// [`LinkRecord::is_valid`] asks of a link: modes are four octal
     /// digits without setuid or setgid.

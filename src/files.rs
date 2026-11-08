@@ -615,7 +615,7 @@ pub(crate) fn write_script(
 
 /// The password path's upload of `heredoc`: a fresh temp name, the stage
 /// that writes the bytes there and the cleanup that removes it.
-fn staged(heredoc: &Heredoc<'_>) -> Result<(String, Upload), String> {
+pub(crate) fn staged(heredoc: &Heredoc<'_>) -> Result<(String, Upload), String> {
     let temp = temp_path()?;
     let upload = Upload {
         stage: stage_script(heredoc, &temp),
@@ -1891,6 +1891,17 @@ pub(crate) fn restore_attrs(
     previous: &Attrs,
     keep_special: bool,
 ) -> String {
+    restore_attrs_as(kind, (dest, dest, sudo, as_root), previous, keep_special)
+}
+
+/// [`restore_attrs`] on `dest` whose messages name `shown` instead: a temp
+/// that becomes `shown` once renamed.
+pub(crate) fn restore_attrs_as(
+    kind: &str,
+    (dest, shown, sudo, as_root): (&str, &str, &str, bool),
+    previous: &Attrs,
+    keep_special: bool,
+) -> String {
     let kept = |mode: &str| {
         if keep_special {
             format!("\"$(anvil_kept {mode})\"")
@@ -1902,7 +1913,9 @@ pub(crate) fn restore_attrs(
     let ids = format!("{}:{}", previous.uid, previous.gid);
     let all = quote("owner, group and ");
     let (own, chmod) = if as_root {
-        let failed = quote(&format!("{kind}: cannot give {dest} owner and group {ids}"));
+        let failed = quote(&format!(
+            "{kind}: cannot give {shown} owner and group {ids}"
+        ));
         let own = format!(
             "anvil_what={all}\n\
                  if [ \"$3:$4\" != {ids} ]; then {sudo}chmod go= {d} || exit 1\n\
@@ -1915,7 +1928,7 @@ pub(crate) fn restore_attrs(
         )
     } else {
         let warning = quote(&format!(
-            "{kind}: {dest} was owned by {ids}; only root can give it back"
+            "{kind}: {shown} was owned by {ids}; only root can give it back"
         ));
         // A group that did not go back never gets the recorded mode's
         // group bits, not even for a moment: one chmod without them.
@@ -1944,7 +1957,8 @@ pub(crate) fn restore_attrs(
          set -- $anvil_line\n\
          anvil_was=$(anvil_octal \"$1\")\n\
          {own}{chmod}\
-         printf 'restored %smode of %s\\n' \"$anvil_what\" {d}\n"
+         printf 'restored %smode of %s\\n' \"$anvil_what\" {}\n",
+        quote(shown)
     )
 }
 

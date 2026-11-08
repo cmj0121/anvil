@@ -16,10 +16,16 @@
 //! last first, by [`links::restore_runs`]: one it created is removed, one
 //! it replaced points at its old target again, and a regular file `force`
 //! replaced is written back, each only while the path is what the apply
-//! left unless forced. The steps that cannot be undone are listed as skips.
+//! left unless forced. Before the links, each path an `[[absent]]` step
+//! removed is put back while it is missing, last removed first, by
+//! [`absent::restore_runs`]: a file from its kept text, a link, an empty
+//! directory, each with its owner, group and mode; one that is again what
+//! was removed is left alone, and anything else there is refused, even
+//! forced. The steps that cannot be undone are listed as skips.
 //! Before any of it, each recorded dest must still be a `[[files]]` dest of
-//! the config with the same `sudo`, each dir a `[[dirs]]` path and each
-//! link a `[[links]]` path, so that a record edited by hand cannot
+//! the config with the same `sudo`, each dir a `[[dirs]]` path, each
+//! link a `[[links]]` path and each removed path an `[[absent]]` path, so
+//! that a record edited by hand cannot
 //! make rollback write, perhaps as root, a path the config never names. The
 //! sudo passwords come from the record's `sudo` flags. The only changes a
 //! rollback makes to the record are `rolled_back`, the dests it put back, so
@@ -36,8 +42,9 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use crate::absent;
 use crate::cancel::Cancel;
-use crate::config::Config;
+use crate::config::{AbsentEntry, AbsentType, Config};
 use crate::dirs;
 use crate::engine::{self, Passwords, Unresolved};
 use crate::error::{Failure, print_json};
@@ -51,7 +58,7 @@ use crate::logger::{DIM, GREEN, RED, escape_invisible};
 use crate::options::{Options, Output};
 use crate::prepared::Prepared;
 use crate::record::{
-    self, LinkPrevious, Previous, Record, RolledBack, Session, TargetRecord, Write,
+    self, AbsentPrevious, LinkPrevious, Previous, Record, RolledBack, Session, TargetRecord, Write,
 };
 use crate::report::{
     self, Escape, Line, NotRestored, Progress, Report, StepReport, Style, TargetReport, print_lines,
@@ -138,9 +145,11 @@ fn check_force(record: &Record, targets: &[Target], force: &Force) -> Result<(),
         .flat_map(|entry| {
             let files = entry.files.iter().map(|file| file.dest.as_str());
             let links = entry.links.iter().map(|link| link.path.as_str());
+            let absent = entry.absent.iter().map(|absent| absent.path.as_str());
             files
                 .chain(entry.dirs.iter().map(|dir| dir.path.as_str()))
                 .chain(links)
+                .chain(absent)
         })
         .collect();
     match dests.iter().find(|dest| !known.contains(dest.as_str())) {
@@ -216,13 +225,17 @@ pub fn run_targets(
         .flat_map(|(target, entry)| {
             let files = (entry.files.iter()).map(|file| (&file.dest, file.not_kept()));
             let links = (entry.links.iter()).map(|link| (&link.path, link.not_kept()));
-            files.chain(links).filter_map(|(dest, reason)| {
-                Some(NotRestored {
-                    target: target.name.clone(),
-                    dest: dest.clone(),
-                    reason: reason?.to_owned(),
+            let absent = (entry.absent.iter()).map(|absent| (&absent.path, absent.not_kept()));
+            absent
+                .chain(files)
+                .chain(links)
+                .filter_map(|(dest, reason)| {
+                    Some(NotRestored {
+                        target: target.name.clone(),
+                        dest: dest.clone(),
+                        reason: reason?.to_owned(),
+                    })
                 })
-            })
         })
         .collect();
     Ok(Report {
@@ -371,11 +384,14 @@ fn roll_back(
     if let Err(error) = check_files(expanded, target, Some(&facts), entry) {
         return failed(error);
     }
-    let mut runs =
-        match links::restore_runs(config, target, &facts, &entry.links, force, host.wording) {
-            Ok(runs) => runs,
-            Err(error) => return failed(error),
-        };
+    let mut runs = match absent::restore_runs(config, target, &facts, &entry.absent) {
+        Ok(runs) => runs,
+        Err(error) => return failed(error),
+    };
+    match links::restore_runs(config, target, &facts, &entry.links, force, host.wording) {
+        Ok(more) => runs.extend(more),
+        Err(error) => return failed(error),
+    }
     match files::restore_runs(config, target, &facts, &entry.files, force, host.wording) {
         Ok(more) => runs.extend(more),
         Err(error) => return failed(error),
@@ -398,9 +414,10 @@ fn roll_back(
         cancel,
         None,
     );
+    let absent = (entry.absent.iter()).map(|absent| (&absent.path, absent.not_kept()));
     let links = (entry.links.iter()).map(|link| (&link.path, link.not_kept()));
-    for (dest, reason) in links.chain(entry.files.iter().map(|file| (&file.dest, file.not_kept())))
-    {
+    let files = (entry.files.iter()).map(|file| (&file.dest, file.not_kept()));
+    for (dest, reason) in absent.chain(links).chain(files) {
         if let Some(reason) = reason {
             report.warn(format!("not restored: {dest} ({reason})"));
         }
@@ -413,6 +430,7 @@ fn roll_back(
                 || (entry.dirs.iter()).any(|dir| &dir.path == dest && dir.write != Write::Refused)
                 || (entry.links.iter())
                     .any(|link| &link.path == dest && link.write != Write::Refused)
+                || (entry.absent.iter()).any(|absent| &absent.path == dest)
         })
         .collect();
     let queued = queued(config, expanded, target, &entry.facts, &dests);
@@ -430,8 +448,8 @@ fn roll_back(
     }
 }
 
-/// The `[[handlers]]` names, in their order, that the file, dir and link
-/// items restored here notify: those whose dest or path is one of `dests` and that apply to
+/// The `[[handlers]]` names, in their order, that the file, dir, link and
+/// absent items restored here notify: those whose dest or path is one of `dests` and that apply to
 /// `target` by `facts`, the ones the record saved, as rollback never runs
 /// a handler or probes for one.
 fn queued(
@@ -465,6 +483,15 @@ fn queued(
                 })
                 .flat_map(|(item, _)| &item.notify),
         )
+        .chain(
+            expanded
+                .absent()
+                .filter(|(item, entry, _)| {
+                    item.matches(target, facts)
+                        && dests.iter().any(|d| expanded.same_dest(&entry.path, d))
+                })
+                .flat_map(|(item, ..)| &item.notify),
+        )
         .collect();
     (config.handlers.iter())
         .filter(|handler| notified.contains(&&handler.name))
@@ -472,17 +499,18 @@ fn queued(
         .collect()
 }
 
-/// The dests of the file steps and the paths of the dir and link steps that
-/// passed. A note's `dest` is `""` and it is
+/// The dests of the file steps and the paths of the dir, link and absent
+/// steps that passed. A note's `dest` is `""` and it is
 /// always a skip, so the `!step.skipped` filter is what keeps it out.
 fn restored(steps: &[StepReport]) -> Vec<String> {
     steps
         .iter()
         .filter(|step| !step.skipped && step.code == Some(0))
         .filter_map(|step| match &step.entry {
-            Entry::File { dest } | Entry::Dir { path: dest } | Entry::Link { path: dest } => {
-                Some(dest.clone())
-            }
+            Entry::File { dest }
+            | Entry::Dir { path: dest }
+            | Entry::Link { path: dest }
+            | Entry::Absent { path: dest } => Some(dest.clone()),
             _ => None,
         })
         .collect()
@@ -556,7 +584,8 @@ fn check_files(
         }
     }
     check_dirs(expanded, target, facts, entry)?;
-    check_links(expanded, target, facts, entry)
+    check_links(expanded, target, facts, entry)?;
+    check_absent(expanded, target, facts, entry)
 }
 
 /// [`check_files`] for `entry`'s dirs: each path is the path of a dir item
@@ -655,6 +684,60 @@ fn check_links(
     Ok(())
 }
 
+/// [`check_files`] for `entry`'s removed paths: each is the path of an
+/// absent item of `expanded` with the same `sudo` that applies to `target`.
+fn check_absent(
+    expanded: &Expanded,
+    target: &Target,
+    facts: Option<&Facts>,
+    entry: &TargetRecord,
+) -> Result<(), String> {
+    let (section, entry_word) = if expanded.from_tasks {
+        ("the config", "absent task")
+    } else {
+        ("[[absent]]", "[[absent]] entry")
+    };
+    for absent in &entry.absent {
+        let path = absent.path.as_str();
+        let refuse = |why: String| Err(format!("rollback: {why}; refusing to restore it"));
+        let named =
+            || (expanded.absent()).filter(move |(_, a, _)| expanded.same_dest(&a.path, path));
+        let same = || named().filter(|(_, a, _)| a.sudo == absent.sudo);
+        let Some((_, first, _)) = named().next() else {
+            return refuse(format!("{path} is not in {section}"));
+        };
+        if same().next().is_none() {
+            return refuse(format!(
+                "{path} has sudo = {} in {section} but sudo = {} in the record",
+                first.sudo, absent.sudo
+            ));
+        }
+        if !same().any(|(item, ..)| item.may_match(target, facts)) {
+            return refuse(format!(
+                "no {entry_word} for {path} applies to {}",
+                target.name
+            ));
+        }
+        let kind = match &absent.previous {
+            Some(AbsentPrevious::File(_)) => AbsentType::File,
+            Some(AbsentPrevious::Link { .. }) => AbsentType::Link,
+            Some(AbsentPrevious::Dir(_)) => AbsentType::Dir,
+            Some(AbsentPrevious::Unknown { .. }) | None => continue,
+        };
+        let typed = |a: &AbsentEntry| a.r#type.is_none_or(|t| t == kind);
+        if !same().any(|(item, a, _)| item.may_match(target, facts) && typed(a)) {
+            let set = same()
+                .find_map(|(item, a, _)| a.r#type.filter(|_| item.may_match(target, facts)))
+                .map_or("", AbsentType::as_str);
+            return refuse(format!(
+                "{path} has type = \"{set}\" in {section} but is a {} in the record",
+                kind.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A step that only shows `cannot undo: WHAT`.
 fn cannot_undo(what: &str) -> PlannedRun {
     files::skip_run("", format!("cannot undo: {what}"))
@@ -710,8 +793,9 @@ struct DryRun {
     ok: bool,
 }
 
-/// What a rollback of `entry` would do, last written file first, then its
-/// steps that cannot be undone.
+/// What a rollback of `entry` would do: its removals put back, last first,
+/// then its links, files and dirs, last written first, then its steps that
+/// cannot be undone.
 fn would(entry: Option<&TargetRecord>) -> Vec<String> {
     let Some(entry) = entry else {
         return vec![NOTHING.to_owned()];
@@ -766,11 +850,31 @@ fn would(entry: Option<&TargetRecord>) -> Vec<String> {
             .map(|above| format!("would remove directory {above} when empty"));
         undo.into_iter().chain(above)
     });
+    let absent = entry.absent.iter().rev().filter_map(|absent| {
+        let path = &absent.path;
+        if let Some(reason) = absent.not_kept() {
+            return Some(format!("cannot undo: {path} ({reason})"));
+        }
+        match absent.previous.as_ref()? {
+            AbsentPrevious::File(_) => Some(format!("would restore {path}")),
+            AbsentPrevious::Link { target } => Some(format!(
+                "would restore link {path} -> {}",
+                shown_text(target)
+            )),
+            AbsentPrevious::Dir(_) => Some(format!("would restore directory {path}")),
+            AbsentPrevious::Unknown { .. } => None,
+        }
+    });
     let rest = entry
         .cannot_undo
         .iter()
         .map(|what| format!("cannot undo: {what}"));
-    links.chain(files).chain(dirs).chain(rest).collect()
+    absent
+        .chain(links)
+        .chain(files)
+        .chain(dirs)
+        .chain(rest)
+        .collect()
 }
 
 /// What `--dry-run` shows for `target`: what a rollback of its entry would

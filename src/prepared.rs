@@ -89,7 +89,8 @@ impl Prepared {
     }
 
     /// Rollback's: the passwords of the targets whose entry in `session`'s
-    /// record wrote a file or stepped on a directory or link through sudo.
+    /// record wrote a file, stepped on a directory or link, or removed a path
+    /// through sudo.
     pub fn rollback(
         opts: &Options,
         config: Config,
@@ -105,6 +106,7 @@ impl Prepared {
                     entry.files.iter().any(|file| file.sudo)
                         || entry.dirs.iter().any(|dir| dir.sudo)
                         || entry.links.iter().any(|link| link.sudo)
+                        || entry.absent.iter().any(|absent| absent.sudo)
                 })
             })
             .filter_map(|target| files::sudo_secret_for(&config, target))

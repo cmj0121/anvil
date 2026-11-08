@@ -463,7 +463,7 @@ pub(crate) enum Bytes<'a> {
 }
 
 impl Bytes<'_> {
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Bytes::Inline(heredoc) => heredoc.text.len(),
             Bytes::Staged(_, len) => *len,
@@ -472,7 +472,7 @@ impl Bytes<'_> {
 
     /// Defines `anvil_bytes`, which prints the bytes: the only place the
     /// script carries them.
-    fn definition(&self) -> Zeroizing<String> {
+    pub(crate) fn definition(&self) -> Zeroizing<String> {
         match self {
             Bytes::Inline(heredoc) => zeroizing(format_args!(
                 "anvil_bytes() {{\n{}\n{}}}\n",
@@ -483,6 +483,30 @@ impl Bytes<'_> {
                 zeroizing(format_args!("anvil_bytes() {{ cat {}; }}\n", quote(staged)))
             }
         }
+    }
+}
+
+/// The EXIT trap of a script that writes a temp: `remove`, then on the
+/// password path the staged file and the sudo ticket, with the check that
+/// the staged file is the user's own regular file, its refusal naming
+/// `kind`; a plain run also gets the signal traps, since `sh` runs no EXIT
+/// trap when a signal kills it.
+pub(crate) fn temp_trap(kind: &str, remove: &str, bytes: &Bytes<'_>) -> String {
+    match bytes {
+        Bytes::Staged(staged, _) => {
+            let s = quote(staged);
+            format!(
+                "trap {} EXIT\n\
+                 [ -f {s} ] && [ ! -L {s} ] && [ -O {s} ] \
+                 || {{ echo {} >&2; exit 1; }}\n",
+                quote(&format!("{remove}; rm -f {s}; sudo -k")),
+                quote(&format!("{kind}: temp file check failed")),
+            )
+        }
+        Bytes::Inline(_) => format!(
+            "trap {} EXIT\ntrap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM\n",
+            quote(remove)
+        ),
     }
 }
 
@@ -536,28 +560,7 @@ impl Replacement<'_> {
             quote(self.temp),
             self.undo
         );
-        let (trap, staged_check) = match &self.bytes {
-            Bytes::Staged(staged, _) => {
-                let s = quote(staged);
-                (
-                    format!(
-                        "trap {} EXIT\n",
-                        quote(&format!("{remove}; rm -f {s}; sudo -k"))
-                    ),
-                    format!(
-                        "[ -f {s} ] && [ ! -L {s} ] && [ -O {s} ] \
-                         || {{ echo 'files: temp file check failed' >&2; exit 1; }}\n"
-                    ),
-                )
-            }
-            Bytes::Inline(_) => (
-                format!(
-                    "trap {} EXIT\ntrap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM\n",
-                    quote(&remove)
-                ),
-                String::new(),
-            ),
-        };
+        let trap = temp_trap("files", &remove, &self.bytes);
         let has_mode = format!("[ -n \"$({sudo}find {d} -prune -perm {mode})\" ]");
         let foreign = quote(&format!(
             "files: {} cannot be given mode {mode}: only its owner can chmod it",
@@ -571,7 +574,7 @@ impl Replacement<'_> {
         zeroizing(format_args!(
             "{{ umask 077; LC_ALL=C; export LC_ALL; set -f\n\
              anvil_t=\n\
-             {trap}{staged_check}{bytes}\
+             {trap}{bytes}\
              anvil_tight() {{ {sudo}test ! -e {d} && return 0; {sudo}chmod 600 {d} 2>/dev/null && return 0; \
              {has_mode} && return 0; echo {foreign} >&2; exit {REFUSED}; }}\n\
              anvil_mode() {{ {sudo}chmod {mode} {d} 2>/dev/null || {has_mode} \

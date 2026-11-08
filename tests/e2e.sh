@@ -958,6 +958,71 @@ else
 fi
 docker exec "$NAME" rm -f /etc/anvil-e2e-dl-link
 
+step "(w) [[absent]] on arch (NOPASSWD): a file, a link and an empty dir removed; rollback recreates them with their owner, group and mode"
+AB_STATE="$TMP/state-absent"
+AB_RECORD="$AB_STATE/anvil/last-apply.json"
+AB_DIR="$TMP/absent"
+mkdir -p "$AB_DIR"
+cat >"$AB_DIR/config.toml" <<CONF
+[[absent]]
+path = "/etc/anvil-e2e-ab-file"
+
+[[absent]]
+path = "/etc/anvil-e2e-ab-link"
+type = "link"
+
+[[absent]]
+path = "/etc/anvil-e2e-ab-dir"
+type = "dir"
+CONF
+ab_anvil() {
+  run_env XDG_STATE_HOME="$AB_STATE" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$AB_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+# Owned root:key, so the rollback must give the group back as root.
+docker exec "$NAME" sh -c 'rm -rf /etc/anvil-e2e-ab-file /etc/anvil-e2e-ab-link /etc/anvil-e2e-ab-dir \
+  && printf "absent file\n" >/etc/anvil-e2e-ab-file && chown root:key /etc/anvil-e2e-ab-file \
+  && chmod 604 /etc/anvil-e2e-ab-file && ln -s /etc/hostname /etc/anvil-e2e-ab-link \
+  && mkdir /etc/anvil-e2e-ab-dir && chown root:key /etc/anvil-e2e-ab-dir && chmod 750 /etc/anvil-e2e-ab-dir'
+ab_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  removed /etc/anvil-e2e-ab-file' "$TMP/out" \
+  && grep -qxF '  removed /etc/anvil-e2e-ab-link' "$TMP/out" \
+  && grep -qxF '  removed /etc/anvil-e2e-ab-dir' "$TMP/out" \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-ab-file \
+  && ! docker exec "$NAME" test -L /etc/anvil-e2e-ab-link \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-ab-dir \
+  && docker exec "$NAME" test -f /etc/hostname \
+  && grep -qF '"absent":[' "$AB_RECORD"; then
+  pass "apply removed the file, the link (its target kept) and the empty dir, and recorded them"
+else
+  fail "apply of absent: exit $code"
+fi
+ab_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  restored directory /etc/anvil-e2e-ab-dir' "$TMP/out" \
+  && grep -qxF '  restored link /etc/anvil-e2e-ab-link -> /etc/hostname' "$TMP/out" \
+  && grep -qxF '  restored /etc/anvil-e2e-ab-file' "$TMP/out" \
+  && [ "$(docker exec "$NAME" cat /etc/anvil-e2e-ab-file)" = 'absent file' ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G %F' /etc/anvil-e2e-ab-file)" = '604 root:key regular file' ] \
+  && [ "$(docker exec "$NAME" readlink /etc/anvil-e2e-ab-link)" = /etc/hostname ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U:%G %F' /etc/anvil-e2e-ab-dir)" = '750 root:key directory' ] \
+  && [ -z "$(docker exec "$NAME" sh -c 'ls -A /etc | grep "^\.anvil-"')" ]; then
+  pass "rollback recreated the dir, the link and the file with its bytes, owner, group and mode"
+else
+  fail "rollback of absent: exit $code"
+fi
+ab_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged /etc/anvil-e2e-ab-file' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-ab-link' "$TMP/out" \
+  && grep -qxF '  unchanged /etc/anvil-e2e-ab-dir' "$TMP/out"; then
+  pass "a second rollback leaves the recreated paths alone"
+else
+  fail "second rollback of absent: exit $code"
+fi
+docker exec "$NAME" rm -rf /etc/anvil-e2e-ab-file /etc/anvil-e2e-ab-link /etc/anvil-e2e-ab-dir
+
 step "(u) a timed-out plain run dies on arch, without timeout(1) there; a step reading stdin ends at once"
 U_DIR="$TMP/remote-kill"
 U_STATE="$TMP/state-u"

@@ -189,7 +189,7 @@ fn replace_fn(sudo: &str, path: &str, temp: &str, target: &str) -> String {
 /// The line after a plain `ln -s -- TARGET PATH` that fails, exit 1,
 /// unless `path` is now a link to `target`: `ln` puts the link inside a
 /// directory that appeared at `path`.
-fn linked_check(sudo: &str, path: &str, target: &str) -> String {
+pub(crate) fn linked_check(sudo: &str, path: &str, target: &str) -> String {
     format!(
         "{sudo}test -L {p} && anvil_rl && [ \"$anvil_l\" = {} ] || {{ echo {} >&2; exit 1; }}",
         quote(target),

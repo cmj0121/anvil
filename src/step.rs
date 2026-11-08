@@ -185,12 +185,14 @@ pub struct LinkRun {
 
 /// An `[[absent]]` step: whether the entry matched no tag or fact of the
 /// target, the type the path must have, when set, and how it runs; `None`
-/// for a skip.
+/// for a skip or a rollback restore, whose password path may stage a
+/// removed file's bytes (`upload`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbsentRun {
     pub skip: bool,
     pub r#type: Option<AbsentType>,
     pub write: Option<absent::AbsentWrite>,
+    pub upload: Option<Upload>,
 }
 
 /// A `[[services]]` step: whether the entry matched no tag or fact of the target.

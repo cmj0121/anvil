@@ -654,7 +654,8 @@ fn execute_inner(
         };
         let (mut run, timeout) = (planned.run.as_str(), planned.timeout);
         let mut upload = (planned.file().and_then(|file| file.upload.as_ref()))
-            .or_else(|| planned.link().and_then(|link| link.upload.as_ref()));
+            .or_else(|| planned.link().and_then(|link| link.upload.as_ref()))
+            .or_else(|| planned.absent().and_then(|absent| absent.upload.as_ref()));
         let write = planned.file().and_then(|file| file.write.as_ref());
         let dir = planned.dir().and_then(|dir| dir.write.as_ref());
         let link = planned.link().and_then(|link| link.write.as_ref());

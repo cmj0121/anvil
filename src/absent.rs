@@ -18,16 +18,29 @@
 //! then fails. Only the walk protects the directories above `path`: the
 //! owner of `path` itself may still change it between the capture and the
 //! removal.
+//!
+//! [`restore_runs`] puts a recorded removal back on rollback, only while
+//! `path` is missing.
+
+use std::path::Path;
+
+use zeroize::Zeroizing;
 
 use crate::config::{AbsentEntry, AbsentType, Config};
 use crate::dirs::without_special;
 use crate::facts::Facts;
-use crate::files::{capture_script, parse_capture, parse_ls, previous_of, sudo_secret_for};
+use crate::files::{
+    CONFLICT, capture_script, parse_capture, parse_ls, previous_of, restore_attrs,
+    restore_attrs_as, skip_run, staged, sudo_secret_for,
+};
 use crate::inventory::Target;
-use crate::links::read_link;
+use crate::links::{linked_check, read_link};
 use crate::record::{AbsentPrevious, AbsentRecord, Attrs, Previous, PreviousFile};
-use crate::remote::{Walk, WalkNonce, login_top, quote, refused, zeroizing};
-use crate::step::{AbsentRun, PlannedRun, RunKind};
+use crate::remote::{
+    Bytes, Heredoc, Walk, WalkNonce, link_removal_checks, login_top, quote, refused, sweep,
+    temp_beside, temp_trap, zeroizing,
+};
+use crate::step::{AbsentRun, PlannedRun, RunKind, Upload, shown_text};
 use crate::tasks::Item;
 use crate::transport::{Output, RUN_TIMEOUT};
 
@@ -272,7 +285,7 @@ pub fn run(
         log::info!("{}: {label} {path}: no match", target.name);
         return Ok(absent_run(
             entry,
-            String::new(),
+            "",
             format!("skipped absent {path}: no match"),
             None,
             None,
@@ -298,7 +311,7 @@ pub fn run(
     };
     Ok(absent_run(
         entry,
-        write.script(),
+        &write.script(),
         format!("absent {path}"),
         secret,
         Some(write),
@@ -308,10 +321,28 @@ pub fn run(
 /// An absent step of `entry`, shown as `label`: a skip when `run` is empty.
 fn absent_run(
     entry: &AbsentEntry,
-    run: String,
+    run: &str,
     label: String,
     sudo_secret: Option<&str>,
     write: Option<AbsentWrite>,
+) -> PlannedRun {
+    let mut planned = restore_run(&entry.path, run, label, sudo_secret, None);
+    if let RunKind::Absent { run: absent, .. } = &mut planned.kind {
+        absent.skip = run.is_empty();
+        absent.r#type = entry.r#type;
+        absent.write = write;
+    }
+    planned
+}
+
+/// A rollback step that puts `path` back with `run`, shown as `label`, its
+/// bytes staged by `upload` on the password path.
+fn restore_run(
+    path: &str,
+    run: &str,
+    label: String,
+    sudo_secret: Option<&str>,
+    upload: Option<Upload>,
 ) -> PlannedRun {
     PlannedRun {
         run: zeroizing(format_args!("{run}")),
@@ -319,17 +350,291 @@ fn absent_run(
         sudo_secret: sudo_secret.map(str::to_owned),
         timeout: RUN_TIMEOUT,
         kind: RunKind::Absent {
-            path: entry.path.clone(),
+            path: path.to_owned(),
             run: AbsentRun {
-                skip: run.is_empty(),
-                r#type: entry.r#type,
-                write,
+                skip: false,
+                r#type: None,
+                write: None,
+                upload,
             },
         },
         task: None,
         name: None,
         notify: Vec::new(),
     }
+}
+
+/// One step per recorded removal, last first, that puts `path` back while
+/// it is missing: `restore PATH` writes a removed file's kept text to a
+/// temp beside it under `umask 077`, gives the temp its owner, group and
+/// mode ([`restore_attrs_as`]) and renames it onto `path`; `restore link
+/// PATH -> TARGET` links it again; `restore directory PATH` makes it under
+/// `umask 077`, then gives it its owner, group and mode. A file whose text
+/// was not kept, or a removal the step could not record, is a skip
+/// `cannot undo: PATH (reason)`. The directories above `path` must pass the
+/// same checks as on apply, and the one holding it must exist: none is
+/// made, else the step is refused, exit [`REFUSED`](crate::remote::REFUSED).
+/// A `path` that is again of the kind removed prints `unchanged PATH`: an
+/// apply whose removal never ran recorded it too. One of another kind is
+/// refused, exit [`CONFLICT`], `--force` or not: a rollback never replaces
+/// it, and never removes a directory.
+pub(crate) fn restore_runs(
+    config: &Config,
+    target: &Target,
+    facts: &Facts,
+    absent: &[AbsentRecord],
+) -> Result<Vec<PlannedRun>, String> {
+    restore_runs_from(&login_top(), config, target, facts, absent)
+}
+
+/// [`restore_runs`] with the login user's directory checks from `top`.
+fn restore_runs_from(
+    top: &Path,
+    config: &Config,
+    target: &Target,
+    facts: &Facts,
+    absent: &[AbsentRecord],
+) -> Result<Vec<PlannedRun>, String> {
+    let root = facts.is_root();
+    let mut runs = Vec::with_capacity(absent.len());
+    for record in absent.iter().rev() {
+        let path = record.path.as_str();
+        if let Some(reason) = record.not_kept() {
+            runs.push(skip_run(path, format!("cannot undo: {path} ({reason})")));
+            continue;
+        }
+        let secret =
+            sudo_secret_for(config, target).filter(|_| record.sudo && facts.sudo_asks_password());
+        let sudo = match secret {
+            Some(_) => "sudo ",
+            None if root || !record.sudo => "",
+            None => "sudo -n ",
+        };
+        let as_root = root || record.sudo;
+        let restore = Restore {
+            path,
+            sudo,
+            as_root,
+            checks: link_removal_checks("absent", sudo, path, as_root, top),
+        };
+        let (run, label, upload) = match &record.previous {
+            Some(AbsentPrevious::Link { target: old }) => (
+                restore.link(old),
+                format!("restore link {path} -> {}", shown_text(old)),
+                None,
+            ),
+            Some(AbsentPrevious::Dir(attrs)) => (
+                restore.dir(attrs),
+                format!("restore directory {path}"),
+                None,
+            ),
+            Some(AbsentPrevious::File(previous)) => {
+                let text = previous.text.as_deref().expect("not_kept said it is kept");
+                let heredoc = Heredoc::new(text).map_err(|why| format!("absent: {path}: {why}"))?;
+                let label = format!("restore {path}");
+                match secret {
+                    Some(_) => {
+                        let (staged, upload) = staged(&heredoc)?;
+                        let bytes = Bytes::Staged(&staged, text.len());
+                        (restore.file(&bytes, previous)?, label, Some(upload))
+                    }
+                    None => (
+                        restore.file(&Bytes::Inline(&heredoc), previous)?,
+                        label,
+                        None,
+                    ),
+                }
+            }
+            // `not_kept` skipped an unknown removal; nothing was saved for none.
+            Some(AbsentPrevious::Unknown { .. }) | None => continue,
+        };
+        log::info!("{}: {label}", target.name);
+        runs.push(restore_run(path, &run, label, secret, upload));
+    }
+    Ok(runs)
+}
+
+/// What each restore script of one removed path shares.
+struct Restore<'a> {
+    path: &'a str,
+    /// `""`, `"sudo -n "`, or `"sudo "` on the password path.
+    sudo: &'a str,
+    as_root: bool,
+    /// [`link_removal_checks`]: the directories above `path`, not `path`.
+    checks: String,
+}
+
+/// What a path found at a removed path is, as a refusal names it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    File,
+    Link,
+    Dir,
+}
+
+impl Kind {
+    fn word(self) -> &'static str {
+        match self {
+            Kind::File => "file",
+            Kind::Link => "link",
+            Kind::Dir => "directory",
+        }
+    }
+}
+
+impl Restore<'_> {
+    /// After `open`, the sudo-ready line, the checks and `defs`: `unchanged
+    /// PATH` when `path` is a `kind` again, a refusal when it is anything
+    /// else, else, once the directory holding it is there, `create`.
+    fn script(&self, open: &str, defs: &str, kind: Kind, create: &str) -> Zeroizing<String> {
+        let (path, sudo) = (self.path, self.sudo);
+        let p = quote(path);
+        let ready = match sudo {
+            "" => String::new(),
+            _ => format!(
+                "{sudo}true || {}\n",
+                refused(&format!("absent: sudo failed; {path} is not restored"))
+            ),
+        };
+        let arm = |now: Kind| {
+            if now == kind {
+                say(&format!("unchanged {path}"))
+            } else {
+                self.conflict(&format!("is a {} now", now.word()), kind)
+            }
+        };
+        let parent = Path::new(path)
+            .parent()
+            .and_then(Path::to_str)
+            .unwrap_or("/");
+        let q = quote(parent);
+        zeroizing(format_args!(
+            "{open}{ready}{checks}true || exit 1\n{defs}\
+             if {sudo}test -L {p}; then {link}\n\
+             elif {sudo}test -d {p}; then {dir}\n\
+             elif {sudo}test -f {p}; then {file}\n\
+             elif {sudo}test -e {p}; then {other}\n\
+             else\n\
+             {sudo}test -d {q} && {sudo}test ! -L {q} || {missing}\n\
+             {create}fi\n}}\n",
+            checks = self.checks,
+            link = arm(Kind::Link),
+            dir = arm(Kind::Dir),
+            file = arm(Kind::File),
+            other = self.conflict("is not a file, directory or link", kind),
+            missing = refused(&format!(
+                "absent: {parent} does not exist; {path} is not restored"
+            )),
+        ))
+    }
+
+    /// The refusal, exit [`CONFLICT`], of a path that `is` something other
+    /// than the `kind` the apply removed.
+    fn conflict(&self, is: &str, kind: Kind) -> String {
+        let why = format!(
+            "absent: {} {is}, not the {} the apply removed; rollback will not replace it",
+            self.path,
+            kind.word()
+        );
+        format!("echo {} >&2; exit {CONFLICT}", quote(&why))
+    }
+
+    /// The opening that every restore without a temp shares.
+    fn plain_open() -> &'static str {
+        "{ umask 077; LC_ALL=C; export LC_ALL; set -f\n"
+    }
+
+    /// Links `path` to `old` again.
+    fn link(&self, old: &str) -> Zeroizing<String> {
+        let (sudo, p) = (self.sudo, quote(self.path));
+        let create = format!(
+            "{sudo}ln -s -- {} {p} || exit 1\n{}\n{}\n",
+            quote(old),
+            linked_check(sudo, self.path, old),
+            say(&format!(
+                "restored link {} -> {}",
+                self.path,
+                shown_text(old)
+            )),
+        );
+        self.script(
+            Self::plain_open(),
+            &read_link(sudo, &p),
+            Kind::Link,
+            &create,
+        )
+    }
+
+    /// Makes `path` 0700, then gives it `attrs`.
+    fn dir(&self, attrs: &Attrs) -> Zeroizing<String> {
+        let (sudo, p) = (self.sudo, quote(self.path));
+        let create = format!(
+            "{sudo}mkdir -- {p} || exit 1\n{{\n{}}} >/dev/null\n{}\n",
+            restore_attrs("absent", (self.path, sudo, self.as_root), attrs, true),
+            say(&format!("restored directory {}", self.path)),
+        );
+        self.script(Self::plain_open(), "", Kind::Dir, &create)
+    }
+
+    /// Writes `bytes` to a temp beside `path`, gives it `previous`'s owner,
+    /// group and mode, then renames it onto `path`. The EXIT trap removes
+    /// the temp once there is one, and on the password path the staged
+    /// file and the sudo ticket.
+    fn file(
+        &self,
+        bytes: &Bytes<'_>,
+        previous: &PreviousFile,
+    ) -> Result<Zeroizing<String>, String> {
+        let (path, sudo) = (self.path, self.sudo);
+        let temp = temp_beside(path)?;
+        let (p, t) = (quote(path), quote(&temp));
+        let remove = format!("[ -z \"$anvil_t\" ] || {sudo}rm -f {t}");
+        let write = match bytes {
+            Bytes::Staged(staged, _) => format!(
+                "{sudo}sh -c 'tee \"$1\" <\"$2\" >/dev/null' sh {t} {}",
+                quote(staged)
+            ),
+            Bytes::Inline(_) => format!("anvil_bytes | {sudo}tee {t} >/dev/null"),
+        };
+        let trap = temp_trap("absent", &remove, bytes);
+        let open = format!("{{ umask 077; LC_ALL=C; export LC_ALL; set -f\nanvil_t=\n{trap}");
+        let defs = match bytes {
+            Bytes::Inline(_) => {
+                zeroizing(format_args!("{}{}", *bytes.definition(), sweep(sudo, path)))
+            }
+            Bytes::Staged(..) => zeroizing(format_args!("{}", sweep(sudo, path))),
+        };
+        let not_written = quote(&format!(
+            "absent: cannot write a temp file beside {path}; {path} is not restored"
+        ));
+        let fail = format!("{{ echo {not_written} >&2; exit 1; }}");
+        let create = format!(
+            "{sudo}test ! -e {t} && {sudo}test ! -L {t} || {fail}\n\
+             anvil_t=1\n\
+             {write} || {fail}\n\
+             set -- $({sudo}ls -ldn {t}) && [ \"$5\" = {len} ] || {fail}\n\
+             {{\n{attrs}}} >/dev/null\n\
+             {sudo}test ! -e {p} && {sudo}test ! -L {p} || {{ {appeared}; }}\n\
+             {sudo}mv -f {t} {p} || exit 1\n\
+             anvil_t=\n\
+             {restored}\n",
+            len = bytes.len(),
+            attrs = restore_attrs_as(
+                "absent",
+                (&temp, path, sudo, self.as_root),
+                &previous.attrs(),
+                false
+            ),
+            appeared = self.conflict("appeared during the restore", Kind::File),
+            restored = say(&format!("restored {path}")),
+        );
+        Ok(self.script(&open, &defs, Kind::File, &create))
+    }
+}
+
+/// `text` as one `printf` line on stdout.
+fn say(text: &str) -> String {
+    format!("printf '%s\\n' {}", quote(text))
 }
 
 #[cfg(test)]
@@ -640,5 +945,190 @@ mod tests {
         };
         assert_eq!(write.seen(&mut out, false), None);
         assert!(out.stdout.is_empty());
+    }
+
+    /// Puts back `records` as the login user from `top`: each step's
+    /// label, status, stdout and stderr, last recorded first.
+    fn restored(
+        top: &Path,
+        records: &[AbsentRecord],
+    ) -> Vec<(String, Option<i32>, String, String)> {
+        let target = Target {
+            name: "web1".to_owned(),
+            kind: crate::inventory::TargetKind::Local,
+            pkg: None,
+            sudo_secret: None,
+            tags: Vec::new(),
+            vars: Default::default(),
+            env: Default::default(),
+        };
+        let facts = Facts(
+            [("user", "u"), ("sudo", "none")]
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        );
+        let runs = restore_runs_from(top, &Config::default(), &target, &facts, records).unwrap();
+        runs.iter()
+            .map(|planned| {
+                let label = planned.label.clone().unwrap_or_default();
+                if matches!(&planned.kind, RunKind::File { .. }) {
+                    return (label, None, String::new(), String::new());
+                }
+                let out = Local.run(&planned.run, RUN_TIMEOUT).unwrap();
+                (
+                    label,
+                    out.code,
+                    String::from_utf8(out.stdout).unwrap(),
+                    String::from_utf8(out.stderr).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// Removes `path` as `write` does: what the record keeps of it.
+    fn removed(path: &Path, top: &Path) -> AbsentRecord {
+        let (code, _, stderr, record) = applied(&write(path, None, top), None);
+        assert_eq!(code, Some(0), "{stderr}");
+        record.unwrap()
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn a_removed_file_link_and_empty_dir_are_put_back_last_removed_first() {
+        let top = sandbox("absent-restore");
+        let (dir, file, link) = (top.join("dir"), top.join("file"), top.join("link"));
+        fs::create_dir(&dir).unwrap();
+        chmod(&dir, 0o750);
+        fs::write(&file, "old text\n").unwrap();
+        chmod(&file, 0o604);
+        symlink("/nowhere/app", &link).unwrap();
+        let ids = attrs_of(&file);
+        let records = [
+            removed(&dir, &top),
+            removed(&file, &top),
+            removed(&link, &top),
+        ];
+        assert!(!dir.exists() && !file.exists() && fs::symlink_metadata(&link).is_err());
+
+        let shown = restored(&top, &records);
+        let (d, f, l) = (dir.display(), file.display(), link.display());
+        assert_eq!(
+            shown,
+            [
+                (
+                    format!("restore link {l} -> /nowhere/app"),
+                    Some(0),
+                    format!("restored link {l} -> /nowhere/app\n"),
+                    String::new()
+                ),
+                (
+                    format!("restore {f}"),
+                    Some(0),
+                    format!("restored {f}\n"),
+                    String::new()
+                ),
+                (
+                    format!("restore directory {d}"),
+                    Some(0),
+                    format!("restored directory {d}\n"),
+                    String::new()
+                ),
+            ]
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "old text\n");
+        assert_eq!(mode_of(&file), 0o604);
+        assert_eq!(attrs_of(&file), ids);
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("/nowhere/app"));
+        assert!(dir.is_dir());
+        assert_eq!(mode_of(&dir), 0o750);
+        let names: Vec<_> = fs::read_dir(&top)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 3, "no temp left: {names:?}");
+
+        let again = restored(&top, &records);
+        for ((_, code, stdout, _), path) in again.iter().zip([&link, &file, &dir]) {
+            assert_eq!(*code, Some(0));
+            assert_eq!(*stdout, format!("unchanged {}\n", path.display()));
+        }
+    }
+
+    #[test]
+    fn a_path_of_the_removed_kind_again_is_left_alone_and_another_kind_refused() {
+        let top = sandbox("absent-restore-there");
+        let (file, link) = (top.join("file"), top.join("link"));
+        fs::write(&file, "old\n").unwrap();
+        chmod(&file, 0o644);
+        symlink("/a", &link).unwrap();
+        let records = [removed(&file, &top), removed(&link, &top)];
+        fs::write(&file, "new\n").unwrap();
+        fs::create_dir(&link).unwrap();
+        let shown = restored(&top, &records);
+        assert_eq!(shown[0].1, Some(CONFLICT), "{shown:?}");
+        assert_eq!(
+            shown[0].3,
+            format!(
+                "absent: {} is a directory now, not the link the apply removed; \
+                 rollback will not replace it\n",
+                link.display()
+            )
+        );
+        assert_eq!(shown[1].1, Some(0));
+        assert_eq!(shown[1].2, format!("unchanged {}\n", file.display()));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "new\n");
+        assert!(link.is_dir());
+    }
+
+    #[test]
+    fn a_missing_parent_is_refused_and_never_made() {
+        let top = sandbox("absent-restore-parent");
+        let app = top.join("app");
+        fs::create_dir(&app).unwrap();
+        let file = app.join("conf");
+        fs::write(&file, "old\n").unwrap();
+        chmod(&file, 0o644);
+        let records = [removed(&file, &top)];
+        fs::remove_dir(&app).unwrap();
+        let shown = restored(&top, &records);
+        assert_eq!(shown[0].1, Some(REFUSED));
+        assert_eq!(
+            shown[0].3,
+            format!(
+                "absent: {} does not exist; {} is not restored\n",
+                app.display(),
+                file.display()
+            )
+        );
+        assert!(!app.exists());
+    }
+
+    #[test]
+    fn a_hash_only_file_and_an_unknown_removal_cannot_be_undone() {
+        let top = sandbox("absent-restore-hash");
+        let file = top.join("secret");
+        fs::write(&file, "private\n").unwrap();
+        chmod(&file, 0o600);
+        let unknown = AbsentRecord {
+            path: top.join("odd").display().to_string(),
+            sudo: false,
+            previous: Some(AbsentPrevious::Unknown {
+                reason: UNREADABLE.to_owned(),
+            }),
+        };
+        let shown = restored(&top, &[removed(&file, &top), unknown]);
+        let labels: Vec<&str> = shown.iter().map(|(label, ..)| label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                format!("cannot undo: {}/odd (unreadable)", top.display()),
+                format!("cannot undo: {} (not world-readable)", file.display()),
+            ]
+        );
+        assert!(!file.exists());
     }
 }
