@@ -1,0 +1,7 @@
+[[files]]
+src = "conf"
+dest = "/etc/app"
+mode = "0644"
+recursive = true
+dir_mode = "0755"
+template = true

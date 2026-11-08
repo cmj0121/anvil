@@ -21,7 +21,7 @@ use crate::trust::check_owner;
 pub const PREFIX: &str = "$/";
 
 /// Maximum folder depth in a recursive traversal.
-const MAX_DEPTH: usize = 64;
+pub(crate) const MAX_DEPTH: usize = 64;
 
 /// Whether `s` explicitly names the store.
 pub fn is_store_path(s: &str) -> bool {
@@ -224,9 +224,28 @@ impl Root {
             Err(e) => return Err(e),
         };
         let mut entries = Vec::new();
-        list_into(&dir, &rel, recursive, 0, &mut entries)?;
+        list_into(&dir, &rel, recursive, false, 0, usize::MAX, &mut entries)?;
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
+    }
+
+    /// [`Root::list`] of the folder `rel` and all below it, through folders
+    /// [`Root::read_trusted`] would trust, stopping once it holds more than
+    /// `cap` entries: `None` then, the listing left unsorted and dropped.
+    pub(crate) fn list_trusted(
+        &self,
+        rel: &str,
+        cap: usize,
+    ) -> Result<Option<Vec<Entry>>, StoreError> {
+        let rel = parse(rel)?;
+        let dir = self.trusted_directory(&rel)?;
+        let mut entries = Vec::new();
+        list_into(&dir, &rel, true, true, 0, cap, &mut entries)?;
+        if entries.len() > cap {
+            return Ok(None);
+        }
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(Some(entries))
     }
 
     /// Reads one regular UTF-8 text file, without NUL, at most 1 MiB.
@@ -639,15 +658,23 @@ fn names(dir: &File, rel: &str) -> Result<Vec<std::ffi::OsString>, StoreError> {
     Ok(names)
 }
 
+/// Lists `dir` into `out`, depth first, stopping once `out` holds more
+/// than `cap` entries; when `trusted`, each folder descended into must pass
+/// [`check_trusted_dir`].
 fn list_into(
     dir: &File,
     rel: &str,
     recursive: bool,
+    trusted: bool,
     depth: usize,
+    cap: usize,
     out: &mut Vec<Entry>,
 ) -> Result<(), StoreError> {
     check_depth(rel, depth)?;
     for name in names(dir, rel)? {
+        if out.len() > cap {
+            return Ok(());
+        }
         let name = name
             .to_str()
             .ok_or_else(|| StoreError::BadPath(rel.to_owned()))?;
@@ -662,7 +689,10 @@ fn list_into(
         });
         if recursive && kind == Kind::Dir {
             let child = open_dir(dir, name.as_ref(), &next)?;
-            list_into(&child, &next, true, depth + 1, out)?;
+            if trusted {
+                check_trusted_dir(&child, &next)?;
+            }
+            list_into(&child, &next, true, trusted, depth + 1, cap, out)?;
         }
     }
     Ok(())

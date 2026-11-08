@@ -51,5 +51,6 @@ pub mod term;
 #[cfg_attr(feature = "test-util", allow(clippy::disallowed_methods))]
 pub mod test_util;
 pub mod transport;
+pub mod tree;
 mod trust;
 pub mod update;

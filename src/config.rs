@@ -550,6 +550,14 @@ pub struct FileEntry {
     pub template: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notify: Vec<String>,
+    /// `true`: `src` is a directory copied as a tree under `dest`
+    /// ([`crate::tree`]); needs `dir_mode`, never `template`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recursive: bool,
+    /// The mode of each directory a recursive copy creates, under the rules
+    /// of `mode`, without group or world write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir_mode: Option<String>,
 }
 
 /// By hand, so a field added later must be chosen for `Debug` rather than
@@ -569,6 +577,8 @@ impl std::fmt::Debug for FileEntry {
             .field("rollback", &self.rollback)
             .field("template", &self.template)
             .field("notify", &self.notify)
+            .field("recursive", &self.recursive)
+            .field("dir_mode", &self.dir_mode)
             .finish()
     }
 }
@@ -1594,6 +1604,24 @@ pub(crate) fn check_file(prefix: &str, entry: &FileEntry) -> Result<(), String> 
     check_dest(&entry.dest)
         .map_err(|why| format!("{prefix}.dest `{}`: {why}", secret::shown_name(&entry.dest)))?;
     check_mode(entry.mode.as_ref()).map_err(|why| format!("{prefix}.mode{why}"))?;
+    match (entry.recursive, entry.dir_mode.as_deref()) {
+        (true, None) => return Err(format!("{prefix}.dir_mode: required with recursive = true")),
+        (false, Some(_)) => {
+            return Err(format!("{prefix}.dir_mode: only with recursive = true"));
+        }
+        (true, Some(_)) if entry.template => {
+            return Err(format!("{prefix}.template: not with recursive = true"));
+        }
+        (true, Some(mode)) => {
+            check_mode_text(mode).map_err(|why| format!("{prefix}.dir_mode{why}"))?;
+            if u32::from_str_radix(mode, 8).expect("checked: octal digits") & 0o022 != 0 {
+                return Err(format!(
+                    "{prefix}.dir_mode `{mode}`: group or world write is refused"
+                ));
+            }
+        }
+        (false, None) => {}
+    }
     check_account(prefix, "owner", entry.owner.as_deref())?;
     check_account(prefix, "group", entry.group.as_deref())?;
     check_selector(prefix, &entry.tags, &entry.facts)
@@ -1800,6 +1828,11 @@ fn check_mode(mode: Option<&ModeValue>) -> Result<(), String> {
         }
         Some(ModeValue::Text(mode)) => mode,
     };
+    check_mode_text(mode)
+}
+
+/// [`check_mode`] of a mode written as a string.
+fn check_mode_text(mode: &str) -> Result<(), String> {
     let shown = secret::shown_name(mode);
     if !is_mode(mode) {
         return Err(format!(" `{shown}`: must be 3 or 4 octal digits"));
@@ -2644,6 +2677,68 @@ mod tests {
     }
 
     #[test]
+    fn a_recursive_entry_takes_a_dir_mode_without_group_or_world_write() {
+        const TREE: &str = "src = \"conf\"\ndest = \"/etc/app\"\nmode = \"0644\"";
+        let tree = file_entry(&format!("{TREE}\nrecursive = true\ndir_mode = \"0750\""));
+        assert_eq!(tree.check_files(), Ok(()));
+        assert!(tree.files[0].recursive);
+        assert_eq!(tree.files[0].dir_mode.as_deref(), Some("0750"));
+        let toml = toml::to_string(&tree).unwrap();
+        assert!(
+            toml.contains("recursive = true\ndir_mode = \"0750\""),
+            "{toml}"
+        );
+        assert!(
+            !toml::to_string(&file_entry(ENTRY))
+                .unwrap()
+                .contains("recursive")
+        );
+        let trees = format!("[[files]]\n{TREE}\nrecursive = true\ndir_mode = \"0750\"\n");
+        assert_eq!(parse(&trees.repeat(MAX_FILES)).check_files(), Ok(()));
+        assert_eq!(
+            parse(&trees.repeat(MAX_FILES + 1))
+                .check_files()
+                .unwrap_err(),
+            "files: 65 entries exceeds the 64 entry limit"
+        );
+        for (keys, message) in [
+            (
+                "recursive = true",
+                "files[0].dir_mode: required with recursive = true",
+            ),
+            (
+                "dir_mode = \"0755\"",
+                "files[0].dir_mode: only with recursive = true",
+            ),
+            (
+                "recursive = true\ndir_mode = \"0755\"\ntemplate = true",
+                "files[0].template: not with recursive = true",
+            ),
+            (
+                "recursive = true\ndir_mode = \"0775\"",
+                "files[0].dir_mode `0775`: group or world write is refused",
+            ),
+            (
+                "recursive = true\ndir_mode = \"0757\"",
+                "files[0].dir_mode `0757`: group or world write is refused",
+            ),
+            (
+                "recursive = true\ndir_mode = \"4755\"",
+                "files[0].dir_mode `4755`: setuid and setgid are refused",
+            ),
+            (
+                "recursive = true\ndir_mode = \"75\"",
+                "files[0].dir_mode `75`: must be 3 or 4 octal digits",
+            ),
+        ] {
+            let err = file_entry(&format!("{TREE}\n{keys}"))
+                .check_files()
+                .unwrap_err();
+            assert_eq!(err, message, "{keys}");
+        }
+    }
+
+    #[test]
     fn more_than_64_files_entries_are_refused() {
         let table = format!("[[files]]\n{ENTRY}\n");
         assert_eq!(parse(&table.repeat(MAX_FILES)).check_files(), Ok(()));
@@ -2685,6 +2780,22 @@ mod tests {
             (
                 "invalid/config-files-bad-group.yaml",
                 "files[1].group `1app`: must be a group name or a numeric id",
+            ),
+            (
+                "invalid/config-files-recursive-no-dir-mode.toml",
+                "files[0].dir_mode: required with recursive = true",
+            ),
+            (
+                "invalid/config-files-dir-mode-not-recursive.yaml",
+                "files[0].dir_mode: only with recursive = true",
+            ),
+            (
+                "invalid/config-files-recursive-template.toml",
+                "files[0].template: not with recursive = true",
+            ),
+            (
+                "invalid/config-files-dir-mode-group-write.toml",
+                "files[0].dir_mode `0775`: group or world write is refused",
             ),
         ] {
             let err = Config::load(Some(&fixture_doc(file))).unwrap_err();

@@ -1950,6 +1950,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_task_file_takes_the_recursive_keys_under_the_files_rules() {
+        let ws = Workspace::new();
+        let config = |keys: &str| {
+            format!(
+                "[[tasks]]\nfile = {{ src = \"conf\", dest = \"/etc/app\", mode = \"0644\"{keys} }}\n"
+            )
+        };
+        let expanded = ws
+            .expand(&config(", recursive = true, dir_mode = \"0750\""))
+            .unwrap();
+        let (_, entry, _) = expanded.files().next().unwrap();
+        assert!(entry.recursive);
+        assert_eq!(entry.dir_mode.as_deref(), Some("0750"));
+        for (keys, message) in [
+            (
+                ", recursive = true",
+                "tasks[0].file.dir_mode: required with recursive = true",
+            ),
+            (
+                ", dir_mode = \"0750\"",
+                "tasks[0].file.dir_mode: only with recursive = true",
+            ),
+            (
+                ", recursive = true, dir_mode = \"0750\", template = true",
+                "tasks[0].file.template: not with recursive = true",
+            ),
+            (
+                ", recursive = true, dir_mode = \"0752\"",
+                "tasks[0].file.dir_mode `0752`: group or world write is refused",
+            ),
+        ] {
+            assert_eq!(ws.expand(&config(keys)).unwrap_err(), message, "{keys}");
+        }
+    }
+
     const HANDLERS: &str =
         "[[handlers]]\nname = \"a\"\nrun = \"x\"\n\n[[handlers]]\nname = \"b\"\nrun = \"y\"\n";
 

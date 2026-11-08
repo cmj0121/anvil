@@ -1392,6 +1392,8 @@ mod tests {
             rollback: true,
             template: false,
             notify: Vec::new(),
+            recursive: false,
+            dir_mode: None,
         }
     }
 

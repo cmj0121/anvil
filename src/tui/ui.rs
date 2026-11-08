@@ -1586,6 +1586,8 @@ mod tests {
             rollback: true,
             template: false,
             notify: Vec::new(),
+            recursive: false,
+            dir_mode: None,
         };
         let config = Config {
             packages: Some(Packages {
@@ -1666,6 +1668,8 @@ mod tests {
                 rollback: true,
                 template: false,
                 notify: Vec::new(),
+                recursive: false,
+                dir_mode: None,
             }],
             services: vec![service("sshd", "local"), service("cron", "web")],
             steps: vec![Step::script("hostname")],

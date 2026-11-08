@@ -43,6 +43,7 @@ impl Prepared {
         cancel: Arc<Cancel>,
     ) -> Result<Prepared, Failure> {
         let mut prepared = Prepared::plan(opts, config, expanded, cancel)?;
+        files::refuse_trees(&prepared.expanded, &prepared.sources)?;
         prepared.passwords = engine::load_passwords(
             &prepared.targets,
             &prepared.config,

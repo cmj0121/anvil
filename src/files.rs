@@ -47,20 +47,51 @@ use crate::step::{FileRun, PlannedRun, RunKind, Upload};
 use crate::tasks::{Expanded, Item};
 use crate::template;
 use crate::transport::{Output, RUN_TIMEOUT};
+use crate::tree::{self, Tree};
 use crate::trust::{self, TrustError};
 
-/// Each file item's src text, by ordinal.
+/// Each file item's src, by ordinal.
 #[derive(Debug, Default)]
-pub struct Sources(Vec<Source>);
+pub struct Sources(Vec<Loaded>);
 
-#[cfg(test)]
+/// One file item's src: a file, or the tree of a `recursive = true` entry.
+#[derive(Debug)]
+pub enum Loaded {
+    File(Source),
+    Tree(Tree),
+}
+
+impl Loaded {
+    /// The src of a single file entry.
+    pub fn file(&self) -> Option<&Source> {
+        match self {
+            Loaded::File(source) => Some(source),
+            Loaded::Tree(_) => None,
+        }
+    }
+}
+
 impl Sources {
+    /// The src of the single file entry with ordinal `i`.
+    pub(crate) fn file(&self, i: usize) -> Option<&Source> {
+        self.0.get(i).and_then(Loaded::file)
+    }
+
+    /// The tree of the recursive entry with ordinal `i`.
+    pub fn tree(&self, i: usize) -> Option<&Tree> {
+        match self.0.get(i) {
+            Some(Loaded::Tree(tree)) => Some(tree),
+            _ => None,
+        }
+    }
+
     /// Each entry's src text, as [`load`] would read it.
+    #[cfg(test)]
     pub fn of(texts: &[&str]) -> Sources {
         Sources(
             texts
                 .iter()
-                .map(|text| Source::of(text.as_bytes().to_vec()))
+                .map(|text| Loaded::File(Source::of(text.as_bytes().to_vec())))
                 .collect(),
         )
     }
@@ -74,7 +105,7 @@ pub struct Source {
 }
 
 impl Source {
-    fn of(bytes: Vec<u8>) -> Source {
+    pub(crate) fn of(bytes: Vec<u8>) -> Source {
         let binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
         Source { bytes, binary }
     }
@@ -119,8 +150,10 @@ pub(crate) fn write_timeout(wire: usize) -> Duration {
     RUN_TIMEOUT + Duration::from_secs(wire as u64 * PER_MIB_SECS / MIB)
 }
 
-/// Reads every src from the store or workspace; source errors name the entry.
-/// Returns [`Sources::default`] without resolving the workspace when there are no files.
+/// Reads every src from the store or workspace, a recursive entry's as its
+/// [`Tree`] ([`tree::expand_workspace`], [`tree::expand_store`]); source
+/// errors name the entry. Returns [`Sources::default`] without resolving the
+/// workspace when there are no files.
 pub fn load(
     expanded: &Expanded,
     workspace: impl FnOnce() -> Result<PathBuf, Failure>,
@@ -133,36 +166,72 @@ pub fn load(
     let canonical = std::cell::LazyCell::new(|| {
         fs::canonicalize(&workspace).map_err(|err| format!("cannot read: {err}"))
     });
-    let sources = expanded.files().map(|(item, entry, i)| {
-        let bytes = if filestore::is_store_path(&entry.src) {
-            store.read_trusted_bytes(&entry.src).map_err(|err| Failure {
-                refused: matches!(err, StoreError::Untrusted(_, _)),
-                ..Failure::usage(store_reason(&entry.src, &err))
-            })
+    let dir = || {
+        canonical
+            .as_ref()
+            .map(PathBuf::as_path)
+            .map_err(|err| Failure::usage(err.clone()))
+    };
+    let mut budget = tree::Budget::default();
+    let mut sources = Vec::new();
+    for (item, entry, i) in expanded.files() {
+        let store_path = filestore::is_store_path(&entry.src);
+        let loaded = if entry.recursive {
+            if store_path {
+                tree::expand_store(&store, (i, &entry.src, &entry.dest), &mut budget)
+            } else {
+                dir().and_then(|dir| {
+                    tree::expand_workspace(dir, (i, &entry.src, &entry.dest), &mut budget)
+                })
+            }
+            .map(Loaded::Tree)
         } else {
-            canonical
-                .as_ref()
-                .map_err(|err| Failure::usage(err.clone()))
-                .and_then(|dir| read_src_bytes(dir, &entry.src))
+            let bytes = if store_path {
+                store.read_trusted_bytes(&entry.src).map_err(|err| Failure {
+                    refused: matches!(err, StoreError::Untrusted(_, _)),
+                    ..Failure::usage(store_reason(&entry.src, &err))
+                })
+            } else {
+                dir().and_then(|dir| read_src_bytes(dir, &entry.src))
+            };
+            bytes
+                .and_then(|bytes| file_source(entry, bytes))
+                .map(Loaded::File)
         };
-        bytes
-            .and_then(|bytes| {
-                let source = Source::of(bytes);
-                if entry.template {
-                    let text = source.text().ok_or_else(|| {
-                        Failure::usage("is binary; template = true needs a text file")
-                    })?;
-                    template::check(text)
-                        .map_err(|why| Failure::usage(format!("template: {why}")))?;
-                }
-                Ok(source)
-            })
-            .map_err(|err| Failure {
-                message: src_message(item, i, &entry.src, &err.message),
-                ..err
-            })
-    });
-    Ok(Sources(sources.collect::<Result<_, _>>()?))
+        sources.push(loaded.map_err(|err| Failure {
+            message: src_message(item, i, &entry.src, &err.message),
+            ..err
+        })?);
+    }
+    Ok(Sources(sources))
+}
+
+/// The src of a single file `entry` from its `bytes`, a templated one
+/// checked to be text that parses.
+fn file_source(entry: &FileEntry, bytes: Vec<u8>) -> Result<Source, Failure> {
+    let source = Source::of(bytes);
+    if entry.template {
+        let text = source
+            .text()
+            .ok_or_else(|| Failure::usage("is binary; template = true needs a text file"))?;
+        template::check(text).map_err(|why| Failure::usage(format!("template: {why}")))?;
+    }
+    Ok(source)
+}
+
+/// Refuses a run that would write a recursive entry: until its items run as
+/// steps, an apply must fail before anything is sent.
+pub fn refuse_trees(expanded: &Expanded, sources: &Sources) -> Result<(), Failure> {
+    match expanded
+        .files()
+        .find(|(_, _, i)| sources.tree(*i).is_some())
+    {
+        Some((item, _, i)) => Err(Failure::usage(item.shown_message(format!(
+            "{}: recursive copy is not supported yet by this anvil",
+            item.label("files", i)
+        )))),
+        None => Ok(()),
+    }
 }
 
 /// `why` the src of the file entry `item` was not read, naming the entry.
@@ -281,6 +350,16 @@ pub fn run(
         log::info!("{}: {label} {dest}: no match", target.name);
         return Ok(skip_run(dest, format!("skipped file {dest}: no match")));
     }
+    if let Some(tree) = sources.tree(i) {
+        let (items, size) = (tree.items.len(), tree.size());
+        return Ok(skip_run(
+            dest,
+            format!(
+                "skipped tree {dest}: {items} items, {size} bytes; \
+                 recursive copy is not supported yet by this anvil"
+            ),
+        ));
+    }
     let Some(ModeValue::Text(mode)) = &entry.mode else {
         return Err(format!("{label}.mode: required"));
     };
@@ -305,7 +384,7 @@ pub fn run(
         None
     };
     let mark = WalkNonce::attrs()?;
-    let binary = rendered.is_none() && sources.0.get(i).is_some_and(|source| source.binary);
+    let binary = rendered.is_none() && sources.file(i).is_some_and(|source| source.binary);
     let write = match secret {
         Some(name) => {
             log::info!(
@@ -386,7 +465,7 @@ fn render_entry(
     if !entry.template {
         return Ok(None);
     }
-    let Some(text) = sources.0.get(i).and_then(Source::text) else {
+    let Some(text) = sources.file(i).and_then(Source::text) else {
         return Err(format!("files[{i}]: src was not loaded"));
     };
     let rendered = template::render(text, &target.vars, facts).and_then(|text| {
@@ -540,8 +619,7 @@ impl FileWrite {
             return Ok(Payload::Text(rendered.text.as_str()));
         }
         let source = sources
-            .0
-            .get(self.ordinal)
+            .file(self.ordinal)
             .ok_or_else(|| format!("files[{}]: src was not loaded", self.ordinal))?;
         Ok(match source.text() {
             Some(text) => Payload::Text(text),
@@ -2355,6 +2433,8 @@ mod tests {
             rollback: true,
             template: false,
             notify: Vec::new(),
+            recursive: false,
+            dir_mode: None,
         }
     }
 
@@ -2488,7 +2568,7 @@ mod tests {
         std::os::unix::fs::symlink("real/src.txt", root.join("link.txt")).unwrap();
         let config = config_in(&root, vec![entry("link.txt", "/etc/x")]);
         let Sources(loaded) = load(&config, || Ok(root.clone())).unwrap();
-        assert_eq!(loaded[0].text(), Some("text"));
+        assert_eq!(loaded[0].file().and_then(Source::text), Some("text"));
         assert_src_refused(&root, "link.txt", &root.join("real"), 0o775, 0o755);
         assert_src_refused(&root, "link.txt", &root.join("real/src.txt"), 0o664, 0o644);
         fs::remove_dir_all(&dir).unwrap();
@@ -2593,8 +2673,8 @@ mod tests {
         );
         let Sources(loaded) = load(&config, || Ok(dir.clone())).unwrap();
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].text(), Some(SECRET_TEXT));
-        assert_eq!(loaded[1].text(), Some(""));
+        assert_eq!(loaded[0].file().and_then(Source::text), Some(SECRET_TEXT));
+        assert_eq!(loaded[1].file().and_then(Source::text), Some(""));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2650,7 +2730,12 @@ mod tests {
         fs::write(dir.join("big"), "a".repeat(limit + 1)).unwrap();
         let config = config_in(&dir, vec![entry("fits", "/etc/fits")]);
         assert_eq!(
-            load(&config, || Ok(dir.clone())).unwrap().0[0].bytes.len(),
+            load(&config, || Ok(dir.clone()))
+                .unwrap()
+                .file(0)
+                .unwrap()
+                .bytes
+                .len(),
             limit
         );
         assert_eq!(
@@ -2677,6 +2762,7 @@ mod tests {
         let loaded = load(&config, || Ok(dir.clone())).unwrap().0;
         let shown: Vec<_> = loaded
             .iter()
+            .filter_map(Loaded::file)
             .map(|source| (source.bytes.as_slice(), source.binary))
             .collect();
         assert_eq!(
@@ -2708,9 +2794,10 @@ mod tests {
         fs::create_dir(dir.join("files")).unwrap();
         fs::write(dir.join("files/blob"), b"\xff\0\x01").unwrap();
         let config = config_in(&dir, vec![entry("$/blob", "/etc/blob")]);
-        let loaded = load(&config, || Ok(dir.clone())).unwrap().0;
+        let loaded = load(&config, || Ok(dir.clone())).unwrap();
+        let loaded = loaded.file(0).unwrap();
         assert_eq!(
-            (loaded[0].bytes.as_slice(), loaded[0].binary),
+            (loaded.bytes.as_slice(), loaded.binary),
             (&b"\xff\0\x01"[..], true)
         );
         fs::remove_dir_all(&dir).unwrap();
@@ -2916,11 +3003,42 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_plans_as_a_skip_naming_its_items_and_size() {
+        let dir = fs::canonicalize(dir("files-tree-plan")).unwrap();
+        fs::create_dir_all(dir.join("conf/sub")).unwrap();
+        fs::write(dir.join("conf/sub/a"), "abc").unwrap();
+        let tree = FileEntry {
+            recursive: true,
+            dir_mode: Some("0755".to_owned()),
+            ..entry("conf", "/etc/app")
+        };
+        let config = config_in(&dir, vec![tree]);
+        let sources = load(&config, || Ok(dir.clone())).unwrap();
+        let run = runs(
+            &config,
+            &sources,
+            &host(&[], None),
+            Some(&user_facts("nopasswd")),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(
+            run.label.as_deref(),
+            Some(
+                "skipped tree /etc/app: 3 items, 3 bytes; \
+                 recursive copy is not supported yet by this anvil"
+            )
+        );
+        assert!(run.file().unwrap().skip && run.run.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_binary_src_travels_in_printf_lines_only_in_plain_runs() {
         let config = config_in(Path::new("/c"), vec![entry("a", "/etc/a")]);
         let mut bytes: Vec<u8> = (0..=255).collect();
         bytes.extend_from_slice(b"hunter2\0");
-        let sources = Sources(vec![Source::of(bytes.clone())]);
+        let sources = Sources(vec![Loaded::File(Source::of(bytes.clone()))]);
         let printf = Printf::new(&bytes);
         let plain = runs(
             &config,
@@ -2984,7 +3102,7 @@ mod tests {
         );
         let config = config_in(Path::new("/c"), vec![entry("a", "/etc/a")]);
         let bytes = vec![0xff; document::MAX_BYTES as usize];
-        let sources = Sources(vec![Source::of(bytes)]);
+        let sources = Sources(vec![Loaded::File(Source::of(bytes))]);
         let run = runs(
             &config,
             &sources,
@@ -8020,7 +8138,7 @@ mod tests {
         );
         let Sources(loaded) = load(&config, || Ok(dir.clone())).unwrap();
         assert_eq!(
-            loaded[0].text(),
+            loaded[0].file().and_then(Source::text),
             Some("a\n{% if %}\n"),
             "a plain src is not parsed"
         );
