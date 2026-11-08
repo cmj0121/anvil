@@ -3,7 +3,7 @@
 English | [繁體中文](README.zh-TW.md)
 
 A web host set up in an order the legacy sections cannot give: packages, a repository, more packages, then a role that
-creates a directory, writes a config, links it, validates it and starts the service. See
+creates a directory, writes a config, links it, removes the default site, validates it and starts the service. See
 [Tasks](../../docs/configuration.md#tasks).
 
 - `config.toml` has only `[[tasks]]`, which run top to bottom. Each top-level task carries `tags = ["web"]`, the tag of
@@ -18,19 +18,25 @@ creates a directory, writes a config, links it, validates it and starts the serv
   the workspace, the directory of `--config`. `Create the site directory` is a `dir` task: `/var/www/site` as
   `root:nginx 0750`, so the nginx workers (group `nginx`, made by the package) can read it and others cannot, with
   `parents = true` for a missing `/var/www` ([Dirs](../../docs/configuration.md#dirs)). `Configure and start` nests the
-  config, the link that enables it, its validation and the service.
+  config, the link that enables it, the removal of the default site, its validation and the service.
 - `Write the site config` writes `/etc/nginx/sites-available/site.conf` with `parents = true`, since the nginx.org
   package has no `sites-available`. `Enable the site` is a `link` task: `/etc/nginx/conf.d/site.conf` points at
   `../sites-available/site.conf`, read from the link's directory, and nginx loads it with the rest of `conf.d/*.conf`
   ([Links](../../docs/configuration.md#links)). A regular file already at that path is refused, not replaced, unless
   the task sets `force = true`.
-- `Write the site config` and `Enable the site` have `notify = ["reload nginx"]`, a `[[handlers]]` entry in
-  `config.toml` (an include cannot hold one) with `service = { name = "nginx", state = "reloaded" }`. It runs once after
-  the last task, only when the file or the link changed: `started` leaves a running nginx as it is, so the handler loads
-  the new config. If `nginx -t` fails, the target stops there, the handler stays pending for the next apply and nginx
-  keeps running its old config ([Handlers](../../docs/configuration.md#handlers)).
+- `Remove the default site` is an `absent` task: it removes the package's `/etc/nginx/conf.d/default.conf` and prints
+  `removed /etc/nginx/conf.d/default.conf`, or `unchanged …` once it is gone. `type = "file"` fails the step, leaving
+  the path as it is, if a link or a directory sits there instead. The path may not be, sit under or hold a file, dir
+  or link path of the config: that is exit 2. The apply record keeps the file, so `anvil rollback` puts it back while
+  it is still missing ([Absent](../../docs/configuration.md#absent)).
+- `Write the site config`, `Enable the site` and `Remove the default site` have `notify = ["reload nginx"]`, a
+  `[[handlers]]` entry in `config.toml` (an include cannot hold one) with
+  `service = { name = "nginx", state = "reloaded" }`. It runs once after the last task, only when the file or the link
+  changed or the default site was removed: `started` leaves a running nginx as it is, so the handler loads the new
+  config. If `nginx -t` fails, the target stops there, the handler stays pending for the next apply and nginx keeps
+  running its old config ([Handlers](../../docs/configuration.md#handlers)).
 - `/var/www/site` stays empty, so the host IP or any other `Host` gets 403 until you add content (an `index.html` then
-  gives 200), and `Host: localhost` is answered by the package's `default.conf`, not this site.
+  gives 200); with `default.conf` gone, `Host: localhost` gets that 403 too.
 
 ## Try it
 

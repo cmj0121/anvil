@@ -37,6 +37,26 @@ files:
       - linode
     notify:
       - log app config change # also when only the owner, group or mode is fixed
+  # Not UTF-8, so copied byte for byte as a binary file; rollback cannot undo it.
+  - src: files/upstream.der
+    dest: /etc/app/upstream.der
+    mode: "0644"
+    tags:
+      - linode
+  # The whole app.d folder, one step per item: each file root:wheel 0640, each
+  # directory it creates wheel 0750. Nothing in /etc/app/app.d is ever removed.
+  - src: files/app.d
+    dest: /etc/app/app.d
+    mode: "0640"
+    owner: root # files only; a created directory keeps root, the sudo identity
+    group: wheel
+    recursive: true
+    dir_mode: "0750" # required with recursive; no group or world write
+    parents: true
+    tags:
+      - linode
+    notify:
+      - log app config change # once, when any item changed
 services:
   - name: sshd
     state: started

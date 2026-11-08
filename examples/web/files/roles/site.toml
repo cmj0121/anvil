@@ -19,6 +19,12 @@ name = "Configure and start"
   link = { path = "/etc/nginx/conf.d/site.conf", target = "../sites-available/site.conf" }
   notify = ["reload nginx"]
 
+  # The package's catch-all site; type = "file" fails the step on a link or dir there.
+  [[tasks.tasks]]
+  name = "Remove the default site"
+  absent = { path = "/etc/nginx/conf.d/default.conf", type = "file" }
+  notify = ["reload nginx"] # only when it was removed
+
   [[tasks.tasks]]
   name = "Validate the config"
   run = "sudo -n nginx -t"

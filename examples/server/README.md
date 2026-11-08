@@ -2,8 +2,8 @@
 
 English | [繁體中文](README.zh-TW.md)
 
-A remote host kept in shape: upgrade, pin, remove, a config directory, root-owned files under `/etc`, a running
-service, guarded steps and handlers.
+A remote host kept in shape: upgrade, pin, remove, a config directory, root-owned files under `/etc` (one of them
+binary, and a whole folder), a running service, guarded steps and handlers.
 
 - `[packages]`: `upgrade = true` upgrades every installed package first, `pin = ["vim"]` installs vim when missing and
   skips it in that upgrade, `remove = ["nano"]` removes nano when installed. Pin works only on pacman and dnf; on brew,
@@ -17,6 +17,17 @@ service, guarded steps and handlers.
   group Arch ships) read it, and others cannot. With the same bytes and only the owner, group or mode off, it prints
   `fixed /etc/app/conf.d/app.conf: …` and notifies `log app config change` as a write does
   ([`owner` and `group`](../../docs/configuration.md#files)).
+- The third `[[files]]` entry copies `files/upstream.der`, a DER certificate the app pins, to `/etc/app/upstream.der`.
+  It is not UTF-8, so anvil copies it byte for byte as a binary file with no key to set; `plan` marks the step
+  `(binary)`, and `anvil rollback` cannot undo it: the apply record keeps only its sha256
+  ([Binary files](../../docs/configuration.md#files)).
+- The fourth `[[files]]` entry has `recursive = true`: it copies the folder `files/app.d` to `/etc/app/app.d`, one step
+  per item, the directory first. Each file is `root:wheel 0640` as `mode`, `owner` and `group` say; each directory it
+  creates gets `group` and `dir_mode = "0750"`, which `recursive` requires and which may not let group or others
+  write, and keeps root as its owner, since `owner` applies to files only. `parents = true` creates a missing
+  `/etc/app` above it. An existing directory is left as it is, and a file in `/etc/app/app.d` that the folder does not
+  hold is never removed. `log app config change` runs once when any item changed
+  ([Recursive copy](../../docs/configuration.md#recursive-copy)).
 - Two `[[steps]]` carry [guards](../../docs/configuration.md#config), so a rerun leaves them alone: `creates` skips the
   first once `/var/tmp/anvil-provisioned` exists, and `unless` skips the second while
   `grep -qx 'managed by anvil' /var/tmp/anvil-note` exits 0. `[[steps]]` take no tags, so both run on every target.
@@ -53,4 +64,4 @@ Files added later, by `git pull` or an editor, come back 664 and are refused aga
 `anvil config --format yaml` edit (that editor view also adds an `anvil:` block and drops comments): paste them into
 that editor and anvil saves them as TOML. Do not copy `yaml/` into `~/.config/anvil/`: a YAML file
 there is read as a legacy document and rewritten to TOML on the next edit, and a TOML and a YAML file of the same
-name are ambiguous (exit 2). To adopt this example, copy the `.toml` files.
+name are ambiguous (exit 2). To adopt this example, copy the `.toml` files and `files/`.
