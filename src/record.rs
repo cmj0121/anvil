@@ -156,6 +156,8 @@ pub struct FileRecord {
     /// The mode written, 4 octal digits.
     pub mode: String,
     pub sudo: bool,
+    /// `""`, and left out, for a [`secret`](FileRecord::secret) write.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub written_sha256: String,
     pub write: Write,
     pub previous: Previous,
@@ -172,6 +174,10 @@ pub struct FileRecord {
     /// kept as its hash only, and rollback cannot undo the write.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub binary: bool,
+    /// Whether the entry rendered secrets: no hash of the bytes written or
+    /// of the previous file is kept, and rollback cannot undo the write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub secret: bool,
 }
 
 /// A file's owner, group and mode.
@@ -207,6 +213,8 @@ pub const NO_ROLLBACK: &str = "rollback = false";
 pub const NOT_WORLD_READABLE: &str = "not world-readable";
 /// Why a binary file, previous or written, has only its hash in the record.
 pub const BINARY: &str = "binary";
+/// Why a file built from secrets has neither text nor hash in the record.
+pub const SECRET: &str = "secret";
 
 /// Whether others may read a file of this octal `mode`; a mode that does not
 /// parse counts as no.
@@ -251,11 +259,15 @@ impl FileRecord {
     }
 
     /// Why a rollback cannot put back this file's previous state, if so:
-    /// always [`BINARY`] after a binary write; else never for an attrs-only
+    /// always [`SECRET`] after a write built from secrets, [`BINARY`] after
+    /// a binary write; else never for an attrs-only
     /// fix or a refused write, which need no text.
     pub fn not_kept(&self) -> Option<&str> {
         if self.write == Write::Refused {
             return None;
+        }
+        if self.secret {
+            return Some(SECRET);
         }
         if self.binary {
             return Some(BINARY);
@@ -290,6 +302,21 @@ impl FileRecord {
         if later.binary {
             self.drop_binary_previous();
         }
+        if later.secret {
+            self.drop_secret_previous();
+        }
+    }
+
+    /// Marks the write as built from secrets and keeps nothing of the
+    /// previous file's bytes, not even their hash.
+    fn drop_secret_previous(&mut self) {
+        self.secret = true;
+        if let Previous::File(previous) = &mut self.previous {
+            previous.sha256.clear();
+            if previous.kept {
+                previous.drop_text(NO_ROLLBACK);
+            }
+        }
     }
 
     /// Marks the write binary and keeps the previous file's hash only.
@@ -316,6 +343,7 @@ impl fmt::Debug for FileRecord {
             .field("written_attrs", &self.written_attrs)
             .field("created_dirs", &self.created_dirs)
             .field("binary", &self.binary)
+            .field("secret", &self.secret)
             .finish()
     }
 }
@@ -893,16 +921,17 @@ fn is_supported(version: u32) -> bool {
 
 /// The version `record` is saved as: [`VERSION`] when any target has a dir,
 /// a link or an absent step, or any file lists created directories (a
-/// refused write always does), is an attrs-only fix or was binary, which an
-/// older anvil would mishandle, else [`VERSION_1`]. The attrs written alone stay version
+/// refused write always does), is an attrs-only fix, was binary or was built
+/// from secrets, which an older anvil would mishandle, else [`VERSION_1`]. The attrs written alone stay version
 /// 1: an older anvil ignores them.
 fn version_of(record: &Record) -> u32 {
     let newer = record.targets.values().any(|target| {
         !target.dirs.is_empty()
             || !target.links.is_empty()
             || !no_absent(&target.absent)
-            || (target.files.iter())
-                .any(|file| !file.created_dirs.is_empty() || file.attrs_only() || file.binary)
+            || (target.files.iter()).any(|file| {
+                !file.created_dirs.is_empty() || file.attrs_only() || file.binary || file.secret
+            })
     });
     if newer { VERSION } else { VERSION_1 }
 }
@@ -981,8 +1010,8 @@ impl FileRecord {
     /// passes the config's dest rule, its modes are octal, its hashes are
     /// empty or lowercase hex, each created directory passes the dest rule
     /// and holds DEST, and its write was not `refused` unless it created
-    /// directories, and a binary write keeps no previous text. A record
-    /// edited by hand must not hand rollback, which may run as root, a path
+    /// directories, a binary write keeps no previous text, and a secret one
+    /// no text or hash. A record edited by hand must not hand rollback, which may run as root, a path
     /// or mode the config would refuse.
     fn is_valid(&self) -> bool {
         let previous = match &self.previous {
@@ -990,6 +1019,10 @@ impl FileRecord {
                 is_mode(&previous.mode)
                     && is_sha256_or_empty(&previous.sha256)
                     && !(self.binary && (previous.kept || previous.text.is_some()))
+                    && !(self.secret
+                        && (previous.kept
+                            || previous.text.is_some()
+                            || !previous.sha256.is_empty()))
             }
             Previous::Absent | Previous::Dangling { .. } => true,
         };
@@ -997,6 +1030,7 @@ impl FileRecord {
             && check_dest(&self.dest).is_ok()
             && is_mode(&self.mode)
             && is_sha256_or_empty(&self.written_sha256)
+            && !(self.secret && !self.written_sha256.is_empty())
             && previous
             && (self.written_attrs.as_ref()).is_none_or(|attrs| is_mode(&attrs.mode))
             && (self.created_dirs.iter()).all(|dir| holds(dir, &self.dest))
@@ -1120,7 +1154,8 @@ impl Session {
         target.files = std::mem::take(&mut target.files)
             .into_iter()
             .filter_map(|file| {
-                let unchanged = !file.attrs_changed()
+                let unchanged = !file.secret
+                    && !file.attrs_changed()
                     && matches!(&file.previous,
                     Previous::File(p) if p.sha256 == file.written_sha256
                         || (p.sha256.is_empty()
@@ -1142,6 +1177,9 @@ impl Session {
                         kept.add_dirs(file.created_dirs);
                         if kept.binary {
                             kept.drop_binary_previous();
+                        }
+                        if kept.secret {
+                            kept.drop_secret_previous();
                         }
                         Some(kept)
                     }
@@ -1603,6 +1641,7 @@ mod tests {
             written_attrs: None,
             created_dirs: Vec::new(),
             binary: false,
+            secret: false,
         }
     }
 
@@ -2979,6 +3018,59 @@ mod tests {
         let mut edited = raw.clone();
         edited["targets"]["web1"]["files"][0]["previous"]["kept"] = json!(true);
         edited["targets"]["web1"]["files"][0]["previous"]["text"] = json!("before");
+        plant(&path, edited.to_string().as_bytes());
+        let err = load(&path).unwrap_err();
+        assert!(err.ends_with(": cannot parse"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_secret_write_keeps_no_hash_saves_version_2_and_never_merges_as_unchanged() {
+        let (path, root) = record_path("record-secret");
+        let mut first = file("/etc/app.env", "", Write::Written, previous("", None));
+        first.secret = true;
+        assert_eq!(first.not_kept(), Some(SECRET));
+        let mut session = Session::open(&path).unwrap();
+        session.merge("web1", target(1, true, vec![first.clone()]));
+        session.save().unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["version"], 2);
+        let entry = &raw["targets"]["web1"]["files"][0];
+        assert_eq!(entry["secret"], true);
+        assert!(entry.get("written_sha256").is_none(), "{entry}");
+        assert_eq!(entry["previous"]["sha256"], "");
+        assert!(entry["previous"].get("text").is_none());
+        assert_eq!(
+            load(&path).unwrap().unwrap().targets["web1"].files,
+            [first.clone()]
+        );
+
+        // A rotated secret wrote other bytes: the later entry replaces the
+        // earlier one, even though neither has a hash to compare.
+        let rotated = FileRecord {
+            mode: "0400".to_owned(),
+            written_attrs: Some(attrs(0, 0, "0400")),
+            ..first.clone()
+        };
+        session.merge("web1", target(2, true, vec![rotated.clone()]));
+        assert_eq!(session.record.targets["web1"].files, [rotated]);
+
+        // Written again from secrets drops the hash and text kept before.
+        let mut again = file(
+            "/etc/app.env",
+            &sha('a'),
+            Write::Written,
+            previous(&sha('c'), Some("before")),
+        );
+        again.written_again(first.clone());
+        let Previous::File(p) = &again.previous else {
+            panic!("{:?}", again.previous);
+        };
+        assert!(again.secret && p.sha256.is_empty() && p.text.is_none());
+
+        // A hand-edited secret entry that holds a hash is refused.
+        let mut edited = raw.clone();
+        edited["targets"]["web1"]["files"][0]["written_sha256"] = json!(sha('a'));
         plant(&path, edited.to_string().as_bytes());
         let err = load(&path).unwrap_err();
         assert!(err.ends_with(": cannot parse"), "{err}");

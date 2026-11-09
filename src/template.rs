@@ -1,14 +1,17 @@
-//! MiniJinja rendering of a templated file's src, with `vars` and `facts`.
+//! MiniJinja rendering of a templated file's src, with `vars`, `facts` and,
+//! for an entry that lists them, `secrets`.
 //!
 //! The engine has strict undefined, a fuel limit, no loader (`include`,
 //! `import` and `extends` do not parse), trim/lstrip blocks, the trailing
-//! newline kept and no auto-escape. Error text gives the position and the
-//! variable's name, never a value.
+//! newline kept, no auto-escape and a `b64encode` filter. Error text gives
+//! the position and the variable's name, never a value.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use minijinja::syntax::SyntaxConfig;
+use minijinja::value::ValueKind;
 use minijinja::{AutoEscape, Environment, Error, ErrorKind, UndefinedBehavior, Value};
 use zeroize::Zeroizing;
 
@@ -21,26 +24,41 @@ const FUEL: u64 = 1_000_000;
 /// Statements that would read another template.
 const REFUSED: &[&str] = &["include", "import", "extends", "from"];
 
+/// Why `b64encode` refused its argument.
+const B64_NEEDS_STRING: &str = "b64encode needs a string";
+
 /// Parses `src`; `Err` is a syntax error with its line.
 pub fn check(src: &str) -> Result<(), String> {
-    environment()
+    environment(Arc::default())
         .template_from_str(src)
         .map(drop)
         .map_err(|err| describe(&err, src, None))
 }
 
-/// Renders `src` with `vars.KEY` and `facts.KEY`; the output is at most
-/// [`MAX_BYTES`] bytes.
+/// A render's text, and each `b64encode` output whose input held the value
+/// of one of its `secrets`, so that step output can be scrubbed of it too.
+pub struct Render {
+    pub text: Zeroizing<String>,
+    pub encoded: Vec<Zeroizing<String>>,
+}
+
+/// Renders `src` with `vars.KEY`, `facts.KEY` and, when `secrets` is not
+/// empty, `secrets.NAME`; the output is at most [`MAX_BYTES`] bytes.
 pub fn render(
     src: &str,
     vars: &Resolved<VarValue>,
     facts: &Facts,
-) -> Result<Zeroizing<String>, String> {
-    let env = environment();
+    secrets: &BTreeMap<String, Zeroizing<String>>,
+) -> Result<Render, String> {
+    let encoded = Arc::new(Encoded {
+        secrets: secrets.values().cloned().collect(),
+        outputs: Mutex::default(),
+    });
+    let env = environment(encoded.clone());
     let template = env
         .template_from_str(src)
         .map_err(|err| describe(&err, src, None))?;
-    let ctx = context(vars, facts);
+    let ctx = context(vars, facts, secrets);
     let mut out = Capped::new();
     match template.render_captured_to(&ctx, &mut out) {
         Ok(_) => {}
@@ -53,15 +71,47 @@ pub fn render(
     let text = std::str::from_utf8(&out.buf).map_err(|_| "rendered output is not UTF-8")?;
     let mut exact = Zeroizing::new(String::with_capacity(text.len()));
     exact.push_str(text);
-    Ok(exact)
+    drop(env);
+    let encoded = std::mem::take(
+        &mut *(encoded.outputs)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
+    Ok(Render {
+        text: exact,
+        encoded,
+    })
+}
+
+/// The values `b64encode` looks for in its input, and the outputs it
+/// recorded for them.
+#[derive(Default)]
+struct Encoded {
+    secrets: Vec<Zeroizing<String>>,
+    outputs: Mutex<Vec<Zeroizing<String>>>,
 }
 
 /// The engine. `replace` is removed (its output has no size limit); `~` and
 /// `*` cannot be capped the same way (minijinja bounds a repetition at 100 MB)
 /// and stay a known self-DoS limit: the template's author owns the inventory.
-fn environment() -> Environment<'static> {
+/// `b64encode` records into `encoded`.
+fn environment(encoded: Arc<Encoded>) -> Environment<'static> {
     let mut env = Environment::new();
     env.remove_filter("replace");
+    env.add_filter("b64encode", move |value: Value| -> Result<String, Error> {
+        let text = (value.as_str())
+            .filter(|_| value.kind() == ValueKind::String)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, B64_NEEDS_STRING))?;
+        let out = b64encode(text.as_bytes());
+        if (encoded.secrets.iter()).any(|secret| text.contains(secret.as_str())) {
+            (encoded
+                .outputs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner))
+            .push(Zeroizing::new(out.clone()));
+        }
+        Ok(out)
+    });
     env.set_undefined_behavior(UndefinedBehavior::Strict);
     env.set_fuel(Some(FUEL));
     env.set_syntax(
@@ -76,7 +126,30 @@ fn environment() -> Environment<'static> {
     env
 }
 
-fn context(vars: &Resolved<VarValue>, facts: &Facts) -> Value {
+/// `bytes` in standard base64 (RFC 4648 §4): `+/`, `=` padding, no line
+/// breaks.
+fn b64encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let byte = |i: usize| u32::from(chunk.get(i).copied().unwrap_or(0));
+        let n = (byte(0) << 16) | (byte(1) << 8) | byte(2);
+        for i in 0..4 {
+            out.push(if i <= chunk.len() {
+                char::from(ALPHABET[(n >> (18 - 6 * i)) as usize & 63])
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+fn context(
+    vars: &Resolved<VarValue>,
+    facts: &Facts,
+    secrets: &BTreeMap<String, Zeroizing<String>>,
+) -> Value {
     let vars = Value::from_pairs(
         vars.iter()
             .map(|(key, (value, _))| (key.as_str(), to_value(value))),
@@ -87,7 +160,12 @@ fn context(vars: &Resolved<VarValue>, facts: &Facts) -> Value {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str())),
     );
-    Value::from_pairs([("vars", vars), ("facts", facts)])
+    let mut pairs = vec![("vars", vars), ("facts", facts)];
+    if !secrets.is_empty() {
+        let secrets = (secrets.iter()).map(|(name, value)| (name.as_str(), value.as_str()));
+        pairs.push(("secrets", Value::from_pairs(secrets)));
+    }
+    Value::from_pairs(pairs)
 }
 
 fn to_value(value: &VarValue) -> Value {
@@ -132,6 +210,9 @@ fn missing_names(names: &HashSet<String>, ctx: &Value) -> Vec<String> {
 fn describe(err: &Error, src: &str, missing: Option<&[String]>) -> String {
     let reason = match err.kind() {
         ErrorKind::OutOfFuel => return "fuel exhausted".to_owned(),
+        ErrorKind::InvalidOperation if err.detail() == Some(B64_NEEDS_STRING) => {
+            B64_NEEDS_STRING.to_owned()
+        }
         ErrorKind::SyntaxError => {
             let detail = err.detail().unwrap_or_default();
             match REFUSED
@@ -252,11 +333,83 @@ mod tests {
     }
 
     fn ok(src: &str, vars: &Resolved<VarValue>) -> String {
-        render(src, vars, &facts()).unwrap().to_string()
+        render(src, vars, &facts(), &BTreeMap::new())
+            .unwrap()
+            .text
+            .to_string()
     }
 
     fn err(src: &str, vars: &Resolved<VarValue>) -> String {
-        render(src, vars, &facts()).unwrap_err()
+        render(src, vars, &facts(), &BTreeMap::new()).err().unwrap()
+    }
+
+    fn secrets(pairs: &[(&str, &str)]) -> BTreeMap<String, Zeroizing<String>> {
+        (pairs.iter())
+            .map(|(name, value)| ((*name).to_owned(), Zeroizing::new((*value).to_owned())))
+            .collect()
+    }
+
+    #[test]
+    fn renders_the_listed_secrets_and_records_their_encoded_forms() {
+        let listed = secrets(&[("TOKEN", "fake-value-one"), ("OTHER", "fake-value-two")]);
+        let src = "T={{ secrets.TOKEN }}\n\
+                   A={{ (\"cmj:\" ~ secrets.TOKEN) | b64encode }}\n\
+                   P={{ \"plain\" | b64encode }}\n";
+        let out = render(src, &vars(&[]), &facts(), &listed).unwrap();
+        assert_eq!(
+            *out.text,
+            "T=fake-value-one\nA=Y21qOmZha2UtdmFsdWUtb25l\nP=cGxhaW4=\n"
+        );
+        let encoded: Vec<&str> = out.encoded.iter().map(|e| e.as_str()).collect();
+        assert_eq!(encoded, ["Y21qOmZha2UtdmFsdWUtb25l"]);
+    }
+
+    #[test]
+    fn an_unlisted_secret_is_undefined_and_none_adds_no_secrets_key() {
+        let listed = secrets(&[("TOKEN", "fake-value-one")]);
+        let why = render("{{ secrets.NOPE }}", &vars(&[]), &facts(), &listed)
+            .err()
+            .unwrap();
+        assert_eq!(why, "line 1: undefined variable `secrets.NOPE`");
+        assert!(!why.contains("fake-value-one"));
+        assert_eq!(
+            err("{{ secrets.TOKEN }}", &vars(&[])),
+            "line 1: undefined variable `secrets`"
+        );
+    }
+
+    #[test]
+    fn b64encode_is_standard_base64_with_padding() {
+        for (input, want) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+            ("\u{ff}\u{fe}?>", "w7/Dvj8+"),
+        ] {
+            assert_eq!(b64encode(input.as_bytes()), want, "{input:?}");
+        }
+        assert_eq!(b64encode(&[0xfb, 0xff]), "+/8=");
+        assert_eq!(
+            ok("{{ 'user:pass' | b64encode }}", &vars(&[])),
+            "dXNlcjpwYXNz"
+        );
+    }
+
+    #[test]
+    fn b64encode_refuses_what_is_not_a_string() {
+        let v = vars(&[("port", VarValue::Int(8080))]);
+        assert_eq!(
+            err("ok\n{{ vars.port | b64encode }}", &v),
+            "line 2: b64encode needs a string"
+        );
+        assert_eq!(
+            err("{{ [1] | b64encode }}", &v),
+            "line 1: b64encode needs a string"
+        );
     }
 
     #[test]
@@ -398,7 +551,14 @@ mod tests {
 
     #[test]
     fn output_keeps_no_spare_capacity() {
-        let out = render("{{ vars.a }}\n", &vars(&[("a", s("short"))]), &facts()).unwrap();
+        let out = render(
+            "{{ vars.a }}\n",
+            &vars(&[("a", s("short"))]),
+            &facts(),
+            &BTreeMap::new(),
+        )
+        .unwrap()
+        .text;
         assert_eq!(*out, "short\n");
         assert!(out.capacity() <= out.len() + 64, "{}", out.capacity());
     }

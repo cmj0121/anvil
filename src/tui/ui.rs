@@ -2732,6 +2732,7 @@ mod tests {
                         parents: false,
                         binary: false,
                         item: None,
+                        secret: None,
                     }),
                 },
             },
@@ -2742,6 +2743,7 @@ mod tests {
         let rendered = Rendered {
             text: "rendered-bytes".to_owned().into(),
             sha256: "ab".repeat(32),
+            scrub: Vec::new(),
         };
         let plan = plan_block(&PlanReport::Planned {
             target: "local".to_owned(),
@@ -3662,6 +3664,7 @@ mod tests {
             no_sudo: 1,
             no_hash: 1,
             rolled_back: 0,
+            secret: 0,
         });
         let lines = doctor_block(&report);
         let rows = shown(&lines);

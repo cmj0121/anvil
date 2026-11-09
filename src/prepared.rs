@@ -89,8 +89,8 @@ impl Prepared {
     }
 
     /// Rollback's: the passwords of the targets whose entry in `session`'s
-    /// record wrote a file, stepped on a directory or link, or removed a path
-    /// through sudo.
+    /// record wrote a file other than one built from secrets (never undone),
+    /// stepped on a directory or link, or removed a path through sudo.
     pub fn rollback(
         opts: &Options,
         config: Config,
@@ -103,7 +103,7 @@ impl Prepared {
             .iter()
             .filter(|target| {
                 (session.record().targets.get(&target.name)).is_some_and(|entry| {
-                    entry.files.iter().any(|file| file.sudo)
+                    entry.files.iter().any(|file| file.sudo && !file.secret)
                         || entry.dirs.iter().any(|dir| dir.sudo)
                         || entry.links.iter().any(|link| link.sudo)
                         || entry.absent.iter().any(|absent| absent.sudo)

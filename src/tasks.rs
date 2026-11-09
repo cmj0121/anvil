@@ -174,6 +174,20 @@ impl Expanded {
             .map(|(_, entry, _)| entry)
     }
 
+    /// The secrets the file items with `secrets` read on a target their
+    /// tags reach (its facts are not known yet).
+    pub fn file_secrets<'a>(&'a self, targets: &[Target]) -> BTreeSet<&'a str> {
+        let mut names = BTreeSet::new();
+        for item in &self.items {
+            if let ItemKind::File { entry, .. } = &item.kind
+                && (targets.iter()).any(|target| files::has_tags(&item.tags, target))
+            {
+                names.extend(entry.secrets.iter().flatten().map(String::as_str));
+            }
+        }
+        names
+    }
+
     /// The sudo secrets a step may type on a target its tags reach: for a
     /// package item, a `sudo = true` dir, file, link or absent item or a
     /// service item; and on

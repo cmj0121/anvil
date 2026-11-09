@@ -398,6 +398,10 @@ impl Serialize for PlannedRun {
             #[serde(skip_serializing_if = "Option::is_none")]
             rendered: Option<RenderedShown<'a>>,
             #[serde(skip_serializing_if = "std::ops::Not::not")]
+            secret: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            secrets: Option<&'a [String]>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
             binary: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             mode: Option<&'a str>,
@@ -427,11 +431,15 @@ impl Serialize for PlannedRun {
             hidden: bool,
         }
         let hidden = self.hidden_mode().is_some();
-        let rendered = self.rendered().map(|rendered| RenderedShown {
-            bytes: rendered.text.len(),
-            sha256: (!hidden).then_some(rendered.sha256.as_str()),
-            hidden,
-        });
+        let secrets = (self.file().and_then(|run| run.write.as_ref()))
+            .and_then(|write| write.secret.as_deref())
+            .map(|secret| secret.names.as_slice());
+        let rendered =
+            (self.rendered().filter(|_| secrets.is_none())).map(|rendered| RenderedShown {
+                bytes: rendered.text.len(),
+                sha256: (!hidden).then_some(rendered.sha256.as_str()),
+                hidden,
+            });
         let Attrs {
             mode,
             owner,
@@ -450,6 +458,8 @@ impl Serialize for PlannedRun {
             path: absent.map(|(path, _)| path),
             r#type: absent.and_then(|(_, r#type)| r#type),
             rendered,
+            secret: secrets.is_some(),
+            secrets,
             binary: self.binary(),
             mode,
             owner,

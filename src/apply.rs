@@ -53,7 +53,7 @@ use crate::cancel::Cancel;
 use crate::config::{Config, MAX_HANDLER_NAME_BYTES, Plugin, is_handler_name};
 use crate::engine::{
     Journal, Passwords, Reached, Recorder, Unresolved, cannot_undo, execute, open_record, probe,
-    resolve, run_handlers,
+    resolve, run_handlers, scrubbed,
 };
 use crate::error::Failure;
 use crate::fanout::{self, Event};
@@ -366,6 +366,7 @@ fn apply_target(
         config,
         expanded,
         sources,
+        Some(passwords),
         plugins,
         cancel,
     );
@@ -380,7 +381,7 @@ fn apply_target(
                 cancel,
                 Some(&mut recorder),
             );
-            run_handlers(
+            let report = run_handlers(
                 "apply",
                 target,
                 transport.as_ref(),
@@ -390,7 +391,8 @@ fn apply_target(
                 cancel,
                 &mut recorder,
                 report,
-            )
+            );
+            scrubbed(report, &runs)
         }
         Err(Unresolved::Failed(error)) => failed("apply", target, Vec::new(), error),
         Err(Unresolved::Cancelled) => cancelled("apply", target, Vec::new(), cancel),
@@ -481,6 +483,7 @@ mod tests {
             config,
             &legacy(config),
             sources,
+            Some(&Passwords::new()),
             plugins,
             cancel,
         )
@@ -3858,6 +3861,7 @@ mod tests {
                 written_attrs: None,
                 created_dirs: Vec::new(),
                 binary: false,
+                secret: false,
             }]
         );
     }
@@ -4739,6 +4743,7 @@ mod tests {
             &config,
             &expanded,
             &Sources::of(&sources),
+            Some(&Passwords::new()),
             &FakePlugins::none(),
             &Cancel::new(),
         )
