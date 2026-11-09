@@ -60,7 +60,7 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
   傳輸錯誤結束 target 時，被它結束的 step 為 `✘`（尚未執行任何 step 時為第一個：連線或探測失敗），
   但若有逾時的 step 保留了輸出，則該列為 `✘`；其餘為 `⊘`。target 還沒有報告時（等待中或執行中）每列皆為 `·`；
   執行結束時仍未執行的 target（`✘ not run`，見下方）每列皆為 `⊘`。
-  在 doctor、edit 與 plan 結果上，列表是上次重新載入時 config 的 step，沒有記號。
+  在 doctor 與 edit 結果上，列表是上次重新載入時 config 的 step，沒有記號；plan 結果則列出該次 plan 載入的 config 的 step，沒有記號。
   run 結果（`x`）只列出一個 step，即它的腳本（第一行，還有更多行時加上 `…`），記號與 apply 相同。
   plugin step 列為 `plugin NAME`。config 載入失敗時改以紅色顯示錯誤。
 - **Results。** 顯示中結果的每個區段一個分頁，而不是每次過去的執行一個分頁。
@@ -94,8 +94,9 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
   每次重新載入（`r`、`o`，以及 `i` 或 `c` 之後）都會重新尋找它，因此移動工作區的 config 編輯會立即生效。
 - **刪除（`D`）。** `delete $/PATH?`，並註明資料夾會連同其中所有內容一起刪除。只有 `y` 會刪除；
   `n` 或 `Esc` 關閉它，其他按鍵保留問題。
-- **說明（`?`）。** 每個群組一列：Run、Targets、Move、History、Edit、Options、App，接著是瀏覽器的 Browser 與 Entry。
-  `?` 或 `Esc` 關閉。
+- **檢視器（`v`）。** 在 plan 結果上，游標所在 file step 會寫入的內容（[下文](#內容檢視器)）。
+- **說明（`?`）。** 每個群組一列：Run、Targets、Move、Plan、History、Edit、Options、App，接著是瀏覽器的 Browser 與 Entry，
+  以及檢視器的 Viewer。`?` 或 `Esc` 關閉。
 
 主機與 config 的文字會如同 CLI 一樣跳脫，secret 的值從不繪出。
 
@@ -110,6 +111,7 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
 | `d`          | 對選擇執行 doctor                                       | `anvil doctor`                            |
 | `a`          | 對選擇執行 apply                                        | `anvil apply`                             |
 | `p`          | 對選擇執行 plan：列出 apply 會執行的 step，一個都不執行 | `anvil plan`                              |
+| `v`          | plan 時檢視游標所在的 file step（[下文](#內容檢視器)）  | `anvil plan --show-content`               |
 | `x`          | 編輯 sh 腳本，確認後在選擇上執行                        | `anvil run FILE`                          |
 | `b`          | 對選擇執行 rollback，按 `y` 確認                        | `anvil rollback`                          |
 | `Esc`        | 取消執行；關閉 overlay                                  | —                                         |
@@ -183,6 +185,37 @@ curl、tar 與新執行檔的 `--version` 執行時輸出都會被擷取，不�
 `D` 會連同所有內容刪除資料夾，symlink 則刪除本身而不跟隨；結果 `removed $/PATH` 或錯誤會成為通知（或紅色錯誤），
 並新增一個結果 `rm $/PATH`，資料夾會重新列出。複製檔案進出、移動與建立資料夾仍由 [`anvil files`](cli.zh-TW.md#anvil-files) 負責。
 
+### 內容檢視器
+
+在 plan 結果上，`v` 以唯讀檢視器開啟 Steps 游標所在的 file 項目，對象是顯示中分頁的 target。
+在關閉前它取代 Steps 與 Results，標題為 `DEST (N bytes)`，內容是 [`anvil plan --show-content`](cli.zh-TW.md#anvil-plan)
+在該 step 下方印出的東西：帶有大小與 sha256 的 `content` 或 `rendered` 行，接著是文字，控制字元與不可見字元會被跳脫。
+比方框寬的行會被截斷。[遞迴複製](configuration.zh-TW.md#recursive-copy)的每個檔案項目各列在一行 `── PATH` 下方。
+二進位檔案只顯示它的那一行，絕不顯示文字；mode 不給其他人讀取權限的檔案只顯示 `content N bytes (hidden: mode MODE)`，不含 sha256。
+狀態列顯示 `↑↓ scroll · PgUp/PgDn page · g/G top/end · O pager · Esc close`。開啟期間適用下列按鍵，表中其他按鍵都不做任何事：
+
+| 按鍵            | 動作                              |
+| --------------- | --------------------------------- |
+| `↑↓` / `jk`     | 捲動一行                          |
+| `PgUp` / `PgDn` | 捲動一頁                          |
+| `g` / `G`       | 到開頭／結尾                      |
+| `O`             | 在 pager 中開啟文字               |
+| `Esc` / `q`     | 關閉檢視器（在這裡 `q` 不會結束） |
+| Ctrl-C          | 結束                              |
+
+沒有東西可檢視時，`v` 不開啟任何東西，並在狀態列說明原因：`v: no plan result`（顯示中的結果不是 plan）、
+`v: not a file step`、`v: TARGET did not plan`（它失敗或被取消）、`v: skipped on TARGET`（項目不符合它）、
+`v: plan is still running` 或 `v: content kept only for the latest plan`。
+只有最新的 plan 結果保留它讀取的位元組；下一次 plan 開始時，較舊的結果就會捨棄它們。
+
+`O` 把文字交給 `$PAGER`（與編輯器一樣依空白分割），未設定時為 `less`，並使用真正的終端機；樹的每個項目各列在一行 `── PATH` 下方。
+pager 收到的文字與檢視器繪製的一樣經過跳脫，因此檔案中的控制字元與不可見字元不會傳到終端機。
+文字寫入編輯器私有的 `<temp dir>/anvil-<uid>/` 目錄中一個 mode 0600 的 `view-<pid>-<random>.txt` 檔案（[編輯器](cli.zh-TW.md#編輯器)），
+pager 結束時該檔案會被以零覆寫並移除；不檢查 pager 的結束狀態。被強制結束的 anvil 留下的檔案，會在其 pid 已不存在且檔案超過一小時時，由下一次 `O` 以零覆寫並移除；
+編輯器自己在那裡的檔案不受影響。
+二進位或隱藏的檔案顯示 `O: nothing to page`，不在 `PATH` 上的 pager 顯示 `O: PAGER not found: CMD`，
+無法啟動的則顯示 ``O: cannot run pager `CMD`: ERROR``。
+
 ## 規則
 
 - **`--parallel N`** 設定 apply、plan、run（`x`）與 rollback（`b`）同時處理的 target 數，與 CLI 相同
@@ -200,7 +233,7 @@ curl、tar 與新執行檔的 `--version` 執行時輸出都會被擷取，不�
   Esc 從不終止正在執行的 step，不論本機或遠端；只有該 step 的逾時會結束它（`x` 為 300 秒）。
   doctor 在每個 target 與每個 doctor plugin 之前檢查：正在執行的探測、雜湊執行或 plugin 會跑完，其餘的以 `cancelled` 結束，
   通知為 `cancelling: the running check finishes first`。
-- **交接。** 編輯器（`i`、`c`、`s`、`x`，以及檔案瀏覽器中的 `e`）、遷移（`m`，讓它的 age 密碼短語提示能運作）、
+- **交接。** 編輯器（`i`、`c`、`s`、`x`，以及檔案瀏覽器中的 `e`）、pager（檢視器中的 `O`）、遷移（`m`，讓它的 age 密碼短語提示能運作）、
   ssh 的互動式重試（密碼、密碼短語或 PIN，見 [SSH 行為](cli.zh-TW.md#ssh-行為)），
   與 [age 密碼短語提示](secrets.zh-TW.md#密碼短語提示)會取得真正的終端機：TUI 離開它的畫面，
   程式像在 CLI 中一樣執行，然後 TUI 回來並顯示結果。ssh 的提示來自 doctor 或 apply 執行；它等待時 TUI 不讀取任何按鍵，

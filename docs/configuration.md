@@ -894,7 +894,8 @@ A message gives the line (no column) and the names involved, never a value. A fi
 delimiter, the password path's temp file, the [apply record](cli.md#the-apply-record)'s hash of what was written,
 [`anvil rollback`](cli.md#anvil-rollback) and doctor's drift check all use that target's rendered text. A changed var
 therefore shows as `wrote DEST` on the next apply, and rollback restores what dest held before it.
-[`anvil plan`](cli.md#anvil-plan) shows each target's rendered size and sha256, and `--show-rendered` its text.
+[`anvil plan`](cli.md#anvil-plan) shows each target's rendered size and sha256 (only the size when others cannot read the
+file), and `--show-content` its text.
 [`config --harden`](#harden) does not judge a templated src: it reports it for review.
 
 **Known limit.** String concatenation (`~`) and a large repetition (`*`) can use a lot of memory on the controller

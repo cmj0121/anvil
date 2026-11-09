@@ -20,7 +20,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
   plan                           show the steps apply would run on every target, running none
-       [--show-rendered]         --show-rendered also prints each templated file's rendered text
+       [--show-content]          --show-content also prints the bytes apply would write per file step
   rollback [--force DEST]...     restore the files the last apply wrote on every target
   run [--timeout SECS] <FILE|->  run a POSIX sh script on every target, read from FILE or stdin
   secret <NAME>                  edit one secret in the editor
@@ -1272,7 +1272,8 @@ secret 由 `anvil doctor` 檢查。
   apply 會在 sudo 的提示輸入某個 secret 的值時，後面再加上 `(sudo password from secret NAME)`。
 - [範本](configuration.zh-TW.md#templating)檔案 step 在其 `would $ file DEST` 行下方多一行 `rendered N bytes, sha256 HEX`：
   該 target 算繪文字的大小與完整 sha256，也就是 apply 會寫入的位元組。算繪失敗的 target 以 `✘` 加上範本訊息結束
-  （[Templating](configuration.zh-TW.md#templating)）。
+  （[Templating](configuration.zh-TW.md#templating)）。`--show-content` 另加每個 file step 的大小、sha256 與文字（見下方 **檔案內容**）。
+  `mode` 不給其他人讀取權限的檔案改為顯示 `rendered N bytes (hidden: mode MODE)`，不含 sha256。
 - 帶有 guard 的 step 在其 `would $` 行下方每個 guard 多一行，依檢查順序：`creates PATH`、`removes PATH`、
   `onlyif CMD`、`unless CMD`（[Guarded steps](#guarded-steps)）。plan 從不執行它們，因此無法得知 apply 是否會略過該 step。
 - file step 為其項目設定的 `owner`、`group` 與 `parents` 各多一行 `owner NAME`、`group NAME`、`parents`，位於 guard 行之後。
@@ -1381,15 +1382,27 @@ link step 的 `target`、`force`（`true`）與 `parents`、absent step 的 `pat
 ]
 ```
 
-**範本檔案。** plan 從不讀取 dest，因此無法做 diff；改為顯示每個 target 會得到什麼。不加旗標時就是
-`rendered N bytes, sha256 HEX` 這一行，不印出任何檔案位元組。`--show-rendered` 另外在該行下方印出每個 target 的算繪文字，
-每行一個 `│ LINE`，控制字元與不可見字元會被跳脫，文字結尾沒有換行時加上 `(no newline at end)`。
-以 [workstation 範例](../examples/workstation/)：
+**檔案內容。** plan 從不讀取 dest，因此無法做 diff；改為顯示每個 target 會得到什麼。不加旗標時，那就是範本檔案的
+`rendered N bytes, sha256 HEX` 這一行，不印出任何檔案位元組。`--show-content` 在每個 file step 的其他行（guard、`owner`、
+`group`、`parents`、`notifies`）下方，加上 apply 會寫入的確切位元組的大小與完整 sha256，接著是它們的文字：
+
+- [範本](configuration.zh-TW.md#templating)檔案使用它的 `rendered N bytes, sha256 HEX` 行，算的是該 target 的算繪文字。
+  其他檔案（包括 `$/` store 的檔案）則為 `content N bytes, sha256 HEX`。
+- 接著是文字，每行一個 `│ LINE`，控制字元與不可見字元會被跳脫，文字結尾沒有換行時加上 `(no newline at end)`。
+- [二進位](configuration.zh-TW.md#files) src 在該行結尾加上 `(binary)`，不印出文字。
+- `mode` 不給其他人讀取權限的檔案（`0600`、`0640`、`0750`，範本檔案也一樣）只顯示大小，
+  即 `content N bytes (hidden: mode MODE)` 或 `rendered N bytes (hidden: mode MODE)`：沒有 sha256 也沒有文字，
+  讓金鑰與其他私密檔案不出現在終端機上。範本檔案不加旗標時也是這一行 `rendered`。
+- [遞迴複製](configuration.zh-TW.md#recursive-copy)的每個檔案項目，在它的 `would $ file PATH` 下方有相同的幾行。
+  因 target 不符合而略過的 step 則沒有。
+
+每個一般 src 與樹中項目只在所有 target 之前雜湊一次；範本檔案則每個 target 各雜湊一次。以
+[workstation 範例](../examples/workstation/)：
 
 ```sh
 anvil --inventory examples/workstation/inventory.toml \
       --config examples/workstation/config.toml \
-      --target local plan --show-rendered
+      --target local plan --show-content
 ```
 
 會印出（套件 step 的長行已截短）：
@@ -1401,6 +1414,10 @@ anvil --inventory examples/workstation/inventory.toml \
   env.GIT_PAGER = less -FRX (global)
   would $ export PATH="$PATH:…"; … brew install $a; }
   would $ file /home/dev/.config/git/ignore
+    content 25 bytes, sha256 e07a5717a95137dc0995fbf65f47087047201da56df2e6574cfadbfb8644eae6
+    │ .DS_Store
+    │ *.swp
+    │ .direnv/
   would $ file /home/dev/.config/git/config
     rendered 152 bytes, sha256 e193e046d4db16a0590b91195db5e9bf31f7680334d590bd8b7a567de25541d8
     │ [user]
@@ -1417,44 +1434,76 @@ anvil --inventory examples/workstation/inventory.toml \
 1 target, nothing executed
 ```
 
-算繪文字包含 vars 放進去的任何內容；它只印在你的終端機上。在 `--json` 中，範本 step 一律帶有
-`"rendered": {"bytes": N, "sha256": "HEX"}`，`--show-rendered` 另加最上層的 `rendered` 清單，每個 target 的每個範本 step 一個物件，
-其中 `step` 是該 target 的 `steps` 索引（此處省略 `vars` 與 `env`）：
+以上面 **遞迴複製** 的項目，把它的 `mode` 改為 `0644`，再加上第二個 `[[files]]` 項目
+`src = "app.key"`、`dest = "/srv/app.key"`、`mode = "0600"`，以及一個 `hostname` step：
+
+```text
+▶ local
+  files[0] conf -> /srv/app (tree: 4 items, 9 bytes)
+  would $ dir /srv/app
+    mode 0750
+  would $ file /srv/app/a.conf
+    content 6 bytes, sha256 cb78bd8a17f7b751fe0d4663366dcbc257204033ef7ddd64b1f2969573b5b2e2
+    │ a = 1
+  would $ dir /srv/app/sub
+    mode 0750
+  would $ file /srv/app/sub/c.bin (binary)
+    content 3 bytes, sha256 ae4b3280e56e2faf83f414a6e3dabe9d5fbe18976544c05fed121accb85b53fc (binary)
+  would $ file /srv/app.key
+    content 15 bytes (hidden: mode 0600)
+  would $ hostname
+  ✔ 6 steps
+
+1 target, nothing executed
+```
+
+文字包含 src 與 vars 放進去的任何內容；它只印在你的終端機上。在 `--json` 中，範本 step 一律帶有
+`"rendered": {"bytes": N, "sha256": "HEX"}`，隱藏的則為 `{"bytes": N, "hidden": true}`；`--show-content` 另加最上層的 `content` 清單（為空時省略）：
+每個 target 的每個有內容的 file step 一個物件，依 step 順序。`step` 是該 target 的 `steps` 索引，`path` 是 dest
+（樹中項目則為完整路徑），隱藏的檔案省略 `sha256`，`text` 只在顯示文字時出現，二進位或隱藏的檔案絕不會有。上面那棵樹（省略 `targets`）：
 
 ```json
 {
   "executed": false,
-  "targets": [
-    {
-      "target": "local",
-      "steps": [
-        { "run": "export PATH=\"$PATH:…\"; … brew install $a; }" },
-        { "run": "file /home/dev/.config/git/ignore" },
-        {
-          "run": "file /home/dev/.config/git/config",
-          "rendered": {
-            "bytes": 152,
-            "sha256": "e193e046d4db16a0590b91195db5e9bf31f7680334d590bd8b7a567de25541d8"
-          }
-        },
-        { "run": "git --version && echo \"pager: $GIT_PAGER\"" }
-      ],
-      "ok": true
-    }
-  ],
+  "targets": […],
   "ok": true,
-  "rendered": [
+  "content": [
     {
       "target": "local",
-      "step": 2,
-      "dest": "/home/dev/.config/git/config",
-      "text": "[user]\n    name = Dev\n    email = dev@home.example\n…"
+      "step": 1,
+      "path": "/srv/app/a.conf",
+      "bytes": 6,
+      "sha256": "cb78bd8a17f7b751fe0d4663366dcbc257204033ef7ddd64b1f2969573b5b2e2",
+      "binary": false,
+      "hidden": false,
+      "text": "a = 1\n"
+    },
+    {
+      "target": "local",
+      "step": 3,
+      "path": "/srv/app/sub/c.bin",
+      "bytes": 3,
+      "sha256": "ae4b3280e56e2faf83f414a6e3dabe9d5fbe18976544c05fed121accb85b53fc",
+      "binary": true,
+      "hidden": false
+    },
+    {
+      "target": "local",
+      "step": 4,
+      "path": "/srv/app.key",
+      "bytes": 15,
+      "binary": false,
+      "hidden": true
     }
   ]
 }
 ```
 
-TUI 的 plan 檢視也顯示 `rendered` 這一行，但絕不顯示文字。
+`--show-rendered` 為了相容而保留，並從 `--help` 中隱藏。它在每個範本檔案的 `rendered` 行下方印出算繪文字，
+並在 `--json` 加上最上層的 `rendered` 清單，每個 target 的每個範本 step 一個 `{"target", "step", "dest", "text"}` 物件。
+隱藏的檔案兩者都不含，因此它的文字絕不會印出。兩個旗標同時給時，給人看的輸出以 `--show-content` 為準。
+
+TUI 的 plan 檢視也顯示 `rendered` 這一行，但絕不顯示文字；`v` 會在[檢視器](tui.zh-TW.md#內容檢視器)中開啟 file step 的內容。
 
 每個選定的 target 都解析成功時以 0 結束，任一個無法連線或解析時為 1，用法或設定錯誤為 2；
 第一個 SIGTERM 或 SIGHUP 結束 plan 時為 143 或 129。
@@ -1699,8 +1748,8 @@ facts = { distro = "arch" }
 
 `anvil plan` 顯示 `would $ file DEST`（二進位 src 加上 `(binary)`，表示它的 rollback 會失去；apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
 與 `would $ skipped file DEST: no match`；項目設定了它們時另加 `owner NAME`、`group NAME` 與 `parents` 行，範本檔案另加一行
-`rendered N bytes, sha256 HEX`。在 `plan --json` 中 `run` 是同一個標籤，二進位 src 另有 `binary: true`，走密碼路徑時另有 `sudo_secret`，
-項目設定了它們時另有 `owner`、`group` 與 `parents`（`true`）。
+`rendered N bytes, sha256 HEX`（其他人無法讀取時為 `rendered N bytes (hidden: mode MODE)`）；`--show-content` 另加 `content` 或 `rendered` 行與文字。
+在 `plan --json` 中 `run` 是同一個標籤，二進位 src 另有 `binary: true`，走密碼路徑時另有 `sudo_secret`，項目設定了它們時另有 `owner`、`group` 與 `parents`（`true`）。
 
 不是 UTF-8、或含 NUL 位元組的 src 是[二進位檔案](configuration.zh-TW.md#files)，會逐位元組複製。
 它以 `printf` 八進位跳脫序列傳到 target，傳輸量最多約為檔案大小的四倍，step 的 30 秒時間限制依傳送量每 MiB 增加 15 秒。
@@ -1733,7 +1782,9 @@ dest 中不屬於這棵樹的檔案會保留。第一個項目之前會有一次
 能把它放回去；接著寫入會拒絕在那次讀取後被改過的 DEST。
 
 檔案的位元組絕不會印出：人類可讀輸出、`--json`、`plan`、`-v` 日誌與 ssh 命令列都不會包含它們。
-唯一的例外是你要求的 `anvil plan --show-rendered` 所印出的[範本](configuration.zh-TW.md#templating)算繪文字（[`anvil plan`](#anvil-plan)）。
+例外是你要求的那些：`anvil plan --show-content`、`anvil plan --show-rendered` 所印出的[範本](configuration.zh-TW.md#templating)算繪文字
+（[`anvil plan`](#anvil-plan)），以及 TUI 的[檢視器與 pager](tui.zh-TW.md#內容檢視器)。
+`mode` 不給其他人讀取權限的檔案，在 `--show-content` 與 TUI 中只顯示大小與 sha256。
 位元組透過腳本的 stdin 送到 target；走密碼路徑時先寫入一個 mode 0600 的 `/tmp/anvil-` 檔案，
 該檔案在 step 結束後移除，不論成功、失敗或取消。
 連線中斷或 anvil 被終止（例如在暫存位元組時按下 Ctrl-C）時，該檔案可能留下來，只有連線使用者能讀取。

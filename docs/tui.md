@@ -62,7 +62,8 @@ Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
   is `✘` (with no step run yet, the first: the connect or probe failed), unless a timed-out step kept its output, which
   is the `✘` row then; the rest are `⊘`. Before the target has a report (waiting or running) every row is `·`; on a
   target the run ended without (`✘ not run`, below) every row is `⊘`. On doctor
-  and edit results the list is the config's as of the last reload, without marks; so is a plan result's. A run result
+  and edit results the list is the config's as of the last reload, without marks; a plan result lists the steps of the
+  config that plan loaded, without marks. A run result
   (`x`) lists one step, its script (the first line, with `…` when it has more), marked as on apply. A plugin step is
   listed as `plugin NAME`. A config that does not load shows its error in red instead.
 - **Results.** One tab per section of the shown result, not one per past run. A doctor result has a `local checks` tab
@@ -98,8 +99,10 @@ Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
   `c`) locates it again, so a config edit that moves the workspace takes effect at once.
 - **Delete (`D`).** `delete $/PATH?`, noting that a folder goes with all it holds. Only `y` deletes; `n` or `Esc`
   closes it, and other keys keep the question.
-- **Help (`?`).** One row per group: Run, Targets, Move, History, Edit, Options, App, then the browser's Browser and
-  Entry. `?` or `Esc` closes it.
+- **Viewer (`v`).** On a plan result, the cursor's file step: what it would write
+  ([below](#the-content-viewer)).
+- **Help (`?`).** One row per group: Run, Targets, Move, Plan, History, Edit, Options, App, then the browser's Browser
+  and Entry, and the viewer's Viewer. `?` or `Esc` closes it.
 
 Host and config text is escaped as in the CLI, and a secret value is never drawn.
 
@@ -114,6 +117,7 @@ Host and config text is escaped as in the CLI, and a secret value is never drawn
 | `d`          | doctor on the selection                                       | `anvil doctor`                            |
 | `a`          | apply on the selection                                        | `anvil apply`                             |
 | `p`          | plan on the selection: the steps apply would run, none run    | `anvil plan`                              |
+| `v`          | on plan, view what the cursor's file step would write         | `anvil plan --show-content`               |
 | `x`          | edit a sh script, confirm, then run it on the selection       | `anvil run FILE`                          |
 | `b`          | rollback on the selection, `y` to confirm                     | `anvil rollback`                          |
 | `Esc`        | cancel the run; close an overlay                              | —                                         |
@@ -190,6 +194,41 @@ folder is listed again. `D` deletes a folder with everything in it, a symlink wi
 `removed $/PATH` or the error, is the notice (or the red error) and a new result `rm $/PATH`, and the folder is listed
 again. Copying files in or out, moving and creating folders stay with [`anvil files`](cli.md#anvil-files).
 
+### The content viewer
+
+On a plan result, `v` opens a read-only viewer on the file entry under the Steps cursor, for the shown tab's target. It
+takes the place of Steps and Results until it closes, titled `DEST (N bytes)`, and holds what
+[`anvil plan --show-content`](cli.md#anvil-plan) prints under that step: the `content` or `rendered` line with the size
+and sha256, then the text, with control and invisible characters escaped. Lines wider than the box are cut. A
+[recursive copy](configuration.md#recursive-copy) shows each of its file items under a `── PATH` line. A binary file
+shows only its line, never the text; one whose mode gives others no read shows only `content N bytes (hidden: mode
+MODE)`, with no sha256. The status bar shows
+`↑↓ scroll · PgUp/PgDn page · g/G top/end · O pager · Esc close`. While it is open these keys apply, and the other keys
+of the table do nothing:
+
+| Key             | Action                                    |
+| --------------- | ----------------------------------------- |
+| `↑↓` / `jk`     | scroll a line                             |
+| `PgUp` / `PgDn` | scroll a page                             |
+| `g` / `G`       | go to the top / the end                   |
+| `O`             | open the text in the pager                |
+| `Esc` / `q`     | close the viewer (`q` does not quit here) |
+| Ctrl-C          | quit                                      |
+
+When there is nothing to view, `v` opens nothing and says why on the status bar: `v: no plan result` (the shown result
+is not a plan), `v: not a file step`, `v: TARGET did not plan` (it failed or was cancelled), `v: skipped on TARGET` (the
+entry does not match it), `v: plan is still running` or `v: content kept only for the latest plan`. Only the newest
+plan result keeps the bytes it read; an older one drops them when the next plan starts.
+
+`O` hands the text to `$PAGER`, split on whitespace as the editor is, else `less`, with the real terminal; a tree's
+items come each under a `── PATH` line. The pager gets the text escaped as the viewer draws it, so a file's control and
+invisible characters never reach the terminal. The text goes to a mode-0600 `view-<pid>-<random>.txt` file in the
+editor's private `<temp dir>/anvil-<uid>/` directory ([The editor](cli.md#the-editor)), which is overwritten with zeros
+and removed when the pager exits; the pager's exit status is not checked. One left behind by a killed anvil is
+overwritten and removed by the next `O` once its pid is gone and it is over an hour old; the editor's own files there
+are left alone. A binary or hidden file gives `O: nothing to page`, a pager not on `PATH`
+`O: PAGER not found: CMD`, and one that cannot start ``O: cannot run pager `CMD`: ERROR``.
+
 ## Rules
 
 - **`--parallel N`** sets how many targets apply, plan, run (`x`) and rollback (`b`) take at once, as in the CLI
@@ -210,10 +249,11 @@ again. Copying files in or out, moving and creating folders stay with [`anvil fi
   Esc never kills a running step, local or remote; only the step's timeout ends it (300 s for `x`). doctor checks
   before each target and each doctor plugin: the running probe, hash run or plugin finishes, and the rest end
   `cancelled`, with the notice `cancelling: the running check finishes first`.
-- **Handoff.** The editor (`i`, `c`, `s`, `x`, and `e` in the files browser), the migration (`m`, so its age passphrase
-  prompt works), ssh's interactive retry (a password, passphrase or PIN, see [SSH behaviour](cli.md#ssh-behaviour)) and
-  the [age passphrase prompt](secrets.md#the-passphrase-prompt) get the real terminal: the TUI leaves its screen, the
-  program runs as it would in the CLI, then the TUI comes back and shows the outcome. ssh's prompt comes from a doctor
+- **Handoff.** The editor (`i`, `c`, `s`, `x`, and `e` in the files browser), the pager (`O` in the viewer), the
+  migration (`m`, so its age passphrase prompt works), ssh's interactive retry (a password, passphrase or PIN, see
+  [SSH behaviour](cli.md#ssh-behaviour)) and the [age passphrase prompt](secrets.md#the-passphrase-prompt) get the real
+  terminal: the TUI leaves its screen, the program runs as it would in the CLI, then the TUI comes back and shows the
+  outcome. ssh's prompt comes from a doctor
   or apply run; while it waits the TUI reads no keys, so `Esc` takes effect only once the TUI is back. Ctrl-C at such a
   prompt goes to ssh or the editor, never to anvil: ssh stops and the target fails with its error, an editor handles
   Ctrl-C its own way. The TUI then shows `interrupted at a prompt` (also a WARN line in the log, whatever the level). At
