@@ -602,6 +602,30 @@ pub fn sudo_sandbox(prefix: &str) -> (Sandbox, &'static str, String) {
     (sandbox, secrets, path)
 }
 
+/// A sandbox without the debug flags whose age store holds each of `names`
+/// as [`VALUE`], set as `anvil secret` sets it, and an empty inventory (only
+/// `local`). Returns the sandbox and the `[secrets]` table every config must
+/// start with; removing `<root>/h/key.txt` breaks the store.
+pub fn secret_sandbox(prefix: &str, names: &[&str]) -> (Sandbox, &'static str) {
+    use age::secrecy::ExposeSecret;
+
+    let sandbox = Sandbox::new(prefix).without_debug_flags();
+    let identity = age::x25519::Identity::generate();
+    write_private(
+        &sandbox.root().join("h/key.txt"),
+        format!("{}\n", identity.to_string().expose_secret()).as_bytes(),
+    );
+    let secrets = "[secrets]\nbackend = \"age\"\n\n\
+                   [secrets.age]\npath = \"~/secrets.age\"\nidentity = \"~/key.txt\"\n\n";
+    sandbox.write_config("config.toml", secrets);
+    sandbox.write_config("inventory.toml", "");
+    for name in names {
+        let out = sandbox.edit(&["secret", name], Some(&sandbox.typed()), None);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    }
+    (sandbox, secrets)
+}
+
 /// A root pacman target backed only by stub commands, with a known sync db.
 pub fn package_sandbox(prefix: &str, names: &[&str]) -> (Sandbox, String) {
     let sandbox = Sandbox::new(prefix);

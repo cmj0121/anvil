@@ -30,6 +30,7 @@ use crate::bytes::hex;
 use crate::config::{Config, FileEntry, ModeValue, is_mode, is_sha256};
 use crate::dirs::{self, DirWrite};
 use crate::document;
+use crate::engine::Passwords;
 use crate::error::Failure;
 use crate::facts::Facts;
 use crate::filestore::{self, StoreError};
@@ -356,7 +357,9 @@ pub fn sudo_secret_for<'a>(config: &'a Config, target: &'a Target) -> Option<&'a
 /// The steps of file `item` for `target`: a skip when it does not match,
 /// else the tee script, or the password path's when sudo asks for a password
 /// and a secret holds it; a `recursive = true` entry has one per item of its
-/// tree ([`tree_runs`]).
+/// tree ([`tree_runs`]). An entry with `secrets` renders them from
+/// `secrets`, apply's loaded values; plan passes `None` and the step is
+/// left unrendered, with no script.
 pub fn run(
     config: &Config,
     item: &Item,
@@ -364,6 +367,7 @@ pub fn run(
     sources: &Sources,
     target: &Target,
     facts: Option<&Facts>,
+    secrets: Option<&Passwords>,
 ) -> Result<Vec<PlannedRun>, String> {
     let facts = facts.ok_or("files: the probe has not run")?;
     let root = facts.is_root();
@@ -385,7 +389,21 @@ pub fn run(
             secret::shown_name(mode)
         ));
     }
-    let rendered = render_entry(item, entry, &label, sources, i, target, facts)?;
+    let names = entry.secrets.as_deref().unwrap_or_default();
+    let secret_file = (!names.is_empty()).then(|| {
+        Box::new(SecretFile {
+            label: label.clone(),
+            names: names.to_vec(),
+        })
+    });
+    let rendered = match (&secret_file, secrets) {
+        (Some(_), None) => None,
+        (_, secrets) => {
+            let values = file_secrets(item, &label, names, secrets)?;
+            render_entry(item, entry, (&label, i), sources, target, facts, &values)?
+        }
+    };
+    let unrendered = secret_file.is_some() && rendered.is_none();
     let ids = Ownership::of(
         &label,
         (entry.owner.as_deref(), entry.group.as_deref()),
@@ -422,6 +440,7 @@ pub fn run(
         parents: entry.parents,
         binary: false,
         item: None,
+        secret: secret_file,
     };
     if let Some(tree) = sources.tree(i) {
         return tree_runs((entry, &label), tree, base, secret, facts, sources);
@@ -433,8 +452,61 @@ pub fn run(
     };
     let binary = base.rendered.is_none() && sources.file(i).is_some_and(|source| source.binary);
     let write = FileWrite { binary, ..base }.aimed(dest, create)?;
+    if unrendered {
+        let run = FileRun {
+            upload: None,
+            skip: false,
+            write: Some(write),
+        };
+        let label = format!("file {dest}");
+        let sudo_secret = secret.map(str::to_owned);
+        return Ok(vec![file_run(
+            dest,
+            Zeroizing::default(),
+            label,
+            sudo_secret,
+            run,
+        )]);
+    }
     Ok(vec![write_run(write, sources, secret)?])
 }
+
+/// The value of each of `names`, the secrets the entry `label` lists, from
+/// `loaded`: set, at least 8 bytes, UTF-8 with no NUL byte. `None` (plan)
+/// or no names is an empty map.
+fn file_secrets(
+    item: &Item,
+    label: &str,
+    names: &[String],
+    loaded: Option<&Passwords>,
+) -> Result<BTreeMap<String, Zeroizing<String>>, String> {
+    let mut values = BTreeMap::new();
+    let Some(loaded) = loaded else {
+        return Ok(values);
+    };
+    for name in names {
+        let why = match loaded.get(name) {
+            None => "is not set".to_owned(),
+            Some(value) if value.len() < SECRET_MIN => {
+                format!("is shorter than {SECRET_MIN} bytes")
+            }
+            Some(value) => match std::str::from_utf8(value) {
+                Ok(text) if !text.contains('\0') => {
+                    values.insert(name.clone(), Zeroizing::new(text.to_owned()));
+                    continue;
+                }
+                _ => "is not UTF-8 or holds a NUL byte".to_owned(),
+            },
+        };
+        return Err(item.shown_message(format!("{label}: secret {name} {why}")));
+    }
+    Ok(values)
+}
+
+/// The fewest bytes a file secret may hold: a shorter value would be
+/// scrubbed from output wherever it happens to occur. The same minimum as
+/// a scrubbed sudo password.
+const SECRET_MIN: usize = crate::transport::SCRUB_MIN;
 
 /// The step that writes `write`, typing the password from `secret`.
 fn write_run(
@@ -534,16 +606,18 @@ fn tree_runs(
     Ok(runs)
 }
 
-/// `target`'s render of the templated `entry`, or `None` when it is not
-/// templated. The error names the entry, line and variable, never a value.
+/// `target`'s render of the templated `entry` with the values of its
+/// `secrets`, or `None` when it is not templated. The error names the
+/// entry, line and variable, never a value. A render with secrets keeps no
+/// hash, and scrubs those values and their encoded forms.
 fn render_entry(
     item: &Item,
     entry: &FileEntry,
-    label: &str,
+    (label, i): (&str, usize),
     sources: &Sources,
-    i: usize,
     target: &Target,
     facts: &Facts,
+    secrets: &BTreeMap<String, Zeroizing<String>>,
 ) -> Result<Option<Box<Rendered>>, String> {
     if !entry.template {
         return Ok(None);
@@ -551,12 +625,26 @@ fn render_entry(
     let Some(text) = sources.file(i).and_then(Source::text) else {
         return Err(format!("files[{i}]: src was not loaded"));
     };
-    let rendered = template::render(text, &target.vars, facts).and_then(|text| {
+    let rendered = template::render(text, &target.vars, facts, secrets).and_then(|render| {
+        let text = render.text;
         if text.contains('\0') {
             return Err("rendered output contains a NUL byte".to_owned());
         }
-        let sha256 = hex(&Sha256::digest(text.as_bytes()));
-        Ok(Box::new(Rendered { text, sha256 }))
+        if secrets.is_empty() {
+            let sha256 = hex(&Sha256::digest(text.as_bytes()));
+            return Ok(Box::new(Rendered {
+                text,
+                sha256,
+                scrub: Vec::new(),
+            }));
+        }
+        let mut scrub: Vec<Zeroizing<String>> = secrets.values().cloned().collect();
+        scrub.extend(render.encoded);
+        Ok(Box::new(Rendered {
+            text,
+            sha256: String::new(),
+            scrub,
+        }))
     });
     rendered.map(Some).map_err(|why| {
         log::info!("{}: {label}: template failed", target.name);
@@ -567,11 +655,23 @@ fn render_entry(
     })
 }
 
-/// One target's rendered text of a templated entry, and its sha256 in hex.
+/// One target's rendered text of a templated entry, and its sha256 in hex,
+/// `""` for an entry with secrets.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Rendered {
     pub text: Zeroizing<String>,
     pub sha256: String,
+    /// For an entry with secrets, each value and each `b64encode` output
+    /// that held one: what that target's step output is scrubbed of.
+    pub scrub: Vec<Zeroizing<String>>,
+}
+
+/// What a write of an entry with `secrets` keeps of them: the entry's label
+/// and the names, never a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretFile {
+    pub label: String,
+    pub names: Vec<String>,
 }
 
 /// By hand: the length only, never the text or, since the file's mode may
@@ -620,6 +720,10 @@ pub struct FileWrite {
     /// For an item of a `recursive = true` entry, its index among the
     /// tree's items, which holds its src.
     pub item: Option<usize>,
+    /// For an entry with `secrets`, its label and names: plan does not
+    /// render it, the record keeps no hash, and a failed write hides the
+    /// target's output.
+    pub secret: Option<Box<SecretFile>>,
 }
 
 /// A write's `owner` and `group`, each by name or numeric id, `None`
@@ -718,6 +822,9 @@ impl FileWrite {
         if let Some(rendered) = &self.rendered {
             return Ok(Payload::Text(rendered.text.as_str()));
         }
+        if self.secret.is_some() {
+            return Err(format!("files[{}]: not rendered at plan", self.ordinal));
+        }
         let source = match self.item {
             Some(k) => (sources.tree(self.ordinal))
                 .and_then(|tree| tree.items.get(k))
@@ -741,7 +848,8 @@ impl FileWrite {
     /// how it ended: `previous` keeps the bytes as text unless the entry
     /// says `rollback = false`, the dest is `hash_only`
     /// ([`Recorder`](crate::engine::Recorder)), they are not text, or the
-    /// src is binary.
+    /// src is binary. An entry with secrets keeps no hash of either, only
+    /// the `secret` marker.
     pub(crate) fn record(
         &self,
         expanded: &Expanded,
@@ -754,20 +862,29 @@ impl FileWrite {
             .file(self.ordinal)
             .expect("a write comes from the list it is recorded against");
         let written = self.payload(sources).map_or(&[][..], Payload::bytes);
-        let previous = previous_of(captured, hash_only || !entry.rollback);
+        let secret = self.secret.is_some();
+        let previous = previous_of(captured, hash_only || !entry.rollback || secret);
         let mut record = FileRecord {
             dest: self.dest.clone(),
             mode: format!("{:0>4}", self.mode),
             sudo: entry.sudo,
-            written_sha256: hex(&Sha256::digest(written)),
+            written_sha256: if secret {
+                String::new()
+            } else {
+                hex(&Sha256::digest(written))
+            },
             write,
             previous,
             written_attrs: None,
             created_dirs: Vec::new(),
             binary: false,
+            secret,
         };
         if self.binary {
             record.drop_binary_previous();
+        }
+        if secret {
+            record.drop_secret_previous();
         }
         record
     }
@@ -842,6 +959,9 @@ pub(crate) enum Expected {
     Absent,
     /// A file with this sha256; `""` (no hash tool at capture) is no check.
     Sha256(String),
+    /// A file with the sha256 that this staged file holds: a secret write's
+    /// password path, whose terminal run goes on argv, keeps the hash on stdin.
+    Staged(String),
 }
 
 /// The write script of `step` from its bytes ([`FileWrite::payload`]: the
@@ -870,8 +990,22 @@ pub(crate) fn write_script(
     if !step.password {
         return tee_script(bytes, step, expected).map(|script| (script, None));
     }
-    let (temp, upload) = staged_bytes(&bytes)?;
-    let script = install_script(&temp, bytes.len(), step, expected)?;
+    let (temp, mut upload) = staged_bytes(&bytes)?;
+    let expected = match expected {
+        Expected::Sha256(sha) if step.secret.is_some() && !sha.is_empty() => {
+            let want = format!("{temp}.sha256");
+            upload.stage = zeroizing(format_args!(
+                "{{ umask 077; set -C; printf '%s\\n' {} >{}; }} || exit 1\n{}",
+                quote(sha),
+                quote(&want),
+                *upload.stage
+            ));
+            upload.cleanup = format!("rm -f {} {}", quote(&temp), quote(&want));
+            Expected::Staged(want)
+        }
+        expected => expected.clone(),
+    };
+    let script = install_script(&temp, bytes.len(), step, &expected)?;
     Ok((script, Some(upload)))
 }
 
@@ -905,15 +1039,28 @@ fn guard(sudo: &str, dest: &str, expected: &Expected) -> String {
             "{sudo}test ! -e {d} || {} || exit {REFUSED}\n",
             refusal(sudo, dest, &format!("test -e {d}"), &changed)
         ),
-        Expected::Sha256(sha) => format!(
-            "{}anvil_now=$(anvil_sha256 {d})\n\
-             case $? in 2) ;; 3) echo {} >&2; exit {REFUSED} ;; \
-             *) [ \"$anvil_now\" = {} ] || {refuse} ;; esac\n",
-            hash_fn(sudo),
-            quote(&unchecked(dest)),
-            quote(sha)
+        Expected::Sha256(sha) => hash_guard(sudo, dest, "", &quote(sha), &refuse),
+        Expected::Staged(want) => hash_guard(
+            sudo,
+            dest,
+            &format!("anvil_want=$(cat {}) || {refuse}\n", quote(want)),
+            "\"$anvil_want\"",
+            &refuse,
         ),
     }
+}
+
+/// [`guard`]'s lines that refuse unless DEST's sha256 is `want`, a shell
+/// word, after `before`.
+fn hash_guard(sudo: &str, dest: &str, before: &str, want: &str, refuse: &str) -> String {
+    format!(
+        "{before}{}anvil_now=$(anvil_sha256 {})\n\
+         case $? in 2) ;; 3) echo {} >&2; exit {REFUSED} ;; \
+         *) [ \"$anvil_now\" = {want} ] || {refuse} ;; esac\n",
+        hash_fn(sudo),
+        quote(dest),
+        quote(&unchecked(dest)),
+    )
 }
 
 fn file_run(
@@ -1482,6 +1629,8 @@ pub enum FileState {
     NoHash,
     /// `sudo -n` refused, or doctor would need the password.
     NoSudo,
+    /// Built from secrets: never hashed, as the record keeps no hash.
+    Secret,
 }
 
 impl FileState {
@@ -1507,6 +1656,7 @@ impl FileState {
             FileState::NotRootOnly => "not_root_only",
             FileState::NoHash => "no_hash",
             FileState::NoSudo => "no_sudo",
+            FileState::Secret => "secret",
         }
     }
 }
@@ -2180,6 +2330,7 @@ pub(crate) fn restore_replaced(
         written_attrs: None,
         created_dirs: Vec::new(),
         binary: false,
+        secret: false,
     };
     let restore = Restore {
         dest,
@@ -2627,6 +2778,7 @@ mod tests {
             parents: false,
             binary: false,
             item: None,
+            secret: None,
         }
     }
 
@@ -2665,7 +2817,17 @@ mod tests {
         let expanded = legacy(config);
         expanded
             .files()
-            .map(|(item, entry, i)| super::run(config, item, (entry, i), sources, target, facts))
+            .map(|(item, entry, i)| {
+                super::run(
+                    config,
+                    item,
+                    (entry, i),
+                    sources,
+                    target,
+                    facts,
+                    Some(&Passwords::new()),
+                )
+            })
             .collect::<Result<Vec<_>, _>>()
             .map(|runs| runs.into_iter().flatten().collect())
     }
@@ -2685,6 +2847,7 @@ mod tests {
             sudo: true,
             rollback: true,
             template: false,
+            secrets: None,
             notify: Vec::new(),
             recursive: false,
             dir_mode: None,
@@ -6943,6 +7106,58 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Whether `text` holds a run of 64 hex digits, a sha256.
+    fn has_sha256(text: &str) -> bool {
+        text.as_bytes()
+            .split(|b| !b.is_ascii_hexdigit())
+            .any(|run| run.len() >= 64)
+    }
+
+    #[test]
+    fn a_secret_password_write_keeps_every_hash_off_argv_and_still_guards() {
+        let dir = dir("files-guard-secret");
+        let bin = passthrough_sudo(&dir);
+        let dest = dir.join("conf");
+        let d = dest.to_str().unwrap();
+        let step = FileWrite {
+            password: true,
+            rendered: Some(Box::new(Rendered {
+                text: Zeroizing::new("new\n".to_owned()),
+                sha256: sha_hex(b"new\n"),
+                scrub: Vec::new(),
+            })),
+            secret: Some(Box::new(SecretFile {
+                label: "files[0]".into(),
+                names: vec!["TOKEN".into()],
+            })),
+            ..plain(d, "0600", "sudo ", &user_checks("sudo ", &dest, &dir), true)
+        };
+        let expected = Expected::Sha256(sha_hex(b"old\n"));
+        for (before, code, after) in [("old\n", 0, "new\n"), ("other\n", REFUSED, "other\n")] {
+            fs::write(&dest, before).unwrap();
+            let (script, upload) = write_script(&step, &Sources::default(), &expected).unwrap();
+            let upload = upload.expect("the password path stages");
+            let argv = crate::ssh::remote_tty_command(&script);
+            let tty = crate::transport::local_tty_command(&script);
+            let local: Vec<_> = tty.get_args().map(|a| a.to_string_lossy()).collect();
+            for (what, text) in [
+                ("script", script.as_str()),
+                ("ssh argv", argv.as_str()),
+                ("local argv", &local.join(" ")),
+                ("cleanup", upload.cleanup.as_str()),
+            ] {
+                assert!(!has_sha256(text), "{what} holds a hash: {text}");
+            }
+            assert_eq!(sh_with(&bin, &upload.stage).code, Some(0));
+            let out = sh_with(&bin, &script);
+            let stderr = String::from_utf8(out.stderr).unwrap();
+            assert_eq!(out.code, Some(code), "{before:?}: {stderr}");
+            assert_eq!(fs::read_to_string(&dest).unwrap(), after, "{before:?}");
+            assert_eq!(sh_with(&bin, &upload.cleanup).code, Some(0));
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn without_a_hash_tool_the_write_is_not_checked() {
         let dir = dir("files-guard-nohash");
@@ -7041,6 +7256,7 @@ mod tests {
             written_attrs: None,
             created_dirs: Vec::new(),
             binary: false,
+            secret: false,
         }
     }
 
@@ -8583,6 +8799,149 @@ mod tests {
         let expanded = legacy(&config);
         let record = one.record(&expanded, &sources, Captured::Absent, Write::Written, false);
         assert_eq!(record.written_sha256, one.rendered.as_ref().unwrap().sha256);
+    }
+
+    /// `templated` with `secrets`, mode 0600 and `rollback = false`.
+    fn with_secrets(src: &str, dest: &str, names: &[&str]) -> FileEntry {
+        FileEntry {
+            mode: Some(ModeValue::Text("0600".to_owned())),
+            rollback: false,
+            secrets: Some(names.iter().map(|name| (*name).to_owned()).collect()),
+            ..templated(src, dest)
+        }
+    }
+
+    /// [`runs`] with `secrets` loaded as apply loads them, or `None` as plan.
+    fn runs_with(
+        config: &Config,
+        sources: &Sources,
+        secrets: Option<&Passwords>,
+    ) -> Result<Vec<PlannedRun>, String> {
+        let expanded = legacy(config);
+        let facts = facts(&[("user", "root")]);
+        let target = host(&[], None);
+        expanded
+            .files()
+            .map(|(item, entry, i)| {
+                super::run(
+                    config,
+                    item,
+                    (entry, i),
+                    sources,
+                    &target,
+                    Some(&facts),
+                    secrets,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|runs| runs.into_iter().flatten().collect())
+    }
+
+    fn loaded(pairs: &[(&str, &[u8])]) -> Passwords {
+        (pairs.iter())
+            .map(|(name, value)| ((*name).to_owned(), Zeroizing::new(value.to_vec())))
+            .collect()
+    }
+
+    #[test]
+    fn a_secret_file_renders_its_secrets_and_records_no_hash() {
+        let src = "T={{ secrets.TOKEN }}\nA={{ ('u:' ~ secrets.TOKEN) | b64encode }}\n";
+        let config = config_in(
+            Path::new("/c"),
+            vec![with_secrets("a.j2", "/etc/a", &["TOKEN"])],
+        );
+        let sources = Sources::of(&[src]);
+        let secrets = loaded(&[("TOKEN", b"fake-value-one"), ("OTHER", b"fake-value-two")]);
+        let runs = runs_with(&config, &sources, Some(&secrets)).unwrap();
+        let write = written(&runs[0]);
+        let rendered = write.rendered.as_ref().unwrap();
+        assert_eq!(
+            *rendered.text,
+            "T=fake-value-one\nA=dTpmYWtlLXZhbHVlLW9uZQ==\n"
+        );
+        assert_eq!(rendered.sha256, "", "no hash of the rendered text");
+        let scrub: Vec<&str> = rendered.scrub.iter().map(|text| text.as_str()).collect();
+        assert_eq!(scrub, ["fake-value-one", "dTpmYWtlLXZhbHVlLW9uZQ=="]);
+        let secret = write.secret.as_deref().unwrap();
+        assert_eq!(
+            (secret.label.as_str(), &secret.names[..]),
+            ("files[0]", &["TOKEN".to_owned()][..])
+        );
+        assert!(
+            runs[0].run.contains("T=fake-value-one"),
+            "the write carries it"
+        );
+        let debug = format!("{:?}", runs[0]);
+        assert!(!debug.contains("fake-value-one"), "{debug}");
+
+        let captured = Captured::File {
+            mode: "0600".to_owned(),
+            uid: 0,
+            gid: 0,
+            size: 4,
+            sha256: hex(&Sha256::digest(b"old\n")),
+            bytes: Some(Zeroizing::new(b"old\n".to_vec())),
+            reason: None,
+        };
+        let expanded = legacy(&config);
+        let record = write.record(&expanded, &sources, captured, Write::Written, false);
+        assert!(record.secret);
+        assert_eq!(record.written_sha256, "");
+        let Previous::File(p) = &record.previous else {
+            panic!("{:?}", record.previous);
+        };
+        assert!(p.sha256.is_empty() && p.text.is_none() && !p.kept);
+        assert_eq!(record.not_kept(), Some(crate::record::SECRET));
+    }
+
+    #[test]
+    fn plan_leaves_a_secret_file_unrendered_with_no_script() {
+        let config = config_in(
+            Path::new("/c"),
+            vec![with_secrets("a.j2", "/etc/a", &["TOKEN", "OTHER"])],
+        );
+        let sources = Sources::of(&["T={{ secrets.TOKEN }}\n"]);
+        let runs = runs_with(&config, &sources, None).unwrap();
+        assert!(runs[0].run.is_empty(), "plan builds no write");
+        let write = written(&runs[0]);
+        assert!(write.rendered.is_none());
+        assert_eq!(write.secret.as_deref().unwrap().names, ["TOKEN", "OTHER"]);
+        assert_eq!(
+            write.payload(&sources).err().unwrap(),
+            "files[0]: not rendered at plan"
+        );
+    }
+
+    #[test]
+    fn a_secret_that_is_unset_short_or_not_text_fails_the_target() {
+        let config = config_in(
+            Path::new("/c"),
+            vec![with_secrets("a.j2", "/etc/a", &["TOKEN"])],
+        );
+        let sources = Sources::of(&["T={{ secrets.TOKEN }}\n"]);
+        for (value, why) in [
+            (None, "is not set"),
+            (Some(&b"1234567"[..]), "is shorter than 8 bytes"),
+            (
+                Some(&b"12345678\xff"[..]),
+                "is not UTF-8 or holds a NUL byte",
+            ),
+            (
+                Some(&b"1234\x005678"[..]),
+                "is not UTF-8 or holds a NUL byte",
+            ),
+        ] {
+            let secrets = loaded(value.map(|value| ("TOKEN", value)).as_slice());
+            let err = runs_with(&config, &sources, Some(&secrets)).unwrap_err();
+            assert_eq!(err, format!("files[0]: secret TOKEN {why}"));
+        }
+        let secrets = loaded(&[("TOKEN", b"12345678")]);
+        let src = Sources::of(&["{{ secrets.NOPE }}\n"]);
+        let err = runs_with(&config, &src, Some(&secrets)).unwrap_err();
+        assert_eq!(
+            err,
+            "files[0].src `a.j2`: template: line 1: undefined variable `secrets.NOPE`"
+        );
     }
 
     #[test]

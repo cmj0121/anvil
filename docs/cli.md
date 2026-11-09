@@ -541,7 +541,7 @@ linode1
   audit           drift: kernel was 6.1, now 6.2
   audit           drift: /etc/app.conf was written, now changed
   audit           notice: /etc/b.conf was written, now changed (the last apply failed while writing it)
-  files           3 not compared (2 no sudo, 1 rolled back)
+  files           4 not compared (2 no sudo, 1 rolled back, 1 secret)
   sudo            WARNING: sudo -n was refused or asks for a password; 2 root-only files were not compared
 ```
 
@@ -595,7 +595,8 @@ cleared environment of a step plugin:
   dest that is a link, which a write would refuse), `not_regular`, `unreadable`, `not_root_only` (a directory above the
   dest fails the write's owner test: root's for an as-root dest, root's or the login user's otherwise; or group or
   others can write it),
-  `no_hash` (neither `sha256sum` nor `shasum`) or `no_sudo`. Only `file` has a `tag`.
+  `no_hash` (neither `sha256sum` nor `shasum`), `no_sudo` or `secret` (a [secret file](configuration.md#secret-files),
+  never hashed; its `written_tag` is empty). Only `file` has a `tag`.
 - No sha256 leaves anvil: each `written_sha256` becomes `written_tag` and each live sha256 a `tag`, the hex
   HMAC-SHA256 of the hex under this run's key. Equal tags mean equal hashes within one run; the tags change on every
   run.
@@ -640,13 +641,14 @@ the config ([Security notes](security.md)).
 `text` in parentheses, `no apply recorded` (a `last_apply` of `null`), `error: REASON` (also
 `error: it replied ok: false`), or `no drift`. An item is cut to 256 bytes and `…`, with runs of spaces shown as one;
 `--json` keeps it whole. Then `files N not compared (…)` counts the files no plugin could compare (no sudo, no hash
-tool, rolled back since), and a target with any `no_sudo` file gets the one `sudo WARNING: …` line, also logged as a
+tool, rolled back since, or a [secret file](configuration.md#secret-files), which doctor never hashes), and a target with any
+`no_sudo` file gets the one `sudo WARNING: …` line, also logged as a
 warning. The tags keep every hash out of the request and out of doctor's output: no hash or tag is ever printed.
 
 **`--json`** adds `local.plugins` (`{"audit": null}` when pinned, else the error), `local.record` and, on a key
 error, `local.tag_key`; and on each target `plugins` (`[{"plugin": "audit", "ok": true, "notice": …, "error": …,
 "findings": [{"target", "item", "was", "now", "severity", "text"}]}]`) and `drift` (`{"not_compared", "no_sudo",
-"no_hash", "rolled_back"}`). Each is left out when empty.
+"no_hash", "rolled_back", "secret"}`, `secret` left out when 0). Each is left out when empty.
 
 **Exit.** A `drift` finding, `ok: false`, a plugin error, a bad pin, a record or key error each make the exit 1, the same
 code as an unreachable target, so a script cannot tell drift from a down host by the code alone; `--json` can. With
@@ -669,7 +671,7 @@ drift (a fact only in the live probe is ignored), then each recorded file in rec
   `not_root_only`: drift with `now` `absent`, `symlink`, `not a regular file`, `unreadable` or
   `not root-only`.
 - the same on a file whose write failed midway: a notice instead, with the text `the last apply failed while writing it`.
-- `no_hash`, `no_sudo`, or a dest rolled back since the apply: no finding; doctor counts it as not compared.
+- `no_hash`, `no_sudo`, `secret`, or a dest rolled back since the apply: no finding; doctor counts it as not compared.
 
 Its limits:
 
@@ -1119,7 +1121,9 @@ which [`anvil rollback`](#anvil-rollback) reads. An apply of plain `[[steps]]` o
   was there before (`previous`), the owner, group and mode the write left (`written_attrs`, as
   `{"uid": 0, "gid": 0, "mode": "0644"}`, once the write succeeded) and the directories `parents` created for it
   (`created_dirs`, top down, left out when empty), and `binary: true` when the src was
-  [binary](configuration.md#files) (left out when false). Per directory (`dirs`), per link (`links`) and per removed
+  [binary](configuration.md#files) (left out when false), and `secret: true` for a
+  [secret file](configuration.md#secret-files) (left out when false), which has no `written_sha256` and a `previous`
+  with an empty `sha256` and no `text`. Per directory (`dirs`), per link (`links`) and per removed
   path (`absent`), each left out when empty: below. It never keeps a secret value, a step's script or a package list.
 - **One entry per dest on a tasks config.** A dest two file tasks write in one apply, spelled the same or differing only
   by repeated slashes, has one file entry under its first spelling: `previous` from
@@ -1184,7 +1188,8 @@ already created directories for DEST (`parents = true`): it is stored, or the ea
 `created_dirs`, so that rollback can remove them.
 
 **Version.** A record is written as `"version": 2` only when some target has `dirs`, `links` or `absent`, or some file has
-`created_dirs`, is an owner, group or mode fix with the bytes unchanged (`fixed DEST: …`) or has `binary`; any other
+`created_dirs`, is an owner, group or mode fix with the bytes unchanged (`fixed DEST: …`) or has `binary` or `secret`;
+any other
 stays `"version": 1`, as above, and this anvil reads both. An older anvil refuses a version 2 record, with
 `apply: PATH: version 2 is not supported` (`rollback: …` for a rollback), rather than load it and lose those fields on
 its next save; keep using this anvil, or a newer one, with that record.
@@ -1239,7 +1244,9 @@ carries it over. A record without the field loads as before. Bad names in it are
 text is UTF-8 with no NUL byte and at most 256 KiB, the entry does not set `rollback = false` and the src written is
 not binary. Otherwise `kept` is false and `reason` says why: `rollback = false`, `not world-readable`, `over 256 KiB`,
 `binary` (the previous file or the src is not UTF-8 or holds a NUL byte), `unreadable`, `no od on the target` or
-`record full`. A record that holds a previous text under a `binary` file is refused on load. The write goes ahead
+`record full`. A secret file keeps neither text nor hash, and a later write of it is never merged as unchanged, so a
+rotated secret is recorded again. A record that holds a hash or text under a `secret` file is refused on load. A record that holds
+a previous text under a `binary` file is refused on load. The write goes ahead
 either way; only its undo is lost, and rollback shows the file as `cannot undo: DEST (REASON)`. `rollback = false` keeps
 the hash only: use it for a dest that holds a secret ([Files](configuration.md#files)).
 
@@ -1336,7 +1343,8 @@ the controller, as apply would, to list the script it returns ([Plugin steps](#p
 
 plan never opens the secret store. A step that would type a sudo password says which secret it would use; whether that
 secret is set and free of control characters is not checked, so plan can pass where apply then fails with
-`packages: secret NAME is not set`. `anvil doctor` checks the secrets.
+`packages: secret NAME is not set`. `anvil doctor` checks the secrets. A [secret file](configuration.md#secret-files)
+is not rendered either: whether its secrets are set is known only at apply.
 
 ```text
 ▶ local
@@ -1365,6 +1373,9 @@ secret is set and free of control characters is not checked, so plan can pass wh
   fails ends in `✘` with the template message ([Templating](configuration.md#templating)). `--show-content` adds each
   file step's size, sha256 and text (**File content**, below). A file whose `mode` gives others no read shows
   `rendered N bytes (hidden: mode MODE)` instead, with no sha256.
+- A [secret file](configuration.md#secret-files) step is `would write DEST (secret: NAME, NAME; rendered at apply)`,
+  naming the secrets it lists, with no size, no sha256 and no `rendered` line: plan never opens the store, so it does
+  not render it. Its src is still checked for syntax.
 - A step with guards adds one line per guard under its `would $` line, in the order they are checked: `creates PATH`,
   `removes PATH`, `onlyif CMD`, `unless CMD` ([Guarded steps](#guarded-steps)). plan never runs them, so it cannot
   tell whether apply would skip the step.
@@ -1399,8 +1410,9 @@ secret is set and free of control characters is not checked, so plan can pass wh
 `--json` is apply's document with `"executed": false` first; a step has its `run` and, when apply would type a sudo
 password, its `sudo_secret`, plus `task` and `name` on a tasks config, `owner`, `group` and `parents` (`true`) on a file
 step that sets them, `mode` and those three on a dir step, `target`, `force` (`true`) and `parents` on a link step,
-`path` and `type` (when set) on an absent step, `guards` on a guarded step and `notify` (the names) on a step with
-`notify`, but never `code`, `stdout` or `stderr`. A planned target with pending handlers has `pending_handlers`, left
+`path` and `type` (when set) on an absent step, `guards` on a guarded step, `notify` (the names) on a step with
+`notify`, and `"secret": true` with `secrets` (the names) and no `rendered` on a secret file step, but never
+`code`, `stdout` or `stderr`. A planned target with pending handlers has `pending_handlers`, left
 out when empty, and the record's load warnings are a top-level `warnings` array, the same text without the `WARNING:`
 prefix, left out when empty. A target with vars or env also has `vars` and `env`, as in doctor's `--json`
 (`"vars": {"port": {"value": 8080, "level": "tag:web"}}`), and a step's `run` is the script as written, without the env
@@ -1492,6 +1504,8 @@ sha256 of the exact bytes apply would write, then their text:
 - A file whose `mode` gives others no read (`0600`, `0640`, `0750`, a templated one included) shows only its size,
   `content N bytes (hidden: mode MODE)` or `rendered N bytes (hidden: mode MODE)`: no sha256 and no text, so keys and
   other private files stay off the terminal. A templated one has that `rendered` line without a flag too.
+- A [secret file](configuration.md#secret-files) shows only `(secret: not rendered at plan)`: no size, no sha256, no
+  text, and no `content` object in `--json`.
 - Each file item of a [recursive copy](configuration.md#recursive-copy) has the same lines under its
   `would $ file PATH`. A step skipped on a target it does not match has none.
 
@@ -1851,6 +1865,14 @@ steps still run. A step whose write fails ends the target like any step. With `-
 
 `unchanged` needs `cmp` (diffutils) on the target; without it every run rewrites the file and prints `wrote DEST`.
 
+A [secret file](configuration.md#secret-files) prints the same lines. Every step's output on its target, in `--json`
+too, has each of its secret values, and each `b64encode` output of a text that held one, replaced with `***`. Its
+write that fails shows `files[0]: write failed on the target (exit N); its output is hidden for a secret file`
+(`(killed)` when it was killed), and a read of dest before the write that fails shows
+`files[0]: could not read DEST on the target (exit N); its output is hidden for a secret file`, never the target's text.
+A secret that is not set, shorter than 8 bytes, or not UTF-8 fails the target before its first step:
+`files[0]: secret NAME is not set`.
+
 In `--json` a file step's `run` is that label. A skipped step has `"skipped": true`, `code` 0 and empty output:
 
 ```json
@@ -1862,7 +1884,8 @@ In `--json` a file step's `run` is that label. A skipped step has `"skipped": tr
 `anvil plan` shows `would $ file DEST`, with `(binary)` for a binary src, whose rollback is lost, and
 `(sudo password from secret NAME)` when apply would take the password path, and `would $ skipped file DEST: no match`;
 an entry that sets them adds `owner NAME`, `group NAME` and `parents` lines, and a templated file its
-`rendered N bytes, sha256 HEX` line (`rendered N bytes (hidden: mode MODE)` when others cannot read it);
+`rendered N bytes, sha256 HEX` line (`rendered N bytes (hidden: mode MODE)` when others cannot read it); a secret file
+is `would write DEST (secret: NAME; rendered at apply)` instead;
 `--show-content` adds the `content` or `rendered` line and the text. In `plan --json` the `run` is the same label,
 with `binary: true` for a binary src, `sudo_secret` for the password path and `owner`, `group` and `parents` (`true`)
 when the entry sets them.
@@ -2347,6 +2370,8 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   `restore DEST` prints `restored DEST`, `remove DEST` prints `removed DEST`, and either prints `unchanged DEST` when
   DEST already is what it was before the apply (a restore still sets the owner, group and mode back). A file whose text was not kept
   is a skipped step `cannot undo: DEST (REASON)`, with the reason from the record (`rollback = false`, say).
+- **Secret files.** A [secret file](configuration.md#secret-files) is always `cannot undo: DEST (secret)`, and DEST
+  is left as it is; rollback never opens the secret store.
 - **Binary files.** A file whose src was [binary](configuration.md#files) is always `cannot undo: DEST (binary)`, and
   DEST is left as it is, also when it did not exist before the apply or only its owner, group or mode changed (a known
   limit); the directories `parents = true` created for it stay too.

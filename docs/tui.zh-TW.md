@@ -192,6 +192,7 @@ curl、tar 與新執行檔的 `--version` 執行時輸出都會被擷取，不�
 在該 step 下方印出的東西：帶有大小與 sha256 的 `content` 或 `rendered` 行，接著是文字，控制字元與不可見字元會被跳脫。
 比方框寬的行會被截斷。[遞迴複製](configuration.zh-TW.md#recursive-copy)的每個檔案項目各列在一行 `── PATH` 下方。
 二進位檔案只顯示它的那一行，絕不顯示文字；mode 不給其他人讀取權限的檔案只顯示 `content N bytes (hidden: mode MODE)`，不含 sha256。
+[Secret file](configuration.zh-TW.md#secret-files) 的標題為 `DEST (secret)`，只顯示 `(secret: not rendered at plan)`。
 狀態列顯示 `↑↓ scroll · PgUp/PgDn page · g/G top/end · O pager · Esc close`。開啟期間適用下列按鍵，表中其他按鍵都不做任何事：
 
 | 按鍵            | 動作                              |

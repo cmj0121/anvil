@@ -13,7 +13,7 @@ use crate::dirs;
 use crate::error::Failure;
 use crate::facts::{self, Facts};
 use crate::fanout;
-use crate::files::{self, Sources};
+use crate::files::{self, SecretFile, Sources};
 use crate::guard;
 use crate::inventory::Target;
 use crate::links;
@@ -33,7 +33,8 @@ use crate::transport::{
 use crate::tree;
 use zeroize::{Zeroize, Zeroizing};
 
-/// Sudo passwords by secret name; a name that is not set is absent.
+/// Sudo passwords and file secrets by secret name; a name that is not set
+/// is absent.
 pub(crate) type Passwords = BTreeMap<String, Zeroizing<Vec<u8>>>;
 
 /// The value of secret `name` to type at sudo's prompt: set, and free of
@@ -61,10 +62,11 @@ pub(crate) fn open_record(command: &str) -> Result<Session, Failure> {
 }
 
 /// The sudo password of each of `targets` with a sudo secret that a step may
-/// type, read from the store `store` builds, opened once: a target's when a
-/// package item, a `sudo = true` file item or a service item carries only tags
-/// it has (its facts are not known yet).
-/// Nothing is built or opened when no step may type one. One trailing
+/// type, and each secret a file item with `secrets` reads, read from the
+/// store `store` builds, opened once: a target's when a package item, a
+/// `sudo = true` file item, a service item or a file item with secrets
+/// carries only tags it has (its facts are not known yet).
+/// Nothing is built or opened when no step needs one. One trailing
 /// newline is trimmed. A store error fails the command. Core dumps are
 /// turned off first.
 pub(crate) fn load_passwords(
@@ -73,7 +75,9 @@ pub(crate) fn load_passwords(
     expanded: &Expanded,
     store: impl FnOnce() -> Result<Box<dyn Store>, Failure>,
 ) -> Result<Passwords, Failure> {
-    read_passwords(expanded.sudo_secrets(config, targets), store)
+    let mut names = expanded.sudo_secrets(config, targets);
+    names.extend(expanded.file_secrets(targets));
+    read_passwords(names, store)
 }
 
 /// The sudo password of each secret in `names`, read from the store
@@ -701,6 +705,7 @@ fn execute_inner(
             .or_else(|| planned.link().and_then(|link| link.upload.as_ref()))
             .or_else(|| planned.absent().and_then(|absent| absent.upload.as_ref()));
         let write = planned.file().and_then(|file| file.write.as_ref());
+        let secret = write.and_then(|write| write.secret.as_deref());
         let dir = planned.dir().and_then(|dir| dir.write.as_ref());
         let link = planned.link().and_then(|link| link.write.as_ref());
         let absent = planned.absent().and_then(|absent| absent.write.as_ref());
@@ -724,6 +729,10 @@ fn execute_inner(
                 let found = match found {
                     Ok(found) => found,
                     Err(Uncaptured::Step { code, stderr }) => {
+                        let stderr = match secret {
+                            Some(secret) => hidden_capture(secret, &write.dest, code),
+                            None => stderr,
+                        };
                         reports.push(noted(
                             StepReport {
                                 run: label.to_owned(),
@@ -889,11 +898,13 @@ fn execute_inner(
             }
             Err(err) => {
                 let error = step_error(&err, password.map(|(name, _)| name), prefix);
-                // A step killed at the limit still shows what it printed.
+                // A step killed at the limit still shows what it printed,
+                // but for a secret file.
                 if let TransportError::Timeout {
                     output: Some(output),
                     ..
                 } = err
+                    && secret.is_none()
                 {
                     let report = StepReport::from_output(label, *output, entry).of(planned);
                     reports.push(noted(report, apply, false));
@@ -902,6 +913,13 @@ fn execute_inner(
             }
         };
         let succeeded = output.code == Some(0);
+        if let Some(secret) = secret {
+            output.stderr.zeroize();
+            if !succeeded {
+                output.stdout.zeroize();
+                output.stderr = hidden_failure(secret, output.code).into_bytes();
+            }
+        }
         if succeeded && output.truncated {
             log::warn!("{command} {}: step output cut at 1 MiB", target.name);
         }
@@ -1100,6 +1118,66 @@ pub(crate) fn run_handlers(
         steps: reports,
         ok,
     }
+}
+
+/// What a failed write of the secret file `secret` shows instead of the
+/// target's output.
+fn hidden_failure(secret: &SecretFile, code: Option<i32>) -> String {
+    hidden(secret, "write failed on the target", code)
+}
+
+/// What a failed capture of the secret file `secret` at `dest`, before any
+/// write, shows instead of the target's output.
+fn hidden_capture(secret: &SecretFile, dest: &str, code: Option<i32>) -> String {
+    hidden(
+        secret,
+        &format!("could not read {dest} on the target"),
+        code,
+    )
+}
+
+/// `secret`'s label, what failed and how the step ended, its output hidden.
+fn hidden(secret: &SecretFile, what: &str, code: Option<i32>) -> String {
+    let exit = code.map_or_else(|| "killed".to_owned(), |code| format!("exit {code}"));
+    format!(
+        "{}: {what} ({exit}); its output is hidden for a secret file",
+        secret.label
+    )
+}
+
+/// `report` with each value and encoded form the file secrets of `runs`
+/// rendered replaced by `***`, longest first, in every step's output and
+/// in the error: whatever step printed them.
+pub(crate) fn scrubbed(mut report: TargetReport, runs: &[PlannedRun]) -> TargetReport {
+    let mut needles: Vec<&str> = (runs.iter())
+        .filter_map(PlannedRun::rendered)
+        .flat_map(|rendered| rendered.scrub.iter().map(|text| text.as_str()))
+        .filter(|text| !text.is_empty())
+        .collect();
+    if needles.is_empty() {
+        return report;
+    }
+    needles.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    needles.dedup();
+    let scrub = |text: &mut String| {
+        for needle in &needles {
+            if text.contains(needle) {
+                let new = text.replace(needle, "***");
+                std::mem::replace(text, new).zeroize();
+            }
+        }
+    };
+    let (TargetReport::Ran { steps, .. }
+    | TargetReport::Failed { steps, .. }
+    | TargetReport::Cancelled { steps, .. }) = &mut report;
+    for step in steps {
+        scrub(&mut step.stdout);
+        scrub(&mut step.stderr);
+    }
+    if let TargetReport::Failed { error, .. } = &mut report {
+        scrub(error);
+    }
+    report
 }
 
 /// The report of handler `name`, which could not run for `error` (it did
@@ -1497,16 +1575,23 @@ impl From<TransportError> for Unresolved {
 /// match is a skip and resolves nothing. Runs nothing on the target, but each
 /// plugin on the controller, in order, `cancel` checked before each. `facts`,
 /// from [`probe`], is required when [`needs_facts`] says so; being one probe,
-/// no step can change what a later item sees. A failure is
+/// no step can change what a later item sees. `secrets`, apply's loaded
+/// values, renders a file item with `secrets`; plan's `None` leaves it
+/// unrendered. A failure is
 /// `packages: <reason>`, `files…`, `services: <reason>`, `dirs…`,
 /// `links…`, `absent…` or `plugin <name>: <reason>`; the first one ends the
 /// list.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one input of a target's steps, passed through"
+)]
 pub fn resolve(
     target: &Target,
     facts: Option<&Facts>,
     config: &Config,
     expanded: &Expanded,
     sources: &Sources,
+    secrets: Option<&Passwords>,
     plugins: &dyn Plugins,
     cancel: &Cancel,
 ) -> Result<Vec<PlannedRun>, Unresolved> {
@@ -1519,7 +1604,8 @@ pub fn resolve(
                 .into_iter()
                 .collect(),
             ItemKind::File { entry, ordinal } => {
-                files::run(config, item, (entry, *ordinal), sources, target, facts)?
+                let entry = (entry, *ordinal);
+                files::run(config, item, entry, sources, target, facts, secrets)?
             }
             ItemKind::Service(entry) => vec![services.run(item, entry)?],
             ItemKind::Dir { entry, ordinal } => {
@@ -1924,6 +2010,7 @@ mod tests {
             &Config::default(),
             &expanded,
             &Sources::default(),
+            Some(&Passwords::new()),
             &FakePlugins::none(),
             &Cancel::new(),
         )

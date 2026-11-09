@@ -29,6 +29,9 @@ pub const MAX_RUN_BYTES: usize = 4 << 10;
 /// request a plugin reads.
 pub const ARGS_LIMIT: usize = 32 << 10;
 
+/// Most names in one file entry's `secrets`.
+const MAX_FILE_SECRETS: usize = 16;
+
 /// Most `[[files]]` entries in one config.
 pub const MAX_FILES: usize = 64;
 
@@ -548,6 +551,10 @@ pub struct FileEntry {
     /// `vars` and `facts`; `false` copies it byte for byte.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub template: bool,
+    /// The names a `template = true` entry reads as `secrets.NAME`;
+    /// `Option` so an empty list gets its own message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notify: Vec<String>,
     /// `true`: `src` is a directory copied as a tree under `dest`
@@ -576,6 +583,7 @@ impl std::fmt::Debug for FileEntry {
             .field("sudo", &self.sudo)
             .field("rollback", &self.rollback)
             .field("template", &self.template)
+            .field("secrets", &self.secrets)
             .field("notify", &self.notify)
             .field("recursive", &self.recursive)
             .field("dir_mode", &self.dir_mode)
@@ -1624,7 +1632,55 @@ pub(crate) fn check_file(prefix: &str, entry: &FileEntry) -> Result<(), String> 
     }
     check_account(prefix, "owner", entry.owner.as_deref())?;
     check_account(prefix, "group", entry.group.as_deref())?;
-    check_selector(prefix, &entry.tags, &entry.facts)
+    check_selector(prefix, &entry.tags, &entry.facts)?;
+    check_file_secrets(prefix, entry)
+}
+
+/// The `secrets` rules of a file entry already past its other checks.
+fn check_file_secrets(prefix: &str, entry: &FileEntry) -> Result<(), String> {
+    let Some(names) = &entry.secrets else {
+        return Ok(());
+    };
+    if names.is_empty() {
+        return Err(format!("{prefix}.secrets: is empty; remove it"));
+    }
+    if names.len() > MAX_FILE_SECRETS {
+        return Err(format!(
+            "{prefix}.secrets: {} entries exceeds the {MAX_FILE_SECRETS} entry limit",
+            names.len()
+        ));
+    }
+    for (i, name) in names.iter().enumerate() {
+        if !secret::is_name(name) {
+            return Err(format!(
+                "{prefix}.secrets[{i}] `{}`: {}",
+                secret::shown_name(name),
+                secret::NAME_RULE
+            ));
+        }
+        if let Some(j) = names[..i].iter().position(|other| other == name) {
+            return Err(format!(
+                "{prefix}.secrets[{i}] `{name}`: same name as secrets[{j}]"
+            ));
+        }
+    }
+    if !entry.template {
+        return Err(format!("{prefix}.secrets: needs template = true"));
+    }
+    let Some(ModeValue::Text(mode)) = &entry.mode else {
+        unreachable!("checked: a quoted mode")
+    };
+    if u32::from_str_radix(mode, 8).expect("checked: octal digits") & 0o077 != 0 {
+        return Err(format!(
+            "{prefix}.secrets: mode `{mode}` lets group or others in; use a mode such as \"0600\""
+        ));
+    }
+    if entry.rollback {
+        return Err(format!(
+            "{prefix}.secrets: needs rollback = false; rollback cannot restore a file built from secrets"
+        ));
+    }
+    Ok(())
 }
 
 /// One dir entry's rules; `prefix` names it, as `dirs[0]`.
@@ -2395,6 +2451,112 @@ mod tests {
             let back: Config = document::from_str(&text, format).unwrap();
             assert_eq!(back, on);
         }
+    }
+
+    const SECRET_ENTRY: &str = "src = \"app.env.j2\"\ndest = \"/etc/app.env\"\nmode = \"0600\"\n\
+         template = true\nrollback = false\nsecrets = [\"TOKEN\", \"API_KEY_2\"]";
+
+    #[test]
+    fn a_files_entry_takes_secrets_and_round_trips() {
+        let plain = file_entry(ENTRY);
+        assert_eq!(plain.files[0].secrets, None);
+        let config = file_entry(SECRET_ENTRY);
+        config.check_files().unwrap();
+        assert_eq!(
+            config.files[0].secrets.as_deref(),
+            Some(["TOKEN".to_string(), "API_KEY_2".to_string()].as_slice())
+        );
+        assert!(format!("{:?}", config.files[0]).contains("secrets: Some([\"TOKEN\""));
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&plain, format).unwrap();
+            assert!(!text.contains("secrets"), "{text}");
+            let text = document::to_string(&config, format).unwrap();
+            assert!(text.contains("API_KEY_2"), "{text}");
+            let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(back, config);
+            back.check_files().unwrap();
+        }
+        let yaml: Config = document::from_str(
+            "files:\n- src: app.env.j2\n  dest: /etc/app.env\n  mode: \"0400\"\n  \
+             template: true\n  rollback: false\n  secrets: [TOKEN]\n",
+            Format::Yaml,
+        )
+        .unwrap();
+        yaml.check_files().unwrap();
+        assert_eq!(
+            yaml.files[0].secrets.as_deref(),
+            Some(["TOKEN".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn a_files_entry_with_secrets_is_refused_unless_it_keeps_them_private() {
+        let base = "src = \"app.env.j2\"\ndest = \"/etc/app.env\"";
+        let names = (0..17).map(|i| format!("\"N{i}\"")).collect::<Vec<_>>();
+        let sixteen = format!("[{}]", names[..16].join(", "));
+        let seventeen = format!("[{}]", names.join(", "));
+        assert_eq!(
+            file_entry(&format!(
+                "{base}\nmode = \"0600\"\ntemplate = true\nrollback = false\nsecrets = {sixteen}"
+            ))
+            .check_files(),
+            Ok(())
+        );
+        for (keys, message) in [
+            (
+                "mode = \"0600\"\ntemplate = true\nrollback = false\nsecrets = []".to_string(),
+                "files[0].secrets: is empty; remove it",
+            ),
+            (
+                format!(
+                    "mode = \"0600\"\ntemplate = true\nrollback = false\nsecrets = {seventeen}"
+                ),
+                "files[0].secrets: 17 entries exceeds the 16 entry limit",
+            ),
+            (
+                "mode = \"0600\"\nsecrets = [\"TOKEN\", \"bad\"]".to_string(),
+                "files[0].secrets[1] `bad`: must match [A-Z][A-Z0-9_]*",
+            ),
+            (
+                "mode = \"0600\"\nsecrets = [\"TOKEN\", \"TOKEN\"]".to_string(),
+                "files[0].secrets[1] `TOKEN`: same name as secrets[0]",
+            ),
+            (
+                "mode = \"0600\"\nrollback = false\nsecrets = [\"TOKEN\"]".to_string(),
+                "files[0].secrets: needs template = true",
+            ),
+            (
+                "mode = \"0640\"\ntemplate = true\nrollback = false\nsecrets = [\"TOKEN\"]"
+                    .to_string(),
+                "files[0].secrets: mode `0640` lets group or others in; use a mode such as \"0600\"",
+            ),
+            (
+                "mode = \"0604\"\ntemplate = true\nrollback = false\nsecrets = [\"TOKEN\"]"
+                    .to_string(),
+                "files[0].secrets: mode `0604` lets group or others in; use a mode such as \"0600\"",
+            ),
+            (
+                "mode = \"0600\"\ntemplate = true\nsecrets = [\"TOKEN\"]".to_string(),
+                "files[0].secrets: needs rollback = false; rollback cannot restore a file built from secrets",
+            ),
+            (
+                "mode = \"0600\"\ntemplate = true\nrollback = true\nsecrets = [\"TOKEN\"]"
+                    .to_string(),
+                "files[0].secrets: needs rollback = false; rollback cannot restore a file built from secrets",
+            ),
+        ] {
+            let config = file_entry(&format!("{base}\n{keys}"));
+            assert_eq!(config.check_files(), Err(message.to_string()), "{keys}");
+        }
+        let err = file_entry(
+            "src = \"a\"\ndest = \"/a\"\nmode = \"0600\"\nowner = \"bad name\"\nsecrets = []",
+        )
+        .check_files()
+        .unwrap_err();
+        assert!(
+            err.starts_with("files[0].owner"),
+            "the entry's own checks come first: {err}"
+        );
     }
 
     #[test]

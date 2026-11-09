@@ -325,6 +325,8 @@ pub struct ContentView<'a> {
     pub sha256: Option<&'a str>,
     pub binary: bool,
     pub templated: bool,
+    /// An entry with `secrets`, which plan does not render: no bytes.
+    pub secret: bool,
 }
 
 /// By hand: the length and hash, never the bytes.
@@ -337,6 +339,7 @@ impl std::fmt::Debug for ContentView<'_> {
             .field("sha256", &self.sha256)
             .field("binary", &self.binary)
             .field("templated", &self.templated)
+            .field("secret", &self.secret)
             .finish()
     }
 }
@@ -347,9 +350,9 @@ impl<'a> ContentView<'a> {
         hidden(self.mode)
     }
 
-    /// The text to show: `None` for a binary or hidden file.
+    /// The text to show: `None` for a binary, hidden or secret file.
     pub fn text(&self) -> Option<&'a str> {
-        if self.binary || self.hidden() {
+        if self.binary || self.hidden() || self.secret {
             return None;
         }
         std::str::from_utf8(self.bytes).ok()
@@ -357,8 +360,12 @@ impl<'a> ContentView<'a> {
 
     /// `content N bytes, sha256 HEX` (`rendered` for a template), then
     /// ` (binary)` for a binary file; `content N bytes (hidden: mode MODE)`,
-    /// with no hash, for a hidden one.
+    /// with no hash, for a hidden one; [`SECRET_UNRENDERED`] for a secret
+    /// one.
     pub fn line(&self) -> String {
+        if self.secret {
+            return SECRET_UNRENDERED.to_owned();
+        }
         let kind = if self.templated {
             "rendered"
         } else {
@@ -374,6 +381,9 @@ impl<'a> ContentView<'a> {
         }
     }
 }
+
+/// What `--show-content` and the viewer show for an entry with `secrets`.
+pub const SECRET_UNRENDERED: &str = "(secret: not rendered at plan)";
 
 /// Why a file step has no [`ContentView`]: its src was never read, which
 /// plan never does.
@@ -410,7 +420,15 @@ pub fn content_of<'a>(
         sha256: (!hidden(&write.mode)).then_some(sha256),
         binary,
         templated,
+        secret: false,
     };
+    if write.secret.is_some() {
+        return Some(Ok(ContentView {
+            sha256: None,
+            secret: true,
+            ..view(&[], "", false, true)
+        }));
+    }
     if let Some(rendered) = write.rendered.as_deref() {
         return Some(Ok(view(
             rendered.text.as_bytes(),
@@ -489,7 +507,7 @@ impl std::fmt::Debug for Content {
 }
 
 /// Every file step's [`Content`] in `targets`, in order; a src that was
-/// never read has none.
+/// never read, or an entry with `secrets`, has none.
 pub fn contents(targets: &[PlanReport], sources: &Sources, hashes: &Hashes) -> Vec<Content> {
     let mut contents = Vec::new();
     for report in targets {
@@ -500,6 +518,9 @@ pub fn contents(targets: &[PlanReport], sources: &Sources, hashes: &Hashes) -> V
             let Some(Ok(view)) = content_of(run, sources, hashes) else {
                 continue;
             };
+            if view.secret {
+                continue;
+            }
             contents.push(Content {
                 target: target.clone(),
                 step,
@@ -722,6 +743,7 @@ fn plan_target(
                 config,
                 expanded,
                 sources,
+                None,
                 plugins,
                 cancel,
             )?;
@@ -876,7 +898,8 @@ pub fn render(report: &PlanReport, show: Show, sources: &Sources, hashes: &Hashe
 /// `would $ command`, then `(binary)` for a binary src, whose rollback is
 /// lost, the secret whose password it would type and the plugin that
 /// returned it, if any; unescaped but for a task's invisible characters,
-/// since its `run` is config text under review.
+/// since its `run` is config text under review. A file entry with `secrets`
+/// is `would write DEST (secret: NAME, NAME; rendered at apply)` instead.
 pub fn would_text(step: &PlannedRun) -> String {
     let binary = if step.binary() { " (binary)" } else { "" };
     let secret = step
@@ -888,10 +911,17 @@ pub fn would_text(step: &PlannedRun) -> String {
         .plugin()
         .map(|name| format!(" (from plugin {name})"))
         .unwrap_or_default();
-    let text = format!(
-        "would $ {}{binary}{secret}{from}",
-        report::command(step.shown())
-    );
+    let text = match file_write(step).and_then(|write| Some((write, write.secret.as_deref()?))) {
+        Some((write, file)) => format!(
+            "would write {} (secret: {}; rendered at apply){secret}",
+            write.dest,
+            file.names.join(", ")
+        ),
+        None => format!(
+            "would $ {}{binary}{secret}{from}",
+            report::command(step.shown())
+        ),
+    };
     match step.task {
         Some(_) => escape_invisible(&text),
         None => text,
@@ -1196,6 +1226,7 @@ mod tests {
             config,
             &legacy(config),
             &Sources::default(),
+            None,
             &FakePlugins::none(),
             &cancel,
         )
@@ -1292,6 +1323,7 @@ mod tests {
             sudo: false,
             rollback: true,
             template: false,
+            secrets: None,
             notify: Vec::new(),
             recursive: true,
             dir_mode: Some("0750".to_owned()),
@@ -1380,6 +1412,7 @@ mod tests {
             sudo: false,
             rollback: true,
             template: false,
+            secrets: None,
             notify: Vec::new(),
             recursive: false,
             dir_mode: None,
@@ -1566,6 +1599,7 @@ mod tests {
             sudo: false,
             rollback: true,
             template: true,
+            secrets: None,
             notify: Vec::new(),
             recursive: false,
             dir_mode: None,
@@ -1658,6 +1692,7 @@ mod tests {
             sudo: false,
             rollback,
             template: false,
+            secrets: None,
             notify: Vec::new(),
             recursive: true,
             dir_mode: Some("0750".to_owned()),
@@ -1697,6 +1732,7 @@ mod tests {
             sudo: true,
             rollback: true,
             template: false,
+            secrets: None,
             notify: Vec::new(),
             recursive: false,
             dir_mode: None,

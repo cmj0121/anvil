@@ -1613,8 +1613,14 @@ impl App {
         let path = entry.tree.unwrap_or(entry.files[0].0);
         let shows_text =
             (entry.files.iter()).any(|(_, view)| view.as_ref().is_ok_and(|v| v.text().is_some()));
+        let secret = (entry.files.iter()).any(|(_, view)| view.as_ref().is_ok_and(|v| v.secret));
+        let size = if secret {
+            "secret".to_owned()
+        } else {
+            format!("{bytes} bytes")
+        };
         Ok(Overlay::Content {
-            title: format!("{} ({bytes} bytes)", shown(path)),
+            title: format!("{} ({size})", shown(path)),
             lines,
             scroll: 0,
             page: shows_text.then_some(page),

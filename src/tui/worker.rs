@@ -801,6 +801,12 @@ mod tests {
                 "0644",
                 "recursive = true\ndir_mode = \"0755\"\n",
             ),
+            entry(
+                "site.j2",
+                "app.env",
+                "0600",
+                "template = true\nrollback = false\nsecrets = [\"TOKEN\"]\n",
+            ),
         ]
         .concat();
         fs::write(opts.config.as_ref().unwrap(), config).unwrap();
@@ -897,6 +903,21 @@ mod tests {
         );
         press(&mut app, KeyCode::Esc);
         assert!(app.overlay.is_none() && !app.quit);
+    }
+
+    #[test]
+    fn a_secret_file_shows_neither_bytes_nor_size_and_pages_nothing() {
+        let (mut app, out) = planned("tui-view-secret");
+        view(&mut app, "app.env");
+        let dest = out.join("app.env").display().to_string();
+        assert_eq!(
+            viewer(&app),
+            (
+                format!("{dest} (secret)"),
+                vec!["(secret: not rendered at plan)".to_owned()],
+                false
+            )
+        );
     }
 
     #[test]

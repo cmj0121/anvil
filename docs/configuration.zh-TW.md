@@ -497,6 +497,7 @@ facts = { distro = "arch" }      # optional; a probe key, equal to that fact
 sudo = false                     # optional; default true. false: write as the connecting user
 rollback = false                 # optional; default true. false: the apply record keeps the hash only
 template = true                  # optional; default false. true: render src per target (see Templating)
+secrets = ["APP_TOKEN"]          # optional; the secrets the template reads as secrets.NAME (see Secret files)
 notify = ["reload sshd"]         # optional; the [[handlers]] to run when the step writes (see Handlers)
 recursive = true                 # optional; default false. true: src is a directory, copied as a tree (see Recursive copy)
 dir_mode = "0755"                # required with recursive = true, else refused: the mode of each directory it creates
@@ -784,12 +785,14 @@ server {
 file task 的寫法相同：
 `file = { src = "$/nginx.conf.j2", dest = "/etc/nginx/nginx.conf", mode = "0644", template = true }`。
 
-**Context。** 只有兩個名稱，沒有其他：沒有 `env`、沒有機密、沒有檔案、沒有時鐘。
+**Context。** 兩個名稱，設定了 [`secrets`](#secret-files) 的項目再多一個，沒有其他：沒有 `env`、沒有檔案、沒有時鐘。
 
 - `vars.KEY` 是 target 解析後的 var，保留其型別：`{{ vars.port + 1 }}`、`{{ vars.users[0] }}`、
   `{{ vars.db.host }}`、`{% for u in vars.users %}`。
 - `facts.KEY` 是探測得到的 fact，為字串，鍵即 [`tags` 與 `facts`](#files) 所列。`facts.pkg` 是探測的原始字串，
   例如 `brew pacman`，而非單一管理器：要測試某一個請寫 `{% if "pacman" in (facts.pkg | split) %}`。
+- `secrets.NAME` 是該項目在 `secrets` 中列出的 secret 的值，為字串；只有列出的名稱存在
+  （[Secret files](#secret-files)）。
 
 **語法。** MiniJinja 的子集：`{{ … }}`、`{# … #}`、`{% if %}` / `elif` / `else`、`{% for %}`（含 `loop`）、
 `{% set %}`、`{% with %}`、`{% filter %}`、`{% raw %}`，以及內建的 filter 與 test（`default`、`join`、`length`、
@@ -799,6 +802,8 @@ file task 的寫法相同：
   沒有 `macro` 與 `call`（`line 1: syntax error: unknown statement macro`），也沒有 `facts.pkg.split()` 這類方法
   （`line 1: unknown method`）：請改用 filter 寫法。
 - `replace` filter 已移除，因為它的輸出沒有大小上限（`line 1: unknown filter`）。
+- anvil 加入的 `b64encode` 把字串的 UTF-8 位元組轉為標準 base64（`+/`、`=` 補位、不換行）：
+  `{{ "user:pass" | b64encode }}` 是 `dXNlcjpwYXNz`。任何範本都能使用；值不是字串時為 `line 2: b64encode needs a string`。
 - 布林值算繪為 `True` 或 `False`，與 Jinja 相同：要得到 `true` 請寫 `{{ vars.flag | lower }}`，
   或 `{{ "yes" if vars.flag else "no" }}`。
 - trim 與 lstrip blocks 已開啟：只含一個 `{% … %}` 標籤的行不會留下空行或縮排，如上例的 `{% if %}`。
@@ -833,10 +838,68 @@ ERROR anvil: files[0].src `files/nginx.conf.j2`: template: line 5: syntax error:
 [apply 紀錄](cli.zh-TW.md#apply-紀錄)中寫入內容的雜湊、[`anvil rollback`](cli.zh-TW.md#anvil-rollback) 與 doctor 的
 drift 檢查，全都使用該 target 的算繪文字。因此 var 改變後，下次 apply 會顯示 `wrote DEST`，rollback 則還原 dest 先前的內容。
 [`anvil plan`](cli.zh-TW.md#anvil-plan) 顯示每個 target 的算繪大小與 sha256（其他人無法讀取該檔案時只顯示大小），`--show-content` 另外顯示文字。
-[`config --harden`](#harden) 不評斷範本 src，而是將它列為待檢查。
+[`config --harden`](#harden) 不評斷範本 src，而是將它列為待檢查。[Secret file](#secret-files) 是例外：plan 不算繪它，紀錄也不保存它的雜湊。
 
 **已知限制。** 字串串接（`~`）與大量重複（`*`）可能在 1 MiB 上限生效之前就在控制端用掉大量記憶體
 （MiniJinja 把單次重複限制在 100 MB）。範本與 config 一樣被信任：能編輯它的人本來就能在 target 上執行任何 step。
+
+### Secret files
+
+範本項目可以從 [secret store](secrets.zh-TW.md) 讀取指定名稱的 secret，用來寫入含 token 的 env 檔或 JSON 設定。
+把它們列在 `secrets` 中；範本以 `{{ secrets.NAME }}` 讀取每一個：
+
+```toml
+[[files]]
+src = "$/svc/traefik.env.j2"
+dest = "/srv/svc/traefik.env"
+mode = "0600"                         # no group or other bits
+template = true                       # required with secrets
+rollback = false                      # required with secrets, written out
+secrets = ["ANVIL_CLOUDFLARE_DNS"]    # 1 to 16 names
+```
+
+`$/svc/traefik.env.j2`：
+
+```jinja
+CF_DNS_API_TOKEN={{ secrets.ANVIL_CLOUDFLARE_DNS }}
+```
+
+registry 登入的 auth 是 `user:token` 的 base64 時，使用 [`b64encode`](#templating) filter：
+`"auth": "{{ ("deploy:" ~ secrets.GH_READ_PACKAGE) | b64encode }}"`。file task 接受同一個鍵：
+`file = { src = "$/app.env.j2", dest = "/etc/app.env", mode = "0600", template = true, rollback = false, … }`，
+大括號中加上 `secrets = ["APP_TOKEN"]`。
+
+**拒絕。** 皆以 2 結束並指出該項目（task 為 `tasks[I].file`），在項目的其他鍵之後檢查：
+
+- `files[0].secrets: is empty; remove it`
+- `files[0].secrets: 17 entries exceeds the 16 entry limit`
+- ``files[0].secrets[1] `bad`: must match [A-Z][A-Z0-9_]*``
+- ``files[0].secrets[1] `TOKEN`: same name as secrets[0]``
+- `files[0].secrets: needs template = true`
+- ``files[0].secrets: mode `0640` lets group or others in; use a mode such as "0600"``（`0600`、`0400` 與 `0700` 可通過）
+- `files[0].secrets: needs rollback = false; rollback cannot restore a file built from secrets`（明寫 `rollback = true` 也一樣）
+
+範本讀取了 `secrets` 未列出的名稱時，是一般的算繪錯誤 ``line 1: undefined variable `secrets.NAME` ``。
+[遞迴複製](#recursive-copy)不能使用 `secrets`，因為它不能使用 `template`。
+
+**apply 時。** apply 在與 sudo 密碼同一次的 store 開啟中讀取列出的 secret，且只在某個選取的 target 符合需要它的項目時才開啟 store。
+結尾的一個換行會被去掉。無法使用的 secret 會讓該 target 在它的任何 step 之前失敗，其他 target 照常進行：
+
+- `files[0]: secret TOKEN is not set`
+- `files[0]: secret TOKEN is shorter than 8 bytes`
+- `files[0]: secret TOKEN is not UTF-8 or holds a NUL byte`
+
+算繪後的文字只經由寫入的 heredoc 送到 target。寫入照常與 dest 比較，所以重跑時顯示 `unchanged DEST`。
+該 target 上每個 step 的輸出中，每個值以及含有某個值的文字經 `b64encode` 的每個輸出，都會被換成 `***`。
+secret file 的寫入失敗時絕不顯示 target 的輸出，只顯示
+`files[0]: write failed on the target (exit N); its output is hidden for a secret file`（被終止的寫入為 `(killed)`），
+寫入前讀取 dest 失敗時顯示 `files[0]: could not read DEST on the target (exit N); its output is hidden for a secret file`。
+
+**其他地方不算繪。** plan、`--show-content` 與 TUI 檢視器從不開啟 store：它們顯示
+`would write DEST (secret: NAME, NAME; rendered at apply)` 與 `(secret: not rendered at plan)`
+（[anvil plan](cli.zh-TW.md#anvil-plan)）。[apply 紀錄](cli.zh-TW.md#apply-紀錄)以 `secret: true` 保存該項目，
+不保存寫入內容或原內容的雜湊；[`anvil rollback`](cli.zh-TW.md#anvil-rollback) 顯示 `cannot undo: DEST (secret)` 並保留 dest 原狀；
+doctor 把它算為 `not compared (secret)`。這能保護與不能保護的範圍見[安全須知](security.zh-TW.md)。
 
 ### Recursive copy
 

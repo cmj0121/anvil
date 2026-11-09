@@ -523,7 +523,7 @@ linode1
   audit           drift: kernel was 6.1, now 6.2
   audit           drift: /etc/app.conf was written, now changed
   audit           notice: /etc/b.conf was written, now changed (the last apply failed while writing it)
-  files           3 not compared (2 no sudo, 1 rolled back)
+  files           4 not compared (2 no sudo, 1 rolled back, 1 secret)
   sudo            WARNING: sudo -n was refused or asks for a password; 2 root-only files were not compared
 ```
 
@@ -573,7 +573,8 @@ linode1
 - `current_files` 對 `last_apply.files` 的每個 dest 各有一項，順序相同。`state` 是 `file`、`absent`、
   `symlink`（dest 是連結，寫入時會拒絕）、`not_regular`、`unreadable`、
   `not_root_only`（dest 上層有目錄未通過寫入時的擁有者檢查：以 root 寫入時須屬於 root，否則須屬於 root 或登入使用者；或群組、其他人可寫入）、
-  `no_hash`（`sha256sum` 與 `shasum` 都沒有）或 `no_sudo`。只有 `file` 帶有 `tag`。
+  `no_hash`（`sha256sum` 與 `shasum` 都沒有）、`no_sudo` 或 `secret`（[secret file](configuration.zh-TW.md#secret-files)，
+  從不雜湊；它的 `written_tag` 為空）。只有 `file` 帶有 `tag`。
 - 沒有任何 sha256 離開 anvil：每個 `written_sha256` 換成 `written_tag`，每個現場 sha256 換成 `tag`，
   也就是以本次執行的金鑰對該十六進位字串做 HMAC-SHA256 的十六進位值。同一次執行中 tag 相同即雜湊相同；每次執行 tag 都不同。
 - 至多 1736704 位元組（64 KiB，再加上紀錄項目最多可列的 64 個檔案，每個 26112）。
@@ -616,14 +617,15 @@ doctor plugin 沒有沙箱。請求中沒有雜湊，但 plugin 以你的身分�
 **顯示列。** 在 target 之下，以 plugin 名稱為標籤：`drift: ITEM was WAS, now NOW`、`notice: …`（括號中為其 `text`）、
 `no apply recorded`（`last_apply` 為 `null`）、`error: REASON`（也包括 `error: it replied ok: false`）或 `no drift`。
 item 會截到 256 位元組並加上 `…`，連續空白顯示為一個；`--json` 保留完整內容。
-接著 `files N not compared (…)` 計算沒有 plugin 能比對的檔案（no sudo、no hash tool、之後已 rollback），
+接著 `files N not compared (…)` 計算沒有 plugin 能比對的檔案（no sudo、no hash tool、之後已 rollback，
+或 doctor 從不雜湊的 [secret file](configuration.zh-TW.md#secret-files)），
 有任何 `no_sudo` 檔案的 target 會多一行 `sudo WARNING: …`，同時記錄為警告。
 tag 讓所有雜湊都不出現在請求與 doctor 的輸出中：任何雜湊或 tag 都不會被印出。
 
 **`--json`** 會加上 `local.plugins`（已釘選為 `{"audit": null}`，否則為錯誤）、`local.record`，金鑰出錯時加上 `local.tag_key`；
 每個 target 加上 `plugins`（`[{"plugin": "audit", "ok": true, "notice": …, "error": …,
 "findings": [{"target", "item", "was", "now", "severity", "text"}]}]`）與
-`drift`（`{"not_compared", "no_sudo", "no_hash", "rolled_back"}`）。各欄位為空時省略。
+`drift`（`{"not_compared", "no_sudo", "no_hash", "rolled_back", "secret"}`，`secret` 為 0 時省略）。各欄位為空時省略。
 
 **結束碼。** `drift` finding、`ok: false`、plugin 錯誤、釘選不符、紀錄或金鑰錯誤都會讓結束碼為 1，
 與無法連線的 target 相同，因此腳本光看結束碼分不出漂移與主機離線；`--json` 可以。
@@ -646,7 +648,7 @@ tag 讓所有雜湊都不出現在請求與 doctor 的輸出中：任何雜湊�
   `not_root_only`：漂移，`now` 分別為 `absent`、`symlink`、`not a regular file`、`unreadable` 或
   `not root-only`。
 - 同上，但該檔案的寫入中途失敗：改為 notice，文字為 `the last apply failed while writing it`。
-- `no_hash`、`no_sudo`，或 apply 之後已被 rollback 的 dest：沒有 finding；doctor 將它計為未比對。
+- `no_hash`、`no_sudo`、`secret`，或 apply 之後已被 rollback 的 dest：沒有 finding；doctor 將它計為未比對。
 
 它的限制：
 
@@ -1061,7 +1063,9 @@ anvil apply --target web1 --drop-pending "reload sshd"
   （`pending_handlers`，以名稱記錄，空時省略），以及 rollback 之後的 `rolled_back`。每個檔案：dest、寫入時的 mode 與 `sudo`、
   寫入位元組的 sha256、寫入如何結束（`write`）、先前的狀態（`previous`）、寫入留下的擁有者、群組與 mode
   （`written_attrs`，形如 `{"uid": 0, "gid": 0, "mode": "0644"}`，寫入成功後才有），以及 `parents` 為它建立的目錄
-  （`created_dirs`，由上而下，空時省略），src 是[二進位檔案](configuration.zh-TW.md#files)時另有 `binary: true`（false 時省略）。每個目錄（`dirs`）、每個連結（`links`）與每個被移除的路徑（`absent`）的內容見下文，空時省略。
+  （`created_dirs`，由上而下，空時省略），src 是[二進位檔案](configuration.zh-TW.md#files)時另有 `binary: true`（false 時省略），
+  [secret file](configuration.zh-TW.md#secret-files) 另有 `secret: true`（false 時省略），它沒有 `written_sha256`，
+  `previous` 的 `sha256` 為空且沒有 `text`。每個目錄（`dirs`）、每個連結（`links`）與每個被移除的路徑（`absent`）的內容見下文，空時省略。
   它絕不保存 secret 的值、step 的腳本或套件清單。
 - **tasks config 上每個 dest 一筆。** 同一次 apply 中兩個 file task 寫入的 dest（拼法相同或只差重複的斜線）只有一筆檔案項目，
   以第一個拼法記錄：`previous` 取自第一次寫入之前，
@@ -1157,7 +1161,8 @@ mode 記錄時不含 setuid 與 setgid 位元，anvil 不動目錄上的這兩�
 因此被終止的 apply 會把已寫入的每個項目留在紀錄中。文字檔很多的樹可能超過下述 16 MiB 上限，被捨棄的文字就無法 rollback；
 [`anvil plan`](#anvil-plan) 會對這樣的樹發出警告。
 
-**版本。** 只有當某個 target 有 `dirs`、`links` 或 `absent`，或某個檔案有 `created_dirs`，或是位元組未變、只修正了擁有者、群組或 mode（`fixed DEST: …`），或帶有 `binary` 時，紀錄才寫成
+**版本。** 只有當某個 target 有 `dirs`、`links` 或 `absent`，或某個檔案有 `created_dirs`，或是位元組未變、只修正了擁有者、群組或 mode（`fixed DEST: …`），或帶有
+`binary` 或 `secret` 時，紀錄才寫成
 `"version": 2`；其他情況維持 `"version": 1`（如上例），這個 anvil 兩者都能讀。舊版 anvil 會拒絕 version 2 的紀錄，
 顯示 `apply: PATH: version 2 is not supported`（rollback 時為 `rollback: …`），而不是載入後在下一次儲存時遺失那些欄位；
 請對該紀錄持續使用這個或更新的 anvil。
@@ -1169,7 +1174,8 @@ mode 記錄時不含 setuid 與 setgid 位元，anvil 不動目錄上的這兩�
 **保存或不保存。** 只有在先前的檔案是所有人可讀（mode 含 `0o004`）、文字是不含 NUL 位元組的 UTF-8、最多 256 KiB，
 項目沒有設定 `rollback = false`，且寫入的 src 不是二進位檔案時，才會保存它。否則 `kept` 為 false，`reason` 說明原因：`rollback = false`、
 `not world-readable`、`over 256 KiB`、`binary`（先前的檔案或 src 不是 UTF-8 或含 NUL 位元組）、`unreadable`、`no od on the target` 或 `record full`。
-`binary` 檔案項目卻保存了先前文字的紀錄，載入時會被拒絕。
+`binary` 檔案項目卻保存了先前文字的紀錄，載入時會被拒絕。secret file 既不保存文字也不保存雜湊，
+之後對它的寫入絕不會被合併為未變更，所以輪替過的 secret 會再次被記錄。`secret` 檔案項目卻保存了雜湊或文字的紀錄，載入時會被拒絕。
 不論哪種情況寫入都會進行；失去的只是它的復原，rollback 會把該檔案顯示為 `cannot undo: DEST (REASON)`。
 `rollback = false` 只保存雜湊：dest 保存 secret 時請使用它（[Files](configuration.zh-TW.md#files)）。
 
@@ -1247,7 +1253,7 @@ rollback 只放回擁有者、群組與 mode。中途失敗的寫入在下一次
 
 plan 絕不開啟 secret store。會輸入 sudo 密碼的 step 會註明它要用哪個 secret；
 該 secret 是否已設定、是否不含控制字元則不檢查，因此 plan 可能通過，而 apply 接著以 `packages: secret NAME is not set` 失敗。
-secret 由 `anvil doctor` 檢查。
+secret 由 `anvil doctor` 檢查。[Secret file](configuration.zh-TW.md#secret-files) 也不會算繪：它的 secret 是否已設定，要到 apply 才知道。
 
 ```text
 ▶ local
@@ -1274,6 +1280,8 @@ secret 由 `anvil doctor` 檢查。
   該 target 算繪文字的大小與完整 sha256，也就是 apply 會寫入的位元組。算繪失敗的 target 以 `✘` 加上範本訊息結束
   （[Templating](configuration.zh-TW.md#templating)）。`--show-content` 另加每個 file step 的大小、sha256 與文字（見下方 **檔案內容**）。
   `mode` 不給其他人讀取權限的檔案改為顯示 `rendered N bytes (hidden: mode MODE)`，不含 sha256。
+- [Secret file](configuration.zh-TW.md#secret-files) step 為 `would write DEST (secret: NAME, NAME; rendered at apply)`，
+  列出它的 secret，沒有大小、沒有 sha256，也沒有 `rendered` 行：plan 從不開啟 store，所以不算繪它。它的 src 仍會檢查語法。
 - 帶有 guard 的 step 在其 `would $` 行下方每個 guard 多一行，依檢查順序：`creates PATH`、`removes PATH`、
   `onlyif CMD`、`unless CMD`（[Guarded steps](#guarded-steps)）。plan 從不執行它們，因此無法得知 apply 是否會略過該 step。
 - file step 為其項目設定的 `owner`、`group` 與 `parents` 各多一行 `owner NAME`、`group NAME`、`parents`，位於 guard 行之後。
@@ -1305,7 +1313,8 @@ secret 由 `anvil doctor` 檢查。
 step 只有 `run`、apply 會輸入 sudo 密碼時的 `sudo_secret`、tasks config 上的 `task` 與 `name`、
 設定了它們的 file step 的 `owner`、`group` 與 `parents`（`true`）、dir step 的 `mode` 與這三個鍵、
 link step 的 `target`、`force`（`true`）與 `parents`、absent step 的 `path` 與 `type`（設定了時）、有 guard 的 step 的
-`guards`，以及帶有 `notify` 的 step 的 `notify`（名稱），絕不會有 `code`、`stdout` 或 `stderr`。
+`guards`、帶有 `notify` 的 step 的 `notify`（名稱），以及 secret file step 的 `"secret": true` 與 `secrets`（名稱）、不含 `rendered`，
+絕不會有 `code`、`stdout` 或 `stderr`。
 有待執行 handler 的已規劃 target 另有 `pending_handlers`，空時省略；紀錄的載入警告則是最上層的 `warnings` 陣列，文字相同但不含 `WARNING:` 前綴，空時省略。
 有 vars 或 env 的 target 另有 `vars` 與 `env`，與 doctor 的 `--json` 相同
 （`"vars": {"port": {"value": 8080, "level": "tag:web"}}`），而 step 的 `run` 是照寫的腳本，不含 env 行：
@@ -1393,6 +1402,8 @@ link step 的 `target`、`force`（`true`）與 `parents`、absent step 的 `pat
 - `mode` 不給其他人讀取權限的檔案（`0600`、`0640`、`0750`，範本檔案也一樣）只顯示大小，
   即 `content N bytes (hidden: mode MODE)` 或 `rendered N bytes (hidden: mode MODE)`：沒有 sha256 也沒有文字，
   讓金鑰與其他私密檔案不出現在終端機上。範本檔案不加旗標時也是這一行 `rendered`。
+- [Secret file](configuration.zh-TW.md#secret-files) 只顯示 `(secret: not rendered at plan)`：沒有大小、sha256、文字，
+  `--json` 中也沒有 `content` 物件。
 - [遞迴複製](configuration.zh-TW.md#recursive-copy)的每個檔案項目，在它的 `would $ file PATH` 下方有相同的幾行。
   因 target 不符合而略過的 step 則沒有。
 
@@ -1738,6 +1749,13 @@ facts = { distro = "arch" }
 
 `unchanged` 需要 target 上有 `cmp`（diffutils）；沒有它時每次執行都會重寫檔案並印出 `wrote DEST`。
 
+[Secret file](configuration.zh-TW.md#secret-files) 印出相同的行。其 target 上每個 step 的輸出（`--json` 也一樣）中，
+它的每個 secret 值以及含有某個值的文字經 `b64encode` 的每個輸出，都會被換成 `***`。它的寫入失敗時顯示
+`files[0]: write failed on the target (exit N); its output is hidden for a secret file`（被終止時為 `(killed)`），
+寫入前讀取 dest 失敗時顯示 `files[0]: could not read DEST on the target (exit N); its output is hidden for a secret file`，
+絕不顯示 target 的文字。secret 未設定、短於 8 個位元組或不是 UTF-8 時，target 會在第一個 step 之前失敗：
+`files[0]: secret NAME is not set`。
+
 在 `--json` 中，file step 的 `run` 就是該標籤。略過的 step 帶有 `"skipped": true`、`code` 為 0 且輸出為空：
 
 ```json
@@ -1748,7 +1766,8 @@ facts = { distro = "arch" }
 
 `anvil plan` 顯示 `would $ file DEST`（二進位 src 加上 `(binary)`，表示它的 rollback 會失去；apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
 與 `would $ skipped file DEST: no match`；項目設定了它們時另加 `owner NAME`、`group NAME` 與 `parents` 行，範本檔案另加一行
-`rendered N bytes, sha256 HEX`（其他人無法讀取時為 `rendered N bytes (hidden: mode MODE)`）；`--show-content` 另加 `content` 或 `rendered` 行與文字。
+`rendered N bytes, sha256 HEX`（其他人無法讀取時為 `rendered N bytes (hidden: mode MODE)`），secret file 則改為
+`would write DEST (secret: NAME; rendered at apply)`；`--show-content` 另加 `content` 或 `rendered` 行與文字。
 在 `plan --json` 中 `run` 是同一個標籤，二進位 src 另有 `binary: true`，走密碼路徑時另有 `sudo_secret`，項目設定了它們時另有 `owner`、`group` 與 `parents`（`true`）。
 
 不是 UTF-8、或含 NUL 位元組的 src 是[二進位檔案](configuration.zh-TW.md#files)，會逐位元組複製。
@@ -2197,6 +2216,8 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
 - **最後寫入的先處理。** 每個記錄的檔案是一個 step，順序與 apply 寫入時相反：`restore DEST` 印出 `restored DEST`，
   `remove DEST` 印出 `removed DEST`；DEST 已經是 apply 之前的樣子時，兩者都印出 `unchanged DEST`（restore 仍會把擁有者、群組與 mode 設回去）。
   文字沒有保存的檔案是一個略過的 step `cannot undo: DEST (REASON)`，原因取自紀錄（例如 `rollback = false`）。
+- **Secret file。** [Secret file](configuration.zh-TW.md#secret-files) 一律是 `cannot undo: DEST (secret)`，DEST 保持原狀；
+  rollback 從不開啟 secret store。
 - **二進位檔案。** src 是[二進位檔案](configuration.zh-TW.md#files)的檔案一律是 `cannot undo: DEST (binary)`，DEST 保持原狀，
   apply 之前它不存在、或只改了擁有者、群組或 mode 時也一樣（已知的限制）；`parents = true` 為它建立的目錄也會留下。
 - **只有擁有者、群組與 mode。** apply 印出 `fixed DEST: …` 之後，step 為 `restore owner, group and mode of DEST`。

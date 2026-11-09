@@ -146,6 +146,29 @@ English | [繁體中文](security.zh-TW.md)
   so `--json`) has any occurrence of a password of 8 bytes or more replaced with `***`; a shorter one is not scrubbed.
   sudo must show anvil's own prompt; a PAM prompt of another kind (2FA, fingerprint) fails the target after 15 s. See
   [Typing the sudo password](packages.md#typing-the-sudo-password).
+- **Secret files stay out of sight, not off the target.** A `[[files]]` entry or file task with
+  [`secrets`](configuration.md#secret-files) sends its rendered text to the target only on stdin: in the write's
+  heredoc, or, on the sudo-password path, staged into a 0600 temp file (the
+  [password path](configuration.md#files)). plan, `--show-content`, the TUI viewer and doctor
+  never render it or open the store, and the apply record keeps `secret: true` with no hash of what was written or
+  replaced, since a hash of a template whose only unknown is a short token can be guessed offline; so rollback cannot
+  undo it and doctor does not compare it. The hash apply checks dest against before the write never appears on argv or
+  in a log: on the sudo-password path it is staged on stdin into a 0600 sidecar `<temp>.sha256`, removed with the temp.
+  Step output on that target (and so `--json`) has each value, and each `b64encode` output of a string that held a whole
+  value, replaced with `***`, and a failed write or read of dest shows its exit status, never the target's output. A
+  file secret shorter than 8 bytes is refused: apply fails that target with
+  `files[0]: secret NAME is shorter than 8 bytes`, so no short value is written unscrubbed. Known limits:
+  - The file on the target is protected by its mode only, which must give group and others nothing (`0600`, `0400`,
+    `0700`), so root and the owner can read it.
+  - Only the raw value and the `b64encode` outputs of strings that contain the whole value are scrubbed. Any other
+    transform is not: `upper`, a slice, `urlencode`, `tojson`, shell quoting, or `b64encode` of part of a value.
+  - The template is trusted like the config: its author can make a render error, or which line fails, depend on a
+    secret's value, and so learn something about it from the message.
+  - Only the loaded values, the final render and the scrub list are zeroed when dropped; the strings the template
+    engine builds along the way are not.
+  - On the sudo-password path, the rendered file and its sidecar hash are staged in 0600 `/tmp/anvil-…` files owned by
+    the connecting user. They are removed after the step, on success, failure or cancel; a lost connection or a killed
+    anvil mid-write can leave them behind, readable only by that user and root.
 - **Plugins are pinned, not sandboxed.** A plugin runs only when a `[plugins]` entry names its file and the file's bytes
   hash to its `sha256` ([Plugins](configuration.md#plugins)). What that does and does not cover:
   - Only the file and its own directory are checked (owned by you, no group or other write bit), not the directories

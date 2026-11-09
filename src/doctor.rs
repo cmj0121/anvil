@@ -224,6 +224,13 @@ pub struct DriftSummary {
     pub no_sudo: usize,
     pub no_hash: usize,
     pub rolled_back: usize,
+    /// Files built from secrets, which the record keeps no hash of.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub secret: usize,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 impl TargetReport {
@@ -637,7 +644,8 @@ impl DoctorRun {
 /// What each of `entry`'s dests holds now, in order: one hash run over
 /// `transport`, as root (a root login, or `sudo -n`) for a `sudo` file. On
 /// a target whose sudo asks for a password, those are `no_sudo` without a
-/// run: doctor never types it.
+/// run: doctor never types it. A file built from secrets is `secret`,
+/// never hashed.
 fn hash_files(
     entry: &TargetRecord,
     facts: &Facts,
@@ -649,7 +657,9 @@ fn hash_files(
     let mut run = Vec::new();
     let mut indexes = Vec::new();
     for (i, file) in entry.files.iter().enumerate() {
-        if !(file.sudo && !root && facts.sudo_asks_password()) {
+        if file.secret {
+            states[i] = (FileState::Secret, None);
+        } else if !(file.sudo && !root && facts.sudo_asks_password()) {
             run.push(HashDest {
                 dest: &file.dest,
                 as_root: root || file.sudo,
@@ -675,8 +685,8 @@ fn hash_files(
     Ok(states)
 }
 
-/// The files of `entry` no plugin can compare: rolled back since, or with
-/// no hash tool or no sudo. `None` when every file is compared.
+/// The files of `entry` no plugin can compare: built from secrets, rolled
+/// back since, or with no hash tool or no sudo. `None` when every file is compared.
 fn summary(
     name: &str,
     entry: &TargetRecord,
@@ -689,6 +699,7 @@ fn summary(
             .as_ref()
             .is_some_and(|rb| rb.at >= entry.at && rb.dests.contains(&file.dest));
         match state {
+            FileState::Secret => summary.secret += 1,
             _ if rolled_back => summary.rolled_back += 1,
             FileState::NoSudo => summary.no_sudo += 1,
             FileState::NoHash => summary.no_hash += 1,
@@ -1184,6 +1195,7 @@ pub fn drift_rows(drift: &DriftSummary) -> Vec<(&'static str, String)> {
         (drift.no_sudo, "no sudo"),
         (drift.no_hash, "no hash tool"),
         (drift.rolled_back, "rolled back"),
+        (drift.secret, "secret"),
     ]
     .into_iter()
     .filter(|(count, _)| *count > 0)
@@ -1961,6 +1973,7 @@ mod tests {
                 written_attrs: None,
                 created_dirs: Vec::new(),
                 binary: false,
+                secret: false,
             })
             .collect();
         Record {
@@ -2124,7 +2137,8 @@ mod tests {
                 not_compared: 2,
                 no_sudo: 2,
                 no_hash: 0,
-                rolled_back: 0
+                rolled_back: 0,
+                secret: 0,
             })
         );
         let request: Value =
@@ -2145,6 +2159,32 @@ mod tests {
                 .is_none()
         );
         assert!(!request.to_string().contains(X_SHA));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_built_from_secrets_is_not_compared_and_never_hashed() {
+        let mut record = recorded(&[("/etc/app.env", false)]);
+        let file = &mut record.targets.get_mut("box").unwrap().files[0];
+        (file.secret, file.written_sha256) = (true, String::new());
+        let (dir, run) = doctor_run("doctor-secret", EMPTY, Some(record));
+        let (reports, drift) =
+            run.target(&host("box"), &facts("user=cmj\n"), &Never, &Cancel::new());
+        assert!(reports[0].passed(), "{reports:?}");
+        let drift = drift.unwrap();
+        assert_eq!((drift.not_compared, drift.secret), (1, 1));
+        assert_eq!(
+            drift_rows(&drift),
+            [("files", "1 not compared (1 secret)".to_owned())]
+        );
+        let request: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("record.stdin")).unwrap())
+                .unwrap();
+        assert_eq!(
+            request["current_files"],
+            serde_json::json!([{"dest": "/etc/app.env", "state": "secret"}])
+        );
+        assert_eq!(request["last_apply"]["files"][0]["written_tag"], "");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2173,7 +2213,8 @@ mod tests {
                 not_compared: 2,
                 no_sudo: 0,
                 no_hash: 1,
-                rolled_back: 1
+                rolled_back: 1,
+                secret: 0,
             })
         );
         let request = std::fs::read_to_string(dir.join("record.stdin")).unwrap();
@@ -2375,10 +2416,11 @@ mod tests {
             },
         ];
         report.drift = Some(DriftSummary {
-            not_compared: 3,
+            not_compared: 4,
             no_sudo: 2,
             no_hash: 0,
             rolled_back: 1,
+            secret: 1,
         });
         let store = Memory::default();
         let text = render(&Report::new(healthy_local(&store, &[]), vec![report]));
@@ -2392,7 +2434,7 @@ mod tests {
                  \x20 first           no apply recorded\n\
                  \x20 slow            error: plugin slow: timed out after 30s\n\
                  \x20 quiet           no drift\n\
-                 \x20 files           3 not compared (2 no sudo, 1 rolled back)\n\
+                 \x20 files           4 not compared (2 no sudo, 1 rolled back, 1 secret)\n\
                  \x20 sudo            WARNING: sudo -n was refused or asks for a \
                  password; 2 root-only files were not compared\n"
             ),

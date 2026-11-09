@@ -174,6 +174,20 @@ impl Expanded {
             .map(|(_, entry, _)| entry)
     }
 
+    /// The secrets the file items with `secrets` read on a target their
+    /// tags reach (its facts are not known yet).
+    pub fn file_secrets<'a>(&'a self, targets: &[Target]) -> BTreeSet<&'a str> {
+        let mut names = BTreeSet::new();
+        for item in &self.items {
+            if let ItemKind::File { entry, .. } = &item.kind
+                && (targets.iter()).any(|target| files::has_tags(&item.tags, target))
+            {
+                names.extend(entry.secrets.iter().flatten().map(String::as_str));
+            }
+        }
+        names
+    }
+
     /// The sudo secrets a step may type on a target its tags reach: for a
     /// package item, a `sudo = true` dir, file, link or absent item or a
     /// service item; and on
@@ -1983,6 +1997,58 @@ mod tests {
             ),
         ] {
             assert_eq!(ws.expand(&config(keys)).unwrap_err(), message, "{keys}");
+        }
+    }
+
+    #[test]
+    fn a_task_file_takes_secrets_under_the_files_rules() {
+        let ws = Workspace::new();
+        let config = |keys: &str| {
+            format!(
+                "[[tasks]]\nrun = \"x\"\n\n[[tasks]]\nfile = {{ src = \"app.env.j2\", dest = \"/etc/app.env\"{keys} }}\n"
+            )
+        };
+        let good =
+            config(", mode = \"0600\", template = true, rollback = false, secrets = [\"TOKEN\"]");
+        let expanded = ws.expand(&good).unwrap();
+        let (_, entry, _) = expanded.files().next().unwrap();
+        assert_eq!(
+            entry.secrets.as_deref(),
+            Some(["TOKEN".to_string()].as_slice())
+        );
+        let parsed: Config = toml::from_str(&good).unwrap();
+        for format in [Format::Toml, Format::Yaml] {
+            let text = document::to_string(&parsed, format).unwrap();
+            let back: Config = document::from_str(&text, format).unwrap();
+            assert_eq!(back, parsed, "{text}");
+        }
+        for (keys, message) in [
+            (
+                ", mode = \"0600\", template = true, rollback = false, secrets = []",
+                "tasks[1].file.secrets: is empty; remove it",
+            ),
+            (
+                ", mode = \"0600\", template = true, rollback = false, secrets = [\"x\"]",
+                "tasks[1].file.secrets[0] `x`: must match [A-Z][A-Z0-9_]*",
+            ),
+            (
+                ", mode = \"0600\", secrets = [\"A\", \"A\"]",
+                "tasks[1].file.secrets[1] `A`: same name as secrets[0]",
+            ),
+            (
+                ", mode = \"0600\", rollback = false, secrets = [\"TOKEN\"]",
+                "tasks[1].file.secrets: needs template = true",
+            ),
+            (
+                ", mode = \"0640\", template = true, rollback = false, secrets = [\"TOKEN\"]",
+                "tasks[1].file.secrets: mode `0640` lets group or others in; use a mode such as \"0600\"",
+            ),
+            (
+                ", mode = \"0600\", template = true, secrets = [\"TOKEN\"]",
+                "tasks[1].file.secrets: needs rollback = false; rollback cannot restore a file built from secrets",
+            ),
+        ] {
+            assert_eq!(ws.refusal(&config(keys)), message, "{keys}");
         }
     }
 
