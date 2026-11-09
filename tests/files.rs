@@ -587,3 +587,219 @@ fn the_dangling_warning_escapes_a_bidi_character_in_a_task_reference() {
     assert!(stderr.contains("`$/evil\\u{202e}`"), "{stderr}");
     assert!(!stderr.contains('\u{202e}'), "{stderr}");
 }
+
+/// `config.toml` for a [`common::secret_sandbox`]: its `[secrets]` table,
+/// then a 0600 templated `app.env` at `dest` reading `names`, then a step
+/// that prints what was written.
+fn secret_file_config(secrets: &str, dest: &str, names: &str) -> String {
+    format!(
+        "{secrets}[[files]]\nsrc = \"app.env.j2\"\ndest = \"{dest}\"\nmode = \"0600\"\nsudo = false\n\
+         template = true\nrollback = false\nsecrets = [{names}]\n\n\
+         [[steps]]\nrun = \"cat {dest}\"\n"
+    )
+}
+
+const SECRET_TEMPLATE: &str =
+    "TOKEN={{ secrets.TOKEN }}\nAUTH={{ (\"cmj:\" ~ secrets.TOKEN) | b64encode }}\n";
+/// The base64 of `cmj:` and [`common::VALUE`].
+const VALUE_AUTH: &str = "Y21qOnMzY3IzdC1odW50ZXIy";
+/// The base64 of `cmj:fake-value-two`, the rotated value.
+const ROTATED_AUTH: &str = "Y21qOmZha2UtdmFsdWUtdHdv";
+
+/// Fails when `text` shows the secret, its encoded form or the hash of the
+/// file rendered from it.
+fn assert_no_secret(what: &str, text: &str, rendered: &str) {
+    for needle in [common::VALUE, VALUE_AUTH, &common::sha256_hex(rendered)] {
+        assert!(!text.contains(needle), "{what} shows {needle}: {text}");
+    }
+}
+
+#[test]
+fn a_file_built_from_secrets_is_written_but_never_shown_recorded_or_undone() {
+    let (s, secrets) = common::secret_sandbox("fs-secret", &["TOKEN"]);
+    fs::write(s.config_dir().join("app.env.j2"), SECRET_TEMPLATE).unwrap();
+    let dest = s.root().join("app.env");
+    let dest = dest.to_str().unwrap();
+    s.write_config(
+        "config.toml",
+        &secret_file_config(secrets, dest, "\"TOKEN\""),
+    );
+    let rendered = format!("TOKEN={}\nAUTH={VALUE_AUTH}\n", common::VALUE);
+
+    let out = run(&s, &["-vvv", "apply"], 0);
+    assert_eq!(fs::read_to_string(dest).unwrap(), rendered);
+    assert_eq!(common::mode(dest), 0o600);
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(&format!("  wrote {dest}\n"))
+            && stdout.contains("  TOKEN=***\n  AUTH=***\n"),
+        "{stdout}"
+    );
+    assert_no_secret("stdout", &stdout, &rendered);
+    assert_no_secret("stderr", &text(&out.stderr), &rendered);
+    let out = run(&s, &["--json", "apply"], 0);
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][1]["stdout"],
+        "TOKEN=***\nAUTH=***\n"
+    );
+    assert_no_secret("json", &text(&out.stdout), &rendered);
+
+    let raw = fs::read_to_string(s.state_home().join("anvil/last-apply.json")).unwrap();
+    assert_no_secret("record", &raw, &rendered);
+    let record = s.last_apply().unwrap();
+    assert_eq!(record["version"], 2);
+    let file = &record["targets"]["local"]["files"][0];
+    assert_eq!(file["secret"], true, "{file}");
+    assert!(file.get("written_sha256").is_none(), "{file}");
+    assert_eq!(file["previous"]["sha256"], "", "{file}");
+    assert!(file["previous"].get("text").is_none(), "{file}");
+
+    let out = run(&s, &["-vv", "apply"], 0);
+    assert!(
+        text(&out.stdout).contains(&format!("  unchanged {dest}\n")),
+        "{}",
+        text(&out.stdout)
+    );
+
+    // A rotated secret is written again, not kept as unchanged.
+    let rotated = s.root().join("rotated.txt");
+    fs::write(&rotated, "fake-value-two\n").unwrap();
+    let out = s.edit(&["secret", "TOKEN"], Some(&rotated), None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let out = run(&s, &["-vv", "apply"], 0);
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains(&format!("  wrote {dest}\n")), "{stdout}");
+    assert!(!stdout.contains("fake-value-two"), "{stdout}");
+    assert!(!stdout.contains(ROTATED_AUTH), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(dest).unwrap(),
+        format!("TOKEN=fake-value-two\nAUTH={ROTATED_AUTH}\n")
+    );
+    let written = fs::read_to_string(dest).unwrap();
+
+    // With the store broken, plan, doctor and rollback still run: none
+    // opens it. Rollback leaves the file as it is.
+    fs::remove_file(s.root().join("h/key.txt")).unwrap();
+    for args in [
+        ["plan"].as_slice(),
+        ["plan", "--show-content"].as_slice(),
+        ["doctor"].as_slice(),
+        ["rollback", "--dry-run"].as_slice(),
+        ["-vv", "rollback"].as_slice(),
+    ] {
+        let out = s.anvil(args, &[]);
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert!(!stderr.contains("key.txt"), "{args:?}: {stderr}");
+        assert_no_secret("stdout", &stdout, &rendered);
+        if args[0] == "doctor" {
+            continue;
+        }
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {stderr}");
+        if args.contains(&"rollback") {
+            assert!(
+                stdout.contains(&format!("cannot undo: {dest} (secret)\n")),
+                "{args:?}: {stdout}"
+            );
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(dest).unwrap(),
+        written,
+        "dest left alone"
+    );
+    let out = s.anvil(&["apply"], &[]);
+    assert_eq!(out.status.code(), Some(1), "apply opens the store");
+    assert!(
+        text(&out.stderr).contains("key.txt"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn a_secret_that_is_not_set_fails_the_target_before_any_step() {
+    let (s, secrets) = common::secret_sandbox("fs-unset", &["TOKEN"]);
+    fs::write(s.config_dir().join("app.env.j2"), SECRET_TEMPLATE).unwrap();
+    let dest = s.root().join("app.env");
+    let dest = dest.to_str().unwrap();
+    s.write_config(
+        "config.toml",
+        &secret_file_config(secrets, dest, "\"TOKEN\", \"MISSING\""),
+    );
+    let out = run(&s, &["--json", "apply"], 1);
+    assert_eq!(
+        json(&out)["targets"][0]["error"],
+        "files[0]: secret MISSING is not set"
+    );
+    assert!(!fs::exists(dest).unwrap(), "nothing written");
+}
+
+#[test]
+fn a_failed_secret_write_hides_what_the_target_printed() {
+    let (s, secrets) = common::secret_sandbox("fs-fail", &["TOKEN"]);
+    fs::write(s.config_dir().join("app.env.j2"), SECRET_TEMPLATE).unwrap();
+    let dest = s.root().join("missing/app.env");
+    let dest = dest.to_str().unwrap();
+    s.write_config(
+        "config.toml",
+        &secret_file_config(secrets, dest, "\"TOKEN\""),
+    );
+    let out = run(&s, &["--json", "apply"], 1);
+    let step = &json(&out)["targets"][0]["steps"][0];
+    let code = step["code"].as_i64().unwrap();
+    assert_eq!(
+        step["stderr"],
+        format!(
+            "files[0]: write failed on the target (exit {code}); its output is hidden for a secret file"
+        ),
+        "{step}"
+    );
+    assert_eq!(step["stdout"], "");
+}
+
+#[test]
+fn apply_opens_no_store_without_a_file_that_reads_secrets() {
+    let (s, secrets) = common::secret_sandbox("fs-nostore", &[]);
+    fs::remove_file(s.root().join("h/key.txt")).unwrap();
+    fs::write(
+        s.config_dir().join("motd.j2"),
+        "host {{ facts.hostname }}\n",
+    )
+    .unwrap();
+    let dest = s.root().join("motd");
+    s.write_config(
+        "config.toml",
+        &format!(
+            "{secrets}[[files]]\nsrc = \"motd.j2\"\ndest = \"{}\"\nmode = \"0644\"\nsudo = false\n\
+             template = true\n",
+            dest.display()
+        ),
+    );
+    run(&s, &["apply"], 0);
+    assert!(dest.exists());
+}
+
+#[test]
+fn a_failed_capture_of_a_secret_dest_hides_what_the_target_printed() {
+    let (s, secrets) = common::secret_sandbox("fs-capture", &["TOKEN"]);
+    fs::write(s.config_dir().join("app.env.j2"), SECRET_TEMPLATE).unwrap();
+    let dest = s.root().join("app.env");
+    fs::create_dir(&dest).unwrap();
+    let dest = dest.to_str().unwrap();
+    s.write_config(
+        "config.toml",
+        &secret_file_config(secrets, dest, "\"TOKEN\""),
+    );
+    let out = run(&s, &["--json", "apply"], 1);
+    let step = &json(&out)["targets"][0]["steps"][0];
+    let code = step["code"].as_i64().unwrap();
+    assert_eq!(
+        step["stderr"],
+        format!(
+            "files[0]: could not read {dest} on the target (exit {code}); \
+             its output is hidden for a secret file"
+        ),
+        "{step}"
+    );
+    assert_eq!(step["stdout"], "");
+}

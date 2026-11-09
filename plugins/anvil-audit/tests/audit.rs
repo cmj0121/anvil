@@ -96,6 +96,14 @@ fn nothing_changed_but_the_sudo_fact_has_no_findings() {
 }
 
 #[test]
+fn a_file_built_from_secrets_has_no_findings() {
+    assert_eq!(
+        reply(&fixture("secret.json")),
+        json!({"ok": true, "findings": []})
+    );
+}
+
+#[test]
 fn each_changed_fact_then_each_changed_file_is_a_finding() {
     let written = Some("written");
     assert_eq!(

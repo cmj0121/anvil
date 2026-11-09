@@ -1329,3 +1329,67 @@ fn a_tree_whose_kept_texts_may_fill_the_record_warns_in_text_and_json() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(json(&out)["warnings"], serde_json::json!([warning]));
 }
+
+#[test]
+fn a_file_built_from_secrets_is_shown_unrendered_without_opening_the_store() {
+    let sandbox = Sandbox::new("pl").without_debug_flags();
+    sandbox.write_config("inventory.toml", "");
+    std::fs::write(
+        sandbox.config_dir().join("app.env.j2"),
+        "TOKEN={{ secrets.TOKEN }}\nAUTH={{ ('u:' ~ secrets.OTHER) | b64encode }}\n",
+    )
+    .unwrap();
+    let dest = sandbox.root().join("app.env");
+    let dest = dest.display();
+    let run = touching(
+        &sandbox,
+        &format!(
+            "[secrets]\nbackend = \"age\"\n\n[secrets.age]\npath = \"{}\"\nidentity = \"{}\"\n\n\
+             [[files]]\nsrc = \"app.env.j2\"\ndest = \"{dest}\"\nmode = \"0600\"\nsudo = false\n\
+             template = true\nrollback = false\nsecrets = [\"TOKEN\", \"OTHER\"]\n\n",
+            sandbox.root().join("store.age").display(),
+            sandbox.root().join("missing-key.txt").display(),
+        ),
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  would write {dest} (secret: TOKEN, OTHER; rendered at apply)\n  \
+             would $ {run}\n  ✔ 2 steps\n\n1 target, nothing executed\n"
+        )
+    );
+    let out = sandbox.anvil(&["plan", "--show-content", "--show-rendered"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains(&format!(
+            "  would write {dest} (secret: TOKEN, OTHER; rendered at apply)\n    \
+             (secret: not rendered at plan)\n"
+        )),
+        "{}",
+        text(&out.stdout)
+    );
+    for args in [
+        ["--json", "plan"].as_slice(),
+        ["--json", "plan", "--show-content", "--show-rendered"].as_slice(),
+    ] {
+        let out = sandbox.anvil(args, &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        let value = json(&out);
+        assert_eq!(
+            value["targets"][0]["steps"][0],
+            serde_json::json!({
+                "run": format!("file {dest}"), "secret": true, "secrets": ["TOKEN", "OTHER"],
+            }),
+            "{args:?}"
+        );
+        assert!(value.get("content").is_none() && value.get("rendered").is_none());
+        let stdout = text(&out.stdout);
+        assert!(
+            !stdout.contains("sha256") && !stdout.contains("bytes"),
+            "{stdout}"
+        );
+        assert!(!text(&out.stderr).contains("missing-key.txt"));
+    }
+}
