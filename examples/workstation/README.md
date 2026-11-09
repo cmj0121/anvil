@@ -22,7 +22,7 @@ rendered from the inventory's vars.
 ## Try it
 
 `plan` prints the steps, including the file steps, and runs none. Under the templated file it shows
-`rendered N bytes, sha256 HEX`; add `--show-rendered` to see the text this machine would get.
+`rendered N bytes, sha256 HEX`; add `--show-content` to see the text this machine would get for each file.
 
 ```sh
 anvil --inventory examples/workstation/inventory.toml \

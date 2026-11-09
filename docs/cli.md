@@ -20,7 +20,7 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
   doctor                         local checks + every target's facts and reachability
   apply                          run the config's steps on every target
   plan                           show the steps apply would run on every target, running none
-       [--show-rendered]         --show-rendered also prints each templated file's rendered text
+       [--show-content]          --show-content also prints the bytes apply would write per file step
   rollback [--force DEST]...     restore the files the last apply wrote on every target
   run [--timeout SECS] <FILE|->  run a POSIX sh script on every target, read from FILE or stdin
   secret <NAME>                  edit one secret in the editor
@@ -1362,7 +1362,9 @@ secret is set and free of control characters is not checked, so plan can pass wh
   `(sudo password from secret NAME)` when apply would type that secret's value at sudo's prompt.
 - A [templated](configuration.md#templating) file step adds `rendered N bytes, sha256 HEX` under its `would $ file DEST`
   line: the size and the full sha256 of that target's rendered text, the bytes apply would write. A target whose render
-  fails ends in `✘` with the template message ([Templating](configuration.md#templating)).
+  fails ends in `✘` with the template message ([Templating](configuration.md#templating)). `--show-content` adds each
+  file step's size, sha256 and text (**File content**, below). A file whose `mode` gives others no read shows
+  `rendered N bytes (hidden: mode MODE)` instead, with no sha256.
 - A step with guards adds one line per guard under its `would $` line, in the order they are checked: `creates PATH`,
   `removes PATH`, `onlyif CMD`, `unless CMD` ([Guarded steps](#guarded-steps)). plan never runs them, so it cannot
   tell whether apply would skip the step.
@@ -1477,16 +1479,29 @@ for a directory. The bytes are never in it. The record warning above is in the t
 ]
 ```
 
-**Templated files.** plan never reads a dest, so it cannot diff; it shows what each target would get instead. Without
-a flag that is the `rendered N bytes, sha256 HEX` line, and no file bytes are printed. `--show-rendered` also prints
-each target's rendered text under that line, one `│ LINE` per line, with control and invisible characters escaped, and
-`(no newline at end)` when the text lacks a final newline. With the
+**File content.** plan never reads a dest, so it cannot diff; it shows what each target would get instead. Without a
+flag that is a templated file's `rendered N bytes, sha256 HEX` line, and no file bytes are printed. `--show-content`
+adds, under every file step's other lines (guards, `owner`, `group`, `parents`, `notifies`), the size and the full
+sha256 of the exact bytes apply would write, then their text:
+
+- A [templated](configuration.md#templating) file has its `rendered N bytes, sha256 HEX` line, of that target's
+  rendered text. Any other file, a `$/` store file included, has `content N bytes, sha256 HEX`.
+- The text follows, one `│ LINE` per line, with control and invisible characters escaped, and `(no newline at end)`
+  when the text lacks a final newline.
+- A [binary](configuration.md#files) src ends the line with `(binary)` and prints no text.
+- A file whose `mode` gives others no read (`0600`, `0640`, `0750`, a templated one included) shows only its size,
+  `content N bytes (hidden: mode MODE)` or `rendered N bytes (hidden: mode MODE)`: no sha256 and no text, so keys and
+  other private files stay off the terminal. A templated one has that `rendered` line without a flag too.
+- Each file item of a [recursive copy](configuration.md#recursive-copy) has the same lines under its
+  `would $ file PATH`. A step skipped on a target it does not match has none.
+
+Each plain src and tree item is hashed once, before any target; a templated file is hashed per target. With the
 [workstation example](../examples/workstation/):
 
 ```sh
 anvil --inventory examples/workstation/inventory.toml \
       --config examples/workstation/config.toml \
-      --target local plan --show-rendered
+      --target local plan --show-content
 ```
 
 prints, with the package step's long line cut:
@@ -1498,6 +1513,10 @@ prints, with the package step's long line cut:
   env.GIT_PAGER = less -FRX (global)
   would $ export PATH="$PATH:…"; … brew install $a; }
   would $ file /home/dev/.config/git/ignore
+    content 25 bytes, sha256 e07a5717a95137dc0995fbf65f47087047201da56df2e6574cfadbfb8644eae6
+    │ .DS_Store
+    │ *.swp
+    │ .direnv/
   would $ file /home/dev/.config/git/config
     rendered 152 bytes, sha256 e193e046d4db16a0590b91195db5e9bf31f7680334d590bd8b7a567de25541d8
     │ [user]
@@ -1514,44 +1533,80 @@ prints, with the package step's long line cut:
 1 target, nothing executed
 ```
 
-The rendered text holds whatever the vars put there; it is printed on your terminal only. In `--json` a templated step
-always has `"rendered": {"bytes": N, "sha256": "HEX"}`, and `--show-rendered` adds a top-level `rendered` list, one
-object per target and templated step, where `step` indexes that target's `steps` (`vars` and `env` left out here):
+With the entry of **Recursive copies** above, its `mode` set to `0644`, a second `[[files]]` entry
+`src = "app.key"`, `dest = "/srv/app.key"`, `mode = "0600"`, and a `hostname` step:
+
+```text
+▶ local
+  files[0] conf -> /srv/app (tree: 4 items, 9 bytes)
+  would $ dir /srv/app
+    mode 0750
+  would $ file /srv/app/a.conf
+    content 6 bytes, sha256 cb78bd8a17f7b751fe0d4663366dcbc257204033ef7ddd64b1f2969573b5b2e2
+    │ a = 1
+  would $ dir /srv/app/sub
+    mode 0750
+  would $ file /srv/app/sub/c.bin (binary)
+    content 3 bytes, sha256 ae4b3280e56e2faf83f414a6e3dabe9d5fbe18976544c05fed121accb85b53fc (binary)
+  would $ file /srv/app.key
+    content 15 bytes (hidden: mode 0600)
+  would $ hostname
+  ✔ 6 steps
+
+1 target, nothing executed
+```
+
+The text holds whatever the src and the vars put there; it is printed on your terminal only. In `--json` a templated
+step always has `"rendered": {"bytes": N, "sha256": "HEX"}`, or `{"bytes": N, "hidden": true}` for a hidden one, and
+`--show-content` adds a top-level `content` list, left out when empty: one object per target and file step with
+content, in step order. `step` indexes that target's `steps`, `path` is the dest (a tree item's full path), `sha256` is
+left out for a hidden file, and `text` is there only when the text is shown, never for a binary or hidden file. For
+the tree above (`targets` left out):
 
 ```json
 {
   "executed": false,
-  "targets": [
-    {
-      "target": "local",
-      "steps": [
-        { "run": "export PATH=\"$PATH:…\"; … brew install $a; }" },
-        { "run": "file /home/dev/.config/git/ignore" },
-        {
-          "run": "file /home/dev/.config/git/config",
-          "rendered": {
-            "bytes": 152,
-            "sha256": "e193e046d4db16a0590b91195db5e9bf31f7680334d590bd8b7a567de25541d8"
-          }
-        },
-        { "run": "git --version && echo \"pager: $GIT_PAGER\"" }
-      ],
-      "ok": true
-    }
-  ],
+  "targets": […],
   "ok": true,
-  "rendered": [
+  "content": [
     {
       "target": "local",
-      "step": 2,
-      "dest": "/home/dev/.config/git/config",
-      "text": "[user]\n    name = Dev\n    email = dev@home.example\n…"
+      "step": 1,
+      "path": "/srv/app/a.conf",
+      "bytes": 6,
+      "sha256": "cb78bd8a17f7b751fe0d4663366dcbc257204033ef7ddd64b1f2969573b5b2e2",
+      "binary": false,
+      "hidden": false,
+      "text": "a = 1\n"
+    },
+    {
+      "target": "local",
+      "step": 3,
+      "path": "/srv/app/sub/c.bin",
+      "bytes": 3,
+      "sha256": "ae4b3280e56e2faf83f414a6e3dabe9d5fbe18976544c05fed121accb85b53fc",
+      "binary": true,
+      "hidden": false
+    },
+    {
+      "target": "local",
+      "step": 4,
+      "path": "/srv/app.key",
+      "bytes": 15,
+      "binary": false,
+      "hidden": true
     }
   ]
 }
 ```
 
-The TUI's plan view shows the `rendered` line too, never the text.
+`--show-rendered` is kept for compatibility and hidden from `--help`. It prints each templated file's rendered text
+under its `rendered` line, and adds a top-level `rendered` list to `--json`, one `{"target", "step", "dest", "text"}`
+object per target and templated step. A hidden file is left out of both, so its text is never printed. With both flags
+the human output is `--show-content`'s.
+
+The TUI's plan view shows the `rendered` line too, never the text; `v` opens a file step's content in a
+[viewer](tui.md#the-content-viewer).
 
 Exit 0 when every selected target resolves, 1 when any cannot be reached or resolved, 2 for usage or config; 143 or
 129 when a first SIGTERM or SIGHUP ended the plan.
@@ -1807,9 +1862,10 @@ In `--json` a file step's `run` is that label. A skipped step has `"skipped": tr
 `anvil plan` shows `would $ file DEST`, with `(binary)` for a binary src, whose rollback is lost, and
 `(sudo password from secret NAME)` when apply would take the password path, and `would $ skipped file DEST: no match`;
 an entry that sets them adds `owner NAME`, `group NAME` and `parents` lines, and a templated file its
-`rendered N bytes, sha256 HEX` line. In `plan --json` the `run` is the same label, with
-`binary: true` for a binary src, `sudo_secret` for the password path and `owner`, `group` and `parents` (`true`) when
-the entry sets them.
+`rendered N bytes, sha256 HEX` line (`rendered N bytes (hidden: mode MODE)` when others cannot read it);
+`--show-content` adds the `content` or `rendered` line and the text. In `plan --json` the `run` is the same label,
+with `binary: true` for a binary src, `sudo_secret` for the password path and `owner`, `group` and `parents` (`true`)
+when the entry sets them.
 
 A src that is not UTF-8, or holds a NUL byte, is [binary](configuration.md#files) and copied byte for byte. It goes to
 the target as `printf` octal escapes, up to about four times its size on the wire, and the step's 30 s timeout grows by
@@ -1844,8 +1900,10 @@ Before each write, apply reads DEST back and keeps what it held in the [apply re
 [`anvil rollback`](#anvil-rollback) can put it back; the write then refuses a DEST that changed since that read.
 
 The file's bytes are never printed: not in the human output, `--json`, `plan`, the `-v` logs or the ssh command line.
-The one exception is a [templated](configuration.md#templating) file's rendered text under `anvil plan --show-rendered`,
-which you ask for ([`anvil plan`](#anvil-plan)).
+The exceptions are the ones you ask for: `anvil plan --show-content`, a [templated](configuration.md#templating)
+file's rendered text under `anvil plan --show-rendered` ([`anvil plan`](#anvil-plan)), and the TUI's
+[viewer and pager](tui.md#the-content-viewer). A file whose mode gives others no read shows only its size and sha256
+under `--show-content` and in the TUI.
 The bytes go to the target on the script's stdin; on the password path they go to a mode-0600 `/tmp/anvil-` file
 first, which is removed after the step, on success, failure or cancel. A lost connection or a killed anvil (a Ctrl-C
 while the bytes are staged, say) can leave that file behind, readable only by the connecting user.

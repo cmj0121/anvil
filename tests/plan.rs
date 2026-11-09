@@ -850,6 +850,233 @@ fn show_rendered_leaves_a_config_without_templates_unchanged() {
     assert_eq!(keys(&doc), ["executed", "ok", "targets"]);
 }
 
+/// A config with a plain, a `$/` store, a templated, a binary and a hidden
+/// file and a tree of one text and one binary item, all on `local`; the
+/// dests, in step order.
+fn with_content(sandbox: &Sandbox) -> [String; 7] {
+    let dir = sandbox.config_dir();
+    sandbox.write_config("inventory.toml", "[tags.local.vars]\nname = \"local\"\n");
+    std::fs::create_dir_all(dir.join("files")).unwrap();
+    std::fs::create_dir_all(dir.join("tree")).unwrap();
+    std::fs::write(dir.join("plain.txt"), "plain {{ vars.name }}\n").unwrap();
+    std::fs::write(dir.join("files").join("store.conf"), "store\n").unwrap();
+    std::fs::write(dir.join("site.j2"), "name = {{ vars.name }}").unwrap();
+    std::fs::write(dir.join("logo.png"), b"\x89PNG\0").unwrap();
+    std::fs::write(dir.join("site.key"), "KEY-BYTES\n").unwrap();
+    std::fs::write(dir.join("tree").join("a.txt"), "tree a\n").unwrap();
+    std::fs::write(dir.join("tree").join("b.bin"), b"\0\x01").unwrap();
+    let dest = |name: &str| sandbox.root().join(name).display().to_string();
+    let entry = |src: &str, dest: &str, mode: &str, more: &str| {
+        format!(
+            "[[files]]\nsrc = \"{src}\"\ndest = \"{dest}\"\nmode = \"{mode}\"\nsudo = false\n{more}\n"
+        )
+    };
+    let tree = dest("tree");
+    let dests = [
+        dest("plain.conf"),
+        dest("store.conf"),
+        dest("site.conf"),
+        dest("logo.png"),
+        dest("site.key"),
+        format!("{tree}/a.txt"),
+        format!("{tree}/b.bin"),
+    ];
+    sandbox.write_config(
+        "config.toml",
+        &[
+            entry("plain.txt", &dests[0], "0644", ""),
+            entry("$/store.conf", &dests[1], "0644", ""),
+            entry("site.j2", &dests[2], "0644", "template = true\n"),
+            entry("logo.png", &dests[3], "0644", ""),
+            entry("site.key", &dests[4], "0600", ""),
+            entry(
+                "tree",
+                &tree,
+                "0644",
+                "recursive = true\ndir_mode = \"0755\"\n",
+            ),
+        ]
+        .concat(),
+    );
+    dests
+}
+
+#[test]
+fn show_content_prints_what_apply_would_write_for_each_file_step() {
+    let sandbox = Sandbox::new("pl");
+    let [plain, store, site, logo, key, a, b] = with_content(&sandbox);
+    let tree = sandbox.root().join("tree");
+    let tree = tree.display();
+    let out = sandbox.anvil(&["plan", "--show-content"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "▶ local\n  vars.name = \"local\" (tag:local)\n  would $ file {plain}\n    content 22 bytes, sha256 {}\n    \
+             │ plain {{{{ vars.name }}}}\n  would $ file {store}\n    content 6 bytes, sha256 {}\n    \
+             │ store\n  would $ file {site}\n    rendered 12 bytes, sha256 {}\n    │ name = local\n    \
+             (no newline at end)\n  would $ file {logo} (binary)\n    content 5 bytes, sha256 {} (binary)\n  \
+             would $ file {key}\n    content 10 bytes (hidden: mode 0600)\n  \
+             files[5] tree -> {tree} (tree: 3 items, 9 bytes)\n  would $ dir {tree}\n    mode 0755\n  \
+             would $ file {a}\n    content 7 bytes, sha256 {}\n    │ tree a\n  \
+             would $ file {b} (binary)\n    content 2 bytes, sha256 {} (binary)\n  would $ hostname\n  ✔ 9 steps\n\n\
+             1 target, nothing executed\n",
+            sha256_hex("plain {{ vars.name }}\n"),
+            sha256_hex("store\n"),
+            sha256_hex("name = local"),
+            sha256_hex(b"\x89PNG\0"),
+            sha256_hex("tree a\n"),
+            sha256_hex(b"\0\x01"),
+        )
+    );
+    assert!(
+        !sandbox.root().join("plain.conf").exists(),
+        "nothing written"
+    );
+}
+
+#[test]
+fn show_content_json_lists_each_file_steps_content_and_no_hidden_text() {
+    let sandbox = Sandbox::new("pl");
+    let [plain, store, site, logo, key, a, b] = with_content(&sandbox);
+    let out = sandbox.anvil(&["--json", "plan", "--show-content"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let doc = json(&out);
+    assert_eq!(keys(&doc), ["content", "executed", "ok", "targets"]);
+    let entry = |step: usize, path: &str, bytes: &[u8], binary: bool, hidden: bool| {
+        let mut value = serde_json::json!({
+            "target": "local", "step": step, "path": path, "bytes": bytes.len(),
+            "sha256": sha256_hex(bytes), "binary": binary, "hidden": hidden,
+        });
+        if hidden {
+            value.as_object_mut().unwrap().remove("sha256");
+        }
+        if !binary && !hidden {
+            value["text"] = String::from_utf8(bytes.to_vec()).unwrap().into();
+        }
+        value
+    };
+    assert_eq!(
+        doc["content"],
+        serde_json::json!([
+            entry(0, &plain, b"plain {{ vars.name }}\n", false, false),
+            entry(1, &store, b"store\n", false, false),
+            entry(2, &site, b"name = local", false, false),
+            entry(3, &logo, b"\x89PNG\0", true, false),
+            entry(4, &key, b"KEY-BYTES\n", false, true),
+            entry(6, &a, b"tree a\n", false, false),
+            entry(7, &b, b"\0\x01", true, false),
+        ])
+    );
+    assert!(
+        !text(&out.stdout).contains("KEY-BYTES"),
+        "hidden never shows"
+    );
+}
+
+#[test]
+fn a_hidden_template_shows_no_hash_or_text_and_stays_out_of_rendered() {
+    let sandbox = Sandbox::new("pl");
+    let [_, _, site, ..] = with_content(&sandbox);
+    let shut = sandbox.root().join("shut.conf").display().to_string();
+    let config = sandbox.config_dir().join("config.toml");
+    let mut body = std::fs::read_to_string(&config).unwrap();
+    body.push_str(&format!(
+        "[[files]]\nsrc = \"site.j2\"\ndest = \"{shut}\"\nmode = \"0640\"\nsudo = false\ntemplate = true\n"
+    ));
+    std::fs::write(&config, body).unwrap();
+    let dests = |args: &[&str]| -> Vec<String> {
+        let out = sandbox.anvil(args, &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        let doc = json(&out);
+        (doc["rendered"].as_array().unwrap().iter())
+            .map(|text| text["dest"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    for args in [
+        &["--json", "plan", "--show-rendered"][..],
+        &["--json", "plan", "--show-rendered", "--show-content"],
+    ] {
+        assert_eq!(dests(args), [site.as_str()], "{args:?}");
+    }
+    let doc = json(&sandbox.anvil(&["--json", "plan"], &[]));
+    let steps = doc["targets"][0]["steps"].as_array().unwrap();
+    let shut_step = (steps.iter())
+        .find(|step| step["run"] == format!("file {shut}"))
+        .unwrap();
+    assert_eq!(
+        shut_step["rendered"],
+        serde_json::json!({"bytes": 12, "hidden": true})
+    );
+    let hash = sha256_hex("name = local");
+    for args in [
+        &["plan"][..],
+        &["plan", "--show-rendered"],
+        &["plan", "--show-rendered", "--show-content"],
+    ] {
+        let out = sandbox.anvil(args, &[]);
+        let stdout = text(&out.stdout);
+        assert!(
+            stdout.contains(&format!(
+                "would $ file {shut}\n    rendered 12 bytes (hidden: mode 0640)\n  would $ hostname\n"
+            )),
+            "{args:?}: {stdout}"
+        );
+        assert_eq!(stdout.matches(&hash).count(), 1, "{args:?}: {stdout}");
+        let texts = usize::from(args.len() > 1);
+        assert_eq!(
+            stdout.matches("│ name = local").count(),
+            texts,
+            "{args:?}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn without_show_content_plan_and_show_rendered_print_no_src_bytes() {
+    let sandbox = Sandbox::new("pl");
+    let [plain, store, site, logo, key, a, b] = with_content(&sandbox);
+    let tree = sandbox.root().join("tree");
+    let tree = tree.display();
+    let rendered = format!(
+        "    rendered 12 bytes, sha256 {}\n",
+        sha256_hex("name = local")
+    );
+    let expected = |text: &str| {
+        format!(
+            "▶ local\n  vars.name = \"local\" (tag:local)\n  would $ file {plain}\n  would $ file {store}\n  \
+             would $ file {site}\n{rendered}{text}  would $ file {logo} (binary)\n  would $ file {key}\n  \
+             files[5] tree -> {tree} (tree: 3 items, 9 bytes)\n  would $ dir {tree}\n    mode 0755\n  \
+             would $ file {a}\n  would $ file {b} (binary)\n  would $ hostname\n  ✔ 9 steps\n\n1 target, nothing executed\n"
+        )
+    };
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), expected(""));
+    let out = sandbox.anvil(&["plan", "--show-rendered"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        expected("    │ name = local\n    (no newline at end)\n")
+    );
+    for args in [
+        &["--json", "plan"][..],
+        &["--json", "plan", "--show-rendered"],
+    ] {
+        let doc = json(&sandbox.anvil(args, &[]));
+        assert!(doc.get("content").is_none(), "{args:?}: {doc}");
+    }
+}
+
+#[test]
+fn show_rendered_is_hidden_from_help_and_show_content_is_listed() {
+    let sandbox = Sandbox::new("pl");
+    let out = sandbox.anvil(&["plan", "--help"], &[]);
+    let help = text(&out.stdout);
+    assert!(help.contains("--show-content"), "{help}");
+    assert!(!help.contains("--show-rendered"), "{help}");
+}
+
 #[test]
 fn a_dir_shows_its_mode_owner_group_and_parents() {
     let sandbox = Sandbox::new("pl");

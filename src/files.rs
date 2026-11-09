@@ -82,6 +82,16 @@ impl Sources {
         self.0.get(i).and_then(Loaded::file)
     }
 
+    /// The src of the file item with ordinal `i`, as loaded.
+    pub(crate) fn get(&self, i: usize) -> Option<&Loaded> {
+        self.0.get(i)
+    }
+
+    /// Each file item's src, in ordinal order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Loaded> {
+        self.0.iter()
+    }
+
     /// The tree of the recursive entry with ordinal `i`.
     pub fn tree(&self, i: usize) -> Option<&Tree> {
         match self.0.get(i) {
@@ -105,14 +115,17 @@ impl Sources {
 /// One src's bytes, at most [`document::MAX_BYTES`]: `binary` when they are
 /// not UTF-8 or hold a NUL.
 pub struct Source {
-    pub bytes: Vec<u8>,
+    pub bytes: Zeroizing<Vec<u8>>,
     pub binary: bool,
 }
 
 impl Source {
     pub(crate) fn of(bytes: Vec<u8>) -> Source {
         let binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
-        Source { bytes, binary }
+        Source {
+            bytes: Zeroizing::new(bytes),
+            binary,
+        }
     }
 
     /// The bytes as text, unless they are binary.
@@ -561,15 +574,11 @@ pub struct Rendered {
     pub sha256: String,
 }
 
-/// By hand: the length and hash, never the text.
+/// By hand: the length only, never the text or, since the file's mode may
+/// hide it, its hash.
 impl fmt::Debug for Rendered {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Rendered(<{} bytes>, sha256 {})",
-            self.text.len(),
-            self.sha256
-        )
+        write!(f, "Rendered(<{} bytes>)", self.text.len())
     }
 }
 
@@ -8554,7 +8563,11 @@ mod tests {
             );
             let debug = format!("{write:?}");
             assert!(!debug.contains("port"), "{debug}");
-            assert!(debug.contains(&format!("sha256 {}", rendered.sha256)));
+            assert!(!debug.contains(&rendered.sha256), "{debug}");
+            assert!(
+                debug.contains(&format!("Rendered(<{} bytes>)", text.len())),
+                "{debug}"
+            );
         }
         let staged = FileWrite {
             password: true,

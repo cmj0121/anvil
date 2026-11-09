@@ -24,13 +24,13 @@ use signal_hook::consts::SIGINT;
 use crate::commands;
 use crate::files_cmd;
 use anvil::cancel::{AbortReason, Cancel};
-use anvil::editor::{Buffer, Editor, Fallback};
+use anvil::editor::{Buffer, Editor, EditorError, Fallback};
 use anvil::error::Failure;
 use anvil::filestore::{self, Root};
 use anvil::logger::{self, Sink};
 use anvil::options::Options;
 use anvil::term;
-use app::{App, EditKind, Effect, LogLine, Msg};
+use app::{App, EditKind, Effect, LogLine, Msg, Page};
 use handoff::{Screen, Session};
 use worker::Worker;
 
@@ -135,6 +135,11 @@ fn event_loop(
                 Effect::Edit(kind) => run_edit(&mut app, &kind),
                 Effect::EditScript => edit_script(&mut app),
                 Effect::Reload => app.reload(),
+                Effect::Page(page) => {
+                    let pager = std::env::var("PAGER").ok();
+                    let path = std::env::var_os("PATH");
+                    app.notice = page_content(&app, &page, pager.as_deref(), path.as_deref()).err();
+                }
             }
         }
         if app.opts.verbose != verbose {
@@ -154,6 +159,28 @@ fn run_edit(app: &mut App, kind: &EditKind) {
     if matches!(kind, EditKind::Inventory | EditKind::Config) {
         app.reload();
     }
+}
+
+/// `O`: the viewer's text in `pager` (`$PAGER`, else `less`, found on
+/// `path`) on this (the main) thread with the real terminal; the status
+/// line when it cannot run.
+fn page_content(
+    app: &App,
+    page: &Page,
+    pager: Option<&str>,
+    path: Option<&std::ffi::OsStr>,
+) -> Result<(), String> {
+    let text = app.page_text(page).ok_or("O: nothing to page")?;
+    let pager = Editor::pager(pager, path).map_err(|err| match err {
+        EditorError::NotFound(program) => format!("O: PAGER not found: {program}"),
+        err => format!("O: {err}"),
+    })?;
+    pager.page(&text).map_err(|err| match err {
+        EditorError::Spawn { program, source } => {
+            format!("O: cannot run pager `{program}`: {source}")
+        }
+        err => format!("O: {err}"),
+    })
 }
 
 /// `x`'s editor on the session's last script, on this (the main) thread

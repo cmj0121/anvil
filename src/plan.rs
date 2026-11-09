@@ -8,23 +8,27 @@
 //! secret is set is `anvil doctor`'s job. A plugin step runs its plugin, on
 //! the controller only, to list the script it returns. Each `[[files]]`
 //! src is read before any target, as apply reads it; its bytes are never
-//! shown, except a templated src's rendered text under `--show-rendered`.
+//! shown, except under `--show-content` (what apply would write, for every
+//! file step whose mode lets others read it) and a templated src's rendered
+//! text under `--show-rendered`.
 //! A `[[services]]` step shows as `service NAME`, never its script.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU8;
 use std::sync::Arc;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::bytes::hex;
 use crate::cancel::{AbortReason, Cancel};
 use crate::config::Config;
 use crate::engine::{self, Unresolved};
 use crate::error::{Failure, print_json};
 use crate::facts::Facts;
 use crate::fanout::{self, Event};
-use crate::files::{MAX_KEPT, Sources};
+use crate::files::{FileWrite, Loaded, MAX_KEPT, Sources};
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
@@ -118,9 +122,14 @@ pub struct Plan {
     pub executed: bool,
     pub targets: Vec<PlanReport>,
     pub ok: bool,
-    /// Each templated file's rendered text, per target, under `--show-rendered`.
+    /// Each templated file's rendered text, per target, under `--show-rendered`;
+    /// none whose mode hides it ([`hidden`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rendered: Vec<RenderedText>,
+    /// What apply would write for each file step, per target, under
+    /// `--show-content`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<Content>,
     /// What loading the record warned of: the targets whose bad pending
     /// handlers it dropped; then each tree whose previous texts may not fit
     /// in the record ([`record_full_warnings`]).
@@ -241,7 +250,8 @@ impl std::fmt::Debug for RenderedText {
     }
 }
 
-/// Every templated file step's rendered text in `targets`, in order.
+/// Every templated file step's rendered text in `targets`, in order; none
+/// whose mode hides it ([`hidden`]).
 fn rendered_texts(targets: &[PlanReport]) -> Vec<RenderedText> {
     let mut texts = Vec::new();
     for report in targets {
@@ -250,6 +260,9 @@ fn rendered_texts(targets: &[PlanReport]) -> Vec<RenderedText> {
         };
         for (step, run) in steps.iter().enumerate() {
             if let (RunKind::File { dest, .. }, Some(rendered)) = (&run.kind, run.rendered()) {
+                if run.hidden_mode().is_some() {
+                    continue;
+                }
                 texts.push(RenderedText {
                     target: target.clone(),
                     step,
@@ -260,6 +273,246 @@ fn rendered_texts(targets: &[PlanReport]) -> Vec<RenderedText> {
         }
     }
     texts
+}
+
+/// What `anvil plan` shows beyond its steps: what apply would write for
+/// each file step (`--show-content`), and each templated file's rendered
+/// text (`--show-rendered`). Both set: the content lines win.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Show {
+    pub content: bool,
+    pub rendered: bool,
+}
+
+/// The sha256 in hex of each single file's src, by `(ordinal, None)`, and of
+/// each tree file item, by `(ordinal, Some(item))`.
+pub type Hashes = HashMap<(usize, Option<usize>), String>;
+
+/// [`Hashes`] of every src in `sources`, each hashed once.
+pub fn hashes(sources: &Sources) -> Hashes {
+    let mut hashes = Hashes::new();
+    for (ordinal, loaded) in sources.iter().enumerate() {
+        match loaded {
+            Loaded::File(source) => {
+                hashes.insert((ordinal, None), hex(&Sha256::digest(&source.bytes)));
+            }
+            Loaded::Tree(tree) => {
+                for (k, item) in tree.items.iter().enumerate() {
+                    if let Some(source) = item.source() {
+                        hashes.insert((ordinal, Some(k)), hex(&Sha256::digest(&source.bytes)));
+                    }
+                }
+            }
+            Loaded::Unread => {}
+        }
+    }
+    hashes
+}
+
+/// Whether a file of `mode` (octal) is hidden: others may not read it, or
+/// the mode does not parse.
+pub fn hidden(mode: &str) -> bool {
+    !record::is_world_readable(mode)
+}
+
+/// The bytes apply would write for one file step, borrowed: the rendered
+/// text of a template, else the src or tree item from [`Sources`].
+pub struct ContentView<'a> {
+    pub path: &'a str,
+    pub mode: &'a str,
+    pub bytes: &'a [u8],
+    /// `None` when the mode hides the bytes ([`hidden`]).
+    pub sha256: Option<&'a str>,
+    pub binary: bool,
+    pub templated: bool,
+}
+
+/// By hand: the length and hash, never the bytes.
+impl std::fmt::Debug for ContentView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContentView")
+            .field("path", &self.path)
+            .field("mode", &self.mode)
+            .field("bytes", &format_args!("<{} bytes>", self.bytes.len()))
+            .field("sha256", &self.sha256)
+            .field("binary", &self.binary)
+            .field("templated", &self.templated)
+            .finish()
+    }
+}
+
+impl<'a> ContentView<'a> {
+    /// Whether the mode hides the bytes ([`hidden`]).
+    pub fn hidden(&self) -> bool {
+        hidden(self.mode)
+    }
+
+    /// The text to show: `None` for a binary or hidden file.
+    pub fn text(&self) -> Option<&'a str> {
+        if self.binary || self.hidden() {
+            return None;
+        }
+        std::str::from_utf8(self.bytes).ok()
+    }
+
+    /// `content N bytes, sha256 HEX` (`rendered` for a template), then
+    /// ` (binary)` for a binary file; `content N bytes (hidden: mode MODE)`,
+    /// with no hash, for a hidden one.
+    pub fn line(&self) -> String {
+        let kind = if self.templated {
+            "rendered"
+        } else {
+            "content"
+        };
+        let size = self.bytes.len();
+        match self.sha256 {
+            Some(sha256) => {
+                let binary = if self.binary { " (binary)" } else { "" };
+                format!("{kind} {size} bytes, sha256 {sha256}{binary}")
+            }
+            None => format!("{kind} {size} bytes (hidden: mode {})", self.mode),
+        }
+    }
+}
+
+/// Why a file step has no [`ContentView`]: its src was never read, which
+/// plan never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unread;
+
+impl Unread {
+    pub const TEXT: &'static str = "content unavailable (src not loaded)";
+}
+
+/// `step`'s write when it is a file step that is not a skip.
+pub fn file_write(step: &PlannedRun) -> Option<&FileWrite> {
+    match &step.kind {
+        RunKind::File { run, .. } if !run.skip => run.write.as_ref(),
+        _ => None,
+    }
+}
+
+/// What apply would write for `step`; `None` for a skip or any step that
+/// is not a file step.
+pub fn content_of<'a>(
+    step: &'a PlannedRun,
+    sources: &'a Sources,
+    hashes: &'a Hashes,
+) -> Option<Result<ContentView<'a>, Unread>> {
+    let RunKind::File { dest, .. } = &step.kind else {
+        return None;
+    };
+    let write = file_write(step)?;
+    let view = |bytes: &'a [u8], sha256: &'a str, binary: bool, templated: bool| ContentView {
+        path: dest,
+        mode: &write.mode,
+        bytes,
+        sha256: (!hidden(&write.mode)).then_some(sha256),
+        binary,
+        templated,
+    };
+    if let Some(rendered) = write.rendered.as_deref() {
+        return Some(Ok(view(
+            rendered.text.as_bytes(),
+            &rendered.sha256,
+            false,
+            true,
+        )));
+    }
+    let source = match (sources.get(write.ordinal), write.item) {
+        (Some(Loaded::File(source)), None) => Some(source),
+        (Some(Loaded::Tree(tree)), Some(item)) => {
+            tree.items.get(item).and_then(|item| item.source())
+        }
+        _ => None,
+    };
+    let hash = hashes.get(&(write.ordinal, write.item));
+    match source.zip(hash) {
+        Some((source, hash)) => Some(Ok(view(&source.bytes, hash, source.binary, false))),
+        None => {
+            debug_assert!(false, "plan: {dest}: src not loaded");
+            Some(Err(Unread))
+        }
+    }
+}
+
+/// One target's content of one file step; `step` indexes that target's
+/// `steps`, `path` is the file's dest, `text` is there only when shown.
+#[derive(Serialize)]
+pub struct Content {
+    pub target: String,
+    pub step: usize,
+    pub path: String,
+    pub bytes: usize,
+    /// Left out when the mode hides the bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    pub binary: bool,
+    pub hidden: bool,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_some_text"
+    )]
+    pub text: Option<Zeroizing<String>>,
+}
+
+fn serialize_some_text<S: serde::Serializer>(
+    text: &Option<Zeroizing<String>>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match text {
+        Some(text) => s.serialize_str(text),
+        None => s.serialize_none(),
+    }
+}
+
+/// By hand: the length, never the text.
+impl std::fmt::Debug for Content {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Content")
+            .field("target", &self.target)
+            .field("step", &self.step)
+            .field("path", &self.path)
+            .field("bytes", &self.bytes)
+            .field("sha256", &self.sha256)
+            .field("binary", &self.binary)
+            .field("hidden", &self.hidden)
+            .field(
+                "text",
+                &self
+                    .text
+                    .as_ref()
+                    .map(|text| format!("<{} bytes>", text.len())),
+            )
+            .finish()
+    }
+}
+
+/// Every file step's [`Content`] in `targets`, in order; a src that was
+/// never read has none.
+pub fn contents(targets: &[PlanReport], sources: &Sources, hashes: &Hashes) -> Vec<Content> {
+    let mut contents = Vec::new();
+    for report in targets {
+        let PlanReport::Planned { target, steps, .. } = report else {
+            continue;
+        };
+        for (step, run) in steps.iter().enumerate() {
+            let Some(Ok(view)) = content_of(run, sources, hashes) else {
+                continue;
+            };
+            contents.push(Content {
+                target: target.clone(),
+                step,
+                path: view.path.to_owned(),
+                bytes: view.bytes.len(),
+                sha256: view.sha256.map(str::to_owned),
+                binary: view.binary,
+                hidden: view.hidden(),
+                text: view.text().map(|text| Zeroizing::new(text.to_owned())),
+            });
+        }
+    }
+    contents
 }
 
 /// What [`plan_targets`] reports as it goes: the targets, a target about to
@@ -413,6 +666,7 @@ pub fn plan_targets(
         targets: reports,
         ok,
         rendered: Vec::new(),
+        content: Vec::new(),
         warnings: Vec::new(),
     }
 }
@@ -497,14 +751,21 @@ fn plan_target(
 
 /// `anvil plan`: prints each target's block once it and every earlier
 /// target have ended (or one JSON document), then the summary.
-pub fn run(out: Output, opts: &Options, show_rendered: bool) -> Result<(), Failure> {
+pub fn run(out: Output, opts: &Options, show: Show) -> Result<(), Failure> {
     let style = Style::detect();
     let (config, expanded) = opts.load_expanded()?;
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
-    let mut print = fanout::in_order(|report| print_lines(&render(report, show_rendered), style));
     let mut follow = status::Follow::new("plan", status::enabled(out.no_progress));
     let prepared = Prepared::plan(opts, config, expanded, cancel)?;
+    let hashes = if show.content {
+        hashes(&prepared.sources)
+    } else {
+        Hashes::new()
+    };
+    let mut print = fanout::in_order(|report| {
+        print_lines(&render(report, show, &prepared.sources, &hashes), style)
+    });
     let mut plan = run_targets(&prepared, &mut |progress| {
         follow.event(&progress);
         if !out.json {
@@ -512,8 +773,11 @@ pub fn run(out: Output, opts: &Options, show_rendered: bool) -> Result<(), Failu
         }
     });
     drop(follow);
-    if show_rendered {
+    if show.rendered {
         plan.rendered = rendered_texts(&plan.targets);
+    }
+    if show.content && out.json {
+        plan.content = contents(&plan.targets, &prepared.sources, &hashes);
     }
     let failed = plan.targets.iter().filter(|t| !t.ok()).count();
     if !out.json {
@@ -541,9 +805,11 @@ pub fn run(out: Output, opts: &Options, show_rendered: bool) -> Result<(), Failu
 /// per resolved var and env value, a `PATH  NAME` line per task and a
 /// `would $ command` line per step and a line per guard ([`guard_texts`]) and file attribute ([`attr_texts`]), then `✔ N steps`, `✘ reason` or `⊘ cancelled` (or its abort
 /// reason), then a blank line. A templated file step's would line is followed
-/// by its [`rendered_text`] and, with `show_rendered`, the text itself. A
-/// tree's first step is preceded by its [`TreeShown::text`] line.
-pub fn render(report: &PlanReport, show_rendered: bool) -> Vec<Line> {
+/// by its [`rendered_text`] and, with `show.rendered`, the text itself. With
+/// `show.content`, every file step's is followed by its
+/// [`ContentView::line`] and its text instead, if shown. A tree's first step
+/// is preceded by its [`TreeShown::text`] line.
+pub fn render(report: &PlanReport, show: Show, sources: &Sources, hashes: &Hashes) -> Vec<Line> {
     let mut lines = vec![Line::header(report.target())];
     let (vars, env) = report.values();
     for (key, value) in report::value_rows(vars, env) {
@@ -572,10 +838,17 @@ pub fn render(report: &PlanReport, show_rendered: bool) -> Vec<Line> {
                     let text = format!("  notifies {}", step.notify.join(", "));
                     lines.push(Line::out(text, Escape::Always, Some(DIM)));
                 }
+                if show.content {
+                    lines.extend(content_lines(step, sources, hashes));
+                    continue;
+                }
                 if let Some(text) = rendered_text(step) {
                     lines.push(Line::out(format!("  {text}"), Escape::Never, Some(DIM)));
                 }
-                if show_rendered && let Some(rendered) = step.rendered() {
+                if show.rendered
+                    && step.hidden_mode().is_none()
+                    && let Some(rendered) = step.rendered()
+                {
                     lines.extend(text_lines(&rendered.text));
                 }
             }
@@ -669,16 +942,35 @@ fn attr_texts(step: &PlannedRun) -> Vec<String> {
     .collect()
 }
 
-/// `rendered N bytes, sha256 HEX` for a templated file step; `None` for a
-/// plain file, a skip or any other step.
+/// `rendered N bytes, sha256 HEX` for a templated file step, or `rendered N
+/// bytes (hidden: mode MODE)` when its mode hides it; `None` for a plain
+/// file, a skip or any other step.
 pub fn rendered_text(step: &PlannedRun) -> Option<String> {
-    step.rendered().map(|rendered| {
-        format!(
-            "rendered {} bytes, sha256 {}",
-            rendered.text.len(),
-            rendered.sha256
-        )
+    let rendered = step.rendered()?;
+    let size = rendered.text.len();
+    Some(match step.hidden_mode() {
+        Some(mode) => format!("rendered {size} bytes (hidden: mode {mode})"),
+        None => format!("rendered {size} bytes, sha256 {}", rendered.sha256),
     })
+}
+
+/// A file step's [`ContentView::line`], then its text as [`text_lines`] when
+/// shown; nothing for any other step.
+fn content_lines(step: &PlannedRun, sources: &Sources, hashes: &Hashes) -> Vec<Line> {
+    match content_of(step, sources, hashes) {
+        None => Vec::new(),
+        Some(Err(Unread)) => vec![Line::out(
+            format!("  {}", Unread::TEXT),
+            Escape::Never,
+            Some(DIM),
+        )],
+        Some(Ok(view)) => {
+            let line = Line::out(format!("  {}", view.line()), Escape::Always, Some(DIM));
+            let mut lines = vec![line];
+            lines.extend(view.text().map(text_lines).unwrap_or_default());
+            lines
+        }
+    }
 }
 
 /// `text` as `  │ LINE` lines, with control and invisible characters
@@ -972,7 +1264,7 @@ mod tests {
 
     fn screen(report: &PlanReport) -> String {
         let style = Style::new(false, false, None);
-        render(report, false)
+        render(report, Show::default(), &Sources::default(), &Hashes::new())
             .iter()
             .map(|line| line.show(style))
             .collect()
@@ -1060,6 +1352,277 @@ mod tests {
         );
         assert!(!target.to_string().contains("a = 1"), "no bytes: {target}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A workspace with a text, a `$/` store, a binary, a hidden, a
+    /// templated and a recursive entry, each planned on `local`.
+    fn content_plan() -> (std::path::PathBuf, Config, Sources, Plan) {
+        use crate::config::{FileEntry, ModeValue};
+
+        let dir = std::fs::canonicalize(crate::test_util::temp_dir("plan-content")).unwrap();
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::create_dir_all(dir.join("tree")).unwrap();
+        std::fs::write(dir.join("a.conf"), "a = 1\nesc \x1b[2J").unwrap();
+        std::fs::write(dir.join("files").join("s.conf"), "store\n").unwrap();
+        std::fs::write(dir.join("logo.png"), b"\x89PNG\0\xff").unwrap();
+        std::fs::write(dir.join("site.key"), "SECRET-KEY\n").unwrap();
+        std::fs::write(dir.join("t.j2"), "t = {{ 1 + 1 }}\n").unwrap();
+        std::fs::write(dir.join("tree").join("i.txt"), "item\n").unwrap();
+        let file = |src: &str, dest: &str, mode: &str| FileEntry {
+            src: src.to_owned(),
+            dest: dest.to_owned(),
+            mode: Some(ModeValue::Text(mode.to_owned())),
+            owner: None,
+            group: None,
+            parents: false,
+            tags: Vec::new(),
+            facts: Default::default(),
+            sudo: false,
+            rollback: true,
+            template: false,
+            notify: Vec::new(),
+            recursive: false,
+            dir_mode: None,
+        };
+        let config = Config {
+            files: vec![
+                file("a.conf", "/etc/a.conf", "0644"),
+                file("$/s.conf", "/etc/s.conf", "0644"),
+                file("logo.png", "/srv/logo.png", "0644"),
+                file("site.key", "/etc/site.key", "0600"),
+                FileEntry {
+                    template: true,
+                    ..file("t.j2", "/etc/t.conf", "0644")
+                },
+                FileEntry {
+                    recursive: true,
+                    dir_mode: Some("0755".to_owned()),
+                    ..file("tree", "/srv/tree", "0644")
+                },
+                FileEntry {
+                    tags: vec!["web".to_owned()],
+                    ..file("a.conf", "/etc/skipped", "0644")
+                },
+            ],
+            path: Some(dir.join("config.toml")),
+            ..Config::default()
+        };
+        let sources = crate::files::load(&legacy(&config), || Ok(dir.clone())).unwrap();
+        let plan = plan_targets(
+            &[target("local")],
+            NonZeroU8::MIN,
+            |_| {
+                Ok(Box::new(Recorder {
+                    log: Arc::default(),
+                    probe: MAC,
+                }))
+            },
+            &config,
+            &sources,
+            &FakePlugins::none(),
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        (dir, config, sources, plan)
+    }
+
+    fn shown(report: &PlanReport, show: Show, sources: &Sources) -> String {
+        let style = Style::new(false, false, None);
+        render(report, show, sources, &hashes(sources))
+            .iter()
+            .map(|line| line.show(style))
+            .collect()
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        hex(&Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn show_content_prints_every_file_steps_bytes_and_hides_binary_and_hidden() {
+        let (dir, _, sources, plan) = content_plan();
+        assert_eq!(
+            shown(
+                &plan.targets[0],
+                Show {
+                    content: true,
+                    rendered: false
+                },
+                &sources
+            ),
+            format!(
+                "▶ local\n  would $ file /etc/a.conf\n    content 14 bytes, sha256 {}\n    \
+                 │ a = 1\n    │ esc \\x1b[2J\n    (no newline at end)\n  \
+                 would $ file /etc/s.conf\n    content 6 bytes, sha256 {}\n    │ store\n  \
+                 would $ file /srv/logo.png (binary)\n    content 6 bytes, sha256 {} (binary)\n  \
+                 would $ file /etc/site.key\n    content 11 bytes (hidden: mode 0600)\n  \
+                 would $ file /etc/t.conf\n    rendered 6 bytes, sha256 {}\n    │ t = 2\n  \
+                 files[5] tree -> /srv/tree (tree: 2 items, 5 bytes)\n  would $ dir /srv/tree\n    \
+                 mode 0755\n  would $ file /srv/tree/i.txt\n    content 5 bytes, sha256 {}\n    │ item\n  \
+                 would $ skipped file /etc/skipped: no match\n  would $ hostname\n  ✔ 9 steps\n\n",
+                sha(b"a = 1\nesc \x1b[2J"),
+                sha(b"store\n"),
+                sha(b"\x89PNG\0\xff"),
+                sha(b"t = 2\n"),
+                sha(b"item\n"),
+            )
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_show_content_no_bytes_show_and_show_rendered_only_adds_template_text() {
+        let (dir, _, sources, plan) = content_plan();
+        let plain = shown(&plan.targets[0], Show::default(), &sources);
+        assert_eq!(plain, screen(&plan.targets[0]));
+        for hidden in ["a = 1", "store", "SECRET", "│", "content "] {
+            assert!(!plain.contains(hidden), "{hidden}: {plain}");
+        }
+        let rendered = shown(
+            &plan.targets[0],
+            Show {
+                content: false,
+                rendered: true,
+            },
+            &sources,
+        );
+        assert_eq!(
+            rendered,
+            plain.replace(
+                &format!("rendered 6 bytes, sha256 {}\n", sha(b"t = 2\n")),
+                &format!(
+                    "rendered 6 bytes, sha256 {}\n    │ t = 2\n",
+                    sha(b"t = 2\n")
+                )
+            )
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn contents_lists_each_file_step_with_text_only_when_shown() {
+        let (dir, _, sources, plan) = content_plan();
+        let contents = contents(&plan.targets, &sources, &hashes(&sources));
+        let entry = |step: usize, path: &str, bytes: &[u8], binary: bool, hidden: bool| {
+            let mut value = serde_json::json!({
+                "target": "local", "step": step, "path": path, "bytes": bytes.len(),
+                "sha256": sha(bytes), "binary": binary, "hidden": hidden,
+            });
+            if hidden {
+                value.as_object_mut().unwrap().remove("sha256");
+            }
+            if !binary && !hidden {
+                value["text"] = String::from_utf8(bytes.to_vec()).unwrap().into();
+            }
+            value
+        };
+        assert_eq!(
+            serde_json::to_value(&contents).unwrap(),
+            serde_json::json!([
+                entry(0, "/etc/a.conf", b"a = 1\nesc \x1b[2J", false, false),
+                entry(1, "/etc/s.conf", b"store\n", false, false),
+                entry(2, "/srv/logo.png", b"\x89PNG\0\xff", true, false),
+                entry(3, "/etc/site.key", b"SECRET-KEY\n", false, true),
+                entry(4, "/etc/t.conf", b"t = 2\n", false, false),
+                entry(6, "/srv/tree/i.txt", b"item\n", false, false),
+            ])
+        );
+        let debug = format!("{contents:?}");
+        assert!(
+            !debug.contains("a = 1") && debug.contains("<6 bytes>"),
+            "{debug}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mode_hides_a_file_when_others_cannot_read_it() {
+        for (mode, hide) in [
+            ("0644", false),
+            ("0604", false),
+            ("0600", true),
+            ("0640", true),
+            ("0700", true),
+            ("644", false),
+            ("bad", true),
+        ] {
+            assert_eq!(hidden(mode), hide, "{mode}");
+        }
+    }
+
+    #[test]
+    fn a_hidden_template_shows_only_its_size_and_never_its_text_or_hash() {
+        use crate::config::{FileEntry, ModeValue};
+
+        let entry = |dest: &str, mode: &str| FileEntry {
+            src: "t.j2".to_owned(),
+            dest: dest.to_owned(),
+            mode: Some(ModeValue::Text(mode.to_owned())),
+            owner: None,
+            group: None,
+            parents: false,
+            tags: Vec::new(),
+            facts: Default::default(),
+            sudo: false,
+            rollback: true,
+            template: true,
+            notify: Vec::new(),
+            recursive: false,
+            dir_mode: None,
+        };
+        let config = Config {
+            files: vec![entry("/etc/open", "0644"), entry("/etc/shut", "0600")],
+            ..Config::default()
+        };
+        let plan = plan_targets(
+            &[target("local")],
+            NonZeroU8::MIN,
+            |_| {
+                Ok(Box::new(Recorder {
+                    log: Arc::default(),
+                    probe: MAC,
+                }))
+            },
+            &config,
+            &Sources::of(&["x\n", "x\n"]),
+            &FakePlugins::none(),
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        let dests: Vec<String> = (rendered_texts(&plan.targets).into_iter())
+            .map(|text| text.dest)
+            .collect();
+        assert_eq!(dests, ["/etc/open"]);
+        let PlanReport::Planned { steps, .. } = &plan.targets[0] else {
+            panic!("{plan:?}")
+        };
+        assert_eq!(
+            rendered_text(&steps[1]).unwrap(),
+            "rendered 2 bytes (hidden: mode 0600)"
+        );
+        let steps = &json(&plan)["targets"][0]["steps"];
+        assert_eq!(
+            steps[0]["rendered"],
+            serde_json::json!({"bytes": 2, "sha256": sha(b"x\n")})
+        );
+        assert_eq!(
+            steps[1]["rendered"],
+            serde_json::json!({"bytes": 2, "hidden": true})
+        );
+        let sources = Sources::of(&["x\n", "x\n"]);
+        for content in [false, true] {
+            let show = Show {
+                content,
+                rendered: true,
+            };
+            let text = shown(&plan.targets[0], show, &sources);
+            assert_eq!(text.matches("│ x").count(), 1, "{text}");
+            assert!(
+                text.contains("rendered 2 bytes (hidden: mode 0600)\n"),
+                "{text}"
+            );
+            assert_eq!(text.matches(&sha(b"x\n")).count(), 1, "{text}");
+        }
     }
 
     #[test]
@@ -1717,6 +2280,7 @@ mod tests {
                 targets: vec![report],
                 ok: false,
                 rendered: Vec::new(),
+                content: Vec::new(),
                 warnings: Vec::new(),
             };
             assert_eq!(plan.abort(), Some(reason));
@@ -1726,6 +2290,7 @@ mod tests {
             targets: Vec::new(),
             ok: true,
             rendered: Vec::new(),
+            content: Vec::new(),
             warnings: Vec::new(),
         };
         assert_eq!(plan.abort(), None);

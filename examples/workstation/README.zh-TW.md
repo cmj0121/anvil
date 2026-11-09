@@ -19,7 +19,7 @@
 ## 試試看
 
 `plan` 列出 step（包括檔案 step），但一個都不執行。範本檔案下方會顯示 `rendered N bytes, sha256 HEX`；
-加上 `--show-rendered` 可看到這台機器會得到的文字。
+加上 `--show-content` 可看到這台機器的每個檔案會得到的文字。
 
 ```sh
 anvil --inventory examples/workstation/inventory.toml \

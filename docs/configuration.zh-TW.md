@@ -832,7 +832,7 @@ ERROR anvil: files[0].src `files/nginx.conf.j2`: template: line 5: syntax error:
 **算繪結果就是檔案。** 對每個 target，與 dest 的比較（`unchanged DEST`）、寫入、heredoc 分隔符、密碼路徑的暫存檔、
 [apply 紀錄](cli.zh-TW.md#apply-紀錄)中寫入內容的雜湊、[`anvil rollback`](cli.zh-TW.md#anvil-rollback) 與 doctor 的
 drift 檢查，全都使用該 target 的算繪文字。因此 var 改變後，下次 apply 會顯示 `wrote DEST`，rollback 則還原 dest 先前的內容。
-[`anvil plan`](cli.zh-TW.md#anvil-plan) 顯示每個 target 的算繪大小與 sha256，`--show-rendered` 另外顯示文字。
+[`anvil plan`](cli.zh-TW.md#anvil-plan) 顯示每個 target 的算繪大小與 sha256（其他人無法讀取該檔案時只顯示大小），`--show-content` 另外顯示文字。
 [`config --harden`](#harden) 不評斷範本 src，而是將它列為待檢查。
 
 **已知限制。** 字串串接（`~`）與大量重複（`*`）可能在 1 MiB 上限生效之前就在控制端用掉大量記憶體

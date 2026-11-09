@@ -182,16 +182,19 @@ fn run_script(
     tx: &Sender<Msg>,
 ) -> Result<(), Failure> {
     let label = report::command(&script);
-    let _ = tx.send(Msg::Steps(vec![app::StepRow { label }]));
+    let _ = tx.send(Msg::Steps(vec![app::StepRow { label, file: None }]));
     let timeout = Duration::from_secs(run::DEFAULT_TIMEOUT);
     let prepared = Prepared::run(opts, cancel)?;
     run::run_targets(&prepared, script, timeout, &mut send_progress(tx));
     Ok(())
 }
 
-/// Plan opens no secret store; the steps pane keeps the app's list.
+/// Plan opens no secret store. As [`run_apply`], the steps sent are this
+/// config's; once every target is planned, the srcs it read follow, for
+/// the viewer.
 fn run_plan(opts: &Options, cancel: Arc<Cancel>, tx: &Sender<Msg>) -> Result<(), Failure> {
     let (config, expanded) = opts.load_expanded()?;
+    let _ = tx.send(Msg::Steps(app::step_rows(&expanded)));
     let prepared = Prepared::plan(opts, config, expanded, cancel)?;
     plan::run_targets(&prepared, &mut |progress| {
         let msg = match progress {
@@ -202,6 +205,12 @@ fn run_plan(opts: &Options, cancel: Arc<Cancel>, tx: &Sender<Msg>) -> Result<(),
         };
         let _ = tx.send(msg);
     });
+    let hashes = plan::hashes(&prepared.sources);
+    let sources = prepared.sources;
+    let _ = tx.send(Msg::PlanSources(Arc::new(app::PlanSources {
+        sources,
+        hashes,
+    })));
     Ok(())
 }
 
@@ -328,6 +337,7 @@ mod tests {
         msgs.iter()
             .map(|msg| match msg {
                 Msg::Steps(rows) => format!("steps {}", rows.len()),
+                Msg::PlanSources(_) => "sources".to_owned(),
                 Msg::Begin(names) => format!("begin {}", names.join(" ")),
                 Msg::Start(name) => format!("start {name}"),
                 Msg::TargetDone(index, report) => format!("done {index} {}", report.target()),
@@ -528,8 +538,13 @@ mod tests {
         )
         .unwrap();
         let worker = spawn(Job::Plan, opts, Arc::new(Cancel::new()), tx);
-        let msgs = collect(worker, &rx);
-        assert_eq!(msgs.len(), 4);
+        let mut msgs = collect(worker, &rx);
+        assert_eq!(msgs.len(), 6);
+        let label = format!("touch {}", ran.display());
+        assert!(matches!(&msgs[0], Msg::Steps(rows) if rows[..] == [row(&label)]));
+        assert!(matches!(&msgs[4], Msg::PlanSources(_)));
+        msgs.drain(..1);
+        msgs.remove(3);
         assert!(matches!(&msgs[0], Msg::Begin(names) if names[..] == ["local"]));
         assert!(matches!(&msgs[1], Msg::Start(name) if name == "local"));
         match &msgs[2] {
@@ -552,7 +567,7 @@ mod tests {
         let worker = spawn(Job::Plan, opts, Arc::new(Cancel::cancelled()), tx);
         let msgs = collect(worker, &rx);
         assert!(matches!(
-            &msgs[2],
+            &msgs[3],
             Msg::PlanDone(_, plan::PlanReport::Cancelled { .. })
         ));
     }
@@ -620,7 +635,7 @@ mod tests {
         fs::write(&gate, "").unwrap();
         let msgs = collect(worker, &rx);
         assert!(
-            matches!(&msgs[2], Msg::PlanDone(_, plan::PlanReport::Cancelled { target, .. }) if target == "down"),
+            matches!(&msgs[3], Msg::PlanDone(_, plan::PlanReport::Cancelled { target, .. }) if target == "down"),
             "the refused probe is cancelled, not a failure"
         );
     }
@@ -735,6 +750,353 @@ mod tests {
             }
             _ => panic!("expected a failed update"),
         }
+    }
+
+    /// The text of the long file [`planned`] copies: 40 numbered lines.
+    fn long_text() -> String {
+        (1..=40).map(|n| format!("line {n}\n")).collect()
+    }
+
+    /// An app showing a plan on `local`, run through the worker, of a text,
+    /// a templated, a binary, a hidden, a skipped and a long file and a tree
+    /// of one text and one binary item; and the dir the dests are under.
+    fn planned(tag: &str) -> (App, std::path::PathBuf) {
+        let opts = local_opts(tag, &[]);
+        let dir = opts.config.as_ref().unwrap().parent().unwrap().to_owned();
+        fs::write(
+            opts.inventory.as_ref().unwrap(),
+            "[tags.local.vars]\nname = \"local\"\n",
+        )
+        .unwrap();
+        fs::create_dir(dir.join("tree")).unwrap();
+        fs::write(
+            dir.join("plain.txt"),
+            "plain\u{1b}]0;x\u{7} {{ vars.name }}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("site.j2"), "name = {{ vars.name }}").unwrap();
+        fs::write(dir.join("logo.png"), b"\x89PNG\0").unwrap();
+        fs::write(dir.join("site.key"), "KEY-BYTES\n").unwrap();
+        fs::write(dir.join("long.txt"), long_text()).unwrap();
+        fs::write(dir.join("tree/a.txt"), "tree a").unwrap();
+        fs::write(dir.join("tree/b.bin"), b"\0\x01").unwrap();
+        let out = dir.join("out");
+        let entry = |src: &str, dest: &str, mode: &str, more: &str| {
+            format!(
+                "[[files]]\nsrc = \"{src}\"\ndest = \"{}/{dest}\"\nmode = \"{mode}\"\n\
+                 sudo = false\n{more}\n",
+                out.display()
+            )
+        };
+        let config = [
+            entry("plain.txt", "plain.conf", "0644", ""),
+            entry("site.j2", "site.conf", "0644", "template = true\n"),
+            entry("logo.png", "logo.png", "0644", ""),
+            entry("site.key", "site.key", "0600", ""),
+            entry("plain.txt", "web.conf", "0644", "tags = [\"web\"]\n"),
+            entry("long.txt", "long.txt", "0644", ""),
+            entry(
+                "tree",
+                "tree",
+                "0644",
+                "recursive = true\ndir_mode = \"0755\"\n",
+            ),
+        ]
+        .concat();
+        fs::write(opts.config.as_ref().unwrap(), config).unwrap();
+        let mut app = App::with_inventory(opts, Err("not loaded yet".to_owned()), Ok(Vec::new()));
+        app.reload();
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        let (tx, rx) = mpsc::channel();
+        let cancel = app.running.as_ref().unwrap().cancel.clone();
+        let worker = spawn(Job::Plan, app.opts.clone(), cancel, tx);
+        for msg in collect(worker, &rx) {
+            app.on_msg(msg);
+        }
+        assert!(
+            matches!(
+                app.shown_result(),
+                Some(RunResult::Plan { ok: Some(true), .. })
+            ),
+            "the plan ran"
+        );
+        (app, out)
+    }
+
+    fn press(app: &mut App, code: KeyCode) -> Vec<app::Effect> {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// `v` with the Steps cursor on the row ending in `dest`.
+    fn view(app: &mut App, dest: &str) -> Vec<app::Effect> {
+        app.cursor = (app.shown_steps().iter())
+            .position(|row| row.label.ends_with(dest))
+            .unwrap_or_else(|| panic!("no row {dest}"));
+        press(app, KeyCode::Char('v'))
+    }
+
+    /// The open viewer's title, its lines with each sha256 as `H`, and
+    /// whether `O` has anything to page.
+    fn viewer(app: &App) -> (String, Vec<String>, bool) {
+        let Some(app::Overlay::Content {
+            title, lines, page, ..
+        }) = &app.overlay
+        else {
+            panic!("no viewer; notice {:?}", app.notice)
+        };
+        let lines = lines
+            .iter()
+            .map(|line| match line.split_once("sha256 ") {
+                Some((head, tail)) => {
+                    assert!(tail[..64].bytes().all(|b| b.is_ascii_hexdigit()), "{line}");
+                    format!("{head}sha256 H{}", &tail[64..])
+                }
+                None => line.clone(),
+            })
+            .collect();
+        (title.clone(), lines, page.is_some())
+    }
+
+    fn scroll(app: &App) -> usize {
+        match &app.overlay {
+            Some(app::Overlay::Content { scroll, .. }) => *scroll,
+            _ => panic!("no viewer"),
+        }
+    }
+
+    #[test]
+    fn v_views_a_plain_or_templated_file_escaped_and_q_closes_without_quitting() {
+        let (mut app, out) = planned("tui-view-text");
+        let dest = out.join("plain.conf").display().to_string();
+        assert_eq!(view(&mut app, "plain.conf"), [app::Effect::Redraw]);
+        assert_eq!(
+            viewer(&app),
+            (
+                format!("{dest} (28 bytes)"),
+                vec![
+                    "content 28 bytes, sha256 H".to_owned(),
+                    "plain\\x1b]0;x\\x07 {{ vars.name }}".to_owned(),
+                ],
+                true
+            )
+        );
+        assert_eq!(press(&mut app, KeyCode::Char('q')), [app::Effect::Redraw]);
+        assert!(
+            app.overlay.is_none() && !app.quit,
+            "q closes the viewer only"
+        );
+
+        view(&mut app, "site.conf");
+        assert_eq!(
+            viewer(&app).1,
+            [
+                "rendered 12 bytes, sha256 H",
+                "name = local",
+                "(no newline at end)"
+            ]
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlay.is_none() && !app.quit);
+    }
+
+    #[test]
+    fn a_binary_or_hidden_file_shows_only_its_size_and_pages_nothing() {
+        let (mut app, _) = planned("tui-view-hidden");
+        view(&mut app, "logo.png");
+        let (title, lines, page) = viewer(&app);
+        assert!(title.ends_with("logo.png (5 bytes)"), "{title}");
+        assert_eq!(
+            (lines, page),
+            (vec!["content 5 bytes, sha256 H (binary)".to_owned()], false)
+        );
+        assert_eq!(press(&mut app, KeyCode::Char('O')), [app::Effect::Redraw]);
+        assert_eq!(app.notice.as_deref(), Some("O: nothing to page"));
+        assert!(app.overlay.is_some(), "the viewer stays open");
+
+        press(&mut app, KeyCode::Esc);
+        view(&mut app, "site.key");
+        let (_, lines, page) = viewer(&app);
+        assert_eq!(
+            (lines, page),
+            (
+                vec!["content 10 bytes (hidden: mode 0600)".to_owned()],
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn a_tree_shows_each_file_item_under_its_path_and_pages_its_text() {
+        let (mut app, out) = planned("tui-view-tree");
+        let tree = out.join("tree").display().to_string();
+        view(&mut app, "tree");
+        assert_eq!(
+            viewer(&app),
+            (
+                format!("{tree} (8 bytes)"),
+                vec![
+                    format!("── {tree}/a.txt"),
+                    "content 6 bytes, sha256 H".to_owned(),
+                    "tree a".to_owned(),
+                    "(no newline at end)".to_owned(),
+                    format!("── {tree}/b.bin"),
+                    "content 2 bytes, sha256 H (binary)".to_owned(),
+                ],
+                true
+            )
+        );
+        let effects = press(&mut app, KeyCode::Char('O'));
+        let [app::Effect::Page(page), app::Effect::Redraw] = &effects[..] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(
+            app.page_text(page).as_deref().map(Vec::as_slice),
+            Some(format!("── {tree}/a.txt\ntree a\n").as_bytes())
+        );
+    }
+
+    #[test]
+    fn the_viewer_scrolls_by_line_page_and_to_either_end() {
+        let (mut app, _) = planned("tui-view-scroll");
+        view(&mut app, "long.txt");
+        assert_eq!(viewer(&app).1.len(), 41);
+        app.content_rows.set(10);
+        let mut at = |code| {
+            press(&mut app, code);
+            scroll(&app)
+        };
+        assert_eq!(at(KeyCode::Up), 0);
+        assert_eq!(at(KeyCode::Char('j')), 1);
+        assert_eq!(at(KeyCode::Down), 2);
+        assert_eq!(at(KeyCode::Char('k')), 1);
+        assert_eq!(at(KeyCode::PageDown), 11);
+        assert_eq!(at(KeyCode::PageDown), 21);
+        assert_eq!(at(KeyCode::PageDown), 31);
+        assert_eq!(at(KeyCode::PageDown), 31, "the last page stays full");
+        assert_eq!(at(KeyCode::PageUp), 21);
+        assert_eq!(at(KeyCode::Char('g')), 0);
+        assert_eq!(at(KeyCode::Char('G')), 31);
+        assert_eq!(at(KeyCode::Char('j')), 31);
+    }
+
+    #[test]
+    fn v_says_why_it_has_nothing_to_show() {
+        let mut app = App::with_inventory(opts(), Ok(Default::default()), Ok(vec![row("x")]));
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.notice.as_deref(), Some("v: no plan result"));
+
+        let (mut app, _) = planned("tui-view-why");
+        view(&mut app, "hostname");
+        assert_eq!(app.notice.as_deref(), Some("v: not a file step"));
+        view(&mut app, "web.conf");
+        assert_eq!(app.notice.as_deref(), Some("v: skipped on local"));
+        assert!(app.overlay.is_none());
+
+        if let Some(RunResult::Plan { targets, .. }) = app.results.last_mut() {
+            targets[0] = app::Slot::Done(plan::PlanReport::Failed {
+                target: "local".to_owned(),
+                vars: Default::default(),
+                env: Default::default(),
+                error: "down".to_owned(),
+                ok: false,
+            });
+        }
+        view(&mut app, "plain.conf");
+        assert_eq!(app.notice.as_deref(), Some("v: local did not plan"));
+    }
+
+    #[test]
+    fn v_on_a_running_plan_says_it_is_still_running() {
+        use crate::tui::app::tests::file_row;
+
+        let mut app = App::with_inventory(opts(), Ok(Default::default()), Ok(Vec::new()));
+        press(&mut app, KeyCode::Char('p'));
+        app.on_msg(Msg::Steps(vec![file_row("file /etc/a", 0)]));
+        app.on_msg(Msg::Begin(vec!["local".to_owned()]));
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.notice.as_deref(), Some("v: local did not plan"));
+        app.on_msg(Msg::PlanDone(
+            0,
+            plan::PlanReport::Planned {
+                target: "local".to_owned(),
+                trees: Vec::new(),
+                vars: Default::default(),
+                env: Default::default(),
+                steps: Vec::new(),
+                pending_handlers: Vec::new(),
+                ok: true,
+            },
+        ));
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.notice.as_deref(), Some("v: plan is still running"));
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn only_the_newest_plan_keeps_its_sources() {
+        let (mut app, _) = planned("tui-view-older");
+        press(&mut app, KeyCode::Char('p'));
+        app.on_msg(Msg::Finished(Err("stopped".to_owned())));
+        press(&mut app, KeyCode::Char('['));
+        assert!(matches!(
+            app.shown_result(),
+            Some(RunResult::Plan {
+                sources: None,
+                ok: Some(true),
+                ..
+            })
+        ));
+        view(&mut app, "plain.conf");
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("v: content kept only for the latest plan")
+        );
+    }
+
+    #[test]
+    fn o_pages_the_text_through_a_0600_file_removed_after_the_pager() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut app, out) = planned("tui-view-pager");
+        view(&mut app, "plain.conf");
+        let effects = press(&mut app, KeyCode::Char('O'));
+        let [app::Effect::Page(page), app::Effect::Redraw] = &effects[..] else {
+            panic!("{effects:?}")
+        };
+        let missing = super::super::page_content(&app, page, Some("no-such-pager -R"), None);
+        assert_eq!(missing, Err("O: PAGER not found: no-such-pager".to_owned()));
+
+        let seen = out.with_file_name("seen");
+        let fake = out.with_file_name("pager");
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nls -ln \"$1\" > '{0}'\nprintf '%s\\n' \"$1\" >> '{0}'\ncat \"$1\" >> '{0}'\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        {
+            let _lock = anvil::term::test_lock();
+            let pager = fake.display().to_string();
+            assert_eq!(
+                super::super::page_content(&app, page, Some(&pager), None),
+                Ok(())
+            );
+        }
+        let seen = fs::read_to_string(&seen).unwrap();
+        let lines: Vec<&str> = seen.lines().collect();
+        assert!(lines[0].starts_with("-rw-------"), "{seen}");
+        assert!(
+            !std::path::Path::new(lines[1]).exists(),
+            "removed: {}",
+            lines[1]
+        );
+        assert_eq!(
+            lines[2], "plain\\x1b]0;x\\x07 {{ vars.name }}",
+            "the text escaped as the viewer draws it"
+        );
     }
 
     #[test]

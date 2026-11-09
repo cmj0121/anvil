@@ -274,6 +274,13 @@ impl PlannedRun {
         self.file()?.write.as_ref()?.rendered.as_deref()
     }
 
+    /// A file step's mode when it gives others no read, so its bytes and
+    /// their hash stay hidden; `None` for any other step.
+    pub fn hidden_mode(&self) -> Option<&str> {
+        let write = self.file()?.write.as_ref()?;
+        (!crate::record::is_world_readable(&write.mode)).then_some(write.mode.as_str())
+    }
+
     /// Whether a file step writes a binary src, whose rollback is lost.
     pub fn binary(&self) -> bool {
         (self.file().and_then(|run| run.write.as_ref())).is_some_and(|write| write.binary)
@@ -409,15 +416,21 @@ impl Serialize for PlannedRun {
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             notify: &'a [String],
         }
-        /// A templated file's rendered size and hash, never its text.
+        /// A templated file's rendered size and, unless its mode hides it,
+        /// hash; never its text.
         #[derive(Serialize)]
         struct RenderedShown<'a> {
             bytes: usize,
-            sha256: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sha256: Option<&'a str>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            hidden: bool,
         }
+        let hidden = self.hidden_mode().is_some();
         let rendered = self.rendered().map(|rendered| RenderedShown {
             bytes: rendered.text.len(),
-            sha256: &rendered.sha256,
+            sha256: (!hidden).then_some(rendered.sha256.as_str()),
+            hidden,
         });
         let Attrs {
             mode,
