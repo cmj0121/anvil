@@ -2,7 +2,7 @@
 //! the files browser over both), an optional log pane, the status bar and
 //! the overlays (help, the secret NAME prompt, the migrate choice, the
 //! options, the targets, the run, rollback, update and delete
-//! confirmations). Host, config and file text is escaped before it is
+//! confirmations, and the plan's file viewer). Host, config and file text is escaped before it is
 //! drawn.
 
 use ratatui::Frame;
@@ -46,6 +46,15 @@ const FILES_STATUS_KEYS: &[&str] = &[
     "Esc close",
 ];
 
+/// The status bar's keys while the viewer is open.
+const CONTENT_STATUS_KEYS: &[&str] = &[
+    "↑↓ scroll",
+    "PgUp/PgDn page",
+    "g/G top/end",
+    "O pager",
+    "Esc close",
+];
+
 /// What the store's empty root says.
 const EMPTY_STORE: &str = "(empty — anvil files cp FILE $/ to add)";
 
@@ -73,6 +82,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("Tab", "focus"),
         ],
     ),
+    ("Plan", &[("v", "view file")]),
     ("History", &[("[ ]", "run")]),
     (
         "Edit",
@@ -116,6 +126,19 @@ const FILES_HELP: &[(&str, &[(&str, &str)])] = &[
     ("Entry", &[("e", "edit"), ("D", "delete")]),
 ];
 
+/// The help overlay's rows for `v`'s viewer, whose keys [`App::on_key`]
+/// handles only while it is open.
+const CONTENT_HELP: &[(&str, &[(&str, &str)])] = &[(
+    "Viewer",
+    &[
+        ("↑↓/jk", "scroll"),
+        ("PgUp/PgDn", "page"),
+        ("g/G", "top/end"),
+        ("O", "pager"),
+        ("Esc/q", "close"),
+    ],
+)];
+
 pub fn draw(app: &App, f: &mut Frame) {
     let log_rows = if app.show_log { LOG_ROWS } else { 0 };
     let [header, main, log, status] = Layout::vertical([
@@ -150,7 +173,32 @@ pub fn draw(app: &App, f: &mut Frame) {
         Some(Overlay::ConfirmRollback { targets }) => draw_confirm_rollback(f, targets),
         Some(Overlay::ConfirmUpdate { version }) => draw_confirm_update(f, version),
         Some(Overlay::ConfirmDelete { path }) => draw_confirm_delete(f, path),
+        Some(Overlay::Content {
+            title,
+            lines,
+            scroll,
+            ..
+        }) => draw_content(app, f, main, title, lines, *scroll),
     }
+}
+
+/// The viewer over Steps and Results: `title` on its border, `lines` from
+/// `scroll`, cut at the box's width; the rows it shows are kept for paging.
+fn draw_content(
+    app: &App,
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    lines: &[String],
+    scroll: usize,
+) {
+    let rows = usize::from(area.height.saturating_sub(2));
+    app.content_rows.set(rows);
+    let shown: Vec<Line> = (lines.iter().skip(scroll).take(rows))
+        .map(|line| Line::from(line.as_str()))
+        .collect();
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(shown).block(block(title, true)), area);
 }
 
 fn focus_style() -> Style {
@@ -262,7 +310,9 @@ fn status_line(app: &App, width: u16) -> Line<'static> {
         (None, None, None, None) => {
             let room = usize::from(width).saturating_sub(spans_width(&right) + 1);
             let mut keys = String::new();
-            let shown = if app.files.is_some() {
+            let shown = if matches!(app.overlay, Some(Overlay::Content { .. })) {
+                CONTENT_STATUS_KEYS
+            } else if app.files.is_some() {
                 FILES_STATUS_KEYS
             } else {
                 STATUS_KEYS
@@ -1117,6 +1167,7 @@ fn draw_help(app: &App, f: &mut Frame) {
     let lines: Vec<Line> = HELP
         .iter()
         .chain(FILES_HELP)
+        .chain(CONTENT_HELP)
         .map(|(group, keys)| {
             let mut spans = vec![Span::styled(format!(" {group:<8}"), heading())];
             for (key, what) in *keys {
@@ -1374,7 +1425,8 @@ mod tests {
     use crossterm::event::KeyCode;
 
     use crate::tui::app::tests::{
-        Store, app, cancelled, inventory, local_report, opts, probed, ran, row as step_row, step,
+        Store, app, cancelled, file_row, inventory, local_report, opts, probed, ran,
+        row as step_row, step,
     };
     use crate::tui::app::{LogLine, Msg, RunKind, RunResult, Running};
     use anvil::cancel::Cancel;
@@ -1603,8 +1655,8 @@ mod tests {
             rows,
             [
                 step_row("packages"),
-                step_row("file /etc/a.conf"),
-                step_row("file /etc/b.conf"),
+                file_row("file /etc/a.conf", 0),
+                file_row("file /etc/b.conf", 1),
                 step_row("hostname"),
                 step_row("false"),
             ]
@@ -1679,7 +1731,7 @@ mod tests {
         assert_eq!(
             rows,
             [
-                step_row("file /etc/a.conf"),
+                file_row("file /etc/a.conf", 0),
                 step_row("service sshd"),
                 step_row("service cron"),
                 step_row("hostname"),
@@ -2221,18 +2273,20 @@ mod tests {
         app.overlay = Some(Overlay::Help);
         let screen = render(&app, 80, 24);
         assert_eq!(
-            screen[7..18],
+            screen[6..19],
             [
                 "│ ┌Help──────────────────────────────────────────────────────────────────────┐ │",
                 "│ │ Run      a apply  p plan  d doctor  x run script  b rollback  Esc cancel │ │",
                 "│ │ Targets  t pick  Space select                                            │ │",
                 "│ │ Move     ↑↓/jk step/scroll  ←→ target  Enter go to step  Tab focus       │ │",
+                "│ │ Plan     v view file                                                     │ │",
                 "│ │ History  [ ] run                                                         │ │",
                 "│ │ Edit     i inventory  c config  s secret  m migrate  F files             │ │",
                 "│ │ Options  f format  o paths  +/- log                                      │ │",
                 "│ │ App      l log  r reload  u update  ? help  q/^C quit                    │ │",
                 "│ │ Browser  ↑↓/jk move  Enter/→/l open  ⌫/←/h up  r reload  Esc/F/q close   │ │",
                 "│ │ Entry    e edit  D delete                                                │ │",
+                "│ │ Viewer   ↑↓/jk scroll  PgUp/PgDn page  g/G top/end  O pager  Esc/q close │ │",
                 "│ └──────────────────────────────────────────────────────────────────────────┘ │",
             ]
         );
@@ -2248,6 +2302,35 @@ mod tests {
         assert_eq!(buf[(x, y)].fg, Color::DarkGray);
         assert_eq!(buf[(x + 2, y)].fg, Color::DarkGray);
         assert_eq!(buf[(13, 8)].fg, Color::LightBlue, "the other keys stay");
+    }
+
+    #[test]
+    fn the_viewer_covers_steps_and_results_from_its_scroll_with_its_keys_below() {
+        let mut app = app();
+        app.overlay = Some(Overlay::Content {
+            title: "/etc/a (12 bytes)".to_owned(),
+            lines: zeroize::Zeroizing::new((0..9).map(|n| format!("line {n}")).collect()),
+            scroll: 2,
+            page: None,
+        });
+        let screen = render(&app, 60, 8);
+        assert_eq!(
+            screen[1..7],
+            [
+                "┌/etc/a (12 bytes)─────────────────────────────────────────┐",
+                "│line 2                                                    │",
+                "│line 3                                                    │",
+                "│line 4                                                    │",
+                "│line 5                                                    │",
+                "└──────────────────────────────────────────────────────────┘",
+            ]
+        );
+        assert_eq!(app.content_rows.get(), 4);
+        assert!(
+            screen[7].starts_with(" ↑↓ scroll · PgUp/PgDn page · g/G top/end"),
+            "{}",
+            screen[7]
+        );
     }
 
     #[test]
@@ -2752,6 +2835,8 @@ mod tests {
         show(
             &mut app,
             RunResult::Plan {
+                steps: Vec::new(),
+                sources: None,
                 targets: done(vec![PlanReport::Planned {
                     target: "local".to_owned(),
                     trees: Vec::new(),
@@ -2786,11 +2871,13 @@ mod tests {
         use anvil::step::PlannedRun;
         use anvil::transport::RUN_TIMEOUT;
 
-        let steps = Ok(vec![step_row("packages"), step_row("hostname")]);
-        let mut app = App::with_inventory(opts(), Ok(inventory()), steps);
+        let steps = vec![step_row("packages"), step_row("hostname")];
+        let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
         show(
             &mut app,
             RunResult::Plan {
+                steps,
+                sources: None,
                 targets: done(vec![
                     PlanReport::Planned {
                         target: "local".to_owned(),

@@ -14,13 +14,17 @@ use anvil::cancel::{AbortReason, Cancel};
 use anvil::config::{Config, StepKind};
 use anvil::document::{Format, MAX_BYTES};
 use anvil::error::Failure;
+use anvil::files::Sources;
 use anvil::filestore::{self, Entry, Kind, Root};
 use anvil::inventory::{Inventory, LOCAL, Sel, Target, UnknownSel};
+use anvil::logger::{escape_controls, escape_invisible};
 use anvil::options::Options;
+use anvil::plan::{ContentView, Unread};
 use anvil::secret::{self, BackendKind};
 use anvil::tasks::{Expanded, ItemKind};
 use anvil::update::{Check, Status};
 use anvil::{doctor, plan, report};
+use zeroize::Zeroizing;
 
 use super::ui;
 
@@ -89,6 +93,8 @@ pub struct App {
     /// An available version whose check came back under another overlay:
     /// the next `u` asks to install it without checking again.
     pub available: Option<String>,
+    /// The viewer's body rows as last drawn: a page for PgUp and PgDn.
+    pub content_rows: Cell<usize>,
     /// The file store `F` browses, or why it has none.
     pub store: Result<Root, String>,
     /// `F`'s browser, drawn over Steps and Results while open.
@@ -242,6 +248,9 @@ pub struct TagRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepRow {
     pub label: String,
+    /// A `[[files]]` row's ordinal among the file items, which its planned
+    /// steps carry: what `v` looks up.
+    pub file: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,11 +414,15 @@ pub enum RunResult {
         /// What the run warns about once it ended, such as a full record.
         warnings: Vec<String>,
     },
-    /// `ok` is `None` while running.
+    /// `ok` is `None` while running. `steps` are those of the config the
+    /// worker loaded, empty until it sends them; `sources` the file bytes it
+    /// read, kept only by the newest plan, for `v`.
     Plan {
+        steps: Vec<StepRow>,
         targets: Vec<Slot<plan::PlanReport>>,
         ok: Option<bool>,
         error: Option<String>,
+        sources: Option<Arc<PlanSources>>,
     },
     Edit {
         /// `inventory`, `config`, `secret NAME`, `migrate → age`, `file
@@ -447,6 +460,22 @@ impl RunResult {
             RunResult::Edit { .. } => 1,
         }
     }
+}
+
+/// A plan's `[[files]]` srcs as its worker read them, and their hashes:
+/// what the viewer shows and the pager gets.
+pub struct PlanSources {
+    pub sources: Sources,
+    pub hashes: plan::Hashes,
+}
+
+/// The file entry a viewer shows: result `result`'s tab `tab`, entry
+/// `ordinal` ([`StepRow::file`]). No bytes: the main thread looks them up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    pub result: usize,
+    pub tab: usize,
+    pub ordinal: usize,
 }
 
 pub struct LogLine {
@@ -494,6 +523,15 @@ pub enum Overlay {
     ConfirmDelete {
         path: String,
     },
+    /// `v`'s read-only viewer: `lines` already escaped, the first shown at
+    /// `scroll`; `page` is what `O` hands the pager, `None` when no text is
+    /// shown.
+    Content {
+        title: String,
+        lines: Zeroizing<Vec<String>>,
+        scroll: usize,
+        page: Option<Page>,
+    },
 }
 
 pub enum Msg {
@@ -508,6 +546,8 @@ pub enum Msg {
     /// Target `index`'s report, in the order the targets end.
     TargetDone(usize, report::TargetReport),
     PlanDone(usize, plan::PlanReport),
+    /// A plan's file srcs, once its targets were planned.
+    PlanSources(Arc<PlanSources>),
     DoctorTarget(doctor::TargetReport),
     Finished(Result<(), String>),
     Panicked(String),
@@ -534,6 +574,9 @@ pub enum Effect {
     EditScript,
     /// Load the inventory and the config again: [`App::reload`].
     Reload,
+    /// Show the viewer's text in the pager on the main thread, with the real
+    /// terminal: [`App::page_text`].
+    Page(Page),
     Redraw,
 }
 
@@ -585,8 +628,12 @@ pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
                     StepKind::Run(run) => report::command(run),
                 },
             };
+            let file = match &item.kind {
+                ItemKind::File { ordinal, .. } => Some(*ordinal),
+                _ => None,
+            };
             let Some(path) = &item.path else {
-                return StepRow { label };
+                return StepRow { label, file };
             };
             let name = item.name.as_deref().filter(|name| !name.trim().is_empty());
             StepRow {
@@ -595,6 +642,7 @@ pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
                     anvil::step::shown_text(name.unwrap_or(&label).trim()),
                     anvil::step::shown_text(path)
                 ),
+                file,
             }
         })
         .collect()
@@ -655,6 +703,7 @@ impl App {
             updated: None,
             available: None,
             store,
+            content_rows: Cell::new(0),
             files: None,
         };
         app.set_steps(steps);
@@ -662,7 +711,8 @@ impl App {
     }
 
     /// `q` and Ctrl-C quit; while a run is going they cancel it first, and
-    /// the loop ends once it has. In the files browser `q` closes it instead.
+    /// the loop ends once it has. In the files browser and the viewer `q`
+    /// closes it instead.
     pub fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         let had_notice = self.notice.take().is_some();
         let ctrl_c =
@@ -671,7 +721,9 @@ impl App {
             self.overlay,
             Some(Overlay::Input { .. } | Overlay::Options { .. })
         );
-        if ctrl_c || (key.code == KeyCode::Char('q') && !typing && self.files.is_none()) {
+        let viewing = matches!(self.overlay, Some(Overlay::Content { .. }));
+        if ctrl_c || (key.code == KeyCode::Char('q') && !typing && !viewing && self.files.is_none())
+        {
             self.quit = true;
             if let Some(running) = &self.running {
                 running.cancel.stop(AbortReason::Cancelled);
@@ -759,6 +811,7 @@ impl App {
             KeyCode::Left => self.move_tab(false),
             KeyCode::Right => self.move_tab(true),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
+            KeyCode::Char('v') => self.view(),
             KeyCode::Tab => self.focus = self.next_focus(),
             KeyCode::Enter => self.scroll_to_step(),
             KeyCode::Up | KeyCode::Char('k') => self.step(false),
@@ -845,6 +898,7 @@ impl App {
         let keep = match (&mut overlay, key.code) {
             (_, KeyCode::Esc)
             | (Overlay::Help, KeyCode::Char('?'))
+            | (Overlay::Content { .. }, KeyCode::Char('q'))
             | (
                 Overlay::Confirm { .. }
                 | Overlay::ConfirmUpdate { .. }
@@ -922,6 +976,35 @@ impl App {
                 }
                 _ => true,
             },
+            (
+                Overlay::Content {
+                    lines,
+                    scroll,
+                    page,
+                    ..
+                },
+                code,
+            ) => {
+                let rows = self.content_rows.get().max(1);
+                let end = lines.len().saturating_sub(rows);
+                *scroll = match code {
+                    KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => *scroll + 1,
+                    KeyCode::PageUp => scroll.saturating_sub(rows),
+                    KeyCode::PageDown => *scroll + rows,
+                    KeyCode::Char('g') => 0,
+                    KeyCode::Char('G') => end,
+                    _ => *scroll,
+                }
+                .min(end);
+                if code == KeyCode::Char('O') {
+                    match page {
+                        Some(page) => effects.insert(0, Effect::Page(page.clone())),
+                        None => self.notice = Some("O: nothing to page".to_owned()),
+                    }
+                }
+                true
+            }
             (Overlay::Options { field, texts }, code) => match code {
                 KeyCode::Enter => {
                     let home = std::env::var_os("HOME");
@@ -1099,8 +1182,15 @@ impl App {
     pub fn on_msg(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::Steps(rows) => {
-                if let Some(RunResult::Apply { steps, .. }) = self.results.last_mut() {
+                if let Some(RunResult::Apply { steps, .. } | RunResult::Plan { steps, .. }) =
+                    self.results.last_mut()
+                {
                     *steps = rows;
+                }
+            }
+            Msg::PlanSources(read) => {
+                if let Some(RunResult::Plan { sources, .. }) = self.results.last_mut() {
+                    *sources = Some(read);
                 }
             }
             Msg::Begin(names) => match self.results.last_mut() {
@@ -1254,11 +1344,20 @@ impl App {
                 error: None,
                 warnings: Vec::new(),
             }),
-            RunKind::Plan => Some(RunResult::Plan {
-                targets: Vec::new(),
-                ok: None,
-                error: None,
-            }),
+            RunKind::Plan => {
+                for result in &mut self.results {
+                    if let RunResult::Plan { sources, .. } = result {
+                        *sources = None;
+                    }
+                }
+                Some(RunResult::Plan {
+                    steps: Vec::new(),
+                    targets: Vec::new(),
+                    ok: None,
+                    error: None,
+                    sources: None,
+                })
+            }
         };
         if let Some(result) = result {
             self.results.push(result);
@@ -1380,6 +1479,7 @@ impl App {
                 targets,
                 ok,
                 error: slot,
+                ..
             }) => {
                 not_run(targets);
                 *ok = Some(error.is_none() && all_ok(targets, plan::PlanReport::ok));
@@ -1436,11 +1536,11 @@ impl App {
         }
     }
 
-    /// The steps the Steps pane lists: those of the shown apply result's
-    /// config, else the config's as of the last reload.
+    /// The steps the Steps pane lists: those of the shown apply or plan
+    /// result's config, else the config's as of the last reload.
     pub fn shown_steps(&self) -> &[StepRow] {
         match self.shown_result() {
-            Some(RunResult::Apply { steps, .. }) => steps,
+            Some(RunResult::Apply { steps, .. } | RunResult::Plan { steps, .. }) => steps,
             _ => &self.steps,
         }
     }
@@ -1469,6 +1569,132 @@ impl App {
         if let Some(scroll) = scroll {
             self.scroll = scroll;
         }
+    }
+
+    /// `v`: opens the viewer on the shown plan tab's file entry under the
+    /// Steps cursor, or says why there is none.
+    fn view(&mut self) {
+        match self.viewed() {
+            Ok(overlay) => self.overlay = Some(overlay),
+            Err(why) => self.notice = Some(format!("v: {why}")),
+        }
+    }
+
+    /// The viewer [`App::view`] opens: a single file's content line and
+    /// text, or each file item of a tree under its `── PATH` line.
+    fn viewed(&self) -> Result<Overlay, String> {
+        let result = (self.shown)
+            .filter(|_| matches!(self.shown_result(), Some(RunResult::Plan { .. })))
+            .ok_or("no plan result")?;
+        let ordinal = (self.shown_steps().get(self.step_cursor()))
+            .and_then(|row| row.file)
+            .ok_or("not a file step")?;
+        let page = Page {
+            result,
+            tab: self.shown_tab(),
+            ordinal,
+        };
+        let entry = self.files_of(&page)?;
+        let mut lines = Zeroizing::new(Vec::new());
+        let mut bytes = 0;
+        for (path, view) in &entry.files {
+            if entry.tree.is_some() {
+                lines.push(format!("── {}", shown(path)));
+            }
+            match view {
+                Ok(view) => {
+                    bytes += view.bytes.len();
+                    lines.push(shown(&view.line()));
+                    lines.extend(view.text().map(text_lines).unwrap_or_default());
+                }
+                Err(Unread) => lines.push(Unread::TEXT.to_owned()),
+            }
+        }
+        let path = entry.tree.unwrap_or(entry.files[0].0);
+        let shows_text =
+            (entry.files.iter()).any(|(_, view)| view.as_ref().is_ok_and(|v| v.text().is_some()));
+        Ok(Overlay::Content {
+            title: format!("{} ({bytes} bytes)", shown(path)),
+            lines,
+            scroll: 0,
+            page: shows_text.then_some(page),
+        })
+    }
+
+    /// What `O` hands the pager for `page`: a single file's text, or each
+    /// shown tree item's under a `── PATH` line, escaped as the viewer
+    /// draws it; `None` when nothing is
+    /// shown or the plan no longer keeps its sources.
+    pub fn page_text(&self, page: &Page) -> Option<Zeroizing<Vec<u8>>> {
+        let entry = self.files_of(page).ok()?;
+        let mut out = Zeroizing::new(Vec::new());
+        for (path, view) in &entry.files {
+            let Some(text) = view.as_ref().ok().and_then(ContentView::text) else {
+                continue;
+            };
+            if entry.tree.is_some() {
+                out.extend_from_slice(format!("── {}\n", shown(path)).as_bytes());
+            }
+            let text = Zeroizing::new(shown(text));
+            out.extend_from_slice(text.as_bytes());
+            if entry.tree.is_some() && !text.ends_with('\n') {
+                out.push(b'\n');
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// The planned steps of `page`'s file entry with what each would write.
+    fn files_of(&self, page: &Page) -> Result<Viewed<'_>, String> {
+        let Some(RunResult::Plan {
+            targets, sources, ..
+        }) = self.results.get(page.result)
+        else {
+            return Err("no plan result".to_owned());
+        };
+        let slot = targets.get(page.tab).ok_or("no plan result")?;
+        let Some(plan::PlanReport::Planned {
+            target,
+            steps,
+            trees,
+            ..
+        }) = slot.report()
+        else {
+            let name = match slot {
+                Slot::Pending(name) | Slot::NotRun(name) => name.as_str(),
+                Slot::Done(report) => report.target(),
+            };
+            return Err(format!("{name} did not plan"));
+        };
+        let newer = (self.results[page.result + 1..].iter())
+            .any(|result| matches!(result, RunResult::Plan { .. }));
+        let read = sources.as_deref().ok_or(if newer {
+            "content kept only for the latest plan"
+        } else {
+            "plan is still running"
+        })?;
+        let mut first = None;
+        let mut tree = false;
+        let mut files = Vec::new();
+        for (i, step) in steps.iter().enumerate() {
+            let Some(write) = plan::file_write(step).filter(|write| write.ordinal == page.ordinal)
+            else {
+                continue;
+            };
+            first.get_or_insert(i);
+            tree |= write.item.is_some();
+            if let Some(view) = plan::content_of(step, &read.sources, &read.hashes) {
+                files.push((write.dest.as_str(), view));
+            }
+        }
+        let Some(first) = first.filter(|_| !files.is_empty()) else {
+            return Err(format!("skipped on {target}"));
+        };
+        let tree = tree.then(|| {
+            (trees.iter().rev().find(|shown| shown.step <= first))
+                .map_or(files[0].0, |shown| shown.dest.as_str())
+        });
+        Ok(Viewed { tree, files })
     }
 
     fn next_focus(&self) -> Pane {
@@ -1526,6 +1752,32 @@ impl App {
         let tags = self.tags.iter().filter(|r| r.selected).map(|r| &r.name);
         self.opts.target = targets.chain(tags).cloned().collect();
     }
+}
+
+/// One file entry of a plan target: its dest when it is a tree, and each
+/// file it writes with its content, in step order.
+struct Viewed<'a> {
+    tree: Option<&'a str>,
+    files: Vec<(&'a str, Result<ContentView<'a>, Unread>)>,
+}
+
+/// `text` with control and invisible characters escaped.
+fn shown(text: &str) -> String {
+    escape_controls(&escape_invisible(text)).into_owned()
+}
+
+/// `text` as one escaped line per line, then `(no newline at end)` when it
+/// lacks a final `\n`.
+fn text_lines(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let mut lines: Vec<String> = body.split('\n').map(shown).collect();
+    if !text.ends_with('\n') {
+        lines.push("(no newline at end)".to_owned());
+    }
+    lines
 }
 
 /// What the status bar says once `u` installed `version`, until restart.
@@ -1669,6 +1921,15 @@ pub mod tests {
     pub fn row(label: &str) -> StepRow {
         StepRow {
             label: label.to_owned(),
+            file: None,
+        }
+    }
+
+    /// A `[[files]]` row: `label` for file item `ordinal`.
+    pub fn file_row(label: &str, ordinal: usize) -> StepRow {
+        StepRow {
+            label: label.to_owned(),
+            file: Some(ordinal),
         }
     }
 
@@ -1960,7 +2221,7 @@ pub mod tests {
         assert_eq!(
             load_steps(&opts),
             Ok(vec![
-                row("file /etc/motd"),
+                file_row("file /etc/motd", 0),
                 row("service sshd"),
                 row("service cron"),
                 row("hostname"),
@@ -1981,7 +2242,7 @@ pub mod tests {
             load_steps(&opts),
             Ok(vec![
                 row("dir /srv/app"),
-                row("file /etc/motd"),
+                file_row("file /etc/motd", 0),
                 row("link /usr/local/bin/app -> ../app/bin"),
                 row("hostname"),
             ])

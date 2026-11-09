@@ -28,7 +28,7 @@ use crate::engine::{self, Unresolved};
 use crate::error::{Failure, print_json};
 use crate::facts::Facts;
 use crate::fanout::{self, Event};
-use crate::files::{Loaded, MAX_KEPT, Sources};
+use crate::files::{FileWrite, Loaded, MAX_KEPT, Sources};
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
 use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
@@ -384,6 +384,14 @@ impl Unread {
     pub const TEXT: &'static str = "content unavailable (src not loaded)";
 }
 
+/// `step`'s write when it is a file step that is not a skip.
+pub fn file_write(step: &PlannedRun) -> Option<&FileWrite> {
+    match &step.kind {
+        RunKind::File { run, .. } if !run.skip => run.write.as_ref(),
+        _ => None,
+    }
+}
+
 /// What apply would write for `step`; `None` for a skip or any step that
 /// is not a file step.
 pub fn content_of<'a>(
@@ -391,10 +399,10 @@ pub fn content_of<'a>(
     sources: &'a Sources,
     hashes: &'a Hashes,
 ) -> Option<Result<ContentView<'a>, Unread>> {
-    let RunKind::File { dest, run } = &step.kind else {
+    let RunKind::File { dest, .. } = &step.kind else {
         return None;
     };
-    let write = run.write.as_ref().filter(|_| !run.skip)?;
+    let write = file_write(step)?;
     let view = |bytes: &'a [u8], sha256: &'a str, binary: bool, templated: bool| ContentView {
         path: dest,
         mode: &write.mode,

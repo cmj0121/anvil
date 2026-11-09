@@ -13,9 +13,14 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
+use rustix::process::Pid;
 
 use crate::bytes;
 use crate::document;
@@ -25,6 +30,12 @@ use crate::term;
 
 /// The editor when neither the config nor the environment names one.
 pub const DEFAULT: &str = "nvim";
+
+/// The pager when `$PAGER` names none.
+pub const PAGER: &str = "less";
+
+/// How long a gone process's [`ViewFile`] is left before it is swept.
+const VIEW_STALE: Duration = Duration::from_secs(60 * 60);
 
 /// How often a temp file name may collide before giving up.
 const NAME_ATTEMPTS: u32 = 16;
@@ -163,6 +174,28 @@ impl Editor {
         })
     }
 
+    /// The pager: `pager` (`$PAGER`) split as [`Editor::from_command`] does,
+    /// else [`PAGER`]; blank counts as unset.
+    pub fn pager(pager: Option<&str>, path: Option<&OsStr>) -> Result<Editor, EditorError> {
+        let command = pager.map(str::trim).filter(|s| !s.is_empty());
+        Editor::from_command(command.unwrap_or(PAGER), path)
+    }
+
+    /// Shows `bytes` in this program as a pager, through a [`ViewFile`],
+    /// with the real terminal; its exit status is not checked.
+    pub fn page(&self, bytes: &[u8]) -> Result<(), EditorError> {
+        let file = ViewFile::new(bytes)?;
+        let mut args: Vec<OsString> = self.args.iter().map(OsString::from).collect();
+        args.push(file.path().as_os_str().to_owned());
+        term::with_terminal(|| exec::resolved(&self.program).args(&args).status()).map_err(
+            |source| EditorError::Spawn {
+                program: self.program.display().to_string(),
+                source,
+            },
+        )?;
+        Ok(())
+    }
+
     /// Opens `initial` in the editor as an `.<ext>` file; `None` when the
     /// editor left it unchanged.
     pub fn edit(
@@ -172,7 +205,7 @@ impl Editor {
         buffer: Buffer,
     ) -> Result<Option<Vec<u8>>, EditorError> {
         let dir = private_dir()?;
-        let (path, file) = create_temp(&dir, ext)?;
+        let (path, file) = create_temp(&dir, "edit", ext)?;
         let result = self.edit_at(&path, file, initial, buffer);
         scrub(&path);
         result
@@ -266,6 +299,44 @@ pub fn command_for(preference: Option<&str>, visual: Option<&str>, editor: Optio
         .to_string()
 }
 
+/// A private temp file holding bytes for a program to read, in the same
+/// directory and with the same mode as the editor's, named
+/// `view-<pid>-<random>.txt`; overwritten with zeros and removed (the file
+/// only) when dropped, or by a later [`ViewFile::new`] once its process is
+/// gone ([`sweep_views`]).
+pub struct ViewFile {
+    path: PathBuf,
+}
+
+impl ViewFile {
+    /// A fresh 0600 `.txt` file holding `bytes`, after sweeping those a
+    /// killed process left behind.
+    pub fn new(bytes: &[u8]) -> Result<ViewFile, EditorError> {
+        let dir = private_dir()?;
+        sweep_views(&dir, rustix::process::getuid().as_raw());
+        let stem = format!("view-{}", std::process::id());
+        let (path, mut file) = create_temp(&dir, &stem, "txt")?;
+        let view = ViewFile { path };
+        let io = |source| EditorError::Io {
+            path: view.path.clone(),
+            source,
+        };
+        file.write_all(bytes).map_err(io)?;
+        file.sync_all().map_err(io)?;
+        Ok(view)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ViewFile {
+    fn drop(&mut self) {
+        scrub(&self.path);
+    }
+}
+
 /// `<temp_dir>/anvil-<uid>/`, created 0700; refused unless it is a directory
 /// we own that group and others cannot reach.
 fn private_dir() -> Result<PathBuf, EditorError> {
@@ -290,11 +361,58 @@ fn private_dir() -> Result<PathBuf, EditorError> {
     Err(EditorError::UnsafeDir { path: dir, reason })
 }
 
-/// A fresh `edit-<random>.<ext>` in `dir`, 0600, that did not exist before.
-fn create_temp(dir: &Path, ext: &str) -> Result<(PathBuf, File), EditorError> {
+/// Scrubs and removes each [`ViewFile`] in `dir` whose process is gone
+/// (`kill(pid, 0)` says no such process) and that was last written over
+/// [`VIEW_STALE`] ago, since a pid means nothing across PID namespaces; as
+/// [`scrub`] does, but only a regular file `uid` owns, opened without
+/// following a symlink. A live pid's file, a newer one, one whose pid or
+/// age cannot be checked and any other file stay.
+fn sweep_views(dir: &Path, uid: u32) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(view_pid) else {
+            continue;
+        };
+        if rustix::process::test_kill_process(pid) != Err(Errno::SRCH) {
+            continue;
+        }
+        let path = entry.path();
+        let flags = OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let Ok(fd) = rustix::fs::open(&path, flags, Mode::empty()) else {
+            continue;
+        };
+        let mut file = File::from(fd);
+        let Ok(meta) = file.metadata() else {
+            continue;
+        };
+        let stale = (meta.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > VIEW_STALE);
+        if !meta.is_file() || meta.uid() != uid || !stale {
+            continue;
+        }
+        let zeros = vec![0u8; meta.len() as usize];
+        let _ = file.write_all(&zeros).and_then(|()| file.sync_all());
+        let _ = fs::remove_file(&path);
+    }
+}
+
+/// The pid in a `view-<pid>-<16 hex>.txt` name; `None` for any other name.
+fn view_pid(name: &str) -> Option<Pid> {
+    let rest = name.strip_prefix("view-")?.strip_suffix(".txt")?;
+    let (pid, random) = rest.split_once('-')?;
+    let hex = random.len() == 16 && random.bytes().all(|b| b.is_ascii_hexdigit());
+    let digits = !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit());
+    (hex && digits).then(|| Pid::from_raw(pid.parse().ok()?))?
+}
+
+/// A fresh `<stem>-<random>.<ext>` in `dir`, 0600, that did not exist before.
+fn create_temp(dir: &Path, stem: &str, ext: &str) -> Result<(PathBuf, File), EditorError> {
     let mut last = io::Error::from(io::ErrorKind::AlreadyExists);
     for _ in 0..NAME_ATTEMPTS {
-        let path = dir.join(format!("edit-{:016x}.{ext}", random()));
+        let path = dir.join(format!("{stem}-{:016x}.{ext}", random()));
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -418,6 +536,97 @@ mod tests {
         let editor = Editor::from_command("true", system_path().as_deref()).unwrap();
         editor.edit(b"x", "handoff", Buffer::Sensitive).unwrap();
         assert_eq!(recorder.events(), [Event::Suspend, Event::Resume]);
+    }
+
+    #[test]
+    fn the_pager_is_pager_split_on_whitespace_else_less() {
+        let path = system_path();
+        let pager = Editor::pager(Some(" sh  -c true "), path.as_deref()).unwrap();
+        assert!(pager.program.ends_with("sh"), "{:?}", pager.program);
+        assert_eq!(pager.args, ["-c", "true"]);
+        let missing = Editor::pager(Some("no-such-pager -R"), path.as_deref()).unwrap_err();
+        assert!(matches!(missing, EditorError::NotFound(ref p) if p == "no-such-pager"));
+        let none = Editor::pager(Some("  "), Some(OsStr::new("/nonexistent"))).unwrap_err();
+        assert!(matches!(none, EditorError::NotFound(ref p) if p == PAGER));
+    }
+
+    #[test]
+    fn the_pager_reads_a_0600_file_that_is_removed_after_it_exits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = term::test_lock();
+        let dir = crate::test_util::temp_dir("editor-pager");
+        let seen = dir.join("seen");
+        let fake = dir.join("pager");
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nls -ln \"$2\" > '{0}'\nprintf '%s\\n' \"$1\" \"$2\" >> '{0}'\ncat \"$2\" >> '{0}'\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let pager = Editor::pager(Some(&format!("{} -R", fake.display())), None).unwrap();
+        pager.page(b"line one\n").unwrap();
+        let seen = fs::read_to_string(&seen).unwrap();
+        let lines: Vec<&str> = seen.lines().collect();
+        assert!(lines[0].starts_with("-rw-------"), "{seen}");
+        assert_eq!(lines[1], "-R");
+        let file = Path::new(lines[2]);
+        assert_eq!(file.parent(), Some(private_dir().unwrap().as_path()));
+        assert_eq!(lines[3], "line one");
+        assert!(!file.exists(), "the file is removed");
+        assert!(private_dir().unwrap().is_dir(), "the dir stays");
+    }
+
+    #[test]
+    fn a_view_file_is_named_by_our_pid_and_a_gone_pids_old_one_is_swept() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = crate::test_util::temp_dir("editor-sweep");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        let name = |pid: u32, k: u64| format!("view-{pid}-{k:016x}.txt");
+        let gone = dir.join(name(i32::MAX as u32, 1));
+        let live = dir.join(name(std::process::id(), 2));
+        let link = dir.join(name(i32::MAX as u32, 3));
+        let edit = dir.join("edit-0000000000000004.txt");
+        let odd = dir.join(format!("view-{}-5.txt", i32::MAX));
+        let fresh = dir.join(name(i32::MAX as u32, 6));
+        let outside = dir.join("outside");
+        let old = SystemTime::now() - VIEW_STALE - Duration::from_secs(60);
+        let age = |path: &Path| {
+            let file = OpenOptions::new().write(true).open(path).unwrap();
+            file.set_modified(old).unwrap();
+        };
+        for path in [&gone, &live, &edit, &odd, &fresh, &outside] {
+            fs::write(path, "secret").unwrap();
+        }
+        for path in [&gone, &live, &edit, &odd, &outside] {
+            age(path);
+        }
+        symlink(&outside, &link).unwrap();
+
+        sweep_views(&dir, uid);
+        assert!(!gone.exists(), "a gone pid's old file is removed");
+        for path in [&live, &edit, &odd, &fresh, &outside] {
+            assert_eq!(fs::read_to_string(path).unwrap(), "secret", "{path:?}");
+        }
+        assert!(
+            fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "the link stays"
+        );
+
+        fs::write(&gone, "secret").unwrap();
+        age(&gone);
+        sweep_views(&dir, uid.wrapping_add(1));
+        assert!(gone.exists(), "another uid's file stays");
+
+        let view = ViewFile::new(b"x").unwrap();
+        let file = view.path().file_name().unwrap().to_str().unwrap();
+        assert_eq!(view_pid(file), Pid::from_raw(std::process::id() as i32));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn editor_at(program: &str) -> Editor {
