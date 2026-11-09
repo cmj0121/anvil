@@ -684,7 +684,7 @@ mod tests {
         assert_eq!((tree.files(), tree.size()), (4, 9));
         assert_eq!(tree.items[0].dest("/etc/app"), "/etc/app");
         assert_eq!(tree.items[4].dest("/etc/app"), "/etc/app/a/b/f");
-        assert_eq!(tree.items[4].source().unwrap().bytes, b"f\n");
+        assert_eq!(*tree.items[4].source().unwrap().bytes, b"f\n");
         assert!(tree.items[3].source().is_none());
         for src in ["conf/", "./conf", "conf/."] {
             assert_eq!(shown(&ws.expand(src).unwrap()), SORTED, "{src}");
@@ -708,7 +708,7 @@ mod tests {
         fs::write(store.path().join("conf/a/z"), b"\xff\0z").unwrap();
         let tree = ws.expand("$/conf").unwrap();
         assert_eq!(shown(&tree), SORTED);
-        assert_eq!(tree.items[4].source().unwrap().bytes, b"f\n");
+        assert_eq!(*tree.items[4].source().unwrap().bytes, b"f\n");
         assert_eq!(
             shown(&ws.expand("$/conf/a").unwrap()),
             ["/", "b/", "b/f", "z (binary)"]

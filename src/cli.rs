@@ -160,8 +160,11 @@ pub enum Command {
     },
     /// Show the steps apply would run on every target, running none
     Plan {
-        /// Also print each templated file's rendered text, per target
+        /// Also print the bytes apply would write for each file step, per target
         #[arg(long)]
+        show_content: bool,
+        /// Also print each templated file's rendered text, per target (kept for scripts)
+        #[arg(long, hide = true)]
         show_rendered: bool,
     },
     /// Restore the files the last apply wrote, on every selected target
@@ -321,7 +324,17 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
             anvil::doctor::run(out, &opts, &config, &expanded, store.as_ref())
         }
         Command::Apply { drop_pending } => anvil::apply::run(out, &opts, drop_pending),
-        Command::Plan { show_rendered } => anvil::plan::run(out, &opts, *show_rendered),
+        Command::Plan {
+            show_content,
+            show_rendered,
+        } => anvil::plan::run(
+            out,
+            &opts,
+            anvil::plan::Show {
+                content: *show_content,
+                rendered: *show_rendered,
+            },
+        ),
         Command::Rollback {
             force,
             force_all,
@@ -542,12 +555,21 @@ mod tests {
         assert!(matches!(
             command(&["plan"]),
             Command::Plan {
+                show_content: false,
                 show_rendered: false
             }
         ));
         assert!(matches!(
             command(&["plan", "--show-rendered"]),
             Command::Plan {
+                show_content: false,
+                show_rendered: true
+            }
+        ));
+        assert!(matches!(
+            command(&["plan", "--show-content", "--show-rendered"]),
+            Command::Plan {
+                show_content: true,
                 show_rendered: true
             }
         ));
