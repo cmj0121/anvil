@@ -82,6 +82,7 @@ enum State {
     NotRootOnly,
     NoHash,
     NoSudo,
+    Secret,
 }
 
 #[derive(Serialize)]
@@ -190,7 +191,7 @@ fn audit(request: Request) -> Result<Reply, String> {
 /// `None` when it is, or when it could not be compared.
 fn changed(file: &RecordedFile, current: &CurrentFile) -> Option<&'static str> {
     Some(match current.state {
-        State::NoHash | State::NoSudo => return None,
+        State::NoHash | State::NoSudo | State::Secret => return None,
         State::File if current.tag.as_deref() == Some(file.written_tag.as_str()) => return None,
         State::File => "changed",
         State::Absent => "absent",
