@@ -26,6 +26,11 @@ age 或 sops 儲存庫會在其他任何事之前先解密，因此錯誤的金�
 有密碼短語的 identity 會在終端機上詢問密碼短語，沒有終端機時儲存庫會回報 `locked`。
 各 backend 的設定、密碼短語提示與 sops 環境變數見[下文](#機密-backend)。
 
+機密有兩種用途：sudo 密碼（`sudo_secret`，[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)），以及在 `secrets`
+中列出它、以 `{{ secrets.NAME }}` 讀取它的範本檔案（[Secret files](configuration.zh-TW.md#secret-files)）。
+apply 在同一次儲存庫開啟中讀取兩者，且只在選取的 target 需要時才開啟；plan、doctor 與 rollback 從不為檔案機密開啟儲存庫。
+檔案機密必須至少 8 個位元組、是 UTF-8 且不含 NUL 位元組。
+
 ## 機密 backend
 
 每個 config（設定檔）只用一個 backend 保存所有 secret：由 `[secrets].backend` 選擇，且只讀取它的區段。

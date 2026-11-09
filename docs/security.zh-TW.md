@@ -126,6 +126,23 @@
   較短的密碼則不會被清除。
   sudo 必須顯示 anvil 自己的提示；其他類型的 PAM 提示（2FA、指紋）會讓該 target 在 15 秒後失敗。
   請參閱[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)。
+- **Secret file 不外露，但仍在 target 上。** 設定了 [`secrets`](configuration.zh-TW.md#secret-files) 的 `[[files]]` 項目或
+  file task，只經由 stdin 把算繪後的文字送到 target：放在寫入的 heredoc 中，或在 sudo 密碼路徑上寫入一個 0600 的暫存檔。
+  plan、`--show-content`、TUI 檢視器與 doctor 從不算繪它，也不開啟儲存庫；apply 紀錄保存 `secret: true`，
+  不保存寫入或被取代內容的雜湊，因為唯一未知數是短 token 的範本，其雜湊可以離線猜出；因此 rollback 無法復原它，
+  doctor 也不比對它。apply 在寫入前用來核對 dest 的雜湊絕不出現在 argv 或日誌中：在 sudo 密碼路徑上，它經由 stdin
+  寫入 0600 的旁檔 `<temp>.sha256`，與暫存檔一起移除。該 target 上的 step 輸出（以及 `--json`）中，每個值以及含有完整值的字串經
+  `b64encode` 的每個輸出都會被換成 `***`，寫入或讀取 dest 失敗時只顯示結束狀態，絕不顯示 target 的輸出。
+  短於 8 個位元組的檔案機密會被拒絕：apply 以 `files[0]: secret NAME is shorter than 8 bytes` 讓該 target 失敗，
+  因此不會寫入未經遮蔽的短值。已知限制：
+  - target 上的檔案只受它的 mode 保護；mode 必須不給 group 與其他人任何權限（`0600`、`0400`、`0700`），
+    所以 root 與擁有者仍能讀取。
+  - 只有原始值，以及含有完整值的字串經 `b64encode` 的輸出會被遮蔽。其他轉換都不會：`upper`、切片、`urlencode`、
+    `tojson`、shell 引號，或只對值的一部分做 `b64encode`。
+  - 範本與 config 一樣被信任：它的作者可以讓算繪錯誤、或哪一行失敗，取決於 secret 的值，從而由訊息得知它的一些資訊。
+  - 只有載入的值、最終的算繪結果與遮蔽清單在釋放時被清零；範本引擎過程中建立的字串則不會。
+  - 在 sudo 密碼路徑上，算繪後的檔案與它的旁檔雜湊暫存在連線使用者擁有的 0600 `/tmp/anvil-…` 檔案中。
+    step 結束後不論成功、失敗或取消都會移除；連線中斷或 anvil 在寫入中途被終止時它們可能留下，只有該使用者與 root 能讀取。
 - **plugin 是被釘選，而不是被沙箱隔離**。只有當 `[plugins]` 項目指定了它的檔案，且檔案位元組的雜湊等於其 `sha256` 時，
   plugin 才會執行（[Plugins](configuration.zh-TW.md#plugins)）。它涵蓋與不涵蓋的範圍：
   - 只檢查檔案本身與它所在的目錄（屬於你、群組與其他人沒有寫入位元），不檢查更上層的目錄。

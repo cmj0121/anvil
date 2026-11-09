@@ -517,6 +517,7 @@ facts = { distro = "arch" }      # optional; a probe key, equal to that fact
 sudo = false                     # optional; default true. false: write as the connecting user
 rollback = false                 # optional; default true. false: the apply record keeps the hash only
 template = true                  # optional; default false. true: render src per target (see Templating)
+secrets = ["APP_TOKEN"]          # optional; the secrets the template reads as secrets.NAME (see Secret files)
 notify = ["reload sshd"]         # optional; the [[handlers]] to run when the step writes (see Handlers)
 recursive = true                 # optional; default false. true: src is a directory, copied as a tree (see Recursive copy)
 dir_mode = "0755"                # required with recursive = true, else refused: the mode of each directory it creates
@@ -842,12 +843,15 @@ With the inventory in [Vars and env](#vars-and-env), `web1` gets `listen 9090;` 
 `listen 8080;`. A file task takes it the same way:
 `file = { src = "$/nginx.conf.j2", dest = "/etc/nginx/nginx.conf", mode = "0644", template = true }`.
 
-**Context.** Two names, nothing else: no `env`, no secrets, no file, no clock.
+**Context.** Two names, and a third on an entry with [`secrets`](#secret-files), nothing else: no `env`, no file, no
+clock.
 
 - `vars.KEY` is the target's resolved var with its type: `{{ vars.port + 1 }}`, `{{ vars.users[0] }}`,
   `{{ vars.db.host }}`, `{% for u in vars.users %}`.
 - `facts.KEY` is a probe fact as a string, one of the keys listed under [`tags` and `facts`](#files). `facts.pkg` is the
   probe's raw string, such as `brew pacman`, not one manager: test one with `{% if "pacman" in (facts.pkg | split) %}`.
+- `secrets.NAME` is the value of a secret the entry lists in `secrets`, as a string; only those names are there
+  ([Secret files](#secret-files)).
 
 **Syntax.** A subset of MiniJinja: `{{ … }}`, `{# … #}`, `{% if %}` / `elif` / `else`, `{% for %}` (with `loop`),
 `{% set %}`, `{% with %}`, `{% filter %}`, `{% raw %}`, and the built-in filters and tests (`default`, `join`, `length`,
@@ -857,6 +861,9 @@ With the inventory in [Vars and env](#vars-and-env), `web1` gets `listen 9090;` 
   `macro` and `call` are not available (`line 1: syntax error: unknown statement macro`), nor are methods such as
   `facts.pkg.split()` (`line 1: unknown method`): use the filter form.
 - The `replace` filter is removed, since its output has no size limit (`line 1: unknown filter`).
+- `b64encode`, added by anvil, gives the UTF-8 bytes of a string in standard base64 (`+/`, `=` padding, no line
+  breaks): `{{ "user:pass" | b64encode }}` is `dXNlcjpwYXNz`. Any template can use it; a value that is not a string is
+  `line 2: b64encode needs a string`.
 - A boolean renders as `True` or `False`, as in Jinja: write `{{ vars.flag | lower }}` for `true`, or
   `{{ "yes" if vars.flag else "no" }}`.
 - Trim and lstrip blocks are on: a line that holds only a `{% … %}` tag leaves no blank line and no indent behind, as
@@ -896,11 +903,75 @@ delimiter, the password path's temp file, the [apply record](cli.md#the-apply-re
 therefore shows as `wrote DEST` on the next apply, and rollback restores what dest held before it.
 [`anvil plan`](cli.md#anvil-plan) shows each target's rendered size and sha256 (only the size when others cannot read the
 file), and `--show-content` its text.
-[`config --harden`](#harden) does not judge a templated src: it reports it for review.
+[`config --harden`](#harden) does not judge a templated src: it reports it for review. A [secret file](#secret-files)
+is the exception: plan does not render it, and the record keeps no hash of it.
 
 **Known limit.** String concatenation (`~`) and a large repetition (`*`) can use a lot of memory on the controller
 before the 1 MiB limit applies (MiniJinja caps one repetition at 100 MB). A template is trusted like the config: whoever
 can edit it can already run any step on the targets.
+
+### Secret files
+
+A templated entry can read named secrets from the [secret store](secrets.md), to write an env file or a JSON config
+that holds a token. List them in `secrets`; the template reads each as `{{ secrets.NAME }}`:
+
+```toml
+[[files]]
+src = "$/svc/traefik.env.j2"
+dest = "/srv/svc/traefik.env"
+mode = "0600"                         # no group or other bits
+template = true                       # required with secrets
+rollback = false                      # required with secrets, written out
+secrets = ["ANVIL_CLOUDFLARE_DNS"]    # 1 to 16 names
+```
+
+`$/svc/traefik.env.j2`:
+
+```jinja
+CF_DNS_API_TOKEN={{ secrets.ANVIL_CLOUDFLARE_DNS }}
+```
+
+For a registry login whose auth is the base64 of `user:token`, use the [`b64encode`](#templating) filter:
+`"auth": "{{ ("deploy:" ~ secrets.GH_READ_PACKAGE) | b64encode }}"`. A file task takes the same key:
+`file = { src = "$/app.env.j2", dest = "/etc/app.env", mode = "0600", template = true, rollback = false, … }`, with
+`secrets = ["APP_TOKEN"]` in the braces.
+
+**Refusals.** Each is exit 2, naming the entry (`tasks[I].file` for a task), checked after the entry's other keys:
+
+- `files[0].secrets: is empty; remove it`
+- `files[0].secrets: 17 entries exceeds the 16 entry limit`
+- ``files[0].secrets[1] `bad`: must match [A-Z][A-Z0-9_]*``
+- ``files[0].secrets[1] `TOKEN`: same name as secrets[0]``
+- `files[0].secrets: needs template = true`
+- ``files[0].secrets: mode `0640` lets group or others in; use a mode such as "0600"`` (`0600`, `0400` and `0700` pass)
+- `files[0].secrets: needs rollback = false; rollback cannot restore a file built from secrets` (also for an explicit
+  `rollback = true`)
+
+A name the template reads but `secrets` does not list is the usual render error,
+``line 1: undefined variable `secrets.NAME` ``. `secrets` is not allowed on a [recursive copy](#recursive-copy), since
+`template` is not.
+
+**At apply.** apply reads the listed secrets in the same single store open as the sudo passwords, and opens the store
+only when a selected target matches an entry that needs it. One trailing newline is trimmed. A secret that cannot be
+used fails that target before any of its steps, and the other targets go on:
+
+- `files[0]: secret TOKEN is not set`
+- `files[0]: secret TOKEN is shorter than 8 bytes`
+- `files[0]: secret TOKEN is not UTF-8 or holds a NUL byte`
+
+The rendered text goes to the target only in the write's heredoc. The write compares it with dest as usual, so a rerun
+prints `unchanged DEST`. Every step's output on that target has each value, and each `b64encode` output of a text that
+held one, replaced with `***`. A failed write of a secret file never shows the target's output, only
+`files[0]: write failed on the target (exit N); its output is hidden for a secret file` (`(killed)` for a write that was
+killed), and a failed read of dest before it
+`files[0]: could not read DEST on the target (exit N); its output is hidden for a secret file`.
+
+**Elsewhere it is not rendered.** plan, `--show-content` and the TUI viewer never open the store: they show
+`would write DEST (secret: NAME, NAME; rendered at apply)` and `(secret: not rendered at plan)`
+([anvil plan](cli.md#anvil-plan)). The [apply record](cli.md#the-apply-record) keeps the entry with `secret: true` and no
+hash of what was written or what was there, [`anvil rollback`](cli.md#anvil-rollback) shows `cannot undo: DEST (secret)`
+and leaves dest as it is, and doctor counts it as `not compared (secret)`. What this does and does not protect is in
+[Security notes](security.md).
 
 ### Recursive copy
 

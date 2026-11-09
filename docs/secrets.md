@@ -26,6 +26,12 @@ comments. An age or sops store is decrypted before anything else happens, so a w
 with a passphrase has its passphrase asked for on the terminal, and without one the store reports `locked`. Setup for
 each backend, the passphrase prompt and the sops environment are [below](#secret-backends).
 
+A secret feeds two things: a sudo password (`sudo_secret`, [Typing the sudo password](packages.md#typing-the-sudo-password))
+and a templated file that lists it in `secrets` and reads it as `{{ secrets.NAME }}`
+([Secret files](configuration.md#secret-files)). apply reads both from one store open, and only when a selected target
+needs one; plan, doctor and rollback never open the store for a file secret. A file secret must be at least 8 bytes,
+UTF-8 and free of NUL bytes.
+
 ## Secret backends
 
 One backend per config holds every secret: `[secrets].backend` selects it and only its section is read. Switch with

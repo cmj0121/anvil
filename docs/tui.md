@@ -202,7 +202,8 @@ takes the place of Steps and Results until it closes, titled `DEST (N bytes)`, a
 and sha256, then the text, with control and invisible characters escaped. Lines wider than the box are cut. A
 [recursive copy](configuration.md#recursive-copy) shows each of its file items under a `── PATH` line. A binary file
 shows only its line, never the text; one whose mode gives others no read shows only `content N bytes (hidden: mode
-MODE)`, with no sha256. The status bar shows
+MODE)`, with no sha256. A [secret file](configuration.md#secret-files) is titled `DEST (secret)` and shows only
+`(secret: not rendered at plan)`. The status bar shows
 `↑↓ scroll · PgUp/PgDn page · g/G top/end · O pager · Esc close`. While it is open these keys apply, and the other keys
 of the table do nothing:
 
