@@ -1539,6 +1539,7 @@ mod tests {
             sudo,
             rollback: true,
             template: false,
+            secrets: None,
             notify: Vec::new(),
             recursive: false,
             dir_mode: None,
