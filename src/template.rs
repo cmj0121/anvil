@@ -15,6 +15,7 @@ use minijinja::value::ValueKind;
 use minijinja::{AutoEscape, Environment, Error, ErrorKind, UndefinedBehavior, Value};
 use zeroize::Zeroizing;
 
+use crate::bytes::base64 as b64encode;
 use crate::document::MAX_BYTES;
 use crate::facts::Facts;
 use crate::inventory::{Resolved, VarValue};
@@ -124,25 +125,6 @@ fn environment(encoded: Arc<Encoded>) -> Environment<'static> {
     );
     env.set_auto_escape_callback(|_| AutoEscape::None);
     env
-}
-
-/// `bytes` in standard base64 (RFC 4648 §4): `+/`, `=` padding, no line
-/// breaks.
-fn b64encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let byte = |i: usize| u32::from(chunk.get(i).copied().unwrap_or(0));
-        let n = (byte(0) << 16) | (byte(1) << 8) | byte(2);
-        for i in 0..4 {
-            out.push(if i <= chunk.len() {
-                char::from(ALPHABET[(n >> (18 - 6 * i)) as usize & 63])
-            } else {
-                '='
-            });
-        }
-    }
-    out
 }
 
 fn context(

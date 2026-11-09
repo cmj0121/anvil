@@ -309,7 +309,7 @@ impl FileRecord {
 
     /// Marks the write as built from secrets and keeps nothing of the
     /// previous file's bytes, not even their hash.
-    fn drop_secret_previous(&mut self) {
+    pub(crate) fn drop_secret_previous(&mut self) {
         self.secret = true;
         if let Previous::File(previous) = &mut self.previous {
             previous.sha256.clear();

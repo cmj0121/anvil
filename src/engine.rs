@@ -1123,19 +1123,24 @@ pub(crate) fn run_handlers(
 /// What a failed write of the secret file `secret` shows instead of the
 /// target's output.
 fn hidden_failure(secret: &SecretFile, code: Option<i32>) -> String {
-    let exit = code.map_or_else(|| "killed".to_owned(), |code| format!("exit {code}"));
-    format!(
-        "{}: write failed on the target ({exit}); its output is hidden for a secret file",
-        secret.label
-    )
+    hidden(secret, "write failed on the target", code)
 }
 
 /// What a failed capture of the secret file `secret` at `dest`, before any
 /// write, shows instead of the target's output.
 fn hidden_capture(secret: &SecretFile, dest: &str, code: Option<i32>) -> String {
+    hidden(
+        secret,
+        &format!("could not read {dest} on the target"),
+        code,
+    )
+}
+
+/// `secret`'s label, what failed and how the step ended, its output hidden.
+fn hidden(secret: &SecretFile, what: &str, code: Option<i32>) -> String {
     let exit = code.map_or_else(|| "killed".to_owned(), |code| format!("exit {code}"));
     format!(
-        "{}: could not read {dest} on the target ({exit}); its output is hidden for a secret file",
+        "{}: {what} ({exit}); its output is hidden for a secret file",
         secret.label
     )
 }
@@ -1152,7 +1157,7 @@ pub(crate) fn scrubbed(mut report: TargetReport, runs: &[PlannedRun]) -> TargetR
     if needles.is_empty() {
         return report;
     }
-    needles.sort_by_key(|text| std::cmp::Reverse(text.len()));
+    needles.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     needles.dedup();
     let scrub = |text: &mut String| {
         for needle in &needles {

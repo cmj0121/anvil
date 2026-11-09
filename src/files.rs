@@ -486,14 +486,16 @@ fn file_secrets(
     };
     for name in names {
         let why = match loaded.get(name) {
-            None => "is not set",
-            Some(value) if value.len() < SECRET_MIN => "is shorter than 8 bytes",
+            None => "is not set".to_owned(),
+            Some(value) if value.len() < SECRET_MIN => {
+                format!("is shorter than {SECRET_MIN} bytes")
+            }
             Some(value) => match std::str::from_utf8(value) {
                 Ok(text) if !text.contains('\0') => {
                     values.insert(name.clone(), Zeroizing::new(text.to_owned()));
                     continue;
                 }
-                _ => "is not UTF-8 or holds a NUL byte",
+                _ => "is not UTF-8 or holds a NUL byte".to_owned(),
             },
         };
         return Err(item.shown_message(format!("{label}: secret {name} {why}")));
@@ -502,8 +504,9 @@ fn file_secrets(
 }
 
 /// The fewest bytes a file secret may hold: a shorter value would be
-/// scrubbed from output wherever it happens to occur.
-const SECRET_MIN: usize = 8;
+/// scrubbed from output wherever it happens to occur. The same minimum as
+/// a scrubbed sudo password.
+const SECRET_MIN: usize = crate::transport::SCRUB_MIN;
 
 /// The step that writes `write`, typing the password from `secret`.
 fn write_run(
@@ -860,10 +863,7 @@ impl FileWrite {
             .expect("a write comes from the list it is recorded against");
         let written = self.payload(sources).map_or(&[][..], Payload::bytes);
         let secret = self.secret.is_some();
-        let mut previous = previous_of(captured, hash_only || !entry.rollback || secret);
-        if secret && let Previous::File(file) = &mut previous {
-            file.sha256.clear();
-        }
+        let previous = previous_of(captured, hash_only || !entry.rollback || secret);
         let mut record = FileRecord {
             dest: self.dest.clone(),
             mode: format!("{:0>4}", self.mode),
@@ -882,6 +882,9 @@ impl FileWrite {
         };
         if self.binary {
             record.drop_binary_previous();
+        }
+        if secret {
+            record.drop_secret_previous();
         }
         record
     }

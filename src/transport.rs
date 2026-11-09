@@ -450,7 +450,7 @@ const LINE_CAP: usize = if TTY_READY.len() > SUDO_OK.len() {
 } + 1;
 /// The shortest password scrubbed from the output: shorter ones would match
 /// too much ordinary text.
-const SCRUB_MIN: usize = 8;
+pub(crate) const SCRUB_MIN: usize = 8;
 /// How often the tty runner checks the child while no output arrives.
 const TTY_POLL: Duration = Duration::from_millis(20);
 

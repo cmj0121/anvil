@@ -27,7 +27,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use crate::bytes;
+use crate::bytes::{self, base64};
 use crate::cancel::Cancel;
 use crate::exec;
 use crate::paths::{self, PrivateDirError};
@@ -433,25 +433,6 @@ impl Transport for Ssh {
 /// and `|`, so every login shell (sh, bash, zsh, fish, csh) runs it alike.
 pub fn remote_tty_command(script: &str) -> String {
     format!("echo {} | base64 -d | sh", base64(script.as_bytes()))
-}
-
-/// Standard base64 with padding.
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let group = chunk.iter().enumerate().fold(0u32, |group, (i, &byte)| {
-            group | u32::from(byte) << (16 - 8 * i)
-        });
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(char::from(ALPHABET[(group >> (18 - 6 * i)) as usize & 63]));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
 }
 
 fn is_host_key_failure(stderr: &str) -> bool {
