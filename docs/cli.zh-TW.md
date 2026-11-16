@@ -1274,7 +1274,8 @@ secret 由 `anvil doctor` 檢查。[Secret file](configuration.zh-TW.md#secret-f
   接著每個 env 值一行 `env.KEY = VALUE (LEVEL)`，顯示方式與 doctor 相同，planned、failed 或 cancelled 的 target 皆然：
   `vars.port = 8080 (tag:web)`、`env.APP_ENV = prod (host)`。值原樣顯示。
 - [`[[tasks]]`](#執行中的-task) config 在每個 step 上方多一行 `PATH  NAME`。
-- 每個 step 是一行 `would $ RUN`（多行的 `run` 顯示第一行加上 `…`）；[二進位](configuration.zh-TW.md#files)的檔案 src 後面加上 `(binary)`，表示它的 rollback 會失去；
+- 每個 step 是一行 `would $ RUN`（多行的 `run` 顯示第一行加上 `…`）；[二進位](configuration.zh-TW.md#files)的檔案 src 後面加上 `(binary)`，
+  表示寫入取代其他位元組時它的 rollback 會失去；
   apply 會在 sudo 的提示輸入某個 secret 的值時，後面再加上 `(sudo password from secret NAME)`。
 - [範本](configuration.zh-TW.md#templating)檔案 step 在其 `would $ file DEST` 行下方多一行 `rendered N bytes, sha256 HEX`：
   該 target 算繪文字的大小與完整 sha256，也就是 apply 會寫入的位元組。算繪失敗的 target 以 `✘` 加上範本訊息結束
@@ -1290,7 +1291,7 @@ secret 由 `anvil doctor` 檢查。[Secret file](configuration.zh-TW.md#secret-f
 - [遞迴複製](configuration.zh-TW.md#recursive-copy)在它符合的 target 上，於第一個 step 之前多一行標頭
   `files[N] SRC -> DEST (tree: N items, SIZE bytes)`（task 則為 `PATH.file`），項目數包含 dest 本身，SIZE 是所有檔案的位元組數。
   接著每個項目各一行：`would $ dir PATH` 加上 `mode DIR_MODE`、設定了時的 `group NAME`，以及設定了時 dest 上的 `parents`；
-  `would $ file PATH` 則在二進位檔案加上 `(binary)`，設定了時另有 `owner` 與 `group` 行。TUI 的 plan 檢視顯示這些 step，但不顯示標頭行。
+  `would $ file PATH` 則在二進位檔案加上 `(binary)`，設定了時另有 `owner` 與 `group` 行。TUI 的 plan 檢視同樣顯示標頭行與這些 step。
 - 設定 `rollback` 的遞迴項目，若其文字檔可能保存的先前文字超過紀錄所能容納，會在 stderr 發出警告
   `WARNING: files[N] DEST: rollback may not keep every previous text (record full)`。
   這是估算：樹中的文字檔數乘以單一檔案最多保存的 256 KiB，與 16 MiB 的紀錄相比，以項目計算，不依它符合哪些 target 篩選；
@@ -1764,7 +1765,8 @@ facts = { distro = "arch" }
 { "run": "skipped file /etc/motd: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true, "changed": false }
 ```
 
-`anvil plan` 顯示 `would $ file DEST`（二進位 src 加上 `(binary)`，表示它的 rollback 會失去；apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
+`anvil plan` 顯示 `would $ file DEST`（二進位 src 加上 `(binary)`，表示寫入取代其他位元組時它的 rollback 會失去；
+apply 會走密碼路徑時加上 `(sudo password from secret NAME)`）
 與 `would $ skipped file DEST: no match`；項目設定了它們時另加 `owner NAME`、`group NAME` 與 `parents` 行，範本檔案另加一行
 `rendered N bytes, sha256 HEX`（其他人無法讀取時為 `rendered N bytes (hidden: mode MODE)`），secret file 則改為
 `would write DEST (secret: NAME; rendered at apply)`；`--show-content` 另加 `content` 或 `rendered` 行與文字。
@@ -1774,7 +1776,7 @@ facts = { distro = "arch" }
 它以 `printf` 八進位跳脫序列傳到 target，傳輸量最多約為檔案大小的四倍，step 的 30 秒時間限制依傳送量每 MiB 增加 15 秒。
 target 的 `sh` 必須把 `printf` 作為內建指令，否則 step 會在寫入任何東西之前拒絕，以 4 結束：
 `files: printf is not a shell builtin; cannot copy a binary file`。文字檔仍以 heredoc 傳送，位元組不變。
-二進位檔案的寫入無法復原（[`anvil rollback`](#anvil-rollback)）。
+取代其他位元組的二進位寫入無法復原（[`anvil rollback`](#anvil-rollback)）；建立 DEST 或只修正擁有者、群組或 mode 的寫入可以復原。
 
 設定 [`recursive = true`](configuration.zh-TW.md#recursive-copy) 的項目複製整個目錄樹，在符合的 target 上每個項目一個 step，依路徑排序：
 dest 與每個目錄為 `$ dir PATH`，每個檔案為 `$ file PATH`，各自如上印出它做了什麼。
@@ -2218,8 +2220,13 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   文字沒有保存的檔案是一個略過的 step `cannot undo: DEST (REASON)`，原因取自紀錄（例如 `rollback = false`）。
 - **Secret file。** [Secret file](configuration.zh-TW.md#secret-files) 一律是 `cannot undo: DEST (secret)`，DEST 保持原狀；
   rollback 從不開啟 secret store。
-- **二進位檔案。** src 是[二進位檔案](configuration.zh-TW.md#files)的檔案一律是 `cannot undo: DEST (binary)`，DEST 保持原狀，
-  apply 之前它不存在、或只改了擁有者、群組或 mode 時也一樣（已知的限制）；`parents = true` 為它建立的目錄也會留下。
+- **二進位檔案。** 紀錄不保存 src 是[二進位檔案](configuration.zh-TW.md#files)的檔案的任何位元組。寫入取代了其他位元組時，
+  step 是 `cannot undo: DEST (binary)`，DEST 保持原狀；原內容因其他原因（例如 `rollback = false`）沒有保存時也一樣。
+  apply 之前 DEST 不存在時，step 是 `remove DEST`，與文字檔相同：DEST 之後被改過就拒絕，加上 `--force` 仍會移除，
+  `parents = true` 為它建立的目錄在清空時也會移除。只改了擁有者、群組或 mode 時，step 是
+  `restore owner, group and mode of DEST`，見下。沒有完成的寫入（`failed_midway`）沒有記錄寫入後的屬性，
+  所以不算只修正屬性，仍是 `cannot undo: DEST (binary)`。[`recursive = true`](configuration.zh-TW.md#recursive-copy)
+  項目的每個項目都依同樣的規則。
 - **只有擁有者、群組與 mode。** apply 印出 `fixed DEST: …` 之後，step 為 `restore owner, group and mode of DEST`。
   它不需要文字，所以 0600 或 0640 的檔案也可以，且不動位元組。它在變更擁有者或群組之前先把 mode 收緊為擁有者的位元，
   最後設定記錄的 mode，並印出 `restored owner, group and mode of DEST`；DEST 已經是那些屬性時印出 `unchanged DEST`。
@@ -2241,7 +2248,8 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   `parents = true` 在 PATH 之上建立的目錄隨後移除，與檔案相同。
   只因這些目錄而保存的被拒絕 step，為 `remove the directories made for PATH` step，只移除那些目錄。
 - **目錄樹。** [遞迴複製](configuration.zh-TW.md#recursive-copy)的項目與檔案、目錄一樣 rollback：
-  檔案取回保存的文字，或在 apply 建立它時移除；二進位檔案，或 `rollback = false`（對每個項目都成立）的檔案，為 `cannot undo: PATH (REASON)`。
+  檔案取回保存的文字，或在 apply 建立它時移除（二進位檔案也一樣）；取代了其他位元組卻沒有保存其文字的檔案
+  （二進位，或 `rollback = false`，對每個項目都成立）為 `cannot undo: PATH (REASON)`。
   樹建立的目錄在它的檔案之後處理，由最深的開始移除，且只在空的時候移除，因此含有不是這棵樹寫入之檔案的目錄會留下，
   並警告 `rollback: PATH is not empty; left in place`。先前文字被紀錄上限捨棄的項目為 `cannot undo: PATH (record full)`。
   項目的 `notify` 只排入一次。

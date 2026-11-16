@@ -34,7 +34,8 @@ English | [繁體中文](security.zh-TW.md)
   `force = true` keeps the regular file it replaces under the same rules, and only its sha256 when a `[[files]]` entry
   or file task for that path says `rollback = false`. An `[[absent]]` entry keeps each regular file it removes under the
   same rules ([Absent](configuration.md#absent)). A binary `[[files]]` src keeps no text at all: only the sha256 of what
-  it replaced and of what it wrote, so rollback cannot undo it ([Files](configuration.md#files)). Never point
+  it replaced and of what it wrote, so rollback cannot undo a write that replaced other bytes; it still removes a file
+  the write created and puts back the owner, group and mode of an attrs-only fix ([Files](configuration.md#files)). Never point
   `$XDG_STATE_HOME` into a dotfiles or other shared repository, and never commit the record. The texts are never
   printed or logged, and core dumps are turned off before the record is read. Since the record is only a file you own,
   rollback never trusts it to choose a path: it refuses a record whose dest or mode apply could not have written, and

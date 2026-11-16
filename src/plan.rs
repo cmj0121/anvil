@@ -167,7 +167,7 @@ pub struct TreeItemShown {
 impl TreeShown {
     /// `ENTRY SRC -> DEST (tree: N items, SIZE bytes)`, invisible
     /// characters escaped, since `src` and `dest` are config text.
-    fn text(&self) -> String {
+    pub fn text(&self) -> String {
         let plural = if self.items.len() == 1 { "" } else { "s" };
         escape_invisible(&format!(
             "{} {} -> {} (tree: {} item{plural}, {} bytes)",
@@ -895,11 +895,12 @@ pub fn render(report: &PlanReport, show: Show, sources: &Sources, hashes: &Hashe
     lines
 }
 
-/// `would $ command`, then `(binary)` for a binary src, whose rollback is
-/// lost, the secret whose password it would type and the plugin that
-/// returned it, if any; unescaped but for a task's invisible characters,
-/// since its `run` is config text under review. A file entry with `secrets`
-/// is `would write DEST (secret: NAME, NAME; rendered at apply)` instead.
+/// `would $ command`, then `(binary)` for a binary src (its rollback is
+/// lost when the write replaces other bytes), the secret whose password it
+/// would type and the plugin that returned it, if any; unescaped but for a
+/// task's invisible characters, since its `run` is config text under review.
+/// A file entry with `secrets` is
+/// `would write DEST (secret: NAME, NAME; rendered at apply)` instead.
 pub fn would_text(step: &PlannedRun) -> String {
     let binary = if step.binary() { " (binary)" } else { "" };
     let secret = step

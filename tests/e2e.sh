@@ -795,7 +795,7 @@ else
   fail "rollback over a 0600 previous: exit $code"
 fi
 
-step "(o) a binary file of every byte 0..255 on arch lands byte for byte; the record keeps only hashes and rollback cannot undo it"
+step "(o) a binary file of every byte 0..255 on arch lands byte for byte; the record keeps only hashes and rollback cannot undo the bytes it replaced"
 BIN_STATE="$TMP/state-bin"
 BIN_RECORD="$BIN_STATE/anvil/last-apply.json"
 BIN_DIR="$TMP/binary"
@@ -846,6 +846,32 @@ if [ "$code" -eq 0 ] && grep -qxF '  $ cannot undo: /etc/anvil-e2e-bin (binary)'
   pass "rollback says it cannot undo the binary file and leaves it, exit 0"
 else
   fail "rollback of a binary file: exit $code"
+fi
+docker exec "$NAME" rm -f /etc/anvil-e2e-bin
+bin_anvil apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qF '"state":"absent"' "$BIN_RECORD" \
+  && bin_anvil -vv rollback --target arch \
+  && grep -qxF '  removed /etc/anvil-e2e-bin' "$TMP/out" \
+  && ! grep -qF '(binary)' "$TMP/out" \
+  && ! docker exec "$NAME" test -e /etc/anvil-e2e-bin; then
+  pass "rollback removes a binary file the apply created"
+else
+  fail "rollback of a created binary file: exit $code"
+fi
+docker exec -i "$NAME" sh -c 'cat >/etc/anvil-e2e-bin && chmod 600 /etc/anvil-e2e-bin' <"$BIN_DIR/every.bin"
+bin_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qF 'fixed /etc/anvil-e2e-bin: mode' "$TMP/out" \
+  && [ "$(docker exec "$NAME" stat -c %a /etc/anvil-e2e-bin)" = 644 ] \
+  && bin_anvil -vv rollback --target arch \
+  && grep -qxF '  restored owner, group and mode of /etc/anvil-e2e-bin' "$TMP/out" \
+  && ! grep -qF '(binary)' "$TMP/out" \
+  && [ "$(docker exec "$NAME" stat -c %a /etc/anvil-e2e-bin)" = 600 ] \
+  && docker exec "$NAME" cat /etc/anvil-e2e-bin | cmp -s - "$BIN_DIR/every.bin"; then
+  pass "rollback puts back the mode of an attrs-only binary fix, bytes untouched"
+else
+  fail "rollback of an attrs-only binary fix: exit $code"
 fi
 docker exec "$NAME" rm -f /etc/anvil-e2e-bin
 
@@ -1123,20 +1149,20 @@ tr_anvil -vv rollback --target arch
 code=$?
 if [ "$code" -eq 0 ] && grep -qxF "  removed $TR_DEST/a.conf" "$TMP/out" \
   && grep -qxF "  removed $TR_DEST/sub/deep/c.conf" "$TMP/out" \
-  && grep -qxF "  \$ cannot undo: $TR_DEST/blob.bin (binary)" "$TMP/out" \
+  && grep -qxF "  removed $TR_DEST/blob.bin" "$TMP/out" \
   && [ "$(grep -F "removed directory $TR_DEST" "$TMP/out")" = "$(printf '%s\n' \
     "  removed directory $TR_DEST/sub/deep" "  removed directory $TR_DEST/sub")" ] \
-  && [ "$(docker exec "$NAME" ls -A "$TR_DEST" | tr '\n' ' ')" = 'blob.bin extra ' ] \
+  && [ "$(docker exec "$NAME" ls -A "$TR_DEST" | tr '\n' ' ')" = 'extra ' ] \
   && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST")" = '755 root:root' ] \
   && [ "$(docker exec "$NAME" cat "$TR_DEST/extra")" = mine ]; then
-  pass "rollback removed the tree's files and created dirs deepest first, left the binary item, the extra file and the existing dest"
+  pass "rollback removed the tree's files and created dirs deepest first, the binary item the apply created too, and left the extra file and the existing dest"
 else
   fail "rollback of a tree: exit $code"
 fi
 tr_anvil -vv rollback --target arch
 code=$?
 if [ "$code" -eq 0 ] && ! grep -qF 'removed' "$TMP/out" \
-  && [ "$(docker exec "$NAME" ls -A "$TR_DEST" | tr '\n' ' ')" = 'blob.bin extra ' ] \
+  && [ "$(docker exec "$NAME" ls -A "$TR_DEST" | tr '\n' ' ')" = 'extra ' ] \
   && [ "$(docker exec "$NAME" stat -c '%a %U:%G' "$TR_DEST")" = '755 root:root' ]; then
   pass "a second rollback of the tree is unchanged"
 else

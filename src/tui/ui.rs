@@ -996,15 +996,20 @@ fn apply_lines(report: &TargetReport) -> (Vec<Line<'static>>, Vec<usize>) {
     (lines, starts)
 }
 
-/// Like the CLI's plan block: `▶ target`, a `PATH  NAME` line per task and a
-/// `would $ command` line per step (a templated file's followed by its rendered
-/// size and sha256), then `✔ N steps`, `✘ reason` or `⊘ cancelled`.
+/// Like the CLI's plan block: `▶ target`, a `PATH  NAME` line per task, a
+/// tree's header line before its first step's would line and a `would $
+/// command` line per step (a templated file's followed by its rendered size
+/// and sha256), then `✔ N steps`, `✘ reason` or `⊘ cancelled`.
 fn plan_block(report: &PlanReport) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(format!("▶ {}", text(report.target()))).style(heading())];
     let end = match report {
-        PlanReport::Planned { steps, .. } => {
-            for step in steps {
+        PlanReport::Planned { steps, trees, .. } => {
+            for (i, step) in steps.iter().enumerate() {
                 lines.extend(step.title().map(task_line));
+                if let Some(tree) = trees.iter().find(|tree| tree.step == i) {
+                    let header = format!("  {}", text(&tree.text()));
+                    lines.push(Line::from(header).style(Modifier::DIM));
+                }
                 let command = format!("  {}", text(&plan::would_text(step)));
                 lines.push(Line::from(command).style(Modifier::DIM));
                 if let Some(rendered) = plan::rendered_text(step) {
@@ -2867,6 +2872,78 @@ mod tests {
         assert!(screen.contains("tasks[0]  First\\u{2066}"), "{screen}");
         let title = screen.find("tasks[0]").unwrap();
         assert!(title < screen.find("would $ true").unwrap(), "{screen}");
+    }
+
+    #[test]
+    fn a_plan_result_shows_a_tree_header_dim_between_its_title_and_would_line() {
+        use anvil::plan::{PlanReport, TreeItemShown, TreeShown};
+        use anvil::step::PlannedRun;
+        use anvil::transport::RUN_TIMEOUT;
+
+        let planned = |task: Option<&str>, label: &str| PlannedRun {
+            run: "true".to_owned().into(),
+            label: Some(label.to_owned()),
+            sudo_secret: None,
+            timeout: RUN_TIMEOUT,
+            kind: anvil::step::RunKind::Script,
+            task: task.map(str::to_owned),
+            name: task.map(|_| "Copy".to_owned()),
+            notify: Vec::new(),
+        };
+        let item = |path: &str, kind, size| TreeItemShown {
+            path: path.to_owned(),
+            kind,
+            size,
+            binary: false,
+        };
+        let mut app = App::with_inventory(opts(), Ok(inventory()), Ok(Vec::new()));
+        show(
+            &mut app,
+            RunResult::Plan {
+                steps: Vec::new(),
+                sources: None,
+                targets: done(vec![PlanReport::Planned {
+                    target: "local".to_owned(),
+                    trees: vec![TreeShown {
+                        step: 1,
+                        entry: "tasks[1].file".to_owned(),
+                        src: "conf\u{2066}".to_owned(),
+                        dest: "/etc/app".to_owned(),
+                        size: 12,
+                        items: vec![item("", "dir", 0), item("a.conf", "file", 12)],
+                    }],
+                    vars: Default::default(),
+                    env: Default::default(),
+                    steps: vec![
+                        planned(None, "true"),
+                        planned(Some("tasks[1]"), "dir /etc/app"),
+                        planned(Some("tasks[1]"), "file /etc/app/a.conf"),
+                    ],
+                    pending_handlers: Vec::new(),
+                    ok: true,
+                }]),
+                ok: Some(true),
+                error: None,
+            },
+        );
+        let header = "tasks[1].file conf\\u{2066} -> /etc/app (tree: 2 items, 12 bytes)";
+        let screen = results_at(&app, 100, 20).join("\n");
+        let at = screen.find(header).unwrap_or_else(|| panic!("{screen}"));
+        assert_eq!(screen.matches("(tree:").count(), 1, "{screen}");
+        assert!(screen.find("tasks[1]  Copy").unwrap() < at, "{screen}");
+        assert!(
+            at < screen.find("would $ dir /etc/app").unwrap(),
+            "{screen}"
+        );
+        assert!(screen.find("would $ true").unwrap() < at, "{screen}");
+        let buf = buffer(&app, 100, 21);
+        let (x, y) = find(&buf, 100, 21, "tasks[1].file conf");
+        assert!(buf[(x, y)].modifier.contains(Modifier::DIM));
+        assert_eq!(
+            x,
+            find(&buf, 100, 21, "would $ dir").0,
+            "indented like the would line"
+        );
     }
 
     #[test]
