@@ -31,7 +31,8 @@
   secret 保存為文字：請改用 `[[tasks]]`，或兩者都設定 `rollback = false`。
   設定 `force = true` 的 `[[links]]` 項目依同樣規則保存它取代的一般檔案；若該路徑的 `[[files]]` 項目或 file task 設定
   `rollback = false`，就只保存其 sha256。`[[absent]]` 項目依同樣規則保存它移除的每個一般檔案（[Absent](configuration.zh-TW.md#absent)）。
-  二進位的 `[[files]]` src 完全不保存文字：只保存它取代的內容與它寫入的內容的 sha256，因此 rollback 無法復原它（[Files](configuration.zh-TW.md#files)）。
+  二進位的 `[[files]]` src 完全不保存文字：只保存它取代的內容與它寫入的內容的 sha256，因此 rollback 無法復原取代其他位元組的寫入；
+  寫入建立的檔案仍會移除，只修正屬性時仍會設回擁有者、群組與 mode（[Files](configuration.zh-TW.md#files)）。
   絕不要把 `$XDG_STATE_HOME` 指進 dotfiles 或其他共用的 repository，也絕不要 commit 這份紀錄。
   這些文字絕不會印出或記錄，且讀取紀錄前會先關閉 core dump。紀錄只是你擁有的一個檔案，因此 rollback 絕不讓它決定路徑：
   dest 或 mode 不可能由 apply 寫出的紀錄會被拒絕，且只還原目前 config 的 `[[files]]` 或 file task 仍列出、`sudo` 相同、

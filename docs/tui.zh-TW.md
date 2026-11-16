@@ -73,7 +73,7 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
   執行結束時仍沒有報告的 target（執行失敗或 panic）會變成 `✘ name`，區段為 `▶ name` 與 `✘ not run`，並算作失敗。
   `←` 與 `→` 在任何窗格都能切換分頁（overlay 開啟時除外），到兩端就停止。
   apply 與 run 區段讀起來像 CLI 的區塊（`▶ name`、`$ command`、它的輸出、`✔ ok · N steps`、`✘ reason` 或 `⊘ cancelled`）；
-  plan 區段像 `anvil plan` 的區塊（`▶ name`、`would $ command`、`✔ N steps`、`✘ reason` 或 `⊘ cancelled`）；
+  plan 區段像 `anvil plan` 的區塊（`▶ name`、遞迴複製的樹標頭行、`would $ command`、`✔ N steps`、`✘ reason` 或 `⊘ cancelled`）；
   doctor 區段讀起來像它的人類可讀輸出，包含 `[packages]` 的 `manager` 列（無法解析 manager 的 target 算作失敗），
   有 [doctor plugin](cli.zh-TW.md#doctor-plugins-drift-since-the-last-apply) 時還有每個 plugin 的列、`files … not compared` 列
   與 `sudo WARNING` 那一行：漂移、錯誤與警告為紅色，notice 與摘要為暗色。此時 `local checks` 分頁也會顯示每個 doctor 釘選與紀錄。

@@ -1366,7 +1366,7 @@ is not rendered either: whether its secrets are set is known only at apply.
   cancelled target alike: `vars.port = 8080 (tag:web)`, `env.APP_ENV = prod (host)`. Values are shown as is.
 - A [`[[tasks]]`](#tasks-in-a-run) config adds a `PATH  NAME` line above each step.
 - Each step is a `would $ RUN` line (a multi-line `run` shows its first line and `…`), followed by `(binary)` for a
-  [binary](configuration.md#files) file src, whose rollback is lost, and
+  [binary](configuration.md#files) file src, whose rollback is lost when the write replaces other bytes, and
   `(sudo password from secret NAME)` when apply would type that secret's value at sudo's prompt.
 - A [templated](configuration.md#templating) file step adds `rendered N bytes, sha256 HEX` under its `would $ file DEST`
   line: the size and the full sha256 of that target's rendered text, the bytes apply would write. A target whose render
@@ -1387,7 +1387,7 @@ is not rendered either: whether its secrets are set is known only at apply.
   `files[N] SRC -> DEST (tree: N items, SIZE bytes)` (`PATH.file` for a task), where the count includes dest itself and
   SIZE is the bytes of all its files. Then each item is its own line: `would $ dir PATH` with `mode DIR_MODE`,
   `group NAME` when set and `parents` on dest when set, and `would $ file PATH` with `(binary)` for a binary file and
-  `owner` and `group` lines when set. The TUI's plan view shows these steps but not the header line.
+  `owner` and `group` lines when set. The TUI's plan view shows the header line and these steps too.
 - A recursive entry with `rollback` whose text files could keep more previous text than the record holds is a warning
   on stderr, `WARNING: files[N] DEST: rollback may not keep every previous text (record full)`. It is an estimate: the
   tree's text files times 256 KiB, the most kept for one file, against the 16 MiB record, counted per entry, not per
@@ -1881,8 +1881,9 @@ In `--json` a file step's `run` is that label. A skipped step has `"skipped": tr
 { "run": "skipped file /etc/motd: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true, "changed": false }
 ```
 
-`anvil plan` shows `would $ file DEST`, with `(binary)` for a binary src, whose rollback is lost, and
-`(sudo password from secret NAME)` when apply would take the password path, and `would $ skipped file DEST: no match`;
+`anvil plan` shows `would $ file DEST`, with `(binary)` for a binary src, whose rollback is lost when the write
+replaces other bytes, and `(sudo password from secret NAME)` when apply would take the password path, and
+`would $ skipped file DEST: no match`;
 an entry that sets them adds `owner NAME`, `group NAME` and `parents` lines, and a templated file its
 `rendered N bytes, sha256 HEX` line (`rendered N bytes (hidden: mode MODE)` when others cannot read it); a secret file
 is `would write DEST (secret: NAME; rendered at apply)` instead;
@@ -1894,7 +1895,8 @@ A src that is not UTF-8, or holds a NUL byte, is [binary](configuration.md#files
 the target as `printf` octal escapes, up to about four times its size on the wire, and the step's 30 s timeout grows by
 15 s per MiB sent. The target's `sh` must have `printf` as a builtin, else the step refuses, exit 4, before anything is
 written: `files: printf is not a shell builtin; cannot copy a binary file`. A text file still goes in a heredoc, its
-bytes unchanged. A binary write cannot be undone ([`anvil rollback`](#anvil-rollback)).
+bytes unchanged. A binary write that replaced other bytes cannot be undone ([`anvil rollback`](#anvil-rollback)); one
+that created DEST or only fixed its owner, group or mode can.
 
 An entry with [`recursive = true`](configuration.md#recursive-copy) copies a directory tree, and is one step per item
 on a target that matches, in sorted path order: `$ dir PATH` for dest and each directory, `$ file PATH` for each file,
@@ -2372,9 +2374,14 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   is a skipped step `cannot undo: DEST (REASON)`, with the reason from the record (`rollback = false`, say).
 - **Secret files.** A [secret file](configuration.md#secret-files) is always `cannot undo: DEST (secret)`, and DEST
   is left as it is; rollback never opens the secret store.
-- **Binary files.** A file whose src was [binary](configuration.md#files) is always `cannot undo: DEST (binary)`, and
-  DEST is left as it is, also when it did not exist before the apply or only its owner, group or mode changed (a known
-  limit); the directories `parents = true` created for it stay too.
+- **Binary files.** The record keeps no bytes of a file whose src was [binary](configuration.md#files). When the write
+  replaced other bytes, the step is `cannot undo: DEST (binary)` and DEST is left as it is, also when the previous was
+  not kept for another reason (`rollback = false`, say). When DEST did not exist before the apply, it is
+  `remove DEST`, as for a text file: refused if DEST changed since, removed anyway under `--force`, and the directories
+  `parents = true` created for it are removed when empty. When only its owner, group or mode changed, it is
+  `restore owner, group and mode of DEST`, below. A write that did not end (`failed_midway`) records no attrs written,
+  so it is not an attrs-only fix and stays `cannot undo: DEST (binary)`. Each item of a
+  [`recursive = true`](configuration.md#recursive-copy) entry follows the same rule.
 - **Owner, group and mode only.** After an apply that printed `fixed DEST: …`, the step is
   `restore owner, group and mode of DEST`. It needs no text, so it works for a 0600 or 0640 file too, and leaves the
   bytes alone. It narrows the mode to the owner's bits before it changes the owner or group, sets the recorded mode last
@@ -2399,8 +2406,9 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   after it, as for a file. A refused step kept only for those directories is the step
   `remove the directories made for PATH`, which only removes them.
 - **Trees.** The items of a [recursive copy](configuration.md#recursive-copy) roll back as files and directories do:
-  a file gets its kept text back, or is removed when the apply created it, and a binary file or one with
-  `rollback = false` (which holds for every item) is `cannot undo: PATH (REASON)`. The directories the tree created
+  a file gets its kept text back, or is removed when the apply created it, binary or not, and a file that replaced
+  other bytes without keeping their text (binary, or `rollback = false`, which holds for every item) is
+  `cannot undo: PATH (REASON)`. The directories the tree created
   come after its files and are removed deepest first, each only when empty, so one that holds a file the tree did not
   write stays, with the warning `rollback: PATH is not empty; left in place`. An item whose previous text the record
   limit dropped is `cannot undo: PATH (record full)`. The entry's `notify` is queued once.

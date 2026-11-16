@@ -574,11 +574,13 @@ mode = "0644"
   `files: printf is not a shell builtin; cannot copy a binary file`。
 - **其餘相同。** 與 dest 的比較、原子性的 rename、`owner`、`group`、`mode`、`parents`、`sudo` 與密碼路徑都與文字檔相同。
   `template = true` 需要文字 src：二進位 src 如上所述以 2 結束。
-- **沒有 rollback。** [apply 紀錄](cli.zh-TW.md#apply-紀錄)只保存寫入的位元組與 dest 原內容的 sha256，絕不保存位元組，
-  並把該次寫入標記為 `binary`。[`anvil rollback`](cli.zh-TW.md#anvil-rollback) 顯示 `cannot undo: DEST (binary)` 並保留 dest 原狀，
-  dest 原本不存在、或只改了擁有者、群組或 mode 時也一樣：這是已知的限制。`anvil plan` 會以 `(binary)` 標記該 step
+- **被取代的位元組沒有 rollback。** [apply 紀錄](cli.zh-TW.md#apply-紀錄)只保存寫入的位元組與 dest 原內容的 sha256，
+  絕不保存位元組，並把該次寫入標記為 `binary`。寫入取代了其他位元組時，[`anvil rollback`](cli.zh-TW.md#anvil-rollback)
+  顯示 `cannot undo: DEST (binary)` 並保留 dest 原狀。dest 原本不存在時，只要它仍符合寫入的位元組，rollback 就會移除它；
+  只改了擁有者、群組或 mode 時，rollback 會把它們設回去。`anvil plan` 會以 `(binary)` 標記該 step
   （[`anvil plan`](cli.zh-TW.md#anvil-plan)）。
-- **非 UTF-8 的文字也是二進位。** 舊版 anvil 拒絕的 latin-1 或其他非 UTF-8 檔案，現在會以二進位複製，因此沒有 rollback。
+- **非 UTF-8 的文字也是二進位。** 舊版 anvil 拒絕的 latin-1 或其他非 UTF-8 檔案，現在會以二進位複製，
+  因此覆寫其他位元組的寫入沒有 rollback。
   執行 `anvil plan` 找出 `(binary)`；要保留 rollback，請把這類檔案轉成 UTF-8。
 
 **`tags` 與 `facts`。** 列出的每個 tag 都必須在 target 上，列出的每個 fact 都必須符合。
@@ -989,7 +991,7 @@ PATH 是該項目在 src 之下的路徑。工作區的走訪在每一層都不�
 
 **已知限制。** 樹從不刪除：沒有遞迴刪除，也沒有清除。樹中不允許 `template = true`，特殊檔案會被拒絕，hard link 會被複製為各自獨立的檔案。
 `anvil files cp` 只接受文字檔，因此儲存區樹中的二進位檔案必須以其他方式放進 `files/`。
-TUI 的 plan 檢視顯示樹的各個項目 step，但不顯示它的標頭行（[`anvil plan`](cli.zh-TW.md#anvil-plan)）。
+TUI 的 plan 檢視與 [`anvil plan`](cli.zh-TW.md#anvil-plan) 一樣顯示樹的標頭行與各個項目 step。
 
 ## Dirs
 

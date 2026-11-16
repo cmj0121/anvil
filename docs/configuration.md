@@ -598,12 +598,14 @@ mode = "0644"
   before anything is written: `files: printf is not a shell builtin; cannot copy a binary file`.
 - **The rest is the same.** The comparison with dest, the atomic rename, `owner`, `group`, `mode`, `parents`, `sudo`
   and the password path work as for text. `template = true` needs a text src: a binary one is exit 2, as above.
-- **No rollback.** The [apply record](cli.md#the-apply-record) keeps only the sha256 of the bytes written and of what
-  dest held, never the bytes, and marks the write `binary`. [`anvil rollback`](cli.md#anvil-rollback) shows
-  `cannot undo: DEST (binary)` and leaves dest as it is, also when dest did not exist before or only its owner, group
-  or mode changed: a known limit. `anvil plan` marks the step `(binary)` ([`anvil plan`](cli.md#anvil-plan)).
+- **No rollback of replaced bytes.** The [apply record](cli.md#the-apply-record) keeps only the sha256 of the bytes
+  written and of what dest held, never the bytes, and marks the write `binary`. When the write replaced other bytes,
+  [`anvil rollback`](cli.md#anvil-rollback) shows `cannot undo: DEST (binary)` and leaves dest as it is. When dest did
+  not exist before, rollback removes it while it still matches the bytes written; when only its owner, group or mode
+  changed, rollback puts those back. `anvil plan` marks the step `(binary)` ([`anvil plan`](cli.md#anvil-plan)).
 - **Non-UTF-8 text is binary.** A latin-1 or other non-UTF-8 file that earlier anvil refused is now copied as binary,
-  so it has no rollback. Run `anvil plan` and look for `(binary)`; convert such a file to UTF-8 to keep rollback.
+  so a write over other bytes has no rollback. Run `anvil plan` and look for `(binary)`; convert such a file to UTF-8
+  to keep rollback.
 
 **`tags` and `facts`.** Every listed tag must be on the target, and every listed fact must match. Tags use the inventory
 rule, ``files[0].tags[1] `bad tag`: must match [A-Za-z0-9_-]+``; `local` is allowed. The `local` target carries `local`
@@ -1074,8 +1076,8 @@ file is reported for review.
 
 **Known limits.** A tree never deletes: there is no recursive delete and no purge. `template = true` is not allowed in a
 tree, special files are refused, and a hard link is copied as a separate file. `anvil files cp` takes text files only,
-so a binary file in a store tree must be put under `files/` another way. The TUI's plan view shows a tree's item steps,
-but not its header line ([`anvil plan`](cli.md#anvil-plan)).
+so a binary file in a store tree must be put under `files/` another way. The TUI's plan view shows a tree's header line
+and item steps as [`anvil plan`](cli.md#anvil-plan) does.
 
 ## Dirs
 

@@ -76,11 +76,12 @@ Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
   panicked) becomes `✘ name`, its section `▶ name` and `✘ not run`, and counts as failed. `←` and `→`
   switch tabs from any pane, except under an overlay, and stop at the ends. The apply and run sections read like the CLI's
   blocks (`▶ name`, `$ command`, its output, `✔ ok · N steps`, `✘ reason` or `⊘ cancelled`); the plan section like
-  `anvil plan`'s (`▶ name`, `would $ command`, `✔ N steps`, `✘ reason` or `⊘ cancelled`); the doctor section reads
-  like its human output, including the `manager` row with `[packages]` (a target whose manager cannot be resolved
-  counts as failed) and, with a [doctor plugin](cli.md#doctor-plugins-drift-since-the-last-apply), each plugin's rows,
-  the `files … not compared` row and the `sudo WARNING` line: drift, errors and the warning in red, notices and the
-  summary dim. The `local checks` tab then also shows each doctor pin and the record.
+  `anvil plan`'s (`▶ name`, a recursive copy's tree header line, `would $ command`, `✔ N steps`, `✘ reason` or
+  `⊘ cancelled`); the doctor section reads like its human output, including the `manager` row with `[packages]` (a
+  target whose manager cannot be resolved counts as failed) and, with a
+  [doctor plugin](cli.md#doctor-plugins-drift-since-the-last-apply), each plugin's rows, the `files … not compared` row
+  and the `sudo WARNING` line: drift, errors and the warning in red, notices and the summary dim. The `local checks` tab
+  then also shows each doctor pin and the record.
   Long lines wrap. A run's own error (config, inventory, a panic) is the last line on every tab.
 - **Status bar.** The last notice, else the keys `a apply · d doctor · t targets · ↑↓ step · ←→ target · ? help`, as
   many as fit; on the right `-v N · <edit format>`.
