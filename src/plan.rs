@@ -167,7 +167,7 @@ pub struct TreeItemShown {
 impl TreeShown {
     /// `ENTRY SRC -> DEST (tree: N items, SIZE bytes)`, invisible
     /// characters escaped, since `src` and `dest` are config text.
-    fn text(&self) -> String {
+    pub fn text(&self) -> String {
         let plural = if self.items.len() == 1 { "" } else { "s" };
         escape_invisible(&format!(
             "{} {} -> {} (tree: {} item{plural}, {} bytes)",
