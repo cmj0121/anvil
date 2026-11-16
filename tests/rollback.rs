@@ -1984,26 +1984,49 @@ fn a_removal_recorded_as_another_kind_than_its_type_is_refused() {
     assert!(std::fs::symlink_metadata(&link).is_err());
 }
 
-#[test]
-fn a_binary_write_keeps_only_hashes_and_rollback_cannot_undo_it() {
-    let sandbox = Sandbox::new("rb");
+/// `blob.bin`, bytes 0 to 255, copied to `<root>/out/over.bin` (a text
+/// before), `<root>/out/new/new.bin` (absent before, `parents = true`) and
+/// `<root>/out/fixed.bin` (these bytes at 0600 before); applied on local.
+/// Returns the bytes and the three dests.
+fn binary_applied(sandbox: &Sandbox) -> (Vec<u8>, [String; 3]) {
     let bytes: Vec<u8> = (0..=255).collect();
     std::fs::write(sandbox.config_dir().join("blob.bin"), &bytes).unwrap();
     let dir = sandbox.root().join("out");
     std::fs::create_dir(&dir).unwrap();
-    let (over, new) = (dir.join("over.bin"), dir.join("new.bin"));
-    let (over, new) = (over.display().to_string(), new.display().to_string());
+    let dest = |name: &str| dir.join(name).display().to_string();
+    let (over, new, fixed) = (dest("over.bin"), dest("new/new.bin"), dest("fixed.bin"));
     std::fs::write(&over, PREVIOUS).unwrap();
     std::fs::set_permissions(&over, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let entry = |dest: &str| {
+    std::fs::write(&fixed, &bytes).unwrap();
+    std::fs::set_permissions(&fixed, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let entry = |dest: &str, parents: bool| {
         format!(
-            "[[files]]\nsrc = \"blob.bin\"\ndest = \"{dest}\"\nmode = \"0644\"\nsudo = false\n\n"
+            "[[files]]\nsrc = \"blob.bin\"\ndest = \"{dest}\"\nmode = \"0644\"\nsudo = false\n{}\n",
+            if parents { "parents = true\n" } else { "" }
         )
     };
-    sandbox.write_config("config.toml", &format!("{}{}", entry(&over), entry(&new)));
-    let out = sandbox.anvil(&["apply"], &[]);
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "{}{}{}",
+            entry(&over, false),
+            entry(&new, true),
+            entry(&fixed, false)
+        ),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(std::fs::read(&over).unwrap(), bytes);
+    assert_eq!(std::fs::read(&new).unwrap(), bytes);
+    assert_eq!(mode(Path::new(&fixed)), 0o644);
+    (bytes, [over, new, fixed])
+}
+
+#[test]
+fn a_binary_write_keeps_only_hashes_and_rollback_undoes_it_unless_it_replaced_bytes() {
+    let sandbox = Sandbox::new("rb");
+    let (bytes, [over, new, fixed]) = binary_applied(&sandbox);
+    let new_dir = Path::new(&new).parent().unwrap().to_owned();
     let raw = std::fs::read_to_string(sandbox.state_home().join("anvil/last-apply.json")).unwrap();
     assert!(
         !raw.contains(PREVIOUS.trim_end()),
@@ -2017,48 +2040,101 @@ fn a_binary_write_keeps_only_hashes_and_rollback_cannot_undo_it() {
         assert!(file["previous"].get("text").is_none(), "{file}");
     }
     assert_eq!(files[0]["previous"]["reason"], "binary");
+    assert_eq!(files[1]["previous"]["state"], "absent");
+    assert_eq!(
+        files[1]["created_dirs"],
+        serde_json::json!([new_dir.display().to_string()])
+    );
 
-    let out = sandbox.anvil(&["-vv", "rollback"], &[]);
+    let out = sandbox.anvil(&["rollback", "--dry-run", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let shown = text(&out.stdout);
+    for line in [
+        format!("  cannot undo: {over} (binary)\n"),
+        format!("would remove {new}"),
+        format!("would remove directory {} when empty", new_dir.display()),
+        format!("would restore owner, group and mode of {fixed}"),
+    ] {
+        assert!(shown.contains(&line), "{line}: {shown}");
+    }
+
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let value = json(&out);
+    let runs = runs(&out);
+    for run in [
+        format!("cannot undo: {over} (binary)"),
+        format!("remove {new}"),
+        format!("restore owner, group and mode of {fixed}"),
+    ] {
+        assert!(runs.contains(&run), "{run}: {runs:?}");
+    }
+    let binary: Vec<_> = runs
+        .iter()
+        .filter(|run| run.ends_with("(binary)"))
+        .collect();
+    assert_eq!(binary, [&format!("cannot undo: {over} (binary)")]);
+    assert_eq!(
+        value["not_restored"],
+        serde_json::json!([{"target": "local", "dest": over, "reason": "binary"}])
+    );
+    assert_eq!(std::fs::read(&over).unwrap(), bytes, "dest left alone");
+    assert!(!Path::new(&new).exists() && !new_dir.exists());
+    assert_eq!(std::fs::read(&fixed).unwrap(), bytes);
+    assert_eq!(mode(Path::new(&fixed)), 0o600);
+
+    let out = sandbox.anvil(&["-vv", "rollback", "--target", "local"], &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let shown = text(&out.stdout);
     for line in [
         format!("  $ cannot undo: {over} (binary)\n"),
         format!("  ⚠ not restored: {over} (binary)\n"),
-        format!("  {new} on local (binary)\n"),
     ] {
         assert!(shown.contains(&line), "{line}: {shown}");
     }
-    let out = sandbox.anvil(&["--json", "rollback"], &[]);
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-    let value = json(&out);
-    let runs: Vec<_> = (value["targets"][0]["steps"].as_array().unwrap().iter())
-        .map(|step| step["run"].as_str().unwrap().to_owned())
-        .collect();
-    assert_eq!(
-        runs,
-        [
-            format!("cannot undo: {new} (binary)"),
-            format!("cannot undo: {over} (binary)"),
-            "cannot undo: step 1".to_owned(),
-        ]
-    );
-    assert_eq!(
-        value["not_restored"],
-        serde_json::json!([
-            {"target": "local", "dest": over, "reason": "binary"},
-            {"target": "local", "dest": new, "reason": "binary"},
-        ])
-    );
-    assert_eq!(std::fs::read(&over).unwrap(), bytes, "dest left alone");
-    assert_eq!(std::fs::read(&new).unwrap(), bytes, "dest left alone");
+}
 
-    let out = sandbox.anvil(&["rollback", "--dry-run"], &[]);
+#[test]
+fn a_binary_write_without_its_written_attrs_cannot_be_undone() {
+    let sandbox = Sandbox::new("rb");
+    let (_, [_, _, fixed]) = binary_applied(&sandbox);
+    let path = sandbox.state_home().join("anvil/last-apply.json");
+    let mut record = sandbox.last_apply().unwrap();
+    let files = record["targets"]["local"]["files"].as_array_mut().unwrap();
+    files[2].as_object_mut().unwrap().remove("written_attrs");
+    files[2]["write"] = "failed_midway".into();
+    std::fs::write(&path, record.to_string()).unwrap();
+
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(
-        text(&out.stdout).contains(&format!("  cannot undo: {over} (binary)\n")),
-        "{}",
-        text(&out.stdout)
+        runs(&out).contains(&format!("cannot undo: {fixed} (binary)")),
+        "{:?}",
+        runs(&out)
     );
+    assert_eq!(mode(Path::new(&fixed)), 0o644, "left as the apply did");
+}
+
+#[test]
+fn a_created_binary_changed_since_the_apply_is_refused_unless_forced() {
+    let sandbox = Sandbox::new("rb");
+    let (_, [over, new, _]) = binary_applied(&sandbox);
+    std::fs::write(&new, "edited by hand\n").unwrap();
+    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains(&format!(
+            "files: {new} changed since the last apply; anvil rollback --force {new} restores it anyway"
+        )),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&new).unwrap(), "edited by hand\n");
+
+    let out = sandbox.anvil(&["rollback", "--target", "local", "--force", &new], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(!Path::new(&new).exists());
+    assert!(Path::new(&over).exists(), "a replaced binary is left alone");
 }
 
 /// A `conf` tree in the workspace: `a.conf`, `blob.bin` (binary),
@@ -2122,7 +2198,7 @@ fn a_tree_rolls_back_its_files_and_removes_its_created_dirs_deepest_first() {
     let at = |run: &str| {
         (runs.iter().position(|r| r == run)).unwrap_or_else(|| panic!("{run}: {runs:?}"))
     };
-    assert!(at(&format!("cannot undo: {d}/blob.bin (binary)")) < runs.len());
+    assert!(at(&format!("remove {d}/blob.bin")) < runs.len());
     let files = at(&format!("restore {d}/a.conf"));
     assert!(
         files > at(&format!("remove {d}/sub/b.conf")),
@@ -2144,17 +2220,13 @@ fn a_tree_rolls_back_its_files_and_removes_its_created_dirs_deepest_first() {
         std::fs::read_to_string(format!("{d}/extra")).unwrap(),
         "mine\n"
     );
-    assert_eq!(
-        std::fs::read(format!("{d}/blob.bin")).unwrap(),
-        [0, 1, 255],
-        "a binary item cannot be undone"
+    assert!(
+        !Path::new(&format!("{d}/blob.bin")).exists(),
+        "a binary item the apply created is removed"
     );
     assert_eq!(
         json(&out)["targets"][0]["warnings"],
-        serde_json::json!([
-            format!("not restored: {d}/blob.bin (binary)"),
-            "pending handler flush queued for the next apply"
-        ]),
+        serde_json::json!(["pending handler flush queued for the next apply"]),
         "the entry's notify, once"
     );
     let record = sandbox.last_apply().unwrap();
@@ -2170,6 +2242,32 @@ fn a_tree_rolls_back_its_files_and_removes_its_created_dirs_deepest_first() {
         PREVIOUS
     );
     assert!(!Path::new(&format!("{d}/sub")).exists());
+}
+
+#[test]
+fn a_tree_binary_item_that_replaced_other_bytes_cannot_be_undone() {
+    let sandbox = Sandbox::new("rt");
+    let d = tree_applied(&sandbox, "");
+    let blob = format!("{d}/blob.bin");
+    let out = sandbox.anvil(&["rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(!Path::new(&blob).exists());
+
+    std::fs::write(&blob, [9u8, 0, 9]).unwrap();
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let out = sandbox.anvil(&["--json", "rollback", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(
+        runs(&out).contains(&format!("cannot undo: {blob} (binary)")),
+        "{:?}",
+        runs(&out)
+    );
+    assert_eq!(std::fs::read(&blob).unwrap(), [0, 1, 255], "left alone");
+    assert_eq!(
+        json(&out)["not_restored"],
+        serde_json::json!([{"target": "local", "dest": blob, "reason": "binary"}])
+    );
 }
 
 #[test]

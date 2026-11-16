@@ -715,7 +715,7 @@ pub struct FileWrite {
     /// The entry's `parents`.
     pub parents: bool,
     /// Whether the src is binary ([`Source::binary`]): the record keeps only
-    /// hashes, and rollback cannot undo the write.
+    /// hashes, and rollback cannot undo a write that replaces other bytes.
     pub binary: bool,
     /// For an item of a `recursive = true` entry, its index among the
     /// tree's items, which holds its src.

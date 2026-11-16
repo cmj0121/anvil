@@ -171,7 +171,9 @@ pub struct FileRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub created_dirs: Vec<String>,
     /// Whether the src written was binary: the previous file, if any, is
-    /// kept as its hash only, and rollback cannot undo the write.
+    /// kept as its hash only, and rollback cannot undo a write that replaced
+    /// other bytes; it still removes a file the write created and puts back
+    /// the attrs of an attrs-only fix.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub binary: bool,
     /// Whether the entry rendered secrets: no hash of the bytes written or
@@ -211,7 +213,8 @@ impl PreviousFile {
 pub const NO_ROLLBACK: &str = "rollback = false";
 /// Why the text of a previous file others may not read was not kept.
 pub const NOT_WORLD_READABLE: &str = "not world-readable";
-/// Why a binary file, previous or written, has only its hash in the record.
+/// Why a binary file, previous or written, has only its hash in the record,
+/// so a rollback cannot put back the bytes a binary write replaced.
 pub const BINARY: &str = "binary";
 /// Why a file built from secrets has neither text nor hash in the record.
 pub const SECRET: &str = "secret";
@@ -260,8 +263,9 @@ impl FileRecord {
 
     /// Why a rollback cannot put back this file's previous state, if so:
     /// always [`SECRET`] after a write built from secrets, [`BINARY`] after
-    /// a binary write; else never for an attrs-only
-    /// fix or a refused write, which need no text.
+    /// a binary write that replaced other bytes; else never for an
+    /// attrs-only fix, a write that created DEST or a refused write, which
+    /// need no text.
     pub fn not_kept(&self) -> Option<&str> {
         if self.write == Write::Refused {
             return None;
@@ -269,13 +273,11 @@ impl FileRecord {
         if self.secret {
             return Some(SECRET);
         }
-        if self.binary {
-            return Some(BINARY);
-        }
         if self.attrs_only() {
             return None;
         }
         match &self.previous {
+            Previous::File(_) if self.binary => Some(BINARY),
             Previous::File(p) if !p.kept || p.text.is_none() => {
                 Some(p.reason.as_deref().unwrap_or("not kept"))
             }
@@ -2949,7 +2951,7 @@ mod tests {
     }
 
     #[test]
-    fn a_binary_write_keeps_only_hashes_saves_version_2_and_cannot_be_undone() {
+    fn a_binary_write_keeps_only_hashes_saves_version_2_and_cannot_undo_replaced_bytes() {
         let (path, root) = record_path("record-binary");
         let mut binary = file(
             "/etc/app/a",
@@ -2977,27 +2979,61 @@ mod tests {
         let loaded = load(&path).unwrap().unwrap();
         assert_eq!(loaded.targets["web1"].files, [binary.clone()]);
 
-        // An attrs-only fix or a dest absent before cannot be undone either;
-        // a refused write still needs nothing.
-        for (what, previous, write, expected) in [
+        // An attrs-only fix, a dest absent or dangling before and a refused
+        // write need no previous bytes; a replaced file whose previous was
+        // not kept for another reason, or a write that did not record its
+        // attrs, still cannot be undone as binary.
+        for (what, previous, write, written_attrs, expected) in [
             (
                 "attrs-only",
                 previous(&sha('b'), None),
                 Write::Written,
+                Some(attrs(0, 5, "0600")),
+                None,
+            ),
+            (
+                "attrs-only without written attrs",
+                previous(&sha('b'), None),
+                Write::FailedMidway,
+                None,
                 Some(BINARY),
             ),
             (
                 "absent before",
                 Previous::Absent,
                 Write::Written,
+                Some(attrs(0, 5, "0600")),
+                None,
+            ),
+            (
+                "dangling before",
+                Previous::Dangling {
+                    target: "/nowhere".to_owned(),
+                },
+                Write::Written,
+                Some(attrs(0, 5, "0600")),
+                None,
+            ),
+            (
+                "rollback = false",
+                previous(&sha('a'), None),
+                Write::Written,
+                Some(attrs(0, 5, "0600")),
                 Some(BINARY),
             ),
-            ("refused", Previous::Absent, Write::Refused, None),
+            (
+                "no previous hash",
+                previous("", None),
+                Write::Written,
+                Some(attrs(0, 5, "0600")),
+                Some(BINARY),
+            ),
+            ("refused", Previous::Absent, Write::Refused, None, None),
         ] {
             let record = FileRecord {
                 previous,
                 write,
-                written_attrs: Some(attrs(0, 5, "0600")),
+                written_attrs,
                 ..binary.clone()
             };
             assert_eq!(record.not_kept(), expected, "{what}");
