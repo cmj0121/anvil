@@ -14,9 +14,11 @@ ARG BASE=archlinux@sha256:52dfbd5afb23a220d5ee92dafcb4c788d96c026ed04179890c23ad
 FROM ${BASE} AS sshd
 
 # pacman's own seccomp sandbox has the same problem under emulation.
+# -Syu, not -Sy: the pinned base ages while the repos move on, and a partial
+# upgrade breaks when a new package needs a newer soname (openssl 4 did).
 RUN sed -i 's/^#\?DisableSandbox/DisableSandbox/' /etc/pacman.conf \
     && (grep -q '^DisableSandbox' /etc/pacman.conf || echo 'DisableSandbox' >> /etc/pacman.conf) \
-    && pacman -Sy --noconfirm --needed filesystem openssh inetutils diffutils sudo \
+    && pacman -Syu --noconfirm --needed filesystem openssh inetutils diffutils sudo \
     && pacman -Scc --noconfirm \
     && ssh-keygen -A \
     && useradd -m -s /bin/bash -p '*' key \
@@ -51,7 +53,7 @@ FROM sshd AS systemd
 # TPM. Only `key` signs in here: the `pw` user and its sudo rule are removed
 # and sshd takes keys only.
 RUN (pacman -Q systemd >/dev/null 2>&1 \
-      || (pacman -Sy --noconfirm systemd && pacman -Scc --noconfirm)) \
+      || (pacman -Syu --noconfirm systemd && pacman -Scc --noconfirm)) \
     && userdel -r pw \
     && rm /etc/sudoers.d/pw \
     && sed -i 's/^PasswordAuthentication yes$/PasswordAuthentication no/' /etc/ssh/sshd_config \
