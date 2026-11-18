@@ -350,8 +350,17 @@ fn parallel_two_plans_two_hosts_at_once_and_keeps_inventory_order() {
         "--target",
         "alpha",
     ];
+    let ok = |out: &std::process::Output| {
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stdout:\n{}\nstderr:\n{}",
+            text(&out.stdout),
+            text(&out.stderr)
+        )
+    };
     let out = sandbox.anvil(&args, &[]);
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    ok(&out);
     let block =
         |name: &str| format!("▶ {name}\n  would $ echo planned (from plugin meet)\n  ✔ 1 step\n\n");
     assert_eq!(
@@ -366,7 +375,7 @@ fn parallel_two_plans_two_hosts_at_once_and_keeps_inventory_order() {
     std::fs::remove_dir_all(sandbox.root().join("barrier")).unwrap();
     sandbox.barrier_step_within(20);
     let out = sandbox.anvil(&[&["--json"][..], &args].concat(), &[]);
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    ok(&out);
     let value = json(&out);
     let targets = value["targets"].as_array().unwrap();
     assert_eq!(targets[0]["target"], "alpha");

@@ -324,7 +324,8 @@ impl Sandbox {
 
     /// A step that waits until two runs of it have started, then prints
     /// `met`: it passes only when two targets run at once. After 30 s it
-    /// gives up: it says why on stderr and exits 1.
+    /// gives up: it says on one stderr line how many runs started and the
+    /// files it saw, and exits 1.
     pub fn barrier_step(&self) -> String {
         self.barrier_step_within(30)
     }
@@ -338,7 +339,7 @@ impl Sandbox {
         format!(
             "touch {dir}/$$; i=0; until [ \"$(ls {dir} | wc -l)\" -ge 2 ]; do \
              i=$((i+1)); if [ $i -gt {polls} ]; then \
-             echo \"barrier: gave up after {secs} s, $(ls {dir} | wc -l) of 2 runs started\" >&2; \
+             echo \"barrier: gave up after {secs} s, $(ls {dir} | wc -l) of 2 runs started: $(echo $(ls {dir}))\" >&2; \
              exit 1; fi; sleep 0.05; done; echo met"
         )
     }
