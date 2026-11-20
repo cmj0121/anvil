@@ -44,9 +44,7 @@ pub fn python(needs: &[&str]) -> bool {
         .iter()
         .map(|need| format!("import {}; {need}", need.split('.').next().unwrap()))
         .collect();
-    let ok = Command::new("python3")
-        .args(["-c", &probe.join("; ")])
-        .output()
+    let ok = anvil::test_util::output(Command::new("python3").args(["-c", &probe.join("; ")]))
         .is_ok_and(|out| out.status.success());
     if !ok {
         eprintln!("skip: no python3 with {}", needs.join(", "));
@@ -291,7 +289,7 @@ impl Sandbox {
             .env("FAKE_SSH_GATE", &gate)
             .stdout(std::process::Stdio::piped())
             .stderr(fs::File::create(&stderr).unwrap());
-        let child = command.spawn().expect("spawn anvil");
+        let child = anvil::test_util::spawn(&mut command).expect("spawn anvil");
         until(|| wait.exists(), "alpha's master attempt");
         let pid = rustix::process::Pid::from_child(&child);
         rustix::process::kill_process(pid, signal).unwrap();
@@ -335,10 +333,10 @@ impl Sandbox {
         let dir = self.root.join("barrier");
         fs::create_dir_all(&dir).unwrap();
         let dir = dir.display();
-        let polls = secs * 20;
         format!(
-            "touch {dir}/$$; i=0; until [ \"$(ls {dir} | wc -l)\" -ge 2 ]; do \
-             i=$((i+1)); if [ $i -gt {polls} ]; then \
+            "touch {dir}/$$; end=$(( $(date +%s) + {secs} )); \
+             until [ \"$(ls {dir} | wc -l)\" -ge 2 ]; do \
+             if [ \"$(date +%s)\" -gt $end ]; then \
              echo \"barrier: gave up after {secs} s, $(ls {dir} | wc -l) of 2 runs started: $(echo $(ls {dir}))\" >&2; \
              exit 1; fi; sleep 0.05; done; echo met"
         )
@@ -378,7 +376,7 @@ impl Sandbox {
                 .arg(fixture("fake-ssh.sh"));
         }
         command.envs(vars.iter().copied());
-        command.output().expect("spawn anvil")
+        anvil::test_util::output(&mut command).expect("spawn anvil")
     }
 
     /// Runs anvil with the fake editor copying `content` over the buffer, or

@@ -1,5 +1,8 @@
 disallowed-methods = [
   { path = "std::process::Command::new", reason = "use exec::program or exec::resolved" },
+  { path = "std::process::Command::spawn", reason = "use exec::spawn" },
+  { path = "std::process::Command::output", reason = "use exec::spawn (+ wait_with_output), or exec::output in tests" },
+  { path = "std::process::Command::status", reason = "use exec::status" },
   { path = "std::fs::write", reason = "use private::write_atomic" },
   { path = "std::fs::File::create", reason = "use private::write_atomic" },
 ]

@@ -278,24 +278,24 @@ fn copies_dot_and_parent_directories_with_explicit_and_folder_destinations() {
         (".", "$/folder/", "folder/project/text"),
         ("..", "$/parent/", "parent/source/project/text"),
     ] {
-        let out = s
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .current_dir(&cwd)
-            .args(["files", "cp", "-r", src, dest])
-            .output()
-            .unwrap();
+        let out = anvil::test_util::output(
+            s.command(env!("CARGO_BIN_EXE_anvil"))
+                .current_dir(&cwd)
+                .args(["files", "cp", "-r", src, dest]),
+        )
+        .unwrap();
         assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
         assert_eq!(
             fs::read_to_string(s.config_dir().join("files").join(expected)).unwrap(),
             "content"
         );
     }
-    let out = s
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .current_dir(&cwd)
-        .args(["files", "cp", "-r", ".", "$/"])
-        .output()
-        .unwrap();
+    let out = anvil::test_util::output(
+        s.command(env!("CARGO_BIN_EXE_anvil"))
+            .current_dir(&cwd)
+            .args(["files", "cp", "-r", ".", "$/"]),
+    )
+    .unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(
         fs::read_to_string(s.config_dir().join("files/project/text")).unwrap(),
@@ -383,12 +383,12 @@ fn relative_host_failures_keep_host_paths() {
             "ERROR anvil: missing: not found\n",
         ),
     ] {
-        let out = s
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .current_dir(s.root())
-            .args(args)
-            .output()
-            .unwrap();
+        let out = anvil::test_util::output(
+            s.command(env!("CARGO_BIN_EXE_anvil"))
+                .current_dir(s.root())
+                .args(args),
+        )
+        .unwrap();
         assert_eq!(out.status.code(), Some(1));
         assert_eq!(text(&out.stderr), expected);
         assert!(out.stdout.is_empty());

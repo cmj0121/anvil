@@ -187,7 +187,7 @@ impl Editor {
         let file = ViewFile::new(bytes)?;
         let mut args: Vec<OsString> = self.args.iter().map(OsString::from).collect();
         args.push(file.path().as_os_str().to_owned());
-        term::with_terminal(|| exec::resolved(&self.program).args(&args).status()).map_err(
+        term::with_terminal(|| exec::status(exec::resolved(&self.program).args(&args))).map_err(
             |source| EditorError::Spawn {
                 program: self.program.display().to_string(),
                 source,
@@ -260,7 +260,7 @@ impl Editor {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
-            exec::resolved(&self.program).args(&args).status()
+            exec::status(exec::resolved(&self.program).args(&args))
         })
         .map_err(|source| EditorError::Spawn {
             program: self.program.display().to_string(),

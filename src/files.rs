@@ -3880,10 +3880,10 @@ mod tests {
 
     #[test]
     fn a_binary_write_refuses_a_printf_that_is_not_a_builtin_before_any_byte() {
-        let found = std::process::Command::new("sh")
-            .args(["-c", "command -v bash >/dev/null"])
-            .status()
-            .is_ok_and(|status| status.success());
+        let found = crate::exec::status(
+            std::process::Command::new("sh").args(["-c", "command -v bash >/dev/null"]),
+        )
+        .is_ok_and(|status| status.success());
         if !found {
             eprintln!("skip: no bash");
             return;
@@ -4650,11 +4650,12 @@ mod tests {
             return;
         };
         let (dir, bin, dest) = write_case("files-other-group", &[]);
-        let chgrp = std::process::Command::new("chgrp")
-            .arg(other.to_string())
-            .arg(&dest)
-            .status()
-            .unwrap();
+        let chgrp = crate::exec::status(
+            std::process::Command::new("chgrp")
+                .arg(other.to_string())
+                .arg(&dest),
+        )
+        .unwrap();
         assert!(chgrp.success());
         let out = sh_with(&bin, &owning(&dest, "", (Some(&uid), None), Some("me")));
         assert_eq!(
@@ -4952,7 +4953,7 @@ mod tests {
 
     /// The trimmed stdout of `command`.
     fn text_of(command: &mut std::process::Command) -> String {
-        String::from_utf8(command.output().unwrap().stdout)
+        String::from_utf8(crate::exec::output(command).unwrap().stdout)
             .unwrap()
             .trim()
             .to_owned()
@@ -5382,10 +5383,9 @@ mod tests {
 
     /// Fails unless `/bin/sh -n` parses `script`.
     fn assert_valid_sh(script: &str) {
-        let syntax = std::process::Command::new("/bin/sh")
-            .args(["-n", "-c", script])
-            .status()
-            .unwrap();
+        let syntax =
+            crate::exec::status(std::process::Command::new("/bin/sh").args(["-n", "-c", script]))
+                .unwrap();
         assert!(syntax.success(), "{script}");
     }
 

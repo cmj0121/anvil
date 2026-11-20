@@ -231,12 +231,13 @@ mod tests {
         for prefix in BREW_PREFIXES {
             assert!(PROBE.contains(prefix), "{prefix}");
         }
-        let out = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(PROBE)
-            .env("PATH", "/usr/bin:/bin")
-            .output()
-            .unwrap();
+        let out = crate::exec::output(
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(PROBE)
+                .env("PATH", "/usr/bin:/bin"),
+        )
+        .unwrap();
         assert_eq!(out.status.code(), Some(0));
         let facts = Facts::parse(&out.stdout).unwrap();
         let installed = BREW_PREFIXES

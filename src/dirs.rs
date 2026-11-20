@@ -543,7 +543,7 @@ mod tests {
 
     fn another_group(path: &Path) -> Option<String> {
         let was = fs::metadata(path).unwrap().gid().to_string();
-        let out = std::process::Command::new("id").arg("-G").output().unwrap();
+        let out = crate::exec::output(std::process::Command::new("id").arg("-G")).unwrap();
         let groups = String::from_utf8(out.stdout).unwrap();
         (groups.split_whitespace())
             .find(|gid| *gid != was)

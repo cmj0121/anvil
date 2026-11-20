@@ -29,18 +29,23 @@ const REQUEST_LIMIT: usize = 1_736_704;
 fn audit_plugin() -> &'static Path {
     static BUILT: OnceLock<PathBuf> = OnceLock::new();
     BUILT.get_or_init(|| {
-        let out = Command::new(env!("CARGO"))
-            .args([
-                "build",
-                "-p",
-                "anvil-audit",
-                "--locked",
-                "--message-format=json-render-diagnostics",
-            ])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .stderr(Stdio::inherit())
-            .output()
-            .expect("run cargo build -p anvil-audit");
+        // Not test_util::output, which would capture stderr too.
+        let out = anvil::test_util::spawn(
+            Command::new(env!("CARGO"))
+                .args([
+                    "build",
+                    "-p",
+                    "anvil-audit",
+                    "--locked",
+                    "--message-format=json-render-diagnostics",
+                ])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit()),
+        )
+        .and_then(std::process::Child::wait_with_output)
+        .expect("run cargo build -p anvil-audit");
         assert!(
             out.status.success(),
             "cargo build -p anvil-audit: {}",
@@ -222,12 +227,13 @@ fn a_removed_file_is_absent_and_a_rolled_back_one_is_not_compared() {
 
 /// Pipes `input` to `anvil-audit`; its exit code, stdout and stderr.
 fn audit(input: &[u8]) -> (Option<i32>, String, String) {
-    let mut child = Command::new(audit_plugin())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = anvil::test_util::spawn(
+        Command::new(audit_plugin())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let input = input.to_vec();
     let writer = std::thread::spawn(move || {

@@ -18,6 +18,10 @@ use crate::paths::DocPath;
 use crate::plugin::{Plugins, Request};
 use crate::secret::{BackendKind, SecretError, Store, Vault};
 
+/// The integration tests spawn through these too: their test threads share a
+/// process, so a child spawned without the lock can inherit another's pipe.
+pub use crate::exec::{output, spawn, status};
+
 pub fn json(value: &impl Serialize) -> serde_json::Value {
     serde_json::to_value(value).unwrap()
 }
@@ -34,10 +38,7 @@ pub fn mode(path: &Path) -> u32 {
 
 /// Makes a named pipe at `path`.
 pub fn mkfifo(path: &Path) {
-    let made = std::process::Command::new("mkfifo")
-        .arg(path)
-        .status()
-        .unwrap();
+    let made = crate::exec::status(std::process::Command::new("mkfifo").arg(path)).unwrap();
     assert!(made.success(), "mkfifo {}", path.display());
 }
 

@@ -118,14 +118,15 @@ fn write_stderr(text: &str) {
 /// as a shell may import a `kill` function from it. Anything but a clean exit 0
 /// counts as no.
 fn hangup_ignored() -> bool {
-    exec::resolved("/bin/sh")
-        .args(["-c", "kill -HUP $$ && exit 0; exit 1"])
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.code() == Some(0))
+    exec::status(
+        exec::resolved("/bin/sh")
+            .args(["-c", "kill -HUP $$ && exit 0; exit 1"])
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .is_ok_and(|status| status.code() == Some(0))
 }
 
 /// Handles the signals for the command's life; dropping it stops the handling

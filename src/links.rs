@@ -953,9 +953,7 @@ mod tests {
         fs::write(dir.join("kept"), "x").unwrap();
         let fifo = top.join("fifo");
         assert!(
-            std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
+            crate::exec::status(std::process::Command::new("mkfifo").arg(&fifo))
                 .unwrap()
                 .success()
         );
@@ -1025,11 +1023,12 @@ mod tests {
         let write = write(&path, "/x", false, false, &top);
         let stale = PathBuf::from(temp_beside(path.to_str().unwrap()).unwrap());
         symlink("/stale", &stale).unwrap();
-        let touched = std::process::Command::new("touch")
-            .args(["-h", "-t", "202001010000"])
-            .arg(&stale)
-            .status()
-            .unwrap();
+        let touched = crate::exec::status(
+            std::process::Command::new("touch")
+                .args(["-h", "-t", "202001010000"])
+                .arg(&stale),
+        )
+        .unwrap();
         assert!(touched.success());
         let (code, _, stderr, _) = applied(&write, None);
         assert_eq!(code, Some(0), "{stderr}");
@@ -1440,11 +1439,12 @@ mod tests {
         let other = format!("{}x", &temp[..temp.len() - 1]);
         for stale in [&temp, &other] {
             symlink("/stale", stale).unwrap();
-            let touched = std::process::Command::new("touch")
-                .args(["-h", "-t", "202001010000"])
-                .arg(stale)
-                .status()
-                .unwrap();
+            let touched = crate::exec::status(
+                std::process::Command::new("touch")
+                    .args(["-h", "-t", "202001010000"])
+                    .arg(stale),
+            )
+            .unwrap();
             assert!(touched.success());
         }
         let (code, _, stderr, _) = applied(&write(&path, "/x", false, false, &top), None);

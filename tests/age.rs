@@ -12,7 +12,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use age::armor::{ArmoredReader, ArmoredWriter, Format};
 use age::secrecy::{ExposeSecret, SecretString};
@@ -126,20 +126,17 @@ fn on_a_terminal(sandbox: &Sandbox, args: &[&str], reply: &str, exit: i32) -> St
         env!("CARGO_BIN_EXE_anvil"),
     ];
     script_args.extend(args);
-    let out = command(sandbox, "python3", &script_args)
-        .env("PTY_PASSPHRASE", PASSPHRASE)
-        .output()
-        .unwrap();
+    let out = anvil::test_util::output(
+        command(sandbox, "python3", &script_args).env("PTY_PASSPHRASE", PASSPHRASE),
+    )
+    .unwrap();
     let transcript = text(&out.stdout);
     assert!(out.status.success(), "{transcript}\n{}", text(&out.stderr));
     transcript
 }
 
 fn anvil(sandbox: &Sandbox, args: &[&str]) -> Output {
-    command(sandbox, env!("CARGO_BIN_EXE_anvil"), args)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    anvil::test_util::output(&mut command(sandbox, env!("CARGO_BIN_EXE_anvil"), args)).unwrap()
 }
 
 #[test]
@@ -261,7 +258,7 @@ fn without_a_terminal_a_passphrase_identity_is_locked() {
     let sandbox = age_sandbox("ag");
     passphrase_identity(&sandbox);
     // A new session has no controlling terminal, so /dev/tty cannot open.
-    let out = command(
+    let out = anvil::test_util::output(&mut command(
         &sandbox,
         "python3",
         &[
@@ -271,9 +268,7 @@ fn without_a_terminal_a_passphrase_identity_is_locked() {
             "--json",
             "doctor",
         ],
-    )
-    .stdin(Stdio::null())
-    .output()
+    ))
     .unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     assert_eq!(

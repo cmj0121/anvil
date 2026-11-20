@@ -264,19 +264,20 @@ fn spawn(
     let real = pin.real.to_string_lossy();
     let real = escape_controls(&real);
     log::debug!("spawn plugin {} {real}", pin.name);
-    let mut child = exec::resolved(&pin.real)
-        .current_dir(pin.real.parent().unwrap_or(Path::new("/")))
-        .env_clear()
-        .envs(
-            vars.into_iter()
-                .filter(|(name, _)| name.to_str().is_some_and(is_passed)),
-        )
-        .process_group(0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| fail(&format_args!("cannot start {real}: {err}")))?;
+    let mut child = exec::spawn(
+        exec::resolved(&pin.real)
+            .current_dir(pin.real.parent().unwrap_or(Path::new("/")))
+            .env_clear()
+            .envs(
+                vars.into_iter()
+                    .filter(|(name, _)| name.to_str().is_some_and(is_passed)),
+            )
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|err| fail(&format_args!("cannot start {real}: {err}")))?;
     // Whatever it leaves in its group dies as it exits, so nothing keeps
     // running or holds stdin and blocks the writer joined below.
     let tracked = Groups::global().track(&child).killing_leftovers();
@@ -1114,12 +1115,13 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5), "not waited out");
         let holder = record(&root, "holder");
         let alive = || {
-            std::process::Command::new("kill")
-                .args(["-0", holder.trim()])
-                .stderr(Stdio::null())
-                .status()
-                .unwrap()
-                .success()
+            crate::exec::status(
+                std::process::Command::new("kill")
+                    .args(["-0", holder.trim()])
+                    .stderr(Stdio::null()),
+            )
+            .unwrap()
+            .success()
         };
         let gone = (0..100).any(|_| {
             thread::sleep(Duration::from_millis(20));
