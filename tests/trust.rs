@@ -226,15 +226,15 @@ fn a_first_config_at_a_loose_umask_does_not_lock_out_the_next_command() {
     let config = nested.join("config.toml");
     let edited = sb.root().join("edited.toml");
     put(&edited, 0o644, "[anvil]\nformat = \"toml\"\n");
-    let out = sb
-        .command("sh")
-        .args(["-c", "umask 002; exec \"$@\"", "sh"])
-        .arg(env!("CARGO_BIN_EXE_anvil"))
-        .args(["config", "--config"])
-        .arg(&config)
-        .env("FAKE_EDITOR_CONTENT", &edited)
-        .output()
-        .unwrap();
+    let out = anvil::test_util::output(
+        sb.command("sh")
+            .args(["-c", "umask 002; exec \"$@\"", "sh"])
+            .arg(env!("CARGO_BIN_EXE_anvil"))
+            .args(["config", "--config"])
+            .arg(&config)
+            .env("FAKE_EDITOR_CONTENT", &edited),
+    )
+    .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     for dir in [&nested, &sb.root().join("made")] {
         let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
@@ -372,7 +372,7 @@ fn a_fifo_as_the_run_script_is_refused_without_waiting_for_a_writer() {
     let sb = Sandbox::new("trf");
     with_host(&sb);
     let fifo = sb.root().join("fix.sh");
-    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    let made = anvil::test_util::status(std::process::Command::new("mkfifo").arg(&fifo));
     assert!(made.unwrap().success());
     chmod(&fifo, 0o644);
     let out = sb.anvil(&["run", "--target", "box", fifo.to_str().unwrap()], &[]);
@@ -508,14 +508,14 @@ fn a_link_in_a_folder_others_can_write_is_refused_and_never_falls_back() {
 /// its exit code and stderr.
 fn bounded(sb: &Sandbox, args: &[&str]) -> (Option<i32>, String) {
     let stderr = sb.root().join("bounded.err");
-    let mut child = sb
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(fs::File::create(&stderr).unwrap())
-        .spawn()
-        .unwrap();
+    let mut child = anvil::test_util::spawn(
+        sb.command(env!("CARGO_BIN_EXE_anvil"))
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(fs::File::create(&stderr).unwrap()),
+    )
+    .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         if let Some(status) = child.try_wait().unwrap() {

@@ -957,10 +957,13 @@ mod tests {
     /// as its argv.
     fn shells() -> Vec<Vec<&'static str>> {
         let found = |name: &str| {
-            std::process::Command::new("sh")
-                .args(["-c", "command -v \"$1\" >/dev/null", "sh", name])
-                .status()
-                .is_ok_and(|status| status.success())
+            crate::exec::status(std::process::Command::new("sh").args([
+                "-c",
+                "command -v \"$1\" >/dev/null",
+                "sh",
+                name,
+            ]))
+            .is_ok_and(|status| status.success())
         };
         let mut shells = Vec::new();
         for argv in [
@@ -983,12 +986,13 @@ mod tests {
     fn printed(argv: &[&str], printf: &Printf) -> Vec<u8> {
         use std::io::Write as _;
         let script = format!("{}anvil_bytes\n", *Bytes::Printf(printf).definition());
-        let mut child = std::process::Command::new(argv[0])
-            .args(&argv[1..])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = crate::exec::spawn(
+            std::process::Command::new(argv[0])
+                .args(&argv[1..])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped()),
+        )
+        .unwrap();
         let mut stdin = child.stdin.take().unwrap();
         let writer = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
         let out = child.wait_with_output().unwrap();
@@ -1057,11 +1061,12 @@ mod tests {
         for i in 0..values.len() {
             script.push_str(&format!("printf '%s\\0' \"$V{i}\"\n"));
         }
-        let out = std::process::Command::new("sh")
-            .args(["-c", &script])
-            .env_clear()
-            .output()
-            .unwrap();
+        let out = crate::exec::output(
+            std::process::Command::new("sh")
+                .args(["-c", &script])
+                .env_clear(),
+        )
+        .unwrap();
         assert!(
             out.status.success(),
             "{}",

@@ -90,7 +90,7 @@ fn check_env(server: &FixtureServer, extra: &[&str], vars: &[(&str, &str)]) -> O
         .args(extra)
         .envs(vars.iter().copied());
     without_proxies(&mut command);
-    let out = command.output().expect("spawn anvil");
+    let out = anvil::test_util::output(&mut command).expect("spawn anvil");
     assert_tmp_empty(&sandbox);
     out
 }
@@ -445,7 +445,7 @@ impl Install {
         }
         command.args(extra);
         without_proxies(&mut command);
-        let out = command.output().expect("spawn anvil");
+        let out = anvil::test_util::output(&mut command).expect("spawn anvil");
         assert_tmp_empty(&self.sandbox);
         out
     }
@@ -516,10 +516,7 @@ fn an_update_replaces_the_binary_keeps_the_old_at_prev_and_the_mode_under_umask_
     assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
     install.assert_updated();
     assert_eq!(install.names(), ["anvil", "anvil.prev"]);
-    let version = Command::new(&install.exe)
-        .arg("--version")
-        .output()
-        .unwrap();
+    let version = anvil::test_util::output(Command::new(&install.exe).arg("--version")).unwrap();
     assert_eq!(text(&version.stdout), "anvil 9.9.9\n");
     let paths: Vec<String> = server
         .requests()
@@ -594,7 +591,7 @@ fn a_symlinked_install_updates_the_file_it_points_at() {
 #[test]
 fn stale_new_files_of_dead_runs_are_swept_and_live_ones_kept() {
     let install = Install::new();
-    let mut child = Command::new("true").spawn().unwrap();
+    let mut child = anvil::test_util::spawn(&mut Command::new("true")).unwrap();
     let dead = child.id();
     child.wait().unwrap();
     fs::write(install.dir.join(format!(".anvil.new-{dead}")), b"stale").unwrap();
@@ -772,9 +769,7 @@ fn a_read_only_install_dir_is_refused_before_any_download() {
 
 /// Whether the tests run as root, where permission refusals do not happen.
 fn as_root() -> bool {
-    let root = Command::new("id")
-        .arg("-u")
-        .output()
+    let root = anvil::test_util::output(Command::new("id").arg("-u"))
         .is_ok_and(|out| text(&out.stdout).trim() == "0");
     if root {
         eprintln!("skip: running as root");

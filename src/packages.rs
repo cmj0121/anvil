@@ -832,16 +832,17 @@ add) echo "install $*"; return "$FAIL";; esac; }
             std::fs::write(&path, format!("#!/bin/sh\n{stub}\n{function} \"$@\"\n")).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let out = std::process::Command::new("/bin/sh")
-            .args(["-c", line])
-            .env(
-                "PATH",
-                format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
-            )
-            .env("FAIL", if fail { "7" } else { "0" })
-            .env("EMPTY_DB", "0")
-            .output()
-            .unwrap();
+        let out = crate::exec::output(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", line])
+                .env(
+                    "PATH",
+                    format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
+                )
+                .env("FAIL", if fail { "7" } else { "0" })
+                .env("EMPTY_DB", "0"),
+        )
+        .unwrap();
         let _ = std::fs::remove_dir_all(dir);
         out
     }
@@ -1943,14 +1944,15 @@ add) echo "install $*"; return "$FAIL";; esac; }
                     -Syu) return $SYNC;; esac; \
                     case \" $* \" in *\" --needed \"*) return $SYNC;; esac; \
                     shift; echo \"installed $*\"; return ${INS:-0}; }";
-        let out = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("{stub}\n{line}"))
-            .env("SYNC", sync.to_string())
-            .env("HAVE", have)
-            .env("DEL", del.to_string())
-            .output()
-            .unwrap();
+        let out = crate::exec::output(
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("{stub}\n{line}"))
+                .env("SYNC", sync.to_string())
+                .env("HAVE", have)
+                .env("DEL", del.to_string()),
+        )
+        .unwrap();
         (out.status.code(), String::from_utf8(out.stdout).unwrap())
     }
 

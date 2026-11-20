@@ -325,18 +325,19 @@ impl Ssh {
 
     /// A timed-out or failed check counts as no master.
     fn master_alive(&self, control_dir: &Path) -> bool {
-        self.command(&self.check_args(control_dir))
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|err| TransportError::Spawn(err.to_string()))
-            .and_then(|child| {
-                let tracked = Groups::global().track(&child);
-                collect(child, Some(tracked), Some(self.check_timeout))
-            })
-            .is_ok_and(|output| output.code == Some(0))
+        exec::spawn(
+            self.command(&self.check_args(control_dir))
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .map_err(|err| TransportError::Spawn(err.to_string()))
+        .and_then(|child| {
+            let tracked = Groups::global().track(&child);
+            collect(child, Some(tracked), Some(self.check_timeout))
+        })
+        .is_ok_and(|output| output.code == Some(0))
     }
 
     /// Opens the master: the key attempt, then one interactive attempt when the
@@ -378,9 +379,8 @@ impl Ssh {
         } else {
             None
         };
-        let child = command
-            .spawn()
-            .map_err(|err| TransportError::Spawn(err.to_string()))?;
+        let child =
+            exec::spawn(&mut command).map_err(|err| TransportError::Spawn(err.to_string()))?;
         // Only the key attempt leads a group of its own; the retry is in
         // anvil's group, which must never be killed with the children.
         let tracked = batch.then(|| Groups::global().track(&child));
@@ -790,17 +790,18 @@ mod tests {
         deadline: u64,
         env: &[(&str, String)],
     ) -> (std::process::Child, std::process::ChildStdin) {
-        let mut child = Command::new(&shell[0])
-            .args(&shell[1..])
-            .args(["-c", WRAPPER, "anvil-run"])
-            .args([bytes.to_string(), marker.to_owned(), deadline.to_string()])
-            .envs(env.iter().map(|(key, value)| (key, value)))
-            .process_group(0)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = crate::exec::spawn(
+            Command::new(&shell[0])
+                .args(&shell[1..])
+                .args(["-c", WRAPPER, "anvil-run"])
+                .args([bytes.to_string(), marker.to_owned(), deadline.to_string()])
+                .envs(env.iter().map(|(key, value)| (key, value)))
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
         let mut stdin = child.stdin.take().unwrap();
         std::io::Write::write_all(&mut stdin, frame.as_bytes()).unwrap();
         (child, stdin)
@@ -1030,12 +1031,13 @@ mod tests {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let out = Command::new(&shell[0])
-            .args(&shell[1..])
-            .args(["-c", "command -v ps"])
-            .env("PATH", path)
-            .output()
-            .unwrap();
+        let out = crate::exec::output(
+            Command::new(&shell[0])
+                .args(&shell[1..])
+                .args(["-c", "command -v ps"])
+                .env("PATH", path),
+        )
+        .unwrap();
         let found = String::from_utf8_lossy(&out.stdout).trim() == bin.join("ps").to_str().unwrap();
         fs::remove_dir_all(&bin).unwrap();
         found
@@ -1526,14 +1528,8 @@ mod tests {
                 .all(|b| b.is_ascii_alphanumeric() || b"+/=- |".contains(&b)),
             "{remote}"
         );
-        let out = Command::new("/bin/sh")
-            .args(["-c", &remote])
-            .output()
-            .unwrap();
-        let direct = Command::new("/bin/sh")
-            .args(["-c", AWKWARD])
-            .output()
-            .unwrap();
+        let out = crate::exec::output(Command::new("/bin/sh").args(["-c", &remote])).unwrap();
+        let direct = crate::exec::output(Command::new("/bin/sh").args(["-c", AWKWARD])).unwrap();
         assert_eq!(out.stdout, direct.stdout);
         assert_eq!(
             String::from_utf8(out.stdout).unwrap(),

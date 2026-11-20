@@ -391,13 +391,14 @@ pub fn run_with_script_in(
 ) -> Result<Output, TransportError> {
     // Its own process group, so a timeout also kills the script's children, which
     // would otherwise keep the output pipes open.
-    let mut child = command
-        .process_group(0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| TransportError::Spawn(err.to_string()))?;
+    let mut child = exec::spawn(
+        command
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|err| TransportError::Spawn(err.to_string()))?;
     let mut tracked = Some(groups.track(&child));
 
     // A script that exits before reading everything closes the pipe early; that is
@@ -541,13 +542,14 @@ pub fn run_tty_with_in(
         ));
     }
     let nonce = Nonce::generate()?;
-    let mut child = command
-        .process_group(0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| TransportError::Spawn(err.to_string()))?;
+    let mut child = exec::spawn(
+        command
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|err| TransportError::Spawn(err.to_string()))?;
     let mut tracked = Some(groups.track(&child));
     let stdin = child.stdin.take().expect("stdin is piped");
     let (done, finished) = mpsc::channel();
@@ -1150,13 +1152,14 @@ mod tests {
 
     #[test]
     fn each_stream_has_its_own_cap() {
-        let child = Command::new("/bin/sh")
-            .args(["-c", "echo 0123456789abc; echo 0123456789 >&2"])
-            .process_group(0)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let child = crate::exec::spawn(
+            Command::new("/bin/sh")
+                .args(["-c", "echo 0123456789abc; echo 0123456789 >&2"])
+                .process_group(0)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
         let out = collect_capped(child, Some(RUN_TIMEOUT), [10, 4]).unwrap();
         assert_eq!(out.stdout, b"0123456789");
         assert_eq!(out.stderr, b"0123");
@@ -1289,13 +1292,14 @@ mod tests {
 
     #[test]
     fn collect_capped_keeps_nothing_on_a_timeout() {
-        let child = Command::new("/bin/sh")
-            .args(["-c", "echo secret; sleep 30"])
-            .process_group(0)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let child = crate::exec::spawn(
+            Command::new("/bin/sh")
+                .args(["-c", "echo secret; sleep 30"])
+                .process_group(0)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
         let err = collect_capped(child, Some(Duration::from_millis(300)), [64, 64]).unwrap_err();
         assert_eq!(
             err,
@@ -1880,11 +1884,12 @@ mod tests {
     #[test]
     fn reaping_the_leader_untracks_its_group_before_the_guard_drops() {
         let groups = Groups::new();
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "exit 0"])
-            .process_group(0)
-            .spawn()
-            .unwrap();
+        let mut child = crate::exec::spawn(
+            Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .process_group(0),
+        )
+        .unwrap();
         let mut tracked = Some(groups.track(&child));
         assert_eq!(live(&groups), 1);
         assert!(reap(&mut child, &mut tracked).unwrap().success());
@@ -1895,10 +1900,7 @@ mod tests {
         // A second guard on the same id keeps it tracked.
         let group = Pid::from_raw(i32::MAX).unwrap();
         let other = groups.track_group(group);
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "exit 0"])
-            .spawn()
-            .unwrap();
+        let mut child = crate::exec::spawn(Command::new("/bin/sh").args(["-c", "exit 0"])).unwrap();
         let mut reaped = groups.track_group(group);
         while reaped.try_wait(&mut child).unwrap().is_none() {
             thread::sleep(REAP_POLL);
@@ -1915,10 +1917,7 @@ mod tests {
 
     /// Whether the process `pid` still runs.
     fn running(pid: &str) -> bool {
-        Command::new("kill")
-            .args(["-0", pid])
-            .stderr(Stdio::null())
-            .status()
+        crate::exec::status(Command::new("kill").args(["-0", pid]).stderr(Stdio::null()))
             .unwrap()
             .success()
     }
@@ -1926,12 +1925,13 @@ mod tests {
     /// A group leader that leaves a `sleep 30` in its group as it exits,
     /// with the pid of that `sleep`.
     fn leaving_a_leftover() -> (Child, String) {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "sleep 30 >/dev/null 2>&1 & echo $!"])
-            .process_group(0)
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = crate::exec::spawn(
+            Command::new("/bin/sh")
+                .args(["-c", "sleep 30 >/dev/null 2>&1 & echo $!"])
+                .process_group(0)
+                .stdout(Stdio::piped()),
+        )
+        .unwrap();
         let mut pid = String::new();
         child
             .stdout
@@ -1960,7 +1960,7 @@ mod tests {
         let mut tracked = Some(groups.track(&child));
         assert!(reap(&mut child, &mut tracked).unwrap().success());
         assert!(running(&leftover), "only a guard that asks kills");
-        let _ = Command::new("kill").args(["-9", &leftover]).status();
+        let _ = crate::exec::status(Command::new("kill").args(["-9", &leftover]));
     }
 
     #[test]

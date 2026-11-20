@@ -236,17 +236,18 @@ impl Runner<'_> {
             self.program.display(),
             sops.path.display()
         );
-        let mut child = command
-            .process_group(0)
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| fail(format!("cannot start {}: {err}", self.program.display())))?;
+        let mut child = exec::spawn(
+            command
+                .process_group(0)
+                .stdin(if input.is_some() {
+                    Stdio::piped()
+                } else {
+                    Stdio::null()
+                })
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .map_err(|err| fail(format!("cannot start {}: {err}", self.program.display())))?;
         let stdin = child.stdin.take();
         let output = thread::scope(|scope| {
             if let (Some(mut stdin), Some(input)) = (stdin, input) {

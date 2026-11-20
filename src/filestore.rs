@@ -1042,7 +1042,7 @@ mod tests {
         assert_eq!(err.to_string(), "$/blob: exceeds the 1 MiB limit");
         fs::create_dir(store.1.path().join("dir")).unwrap();
         let fifo = store.1.path().join("fifo");
-        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        let made = crate::exec::status(std::process::Command::new("mkfifo").arg(&fifo));
         assert!(made.unwrap().success());
         for rel in ["$/dir", "$/fifo"] {
             let err = store.1.read_trusted_bytes(rel).unwrap_err();

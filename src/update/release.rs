@@ -302,14 +302,14 @@ fn curl(
             url.to_string_lossy()
         );
     }
-    let child = curl
-        .args(args)
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("cannot start {}: {err}", curl.get_program().display()))?;
+    let child = exec::spawn(
+        curl.args(args)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|err| format!("cannot start {}: {err}", curl.get_program().display()))?;
     let output =
         collect_capped(child, Some(timeout), [64, STDERR_LIMIT]).map_err(|err| match err {
             TransportError::Timeout { after, .. } => {

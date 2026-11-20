@@ -16,17 +16,18 @@ use common::{CONNECT_REFUSED, CONNECT_REFUSED_MESSAGE, Sandbox, fixture, json, t
 
 /// Runs anvil with `input` on its stdin.
 fn anvil_stdin(sandbox: &Sandbox, args: &[&str], vars: &[(&str, &str)], input: &[u8]) -> Output {
-    let mut child = sandbox
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .args(args)
-        .args(["--secret-store", "memory", "--ssh-program"])
-        .arg(fixture("fake-ssh.sh"))
-        .envs(vars.iter().copied())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn anvil");
+    let mut child = anvil::test_util::spawn(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(args)
+            .args(["--secret-store", "memory", "--ssh-program"])
+            .arg(fixture("fake-ssh.sh"))
+            .envs(vars.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("spawn anvil");
     // anvil may refuse before reading all of it.
     let _ = child.stdin.take().unwrap().write_all(input);
     child.wait_with_output().unwrap()

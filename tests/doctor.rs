@@ -575,15 +575,16 @@ fn gated_doctor(sandbox: &Sandbox) -> (std::process::Child, std::sync::mpsc::Rec
         gated_plugin(sandbox, "b")
     );
     sandbox.write_config("config.toml", &config);
-    let mut child = sandbox
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .args(["--secret-store", "memory", "--ssh-program"])
-        .arg(fixture("fake-ssh.sh"))
-        .args(["--json", "doctor"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn anvil");
+    let mut child = anvil::test_util::spawn(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", "--ssh-program"])
+            .arg(fixture("fake-ssh.sh"))
+            .args(["--json", "doctor"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("spawn anvil");
     let (tx, lines) = std::sync::mpsc::channel();
     let stderr = child.stderr.take().unwrap();
     std::thread::spawn(move || {
@@ -672,19 +673,20 @@ fn a_second_ctrl_c_kills_the_running_plugin_and_anvil_dies_by_sigint() {
 #[test]
 fn unknown_packages_are_a_read_only_warning_with_exit_zero() {
     let (sandbox, path) = common::package_sandbox("dp", &["git", "missing"]);
-    let out = sandbox
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .args([
-            "--json",
-            "doctor",
-            "--target",
-            "local",
-            "--secret-store",
-            "memory",
-        ])
-        .env("PATH", &path)
-        .output()
-        .unwrap();
+    let out = anvil::test_util::output(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args([
+                "--json",
+                "doctor",
+                "--target",
+                "local",
+                "--secret-store",
+                "memory",
+            ])
+            .env("PATH", &path),
+    )
+    .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let value = json(&out);
     assert_eq!(value["ok"], true);
@@ -692,12 +694,13 @@ fn unknown_packages_are_a_read_only_warning_with_exit_zero() {
         value["targets"][0]["packages"],
         "WARNING: not found by pacman: missing"
     );
-    let out = sandbox
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .args(["doctor", "--target", "local", "--secret-store", "memory"])
-        .env("PATH", path)
-        .output()
-        .unwrap();
+    let out = anvil::test_util::output(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["doctor", "--target", "local", "--secret-store", "memory"])
+            .env("PATH", path),
+    )
+    .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let shown = text(&out.stdout);
     assert!(
@@ -774,13 +777,14 @@ fn doctor_ignores_an_ssh_planted_in_the_current_directory() {
     .unwrap();
     common::chmod(&cwd.join("ssh"), 0o755);
     let doctor = |path: &str| {
-        sandbox
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .args(["--secret-store", "memory", "doctor", "--target", "box"])
-            .current_dir(&cwd)
-            .env("PATH", path)
-            .output()
-            .expect("spawn anvil")
+        anvil::test_util::output(
+            sandbox
+                .command(env!("CARGO_BIN_EXE_anvil"))
+                .args(["--secret-store", "memory", "doctor", "--target", "box"])
+                .current_dir(&cwd)
+                .env("PATH", path),
+        )
+        .expect("spawn anvil")
     };
     let out = doctor(":/usr/bin");
     assert!(!ran.exists(), "{}", text(&out.stdout));

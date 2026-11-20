@@ -22,7 +22,11 @@ use common::{
 };
 
 fn local_hostname() -> String {
-    text(&Command::new("hostname").output().unwrap().stdout)
+    text(
+        &anvil::test_util::output(&mut Command::new("hostname"))
+            .unwrap()
+            .stdout,
+    )
 }
 
 #[test]
@@ -687,18 +691,19 @@ fn a_file_through_sudo_with_a_password_is_staged_installed_and_removed() {
     );
     let apply = |args: &[&str], password: &str| {
         let _ = std::fs::remove_file(&sudo_log);
-        sandbox
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .arg("--ssh-program")
-            .arg(common::fixture("fake-ssh.sh"))
-            .args(args)
-            .args(["apply", "--target", "fake"])
-            .env("PATH", &path)
-            .env("FAKE_SSH_LOG", &ssh_log)
-            .env("FAKE_SUDO_LOG", &sudo_log)
-            .env("FAKE_SUDO_PW", password)
-            .output()
-            .unwrap()
+        anvil::test_util::output(
+            sandbox
+                .command(env!("CARGO_BIN_EXE_anvil"))
+                .arg("--ssh-program")
+                .arg(common::fixture("fake-ssh.sh"))
+                .args(args)
+                .args(["apply", "--target", "fake"])
+                .env("PATH", &path)
+                .env("FAKE_SSH_LOG", &ssh_log)
+                .env("FAKE_SUDO_LOG", &sudo_log)
+                .env("FAKE_SUDO_PW", password),
+        )
+        .unwrap()
     };
     let assert_clean = |out: &std::process::Output| {
         for (what, shown) in [
@@ -990,11 +995,12 @@ fn beating_into(kind: Kind, stderr: Option<Stdio>) -> Running {
             command.args(["--parallel", "2", "apply"]);
         }
     }
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(stderr.unwrap_or_else(Stdio::piped))
-        .spawn()
-        .expect("spawn anvil");
+    let mut child = anvil::test_util::spawn(
+        command
+            .stdout(Stdio::piped())
+            .stderr(stderr.unwrap_or_else(Stdio::piped)),
+    )
+    .expect("spawn anvil");
     let (tx, lines) = mpsc::channel();
     if let Some(stderr) = child.stderr.take() {
         std::thread::spawn(move || {
@@ -1246,16 +1252,17 @@ fn a_sigkill_during_a_write_over_a_file_rolls_back_to_its_original_bytes() {
         sandbox.root().join("bin").display(),
         std::env::var("PATH").unwrap()
     );
-    let out = sandbox
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .arg("--ssh-program")
-        .arg(common::fixture("fake-ssh.sh"))
-        .args(["rollback", "--target", "fake"])
-        .env("PATH", path)
-        .env("FAKE_SUDO_LOG", sandbox.root().join("sudo.log"))
-        .env("FAKE_SUDO_PW", common::VALUE)
-        .output()
-        .unwrap();
+    let out = anvil::test_util::output(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .arg("--ssh-program")
+            .arg(common::fixture("fake-ssh.sh"))
+            .args(["rollback", "--target", "fake"])
+            .env("PATH", path)
+            .env("FAKE_SUDO_LOG", sandbox.root().join("sudo.log"))
+            .env("FAKE_SUDO_PW", common::VALUE),
+    )
+    .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), PREVIOUS);
 }
@@ -1278,15 +1285,16 @@ fn an_inherited_ignored_sighup_stays_ignored_for_anvil_and_its_steps() {
             second.display()
         ),
     );
-    let child = sandbox
-        .command("/bin/sh")
-        .args(["-c", "trap \"\" HUP; exec \"$0\" \"$@\""])
-        .arg(env!("CARGO_BIN_EXE_anvil"))
-        .args(["--secret-store", "memory", "apply", "--target", "local"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn anvil");
+    let child = anvil::test_util::spawn(
+        sandbox
+            .command("/bin/sh")
+            .args(["-c", "trap \"\" HUP; exec \"$0\" \"$@\""])
+            .arg(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", "apply", "--target", "local"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .expect("spawn anvil");
     until(|| beat.join("beat").exists(), "the first beat");
     let pid = rustix::process::Pid::from_child(&child);
     rustix::process::kill_process(pid, Signal::HUP).unwrap();
@@ -1312,14 +1320,15 @@ fn a_kill_function_in_the_environment_does_not_fool_the_probe_for_the_ignore() {
         ),
     );
     // A shell that imports it (bash as sh) would see `kill` succeed unsent.
-    let child = sandbox
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .env("BASH_FUNC_kill%%", "() { return 0; }")
-        .args(["--secret-store", "memory", "apply", "--target", "local"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn anvil");
+    let child = anvil::test_util::spawn(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .env("BASH_FUNC_kill%%", "() { return 0; }")
+            .args(["--secret-store", "memory", "apply", "--target", "local"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .expect("spawn anvil");
     until(|| beat.join("beat").exists(), "the first beat");
     let pid = rustix::process::Pid::from_child(&child);
     rustix::process::kill_process(pid, Signal::HUP).unwrap();
@@ -1352,14 +1361,15 @@ fn a_probe_for_the_ignore_leaves_anvil_and_its_group_alone() {
         "config.toml",
         &format!("[[steps]]\nrun = 'touch {}'\n", second.display()),
     );
-    let out = sandbox
-        .command("/bin/sh")
-        .args(["-c", script])
-        .arg(env!("CARGO_BIN_EXE_anvil"))
-        .args(["--secret-store", "memory", "apply", "--target", "local"])
-        .process_group(0)
-        .output()
-        .unwrap();
+    let out = anvil::test_util::output(
+        sandbox
+            .command("/bin/sh")
+            .args(["-c", script])
+            .arg(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", "apply", "--target", "local"])
+            .process_group(0),
+    )
+    .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(text(&out.stdout).contains("alive"), "{}", text(&out.stdout));
     assert!(second.exists(), "anvil went on");
@@ -1761,15 +1771,16 @@ fn a_target_that_ended_is_saved_while_the_next_runs_and_holds_the_lock() {
             ),
         ),
     );
-    let mut child = sandbox
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .args(["--secret-store", "memory", "--ssh-program"])
-        .arg(common::fixture("fake-ssh.sh"))
-        .arg("apply")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn anvil");
+    let mut child = anvil::test_util::spawn(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", "--ssh-program"])
+            .arg(common::fixture("fake-ssh.sh"))
+            .arg("apply")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .expect("spawn anvil");
     until(|| waiting.exists(), "fake's step");
     let record = sandbox.last_apply().expect("local's entry is saved");
     assert_eq!(record["targets"]["local"]["files"][0]["dest"], local);
@@ -1822,17 +1833,18 @@ fn the_password_path_capture_leaks_no_byte_at_trace_level() {
         sandbox.root().join("ssh.log"),
         sandbox.root().join("sudo.log"),
     );
-    let out = sandbox
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .arg("--ssh-program")
-        .arg(common::fixture("fake-ssh.sh"))
-        .args(["-vvv", "apply", "--target", "fake"])
-        .env("PATH", &path)
-        .env("FAKE_SSH_LOG", &ssh_log)
-        .env("FAKE_SUDO_LOG", &sudo_log)
-        .env("FAKE_SUDO_PW", common::VALUE)
-        .output()
-        .unwrap();
+    let out = anvil::test_util::output(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .arg("--ssh-program")
+            .arg(common::fixture("fake-ssh.sh"))
+            .args(["-vvv", "apply", "--target", "fake"])
+            .env("PATH", &path)
+            .env("FAKE_SSH_LOG", &ssh_log)
+            .env("FAKE_SUDO_LOG", &sudo_log)
+            .env("FAKE_SUDO_PW", common::VALUE),
+    )
+    .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let stderr = text(&out.stderr);
     assert!(
@@ -1869,12 +1881,13 @@ fn the_password_path_capture_leaks_no_byte_at_trace_level() {
 fn unknown_packages_warn_and_continue_with_exit_zero() {
     for names in [&["git", "missing"][..], &["missing"][..]] {
         let (sandbox, path) = common::package_sandbox("ap", names);
-        let out = sandbox
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .args(["--json", "apply", "--target", "local"])
-            .env("PATH", &path)
-            .output()
-            .unwrap();
+        let out = anvil::test_util::output(
+            sandbox
+                .command(env!("CARGO_BIN_EXE_anvil"))
+                .args(["--json", "apply", "--target", "local"])
+                .env("PATH", &path),
+        )
+        .unwrap();
         assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
         let value = json(&out);
         assert_eq!(value["ok"], true);
@@ -1890,12 +1903,13 @@ fn unknown_packages_warn_and_continue_with_exit_zero() {
         assert!(!installed.contains("missing"));
         assert_eq!(installed.contains("installed"), names.contains(&"git"));
         assert_eq!(target["steps"][1]["stdout"], "later-step\n");
-        let out = sandbox
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .args(["apply", "--target", "local"])
-            .env("PATH", &path)
-            .output()
-            .unwrap();
+        let out = anvil::test_util::output(
+            sandbox
+                .command(env!("CARGO_BIN_EXE_anvil"))
+                .args(["apply", "--target", "local"])
+                .env("PATH", &path),
+        )
+        .unwrap();
         assert_eq!(out.status.code(), Some(0));
         let shown = text(&out.stdout);
         assert!(
@@ -1909,13 +1923,14 @@ fn unknown_packages_warn_and_continue_with_exit_zero() {
         );
     }
     let (sandbox, path) = common::package_sandbox("ap", &["git", "missing"]);
-    let out = sandbox
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .args(["--json", "apply", "--target", "local"])
-        .env("PATH", path)
-        .env("INSTALL_EXIT", "7")
-        .output()
-        .unwrap();
+    let out = anvil::test_util::output(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--json", "apply", "--target", "local"])
+            .env("PATH", path)
+            .env("INSTALL_EXIT", "7"),
+    )
+    .unwrap();
     assert_eq!(out.status.code(), Some(1));
     let value = json(&out);
     assert_eq!(value["targets"][0]["steps"].as_array().unwrap().len(), 1);
@@ -1930,20 +1945,20 @@ fn apply_on_a_terminal(sandbox: &Sandbox, args: &[&str]) -> Option<String> {
     if !common::python(&["os.login_tty"]) {
         return None;
     }
-    let out = sandbox
-        .command("python3")
-        .arg(common::fixture("pty_capture.py"))
-        .args([
-            "--",
-            env!("CARGO_BIN_EXE_anvil"),
-            "--secret-store",
-            "memory",
-            "apply",
-        ])
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let out = anvil::test_util::output(
+        sandbox
+            .command("python3")
+            .arg(common::fixture("pty_capture.py"))
+            .args([
+                "--",
+                env!("CARGO_BIN_EXE_anvil"),
+                "--secret-store",
+                "memory",
+                "apply",
+            ])
+            .args(args),
+    )
+    .unwrap();
     let transcript = text(&out.stdout);
     assert_eq!(
         out.status.code(),
@@ -2188,7 +2203,7 @@ fn apply_as_user(
     if !safe_top {
         command.env_remove("ANVIL_DEBUG_SAFE_TOP");
     }
-    command.output().unwrap()
+    anvil::test_util::output(&mut command).unwrap()
 }
 
 #[test]
@@ -2689,15 +2704,16 @@ fn an_interrupted_or_killed_apply_keeps_the_notify_pending() {
             let _ = std::fs::remove_file(path);
         }
         let _ = std::fs::remove_file(sandbox.state_home().join("anvil/last-apply.json"));
-        let mut child = sandbox
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .args(["--secret-store", "memory", "--ssh-program"])
-            .arg(common::fixture("fake-ssh.sh"))
-            .args(["apply", "--target", "local"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn anvil");
+        let mut child = anvil::test_util::spawn(
+            sandbox
+                .command(env!("CARGO_BIN_EXE_anvil"))
+                .args(["--secret-store", "memory", "--ssh-program"])
+                .arg(common::fixture("fake-ssh.sh"))
+                .args(["apply", "--target", "local"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .expect("spawn anvil");
         until(|| started.exists(), "the step to start");
         let pid = rustix::process::Pid::from_child(&child);
         rustix::process::kill_process(pid, signal).unwrap();
@@ -2832,15 +2848,16 @@ fn a_ctrl_c_in_the_handler_phase_keeps_the_handlers_not_run_pending() {
              [[handlers]]\nname = \"after\"\nrun = 'echo after >> {root}/local.log'\n"
         ),
     );
-    let child = sandbox
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .args(["--secret-store", "memory", "--ssh-program"])
-        .arg(common::fixture("fake-ssh.sh"))
-        .args(["apply", "--target", "local"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn anvil");
+    let child = anvil::test_util::spawn(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", "--ssh-program"])
+            .arg(common::fixture("fake-ssh.sh"))
+            .args(["apply", "--target", "local"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("spawn anvil");
     until(
         || sandbox.root().join("started").exists(),
         "the handler to start",
@@ -2995,9 +3012,13 @@ fn drop_pending_whose_save_fails_is_exit_1_before_any_target() {
 
 /// `id FLAG` of the user running the tests.
 fn id(flag: &str) -> String {
-    text(&Command::new("id").arg(flag).output().unwrap().stdout)
-        .trim_end()
-        .to_owned()
+    text(
+        &anvil::test_util::output(Command::new("id").arg(flag))
+            .unwrap()
+            .stdout,
+    )
+    .trim_end()
+    .to_owned()
 }
 
 /// A config copying "motd\n" to each of `dests`, as `(dest, tag, extra keys)`,
@@ -3160,7 +3181,7 @@ fn an_unknown_owner_or_group_fails_the_step_and_leaves_dest_unchanged() {
         with_owned_files(&sandbox, &[(&dest, "local", keys)]);
         let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
         command.args(["--secret-store", "memory", "apply", "--target", "local"]);
-        let out = command.env("PATH", &path).output().unwrap();
+        let out = anvil::test_util::output(command.env("PATH", &path)).unwrap();
         assert_eq!(out.status.code(), Some(1), "{keys}{}", text(&out.stdout));
         let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
         assert!(shown.contains(&wording), "{keys}{shown}");
@@ -3223,16 +3244,17 @@ fn an_owner_and_group_reach_dest_on_the_password_path() {
         ),
     );
     let sudo_log = sandbox.root().join("sudo.log");
-    let out = sandbox
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .arg("--ssh-program")
-        .arg(common::fixture("fake-ssh.sh"))
-        .args(["apply", "--target", "fake"])
-        .env("PATH", &path)
-        .env("FAKE_SUDO_LOG", &sudo_log)
-        .env("FAKE_SUDO_PW", common::VALUE)
-        .output()
-        .unwrap();
+    let out = anvil::test_util::output(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .arg("--ssh-program")
+            .arg(common::fixture("fake-ssh.sh"))
+            .args(["apply", "--target", "fake"])
+            .env("PATH", &path)
+            .env("FAKE_SUDO_LOG", &sudo_log)
+            .env("FAKE_SUDO_PW", common::VALUE),
+    )
+    .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), "motd\n");
     assert_eq!(ids_of(&dest), (uid.clone(), gid.clone()));
@@ -3309,7 +3331,7 @@ fn a_fix_that_does_not_take_fails_the_step_and_does_not_notify() {
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
     command.args(["apply", "--target", "local"]);
-    let out = command.env("PATH", &path).output().unwrap();
+    let out = anvil::test_util::output(command.env("PATH", &path)).unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
     let (uid, gid) = ids_of(&dest);
     let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
@@ -3421,11 +3443,8 @@ fn parents_creates_missing_directories_0755_top_down_on_local_and_the_fake_host(
     let mut command = sandbox.command(env!("CARGO_BIN_EXE_anvil"));
     command.args(["--secret-store", "memory", "--ssh-program"]);
     command.arg(common::fixture("fake-ssh.sh"));
-    let run = command
-        .args(["--json", "apply"])
-        .env("PATH", &path)
-        .output()
-        .unwrap();
+    let run =
+        anvil::test_util::output(command.args(["--json", "apply"]).env("PATH", &path)).unwrap();
     assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
     for dest in [&local, &web, &root] {
         assert_eq!(std::fs::read_to_string(dest).unwrap(), "motd\n");
@@ -4096,7 +4115,7 @@ fn a_full_dir_a_wrong_type_a_fifo_and_an_open_parent_fail_with_nothing_removed()
     std::fs::create_dir(&full).unwrap();
     std::fs::write(full.join("inside"), "x").unwrap();
     std::fs::write(&file, "keep\n").unwrap();
-    let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    let made = anvil::test_util::status(Command::new("mkfifo").arg(&fifo)).unwrap();
     assert!(made.success());
     std::fs::create_dir(&open).unwrap();
     common::chmod(&open, 0o777);
@@ -4229,14 +4248,15 @@ fn a_binary_src_lands_byte_for_byte_on_local_and_the_fake_host_with_and_without_
         .collect();
     sandbox.write_config("config.toml", &entries);
     let apply = || {
-        sandbox
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .args(["--secret-store", "memory", "--ssh-program"])
-            .arg(common::fixture("fake-ssh.sh"))
-            .args(["--json", "apply"])
-            .env("PATH", &path)
-            .output()
-            .unwrap()
+        anvil::test_util::output(
+            sandbox
+                .command(env!("CARGO_BIN_EXE_anvil"))
+                .args(["--secret-store", "memory", "--ssh-program"])
+                .arg(common::fixture("fake-ssh.sh"))
+                .args(["--json", "apply"])
+                .env("PATH", &path),
+        )
+        .unwrap()
     };
     let changed = |run: &std::process::Output| -> Vec<bool> {
         json(run)["targets"]
@@ -4287,16 +4307,17 @@ fn a_binary_src_through_sudo_with_a_password_is_staged_and_installed() {
     );
     let sudo_log = sandbox.root().join("sudo.log");
     let apply = || {
-        sandbox
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .arg("--ssh-program")
-            .arg(common::fixture("fake-ssh.sh"))
-            .args(["-vv", "apply", "--target", "fake"])
-            .env("PATH", &path)
-            .env("FAKE_SUDO_LOG", &sudo_log)
-            .env("FAKE_SUDO_PW", common::VALUE)
-            .output()
-            .unwrap()
+        anvil::test_util::output(
+            sandbox
+                .command(env!("CARGO_BIN_EXE_anvil"))
+                .arg("--ssh-program")
+                .arg(common::fixture("fake-ssh.sh"))
+                .args(["-vv", "apply", "--target", "fake"])
+                .env("PATH", &path)
+                .env("FAKE_SUDO_LOG", &sudo_log)
+                .env("FAKE_SUDO_PW", common::VALUE),
+        )
+        .unwrap()
     };
     let out = apply();
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
@@ -4721,10 +4742,9 @@ fn killed_mid_tree(files: &[String], tool: &str, pause: &str) -> (serde_json::Va
     );
     let bin = sandbox.root().join("bin");
     std::fs::create_dir(&bin).unwrap();
-    let real = Command::new("sh")
-        .args(["-c", &format!("command -v {tool}")])
-        .output()
-        .unwrap();
+    let real =
+        anvil::test_util::output(Command::new("sh").args(["-c", &format!("command -v {tool}")]))
+            .unwrap();
     std::fs::write(
         bin.join(tool),
         format!(
@@ -4736,17 +4756,18 @@ fn killed_mid_tree(files: &[String], tool: &str, pause: &str) -> (serde_json::Va
     )
     .unwrap();
     std::fs::set_permissions(bin.join(tool), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut child = sandbox
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .args(["--json", "apply", "--target", "local"])
-        .env(
-            "PATH",
-            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
-        )
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = anvil::test_util::spawn(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--json", "apply", "--target", "local"])
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .unwrap();
     let paused = sandbox.root().join("paused");
     until(|| paused.exists(), "the paused step");
     child.kill().unwrap();

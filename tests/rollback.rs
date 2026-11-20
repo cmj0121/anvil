@@ -503,17 +503,18 @@ fn rollback_through_sudo_with_a_password_installs_the_previous_owner_and_mode() 
     );
     let sudo_log = sandbox.root().join("sudo.log");
     let run = |args: &[&str]| {
-        sandbox
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .arg("--ssh-program")
-            .arg(common::fixture("fake-ssh.sh"))
-            .args(args)
-            .args(["--target", "fake"])
-            .env("PATH", &path)
-            .env("FAKE_SUDO_LOG", &sudo_log)
-            .env("FAKE_SUDO_PW", common::VALUE)
-            .output()
-            .unwrap()
+        anvil::test_util::output(
+            sandbox
+                .command(env!("CARGO_BIN_EXE_anvil"))
+                .arg("--ssh-program")
+                .arg(common::fixture("fake-ssh.sh"))
+                .args(args)
+                .args(["--target", "fake"])
+                .env("PATH", &path)
+                .env("FAKE_SUDO_LOG", &sudo_log)
+                .env("FAKE_SUDO_PW", common::VALUE),
+        )
+        .unwrap()
     };
     let out = run(&["apply"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
@@ -567,17 +568,18 @@ fn rollback_through_sudo_with_a_password_recreates_a_removed_file_from_a_staged_
     );
     let sudo_log = sandbox.root().join("sudo.log");
     let run = |args: &[&str]| {
-        sandbox
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .arg("--ssh-program")
-            .arg(common::fixture("fake-ssh.sh"))
-            .args(args)
-            .args(["--target", "fake"])
-            .env("PATH", &path)
-            .env("FAKE_SUDO_LOG", &sudo_log)
-            .env("FAKE_SUDO_PW", common::VALUE)
-            .output()
-            .unwrap()
+        anvil::test_util::output(
+            sandbox
+                .command(env!("CARGO_BIN_EXE_anvil"))
+                .arg("--ssh-program")
+                .arg(common::fixture("fake-ssh.sh"))
+                .args(args)
+                .args(["--target", "fake"])
+                .env("PATH", &path)
+                .env("FAKE_SUDO_LOG", &sudo_log)
+                .env("FAKE_SUDO_PW", common::VALUE),
+        )
+        .unwrap()
     };
     let out = run(&["apply"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
@@ -681,15 +683,16 @@ fn rollback_is_refused_while_an_apply_holds_the_record() {
             ),
         ),
     );
-    let mut child = sandbox
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .args(["--secret-store", "memory", "--ssh-program"])
-        .arg(common::fixture("fake-ssh.sh"))
-        .args(["apply", "--target", "local"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn anvil");
+    let mut child = anvil::test_util::spawn(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_anvil"))
+            .args(["--secret-store", "memory", "--ssh-program"])
+            .arg(common::fixture("fake-ssh.sh"))
+            .args(["apply", "--target", "local"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .expect("spawn anvil");
     let started = std::time::Instant::now();
     while !waiting.exists() {
         assert!(
@@ -794,13 +797,14 @@ fn an_apply_killed_partway_through_a_target_rolls_back_to_the_originals() {
                 file_task("a.txt", &three),
             ),
         );
-        let mut child = sandbox
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .args(["--secret-store", "memory", "apply", "--target", "local"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn anvil");
+        let mut child = anvil::test_util::spawn(
+            sandbox
+                .command(env!("CARGO_BIN_EXE_anvil"))
+                .args(["--secret-store", "memory", "apply", "--target", "local"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .expect("spawn anvil");
         wait_for(&reached);
         assert_eq!(std::fs::read_to_string(&one).unwrap(), "bytes-a\n");
         assert_eq!(std::fs::read_to_string(&two).unwrap(), "bytes-b\n");

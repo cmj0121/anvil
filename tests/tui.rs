@@ -56,13 +56,14 @@ fn drive_args(sandbox: &Sandbox, vars: &[(&str, &str)], steps: &[&str], anvil: &
         "memory",
     ]);
     args.extend(anvil);
-    let out = sandbox
-        .command("python3")
-        .args(&args)
-        .env_remove("EDITOR")
-        .envs(vars.iter().copied())
-        .output()
-        .unwrap();
+    let out = anvil::test_util::output(
+        sandbox
+            .command("python3")
+            .args(&args)
+            .env_remove("EDITOR")
+            .envs(vars.iter().copied()),
+    )
+    .unwrap();
     let transcript = text(&out.stdout);
     assert!(out.status.success(), "{transcript}\n{}", text(&out.stderr));
     transcript

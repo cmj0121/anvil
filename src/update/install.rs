@@ -274,16 +274,16 @@ fn stale(name: &std::ffi::OsStr, uid: u32, euid: u32) -> bool {
 /// member, which must be a regular file of at most 128 MiB.
 pub fn extract(tarball: &[u8], stage: &Path, member: &str) -> Result<PathBuf, String> {
     let mut tar = exec::program("tar")?;
-    let mut child = tar
-        .args(["-xzf", "-", "-C"])
-        .arg(stage)
-        .arg(member)
-        .process_group(0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("cannot start {}: {err}", tar.get_program().display()))?;
+    let mut child = exec::spawn(
+        tar.args(["-xzf", "-", "-C"])
+            .arg(stage)
+            .arg(member)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|err| format!("cannot start {}: {err}", tar.get_program().display()))?;
     let stdin = child.stdin.take();
     let output = std::thread::scope(|scope| {
         if let Some(mut stdin) = stdin {
@@ -320,14 +320,15 @@ pub fn extract(tarball: &[u8], stage: &Path, member: &str) -> Result<PathBuf, St
 /// Runs `binary --version` with stdin null and its output captured, killed
 /// after 10 s; it must exit 0 and print `anvil <version>`.
 pub fn smoke(binary: &Path, version: &str) -> Result<(), String> {
-    let child = exec::resolved(binary)
-        .arg("--version")
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("cannot run the downloaded binary: {err}"))?;
+    let child = exec::spawn(
+        exec::resolved(binary)
+            .arg("--version")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|err| format!("cannot run the downloaded binary: {err}"))?;
     let output =
         collect_capped(child, Some(SMOKE_TIMEOUT), [OUTPUT_LIMIT; 2]).map_err(|err| match err {
             TransportError::Timeout { .. } => format!(
@@ -501,7 +502,7 @@ mod tests {
 
     #[test]
     fn sweep_leaves_a_file_someone_else_owns() {
-        let mut child = Command::new("true").spawn().unwrap();
+        let mut child = crate::exec::spawn(&mut Command::new("true")).unwrap();
         let dead = child.id();
         child.wait().unwrap();
         let name = OsString::from(format!("{NEW_PREFIX}{dead}"));
@@ -550,7 +551,7 @@ mod tests {
     fn sweep_removes_new_files_of_dead_runs_and_this_pid_only() {
         let dir = Dir::new("update-sweep");
         let exe = dir.file("anvil", b"old", 0o755);
-        let mut child = Command::new("true").spawn().unwrap();
+        let mut child = crate::exec::spawn(&mut Command::new("true")).unwrap();
         let dead = child.id();
         child.wait().unwrap();
         for name in [
@@ -654,14 +655,15 @@ mod tests {
         let top = src.0.join("anvil-v9.9.9-aarch64-apple-darwin");
         fs::create_dir(&top).unwrap();
         std::os::unix::fs::symlink("/bin/sh", top.join("anvil")).unwrap();
-        let out = Command::new("tar")
-            .arg("-czf")
-            .arg("-")
-            .arg("-C")
-            .arg(&src.0)
-            .arg("anvil-v9.9.9-aarch64-apple-darwin")
-            .output()
-            .unwrap();
+        let out = crate::exec::output(
+            Command::new("tar")
+                .arg("-czf")
+                .arg("-")
+                .arg("-C")
+                .arg(&src.0)
+                .arg("anvil-v9.9.9-aarch64-apple-darwin"),
+        )
+        .unwrap();
         assert!(
             out.status.success(),
             "{}",

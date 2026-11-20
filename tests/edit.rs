@@ -845,17 +845,17 @@ fn explicit_inventory_edits_without_a_resolvable_workspace() {
     let inventory = sb.root().join("chosen.toml");
     fs::copy(fixture("inventory.toml"), &inventory).unwrap();
     let original = fs::read(&inventory).unwrap();
-    let out = sb
-        .command(env!("CARGO_BIN_EXE_anvil"))
-        .args([
-            "--inventory",
-            inventory.to_str().unwrap(),
-            "inventory",
-            "--json",
-        ])
-        .env_remove("HOME")
-        .output()
-        .unwrap();
+    let out = anvil::test_util::output(
+        sb.command(env!("CARGO_BIN_EXE_anvil"))
+            .args([
+                "--inventory",
+                inventory.to_str().unwrap(),
+                "inventory",
+                "--json",
+            ])
+            .env_remove("HOME"),
+    )
+    .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(common::json(&out)["path"], inventory.to_str().unwrap());
     assert_eq!(common::json(&out)["changed"], false);
@@ -1020,12 +1020,12 @@ fn config_full_relative_config_keeps_the_workspace() {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let original = "# keep this comment\n[packages]\n";
         fs::write(&path, original).unwrap();
-        let out = sb
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .current_dir(sb.root())
-            .args(["--config", config, "config", "--full", "--json"])
-            .output()
-            .unwrap();
+        let out = anvil::test_util::output(
+            sb.command(env!("CARGO_BIN_EXE_anvil"))
+                .current_dir(sb.root())
+                .args(["--config", config, "config", "--full", "--json"]),
+        )
+        .unwrap();
         assert!(out.status.success(), "{}", text(&out.stderr));
         assert_eq!(common::json(&out)["changed"], false);
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
@@ -1035,13 +1035,13 @@ fn config_full_relative_config_keeps_the_workspace() {
             sb.seen(1).replace("run = \"hostname\"", "run = \"uptime\""),
         )
         .unwrap();
-        let out = sb
-            .command(env!("CARGO_BIN_EXE_anvil"))
-            .current_dir(sb.root())
-            .args(["--config", config, "config", "--full", "--json"])
-            .env("FAKE_EDITOR_CONTENT", &content)
-            .output()
-            .unwrap();
+        let out = anvil::test_util::output(
+            sb.command(env!("CARGO_BIN_EXE_anvil"))
+                .current_dir(sb.root())
+                .args(["--config", config, "config", "--full", "--json"])
+                .env("FAKE_EDITOR_CONTENT", &content),
+        )
+        .unwrap();
         assert!(out.status.success(), "{}", text(&out.stderr));
         assert_eq!(common::json(&out)["changed"], true);
         let saved = fs::read_to_string(&path).unwrap();

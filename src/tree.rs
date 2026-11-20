@@ -779,10 +779,10 @@ mod tests {
     fn a_special_file_in_the_tree_is_refused() {
         let ws = Workspace::new();
         ws.mkdir("conf/sub");
-        let status = std::process::Command::new("mkfifo")
-            .arg(ws.0.join("conf/sub/fifo"))
-            .status()
-            .unwrap();
+        let status = crate::exec::status(
+            std::process::Command::new("mkfifo").arg(ws.0.join("conf/sub/fifo")),
+        )
+        .unwrap();
         assert!(status.success());
         assert_eq!(
             ws.expand("conf").unwrap_err(),
