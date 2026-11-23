@@ -214,20 +214,25 @@ pub fn script(
                 },
             ),
         };
-        let mut checks = String::new();
+        let mut checks = format!(
+            "anvil_r=${{anvil_line#*:*:}}; anvil_uid=${{anvil_r%%:*}}; anvil_r=${{anvil_r#*:}}\n\
+             anvil_r=${{anvil_r#*:}}; anvil_r=${{anvil_r#*:}}; anvil_home=${{anvil_r%%:*}}\n\
+             case $anvil_uid in ''|*[!0]*) ;; *) {} ;; esac\n",
+            fail(&format!("{at}: has uid 0; refused")),
+        );
+        if entry.remove_home {
+            checks += &format!(
+                "case $anvil_home in ''|*[!/]*) ;; *) {} ;; esac\n\
+                 if [ -e \"$anvil_home\" ]; then\n\
+                 anvil_o=$(ls -dn -- \"$anvil_home\" | awk '{{ print $3 }}')\n\
+                 [ \"$anvil_o\" = \"$anvil_uid\" ] || {{ echo {}\"$anvil_home\"{} >&2; exit 1; }}\n\
+                 fi\n",
+                fail(&format!("{at}: home / is not removed")),
+                quote(&format!("{at}: home ")),
+                quote(&format!(" is not owned by {name}; not removed")),
+            );
+        }
         if entry.force && !busybox {
-            checks += "anvil_r=${anvil_line#*:*:}; anvil_uid=${anvil_r%%:*}; anvil_r=${anvil_r#*:}\n\
-                       anvil_r=${anvil_r#*:}; anvil_r=${anvil_r#*:}; anvil_home=${anvil_r%%:*}\n";
-            if entry.remove_home {
-                checks += &format!(
-                    "if [ -e \"$anvil_home\" ]; then\n\
-                     anvil_o=$(ls -dn -- \"$anvil_home\" | awk '{{ print $3 }}')\n\
-                     [ \"$anvil_o\" = \"$anvil_uid\" ] || {{ echo {}\"$anvil_home\"{} >&2; exit 1; }}\n\
-                     fi\n",
-                    quote(&format!("{at}: home ")),
-                    quote(&format!(" is not owned by {name}; not removed with force")),
-                );
-            }
             checks += &format!(
                 "if anvil_gl=$(anvil_get group {name} 1); then\n\
                  anvil_gg=${{anvil_gl#*:*:}}; anvil_gg=${{anvil_gg%%:*}}\n\
@@ -861,6 +866,12 @@ pub(crate) fn rendered(text: String) -> Box<Rendered> {
 /// The groups whose loss may lock the login user out of sudo.
 const ADMIN_GROUPS: [&str; 3] = ["wheel", "sudo", "admin"];
 
+/// Whether `entry` may drop its user from an admin group: `exclusive_groups`
+/// drops supplementary groups, and `group` moves the primary one.
+fn admin_guard(entry: &UserEntry) -> bool {
+    entry.exclusive_groups || entry.group.is_some()
+}
+
 /// Defines `anvil_pw NAME`, which prints NAME's passwd line, with getent or
 /// awk over `/etc/passwd`, and returns 2 when there is none.
 const ANVIL_PW: &str = "anvil_pw() { if command -v getent >/dev/null 2>&1; then getent passwd \"$1\"; \
@@ -977,10 +988,11 @@ const MOUNTS: &str = "/proc/mounts";
 
 /// The read-only sh script whose output [`check_state`] reads, or `None`
 /// when no user item `target` matches has a guard that needs the target's
-/// state or `authorized_keys`: `exclusive_groups` on the login user, or
-/// removing a user without `force`. It prints the login user's `id -Gn`,
-/// `id -G` and `id -gn` groups (`unknown` when `id` cannot tell) and the
-/// gids of `wheel`, `sudo` and `admin`; per user to remove
+/// state or `authorized_keys`: `exclusive_groups` or `group` on the login
+/// user, or removing a user without `force`. It prints the login user's
+/// `id -Gn`, `id -G` and `id -gn` groups (`unknown` when `id` cannot tell)
+/// and the gids and `/etc/group` members of `wheel`, `sudo` and `admin`
+/// (`gid.GROUP=`, `members.GROUP=`); per user to remove
 /// `busy.NAME=yes|no|unknown`: whether it owns a process, from `pgrep -u`,
 /// or the effective uid of `/proc/*/status` without pgrep. It is `unknown`
 /// when neither can tell, or when a non-root login cannot see other users'
@@ -1025,7 +1037,7 @@ fn query_with(expanded: &Expanded, target: &Target, facts: &Facts, mounts: &str)
         }
         if entry.absent() && !entry.force {
             body += &format!("echo \"busy.{name}=$(anvil_busy {name})\"\n");
-        } else if !entry.absent() && entry.exclusive_groups && login == Some(name) && !groups {
+        } else if !entry.absent() && admin_guard(entry) && login == Some(name) && !groups {
             groups = true;
             body += &format!(
                 "anvil_v=$(id -Gn {name} 2>/dev/null); echo \"login_groups=${{anvil_v:-unknown}}\"\n\
@@ -1033,7 +1045,10 @@ fn query_with(expanded: &Expanded, target: &Target, facts: &Facts, mounts: &str)
                  echo \"login_primary=$(id -gn {name} 2>/dev/null)\"\n"
             );
             for group in ADMIN_GROUPS {
-                body += &format!("echo \"gid.{group}=$(anvil_gid {group})\"\n");
+                body += &format!(
+                    "echo \"gid.{group}=$(anvil_group {group} 3)\"\n\
+                     echo \"members.{group}=$(anvil_group {group} 4)\"\n"
+                );
             }
         }
     }
@@ -1042,8 +1057,8 @@ fn query_with(expanded: &Expanded, target: &Target, facts: &Facts, mounts: &str)
     }
     Some(format!(
         "{{ LC_ALL=C; export LC_ALL; set -f\n\
-         anvil_gid() {{ {{ if command -v getent >/dev/null 2>&1; then getent group \"$1\"; \
-         else awk -F: -v k=\"$1\" '$1 == k' /etc/group; fi; }} 2>/dev/null | cut -d: -f3; }}\n\
+         anvil_group() {{ {{ if command -v getent >/dev/null 2>&1; then getent group \"$1\"; \
+         else awk -F: -v k=\"$1\" '$1 == k' /etc/group; fi; }} 2>/dev/null | cut -d: -f\"$2\"; }}\n\
          {ANVIL_PW}\
          anvil_hidden() {{ [ \"$(id -u)\" != 0 ] || return 1\n\
          awk '$2 == \"/proc\" {{ n = split($4, o, \",\"); \
@@ -1111,8 +1126,8 @@ pub fn check_state(
                 .filter_map(|line| parse_key(line).ok())
                 .collect();
             let read = || {
-                let end = text.find(QUERY_END).unwrap_or(text.len());
-                let keys: Vec<&str> = (text[..end].split('\n'))
+                let keys: Vec<&str> = (text.split('\n'))
+                    .take_while(|line| *line != QUERY_END)
                     .filter_map(|line| line.strip_prefix("login_key="))
                     .collect();
                 file_keys(&keys.join("\n"))
@@ -1148,11 +1163,7 @@ pub fn check_state(
                 }
             }
         }
-        if let Some(groups) = &entry.groups
-            && entry.exclusive_groups
-            && !entry.absent()
-            && login == Some(name)
-        {
+        if !entry.absent() && admin_guard(entry) && login == Some(name) {
             let known = |key: &str| state.get(key).copied().filter(|value| *value != "unknown");
             let (Some(names), Some(gids)) = (known("login_groups"), known("login_gids")) else {
                 return Err(format!(
@@ -1169,9 +1180,25 @@ pub fn check_state(
                 Some(set) => set == group,
                 None => state.get("login_primary") == Some(&group),
             };
-            let dropped = ADMIN_GROUPS.into_iter().find(|group| {
-                member(group) && !primary(group) && !groups.iter().any(|kept| kept == group)
-            });
+            let listed = |group: &str| entry.groups.iter().flatten().any(|kept| kept == group);
+            let mut dropped = None;
+            for group in ADMIN_GROUPS {
+                if !member(group) || primary(group) || listed(group) {
+                    continue;
+                }
+                if !entry.exclusive_groups {
+                    let Some(members) = state.get(format!("members.{group}").as_str()) else {
+                        return Err(format!(
+                            "{label} {name}: cannot tell whether the login user is in wheel, sudo or admin"
+                        ));
+                    };
+                    if members.split(',').any(|member| member == name) {
+                        continue;
+                    }
+                }
+                dropped = Some(group);
+                break;
+            }
             if let Some(group) = dropped {
                 return Err(format!(
                     "{label} {name}: would drop the login user from {group}"
@@ -1674,7 +1701,8 @@ mod tests {
         for wanted in [
             "anvil_v=$(id -Gn deploy 2>/dev/null); echo \"login_groups=${anvil_v:-unknown}\"\n",
             "anvil_v=$(id -G deploy 2>/dev/null); echo \"login_gids=${anvil_v:-unknown}\"\n",
-            "echo \"gid.wheel=$(anvil_gid wheel)\"\n",
+            "echo \"gid.wheel=$(anvil_group wheel 3)\"\n",
+            "echo \"members.wheel=$(anvil_group wheel 4)\"\n",
             "echo \"busy.old=$(anvil_busy old)\"\n",
             "echo anvil-users-end=1\n",
         ] {
@@ -1683,6 +1711,63 @@ mod tests {
         assert!(
             !script.contains("sudo -n") && !script.contains("sudo true"),
             "{script}"
+        );
+    }
+
+    #[test]
+    fn moving_the_login_users_primary_group_off_an_admin_group_is_refused() {
+        let target = crate::test_util::target("web");
+        let facts = login("deploy");
+        let state = |text: &str, output: &str| {
+            check_state(
+                &users(&format!("[[users]]\nname = \"deploy\"\n{text}")),
+                &target,
+                &facts,
+                output.as_bytes(),
+                &StoreKeys::default(),
+            )
+            .map(|_| ())
+        };
+        let output = |members: &str| {
+            format!(
+                "login_groups=wheel docker\nlogin_gids=10 2001\nlogin_primary=wheel\n\
+                 gid.wheel=10\n{members}gid.sudo=\nmembers.sudo=\ngid.admin=\nmembers.admin=\n\
+                 anvil-users-end=1\n"
+            )
+        };
+        let primary_only = output("members.wheel=\n");
+        let dropped = Err("users[0] deploy: would drop the login user from wheel".to_owned());
+        assert_eq!(state("group = \"app\"", &primary_only), dropped);
+        assert_eq!(state("group = \"2000\"", &primary_only), dropped);
+        assert_eq!(
+            state("group = \"app\"", &output("")),
+            Err(
+                "users[0] deploy: cannot tell whether the login user is in wheel, sudo or admin"
+                    .to_owned()
+            )
+        );
+        for (text, output) in [
+            ("group = \"app\"", output("members.wheel=web,deploy\n")),
+            (
+                "group = \"app\"\ngroups = [\"wheel\"]",
+                primary_only.clone(),
+            ),
+            ("group = \"wheel\"", primary_only.clone()),
+            ("group = \"10\"", primary_only.clone()),
+            ("groups = [\"docker\"]", primary_only.clone()),
+        ] {
+            assert_eq!(state(text, &output), Ok(()), "{text}");
+        }
+        let script = query(
+            &users("[[users]]\nname = \"deploy\"\ngroup = \"app\"\n"),
+            &target,
+            &facts,
+        );
+        assert!(
+            script.is_some_and(
+                |script| script.contains("echo \"members.wheel=$(anvil_group wheel 4)\"\n")
+            ),
+            "a primary group change queries the admin groups"
         );
     }
 
@@ -1894,31 +1979,63 @@ mod tests {
     }
 
     #[test]
-    fn force_with_remove_home_removes_only_a_home_the_user_owns() {
-        let keys = "state = \"absent\"\nremove_home = true\nforce = true";
+    fn a_user_with_uid_0_is_never_removed() {
+        for root in ["0", "00"] {
+            let passwd = format!("root:x:0:0::/root:/bin/sh\ndeploy:x:{root}:0::/root:/bin/sh\n");
+            for accounts in [Accounts::Shadow, Accounts::Busybox] {
+                for keys in ["", "remove_home = true", "remove_home = true\nforce = true"] {
+                    let absent = entry(&format!("state = \"absent\"\n{keys}"));
+                    let (code, out, err, log) = Fake::new(&passwd).run(&absent, accounts);
+                    assert_eq!(
+                        (code, out.as_str(), err.as_str(), log.as_str()),
+                        (Some(1), "", "users[0] deploy: has uid 0; refused\n", ""),
+                        "{root} {keys}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remove_home_removes_only_a_home_the_user_owns_and_never_root() {
         let home = temp_dir("users-home");
         let me = my_uid();
-        let passwd = |uid: &str| {
-            format!(
-                "root:x:0:0::/root:/bin/sh\ndeploy:x:{uid}:100:Deploy:{}:/bin/sh\n",
-                home.display()
-            )
+        let passwd = |uid: &str, home: &str| {
+            format!("root:x:0:0::/root:/bin/sh\ndeploy:x:{uid}:100:Deploy:{home}:/bin/sh\n")
         };
-        let (code, out, err, log) = Fake::new(&passwd("1500")).run(&entry(keys), Accounts::Shadow);
-        assert_eq!((code, out.as_str(), log.as_str()), (Some(1), "", ""));
-        assert_eq!(
-            err,
-            format!(
-                "users[0] deploy: home {} is not owned by deploy; not removed with force\n",
-                home.display()
-            )
-        );
-        let (code, out, err, log) = Fake::new(&passwd(&me)).run(&entry(keys), Accounts::Shadow);
-        assert_eq!(
-            (code, out.as_str(), log.as_str()),
-            (Some(0), "removed user deploy\n", "userdel -f -r deploy\n"),
-            "{err}"
-        );
+        let at = home.display().to_string();
+        for (accounts, force, wanted) in [
+            (Accounts::Shadow, "force = true", "userdel -f -r deploy\n"),
+            (Accounts::Shadow, "", "userdel -r deploy\n"),
+            (Accounts::Busybox, "", "deluser --remove-home deploy\n"),
+            (
+                Accounts::Busybox,
+                "force = true",
+                "deluser --remove-home deploy\n",
+            ),
+        ] {
+            let keys = entry(&format!("state = \"absent\"\nremove_home = true\n{force}"));
+            let (code, out, err, log) = Fake::new(&passwd("1500", &at)).run(&keys, accounts);
+            assert_eq!((code, out.as_str(), log.as_str()), (Some(1), "", ""));
+            assert_eq!(
+                err,
+                format!("users[0] deploy: home {at} is not owned by deploy; not removed\n")
+            );
+            for root in ["/", "//"] {
+                let (code, out, err, log) = Fake::new(&passwd(&me, root)).run(&keys, accounts);
+                assert_eq!(
+                    (code, out.as_str(), err.as_str(), log.as_str()),
+                    (Some(1), "", "users[0] deploy: home / is not removed\n", ""),
+                    "{root}"
+                );
+            }
+            let (code, out, err, log) = Fake::new(&passwd(&me, &at)).run(&keys, accounts);
+            assert_eq!(
+                (code, out.as_str(), log.as_str()),
+                (Some(0), "removed user deploy\n", wanted),
+                "{err}"
+            );
+        }
         fs::remove_dir_all(&home).unwrap();
     }
 
@@ -2372,6 +2489,33 @@ mod tests {
             "the entry's sudo, not always true"
         );
         assert!(restore(&facts, None).is_err());
+        let forged = crate::record::FileRecord {
+            sudo: true,
+            ..record.clone()
+        };
+        let mut password = other.clone();
+        password.0.insert("sudo".to_owned(), "password".to_owned());
+        for facts in [&facts, &other, &password] {
+            let runs = crate::files::restore_runs(
+                &config,
+                &target,
+                facts,
+                (
+                    std::slice::from_ref(&forged),
+                    &[("deploy".to_owned(), true)].into(),
+                ),
+                &crate::files::Force::None,
+                crate::files::Wording::Cli,
+            )
+            .unwrap();
+            let run = runs[0].run.to_string();
+            let inner = run.split_once('\n').map_or("", |(_, inner)| inner);
+            assert!(
+                !inner.contains("sudo -n") && !inner.contains("anvil_sudo='sudo"),
+                "a record's sudo is not used: {run}"
+            );
+            assert!(runs[0].sudo_secret.is_none(), "{run}");
+        }
     }
 
     #[test]
@@ -2429,6 +2573,13 @@ mod tests {
             "a commented match does not count"
         );
         assert_eq!(state(&format!("login_key=# {a}\nlogin_key={b}\n")), Ok(()));
+        assert_eq!(
+            state(&format!(
+                "login_key={a}\nlogin_key=# anvil-users-end=1\nlogin_key={b}\n"
+            )),
+            Ok(()),
+            "only a line that is exactly the end marker ends the keys"
+        );
         let unknown =
             Err("users[0] deploy: cannot tell which keys the login user signs in with".to_owned());
         for bad in [

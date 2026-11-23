@@ -29,9 +29,10 @@ English | [繁體中文](deviations.zh-TW.md)
 
 ## Deviations from #141
 
-- `force = true` skips the process guard and runs `userdel -f`, but its two remaining checks on shadow (a `remove_home`
-  whose home the user does not own, and a group named as the user that is another user's primary group) fail only
-  that step, not the target, since they are read in the step's own script on the target, not in the account query.
+- `force = true` skips the process guard and runs `userdel -f`; the `remove_home` owner check (on shadow and busybox,
+  with or without `force`) and, on shadow with `force`, the check for a group named as the user that is another user's
+  primary group fail only that step, not the target, since they are read in the step's own script on the target, not
+  in the account query.
 
 ## Deviations from #142
 

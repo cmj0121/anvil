@@ -29,8 +29,8 @@
 
 ## 與 #141 的差異
 
-- `force = true` 略過 process 保護並執行 `userdel -f`，但它在 shadow 上剩下的兩項檢查（`remove_home` 要移除的 home
-  不屬於該 user，以及與該 user 同名的 group 是另一個 user 的主要 group）只讓該 step 失敗，而不是 target，
+- `force = true` 略過 process 保護並執行 `userdel -f`；`remove_home` 的擁有者檢查（shadow 與 busybox 上，不論是否設定 `force`），
+  以及 shadow 上設定 `force` 時，與該 user 同名的 group 是另一個 user 的主要 group 的檢查，只讓該 step 失敗，而不是 target，
   因為它們是在 target 上由 step 自己的腳本讀取，而不是在帳號查詢中。
 
 ## 與 #142 的差異

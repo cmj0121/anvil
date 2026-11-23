@@ -670,7 +670,8 @@ fn check_files(
 /// the target: its dest must be `HOME/.ssh/authorized_keys` of its user,
 /// HOME the entry's `home` or else the passwd home read over `transport`,
 /// and every line of its previous text a key, a comment or blank
-/// ([`users::file_keys`]). It returns each such user's entry `sudo`, which
+/// ([`users::file_keys`]); the record's own `sudo` must be false, since it
+/// is written as its user. It returns each such user's entry `sudo`, which
 /// its restore runs with; the error names the record.
 fn check_keys(
     transport: &dyn Transport,
@@ -685,6 +686,12 @@ fn check_keys(
     let mut found = Vec::new();
     for file in &entry.files {
         let Some(user) = &file.user else { continue };
+        if file.sudo {
+            return Err(refuse(
+                &file.dest,
+                format!("is the authorized_keys of user {user} but has sudo = true in the record"),
+            ));
+        }
         let Some(config) = users::keys_entry(expanded, target, Some(facts), user) else {
             return Err(refuse(
                 &file.dest,
@@ -1596,6 +1603,7 @@ mod tests {
         let record = |user: &str, dest: &str, text: &str| TargetRecord {
             files: vec![FileRecord {
                 user: Some(user.to_owned()),
+                sudo: false,
                 ..file(dest, kept(Some(text)))
             }],
             ..entry()
@@ -1638,6 +1646,16 @@ mod tests {
                 "rollback: {dest} has a previous text with a line that is not a key; \
                  refusing to restore it"
             ))
+        );
+        let mut root = record("deploy", dest, "");
+        root.files[0].sudo = true;
+        assert_eq!(
+            check(&homed, &root),
+            Err(format!(
+                "rollback: {dest} is the authorized_keys of user deploy but has sudo = true \
+                 in the record; refusing to restore it"
+            )),
+            "the record must not choose root"
         );
         let gone = config("[[users]]\nname = \"anvil_nobody_x\"\nauthorized_keys = []\n");
         let dest = "/home/anvil_nobody_x/.ssh/authorized_keys";

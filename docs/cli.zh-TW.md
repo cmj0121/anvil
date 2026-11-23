@@ -2384,6 +2384,8 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   否則該 target 失敗且不執行任何東西，顯示
   `rollback: DEST is not the authorized_keys of user NAME in [[files]]; refusing to restore it`、
   `rollback: DEST is not the authorized_keys of user NAME; refusing to restore it`（探測之後沒有這樣的項目適用）、
+  `rollback: DEST is the authorized_keys of user NAME but has sudo = true in the record; refusing to restore it`
+  （key 的紀錄絕不在其 user 的包裝內以 sudo 還原）、
   `rollback: DEST is not in the home of user NAME; refusing to restore it`、
   `rollback: cannot read the homes of the users` 或
   `rollback: DEST has a previous text with a line that is not a key; refusing to restore it`。

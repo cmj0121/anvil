@@ -698,15 +698,15 @@ pub struct UserEntry {
     /// `present` or `absent`; `None` is `present`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
-    /// `true`: removing the user also removes its home and mail spool.
+    /// `true`: removing the user also removes its home and mail spool; the
+    /// step fails, nothing changed, for a home of `/` or one it does not own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub remove_home: bool,
     /// `true`: the user is removed even while it owns running processes:
     /// the process guard is skipped and shadow runs `userdel -f`; busybox
     /// `deluser`, which checks no processes, runs as without it.
-    /// On shadow it still fails the step, not the target, when `remove_home`
-    /// would remove a home the user does not own, or a group named as the
-    /// user is another user's primary group.
+    /// On shadow it still fails the step, not the target, when a group named
+    /// as the user is another user's primary group.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub force: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
