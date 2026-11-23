@@ -225,10 +225,13 @@ impl Options {
         })
     }
 
-    /// `config`'s `[[files]]` sources; the workspace is resolved only when
-    /// a relative or store src needs it.
+    /// `config`'s `[[files]]` sources and the `authorized_keys` its users
+    /// read from the store; the workspace is resolved only when a relative
+    /// or store path needs it.
     pub fn sources(&self, config: &Config, expanded: &Expanded) -> Result<Sources, Failure> {
-        files::load(expanded, || self.workspace(config))
+        let sources = files::load(expanded, || self.workspace(config))?;
+        let keys = crate::users::load_keys(expanded, || self.workspace(config))?;
+        Ok(sources.with_keys(keys))
     }
 
     /// The targets `--target` selects from `config`'s inventory (all when none).

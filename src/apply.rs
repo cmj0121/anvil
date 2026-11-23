@@ -364,17 +364,17 @@ fn apply_target(
         journal.filter(|_| facts.is_some()),
     );
     let guarded = match &facts {
-        Some(facts) => guard_users(transport.as_ref(), expanded, target, facts),
-        None => Ok(()),
+        Some(facts) => guard_users(transport.as_ref(), (expanded, sources), target, facts),
+        None => Ok(crate::users::Homes::default()),
     };
-    let resolved = guarded.and_then(|()| {
+    let resolved = guarded.and_then(|homes| {
         resolve(
             target,
             facts.as_ref(),
             config,
             expanded,
             sources,
-            Some(passwords),
+            (Some(passwords), Some(&homes)),
             plugins,
             cancel,
         )
@@ -492,7 +492,7 @@ mod tests {
             config,
             &legacy(config),
             sources,
-            Some(&Passwords::new()),
+            (Some(&Passwords::new()), None),
             plugins,
             cancel,
         )
@@ -3861,6 +3861,7 @@ mod tests {
         assert_eq!(
             record.files,
             [FileRecord {
+                user: None,
                 dest: "/etc/a.conf".to_owned(),
                 mode: "0644".to_owned(),
                 sudo: true,
@@ -4752,7 +4753,7 @@ mod tests {
             &config,
             &expanded,
             &Sources::of(&sources),
-            Some(&Passwords::new()),
+            (Some(&Passwords::new()), None),
             &FakePlugins::none(),
             &Cancel::new(),
         )

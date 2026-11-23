@@ -688,6 +688,13 @@ pub struct UserEntry {
     pub system: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// OpenSSH public key lines, or `$/` store paths each holding one, for
+    /// `HOME/.ssh/authorized_keys`; `None` leaves the file alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_keys: Option<Vec<String>>,
+    /// `true`: the file holds exactly `authorized_keys`; else they are added.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exclusive_keys: bool,
     /// `present` or `absent`; `None` is `present`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
@@ -2070,6 +2077,20 @@ pub(crate) fn check_user(prefix: &str, entry: &UserEntry) -> Result<(), String> 
     if entry.exclusive_groups && entry.groups.is_none() {
         return Err(format!("{prefix}.exclusive_groups: needs groups"));
     }
+    if entry.exclusive_keys && entry.authorized_keys.is_none() {
+        return Err(format!("{prefix}.exclusive_keys: needs authorized_keys"));
+    }
+    for (j, key) in entry.authorized_keys.iter().flatten().enumerate() {
+        if crate::filestore::is_store_path(key) {
+            continue;
+        }
+        crate::users::parse_key(key).map_err(|why| {
+            format!(
+                "{prefix}.authorized_keys[{j}] `{}`: {why}",
+                escape_controls(&crate::users::shown_key(key))
+            )
+        })?;
+    }
     for (key, value) in [("shell", &entry.shell), ("home", &entry.home)] {
         if let Some(path) = value
             && (!path.starts_with('/') || path.contains(':') || path.chars().any(char::is_control))
@@ -2108,6 +2129,8 @@ pub(crate) fn check_user(prefix: &str, entry: &UserEntry) -> Result<(), String> 
         ("create_home", !entry.create_home),
         ("system", entry.system),
         ("comment", entry.comment.is_some()),
+        ("authorized_keys", entry.authorized_keys.is_some()),
+        ("exclusive_keys", entry.exclusive_keys),
     ];
     let (refused, why) = if entry.absent() {
         (present_only.as_slice(), "not with state = \"absent\"")

@@ -26,7 +26,9 @@
 //! the config with the same `sudo`, each dir a `[[dirs]]` path, each
 //! link a `[[links]]` path and each removed path an `[[absent]]` path, so
 //! that a record edited by hand cannot
-//! make rollback write, perhaps as root, a path the config never names. A
+//! make rollback write, perhaps as root, a path the config never names; a
+//! recorded `authorized_keys` goes back as its user, who must be a
+//! `[[users]]` entry with `authorized_keys` that applies to the target. A
 //! file or dir a `recursive = true` entry wrote counts when it is an item of
 //! that kind in the entry's tree, loaded again from its src ([`tree::at`]);
 //! one under the entry's dest that the tree no longer holds is shown as
@@ -41,7 +43,7 @@
 //! idempotent.
 
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU8;
 use std::sync::Arc;
 
@@ -70,9 +72,10 @@ use crate::report::{
 };
 use crate::status;
 use crate::step::{Entry, PlannedRun, shown_text};
-use crate::tasks::{Expanded, Item};
-use crate::transport::{Transport, TransportError};
+use crate::tasks::{Expanded, Item, ItemKind};
+use crate::transport::{RUN_TIMEOUT, Transport, TransportError};
 use crate::tree::{self, At};
+use crate::users;
 
 /// What a selected target with no entry in the record shows.
 const NOTHING: &str = "nothing recorded";
@@ -408,6 +411,13 @@ fn roll_back(
         Err(error) => return failed(error),
     };
     let entry = &*without(entry, &gone);
+    let keys_sudo = match check_keys(transport.as_ref(), expanded, target, &facts, entry) {
+        Ok(sudo) => sudo,
+        Err(Unresolved::Failed(error)) => return failed(error),
+        Err(Unresolved::Cancelled) => {
+            return RolledTarget::report(report::cancelled("rollback", target, Vec::new(), cancel));
+        }
+    };
     let mut runs = match absent::restore_runs(config, target, &facts, &entry.absent) {
         Ok(runs) => runs,
         Err(error) => return failed(error),
@@ -416,7 +426,8 @@ fn roll_back(
         Ok(more) => runs.extend(more),
         Err(error) => return failed(error),
     }
-    match files::restore_runs(config, target, &facts, &entry.files, force, host.wording) {
+    let files = (&entry.files[..], &keys_sudo);
+    match files::restore_runs(config, target, &facts, files, force, host.wording) {
         Ok(more) => runs.extend(more),
         Err(error) => return failed(error),
     }
@@ -583,6 +594,23 @@ fn check_files(
         let named = || files_at(expanded, sources, dest, At::File);
         let same = || named().filter(|(_, f)| f.sudo == file.sudo);
         let selected = |item: &Item| item.may_match(target, facts);
+        if let Some(user) = &file.user {
+            let parent = dest.strip_suffix("/authorized_keys");
+            let keys = expanded.items.iter().any(|item| {
+                matches!(&item.kind, ItemKind::User { entry, .. }
+                    if &entry.name == user && entry.authorized_keys.is_some() && !entry.absent())
+                    && selected(item)
+            });
+            if !keys
+                || !dest.ends_with("/.ssh/authorized_keys")
+                || !(file.created_dirs.iter()).all(|dir| Some(dir.as_str()) == parent)
+            {
+                return refuse(format!(
+                    "{dest} is not the authorized_keys of user {user} in {section}"
+                ));
+            }
+            continue;
+        }
         let Some((_, first)) = named().next() else {
             if files_at(expanded, sources, dest, At::Dir).next().is_some() {
                 return refuse(format!(
@@ -636,6 +664,75 @@ fn check_files(
     check_links(expanded, target, facts, entry)?;
     check_absent(expanded, target, facts, entry)?;
     Ok(Gone { files: gone, dirs })
+}
+
+/// After the probe, each `authorized_keys` record of `entry` checked against
+/// the target: its dest must be `HOME/.ssh/authorized_keys` of its user,
+/// HOME the entry's `home` or else the passwd home read over `transport`,
+/// and every line of its previous text a key, a comment or blank
+/// ([`users::file_keys`]). It returns each such user's entry `sudo`, which
+/// its restore runs with; the error names the record.
+fn check_keys(
+    transport: &dyn Transport,
+    expanded: &Expanded,
+    target: &Target,
+    facts: &Facts,
+    entry: &TargetRecord,
+) -> Result<BTreeMap<String, bool>, Unresolved> {
+    let refuse = |dest: &str, why: String| -> Unresolved {
+        format!("rollback: {dest} {why}; refusing to restore it").into()
+    };
+    let mut found = Vec::new();
+    for file in &entry.files {
+        let Some(user) = &file.user else { continue };
+        let Some(config) = users::keys_entry(expanded, target, Some(facts), user) else {
+            return Err(refuse(
+                &file.dest,
+                format!("is not the authorized_keys of user {user}"),
+            ));
+        };
+        if let Previous::File(previous) = &file.previous
+            && let Some(text) = &previous.text
+            && users::file_keys(text).is_none()
+        {
+            return Err(refuse(
+                &file.dest,
+                "has a previous text with a line that is not a key".to_owned(),
+            ));
+        }
+        found.push((file, user.as_str(), config));
+    }
+    let asked: Vec<&str> = (found.iter())
+        .filter(|(.., config)| config.home.is_none())
+        .map(|(_, user, _)| *user)
+        .collect();
+    let homes = if asked.is_empty() {
+        BTreeMap::new()
+    } else {
+        let output = transport.run(&users::home_query(&asked), RUN_TIMEOUT)?;
+        match (output.code, users::parse_homes(&output.stdout)) {
+            (Some(0), Some(homes)) => homes,
+            _ => {
+                return Err("rollback: cannot read the homes of the users"
+                    .to_owned()
+                    .into());
+            }
+        }
+    };
+    let mut sudo = BTreeMap::new();
+    for (file, user, config) in found {
+        let home = config.home.as_ref().or(homes.get(user));
+        let wanted =
+            home.map(|home| format!("{}/.ssh/authorized_keys", home.trim_end_matches('/')));
+        if wanted.as_deref() != Some(file.dest.as_str()) {
+            return Err(refuse(
+                &file.dest,
+                format!("is not in the home of user {user}"),
+            ));
+        }
+        sudo.insert(user.to_owned(), config.sudo);
+    }
+    Ok(sudo)
 }
 
 /// The recorded tree files and dirs [`check_files`] found no longer in
@@ -1194,6 +1291,7 @@ mod tests {
 
     fn file(dest: &str, previous: Previous) -> FileRecord {
         FileRecord {
+            user: None,
             dest: dest.to_owned(),
             mode: "0644".to_owned(),
             sudo: true,
@@ -1449,6 +1547,124 @@ mod tests {
     }
 
     #[test]
+    fn an_authorized_keys_record_needs_that_users_keys_in_the_config() {
+        let web1 = web1();
+        let dest = "/home/deploy/.ssh/authorized_keys";
+        let record = |dest: &str, dirs: &[&str]| TargetRecord {
+            files: vec![FileRecord {
+                user: Some("deploy".to_owned()),
+                created_dirs: dirs.iter().map(|dir| (*dir).to_owned()).collect(),
+                ..file(dest, Previous::Absent)
+            }],
+            ..entry()
+        };
+        let config = |text: &str| legacy(&toml::from_str::<Config>(text).unwrap());
+        let keys = config("[[users]]\nname = \"deploy\"\nauthorized_keys = []\n");
+        assert_eq!(
+            checked(&keys, &web1, None, &record(dest, &["/home/deploy/.ssh"])),
+            Ok(())
+        );
+        let refused = |dest: &str| {
+            Err(format!(
+                "rollback: {dest} is not the authorized_keys of user deploy in [[files]]; \
+                 refusing to restore it"
+            ))
+        };
+        for (expanded, dest, dirs) in [
+            (config("[[users]]\nname = \"deploy\"\n"), dest, &[][..]),
+            (
+                config("[[users]]\nname = \"web\"\nauthorized_keys = []\n"),
+                dest,
+                &[],
+            ),
+            (keys.clone(), "/etc/passwd", &[]),
+            (keys.clone(), dest, &["/home/deploy"]),
+        ] {
+            assert_eq!(
+                checked(&expanded, &web1, None, &record(dest, dirs)),
+                refused(dest),
+                "{dest} {dirs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_authorized_keys_record_must_be_in_its_users_home_and_hold_only_keys() {
+        let web1 = web1();
+        let key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB a";
+        let record = |user: &str, dest: &str, text: &str| TargetRecord {
+            files: vec![FileRecord {
+                user: Some(user.to_owned()),
+                ..file(dest, kept(Some(text)))
+            }],
+            ..entry()
+        };
+        let config = |text: &str| legacy(&toml::from_str::<Config>(text).unwrap());
+        let homed = config(
+            "[[users]]\nname = \"deploy\"\nhome = \"/srv/deploy/\"\nsudo = false\nauthorized_keys = []\n",
+        );
+        let facts = facts(&[("user", "root")]);
+        let check = |expanded: &Expanded, entry: &TargetRecord| {
+            check_keys(&crate::transport::Local, expanded, &web1, &facts, entry).map_err(|err| {
+                match err {
+                    Unresolved::Failed(error) => error,
+                    Unresolved::Cancelled => "cancelled".to_owned(),
+                }
+            })
+        };
+        let dest = "/srv/deploy/.ssh/authorized_keys";
+        assert_eq!(
+            check(
+                &homed,
+                &record("deploy", dest, &format!("# mine\n\n{key}\n"))
+            ),
+            Ok(BTreeMap::from([("deploy".to_owned(), false)])),
+            "the entry's sudo"
+        );
+        let other = "/home/deploy/.ssh/authorized_keys";
+        assert_eq!(
+            check(&homed, &record("deploy", other, "")),
+            Err(format!(
+                "rollback: {other} is not in the home of user deploy; refusing to restore it"
+            ))
+        );
+        assert_eq!(
+            check(
+                &homed,
+                &record("deploy", dest, &format!("{key}\ncommand=\"x\" /bin/sh\n"))
+            ),
+            Err(format!(
+                "rollback: {dest} has a previous text with a line that is not a key; \
+                 refusing to restore it"
+            ))
+        );
+        let gone = config("[[users]]\nname = \"anvil_nobody_x\"\nauthorized_keys = []\n");
+        let dest = "/home/anvil_nobody_x/.ssh/authorized_keys";
+        assert_eq!(
+            check(&gone, &record("anvil_nobody_x", dest, "")),
+            Err(format!(
+                "rollback: {dest} is not in the home of user anvil_nobody_x; refusing to restore it"
+            )),
+            "no passwd home: refused"
+        );
+    }
+
+    #[test]
+    fn the_home_query_reads_passwd_homes() {
+        assert_eq!(
+            users::parse_homes(b"home.deploy=/srv/d\nanvil-users-end=1\n"),
+            Some(BTreeMap::from([("deploy".to_owned(), "/srv/d".to_owned())]))
+        );
+        assert_eq!(users::parse_homes(b"home.deploy=/srv/d\n"), None);
+        let script = users::home_query(&["deploy"]);
+        assert!(
+            script.contains("anvil_l=$(anvil_pw deploy) && echo \"home.deploy="),
+            "{script}"
+        );
+    }
+
+    #[test]
     fn created_dirs_need_parents_in_the_config() {
         let web1 = web1();
         let mut entry = entry();
@@ -1592,6 +1808,7 @@ mod tests {
         let config: Config = toml::from_str(&format!("{}{}", entry(first), entry(later))).unwrap();
         let config = crate::tasks::expand(&config, || Ok("/nowhere".into())).unwrap();
         let write = |sudo, rollback: bool| FileRecord {
+            user: None,
             dest: "/etc/a".to_owned(),
             mode: "0644".to_owned(),
             sudo,
