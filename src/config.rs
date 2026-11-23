@@ -688,9 +688,20 @@ pub struct UserEntry {
     pub system: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
-    /// Only `present`, the default, so far.
+    /// `present` or `absent`; `None` is `present`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// `true`: removing the user also removes its home and mail spool.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remove_home: bool,
+    /// `true`: the user is removed even while it owns running processes:
+    /// the process guard is skipped and shadow runs `userdel -f`; busybox
+    /// `deluser`, which checks no processes, runs as without it.
+    /// On shadow it still fails the step, not the target, when `remove_home`
+    /// would remove a home the user does not own, or a group named as the
+    /// user is another user's primary group.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -702,6 +713,11 @@ pub struct UserEntry {
 }
 
 impl UserEntry {
+    /// Whether the entry removes the user.
+    pub fn absent(&self) -> bool {
+        self.state.as_deref() == Some("absent")
+    }
+
     /// The home a new user gets.
     pub fn new_home(&self) -> String {
         (self.home.clone()).unwrap_or_else(|| format!("/home/{}", self.name))
@@ -2073,13 +2089,33 @@ pub(crate) fn check_user(prefix: &str, entry: &UserEntry) -> Result<(), String> 
         ));
     }
     match entry.state.as_deref() {
-        None | Some("present") => {}
+        None | Some("present" | "absent") => {}
         Some(state) => {
             return Err(format!(
-                "{prefix}.state `{}`: must be present",
+                "{prefix}.state `{}`: must be present or absent",
                 escape_controls(state)
             ));
         }
+    }
+    let absent_only = [("remove_home", entry.remove_home), ("force", entry.force)];
+    let present_only = [
+        ("uid", entry.uid.is_some()),
+        ("group", entry.group.is_some()),
+        ("groups", entry.groups.is_some()),
+        ("exclusive_groups", entry.exclusive_groups),
+        ("shell", entry.shell.is_some()),
+        ("home", entry.home.is_some()),
+        ("create_home", !entry.create_home),
+        ("system", entry.system),
+        ("comment", entry.comment.is_some()),
+    ];
+    let (refused, why) = if entry.absent() {
+        (present_only.as_slice(), "not with state = \"absent\"")
+    } else {
+        (absent_only.as_slice(), "only with state = \"absent\"")
+    };
+    if let Some((key, _)) = refused.iter().find(|(_, set)| *set) {
+        return Err(format!("{prefix}.{key}: {why}"));
     }
     check_selector(prefix, &entry.tags, &entry.facts)
 }
@@ -3939,7 +3975,11 @@ mod tests {
             ),
             (
                 "invalid/config-users-bad-state.toml",
-                "users[0].state `gone`: must be present",
+                "users[0].state `gone`: must be present or absent",
+            ),
+            (
+                "invalid/config-users-shell-on-absent.toml",
+                "users[0].shell: not with state = \"absent\"",
             ),
         ] {
             let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
@@ -3984,6 +4024,7 @@ mod tests {
             "name = \"deploy\"\ngroup = \"app\"\ngroups = [\"docker\", \"wheel\"]\nshell = \"/bin/bash\"",
             "name = \"_svc\"\nhome = \"/srv/svc\"\ncreate_home = false\nsystem = true\ncomment = \"Svc, x\"",
             "name = \"deploy\"\nstate = \"present\"\nsudo = false\ntags = [\"web\"]\nfacts = { accounts = \"shadow\" }",
+            "name = \"old\"\nstate = \"absent\"\nremove_home = true\nforce = true\nsudo = false\ntags = [\"web\"]",
         ] {
             assert_eq!(user(keys), Ok(()), "{keys}");
         }
@@ -4020,8 +4061,32 @@ mod tests {
                 "name = \"deploy\"\ncomment = \"a:b\"",
                 "users[0].comment `a:b`: must not hold `:` or control characters",
             ),
+            (
+                "name = \"deploy\"\nremove_home = true",
+                "users[0].remove_home: only with state = \"absent\"",
+            ),
+            (
+                "name = \"deploy\"\nforce = true",
+                "users[0].force: only with state = \"absent\"",
+            ),
         ] {
             assert_eq!(user(keys), Err(wanted.to_owned()), "{keys}");
+        }
+        for (keys, key) in [
+            ("uid = 2000", "uid"),
+            ("group = \"app\"", "group"),
+            ("groups = []", "groups"),
+            ("shell = \"/bin/sh\"", "shell"),
+            ("home = \"/srv/d\"", "home"),
+            ("create_home = false", "create_home"),
+            ("system = true", "system"),
+            ("comment = \"x\"", "comment"),
+        ] {
+            assert_eq!(
+                user(&format!("name = \"old\"\nstate = \"absent\"\n{keys}")),
+                Err(format!("users[0].{key}: not with state = \"absent\"")),
+                "{keys}"
+            );
         }
         let many: String = (0..=MAX_USERS)
             .map(|i| format!("[[users]]\nname = \"u{i}\"\n"))

@@ -1166,7 +1166,7 @@ else
 fi
 docker exec "$NAME" sh -c 'for g in anvil-e2e anvil-e2e-sys; do groupdel "$g" 2>/dev/null; done; :'
 
-step "(z) [[users]] on arch (shadow, NOPASSWD): deploy created in a group made the same run, its shell fixed, then unchanged"
+step "(z) [[users]] on arch (shadow, NOPASSWD): deploy created in a group made the same run, its shell fixed, then unchanged, then removed; removing the login user is refused"
 US_DIR="$TMP/users"
 mkdir -p "$US_DIR"
 us_config() {
@@ -1211,7 +1211,45 @@ if [ "$code" -eq 0 ] && grep -qxF '  unchanged user deploy' "$TMP/out" && ! grep
 else
   fail "third apply of users: exit $code"
 fi
-docker exec "$NAME" sh -c 'userdel -r deploy 2>/dev/null; groupdel anvil-e2e-users 2>/dev/null; :'
+cat >"$US_DIR/config.toml" <<CONF
+[[users]]
+name = "deploy"
+state = "absent"
+remove_home = true
+CONF
+us_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  removed user deploy' "$TMP/out" \
+  && ! docker exec "$NAME" getent passwd deploy >/dev/null && ! docker exec "$NAME" test -e /home/deploy; then
+  pass "state = absent removed deploy with userdel -r"
+else
+  fail "removal of deploy: exit $code"
+fi
+us_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged user deploy' "$TMP/out" && ! grep -qF 'removed user' "$TMP/out"; then
+  pass "a second removal apply changes no user"
+else
+  fail "second removal apply: exit $code"
+fi
+cat >"$US_DIR/config.toml" <<CONF
+[[groups]]
+name = "anvil-e2e-guard"
+
+[[users]]
+name = "key"
+state = "absent"
+force = true
+CONF
+us_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 1 ] && grep -qF 'users[0] key: is the login user' "$TMP/out" "$TMP/err" \
+  && docker exec "$NAME" getent passwd key >/dev/null && ! docker exec "$NAME" getent group anvil-e2e-guard >/dev/null; then
+  pass "removing the login user is refused before any change on the target"
+else
+  fail "login user guard: exit $code"
+fi
+docker exec "$NAME" sh -c 'userdel -r deploy 2>/dev/null; groupdel anvil-e2e-users 2>/dev/null; groupdel anvil-e2e-guard 2>/dev/null; :'
 
 step "(x) a recursive [[files]] tree on arch (NOPASSWD): owner, group, mode and dir_mode on a nested tree into an existing dir; rollback removes what it created"
 TR_STATE="$TMP/state-tree"
@@ -1678,6 +1716,31 @@ CONF
     pass "busybox: a further apply changes no user"
   else
     fail "further apply of users on alpine: exit $code"
+  fi
+  cat >"$ALP_DIR/users.toml" <<CONF
+[[users]]
+name = "deploy"
+state = "absent"
+CONF
+  alp_remove() {
+    run_env XDG_STATE_HOME="$TMP/state-alpine" "$ANVIL" --ssh-program "$ALP_DIR/ssh" \
+      --inventory "$ALP_DIR/inventory.toml" --config "$ALP_DIR/users.toml" -vv apply --target alpine \
+      </dev/null >"$TMP/out" 2>"$TMP/err"
+  }
+  alp_remove
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  removed user deploy' "$TMP/out" \
+    && ! docker exec "$ALP_NAME" grep -q '^deploy:' /etc/passwd; then
+    pass "busybox: deluser removed deploy"
+  else
+    fail "removal of deploy on alpine: exit $code"
+  fi
+  alp_remove
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  unchanged user deploy' "$TMP/out" && ! grep -qF 'removed user' "$TMP/out"; then
+    pass "busybox: a second removal apply changes no user"
+  else
+    fail "second removal apply on alpine: exit $code"
   fi
   docker rm -f "$ALP_NAME" >/dev/null 2>&1
 else

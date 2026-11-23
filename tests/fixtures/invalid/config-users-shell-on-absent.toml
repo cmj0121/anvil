@@ -1,0 +1,4 @@
+[[users]]
+name = "old"
+state = "absent"
+shell = "/bin/sh"
