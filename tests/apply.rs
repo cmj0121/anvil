@@ -5312,3 +5312,220 @@ fn a_user_owning_processes_is_removed_only_with_force() {
         "force asks no query"
     );
 }
+
+const KEY_A: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB a@host";
+const KEY_B: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC b@host";
+const KEY_C: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMD c@host";
+
+/// The login user, in the fake passwd with its home at `<root>/home`, and
+/// that home; [`fake_accounts`] first on the returned `PATH`.
+fn keys_user(sandbox: &Sandbox) -> (String, PathBuf, String) {
+    let path = fake_accounts(sandbox, "");
+    let me = login_user(sandbox, &path);
+    let home = sandbox.root().join("home");
+    std::fs::create_dir(&home).unwrap();
+    common::chmod(&home, 0o755);
+    // Never root's real home, when the tests run as root.
+    let root = if me == "root" {
+        ""
+    } else {
+        "root:x:0:0::/root:/bin/sh\n"
+    };
+    std::fs::write(
+        sandbox.root().join("acct/passwd"),
+        format!("{root}{me}:x:1500:100::{}:/bin/sh\n", home.display()),
+    )
+    .unwrap();
+    (me, home, path)
+}
+
+#[test]
+fn authorized_keys_are_added_or_set_exactly_and_rollback_restores_the_file() {
+    let sandbox = Sandbox::new("ak");
+    let (me, home, path) = keys_user(&sandbox);
+    let ssh = home.join(".ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    common::chmod(&ssh, 0o700);
+    let file = ssh.join("authorized_keys");
+    std::fs::write(&file, format!("{KEY_A}\n")).unwrap();
+    common::chmod(&file, 0o600);
+    store_file(&sandbox, "keys/c.pub", &format!("{KEY_C}\n"));
+    let dest = file.display().to_string();
+    let config = |exclusive: bool| {
+        sandbox.write_config(
+            "config.toml",
+            &format!(
+                "[[users]]\nname = \"{me}\"\nsudo = false\nnotify = [\"log\"]\n\
+                 authorized_keys = [\"{KEY_B}\", \"$/keys/c.pub\"]\nexclusive_keys = {exclusive}\n\n\
+                 [[handlers]]\nname = \"log\"\nrun = 'echo log >> {}/handler.log'\n",
+                sandbox.root().display()
+            ),
+        );
+    };
+    let apply = || {
+        let out = sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+        json(&out)["targets"][0]["steps"].clone()
+    };
+    config(false);
+    let out = sandbox.anvil(&["plan"], &[("PATH", &path)]);
+    assert!(
+        text(&out.stdout).contains(&format!("user {me} (authorized_keys 2)")),
+        "{}",
+        text(&out.stdout)
+    );
+    let steps = apply();
+    assert_eq!(steps[0]["stdout"], format!("unchanged user {me}\n"));
+    assert_eq!(steps[1]["run"], format!("file {dest}"));
+    assert_eq!(steps[1]["stdout"], format!("wrote {dest}\n"));
+    assert_eq!(steps[1]["changed"], true);
+    let keys = || std::fs::read_to_string(&file).unwrap();
+    assert_eq!(
+        keys(),
+        format!("{KEY_A}\n{KEY_B}\n{KEY_C}\n"),
+        "add-only keeps A"
+    );
+    assert_eq!(common::mode(&file) & 0o7777, 0o600);
+    let handled = || std::fs::read_to_string(sandbox.root().join("handler.log")).unwrap();
+    assert_eq!(handled(), "log\n");
+
+    let steps = apply();
+    assert_eq!(steps[1]["stdout"], format!("unchanged {dest}\n"));
+    assert_eq!(steps[1]["changed"], false);
+    assert_eq!(handled(), "log\n");
+
+    config(true);
+    let out = sandbox.anvil(&["plan"], &[("PATH", &path)]);
+    assert!(
+        text(&out.stdout).contains(&format!("user {me} (authorized_keys 2, exclusive)")),
+        "{}",
+        text(&out.stdout)
+    );
+    let steps = apply();
+    assert_eq!(steps[1]["stdout"], format!("wrote {dest}\n"));
+    assert_eq!(
+        keys(),
+        format!("{KEY_B}\n{KEY_C}\n"),
+        "exactly the listed keys"
+    );
+    let record = sandbox.last_apply().unwrap();
+    let recorded = &record["targets"]["local"]["files"][0];
+    assert_eq!(recorded["dest"], dest.as_str(), "{record}");
+    assert_eq!(recorded["user"], me.as_str(), "{record}");
+    assert_eq!(apply()[1]["stdout"], format!("unchanged {dest}\n"));
+
+    let out = sandbox.anvil(&["-vv", "rollback"], &[("PATH", &path)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains(&format!("restored {dest}")),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(
+        keys(),
+        format!("{KEY_A}\n{KEY_B}\n{KEY_C}\n"),
+        "the previous file"
+    );
+    assert_eq!(common::mode(&file) & 0o7777, 0o600);
+}
+
+#[test]
+fn a_missing_ssh_dir_is_made_private_and_rollback_removes_it() {
+    let sandbox = Sandbox::new("ak");
+    let (me, home, path) = keys_user(&sandbox);
+    sandbox.write_config(
+        "config.toml",
+        &format!("[[users]]\nname = \"{me}\"\nsudo = false\nauthorized_keys = [\"{KEY_A}\"]\n"),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[("PATH", &path)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let ssh = home.join(".ssh");
+    assert_eq!(common::mode(&ssh) & 0o7777, 0o700);
+    assert_eq!(
+        std::fs::read_to_string(ssh.join("authorized_keys")).unwrap(),
+        format!("{KEY_A}\n")
+    );
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["files"][0]["created_dirs"],
+        serde_json::json!([ssh.display().to_string()]),
+        "{record}"
+    );
+    let out = sandbox.anvil(&["rollback"], &[("PATH", &path)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(!ssh.exists(), "{}", text(&out.stdout));
+    assert!(home.exists());
+}
+
+/// The local login user is whoever runs the tests: a non-root login.
+#[test]
+fn exclusive_keys_that_drop_the_login_key_fail_the_target_before_any_change() {
+    let sandbox = Sandbox::new("ak");
+    let (me, home, path) = keys_user(&sandbox);
+    let config = |keys: &str| {
+        sandbox.write_config(
+            "config.toml",
+            &format!(
+                "[[groups]]\nname = \"app\"\nsudo = false\n\n\
+                 [[users]]\nname = \"{me}\"\nsudo = false\nauthorized_keys = [{keys}]\nexclusive_keys = true\n"
+            ),
+        );
+        sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        )
+    };
+    let wanted = format!("users[0] {me}: would drop the login key");
+    let out = config("");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert_eq!(
+        json(&out)["targets"][0]["error"],
+        wanted.as_str(),
+        "no file: one key needed"
+    );
+    std::fs::create_dir(home.join(".ssh")).unwrap();
+    let file = home.join(".ssh/authorized_keys");
+    std::fs::write(&file, format!("# note\nno-pty {KEY_A}\n")).unwrap();
+    let out = config(&format!("\"{KEY_B}\""));
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let value = json(&out);
+    assert_eq!(value["targets"][0]["error"], wanted.as_str(), "{value}");
+    assert!(value["targets"][0]["steps"].is_null(), "{value}");
+    assert!(!sandbox.root().join("acct/log").exists(), "no tool ran");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("# note\nno-pty {KEY_A}\n")
+    );
+
+    let renamed = KEY_A.replace("a@host", "renamed");
+    let out = config(&format!("\"{KEY_B}\", \"{renamed}\""));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("{KEY_B}\n{renamed}\n")
+    );
+}
+
+#[test]
+fn a_store_key_that_is_not_one_key_line_is_a_usage_error() {
+    let sandbox = Sandbox::new("ak");
+    store_file(&sandbox, "keys/two.pub", &format!("{KEY_A}\n{KEY_B}\n"));
+    sandbox.write_config(
+        "config.toml",
+        "[[users]]\nname = \"deploy\"\nauthorized_keys = [\"$/keys/two.pub\"]\n",
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr)
+            .contains("users[0].authorized_keys[0] `$/keys/two.pub`: must be one line"),
+        "{}",
+        text(&out.stderr)
+    );
+}

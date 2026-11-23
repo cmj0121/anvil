@@ -180,6 +180,11 @@ pub struct FileRecord {
     /// of the previous file is kept, and rollback cannot undo the write.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub secret: bool,
+    /// For a `[[users]]` entry's `authorized_keys`, the user it was written
+    /// as: its previous text, public keys, is kept whatever its mode, and
+    /// rollback writes it back as that user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 /// A file's owner, group and mode.
@@ -932,7 +937,11 @@ fn version_of(record: &Record) -> u32 {
             || !target.links.is_empty()
             || !no_absent(&target.absent)
             || (target.files.iter()).any(|file| {
-                !file.created_dirs.is_empty() || file.attrs_only() || file.binary || file.secret
+                !file.created_dirs.is_empty()
+                    || file.attrs_only()
+                    || file.binary
+                    || file.secret
+                    || file.user.is_some()
             })
     });
     if newer { VERSION } else { VERSION_1 }
@@ -1226,6 +1235,7 @@ impl Session {
             if let Previous::File(p) = &mut file.previous
                 && p.text.is_some()
                 && !is_world_readable(&p.mode)
+                && file.user.is_none()
             {
                 p.drop_text(NOT_WORLD_READABLE);
                 warnings.push(stripped_warning(&file.dest, name));
@@ -1634,6 +1644,7 @@ mod tests {
 
     fn file(dest: &str, written: &str, write: Write, previous: Previous) -> FileRecord {
         FileRecord {
+            user: None,
             dest: dest.to_owned(),
             mode: "0644".to_owned(),
             sudo: true,
@@ -2940,6 +2951,14 @@ mod tests {
                 VERSION,
             ),
             ("unchanged attrs", fixed(attrs(0, 0, "0644")), VERSION_1),
+            (
+                "authorized_keys",
+                FileRecord {
+                    user: Some("deploy".to_owned()),
+                    ..plain.clone()
+                },
+                VERSION,
+            ),
         ] {
             let record = Record {
                 version: VERSION_1,

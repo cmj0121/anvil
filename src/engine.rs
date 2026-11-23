@@ -775,13 +775,14 @@ fn execute_inner(
                 }
                 recorder.wrote = true;
                 let intents: Vec<FileRecord> =
-                    found.iter().map(|(_, intent, _)| intent.clone()).collect();
+                    found.iter().map(|(_, ahead)| ahead.0.clone()).collect();
                 if !recorder.snapshot(&intents, &reports) {
                     return cancelled(command, target, reports, cancel).at(planned);
                 }
-                (tree.ahead).extend(found.into_iter().map(|(m, intent, at)| (m, (intent, at))));
+                tree.ahead.extend(found);
             }
-            let (intent, expected) = tree.ahead.remove(&n).expect("captured above");
+            let (intent, expected, merged) = tree.ahead.remove(&n).expect("captured above");
+            let write = merged.as_deref().unwrap_or(write);
             rebuilt = match files::write_script(write, recorder.sources, &expected) {
                 Ok(rebuilt) => rebuilt,
                 Err(error) => return failed(command, target, reports, error).at(planned),
@@ -1236,9 +1237,14 @@ struct TreeRun {
     /// What the tree's check found; `None` without one.
     look: Option<files::TreeLook>,
     /// The captured intents of the file items still to run, by step index,
-    /// with what each write must find at DEST.
-    ahead: BTreeMap<usize, (FileRecord, files::Expected)>,
+    /// with what each write must find at DEST and, for authorized_keys, the
+    /// write with its merged bytes.
+    ahead: BTreeMap<usize, Ahead>,
 }
+
+/// One captured write still to run: its intent, what it must find at DEST,
+/// and an authorized_keys write rebuilt with its merged bytes.
+type Ahead = (FileRecord, files::Expected, Option<Box<files::FileWrite>>);
 
 impl TreeRun {
     /// The intents of `ahead`, which every save while they wait must keep:
@@ -1246,7 +1252,7 @@ impl TreeRun {
     fn intents(&self) -> Vec<FileRecord> {
         self.ahead
             .values()
-            .map(|(intent, _)| intent.clone())
+            .map(|(intent, ..)| intent.clone())
             .collect()
     }
 }
@@ -1274,7 +1280,7 @@ fn captures(
     look: Option<&files::TreeLook>,
     password: Option<&[u8]>,
     recorder: &Recorder<'_>,
-) -> Result<Vec<(usize, FileRecord, files::Expected)>, Uncaptured> {
+) -> Result<Vec<(usize, Ahead)>, Uncaptured> {
     let mut found = Vec::new();
     let mut kept = 0;
     let first = runs[n].file().and_then(|file| file.write.as_ref());
@@ -1311,14 +1317,25 @@ fn captures(
             kept += bytes.len() as u64;
         }
         let expected = captured.expected();
-        let intent = write.record(
+        let merged = match write.merged(&captured) {
+            None => None,
+            Some(Ok(merged)) => Some(Box::new(merged)),
+            Some(Err(error)) if m == n => {
+                return Err(Uncaptured::Step {
+                    code: Some(1),
+                    stderr: format!("{error}\n"),
+                });
+            }
+            Some(Err(_)) => break,
+        };
+        let intent = merged.as_deref().unwrap_or(write).record(
             recorder.expanded,
             recorder.sources,
             captured,
             record::Write::FailedMidway,
             recorder.is_hash_only(&write.dest),
         );
-        found.push((m, intent, expected));
+        found.push((m, (intent, expected, merged)));
         if tree.is_none() || found.len() >= JOURNAL_ITEMS || kept >= JOURNAL_KEPT {
             break;
         }
@@ -1378,7 +1395,8 @@ fn capture(
             stderr,
         });
     }
-    let found = files::parse_capture(&write.dest, &stdout).map_err(|error| Uncaptured::Step {
+    let found = files::parse_capture_any(&write.dest, &stdout, write.keys.is_some());
+    let found = found.map_err(|error| Uncaptured::Step {
         code: Some(1),
         stderr: format!("{error}\n"),
     })?;
@@ -1611,7 +1629,9 @@ impl From<TransportError> for Unresolved {
 /// from [`probe`], is required when [`needs_facts`] says so; being one probe,
 /// no step can change what a later item sees. `secrets`, apply's loaded
 /// values, renders a file item with `secrets`; plan's `None` leaves it
-/// unrendered. A failure is
+/// unrendered. A user item with `authorized_keys` is followed by the file
+/// step that writes them ([`users::keys_run`]) when `homes`, from
+/// [`guard_users`], says where; plan's `None` has no such step. A failure is
 /// `packages: <reason>`, `files…`, `services: <reason>`, `dirs…`,
 /// `links…`, `absent…` or `plugin <name>: <reason>`; the first one ends the
 /// list.
@@ -1625,7 +1645,7 @@ pub fn resolve(
     config: &Config,
     expanded: &Expanded,
     sources: &Sources,
-    secrets: Option<&Passwords>,
+    (secrets, homes): (Option<&Passwords>, Option<&users::Homes>),
     plugins: &dyn Plugins,
     cancel: &Cancel,
 ) -> Result<Vec<PlannedRun>, Unresolved> {
@@ -1646,7 +1666,10 @@ pub fn resolve(
                 vec![groups::run(config, item, (entry, *ordinal), target, facts)?]
             }
             ItemKind::User { entry, ordinal } => {
-                vec![users::run(config, item, (entry, *ordinal), target, facts)?]
+                let entry = (entry, *ordinal);
+                let keys = users::keys_run(item, entry, target, facts, (homes, sources))?;
+                let user = users::run(config, item, entry, target, facts)?;
+                std::iter::once(user).chain(keys).collect()
             }
             ItemKind::Dir { entry, ordinal } => {
                 vec![dirs::run(config, item, (entry, *ordinal), target, facts)?]
@@ -1704,17 +1727,19 @@ pub fn probe(transport: &dyn Transport, expanded: &Expanded) -> Result<Facts, Un
 
 /// The `[[users]]` lockout guards, after the probe and before any step on
 /// `target`: those the config decides, then, when one needs the target's
-/// state, those [`users::query`] reads over `transport`, as the probe runs.
-/// The error is the target's failure, or Cancelled when the transport was.
+/// state, those [`users::query`] reads over `transport`, as the probe runs;
+/// `sources` holds the store's `authorized_keys`. It returns the homes of
+/// the users whose `authorized_keys` [`resolve`] writes. The error is the
+/// target's failure, or Cancelled when the transport was.
 pub fn guard_users(
     transport: &dyn Transport,
-    expanded: &Expanded,
+    (expanded, sources): (&Expanded, &Sources),
     target: &Target,
     facts: &Facts,
-) -> Result<(), Unresolved> {
+) -> Result<users::Homes, Unresolved> {
     users::check_config(expanded, target, facts)?;
     let Some(query) = users::query(expanded, target, facts) else {
-        return Ok(());
+        return Ok(users::Homes::default());
     };
     let output = transport.run(&query, RUN_TIMEOUT)?;
     match output.code {
@@ -1726,7 +1751,13 @@ pub fn guard_users(
                 .into());
         }
     }
-    Ok(users::check_state(expanded, target, facts, &output.stdout)?)
+    Ok(users::check_state(
+        expanded,
+        target,
+        facts,
+        &output.stdout,
+        sources.keys(),
+    )?)
 }
 
 /// Whether `target` matches `item`, whose selector needs `facts` only when it
@@ -2077,7 +2108,7 @@ mod tests {
             &Config::default(),
             &expanded,
             &Sources::default(),
-            Some(&Passwords::new()),
+            (Some(&Passwords::new()), None),
             &FakePlugins::none(),
             &Cancel::new(),
         )
