@@ -605,7 +605,7 @@ pub fn load_steps(opts: &Options) -> Result<Vec<StepRow>, String> {
 }
 
 /// The steps apply runs for `expanded`, in its order: `packages`, `group
-/// <name>` or `remove group <name>`, `dir <path>`,
+/// <name>` or `remove group <name>`, `user <name>`, `dir <path>`,
 /// `file <dest>`, `link <path> -> <target>`, `absent <path>`, `service <name>`
 /// (each a step on every target, skipped where it does not match), each step's
 /// command as its `$` line shows it, or `plugin <name>` for a plugin step, whose
@@ -620,6 +620,7 @@ pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
             let label = match &item.kind {
                 ItemKind::Packages(_) => "packages".to_owned(),
                 ItemKind::Group { entry, .. } => anvil::groups::shown(entry),
+                ItemKind::User { entry, .. } => anvil::users::shown(entry),
                 ItemKind::Dir { entry, .. } => format!("dir {}", entry.path),
                 ItemKind::File { entry, .. } => format!("file {}", entry.dest),
                 ItemKind::Link { entry, .. } => format!("link {} -> {}", entry.path, entry.target),

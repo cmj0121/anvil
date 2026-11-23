@@ -1430,3 +1430,30 @@ fn a_group_shows_its_desired_state_from_the_config_alone() {
     assert_eq!(steps[0]["run"], "group app (gid 2000, system)");
     assert_eq!(steps[2]["run"], "remove group old");
 }
+
+#[test]
+fn a_user_shows_its_desired_state_from_the_config_alone() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.write_config(
+        "config.toml",
+        "[[users]]\nname = \"deploy\"\nuid = 2000\ngroup = \"app\"\ngroups = [\"docker\"]\n\
+         shell = \"/bin/bash\"\nsudo = false\n\n\
+         [[users]]\nname = \"web\"\ntags = [\"web\"]\n\n\
+         [[groups]]\nname = \"app\"\nsudo = false\n",
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "▶ local\n  would group app\n  \
+         would user deploy (uid 2000, group app, groups docker, shell /bin/bash)\n  \
+         would $ skipped user web: no match\n  \
+         would $ hostname\n  ✔ 4 steps\n\n1 target, nothing executed\n"
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    let steps = &json(&out)["targets"][0]["steps"];
+    assert_eq!(
+        steps[1]["run"],
+        "user deploy (uid 2000, group app, groups docker, shell /bin/bash)"
+    );
+}

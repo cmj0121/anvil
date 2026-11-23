@@ -1,6 +1,6 @@
 //! The config document: `[anvil]` preferences, the `[secrets]` backend, the
 //! `[packages]` to install, the pinned `[plugins]`, the `[[groups]]` to
-//! create or remove, the `[[dirs]]` to make,
+//! create or remove, the `[[users]]` to create or fix, the `[[dirs]]` to make,
 //! the `[[files]]` to copy, the `[[links]]` to point, the `[[services]]` to
 //! bring to a state, the `[[steps]]` that
 //! `anvil apply` runs, the `[harden]` rules `config --harden` skips and the
@@ -45,6 +45,12 @@ pub const MAX_GROUPS: usize = 64;
 /// The highest `[[groups]]` gid.
 const MAX_GID: i64 = 60000;
 
+/// Most `[[users]]` entries in one config.
+pub const MAX_USERS: usize = 64;
+
+/// The highest `[[users]]` uid.
+const MAX_UID: i64 = 60000;
+
 /// Most `[[dirs]]` entries in one config.
 pub const MAX_DIRS: usize = 64;
 
@@ -85,6 +91,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<GroupEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub users: Vec<UserEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dirs: Vec<DirEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<FileEntry>,
@@ -118,6 +126,8 @@ struct RawConfig {
     plugins: BTreeMap<String, Plugin>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     groups: Vec<GroupEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    users: Vec<UserEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     dirs: Vec<DirEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -156,6 +166,7 @@ impl TryFrom<RawConfig> for Config {
             let mixed = [
                 (raw.steps.is_some(), "[[steps]]"),
                 (!raw.groups.is_empty(), "[[groups]]"),
+                (!raw.users.is_empty(), "[[users]]"),
                 (!raw.dirs.is_empty(), "[[dirs]]"),
                 (!raw.files.is_empty(), "[[files]]"),
                 (!raw.links.is_empty(), "[[links]]"),
@@ -192,6 +203,7 @@ impl TryFrom<RawConfig> for Config {
             packages: raw.packages,
             plugins: raw.plugins,
             groups: raw.groups,
+            users: raw.users,
             dirs: raw.dirs,
             files: raw.files,
             links: raw.links,
@@ -214,6 +226,7 @@ impl From<Config> for RawConfig {
             packages: config.packages,
             plugins: config.plugins,
             groups: config.groups,
+            users: config.users,
             dirs: config.dirs,
             files: config.files,
             links: config.links,
@@ -235,6 +248,7 @@ impl Default for Config {
             packages: None,
             plugins: BTreeMap::new(),
             groups: Vec::new(),
+            users: Vec::new(),
             dirs: Vec::new(),
             files: Vec::new(),
             links: Vec::new(),
@@ -472,7 +486,7 @@ impl Guards {
 }
 
 /// A `[[tasks]]` entry: exactly one kind (`run`, `plugin`, `packages`, `group`,
-/// `dir`, `file`, `link`, `absent`, `service`, `include` or `tasks`) on the targets its `tags` and `facts` match.
+/// `user`, `dir`, `file`, `link`, `absent`, `service`, `include` or `tasks`) on the targets its `tags` and `facts` match.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Task {
@@ -506,6 +520,8 @@ pub struct Task {
     pub service: Option<ServiceEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<GroupEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<UserEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<DirEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -638,6 +654,57 @@ impl GroupEntry {
     /// Whether the entry removes the group.
     pub fn absent(&self) -> bool {
         self.state.as_deref() == Some("absent")
+    }
+}
+
+/// A `[[users]]` entry: the local user `name`, created or fixed on each
+/// target whose tags and facts all match. Only the keys that are set are
+/// compared and fixed; an unset key never changes an existing user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserEntry {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<i64>,
+    /// The primary group: a name or a numeric gid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Supplementary group names; `None` leaves them alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<Vec<String>>,
+    /// `true`: the user leaves every supplementary group not in `groups`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exclusive_groups: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    /// Unset: a new user gets `/home/NAME` and an existing one keeps its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
+    /// Whether a new user's home directory is made.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub create_home: bool,
+    /// `true`: a new user is a system user.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub system: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Only `present`, the default, so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facts: BTreeMap<String, String>,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub sudo: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<String>,
+}
+
+impl UserEntry {
+    /// The home a new user gets.
+    pub fn new_home(&self) -> String {
+        (self.home.clone()).unwrap_or_else(|| format!("/home/{}", self.name))
     }
 }
 
@@ -921,6 +988,9 @@ upgrade = false
 timeout = 300
 [[groups]]
 sudo = true
+[[users]]
+sudo = true
+create_home = true
 [[dirs]]
 sudo = true
 [[files]]
@@ -959,6 +1029,10 @@ parents = false
 [[groups]]
 name = "app"
 gid = 2000
+[[users]]
+name = "deploy"
+group = "app"
+shell = "/bin/bash"
 [[dirs]]
 path = "/srv/app"
 mode = "0755"
@@ -1070,7 +1144,7 @@ impl Config {
             let refused = !self.tasks.is_empty()
                 && matches!(
                     key.as_str(),
-                    "groups" | "dirs" | "files" | "links" | "absent" | "services"
+                    "groups" | "users" | "dirs" | "files" | "links" | "absent" | "services"
                 );
             if value.get(&key).is_none() && !refused {
                 let table = toml::Table::from_iter([(key, example)]);
@@ -1177,6 +1251,8 @@ impl Config {
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_groups()
             .map_err(|message| DocumentError::invalid(path, message))?;
+        self.check_users()
+            .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_dirs()
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_files()
@@ -1247,6 +1323,30 @@ impl Config {
             if let Some(j) = (self.groups[..i].iter()).position(|other| other.name == entry.name) {
                 return Err(format!(
                     "{prefix}.name `{}`: same name as groups[{j}]",
+                    entry.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The `[[users]]` syntax rules, and no name written twice; whether a
+    /// target has the groups and the shell is asked only when `apply` runs,
+    /// after the `[[groups]]` that may create them.
+    fn check_users(&self) -> Result<(), String> {
+        if self.users.len() > MAX_USERS {
+            return Err(format!(
+                "users: {} entries exceeds the {MAX_USERS} entry limit",
+                self.users.len()
+            ));
+        }
+        for (i, entry) in self.users.iter().enumerate() {
+            let prefix = format!("users[{i}]");
+            check_user(&prefix, entry)?;
+            check_notify(&prefix, &entry.notify, &self.handlers)?;
+            if let Some(j) = (self.users[..i].iter()).position(|other| other.name == entry.name) {
+                return Err(format!(
+                    "{prefix}.name `{}`: same name as users[{j}]",
                     entry.name
                 ));
             }
@@ -1912,6 +2012,78 @@ pub(crate) fn check_group(prefix: &str, entry: &GroupEntry) -> Result<(), String
     check_selector(prefix, &entry.tags, &entry.facts)
 }
 
+/// One user entry's rules; `prefix` names it, as `users[0]`.
+pub(crate) fn check_user(prefix: &str, entry: &UserEntry) -> Result<(), String> {
+    let shape = "must match [a-z_][a-z0-9_.-]*, at most 32 bytes";
+    if !is_account_name(&entry.name) {
+        return Err(format!(
+            "{prefix}.name `{}`: {shape}",
+            secret::shown_name(&entry.name)
+        ));
+    }
+    if let Some(uid) = entry.uid
+        && !(1..=MAX_UID).contains(&uid)
+    {
+        return Err(format!("{prefix}.uid `{uid}`: must be 1 to {MAX_UID}"));
+    }
+    if let Some(group) = &entry.group {
+        let gid = group.bytes().all(|b| b.is_ascii_digit())
+            && group
+                .parse::<i64>()
+                .is_ok_and(|gid| (0..=MAX_GID).contains(&gid));
+        if !gid && !is_account_name(group) {
+            return Err(format!(
+                "{prefix}.group `{}`: must be a group name or a gid of 0 to {MAX_GID}",
+                secret::shown_name(group)
+            ));
+        }
+    }
+    for (j, group) in entry.groups.iter().flatten().enumerate() {
+        if !is_account_name(group) {
+            return Err(format!(
+                "{prefix}.groups[{j}] `{}`: {shape}",
+                secret::shown_name(group)
+            ));
+        }
+        if let Some(k) = (entry.groups.iter().flatten().take(j)).position(|other| other == group) {
+            return Err(format!(
+                "{prefix}.groups[{j}] `{group}`: same group as groups[{k}]"
+            ));
+        }
+    }
+    if entry.exclusive_groups && entry.groups.is_none() {
+        return Err(format!("{prefix}.exclusive_groups: needs groups"));
+    }
+    for (key, value) in [("shell", &entry.shell), ("home", &entry.home)] {
+        if let Some(path) = value
+            && (!path.starts_with('/') || path.contains(':') || path.chars().any(char::is_control))
+        {
+            return Err(format!(
+                "{prefix}.{key} `{}`: must be an absolute path without `:`",
+                escape_controls(path)
+            ));
+        }
+    }
+    if let Some(comment) = &entry.comment
+        && (comment.contains(':') || comment.chars().any(char::is_control))
+    {
+        return Err(format!(
+            "{prefix}.comment `{}`: must not hold `:` or control characters",
+            escape_controls(comment)
+        ));
+    }
+    match entry.state.as_deref() {
+        None | Some("present") => {}
+        Some(state) => {
+            return Err(format!(
+                "{prefix}.state `{}`: must be present",
+                escape_controls(state)
+            ));
+        }
+    }
+    check_selector(prefix, &entry.tags, &entry.facts)
+}
+
 /// One service entry's rules; `prefix` names it, as `services[0]`. Only a
 /// handler's service (`in_handler`) may ask for `restarted` or `reloaded`.
 pub(crate) fn check_service(
@@ -2235,6 +2407,7 @@ pub(crate) fn check_tasks(
             ("file", task.file.is_some()),
             ("service", task.service.is_some()),
             ("group", task.group.is_some()),
+            ("user", task.user.is_some()),
             ("dir", task.dir.is_some()),
             ("link", task.link.is_some()),
             ("absent", task.absent.is_some()),
@@ -2247,8 +2420,8 @@ pub(crate) fn check_tasks(
             [_] => {}
             [] => {
                 return Err(format!(
-                    "{path}: needs one of run, plugin, packages, file, service, group, dir, link, \
-                     absent, include, tasks"
+                    "{path}: needs one of run, plugin, packages, file, service, group, user, dir, \
+                     link, absent, include, tasks"
                 ));
             }
             many => return Err(format!("{path}: has {}; keep one", many.join(" and "))),
@@ -2274,8 +2447,8 @@ pub(crate) fn check_tasks(
             }
             if task.include.is_some() || task.tasks.is_some() {
                 return Err(format!(
-                    "{path}.notify: only on a run, plugin, file, service, group, dir, link or \
-                     absent task"
+                    "{path}.notify: only on a run, plugin, file, service, group, user, dir, link \
+                     or absent task"
                 ));
             }
             check_notify(&path, &task.notify, handlers)?;
@@ -2307,6 +2480,18 @@ pub(crate) fn check_tasks(
             if !group.tags.is_empty() || !group.facts.is_empty() {
                 return Err(format!(
                     "{path}.group: tags and facts belong on the task, not the group"
+                ));
+            }
+        }
+        if let Some(user) = &task.user {
+            if !user.notify.is_empty() {
+                return Err(format!(
+                    "{path}.user: notify belongs on the task, not the user"
+                ));
+            }
+            if !user.tags.is_empty() || !user.facts.is_empty() {
+                return Err(format!(
+                    "{path}.user: tags and facts belong on the task, not the user"
                 ));
             }
         }
@@ -3733,6 +3918,161 @@ mod tests {
         );
     }
 
+    #[test]
+    fn users_fixtures_are_refused_naming_the_entry_and_the_key() {
+        for (file, field) in [
+            (
+                "invalid/config-users-bad-name.toml",
+                "users[1].name `Deploy`: must match [a-z_][a-z0-9_.-]*, at most 32 bytes",
+            ),
+            (
+                "invalid/config-users-bad-uid.yaml",
+                "users[0].uid `70000`: must be 1 to 60000",
+            ),
+            (
+                "invalid/config-users-duplicate-name.toml",
+                "users[1].name `deploy`: same name as users[0]",
+            ),
+            (
+                "invalid/config-users-bad-shell.toml",
+                "users[0].shell `bash`: must be an absolute path without `:`",
+            ),
+            (
+                "invalid/config-users-bad-state.toml",
+                "users[0].state `gone`: must be present",
+            ),
+        ] {
+            let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                matches!(err, DocumentError::Invalid { .. }),
+                "{file}: {message}"
+            );
+            assert!(message.contains(file), "{file}: {message}");
+            assert!(message.contains(field), "{file}: {message}");
+        }
+        for (file, key, line) in [
+            (
+                "invalid/config-users-unknown-key.toml",
+                "password",
+                "line 4",
+            ),
+            (
+                "invalid/config-users-groups-not-list.yaml",
+                "groups",
+                "line 3",
+            ),
+        ] {
+            let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                matches!(err, DocumentError::Parse { .. }),
+                "{file}: {message}"
+            );
+            assert!(message.contains(file), "{file}: {message}");
+            assert!(message.contains(key), "{file}: {message}");
+            assert!(message.contains(line), "{file}: {message}");
+        }
+    }
+
+    #[test]
+    fn user_entries_within_the_rules_pass_and_the_rest_name_the_key() {
+        let user = |keys: &str| parse(&format!("[[users]]\n{keys}\n")).check_users();
+        for keys in [
+            "name = \"deploy\"",
+            "name = \"deploy\"\nuid = 60000\ngroup = \"0\"\ngroups = []\nexclusive_groups = true",
+            "name = \"deploy\"\ngroup = \"app\"\ngroups = [\"docker\", \"wheel\"]\nshell = \"/bin/bash\"",
+            "name = \"_svc\"\nhome = \"/srv/svc\"\ncreate_home = false\nsystem = true\ncomment = \"Svc, x\"",
+            "name = \"deploy\"\nstate = \"present\"\nsudo = false\ntags = [\"web\"]\nfacts = { accounts = \"shadow\" }",
+        ] {
+            assert_eq!(user(keys), Ok(()), "{keys}");
+        }
+        for (keys, wanted) in [
+            (
+                "name = \"deploy\"\nuid = 0",
+                "users[0].uid `0`: must be 1 to 60000",
+            ),
+            (
+                "name = \"deploy\"\ngroup = \"1app\"",
+                "users[0].group `1app`: must be a group name or a gid of 0 to 60000",
+            ),
+            (
+                "name = \"deploy\"\ngroup = \"70000\"",
+                "users[0].group `70000`: must be a group name or a gid of 0 to 60000",
+            ),
+            (
+                "name = \"deploy\"\ngroups = [\"docker\", \"Wheel\"]",
+                "users[0].groups[1] `Wheel`: must match [a-z_][a-z0-9_.-]*, at most 32 bytes",
+            ),
+            (
+                "name = \"deploy\"\ngroups = [\"docker\", \"docker\"]",
+                "users[0].groups[1] `docker`: same group as groups[0]",
+            ),
+            (
+                "name = \"deploy\"\nexclusive_groups = true",
+                "users[0].exclusive_groups: needs groups",
+            ),
+            (
+                "name = \"deploy\"\nhome = \"/srv/a:b\"",
+                "users[0].home `/srv/a:b`: must be an absolute path without `:`",
+            ),
+            (
+                "name = \"deploy\"\ncomment = \"a:b\"",
+                "users[0].comment `a:b`: must not hold `:` or control characters",
+            ),
+        ] {
+            assert_eq!(user(keys), Err(wanted.to_owned()), "{keys}");
+        }
+        let many: String = (0..=MAX_USERS)
+            .map(|i| format!("[[users]]\nname = \"u{i}\"\n"))
+            .collect();
+        assert_eq!(
+            parse(&many).check_users().unwrap_err(),
+            "users: 65 entries exceeds the 64 entry limit"
+        );
+    }
+
+    #[test]
+    fn a_user_task_takes_no_notify_tags_or_facts_of_its_own() {
+        let tasks = |text: &str| {
+            let config = parse(text);
+            check_tasks(&config.tasks, "tasks", &config.handlers)
+        };
+        assert_eq!(
+            tasks("[[tasks]]\nuser = { name = \"deploy\", group = \"app\" }\n"),
+            Ok(())
+        );
+        for (task, wanted) in [
+            (
+                "user = { name = \"deploy\", notify = [\"h\"] }",
+                "tasks[0].user: notify belongs on the task, not the user",
+            ),
+            (
+                "user = { name = \"deploy\", facts = { os = \"Linux\" } }",
+                "tasks[0].user: tags and facts belong on the task, not the user",
+            ),
+            (
+                "user = { name = \"deploy\" }\ngroup = { name = \"app\" }",
+                "tasks[0]: has group and user; keep one",
+            ),
+        ] {
+            assert_eq!(
+                tasks(&format!("[[tasks]]\n{task}\n")),
+                Err(wanted.to_owned()),
+                "{task}"
+            );
+        }
+        let mixed: Result<Config, String> = document::from_str(
+            "[[users]]\nname = \"deploy\"\n\n[[tasks]]\nrun = \"true\"\n",
+            Format::Toml,
+        );
+        assert!(
+            mixed
+                .unwrap_err()
+                .contains("[[tasks]] cannot be mixed with [[users]]"),
+        );
+    }
+
     fn service_entry(keys: &str) -> Config {
         parse(&format!("[[services]]\n{keys}\n"))
     }
@@ -4861,7 +5201,7 @@ facts = { os = "Linux" }
             ),
             (
                 "name = \"only\"",
-                "tasks[0]: needs one of run, plugin, packages, file, service, group, dir, link, absent, include, tasks",
+                "tasks[0]: needs one of run, plugin, packages, file, service, group, user, dir, link, absent, include, tasks",
             ),
         ] {
             let err = validated(&format!("[[tasks]]\n{task}\n")).unwrap_err();
@@ -5621,7 +5961,7 @@ removes = "/tmp/stale"
         for kind in ["include = \"$/a.toml\"", "tasks = []"] {
             assert_eq!(
                 refused(&format!("{kind}\nnotify = [\"reload sshd\"]")),
-                "tasks[0].notify: only on a run, plugin, file, service, group, dir, link or absent task"
+                "tasks[0].notify: only on a run, plugin, file, service, group, user, dir, link or absent task"
             );
         }
         assert_eq!(
