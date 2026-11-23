@@ -54,8 +54,8 @@ use std::sync::Arc;
 use crate::cancel::Cancel;
 use crate::config::{Config, MAX_HANDLER_NAME_BYTES, Plugin, is_handler_name};
 use crate::engine::{
-    Journal, Passwords, Reached, Recorder, Unresolved, cannot_undo, execute, open_record, probe,
-    resolve, run_handlers, scrubbed,
+    Journal, Passwords, Reached, Recorder, Unresolved, cannot_undo, execute, guard_users,
+    open_record, probe, resolve, run_handlers, scrubbed,
 };
 use crate::error::Failure;
 use crate::fanout::{self, Event};
@@ -308,9 +308,10 @@ fn needs_facts(config: &Config, expanded: &Expanded) -> bool {
         })
 }
 
-/// Probes `target` when [`needs_facts`], then runs the steps [`resolve`]
-/// lists, then the handler phase ([`run_handlers`]); `passwords` holds the
-/// sudo passwords to type. A target the probe reached comes back with its
+/// Probes `target` when [`needs_facts`], checks the `[[users]]` lockout
+/// guards ([`guard_users`]), then runs the steps [`resolve`] lists, then
+/// the handler phase ([`run_handlers`]); `passwords` holds the sudo
+/// passwords to type. A target the probe reached comes back with its
 /// record: its facts, each file written with what DEST held before, the
 /// steps that ran but cannot be undone, and the handlers still pending. A
 /// pending name `[[handlers]]` no longer has is dropped with a warning.
@@ -362,16 +363,22 @@ fn apply_target(
         facts.as_ref(),
         journal.filter(|_| facts.is_some()),
     );
-    let resolved = resolve(
-        target,
-        facts.as_ref(),
-        config,
-        expanded,
-        sources,
-        Some(passwords),
-        plugins,
-        cancel,
-    );
+    let guarded = match &facts {
+        Some(facts) => guard_users(transport.as_ref(), expanded, target, facts),
+        None => Ok(()),
+    };
+    let resolved = guarded.and_then(|()| {
+        resolve(
+            target,
+            facts.as_ref(),
+            config,
+            expanded,
+            sources,
+            Some(passwords),
+            plugins,
+            cancel,
+        )
+    });
     let mut report = match resolved {
         Ok(runs) => {
             let report = execute(

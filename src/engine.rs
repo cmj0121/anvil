@@ -1507,11 +1507,16 @@ fn changed(planned: &PlannedRun, output: &Output) -> bool {
             })
         }
         RunKind::User { name, .. } => {
-            let (created, fixed) = (
+            let (created, removed, fixed) = (
                 format!("created user {name}"),
+                format!("removed user {name}"),
                 format!("fixed user {name}: "),
             );
-            lines.any(|line| line == created.as_bytes() || line.starts_with(fixed.as_bytes()))
+            lines.any(|line| {
+                line == created.as_bytes()
+                    || line == removed.as_bytes()
+                    || line.starts_with(fixed.as_bytes())
+            })
         }
         RunKind::Service { name, .. } => {
             let unchanged = format!("unchanged service {name}");
@@ -1695,6 +1700,33 @@ pub fn probe(transport: &dyn Transport, expanded: &Expanded) -> Result<Facts, Un
         None => return Err(reason(format!("{probe}was killed by a signal")).into()),
     }
     Facts::parse(&output.stdout).map_err(|err| reason(err.to_string()).into())
+}
+
+/// The `[[users]]` lockout guards, after the probe and before any step on
+/// `target`: those the config decides, then, when one needs the target's
+/// state, those [`users::query`] reads over `transport`, as the probe runs.
+/// The error is the target's failure, or Cancelled when the transport was.
+pub fn guard_users(
+    transport: &dyn Transport,
+    expanded: &Expanded,
+    target: &Target,
+    facts: &Facts,
+) -> Result<(), Unresolved> {
+    users::check_config(expanded, target, facts)?;
+    let Some(query) = users::query(expanded, target, facts) else {
+        return Ok(());
+    };
+    let output = transport.run(&query, RUN_TIMEOUT)?;
+    match output.code {
+        Some(0) => {}
+        Some(code) => return Err(format!("users: the account query exited {code}").into()),
+        None => {
+            return Err("users: the account query was killed by a signal"
+                .to_owned()
+                .into());
+        }
+    }
+    Ok(users::check_state(expanded, target, facts, &output.stdout)?)
 }
 
 /// Whether `target` matches `item`, whose selector needs `facts` only when it

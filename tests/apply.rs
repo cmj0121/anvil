@@ -4862,8 +4862,8 @@ fn a_symlink_to_the_same_bytes_at_a_tree_file_is_not_unchanged() {
 /// the probe reports `accounts=shadow` with that directory: `getent` reads
 /// `<root>/acct/group` and `passwd`, starting as `group`, and each tool
 /// appends its argv to `<root>/acct/log`, `groupadd` and `groupdel`
-/// changing `group`, and `useradd` and `usermod -s` changing `passwd`, as
-/// the real ones would.
+/// changing `group`, and `useradd`, `usermod -s` and `userdel` changing
+/// `passwd`, as the real ones would.
 fn fake_accounts(sandbox: &Sandbox, group: &str) -> String {
     let acct = sandbox.root().join("acct");
     std::fs::create_dir(&acct).unwrap();
@@ -4883,6 +4883,8 @@ fn fake_accounts(sandbox: &Sandbox, group: &str) -> String {
                   echo \"$1:x:$u:$g::$h:$s\" >>\"$d/passwd\" ;;\n\
                 usermod) [ \"$1\" = -s ] && awk -F: -v OFS=: -v n=\"$3\" -v s=\"$2\" '$1 == n { $7 = s } { print }' \
                   \"$d/passwd\" >\"$d/passwd.new\" && mv \"$d/passwd.new\" \"$d/passwd\" ;;\n\
+                userdel) for n; do :; done; grep -v \"^$n:\" \"$d/passwd\" >\"$d/passwd.new\"; \
+                  mv \"$d/passwd.new\" \"$d/passwd\" ;;\n\
                 esac\n";
     let tools = [
         "useradd", "usermod", "userdel", "groupadd", "groupmod", "groupdel",
@@ -5129,5 +5131,184 @@ fn a_user_on_a_target_without_account_tools_fails_its_step() {
     assert_eq!(
         steps[0]["stderr"],
         "users: no account tools on this target (accounts = none)\n"
+    );
+}
+
+/// The login user of the local target, from the record of an apply that
+/// changes nothing.
+fn login_user(sandbox: &Sandbox, path: &str) -> String {
+    sandbox.write_config(
+        "config.toml",
+        "[[users]]\nname = \"anvil_gone_x\"\nstate = \"absent\"\nsudo = false\n",
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[("PATH", path)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let record = sandbox.last_apply().unwrap();
+    record["targets"]["local"]["facts"]["user"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn an_absent_user_is_removed_and_a_second_apply_changes_nothing() {
+    let sandbox = Sandbox::new("ax");
+    let path = fake_accounts(&sandbox, "old:x:3000:\n");
+    let acct = sandbox.root().join("acct");
+    std::fs::write(
+        acct.join("passwd"),
+        "root:x:0:0::/root:/bin/sh\nold:x:3000:3000::/home/old:/bin/sh\n",
+    )
+    .unwrap();
+    let root = sandbox.root().display().to_string();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[users]]\nname = \"old\"\nstate = \"absent\"\nremove_home = true\nsudo = false\n\
+             notify = [\"log\"]\n\n\
+             [[groups]]\nname = \"old\"\nstate = \"absent\"\nsudo = false\n\n\
+             [[handlers]]\nname = \"log\"\nrun = 'echo log >> {root}/handler.log'\n"
+        ),
+    );
+    let apply = || {
+        let out = sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+        json(&out)["targets"][0]["steps"].clone()
+    };
+    let steps = apply();
+    assert_eq!(steps[0]["run"], "remove user old");
+    assert_eq!(steps[0]["stdout"], "removed user old\n");
+    assert_eq!(steps[0]["changed"], true);
+    assert_eq!(steps[1]["stdout"], "removed group old\n", "users go first");
+    let log = || std::fs::read_to_string(acct.join("log")).unwrap();
+    assert_eq!(log(), "userdel -r old\ngroupdel old\n");
+    let handled = || std::fs::read_to_string(sandbox.root().join("handler.log")).unwrap();
+    assert_eq!(handled(), "log\n");
+
+    let steps = apply();
+    assert_eq!(steps[0]["stdout"], "unchanged user old\n");
+    assert_eq!(steps[0]["changed"], false);
+    assert_eq!(log(), "userdel -r old\ngroupdel old\n", "nothing more ran");
+    assert_eq!(handled(), "log\n");
+}
+
+/// Each refusal fails the target before any step, a group step before the
+/// user included; the local login user is whoever runs the tests.
+#[test]
+fn a_lockout_guard_fails_the_target_before_any_change() {
+    let sandbox = Sandbox::new("ax");
+    let path = fake_accounts(&sandbox, "");
+    let me = login_user(&sandbox, &path);
+    let group = "[[groups]]\nname = \"app\"\nsudo = false\n\n";
+    for (users, wanted) in [
+        (
+            format!("{group}[[users]]\nname = \"{me}\"\nstate = \"absent\"\nsudo = false\n"),
+            format!("users[0] {me}: is the login user"),
+        ),
+        (
+            format!(
+                "{group}[[users]]\nname = \"root\"\nstate = \"absent\"\nforce = true\nsudo = false\n"
+            ),
+            "users[0] root: refused".to_owned(),
+        ),
+        (
+            format!("{group}[[users]]\nname = \"{me}\"\nshell = \"/sbin/nologin\"\nsudo = false\n"),
+            format!("users[0] {me}: shell /sbin/nologin would lock out the login user"),
+        ),
+        (
+            format!(
+                "[[tasks]]\ngroup = {{ name = \"app\", sudo = false }}\n\n\
+                 [[tasks]]\nuser = {{ name = \"{me}\", state = \"absent\", sudo = false }}\n"
+            ),
+            format!("tasks[1].user {me}: is the login user"),
+        ),
+    ] {
+        sandbox.write_config("config.toml", &users);
+        let out = sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        );
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+        let value = json(&out);
+        assert_eq!(value["targets"][0]["error"], wanted.as_str(), "{value}");
+        assert!(value["targets"][0]["steps"].is_null(), "{value}");
+        assert!(!sandbox.root().join("acct/log").exists(), "no tool ran");
+
+        let out = sandbox.anvil(&["--json", "plan"], &[("PATH", &path)]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+        assert_eq!(json(&out)["targets"][0]["error"], wanted.as_str());
+    }
+}
+
+#[test]
+fn a_user_owning_processes_is_removed_only_with_force() {
+    let sandbox = Sandbox::new("ax");
+    let path = fake_accounts(&sandbox, "");
+    let acct = sandbox.root().join("acct");
+    std::fs::write(
+        acct.join("passwd"),
+        "root:x:0:0::/root:/bin/sh\nbusy:x:3000:3000::/home/busy:/bin/sh\n",
+    )
+    .unwrap();
+    let id = format!(
+        "#!/bin/sh\n[ \"$1 $2\" = \"-u busy\" ] && {{ echo 3000; exit 0; }}\nexec {} \"$@\"\n",
+        ["/usr/bin/id", "/bin/id"]
+            .into_iter()
+            .find(|id| std::path::Path::new(id).exists())
+            .unwrap()
+    );
+    for (name, body) in [
+        ("id", id.as_str()),
+        (
+            "pgrep",
+            "#!/bin/sh\necho \"pgrep $*\" >>\"$(dirname \"$0\")/pgrep.log\"\n[ \"$2\" = busy ]\n",
+        ),
+    ] {
+        std::fs::write(acct.join(name), body).unwrap();
+        common::chmod(&acct.join(name), 0o755);
+    }
+    let config = |force: &str| {
+        sandbox.write_config(
+            "config.toml",
+            &format!(
+                "[[groups]]\nname = \"app\"\nsudo = false\n\n\
+                 [[users]]\nname = \"busy\"\nstate = \"absent\"\nsudo = false\n{force}"
+            ),
+        );
+        sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        )
+    };
+    let out = config("");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let value = json(&out);
+    assert_eq!(
+        value["targets"][0]["error"],
+        "users[0] busy: owns running processes"
+    );
+    assert!(!acct.join("log").exists(), "no tool ran");
+    assert_eq!(
+        std::fs::read_to_string(acct.join("pgrep.log")).unwrap(),
+        "pgrep -u busy\n"
+    );
+
+    let out = config("force = true\n");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][1]["stdout"],
+        "removed user busy\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(acct.join("log")).unwrap(),
+        "groupadd app\nuserdel -f busy\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(acct.join("pgrep.log")).unwrap(),
+        "pgrep -u busy\n",
+        "force asks no query"
     );
 }

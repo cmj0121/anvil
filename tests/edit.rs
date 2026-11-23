@@ -1206,6 +1206,11 @@ fn a_bad_file_dir_link_absent_group_or_user_entry_exits_two_naming_it() {
             &["config"][..],
             "users[1].name `deploy`: same name as users[0]",
         ),
+        (
+            "invalid/config-users-shell-on-absent.toml",
+            &["config"][..],
+            "users[0].shell: not with state = \"absent\"",
+        ),
     ] {
         let sb = sandbox();
         let original = "[packages]\n";

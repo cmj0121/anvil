@@ -1457,3 +1457,18 @@ fn a_user_shows_its_desired_state_from_the_config_alone() {
         "user deploy (uid 2000, group app, groups docker, shell /bin/bash)"
     );
 }
+
+#[test]
+fn a_user_to_remove_shows_from_the_config_alone() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.write_config(
+        "config.toml",
+        "[[users]]\nname = \"olduser\"\nstate = \"absent\"\nsudo = false\n",
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][0]["run"],
+        "remove user olduser"
+    );
+}

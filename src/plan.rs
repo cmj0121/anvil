@@ -41,6 +41,7 @@ use crate::status;
 use crate::step::{PlannedRun, RunKind};
 use crate::tasks::Expanded;
 use crate::transport::{Transport, TransportError};
+use crate::users;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
@@ -737,6 +738,7 @@ fn plan_target(
         .map_err(|err| Unresolved::Failed(err.to_string()))
         .and_then(|transport| engine::probe(transport.as_ref(), expanded))
         .and_then(|facts| {
+            users::check_config(expanded, target, &facts)?;
             let steps = engine::resolve(
                 target,
                 Some(&facts),
