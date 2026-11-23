@@ -1405,3 +1405,28 @@ fn a_file_built_from_secrets_is_shown_unrendered_without_opening_the_store() {
         assert!(!text(&out.stderr).contains("missing-key.txt"));
     }
 }
+
+#[test]
+fn a_group_shows_its_desired_state_from_the_config_alone() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.write_config(
+        "config.toml",
+        "[[groups]]\nname = \"old\"\nstate = \"absent\"\nsudo = false\n\n\
+         [[groups]]\nname = \"app\"\ngid = 2000\nsystem = true\nsudo = false\nnotify = [\"h\"]\n\n\
+         [[groups]]\nname = \"web\"\ntags = [\"web\"]\n\n\
+         [[handlers]]\nname = \"h\"\nrun = \"true\"\n",
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert_eq!(
+        stdout,
+        "▶ local\n  would group app (gid 2000, system)\n    notifies h\n  \
+         would $ skipped group web: no match\n  would remove group old\n  \
+         would $ hostname\n  ✔ 4 steps\n\n1 target, nothing executed\n"
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    let steps = &json(&out)["targets"][0]["steps"];
+    assert_eq!(steps[0]["run"], "group app (gid 2000, system)");
+    assert_eq!(steps[2]["run"], "remove group old");
+}

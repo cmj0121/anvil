@@ -1,0 +1,4 @@
+[[groups]]
+name = "old"
+state = "absent"
+gid = 2000

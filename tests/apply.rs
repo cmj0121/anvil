@@ -4857,3 +4857,149 @@ fn a_symlink_to_the_same_bytes_at_a_tree_file_is_not_unchanged() {
             .is_symlink()
     );
 }
+
+/// Stand-in shadow-utils in `<root>/acct`, first on the returned `PATH`, so
+/// the probe reports `accounts=shadow` with that directory: `getent` reads
+/// `<root>/acct/group` and `passwd`, starting as `group`, and each tool
+/// appends its argv to `<root>/acct/log`, `groupadd` and `groupdel`
+/// changing `group` as the real ones would.
+fn fake_accounts(sandbox: &Sandbox, group: &str) -> String {
+    let acct = sandbox.root().join("acct");
+    std::fs::create_dir(&acct).unwrap();
+    std::fs::write(acct.join("group"), group).unwrap();
+    std::fs::write(acct.join("passwd"), "root:x:0:0::/root:/bin/sh\n").unwrap();
+    let getent = "#!/bin/sh\nd=$(dirname \"$0\")\n[ $# -eq 1 ] && exec cat \"$d/$1\"\n\
+                  awk -F: -v k=\"$2\" '$1 == k || $3 == k { print; f = 1 } END { exit f ? 0 : 2 }' \"$d/$1\"\n";
+    let tool = "#!/bin/sh\nd=$(dirname \"$0\")\necho \"${0##*/} $*\" >>\"$d/log\"\n\
+                case ${0##*/} in\n\
+                groupadd) g=1234; [ \"$1\" = -g ] && { g=$2; shift 2; }; echo \"$1:x:$g:\" >>\"$d/group\" ;;\n\
+                groupdel) grep -v \"^$1:\" \"$d/group\" >\"$d/group.new\"; mv \"$d/group.new\" \"$d/group\" ;;\n\
+                esac\n";
+    let tools = [
+        "useradd", "usermod", "userdel", "groupadd", "groupmod", "groupdel",
+    ];
+    for (name, body) in std::iter::once(("getent", getent)).chain(tools.map(|name| (name, tool))) {
+        std::fs::write(acct.join(name), body).unwrap();
+        common::chmod(&acct.join(name), 0o755);
+    }
+    format!("{}:{}", acct.display(), std::env::var("PATH").unwrap())
+}
+
+#[test]
+fn groups_run_after_packages_before_dirs_and_a_second_apply_changes_nothing() {
+    let sandbox = Sandbox::new("ag");
+    let path = fake_accounts(&sandbox, "old:x:3000:\n");
+    let root = sandbox.root().display().to_string();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[dirs]]\npath = \"{root}/app\"\nmode = \"0750\"\nsudo = false\n\n\
+             [[groups]]\nname = \"old\"\nstate = \"absent\"\nsudo = false\n\n\
+             [[groups]]\nname = \"app\"\ngid = 2000\nsudo = false\nnotify = [\"log\"]\n\n\
+             [[handlers]]\nname = \"log\"\nrun = 'echo log >> {root}/handler.log'\n"
+        ),
+    );
+    let apply = || {
+        let out = sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+        json(&out)["targets"][0]["steps"].clone()
+    };
+    let steps = apply();
+    let shown = |i: usize| {
+        (
+            steps[i]["run"].clone(),
+            steps[i]["stdout"].clone(),
+            steps[i]["changed"].clone(),
+        )
+    };
+    assert_eq!(
+        shown(0),
+        (
+            "group app (gid 2000)".into(),
+            "created group app\n".into(),
+            true.into()
+        )
+    );
+    assert_eq!(
+        shown(1),
+        (
+            "remove group old".into(),
+            "removed group old\n".into(),
+            true.into()
+        )
+    );
+    assert_eq!(steps[2]["run"], format!("dir {root}/app"));
+    let acct = sandbox.root().join("acct");
+    let log = || std::fs::read_to_string(acct.join("log")).unwrap();
+    assert_eq!(log(), "groupadd -g 2000 app\ngroupdel old\n");
+    assert_eq!(
+        std::fs::read_to_string(acct.join("group")).unwrap(),
+        "app:x:2000:\n"
+    );
+    let handled = || std::fs::read_to_string(sandbox.root().join("handler.log")).unwrap();
+    assert_eq!(handled(), "log\n");
+    let record = sandbox.last_apply().unwrap();
+    let cannot_undo = &record["targets"]["local"]["cannot_undo"];
+    assert_eq!(cannot_undo[0], "group app", "{record}");
+    assert_eq!(cannot_undo[1], "group old", "{record}");
+
+    let steps = apply();
+    let shown = |i: usize| (steps[i]["stdout"].clone(), steps[i]["changed"].clone());
+    assert_eq!(shown(0), ("unchanged group app\n".into(), false.into()));
+    assert_eq!(shown(1), ("unchanged group old\n".into(), false.into()));
+    assert_eq!(
+        log(),
+        "groupadd -g 2000 app\ngroupdel old\n",
+        "nothing more ran"
+    );
+    assert_eq!(handled(), "log\n", "unchanged does not notify");
+}
+
+#[test]
+fn a_group_the_target_does_not_match_is_skipped() {
+    let sandbox = Sandbox::new("ag");
+    let path = fake_accounts(&sandbox, "");
+    sandbox.write_config(
+        "config.toml",
+        "[[groups]]\nname = \"app\"\ntags = [\"web\"]\n\n\
+         [[groups]]\nname = \"db\"\nsudo = false\nfacts = { accounts = \"busybox\" }\n",
+    );
+    let out = sandbox.anvil(
+        &["--json", "apply", "--target", "local"],
+        &[("PATH", &path)],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let value = json(&out);
+    let steps = &value["targets"][0]["steps"];
+    for (i, line) in ["skipped group app: no match", "skipped group db: no match"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(steps[i]["run"], line, "{value}");
+        assert_eq!(steps[i]["skipped"], true, "{value}");
+    }
+    assert!(!sandbox.root().join("acct/log").exists(), "no tool ran");
+}
+
+/// macOS has neither shadow-utils nor busybox: the group step fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_group_on_a_target_without_account_tools_fails_its_step() {
+    let sandbox = Sandbox::new("ag");
+    sandbox.write_config(
+        "config.toml",
+        "[[groups]]\nname = \"app\"\nsudo = false\n\n[[steps]]\nrun = \"true\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let value = json(&out);
+    let steps = value["targets"][0]["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1, "{value}");
+    assert_eq!(
+        steps[0]["stderr"],
+        "groups: no account tools on this target (accounts = none)\n"
+    );
+}

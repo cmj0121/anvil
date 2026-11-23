@@ -25,6 +25,8 @@ pub const KEYS: &[&str] = &[
     "shell",
     "pkg",
     "sudo",
+    "accounts",
+    "accounts_bin",
 ];
 
 /// Facts reported by one target, keyed as the probe prints them.
