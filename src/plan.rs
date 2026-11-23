@@ -902,7 +902,8 @@ pub fn render(report: &PlanReport, show: Show, sources: &Sources, hashes: &Hashe
 /// A file entry with `secrets` is
 /// `would write DEST (secret: NAME, NAME; rendered at apply)` instead, and a
 /// group step that runs is `would group NAME (gid N)` or `would remove group
-/// NAME`, from the config alone.
+/// NAME`, and a user step `would user NAME (uid N, shell PATH)`, from the
+/// config alone.
 pub fn would_text(step: &PlannedRun) -> String {
     let binary = if step.binary() { " (binary)" } else { "" };
     let secret = step
@@ -920,7 +921,9 @@ pub fn would_text(step: &PlannedRun) -> String {
             write.dest,
             file.names.join(", ")
         ),
-        None if step.group().is_some_and(|group| !group.skip) => {
+        None if step.group().is_some_and(|group| !group.skip)
+            || step.user().is_some_and(|user| !user.skip) =>
+        {
             format!("would {}{secret}", step.shown())
         }
         None => format!(

@@ -4862,7 +4862,8 @@ fn a_symlink_to_the_same_bytes_at_a_tree_file_is_not_unchanged() {
 /// the probe reports `accounts=shadow` with that directory: `getent` reads
 /// `<root>/acct/group` and `passwd`, starting as `group`, and each tool
 /// appends its argv to `<root>/acct/log`, `groupadd` and `groupdel`
-/// changing `group` as the real ones would.
+/// changing `group`, and `useradd` and `usermod -s` changing `passwd`, as
+/// the real ones would.
 fn fake_accounts(sandbox: &Sandbox, group: &str) -> String {
     let acct = sandbox.root().join("acct");
     std::fs::create_dir(&acct).unwrap();
@@ -4874,6 +4875,14 @@ fn fake_accounts(sandbox: &Sandbox, group: &str) -> String {
                 case ${0##*/} in\n\
                 groupadd) g=1234; [ \"$1\" = -g ] && { g=$2; shift 2; }; echo \"$1:x:$g:\" >>\"$d/group\" ;;\n\
                 groupdel) grep -v \"^$1:\" \"$d/group\" >\"$d/group.new\"; mv \"$d/group.new\" \"$d/group\" ;;\n\
+                useradd) u=1001; g=100; s=/bin/sh; h=\n\
+                  while [ $# -gt 1 ]; do case $1 in\n\
+                  -u) u=$2; shift ;; -s) s=$2; shift ;; -d) h=$2; shift ;;\n\
+                  -g) g=$(awk -F: -v k=\"$2\" '$1 == k { print $3 }' \"$d/group\"); shift ;;\n\
+                  esac; shift; done\n\
+                  echo \"$1:x:$u:$g::$h:$s\" >>\"$d/passwd\" ;;\n\
+                usermod) [ \"$1\" = -s ] && awk -F: -v OFS=: -v n=\"$3\" -v s=\"$2\" '$1 == n { $7 = s } { print }' \
+                  \"$d/passwd\" >\"$d/passwd.new\" && mv \"$d/passwd.new\" \"$d/passwd\" ;;\n\
                 esac\n";
     let tools = [
         "useradd", "usermod", "userdel", "groupadd", "groupmod", "groupdel",
@@ -5001,5 +5010,124 @@ fn a_group_on_a_target_without_account_tools_fails_its_step() {
     assert_eq!(
         steps[0]["stderr"],
         "groups: no account tools on this target (accounts = none)\n"
+    );
+}
+
+#[test]
+fn users_run_after_present_groups_and_a_group_made_the_same_run_counts() {
+    let sandbox = Sandbox::new("au");
+    let path = fake_accounts(&sandbox, "");
+    let user = |shell: &str| {
+        sandbox.write_config(
+            "config.toml",
+            &format!(
+                "[[users]]\nname = \"deploy\"\nuid = 2000\ngroup = \"app\"\nshell = \"{shell}\"\n\
+                 sudo = false\nnotify = [\"log\"]\n\n\
+                 [[users]]\nname = \"web\"\ntags = [\"web\"]\n\n\
+                 [[groups]]\nname = \"app\"\ngid = 2000\nsudo = false\n\n\
+                 [[handlers]]\nname = \"log\"\nrun = 'echo log >> {}/handler.log'\n",
+                sandbox.root().display()
+            ),
+        );
+    };
+    let apply = || {
+        let out = sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+        json(&out)["targets"][0]["steps"].clone()
+    };
+    user("/bin/sh");
+    let steps = apply();
+    let shown = |i: usize| {
+        (
+            steps[i]["run"].clone(),
+            steps[i]["stdout"].clone(),
+            steps[i]["changed"].clone(),
+        )
+    };
+    assert_eq!(shown(0).1, "created group app\n");
+    assert_eq!(
+        shown(1),
+        (
+            "user deploy (uid 2000, group app, shell /bin/sh)".into(),
+            "created user deploy\n".into(),
+            true.into()
+        )
+    );
+    assert_eq!(steps[2]["run"], "skipped user web: no match");
+    assert_eq!(steps[2]["skipped"], true);
+    let acct = sandbox.root().join("acct");
+    let log = || std::fs::read_to_string(acct.join("log")).unwrap();
+    assert_eq!(
+        log(),
+        "groupadd -g 2000 app\nuseradd -u 2000 -g app -s /bin/sh -d /home/deploy -m deploy\n"
+    );
+    let handled = || std::fs::read_to_string(sandbox.root().join("handler.log")).unwrap();
+    assert_eq!(handled(), "log\n");
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["cannot_undo"][1], "user deploy",
+        "{record}"
+    );
+
+    user("/bin/bash");
+    let steps = apply();
+    assert_eq!(steps[1]["stdout"], "fixed user deploy: shell\n");
+    assert_eq!(steps[1]["changed"], true);
+    assert!(
+        log().ends_with("usermod -s /bin/bash deploy\n"),
+        "{}",
+        log()
+    );
+    assert_eq!(handled(), "log\nlog\n");
+
+    let before = log();
+    let steps = apply();
+    assert_eq!(steps[1]["stdout"], "unchanged user deploy\n");
+    assert_eq!(steps[1]["changed"], false);
+    assert_eq!(log(), before, "nothing more ran");
+    assert_eq!(handled(), "log\nlog\n", "unchanged does not notify");
+}
+
+#[test]
+fn a_user_whose_group_is_on_no_target_fails_its_step_before_any_change() {
+    let sandbox = Sandbox::new("au");
+    let path = fake_accounts(&sandbox, "");
+    sandbox.write_config(
+        "config.toml",
+        "[[users]]\nname = \"deploy\"\ngroups = [\"nope\"]\nsudo = false\n",
+    );
+    let out = sandbox.anvil(
+        &["--json", "apply", "--target", "local"],
+        &[("PATH", &path)],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let value = json(&out);
+    assert_eq!(
+        value["targets"][0]["steps"][0]["stderr"],
+        "users[0] deploy: group nope does not exist on this target\n"
+    );
+    assert!(!sandbox.root().join("acct/log").exists(), "no tool ran");
+}
+
+/// macOS has neither shadow-utils nor busybox: the user step fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_user_on_a_target_without_account_tools_fails_its_step() {
+    let sandbox = Sandbox::new("au");
+    sandbox.write_config(
+        "config.toml",
+        "[[users]]\nname = \"deploy\"\nsudo = false\n\n[[steps]]\nrun = \"true\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let value = json(&out);
+    let steps = value["targets"][0]["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1, "{value}");
+    assert_eq!(
+        steps[0]["stderr"],
+        "users: no account tools on this target (accounts = none)\n"
     );
 }

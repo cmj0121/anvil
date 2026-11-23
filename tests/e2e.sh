@@ -1166,6 +1166,53 @@ else
 fi
 docker exec "$NAME" sh -c 'for g in anvil-e2e anvil-e2e-sys; do groupdel "$g" 2>/dev/null; done; :'
 
+step "(z) [[users]] on arch (shadow, NOPASSWD): deploy created in a group made the same run, its shell fixed, then unchanged"
+US_DIR="$TMP/users"
+mkdir -p "$US_DIR"
+us_config() {
+  cat >"$US_DIR/config.toml" <<CONF
+[[groups]]
+name = "anvil-e2e-users"
+
+[[users]]
+name = "deploy"
+groups = ["anvil-e2e-users"]
+shell = "$1"
+CONF
+}
+us_anvil() {
+  run_env XDG_STATE_HOME="$TMP/state-users" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$US_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+us_shell() { docker exec "$NAME" getent passwd deploy | cut -d: -f7; }
+docker exec "$NAME" sh -c 'userdel -r deploy 2>/dev/null; groupdel anvil-e2e-users 2>/dev/null; :'
+us_config /bin/sh
+us_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  created user deploy' "$TMP/out" \
+  && [ "$(us_shell)" = /bin/sh ] && docker exec "$NAME" id -Gn deploy | grep -qw anvil-e2e-users \
+  && docker exec "$NAME" test -d /home/deploy; then
+  pass "apply created deploy with its home, in the group created before it"
+else
+  fail "apply of users: exit $code"
+fi
+us_config /bin/bash
+us_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  fixed user deploy: shell' "$TMP/out" && [ "$(us_shell)" = /bin/bash ]; then
+  pass "a changed shell is fixed, naming only the shell"
+else
+  fail "shell fix: exit $code"
+fi
+us_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged user deploy' "$TMP/out" && ! grep -qE '(created|fixed) (user|group)' "$TMP/out"; then
+  pass "a third apply changes no user"
+else
+  fail "third apply of users: exit $code"
+fi
+docker exec "$NAME" sh -c 'userdel -r deploy 2>/dev/null; groupdel anvil-e2e-users 2>/dev/null; :'
+
 step "(x) a recursive [[files]] tree on arch (NOPASSWD): owner, group, mode and dir_mode on a nested tree into an existing dir; rollback removes what it created"
 TR_STATE="$TMP/state-tree"
 TR_DIR="$TMP/tree"
@@ -1591,6 +1638,46 @@ CONF
     pass "busybox: a second apply changes no group"
   else
     fail "second apply of groups on alpine: exit $code"
+  fi
+  # No CAP_CHOWN in this container: adduser could not hand a new home over.
+  alp_users() {
+    cat >"$ALP_DIR/users.toml" <<CONF
+[[groups]]
+name = "anvil-e2e-users"
+
+[[users]]
+name = "deploy"
+groups = ["anvil-e2e-users"]
+shell = "$1"
+create_home = false
+CONF
+    run_env XDG_STATE_HOME="$TMP/state-alpine" "$ANVIL" --ssh-program "$ALP_DIR/ssh" \
+      --inventory "$ALP_DIR/inventory.toml" --config "$ALP_DIR/users.toml" -vv apply --target alpine \
+      </dev/null >"$TMP/out" 2>"$TMP/err"
+  }
+  alp_users /bin/sh
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  created user deploy' "$TMP/out" \
+    && docker exec "$ALP_NAME" grep -q '^deploy:x:[0-9]*:[0-9]*:[^:]*:/home/deploy:/bin/sh$' /etc/passwd \
+    && docker exec "$ALP_NAME" grep -q '^anvil-e2e-users:x:[0-9]*:deploy$' /etc/group; then
+    pass "busybox: adduser created deploy, addgroup put it in the group made the same run"
+  else
+    fail "apply of users on alpine: exit $code"
+  fi
+  alp_users /bin/ash
+  code=$?
+  if [ "$code" -eq 1 ] && grep -qF 'users[0] deploy: busybox cannot change shell; install shadow' "$TMP/err" \
+    && docker exec "$ALP_NAME" grep -q '^deploy:.*:/bin/sh$' /etc/passwd; then
+    pass "busybox: a shell change is refused, naming the field, and nothing changes"
+  else
+    fail "busybox shell change on alpine: exit $code"
+  fi
+  alp_users /bin/sh
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  unchanged user deploy' "$TMP/out" && ! grep -qE '(created|fixed) (user|group)' "$TMP/out"; then
+    pass "busybox: a further apply changes no user"
+  else
+    fail "further apply of users on alpine: exit $code"
   fi
   docker rm -f "$ALP_NAME" >/dev/null 2>&1
 else

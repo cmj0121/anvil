@@ -21,9 +21,9 @@
 //! change which manager or facts a later task sees.
 //!
 //! The fixed order is packages, the `[[groups]]` to create or fix, the
-//! `[[groups]]` to remove, `[[dirs]]`, `[[files]]`, `[[links]]`, `[[absent]]`,
-//! `[[services]]`, `[[steps]]`, then the handlers. A group step is not
-//! recorded for rollback.
+//! `[[users]]`, the `[[groups]]` to remove, `[[dirs]]`, `[[files]]`,
+//! `[[links]]`, `[[absent]]`, `[[services]]`, `[[steps]]`, then the
+//! handlers. A group or user step is not recorded for rollback.
 //!
 //! Each `[[files]]` entry is one step after the package and `[[dirs]]`
 //! steps, before `[[links]]`: it copies its src when the target matches, else it is
