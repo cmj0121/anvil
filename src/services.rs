@@ -22,6 +22,7 @@ use crate::facts::Facts;
 use crate::files::{self, quote};
 use crate::inventory::Target;
 use crate::packages::Manager;
+use crate::remote::fail;
 use crate::secret;
 use crate::step::{PlannedRun, RunKind, ServiceRun};
 use crate::tasks::Item;
@@ -262,11 +263,6 @@ fn reload_if_up(name: &str, command: &str) -> String {
         act(name, true, command),
         quote(&format!("service {name} is not running; not reloaded"))
     )
-}
-
-/// `message` on stderr, then exit 1.
-fn fail(message: &str) -> String {
-    format!("{{ echo {} >&2; exit 1; }}", quote(message))
 }
 
 /// `command` with its stdout on stderr, then each of `lines` on stdout,

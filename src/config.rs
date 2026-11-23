@@ -1333,48 +1333,26 @@ impl Config {
     /// The `[[groups]]` syntax rules, and no name written twice; whether a
     /// target has the group is asked only when `apply` runs.
     fn check_groups(&self) -> Result<(), String> {
-        if self.groups.len() > MAX_GROUPS {
-            return Err(format!(
-                "groups: {} entries exceeds the {MAX_GROUPS} entry limit",
-                self.groups.len()
-            ));
-        }
-        for (i, entry) in self.groups.iter().enumerate() {
-            let prefix = format!("groups[{i}]");
-            check_group(&prefix, entry)?;
-            check_notify(&prefix, &entry.notify, &self.handlers)?;
-            if let Some(j) = (self.groups[..i].iter()).position(|other| other.name == entry.name) {
-                return Err(format!(
-                    "{prefix}.name `{}`: same name as groups[{j}]",
-                    entry.name
-                ));
-            }
-        }
-        Ok(())
+        check_named_list(
+            ("groups", MAX_GROUPS),
+            &self.groups,
+            &self.handlers,
+            check_group,
+            |entry| (&entry.name, &entry.notify),
+        )
     }
 
     /// The `[[users]]` syntax rules, and no name written twice; whether a
     /// target has the groups and the shell is asked only when `apply` runs,
     /// after the `[[groups]]` that may create them.
     fn check_users(&self) -> Result<(), String> {
-        if self.users.len() > MAX_USERS {
-            return Err(format!(
-                "users: {} entries exceeds the {MAX_USERS} entry limit",
-                self.users.len()
-            ));
-        }
-        for (i, entry) in self.users.iter().enumerate() {
-            let prefix = format!("users[{i}]");
-            check_user(&prefix, entry)?;
-            check_notify(&prefix, &entry.notify, &self.handlers)?;
-            if let Some(j) = (self.users[..i].iter()).position(|other| other.name == entry.name) {
-                return Err(format!(
-                    "{prefix}.name `{}`: same name as users[{j}]",
-                    entry.name
-                ));
-            }
-        }
-        Ok(())
+        check_named_list(
+            ("users", MAX_USERS),
+            &self.users,
+            &self.handlers,
+            check_user,
+            |entry| (&entry.name, &entry.notify),
+        )
     }
 
     /// The `[[dirs]]` syntax rules; nothing here touches the filesystem.
@@ -1733,6 +1711,36 @@ fn check_script(key: &str, script: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The rules of the `section` list, `max` entries at most: each entry's
+/// own (`check`), its notify, and no name written twice; `named` gives an
+/// entry's name and notify.
+fn check_named_list<T>(
+    (section, max): (&str, usize),
+    list: &[T],
+    handlers: &[Handler],
+    check: fn(&str, &T) -> Result<(), String>,
+    named: fn(&T) -> (&String, &Vec<String>),
+) -> Result<(), String> {
+    if list.len() > max {
+        return Err(format!(
+            "{section}: {} entries exceeds the {max} entry limit",
+            list.len()
+        ));
+    }
+    for (i, entry) in list.iter().enumerate() {
+        let prefix = format!("{section}[{i}]");
+        check(&prefix, entry)?;
+        let (name, notify) = named(entry);
+        check_notify(&prefix, notify, handlers)?;
+        if let Some(j) = (list[..i].iter()).position(|other| named(other).0 == name) {
+            return Err(format!(
+                "{prefix}.name `{name}`: same name as {section}[{j}]"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Every `notify` name names a `[[handlers]]` entry; `prefix` names the owner.
 fn check_notify(prefix: &str, notify: &[String], handlers: &[Handler]) -> Result<(), String> {
     match notify
@@ -1992,6 +2000,11 @@ fn check_account(prefix: &str, key: &str, value: Option<&str>) -> Result<(), Str
     }
 }
 
+/// Whether a `group` names a gid: it is digits only.
+pub(crate) fn is_gid(value: &str) -> bool {
+    value.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// A user or group name: `[a-z_][a-z0-9_.-]*` of 1 to 32 bytes.
 pub(crate) fn is_account_name(value: &str) -> bool {
     let mut bytes = value.bytes();
@@ -2015,24 +2028,40 @@ pub(crate) fn check_group(prefix: &str, entry: &GroupEntry) -> Result<(), String
     {
         return Err(format!("{prefix}.gid `{gid}`: must be 1 to {MAX_GID}"));
     }
-    match entry.state.as_deref() {
-        None | Some("present" | "absent") => {}
-        Some(state) => {
-            return Err(format!(
-                "{prefix}.state `{}`: must be present or absent",
-                escape_controls(state)
-            ));
-        }
-    }
-    if entry.absent() {
-        if entry.gid.is_some() {
-            return Err(format!("{prefix}.gid: not with state = \"absent\""));
-        }
-        if entry.system {
-            return Err(format!("{prefix}.system: not with state = \"absent\""));
-        }
-    }
+    check_state(prefix, entry.state.as_deref())?;
+    let present_only = [("gid", entry.gid.is_some()), ("system", entry.system)];
+    check_state_keys(prefix, entry.absent(), &present_only, &[])?;
     check_selector(prefix, &entry.tags, &entry.facts)
+}
+
+/// An account entry's `state`: unset, `present` or `absent`.
+fn check_state(prefix: &str, state: Option<&str>) -> Result<(), String> {
+    match state {
+        None | Some("present" | "absent") => Ok(()),
+        Some(state) => Err(format!(
+            "{prefix}.state `{}`: must be present or absent",
+            escape_controls(state)
+        )),
+    }
+}
+
+/// The first of the `present_only` keys set on an `absent` entry, or of
+/// the `absent_only` keys set on another, refused.
+fn check_state_keys(
+    prefix: &str,
+    absent: bool,
+    present_only: &[(&str, bool)],
+    absent_only: &[(&str, bool)],
+) -> Result<(), String> {
+    let (refused, why) = if absent {
+        (present_only, "not with state = \"absent\"")
+    } else {
+        (absent_only, "only with state = \"absent\"")
+    };
+    match refused.iter().find(|(_, set)| *set) {
+        Some((key, _)) => Err(format!("{prefix}.{key}: {why}")),
+        None => Ok(()),
+    }
 }
 
 /// One user entry's rules; `prefix` names it, as `users[0]`.
@@ -2050,7 +2079,7 @@ pub(crate) fn check_user(prefix: &str, entry: &UserEntry) -> Result<(), String> 
         return Err(format!("{prefix}.uid `{uid}`: must be 1 to {MAX_UID}"));
     }
     if let Some(group) = &entry.group {
-        let gid = group.bytes().all(|b| b.is_ascii_digit())
+        let gid = is_gid(group)
             && group
                 .parse::<i64>()
                 .is_ok_and(|gid| (0..=MAX_GID).contains(&gid));
@@ -2109,15 +2138,7 @@ pub(crate) fn check_user(prefix: &str, entry: &UserEntry) -> Result<(), String> 
             escape_controls(comment)
         ));
     }
-    match entry.state.as_deref() {
-        None | Some("present" | "absent") => {}
-        Some(state) => {
-            return Err(format!(
-                "{prefix}.state `{}`: must be present or absent",
-                escape_controls(state)
-            ));
-        }
-    }
+    check_state(prefix, entry.state.as_deref())?;
     let absent_only = [("remove_home", entry.remove_home), ("force", entry.force)];
     let present_only = [
         ("uid", entry.uid.is_some()),
@@ -2132,14 +2153,7 @@ pub(crate) fn check_user(prefix: &str, entry: &UserEntry) -> Result<(), String> 
         ("authorized_keys", entry.authorized_keys.is_some()),
         ("exclusive_keys", entry.exclusive_keys),
     ];
-    let (refused, why) = if entry.absent() {
-        (present_only.as_slice(), "not with state = \"absent\"")
-    } else {
-        (absent_only.as_slice(), "only with state = \"absent\"")
-    };
-    if let Some((key, _)) = refused.iter().find(|(_, set)| *set) {
-        return Err(format!("{prefix}.{key}: {why}"));
-    }
+    check_state_keys(prefix, entry.absent(), &present_only, &absent_only)?;
     check_selector(prefix, &entry.tags, &entry.facts)
 }
 
@@ -2530,27 +2544,27 @@ pub(crate) fn check_tasks(
                 "{path}.service: notify belongs on the task, not the service"
             ));
         }
-        if let Some(group) = &task.group {
-            if !group.notify.is_empty() {
+        let accounts = [
+            (
+                "group",
+                (task.group.as_ref()).map(|e| (&e.notify, &e.tags, &e.facts)),
+            ),
+            (
+                "user",
+                (task.user.as_ref()).map(|e| (&e.notify, &e.tags, &e.facts)),
+            ),
+        ];
+        for (noun, (notify, tags, facts)) in
+            (accounts.into_iter()).filter_map(|(noun, entry)| Some((noun, entry?)))
+        {
+            if !notify.is_empty() {
                 return Err(format!(
-                    "{path}.group: notify belongs on the task, not the group"
+                    "{path}.{noun}: notify belongs on the task, not the {noun}"
                 ));
             }
-            if !group.tags.is_empty() || !group.facts.is_empty() {
+            if !tags.is_empty() || !facts.is_empty() {
                 return Err(format!(
-                    "{path}.group: tags and facts belong on the task, not the group"
-                ));
-            }
-        }
-        if let Some(user) = &task.user {
-            if !user.notify.is_empty() {
-                return Err(format!(
-                    "{path}.user: notify belongs on the task, not the user"
-                ));
-            }
-            if !user.tags.is_empty() || !user.facts.is_empty() {
-                return Err(format!(
-                    "{path}.user: tags and facts belong on the task, not the user"
+                    "{path}.{noun}: tags and facts belong on the task, not the {noun}"
                 ));
             }
         }

@@ -53,7 +53,7 @@ use crate::template;
 use crate::transport::{Output, RUN_TIMEOUT};
 use crate::tree::{self, Tree, TreeItem};
 use crate::trust::{self, TrustError};
-use crate::users::{KeysWrite, StoreKeys};
+use crate::users::{KeysWrite, StoreKeys, wrapped};
 
 /// Each file item's src, by ordinal, and the user items' `authorized_keys`
 /// read from the store.
@@ -367,6 +367,24 @@ pub fn sudo_secret_for<'a>(config: &'a Config, target: &'a Target) -> Option<&'a
         .map_or(target.sudo_secret.as_deref(), |p| p.sudo_secret_for(target))
 }
 
+/// How a step whose entry says `sudo` runs on a target whose login has
+/// `facts`: `"sudo "` with the secret that holds the password sudo asks
+/// for, else `""` on a root login or without `sudo`, else `"sudo -n "`.
+pub(crate) fn sudo_for<'a>(
+    config: &'a Config,
+    target: &'a Target,
+    facts: &Facts,
+    sudo: bool,
+) -> (&'static str, Option<&'a str>) {
+    let secret = sudo_secret_for(config, target).filter(|_| sudo && facts.sudo_asks_password());
+    let prefix = match secret {
+        Some(_) => "sudo ",
+        None if facts.is_root() || !sudo => "",
+        None => "sudo -n ",
+    };
+    (prefix, secret)
+}
+
 /// The steps of file `item` for `target`: a skip when it does not match,
 /// else the tee script, or the password path's when sudo asks for a password
 /// and a secret holds it; a `recursive = true` entry has one per item of its
@@ -423,21 +441,15 @@ pub fn run(
         !root && !entry.sudo,
         facts,
     )?;
-    let secret =
-        sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
-    let (sudo, password) = match secret {
-        Some(name) => {
-            log::info!(
-                "{}: {label} {dest}, sudo password from secret {name}",
-                target.name
-            );
-            ("sudo ", true)
-        }
-        None => {
-            log::info!("{}: {label} {dest}", target.name);
-            (if root || !entry.sudo { "" } else { "sudo -n " }, false)
-        }
-    };
+    let (sudo, secret) = sudo_for(config, target, facts, entry.sudo);
+    match secret {
+        Some(name) => log::info!(
+            "{}: {label} {dest}, sudo password from secret {name}",
+            target.name
+        ),
+        None => log::info!("{}: {label} {dest}", target.name),
+    }
+    let password = secret.is_some();
     let base = FileWrite {
         ordinal: i,
         dest: String::new(),
@@ -645,12 +657,7 @@ fn render_entry(
             return Err("rendered output contains a NUL byte".to_owned());
         }
         if secrets.is_empty() {
-            let sha256 = hex(&Sha256::digest(text.as_bytes()));
-            return Ok(Box::new(Rendered {
-                text,
-                sha256,
-                scrub: Vec::new(),
-            }));
+            return Ok(Rendered::plain(text));
         }
         let mut scrub: Vec<Zeroizing<String>> = secrets.values().cloned().collect();
         scrub.extend(render.encoded);
@@ -686,6 +693,18 @@ pub struct Rendered {
 pub struct SecretFile {
     pub label: String,
     pub names: Vec<String>,
+}
+
+impl Rendered {
+    /// `text` with its hash and nothing to scrub: no secret is in it.
+    pub(crate) fn plain(text: Zeroizing<String>) -> Box<Rendered> {
+        let sha256 = hex(&Sha256::digest(text.as_bytes()));
+        Box::new(Rendered {
+            text,
+            sha256,
+            scrub: Vec::new(),
+        })
+    }
 }
 
 /// By hand: the length only, never the text or, since the file's mode may
@@ -740,7 +759,7 @@ pub struct FileWrite {
     pub secret: Option<Box<SecretFile>>,
     /// For a user's `authorized_keys`, its keys and whom it is written as:
     /// the bytes are [`KeysWrite::merged`] into `rendered` once the capture
-    /// read the file, and every run goes through [`KeysWrite::wrapped`].
+    /// read the file, and every run goes through [`wrapped`].
     pub keys: Option<Box<KeysWrite>>,
 }
 
@@ -865,7 +884,7 @@ impl FileWrite {
     pub(crate) fn capture(&self) -> Zeroizing<String> {
         let script = capture_any(&self.dest, &self.sudo, &self.checks, self.keys.is_some());
         match &self.keys {
-            Some(keys) => keys.wrapped(&script),
+            Some(keys) => wrapped(&keys.wrap, &script),
             None => Zeroizing::new(script),
         }
     }
@@ -875,8 +894,7 @@ impl FileWrite {
     pub(crate) fn merged(&self, captured: &Captured) -> Option<Result<FileWrite, String>> {
         let keys = self.keys.as_ref()?;
         Some(keys.merged(&self.dest, captured).map(|text| FileWrite {
-            rendered: Some(crate::users::rendered(text)),
-            keys: Some(keys.clone()),
+            rendered: Some(Rendered::plain(Zeroizing::new(text))),
             ..self.clone()
         }))
     }
@@ -1034,7 +1052,7 @@ pub(crate) fn write_script(
     if !step.password {
         let script = tee_script(bytes, step, expected)?;
         let script = match &step.keys {
-            Some(keys) => keys.wrapped(&script),
+            Some(keys) => wrapped(&keys.wrap, &script),
             None => script,
         };
         return Ok((script, None));
@@ -2284,8 +2302,7 @@ fn restore_runs_from(
         // An authorized_keys file goes back as the user it was written as,
         // never with the record's sudo inside that wrap.
         let file_sudo = file.sudo && file.user.is_none();
-        let secret =
-            sudo_secret_for(config, target).filter(|_| file_sudo && facts.sudo_asks_password());
+        let (sudo, secret) = sudo_for(config, target, facts, file_sudo);
         let wrap = match &file.user {
             Some(user) => {
                 let sudo = (keys_sudo.get(user).copied())
@@ -2293,11 +2310,6 @@ fn restore_runs_from(
                 crate::users::as_user(&format!("files: {dest}"), user, facts, sudo)?
             }
             None => String::new(),
-        };
-        let sudo = match secret {
-            Some(_) => "sudo ",
-            None if root || !file_sudo => "",
-            None => "sudo -n ",
         };
         let as_root = (root || file_sudo) && file.user.is_none();
         let refused = file.write == Write::Refused;
@@ -2372,7 +2384,7 @@ fn restore_runs_from(
         log::info!("{}: {label}", target.name);
         runs.push(file_run(
             dest,
-            crate::users::wrapped(&wrap, &run),
+            wrapped(&wrap, &run),
             label,
             secret.map(str::to_owned),
             FileRun {
