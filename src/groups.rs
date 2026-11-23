@@ -1,7 +1,7 @@
 //! `[[groups]]`: a local group created, its gid fixed, or removed, on each
 //! target whose tags and facts all match.
 //!
-//! [`run`] turns each entry into one step per target: a skip when the entry
+//! [`run`](crate::accounts::run) turns each entry into one step per target: a skip when the entry
 //! does not match, else one script, run as root or through sudo, with the
 //! password typed when sudo asks for one. The tools come from the probe's
 //! `accounts` and `accounts_bin` facts and are called by absolute path, as a
@@ -16,90 +16,37 @@
 //! change. A group with no `gid` is never renumbered. Nothing is recorded
 //! for rollback.
 
-use crate::config::{Config, GroupEntry, is_account_name};
-use crate::facts::Facts;
-use crate::files::sudo_secret_for;
-use crate::inventory::Target;
-use crate::remote::quote;
-use crate::step::{GroupRun, PlannedRun, RunKind};
-use crate::tasks::Item;
-use crate::transport::RUN_TIMEOUT;
+use crate::accounts::{ALL_PASSWD, Account, Accounts, prelude};
+use crate::config::{GroupEntry, is_account_name};
+use crate::remote::{fail, quote};
+use crate::step::{GroupRun, RunKind};
 
-/// The failure of a step on a target with no account tools.
-pub const NO_TOOLS: &str = "groups: no account tools on this target (accounts = none)";
+impl Account for GroupEntry {
+    const SECTION: &'static str = "groups";
+    const NOUN: &'static str = "group";
 
-/// The account tools a target has, from its `accounts` fact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Accounts {
-    /// shadow-utils: `groupadd`, `groupmod`, `groupdel`.
-    Shadow,
-    /// busybox: `addgroup`, `delgroup`; no gid change.
-    Busybox,
-}
-
-impl Accounts {
-    /// The tools and the absolute directory that holds them; `None` for
-    /// `accounts = none`, a missing fact, or a directory that is not absolute.
-    pub fn of(facts: &Facts) -> Option<(Accounts, &str)> {
-        let accounts = match facts.get("accounts")? {
-            "shadow" => Accounts::Shadow,
-            "busybox" => Accounts::Busybox,
-            _ => return None,
-        };
-        let bin = facts
-            .get("accounts_bin")
-            .filter(|bin| bin.starts_with('/'))?;
-        Some((accounts, bin))
+    fn name(&self) -> &str {
+        &self.name
     }
-}
 
-/// The step of group `item`, holding `entry`, the `i`th group item.
-pub fn run(
-    config: &Config,
-    item: &Item,
-    (entry, i): (&GroupEntry, usize),
-    target: &Target,
-    facts: Option<&Facts>,
-) -> Result<PlannedRun, String> {
-    let facts = facts.ok_or("groups: the probe has not run")?;
-    let label = item.label("groups", i);
-    let name = &entry.name;
-    if !item.matches(target, facts) {
-        log::info!("{}: {label} {name}: no match", target.name);
-        return Ok(group_run(
-            name,
-            String::new(),
-            format!("skipped group {name}: no match"),
-            None,
-            true,
-        ));
+    fn sudo(&self) -> bool {
+        self.sudo
     }
-    let Some((accounts, bin)) = Accounts::of(facts) else {
-        log::info!("{}: {label} {name}: no account tools", target.name);
-        return Ok(group_run(
+
+    fn shown(&self) -> String {
+        shown(self)
+    }
+
+    fn script(&self, label: &str, tools: (Accounts, &str), sudo: &str) -> String {
+        script(label, self, tools, sudo)
+    }
+
+    fn kind(name: String, skip: bool) -> RunKind {
+        RunKind::Group {
             name,
-            format!("{{ {}\n}}\n", fail(NO_TOOLS)),
-            shown(entry),
-            None,
-            false,
-        ));
-    };
-    let root = facts.is_root();
-    let secret =
-        sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
-    let sudo = match secret {
-        Some(_) => "sudo ",
-        None if root || !entry.sudo => "",
-        None => "sudo -n ",
-    };
-    log::info!("{}: {label} {name} with {accounts:?} in {bin}", target.name);
-    Ok(group_run(
-        name,
-        script(&label, entry, (accounts, bin), sudo),
-        shown(entry),
-        secret.map(str::to_owned),
-        false,
-    ))
+            run: GroupRun { skip },
+        }
+    }
 }
 
 /// What the step shows, from the config alone: `group NAME`, with `(gid N,
@@ -122,33 +69,6 @@ pub fn shown(entry: &GroupEntry) -> String {
     }
 }
 
-fn group_run(
-    name: &str,
-    run: String,
-    label: String,
-    sudo_secret: Option<String>,
-    skip: bool,
-) -> PlannedRun {
-    PlannedRun {
-        run: run.into(),
-        label: Some(label),
-        sudo_secret,
-        timeout: RUN_TIMEOUT,
-        kind: RunKind::Group {
-            name: name.to_owned(),
-            run: GroupRun { skip },
-        },
-        task: None,
-        name: None,
-        notify: Vec::new(),
-    }
-}
-
-/// `message` on stderr, then exit 1.
-fn fail(message: &str) -> String {
-    format!("{{ echo {} >&2; exit 1; }}", quote(message))
-}
-
 /// One sh brace group that brings group `entry` to its state with the
 /// `accounts` tools in `bin`; `label` names the entry in its failures and
 /// `sudo` is "" (root), "sudo -n " or "sudo " (a password typed). Reads need
@@ -165,11 +85,6 @@ pub fn script(
     let name = entry.name.as_str();
     debug_assert!(is_account_name(name), "{name}");
     let bin = quote(bin);
-    let check = if sudo.is_empty() {
-        String::new()
-    } else {
-        format!("{sudo}true || exit\n")
-    };
     let line = |text: String| format!("echo {}\n", quote(&text));
     let unchanged = line(format!("unchanged group {name}"));
     let body = if entry.absent() {
@@ -179,8 +94,7 @@ pub fn script(
         };
         format!(
             "if [ -z \"$anvil_line\" ]; then {unchanged}else\n\
-             anvil_user=$({{ if [ -n \"$anvil_g\" ]; then getent passwd; else cat /etc/passwd; fi; }} \
-             | awk -F: -v g=\"$anvil_gid\" '$4 == g {{ print $1; exit }}')\n\
+             anvil_user=$({ALL_PASSWD} | awk -F: -v g=\"$anvil_gid\" '$4 == g {{ print $1; exit }}')\n\
              [ -z \"$anvil_user\" ] || {{ echo {primary}\"$anvil_user\" >&2; exit 1; }}\n\
              {delete} >&2 || exit\n\
              {removed}fi\n",
@@ -235,28 +149,16 @@ pub fn script(
         )
     };
     format!(
-        "{{ LC_ALL=C; export LC_ALL; set -f\n\
-         {check}\
-         anvil_g=; command -v getent >/dev/null 2>&1 && anvil_g=1\n\
-         anvil_get() {{ if [ -n \"$anvil_g\" ]; then getent \"$1\" \"$2\"; else \
-         awk -F: -v k=\"$2\" -v f=\"$3\" '$f == k {{ print; n = 1; exit }} END {{ exit n ? 0 : 2 }}' \
-         \"/etc/$1\"; fi; }}\n\
-         anvil_line=$(anvil_get group {name} 1); anvil_rc=$?\n\
-         case $anvil_rc in 0) ;; 2) anvil_line= ;; *) {unread} ;; esac\n\
-         anvil_gid=${{anvil_line#*:*:}}; anvil_gid=${{anvil_gid%%:*}}\n\
-         {body}}}\n",
-        unread = fail(&format!("groups: cannot read group {name}")),
+        "{read}anvil_gid=${{anvil_line#*:*:}}; anvil_gid=${{anvil_gid%%:*}}\n{body}}}\n",
+        read = prelude::<GroupEntry>("group", name, sudo),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::{Path, PathBuf};
-
     use super::*;
-    use crate::test_util::{chmod, temp_dir};
-    use crate::transport::{Local, Transport};
+    use crate::facts::Facts;
+    use crate::test_util::AccountStubs;
 
     fn entry(keys: &str) -> GroupEntry {
         toml::from_str(&format!("name = \"app\"\n{keys}")).unwrap()
@@ -266,67 +168,29 @@ mod tests {
         Facts::parse(format!("{text}anvil-probe-end=1\n").as_bytes()).unwrap()
     }
 
-    /// A stub `getent` over `group` and `passwd` files in `dir`, and stub
-    /// account tools in `dir/bin` that log their arguments to `dir/log`.
-    struct Fake {
-        dir: PathBuf,
-    }
+    /// [`AccountStubs`] with the group tools.
+    struct Fake(AccountStubs);
 
     impl Fake {
         fn new(group: &str, passwd: &str) -> Fake {
-            let dir = temp_dir("groups");
-            fs::create_dir(dir.join("bin")).unwrap();
-            fs::write(dir.join("group"), group).unwrap();
-            fs::write(dir.join("passwd"), passwd).unwrap();
-            let getent = format!(
-                "#!/bin/sh\n[ $# -eq 1 ] && exec cat '{0}'/\"$1\"\n\
-                 awk -F: -v k=\"$2\" '$1 == k || $3 == k {{ print; f = 1 }} END {{ exit f ? 0 : 2 }}' \
-                 '{0}'/\"$1\"\n",
-                dir.display()
-            );
-            Self::tool(&dir.join("getent"), &getent);
-            for tool in ["groupadd", "groupmod", "groupdel", "addgroup", "delgroup"] {
-                let log = format!(
-                    "#!/bin/sh\necho \"{tool} $*\" >>'{}'/log\necho {tool} ran\n",
-                    dir.display()
-                );
-                Self::tool(&dir.join("bin").join(tool), &log);
-            }
-            Fake { dir }
+            let tools = ["groupadd", "groupmod", "groupdel", "addgroup", "delgroup"];
+            Fake(AccountStubs::new("groups", group, passwd, &tools))
         }
 
-        fn tool(path: &Path, text: &str) {
-            fs::write(path, text).unwrap();
-            chmod(path, 0o755);
-        }
-
-        /// `entry`'s script under `accounts`, run with the stub getent first
-        /// on `PATH`: its exit code, stdout, stderr and the tools' log.
+        /// `entry`'s script under `accounts`, run with the stubs: its exit
+        /// code, stdout, stderr and the tools' log.
         fn run(
             &self,
             entry: &GroupEntry,
             accounts: Accounts,
         ) -> (Option<i32>, String, String, String) {
-            let bin = self.dir.join("bin");
-            let script = format!(
-                "PATH='{}':$PATH\n{}",
-                self.dir.display(),
-                script("groups[0]", entry, (accounts, bin.to_str().unwrap()), "")
-            );
-            let out = Local.run(&script, RUN_TIMEOUT).unwrap();
-            let log = fs::read_to_string(self.dir.join("log")).unwrap_or_default();
-            (
-                out.code,
-                String::from_utf8(out.stdout).unwrap(),
-                String::from_utf8(out.stderr).unwrap(),
-                log,
-            )
-        }
-    }
-
-    impl Drop for Fake {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.dir);
+            let bin = self.0.bin();
+            self.0.run(&script(
+                "groups[0]",
+                entry,
+                (accounts, bin.to_str().unwrap()),
+                "",
+            ))
         }
     }
 

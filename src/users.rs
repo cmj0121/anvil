@@ -1,11 +1,11 @@
 //! `[[users]]`: a local user created, the keys set on it fixed, or removed, on each
 //! target whose tags and facts all match.
 //!
-//! [`run`] turns each entry into one step per target, as `[[groups]]` does:
-//! a skip when the entry does not match, else one script, run as root or
-//! through sudo, with the tools from the probe's `accounts` and
-//! `accounts_bin` facts called by absolute path; a target with neither
-//! shadow-utils nor busybox fails the step.
+//! [`run`](crate::accounts::run) turns each entry into one step per
+//! target, as `[[groups]]` does: a skip when the entry does not match, else
+//! one script, run as root or through sudo, with the tools from the probe's
+//! `accounts` and `accounts_bin` facts called by absolute path; a target
+//! with neither shadow-utils nor busybox fails the step.
 //!
 //! [`script`] reads the user with `getent passwd` (awk over `/etc/passwd`
 //! without getent) and `id -Gn`. Before any change it fails the step when a
@@ -40,71 +40,46 @@ use std::path::PathBuf;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::accounts::{ALL_PASSWD, ANVIL_GET, Account, Accounts, OPEN, prelude};
 use crate::bytes::{hex, unbase64};
-use crate::config::{Config, UserEntry, is_account_name};
+use crate::config::{UserEntry, is_account_name, is_gid};
 use crate::error::Failure;
 use crate::facts::Facts;
-use crate::files::{
-    Captured, FileWrite, Rendered, Sources, skip_run, store_reason, sudo_secret_for,
-};
+use crate::files::{Captured, FileWrite, Sources, skip_run, store_reason};
 use crate::filestore::{self, StoreError};
-use crate::groups::Accounts;
 use crate::inventory::Target;
-use crate::remote::{Walk, WalkNonce, login_checks, login_top, quote, refusal, zeroizing};
+use crate::remote::{
+    Heredoc, Walk, WalkNonce, fail, login_checks, login_top, quote, refusal, zeroizing,
+};
 use crate::step::{FileRun, PlannedRun, RunKind, UserRun};
 use crate::tasks::{Expanded, Item, ItemKind};
-use crate::transport::RUN_TIMEOUT;
 
-/// The failure of a step on a target with no account tools.
-pub const NO_TOOLS: &str = "users: no account tools on this target (accounts = none)";
+impl Account for UserEntry {
+    const SECTION: &'static str = "users";
+    const NOUN: &'static str = "user";
 
-/// The step of user `item`, holding `entry`, the `i`th user item.
-pub fn run(
-    config: &Config,
-    item: &Item,
-    (entry, i): (&UserEntry, usize),
-    target: &Target,
-    facts: Option<&Facts>,
-) -> Result<PlannedRun, String> {
-    let facts = facts.ok_or("users: the probe has not run")?;
-    let label = item.label("users", i);
-    let name = &entry.name;
-    if !item.matches(target, facts) {
-        log::info!("{}: {label} {name}: no match", target.name);
-        return Ok(user_run(
-            name,
-            String::new(),
-            format!("skipped user {name}: no match"),
-            None,
-            true,
-        ));
+    fn name(&self) -> &str {
+        &self.name
     }
-    let Some((accounts, bin)) = Accounts::of(facts) else {
-        log::info!("{}: {label} {name}: no account tools", target.name);
-        return Ok(user_run(
+
+    fn sudo(&self) -> bool {
+        self.sudo
+    }
+
+    fn shown(&self) -> String {
+        shown(self)
+    }
+
+    fn script(&self, label: &str, tools: (Accounts, &str), sudo: &str) -> String {
+        script(label, self, tools, sudo)
+    }
+
+    fn kind(name: String, skip: bool) -> RunKind {
+        RunKind::User {
             name,
-            format!("{{ {}\n}}\n", fail(NO_TOOLS)),
-            shown(entry),
-            None,
-            false,
-        ));
-    };
-    let root = facts.is_root();
-    let secret =
-        sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
-    let sudo = match secret {
-        Some(_) => "sudo ",
-        None if root || !entry.sudo => "",
-        None => "sudo -n ",
-    };
-    log::info!("{}: {label} {name} with {accounts:?} in {bin}", target.name);
-    Ok(user_run(
-        name,
-        script(&label, entry, (accounts, bin), sudo),
-        shown(entry),
-        secret.map(str::to_owned),
-        false,
-    ))
+            run: UserRun { skip },
+        }
+    }
 }
 
 /// What the step shows, from the config alone: `user NAME`, with `(uid N,
@@ -150,33 +125,6 @@ pub fn shown(entry: &UserEntry) -> String {
     }
 }
 
-fn user_run(
-    name: &str,
-    run: String,
-    label: String,
-    sudo_secret: Option<String>,
-    skip: bool,
-) -> PlannedRun {
-    PlannedRun {
-        run: run.into(),
-        label: Some(label),
-        sudo_secret,
-        timeout: RUN_TIMEOUT,
-        kind: RunKind::User {
-            name: name.to_owned(),
-            run: UserRun { skip },
-        },
-        task: None,
-        name: None,
-        notify: Vec::new(),
-    }
-}
-
-/// `message` on stderr, then exit 1.
-fn fail(message: &str) -> String {
-    format!("{{ echo {} >&2; exit 1; }}", quote(message))
-}
-
 /// One sh brace group that brings user `entry` to the keys it sets with the
 /// `accounts` tools in `bin`; `label` names the entry in its failures and
 /// `sudo` is "" (root), "sudo -n " or "sudo " (a password typed). Reads need
@@ -198,6 +146,13 @@ pub fn script(
     let at = format!("{label} {name}");
     let line = |text: String| format!("echo {}\n", quote(&text));
     let unchanged = line(format!("unchanged user {name}"));
+    // The passwd fields, empty when there is no such user.
+    let read = format!(
+        "{}anvil_r=${{anvil_line#*:*:}}; anvil_uid=${{anvil_r%%:*}}; anvil_r=${{anvil_r#*:}}\n\
+         anvil_gid=${{anvil_r%%:*}}; anvil_r=${{anvil_r#*:}}; anvil_gecos=${{anvil_r%%:*}}\n\
+         anvil_r=${{anvil_r#*:}}; anvil_home=${{anvil_r%%:*}}; anvil_shell=${{anvil_r#*:}}\n",
+        prelude::<UserEntry>("passwd", name, sudo)
+    );
     if entry.absent() {
         let delete = match accounts {
             Accounts::Shadow => format!(
@@ -215,9 +170,7 @@ pub fn script(
             ),
         };
         let mut checks = format!(
-            "anvil_r=${{anvil_line#*:*:}}; anvil_uid=${{anvil_r%%:*}}; anvil_r=${{anvil_r#*:}}\n\
-             anvil_r=${{anvil_r#*:}}; anvil_r=${{anvil_r#*:}}; anvil_home=${{anvil_r%%:*}}\n\
-             case $anvil_uid in ''|*[!0]*) ;; *) {} ;; esac\n",
+            "case $anvil_uid in ''|*[!0]*) ;; *) {} ;; esac\n",
             fail(&format!("{at}: has uid 0; refused")),
         );
         if entry.remove_home {
@@ -236,28 +189,22 @@ pub fn script(
             checks += &format!(
                 "if anvil_gl=$(anvil_get group {name} 1); then\n\
                  anvil_gg=${{anvil_gl#*:*:}}; anvil_gg=${{anvil_gg%%:*}}\n\
-                 anvil_other=$({{ if [ -n \"$anvil_g\" ]; then getent passwd; else cat /etc/passwd; fi; }} \
-                 | awk -F: -v g=\"$anvil_gg\" -v n={name} '$4 == g && $1 != n {{ print $1; exit }}')\n\
+                 anvil_other=$({ALL_PASSWD} | awk -F: -v g=\"$anvil_gg\" -v n={name} '$4 == g && $1 != n {{ print $1; exit }}')\n\
                  [ -z \"$anvil_other\" ] || {{ echo {}\"$anvil_other\" >&2; exit 1; }}\n\
                  fi\n",
                 quote(&format!("{at}: group {name} is the primary group of user ")),
             );
         }
         return format!(
-            "{}if [ -z \"$anvil_line\" ]; then {unchanged}else\n\
+            "{read}if [ -z \"$anvil_line\" ]; then {unchanged}else\n\
              {checks}{delete} >&2 || exit\n\
              {}fi\n}}\n",
-            read_user(name, sudo),
             line(format!("removed user {name}")),
         );
     }
     let mut checks = String::new();
     if let Some(group) = &entry.group {
-        let field = if group.bytes().all(|b| b.is_ascii_digit()) {
-            3
-        } else {
-            1
-        };
+        let field = if is_gid(group) { 3 } else { 1 };
         checks += &format!(
             "anvil_pl=$(anvil_get group {group} {field}) || {}\n\
              anvil_pname=${{anvil_pl%%:*}}; anvil_pgid=${{anvil_pl#*:*:}}; \
@@ -399,38 +346,12 @@ pub fn script(
     format!(
         "{read}{checks}\
          if [ -z \"$anvil_line\" ]; then\n{create}{created}else\n\
-         anvil_r=${{anvil_line#*:*:}}; anvil_uid=${{anvil_r%%:*}}; anvil_r=${{anvil_r#*:}}\n\
-         anvil_gid=${{anvil_r%%:*}}; anvil_r=${{anvil_r#*:}}; anvil_gecos=${{anvil_r%%:*}}\n\
-         anvil_r=${{anvil_r#*:}}; anvil_home=${{anvil_r%%:*}}; anvil_shell=${{anvil_r#*:}}\n\
          anvil_fixed=; set --\n\
          {fix}\
          if [ -n \"$anvil_fixed\" ]; then\n{apply}\
          echo {fixed}\"${{anvil_fixed#, }}\"\n\
          else {unchanged}fi\nfi\n}}\n",
-        read = read_user(name, sudo),
         fixed = quote(&format!("fixed user {name}: ")),
-    )
-}
-
-/// The opening of [`script`]: the brace group, `sudo true` when `sudo` is
-/// set, the `anvil_get DB KEY FIELD` reader, and user `name`'s passwd line
-/// in `anvil_line`, empty when there is none.
-fn read_user(name: &str, sudo: &str) -> String {
-    let check = if sudo.is_empty() {
-        String::new()
-    } else {
-        format!("{sudo}true || exit\n")
-    };
-    format!(
-        "{{ LC_ALL=C; export LC_ALL; set -f\n\
-         {check}\
-         anvil_g=; command -v getent >/dev/null 2>&1 && anvil_g=1\n\
-         anvil_get() {{ if [ -n \"$anvil_g\" ]; then getent \"$1\" \"$2\"; else \
-         awk -F: -v k=\"$2\" -v f=\"$3\" '$f == k {{ print; n = 1; exit }} END {{ exit n ? 0 : 2 }}' \
-         \"/etc/$1\"; fi; }}\n\
-         anvil_line=$(anvil_get passwd {name} 1); anvil_rc=$?\n\
-         case $anvil_rc in 0) ;; 2) anvil_line= ;; *) {unread} ;; esac\n",
-        unread = fail(&format!("users: cannot read user {name}")),
     )
 }
 
@@ -592,10 +513,33 @@ pub(crate) fn shown_key(line: &str) -> String {
     }
 }
 
+/// One `authorized_keys` line and the key it holds, parsed once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyLine {
+    pub line: String,
+    pub key: Key,
+}
+
+impl KeyLine {
+    /// `line` as a key line ([`parse_key`]).
+    pub(crate) fn parse(line: &str) -> Result<KeyLine, String> {
+        Ok(KeyLine {
+            key: parse_key(line)?,
+            line: line.to_owned(),
+        })
+    }
+}
+
+impl PartialEq<String> for KeyLine {
+    fn eq(&self, line: &String) -> bool {
+        self.line == *line
+    }
+}
+
 /// The key lines `authorized_keys` reads from the store, by user ordinal and
 /// index in the list.
 #[derive(Debug, Default)]
-pub struct StoreKeys(BTreeMap<(usize, usize), String>);
+pub struct StoreKeys(BTreeMap<(usize, usize), KeyLine>);
 
 /// Reads each `$/` item of each user item's `authorized_keys` from the
 /// store, as `[[files]]` reads a store src; each must hold one key line
@@ -637,22 +581,28 @@ pub fn load_keys(
         let text = String::from_utf8(bytes).map_err(|_| Failure::usage(named("is not text")))?;
         let line = text.strip_suffix('\n').unwrap_or(&text);
         let line = line.strip_suffix('\r').unwrap_or(line);
-        parse_key(line).map_err(|why| Failure::usage(named(&why)))?;
-        keys.insert((i, j), line.to_owned());
+        let line = KeyLine::parse(line).map_err(|why| Failure::usage(named(&why)))?;
+        keys.insert((i, j), line);
     }
     Ok(StoreKeys(keys))
 }
 
 /// The key lines of user `entry`, the `i`th user item: each inline line as
-/// written, each `$/` one as [`load_keys`] read it.
-fn listed(entry: &UserEntry, i: usize, store: &StoreKeys) -> Result<Vec<String>, String> {
+/// written, each `$/` one as [`load_keys`] read it; `label` names the entry
+/// when an inline line is not a key.
+fn listed(
+    entry: &UserEntry,
+    i: usize,
+    store: &StoreKeys,
+    label: impl Fn() -> String,
+) -> Result<Vec<KeyLine>, String> {
     (entry.authorized_keys.iter().flatten().enumerate())
         .map(|(j, key)| {
             if filestore::is_store_path(key) {
                 (store.0.get(&(i, j)).cloned())
                     .ok_or_else(|| format!("users[{i}].authorized_keys[{j}]: was not loaded"))
             } else {
-                Ok(key.clone())
+                KeyLine::parse(key).map_err(|why| format!("{}: {why}", label()))
             }
         })
         .collect()
@@ -672,17 +622,12 @@ pub struct KeysWrite {
     /// `users[N] NAME`, which starts its failures.
     pub label: String,
     pub user: String,
-    pub keys: Vec<String>,
+    pub keys: Vec<KeyLine>,
     pub exclusive: bool,
     pub wrap: String,
 }
 
 impl KeysWrite {
-    /// `script` run through [`Self::wrap`] on its stdin, from `/`.
-    pub(crate) fn wrapped(&self, script: &str) -> Zeroizing<String> {
-        wrapped(&self.wrap, script)
-    }
-
     /// The file `captured` becomes: the listed keys added to it, each not
     /// there yet at the end, or with `exclusive` only the listed keys, one
     /// per line. A file the capture could not read fails, naming `dest`.
@@ -701,21 +646,13 @@ impl KeysWrite {
                 ));
             }
         };
-        let mut have: Vec<Key> = if self.exclusive {
-            Vec::new()
-        } else {
-            current
-                .lines()
-                .filter_map(|line| parse_key(line).ok())
-                .collect()
-        };
-        let mut text = if self.exclusive {
-            String::new()
-        } else {
-            current.to_owned()
-        };
-        for line in &self.keys {
-            let key = parse_key(line).map_err(|why| format!("{}: {why}", self.label))?;
+        let current = if self.exclusive { "" } else { current };
+        let found: Vec<Key> = (current.lines())
+            .filter_map(|line| parse_key(line).ok())
+            .collect();
+        let mut have: Vec<&Key> = found.iter().collect();
+        let mut text = current.to_owned();
+        for KeyLine { line, key } in &self.keys {
             if have.contains(&key) {
                 continue;
             }
@@ -731,17 +668,19 @@ impl KeysWrite {
 }
 
 /// `script` on the stdin of `wrap`, from `/`, or as it is when `wrap` is
-/// `""`; the heredoc's delimiter holds the script's own hash.
+/// `""`; the heredoc's delimiter holds the script's own hash, which no line
+/// of it can equal.
 pub(crate) fn wrapped(wrap: &str, script: &str) -> Zeroizing<String> {
     if wrap.is_empty() {
         return Zeroizing::new(script.to_owned());
     }
-    let end = format!(
-        "ANVIL_AS_{}",
-        &hex(&Sha256::digest(script.as_bytes()))[..32]
-    );
+    let hash = hex(&Sha256::digest(script.as_bytes())[..16]);
+    let heredoc = Heredoc::with_delimiter(script, format!("ANVIL_AS_{hash}"))
+        .expect("no line of a script is its own hash");
     zeroizing(format_args!(
-        "{wrap} <<'{end}'\ncd / || exit 1\n{script}\n{end}\n"
+        "{wrap} <<'{}'\ncd / || exit 1\n{}",
+        heredoc.delimiter,
+        heredoc.body()
     ))
 }
 
@@ -772,6 +711,11 @@ pub(crate) fn as_user(
     }
 }
 
+/// The authorized_keys file of a user whose home is `home`.
+pub(crate) fn keys_dest(home: &str) -> String {
+    format!("{}/.ssh/authorized_keys", home.trim_end_matches('/'))
+}
+
 /// The step after user `item`'s that writes its `authorized_keys`, or `None`
 /// when it has none, removes the user, does not match, has no account tools
 /// (its user step fails) or `homes` is `None` (plan). It is a file step of
@@ -794,7 +738,7 @@ pub fn keys_run(
     let label = format!("{} {name}", item.label("users", i));
     let home =
         (homes.0.get(&i)).ok_or_else(|| format!("{label}: the account query has no home"))?;
-    let dest = format!("{}/.ssh/authorized_keys", home.trim_end_matches('/'));
+    let dest = keys_dest(home);
     let wrap = as_user(&label, name, facts, entry.sudo)?;
     let top = login_top();
     let h = quote(home);
@@ -810,11 +754,18 @@ pub fn keys_run(
     );
     let mut walk = Walk::new("files", &dest, false, &top, Some(WalkNonce::generate()?));
     walk.private = true;
-    let keys = listed(entry, i, sources.keys())?;
+    let keys = listed(entry, i, sources.keys(), || label.clone())?;
     log::info!("{}: {label} {dest}, {} keys", target.name, keys.len());
+    let mut run = skip_run(&dest, format!("file {dest}"));
+    run.run = Zeroizing::new(format!(
+        "{}\n",
+        fail(&format!(
+            "{label}: authorized_keys is written by apply only"
+        ))
+    ));
     let write = FileWrite {
         ordinal: i,
-        dest: dest.clone(),
+        dest,
         mode: "600".to_owned(),
         sudo: String::new(),
         checks,
@@ -829,20 +780,13 @@ pub fn keys_run(
         item: None,
         secret: None,
         keys: Some(Box::new(KeysWrite {
-            label: label.clone(),
+            label,
             user: name.to_owned(),
             keys,
             exclusive: entry.exclusive_keys,
             wrap,
         })),
     };
-    let mut run = skip_run(&dest, format!("file {dest}"));
-    run.run = Zeroizing::new(format!(
-        "{{ echo {} >&2; exit 1; }}\n",
-        quote(&format!(
-            "{label}: authorized_keys is written by apply only"
-        ))
-    ));
     if let RunKind::File { run: file, .. } = &mut run.kind {
         *file = FileRun {
             upload: None,
@@ -851,16 +795,6 @@ pub fn keys_run(
         };
     }
     Ok(Some(run))
-}
-
-/// `text` as a templated write's rendered bytes, with their hash.
-pub(crate) fn rendered(text: String) -> Box<Rendered> {
-    let sha256 = hex(&Sha256::digest(text.as_bytes()));
-    Box::new(Rendered {
-        text: Zeroizing::new(text),
-        sha256,
-        scrub: Vec::new(),
-    })
 }
 
 /// The groups whose loss may lock the login user out of sudo.
@@ -872,27 +806,34 @@ fn admin_guard(entry: &UserEntry) -> bool {
     entry.exclusive_groups || entry.group.is_some()
 }
 
-/// Defines `anvil_pw NAME`, which prints NAME's passwd line, with getent or
-/// awk over `/etc/passwd`, and returns 2 when there is none.
-const ANVIL_PW: &str = "anvil_pw() { if command -v getent >/dev/null 2>&1; then getent passwd \"$1\"; \
-else awk -F: -v k=\"$1\" '$1 == k { print; f = 1 } END { exit f ? 0 : 2 }' /etc/passwd; fi; }\n";
+/// Defines, after [`ANVIL_GET`], `anvil_pw NAME`, which prints NAME's
+/// passwd line and returns 2 when there is none, and `anvil_group NAME N`,
+/// which prints field N of group NAME's line, empty when there is none.
+const ANVIL_PW: &str = "anvil_pw() { anvil_get passwd \"$1\" 1; }\n\
+     anvil_group() { anvil_get group \"$1\" 1 2>/dev/null | cut -d: -f\"$2\"; }\n";
 
-/// The `[[users]]` entry with `authorized_keys` named `user` that may apply
+/// The `[[users]]` entry with `authorized_keys` named `user` that applies
 /// to `target`, as rollback finds the one a keys record was written for.
 pub(crate) fn keys_entry<'a>(
     expanded: &'a Expanded,
     target: &Target,
-    facts: Option<&Facts>,
+    facts: &Facts,
     user: &str,
 ) -> Option<&'a UserEntry> {
     expanded.items.iter().find_map(|item| match &item.kind {
         ItemKind::User { entry, .. }
-            if entry.name == user && has_keys(entry) && item.may_match(target, facts) =>
+            if entry.name == user && has_keys(entry) && item.matches(target, facts) =>
         {
             Some(entry)
         }
         _ => None,
     })
+}
+
+/// The line that prints `home.NAME=HOME` from user `name`'s passwd line,
+/// read into `anvil_l`.
+fn home_line(name: &str) -> String {
+    format!("echo \"home.{name}=$(printf '%s\\n' \"$anvil_l\" | cut -d: -f6)\"")
 }
 
 /// The read-only script that prints `home.NAME=HOME` for each of `names`
@@ -902,53 +843,71 @@ pub(crate) fn home_query(names: &[&str]) -> String {
         .iter()
         .map(|name| {
             debug_assert!(is_account_name(name), "{name}");
-            format!(
-                "anvil_l=$(anvil_pw {name}) && echo \"home.{name}=$(printf '%s\\n' \"$anvil_l\" | cut -d: -f6)\"\n"
-            )
+            format!("anvil_l=$(anvil_pw {name}) && {}\n", home_line(name))
         })
         .collect();
-    format!("{{ LC_ALL=C; export LC_ALL; set -f\n{ANVIL_PW}{body}echo {QUERY_END}\n}} </dev/null\n")
+    format!("{OPEN}{ANVIL_GET}{ANVIL_PW}{body}echo {QUERY_END}\n}} </dev/null\n")
 }
 
 /// The homes [`home_query`]'s `output` names, by user; `None` without its
 /// end marker.
 pub(crate) fn parse_homes(output: &[u8]) -> Option<BTreeMap<String, String>> {
     let text = String::from_utf8_lossy(output);
-    let mut homes = BTreeMap::new();
-    for line in text.lines() {
-        if line == QUERY_END {
-            return Some(homes);
-        }
-        if let Some((name, home)) = line.strip_prefix("home.").and_then(|l| l.split_once('=')) {
-            homes.insert(name.to_owned(), home.to_owned());
-        }
-    }
-    None
+    let state = parse_state(&text)?;
+    let homes = (state.values.into_iter())
+        .filter_map(|(key, home)| match key {
+            ("home", Some(name)) => Some((name.to_owned(), home.to_owned())),
+            _ => None,
+        })
+        .collect();
+    Some(homes)
 }
 
 /// The last line of the [`query`] output.
 const QUERY_END: &str = "anvil-users-end=1";
 
-/// The user items of `expanded` that `target` matches, each with its label
-/// and ordinal.
-fn matched<'a>(
-    expanded: &'a Expanded,
-    target: &'a Target,
-    facts: &'a Facts,
-) -> impl Iterator<Item = (String, &'a UserEntry, usize)> {
-    expanded
-        .items
-        .iter()
-        .filter_map(move |item| match &item.kind {
-            ItemKind::User { entry, ordinal } if item.matches(target, facts) => {
-                Some((item.label("users", *ordinal), entry, *ordinal))
-            }
-            _ => None,
-        })
+/// What a [`query`] or [`home_query`] output says before its end marker.
+#[derive(Default)]
+struct State<'a> {
+    /// Each `KEY=VALUE` line's value, by KEY split at its first `.`:
+    /// `user.NAME` is `("user", Some("NAME"))`, `login_keys` is
+    /// `("login_keys", None)`.
+    values: BTreeMap<(&'a str, Option<&'a str>), &'a str>,
+    /// The text after each `login_key=`: the login user's authorized_keys
+    /// lines as the target sent them, a `\r` kept.
+    keys: Vec<&'a str>,
+}
+
+/// `text`'s [`State`], from one scan; `None` without the end marker. The
+/// values end at the first line that is the marker once a CRLF ending is
+/// taken off, the keys at the first that is exactly the marker.
+fn parse_state(text: &str) -> Option<State<'_>> {
+    let mut state = State::default();
+    let (mut ended, mut values_ended) = (false, false);
+    for piece in text.split_inclusive('\n') {
+        let raw = piece.strip_suffix('\n').unwrap_or(piece);
+        if raw == QUERY_END {
+            ended = true;
+            break;
+        }
+        let line = piece.strip_suffix("\r\n").unwrap_or(raw);
+        if line == QUERY_END {
+            (ended, values_ended) = (true, true);
+        } else if let Some(key) = raw.strip_prefix("login_key=") {
+            state.keys.push(key);
+        } else if !values_ended && let Some((key, value)) = line.split_once('=') {
+            let key = match key.split_once('.') {
+                Some((key, name)) => (key, Some(name)),
+                None => (key, None),
+            };
+            state.values.insert(key, value);
+        }
+    }
+    ended.then_some(state)
 }
 
 /// Whether user `entry` writes its `authorized_keys`.
-fn has_keys(entry: &UserEntry) -> bool {
+pub(crate) fn has_keys(entry: &UserEntry) -> bool {
     !entry.absent() && entry.authorized_keys.is_some()
 }
 
@@ -957,34 +916,247 @@ fn locks_out(shell: &str) -> bool {
     matches!(shell.rsplit('/').next(), Some("nologin" | "false"))
 }
 
+/// The user items of a list that one target matches, each with its
+/// ordinal: what every lockout guard looks at.
+pub(crate) struct Matched<'a>(Vec<(&'a Item, &'a UserEntry, usize)>);
+
+impl<'a> Matched<'a> {
+    /// The user items of `expanded` that `target` matches.
+    pub(crate) fn of(expanded: &'a Expanded, target: &Target, facts: &Facts) -> Matched<'a> {
+        Matched(
+            (expanded.items.iter())
+                .filter_map(|item| match &item.kind {
+                    ItemKind::User { entry, ordinal } if item.matches(target, facts) => {
+                        Some((item, entry, *ordinal))
+                    }
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
+    /// [`check_config`] of these items.
+    pub(crate) fn check_config(&self, facts: &Facts) -> Result<(), String> {
+        let login = facts.get("user");
+        for &(item, entry, i) in &self.0 {
+            let name = entry.name.as_str();
+            let at = || format!("{} {name}", item.label("users", i));
+            if entry.absent() && name == "root" {
+                return Err(format!("{}: refused", at()));
+            }
+            if entry.absent() && login == Some(name) {
+                return Err(format!("{}: is the login user", at()));
+            }
+            if let Some(shell) = &entry.shell
+                && login == Some(name)
+                && locks_out(shell)
+            {
+                return Err(format!(
+                    "{}: shell {shell} would lock out the login user",
+                    at()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`query`] of these items, reading `/proc`'s mount options from
+    /// `mounts`.
+    pub(crate) fn query(&self, facts: &Facts, mounts: &str) -> Option<String> {
+        let login = facts.get("user");
+        let mut body = String::new();
+        let mut groups = false;
+        let mut keys = false;
+        for &(_, entry, _) in &self.0 {
+            let name = entry.name.as_str();
+            if has_keys(entry) {
+                body += &format!(
+                    "anvil_l=$(anvil_pw {name}); case $? in \
+                     0) echo user.{name}=present; {} ;; \
+                     2) echo user.{name}=missing ;; *) echo user.{name}=unknown ;; esac\n",
+                    home_line(name)
+                );
+            }
+            if has_keys(entry) && entry.exclusive_keys && login == Some(name) && !keys {
+                keys = true;
+                body += "anvil_h=${anvil_l#*:*:*:*:*:}; anvil_h=${anvil_h%%:*}; \
+                         anvil_f=\"$anvil_h/.ssh/authorized_keys\"\n\
+                         if [ -z \"$anvil_h\" ]; then echo login_keys=unknown\n\
+                         elif [ -e \"$anvil_f\" ]; then\n\
+                         if anvil_k=$(cat -- \"$anvil_f\" 2>/dev/null); then echo login_keys=read\n\
+                         printf '%s\\n' \"$anvil_k\" | sed 's/^/login_key=/'\n\
+                         else echo login_keys=unknown; fi\n\
+                         elif [ -x \"$anvil_h\" ] && { [ ! -e \"$anvil_h/.ssh\" ] || [ -x \"$anvil_h/.ssh\" ]; }; then \
+                         echo login_keys=missing\n\
+                         else echo login_keys=unknown; fi\n";
+            }
+            if entry.absent() && !entry.force {
+                body += &format!("echo \"busy.{name}=$(anvil_busy {name})\"\n");
+            } else if !entry.absent() && admin_guard(entry) && login == Some(name) && !groups {
+                groups = true;
+                body += &format!(
+                    "anvil_v=$(id -Gn {name} 2>/dev/null); echo \"login_groups=${{anvil_v:-unknown}}\"\n\
+                     anvil_v=$(id -G {name} 2>/dev/null); echo \"login_gids=${{anvil_v:-unknown}}\"\n\
+                     echo \"login_primary=$(id -gn {name} 2>/dev/null)\"\n"
+                );
+                for group in ADMIN_GROUPS {
+                    body += &format!(
+                        "echo \"gid.{group}=$(anvil_group {group} 3)\"\n\
+                         echo \"members.{group}=$(anvil_group {group} 4)\"\n"
+                    );
+                }
+            }
+        }
+        if body.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{OPEN}{ANVIL_GET}{ANVIL_PW}\
+             anvil_hidden() {{ [ \"$(id -u)\" != 0 ] || return 1\n\
+             awk '$2 == \"/proc\" {{ n = split($4, o, \",\"); \
+             for (i = 1; i <= n; i++) if (o[i] ~ /^hidepid=/ && o[i] != \"hidepid=0\" && o[i] != \"hidepid=off\") h = 1 }} \
+             END {{ exit h ? 0 : 1 }}' {mounts} 2>/dev/null\n\
+             case $? in 0) return 0 ;; 1) return 1 ;; esac\n\
+             [ -d /proc/self ]; }}\n\
+             anvil_busy() {{ id -u \"$1\" >/dev/null 2>&1 || {{ echo no; return; }}\n\
+             if anvil_hidden; then echo unknown\n\
+             elif command -v pgrep >/dev/null 2>&1; then pgrep -u \"$1\" >/dev/null 2>&1\n\
+             case $? in 0) echo yes ;; 1) echo no ;; *) echo unknown ;; esac\n\
+             elif [ -r /proc/self/status ]; then anvil_u=$(id -u \"$1\"); set +f\n\
+             anvil_r=$(awk -v u=\"$anvil_u\" '/^Uid:/ && $3 == u {{ f = 1; exit }} \
+             END {{ print f ? \"yes\" : \"no\" }}' /proc/[0-9]*/status 2>/dev/null); set -f\n\
+             echo \"${{anvil_r:-unknown}}\"\n\
+             else echo unknown; fi; }}\n\
+             {body}echo {QUERY_END}\n}} </dev/null\n",
+            mounts = quote(mounts),
+        ))
+    }
+
+    /// [`check_state`] of these items.
+    pub(crate) fn check_state(
+        &self,
+        facts: &Facts,
+        output: &[u8],
+        store: &StoreKeys,
+    ) -> Result<Homes, String> {
+        let text = String::from_utf8_lossy(output);
+        let Some(State {
+            values,
+            keys: login_keys,
+        }) = parse_state(&text)
+        else {
+            return Err("users: the account query output has no end marker".to_owned());
+        };
+        let get = |key: &str, name: Option<&str>| values.get(&(key, name)).copied();
+        let login = facts.get("user");
+        let mut homes = Homes::default();
+        for &(item, entry, i) in &self.0 {
+            let name = entry.name.as_str();
+            let at = || format!("{} {name}", item.label("users", i));
+            if has_keys(entry) {
+                let home = match (&entry.home, get("user", Some(name))) {
+                    (Some(home), _) => home.clone(),
+                    (None, Some("missing")) => entry.new_home(),
+                    (None, Some("present")) => match get("home", Some(name)) {
+                        Some(home) if home.starts_with('/') => home.to_owned(),
+                        _ => return Err(format!("{}: has no home for authorized_keys", at())),
+                    },
+                    (None, _) => return Err(format!("{}: cannot read the user", at())),
+                };
+                homes.0.insert(i, home);
+            }
+            if has_keys(entry) && entry.exclusive_keys && login == Some(name) {
+                let wanted = listed(entry, i, store, at)?;
+                let have: Option<Vec<Key>> = match get("login_keys", None) {
+                    Some("read") => file_keys(&login_keys.join("\n")),
+                    Some("missing") => Some(Vec::new()),
+                    _ => None,
+                };
+                let Some(have) = have else {
+                    return Err(format!(
+                        "{}: cannot tell which keys the login user signs in with",
+                        at()
+                    ));
+                };
+                let kept = if have.is_empty() {
+                    !wanted.is_empty()
+                } else {
+                    have.iter().any(|key| wanted.iter().any(|w| w.key == *key))
+                };
+                if !kept {
+                    return Err(format!("{}: would drop the login key", at()));
+                }
+            }
+            if entry.absent() && !entry.force {
+                match get("busy", Some(name)) {
+                    Some("no") => {}
+                    Some("yes") => return Err(format!("{}: owns running processes", at())),
+                    _ => {
+                        return Err(format!(
+                            "{}: cannot tell whether it owns running processes; \
+                             set force = true to remove it anyway",
+                            at()
+                        ));
+                    }
+                }
+            }
+            if !entry.absent() && admin_guard(entry) && login == Some(name) {
+                let unknown = || {
+                    format!(
+                        "{}: cannot tell whether the login user is in wheel, sudo or admin",
+                        at()
+                    )
+                };
+                let known = |key: &str, group: Option<&str>| {
+                    get(key, group).filter(|value| *value != "unknown")
+                };
+                let (Some(names), Some(gids)) =
+                    (known("login_groups", None), known("login_gids", None))
+                else {
+                    return Err(unknown());
+                };
+                let gid = |group: &str| known("gid", Some(group)).filter(|gid| !gid.is_empty());
+                let member = |group: &str| {
+                    names.split_whitespace().any(|have| have == group)
+                        || gid(group)
+                            .is_some_and(|gid| gids.split_whitespace().any(|have| have == gid))
+                };
+                let primary = |group: &str| match entry.group.as_deref() {
+                    Some(set) if is_gid(set) => gid(group) == Some(set),
+                    Some(set) => set == group,
+                    None => get("login_primary", None) == Some(group),
+                };
+                let listed = |group: &str| entry.groups.iter().flatten().any(|kept| kept == group);
+                for group in ADMIN_GROUPS {
+                    if !member(group) || primary(group) || listed(group) {
+                        continue;
+                    }
+                    if !entry.exclusive_groups {
+                        let Some(members) = get("members", Some(group)) else {
+                            return Err(unknown());
+                        };
+                        if members.split(',').any(|member| member == name) {
+                            continue;
+                        }
+                    }
+                    return Err(format!("{}: would drop the login user from {group}", at()));
+                }
+            }
+        }
+        Ok(homes)
+    }
+}
+
 /// The guards the config alone decides, for the user items `target`
 /// matches: removing the login user (the probe's `user` fact) or root, or
 /// giving the login user a `nologin` or `false` shell. The error is the
 /// target's failure.
 pub fn check_config(expanded: &Expanded, target: &Target, facts: &Facts) -> Result<(), String> {
-    let login = facts.get("user");
-    for (label, entry, _) in matched(expanded, target, facts) {
-        let name = entry.name.as_str();
-        if entry.absent() && name == "root" {
-            return Err(format!("{label} root: refused"));
-        }
-        if entry.absent() && login == Some(name) {
-            return Err(format!("{label} {name}: is the login user"));
-        }
-        if let Some(shell) = &entry.shell
-            && login == Some(name)
-            && locks_out(shell)
-        {
-            return Err(format!(
-                "{label} {name}: shell {shell} would lock out the login user"
-            ));
-        }
-    }
-    Ok(())
+    Matched::of(expanded, target, facts).check_config(facts)
 }
 
 /// Where the query reads `/proc`'s mount options.
-const MOUNTS: &str = "/proc/mounts";
+pub(crate) const MOUNTS: &str = "/proc/mounts";
 
 /// The read-only sh script whose output [`check_state`] reads, or `None`
 /// when no user item `target` matches has a guard that needs the target's
@@ -1008,76 +1180,7 @@ pub fn query(expanded: &Expanded, target: &Target, facts: &Facts) -> Option<Stri
 
 /// [`query`], reading `/proc`'s mount options from `mounts`.
 fn query_with(expanded: &Expanded, target: &Target, facts: &Facts, mounts: &str) -> Option<String> {
-    let login = facts.get("user");
-    let mut body = String::new();
-    let mut groups = false;
-    let mut keys = false;
-    for (_, entry, _) in matched(expanded, target, facts) {
-        let name = entry.name.as_str();
-        if has_keys(entry) {
-            body += &format!(
-                "anvil_l=$(anvil_pw {name}); case $? in \
-                 0) echo user.{name}=present; echo \"home.{name}=$(printf '%s\\n' \"$anvil_l\" | cut -d: -f6)\" ;; \
-                 2) echo user.{name}=missing ;; *) echo user.{name}=unknown ;; esac\n"
-            );
-        }
-        if has_keys(entry) && entry.exclusive_keys && login == Some(name) && !keys {
-            keys = true;
-            body += &format!(
-                "anvil_h=$(anvil_pw {name} | cut -d: -f6); anvil_f=\"$anvil_h/.ssh/authorized_keys\"\n\
-                 if [ -z \"$anvil_h\" ]; then echo login_keys=unknown\n\
-                 elif [ -e \"$anvil_f\" ]; then\n\
-                 if anvil_k=$(cat -- \"$anvil_f\" 2>/dev/null); then echo login_keys=read\n\
-                 printf '%s\\n' \"$anvil_k\" | sed 's/^/login_key=/'\n\
-                 else echo login_keys=unknown; fi\n\
-                 elif [ -x \"$anvil_h\" ] && {{ [ ! -e \"$anvil_h/.ssh\" ] || [ -x \"$anvil_h/.ssh\" ]; }}; then \
-                 echo login_keys=missing\n\
-                 else echo login_keys=unknown; fi\n"
-            );
-        }
-        if entry.absent() && !entry.force {
-            body += &format!("echo \"busy.{name}=$(anvil_busy {name})\"\n");
-        } else if !entry.absent() && admin_guard(entry) && login == Some(name) && !groups {
-            groups = true;
-            body += &format!(
-                "anvil_v=$(id -Gn {name} 2>/dev/null); echo \"login_groups=${{anvil_v:-unknown}}\"\n\
-                 anvil_v=$(id -G {name} 2>/dev/null); echo \"login_gids=${{anvil_v:-unknown}}\"\n\
-                 echo \"login_primary=$(id -gn {name} 2>/dev/null)\"\n"
-            );
-            for group in ADMIN_GROUPS {
-                body += &format!(
-                    "echo \"gid.{group}=$(anvil_group {group} 3)\"\n\
-                     echo \"members.{group}=$(anvil_group {group} 4)\"\n"
-                );
-            }
-        }
-    }
-    if body.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{{ LC_ALL=C; export LC_ALL; set -f\n\
-         anvil_group() {{ {{ if command -v getent >/dev/null 2>&1; then getent group \"$1\"; \
-         else awk -F: -v k=\"$1\" '$1 == k' /etc/group; fi; }} 2>/dev/null | cut -d: -f\"$2\"; }}\n\
-         {ANVIL_PW}\
-         anvil_hidden() {{ [ \"$(id -u)\" != 0 ] || return 1\n\
-         awk '$2 == \"/proc\" {{ n = split($4, o, \",\"); \
-         for (i = 1; i <= n; i++) if (o[i] ~ /^hidepid=/ && o[i] != \"hidepid=0\" && o[i] != \"hidepid=off\") h = 1 }} \
-         END {{ exit h ? 0 : 1 }}' {mounts} 2>/dev/null\n\
-         case $? in 0) return 0 ;; 1) return 1 ;; esac\n\
-         [ -d /proc/self ]; }}\n\
-         anvil_busy() {{ id -u \"$1\" >/dev/null 2>&1 || {{ echo no; return; }}\n\
-         if anvil_hidden; then echo unknown\n\
-         elif command -v pgrep >/dev/null 2>&1; then pgrep -u \"$1\" >/dev/null 2>&1\n\
-         case $? in 0) echo yes ;; 1) echo no ;; *) echo unknown ;; esac\n\
-         elif [ -r /proc/self/status ]; then anvil_u=$(id -u \"$1\"); set +f\n\
-         anvil_r=$(awk -v u=\"$anvil_u\" '/^Uid:/ && $3 == u {{ f = 1; exit }} \
-         END {{ print f ? \"yes\" : \"no\" }}' /proc/[0-9]*/status 2>/dev/null); set -f\n\
-         echo \"${{anvil_r:-unknown}}\"\n\
-         else echo unknown; fi; }}\n\
-         {body}echo {QUERY_END}\n}} </dev/null\n",
-        mounts = quote(mounts),
-    ))
+    Matched::of(expanded, target, facts).query(facts, mounts)
 }
 
 /// The guards [`query`]'s `output` decides, as the target was before the
@@ -1094,130 +1197,18 @@ pub fn check_state(
     output: &[u8],
     store: &StoreKeys,
 ) -> Result<Homes, String> {
-    let text = String::from_utf8_lossy(output);
-    let lines = || text.lines().take_while(|line| *line != QUERY_END);
-    let state: BTreeMap<&str, &str> = lines()
-        .filter(|line| !line.starts_with("login_key="))
-        .filter_map(|line| line.split_once('='))
-        .collect();
-    if !text.lines().any(|line| line == QUERY_END) {
-        return Err("users: the account query output has no end marker".to_owned());
-    }
-    let login = facts.get("user");
-    let mut homes = Homes::default();
-    for (label, entry, i) in matched(expanded, target, facts) {
-        let name = entry.name.as_str();
-        if has_keys(entry) {
-            let home = match (&entry.home, state.get(format!("user.{name}").as_str())) {
-                (Some(home), _) => home.clone(),
-                (None, Some(&"missing")) => entry.new_home(),
-                (None, Some(&"present")) => match state.get(format!("home.{name}").as_str()) {
-                    Some(home) if home.starts_with('/') => (*home).to_owned(),
-                    _ => return Err(format!("{label} {name}: has no home for authorized_keys")),
-                },
-                (None, _) => return Err(format!("{label} {name}: cannot read the user")),
-            };
-            homes.0.insert(i, home);
-        }
-        if has_keys(entry) && entry.exclusive_keys && login == Some(name) {
-            let wanted = listed(entry, i, store)?;
-            let wanted: Vec<Key> = wanted
-                .iter()
-                .filter_map(|line| parse_key(line).ok())
-                .collect();
-            let read = || {
-                let keys: Vec<&str> = (text.split('\n'))
-                    .take_while(|line| *line != QUERY_END)
-                    .filter_map(|line| line.strip_prefix("login_key="))
-                    .collect();
-                file_keys(&keys.join("\n"))
-            };
-            let have: Option<Vec<Key>> = match state.get("login_keys") {
-                Some(&"read") => read(),
-                Some(&"missing") => Some(Vec::new()),
-                _ => None,
-            };
-            let Some(have) = have else {
-                return Err(format!(
-                    "{label} {name}: cannot tell which keys the login user signs in with"
-                ));
-            };
-            let kept = if have.is_empty() {
-                !wanted.is_empty()
-            } else {
-                have.iter().any(|key| wanted.contains(key))
-            };
-            if !kept {
-                return Err(format!("{label} {name}: would drop the login key"));
-            }
-        }
-        if entry.absent() && !entry.force {
-            match state.get(format!("busy.{name}").as_str()) {
-                Some(&"no") => {}
-                Some(&"yes") => return Err(format!("{label} {name}: owns running processes")),
-                _ => {
-                    return Err(format!(
-                        "{label} {name}: cannot tell whether it owns running processes; \
-                         set force = true to remove it anyway"
-                    ));
-                }
-            }
-        }
-        if !entry.absent() && admin_guard(entry) && login == Some(name) {
-            let known = |key: &str| state.get(key).copied().filter(|value| *value != "unknown");
-            let (Some(names), Some(gids)) = (known("login_groups"), known("login_gids")) else {
-                return Err(format!(
-                    "{label} {name}: cannot tell whether the login user is in wheel, sudo or admin"
-                ));
-            };
-            let gid = |group: &str| known(&format!("gid.{group}")).filter(|gid| !gid.is_empty());
-            let member = |group: &str| {
-                names.split_whitespace().any(|have| have == group)
-                    || gid(group).is_some_and(|gid| gids.split_whitespace().any(|have| have == gid))
-            };
-            let primary = |group: &str| match entry.group.as_deref() {
-                Some(set) if set.bytes().all(|b| b.is_ascii_digit()) => gid(group) == Some(set),
-                Some(set) => set == group,
-                None => state.get("login_primary") == Some(&group),
-            };
-            let listed = |group: &str| entry.groups.iter().flatten().any(|kept| kept == group);
-            let mut dropped = None;
-            for group in ADMIN_GROUPS {
-                if !member(group) || primary(group) || listed(group) {
-                    continue;
-                }
-                if !entry.exclusive_groups {
-                    let Some(members) = state.get(format!("members.{group}").as_str()) else {
-                        return Err(format!(
-                            "{label} {name}: cannot tell whether the login user is in wheel, sudo or admin"
-                        ));
-                    };
-                    if members.split(',').any(|member| member == name) {
-                        continue;
-                    }
-                }
-                dropped = Some(group);
-                break;
-            }
-            if let Some(group) = dropped {
-                return Err(format!(
-                    "{label} {name}: would drop the login user from {group}"
-                ));
-            }
-        }
-    }
-    Ok(homes)
+    Matched::of(expanded, target, facts).check_state(facts, output, store)
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::*;
     use crate::config::Config;
-    use crate::test_util::{chmod, temp_dir};
-    use crate::transport::{Local, Transport};
+    use crate::test_util::{AccountStubs, chmod, temp_dir};
+    use crate::transport::{Local, RUN_TIMEOUT, Transport};
 
     fn entry(keys: &str) -> UserEntry {
         toml::from_str(&format!("name = \"deploy\"\n{keys}")).unwrap()
@@ -1229,83 +1220,62 @@ mod tests {
                           deploy:x:1500:100:Deploy:/home/deploy:/bin/sh\n";
     const SHELLS: &str = "/bin/sh\n/bin/bash\n";
 
-    /// A stub `getent` and `id` over `group` and `passwd` files in `dir`, an
-    /// `/etc/shells` stand-in at `dir/shells`, and stub account tools in
-    /// `dir/bin` that log their arguments to `dir/log`.
-    struct Fake {
-        dir: PathBuf,
+    /// [`AccountStubs`] with the user tools, a stub `id` over its files, and
+    /// an `/etc/shells` stand-in at `dir/shells` that a stub `grep` reads.
+    struct Fake(AccountStubs);
+
+    impl std::ops::Deref for Fake {
+        type Target = AccountStubs;
+
+        fn deref(&self) -> &AccountStubs {
+            &self.0
+        }
     }
 
     impl Fake {
         fn new(passwd: &str) -> Fake {
-            let dir = temp_dir("users");
-            fs::create_dir(dir.join("bin")).unwrap();
-            fs::write(dir.join("group"), GROUP).unwrap();
-            fs::write(dir.join("passwd"), passwd).unwrap();
-            fs::write(dir.join("shells"), SHELLS).unwrap();
-            let d = dir.display();
-            let getent = format!(
-                "#!/bin/sh\n[ $# -eq 1 ] && exec cat '{d}'/\"$1\"\n\
-                 awk -F: -v k=\"$2\" '$1 == k || $3 == k {{ print; f = 1 }} END {{ exit f ? 0 : 2 }}' \
-                 '{d}'/\"$1\"\n"
-            );
-            Self::tool(&dir.join("getent"), &getent);
-            let id = format!(
-                "#!/bin/sh\nu=$2\n\
-                 g=$(awk -F: -v u=\"$u\" '$1 == u {{ print $4 }}' '{d}'/passwd)\n\
-                 p=$(awk -F: -v g=\"$g\" '$3 == g {{ print $1 }}' '{d}'/group)\n\
-                 [ \"$1\" = -gn ] && {{ echo \"$p\"; exit; }}\n\
-                 s=$(awk -F: -v u=\"$u\" '{{ n = split($4, m, \",\"); for (i = 1; i <= n; i++) \
-                 if (m[i] == u) printf \" %s\", $1 }}' '{d}'/group)\n\
-                 echo \"$p$s\"\n"
-            );
-            Self::tool(&dir.join("id"), &id);
-            let grep = format!(
-                "#!/bin/sh\n[ \"$4\" = /etc/shells ] && set -- \"$1\" \"$2\" \"$3\" '{d}'/shells\n\
-                 exec /usr/bin/grep \"$@\"\n"
-            );
-            Self::tool(&dir.join("grep"), &grep);
-            for tool in [
+            let tools = [
                 "useradd", "usermod", "userdel", "adduser", "deluser", "addgroup", "delgroup",
-            ] {
-                let log = format!("#!/bin/sh\necho \"{tool} $*\" >>'{d}'/log\necho {tool} ran\n");
-                Self::tool(&dir.join("bin").join(tool), &log);
-            }
-            Fake { dir }
+            ];
+            let stubs = AccountStubs::new("users", GROUP, passwd, &tools);
+            fs::write(stubs.dir.join("shells"), SHELLS).unwrap();
+            let d = stubs.dir.display();
+            stubs.stub(
+                "id",
+                &format!(
+                    "#!/bin/sh\nu=$2\n\
+                     g=$(awk -F: -v u=\"$u\" '$1 == u {{ print $4 }}' '{d}'/passwd)\n\
+                     p=$(awk -F: -v g=\"$g\" '$3 == g {{ print $1 }}' '{d}'/group)\n\
+                     [ \"$1\" = -gn ] && {{ echo \"$p\"; exit; }}\n\
+                     s=$(awk -F: -v u=\"$u\" '{{ n = split($4, m, \",\"); for (i = 1; i <= n; i++) \
+                     if (m[i] == u) printf \" %s\", $1 }}' '{d}'/group)\n\
+                     echo \"$p$s\"\n"
+                ),
+            );
+            stubs.stub(
+                "grep",
+                &format!(
+                    "#!/bin/sh\n[ \"$4\" = /etc/shells ] && set -- \"$1\" \"$2\" \"$3\" '{d}'/shells\n\
+                     exec /usr/bin/grep \"$@\"\n"
+                ),
+            );
+            Fake(stubs)
         }
 
-        fn tool(path: &Path, text: &str) {
-            fs::write(path, text).unwrap();
-            chmod(path, 0o755);
-        }
-
-        /// `entry`'s script under `accounts`, run with the stubs first on
-        /// `PATH`: its exit code, stdout, stderr and the tools' log.
+        /// `entry`'s script under `accounts`, run with the stubs: its exit
+        /// code, stdout, stderr and the tools' log.
         fn run(
             &self,
             entry: &UserEntry,
             accounts: Accounts,
         ) -> (Option<i32>, String, String, String) {
-            let bin = self.dir.join("bin");
-            let script = format!(
-                "PATH='{}':$PATH\n{}",
-                self.dir.display(),
-                script("users[0]", entry, (accounts, bin.to_str().unwrap()), "")
-            );
-            let out = Local.run(&script, RUN_TIMEOUT).unwrap();
-            let log = fs::read_to_string(self.dir.join("log")).unwrap_or_default();
-            (
-                out.code,
-                String::from_utf8(out.stdout).unwrap(),
-                String::from_utf8(out.stderr).unwrap(),
-                log,
-            )
-        }
-    }
-
-    impl Drop for Fake {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.dir);
+            let bin = self.bin();
+            self.0.run(&script(
+                "users[0]",
+                entry,
+                (accounts, bin.to_str().unwrap()),
+                "",
+            ))
         }
     }
 
@@ -2163,7 +2133,9 @@ mod tests {
         KeysWrite {
             label: "users[0] deploy".to_owned(),
             user: "deploy".to_owned(),
-            keys: keys.to_vec(),
+            keys: (keys.iter())
+                .map(|line| KeyLine::parse(line).unwrap())
+                .collect(),
             exclusive,
             wrap: String::new(),
         }

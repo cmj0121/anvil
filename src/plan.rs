@@ -745,7 +745,7 @@ fn plan_target(
                 config,
                 expanded,
                 sources,
-                (None, None),
+                engine::ApplyOnly::default(),
                 plugins,
                 cancel,
             )?;
@@ -1237,7 +1237,7 @@ mod tests {
             config,
             &legacy(config),
             &Sources::default(),
-            (None, None),
+            engine::ApplyOnly::default(),
             &FakePlugins::none(),
             &cancel,
         )

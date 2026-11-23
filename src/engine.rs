@@ -7,6 +7,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::absent;
+use crate::accounts;
 use crate::cancel::{AbortReason, Cancel};
 use crate::config::{Config, FileEntry, Handler, Step, StepKind};
 use crate::dirs;
@@ -14,7 +15,6 @@ use crate::error::Failure;
 use crate::facts::{self, Facts};
 use crate::fanout;
 use crate::files::{self, SecretFile, Sources};
-use crate::groups;
 use crate::guard;
 use crate::inventory::Target;
 use crate::links;
@@ -1512,23 +1512,15 @@ fn changed(planned: &PlannedRun, output: &Output) -> bool {
             let removed = format!("removed {path}");
             lines.any(|line| line == removed.as_bytes())
         }
-        RunKind::Group { name, .. } => {
-            let (created, removed) = (
-                format!("created group {name}"),
-                format!("removed group {name}"),
-            );
-            let fixed = format!("fixed group {name}: ");
-            lines.any(|line| {
-                line == created.as_bytes()
-                    || line == removed.as_bytes()
-                    || line.starts_with(fixed.as_bytes())
-            })
-        }
-        RunKind::User { name, .. } => {
+        RunKind::Group { name, .. } | RunKind::User { name, .. } => {
+            let noun = match planned.kind {
+                RunKind::Group { .. } => "group",
+                _ => "user",
+            };
             let (created, removed, fixed) = (
-                format!("created user {name}"),
-                format!("removed user {name}"),
-                format!("fixed user {name}: "),
+                format!("created {noun} {name}"),
+                format!("removed {noun} {name}"),
+                format!("fixed {noun} {name}: "),
             );
             lines.any(|line| {
                 line == created.as_bytes()
@@ -1618,6 +1610,15 @@ impl From<TransportError> for Unresolved {
     }
 }
 
+/// What [`resolve`] has only when apply runs it; plan's is the default.
+#[derive(Default, Clone, Copy)]
+pub struct ApplyOnly<'a> {
+    /// The loaded sudo passwords and file secrets.
+    pub secrets: Option<&'a Passwords>,
+    /// Where each user's `authorized_keys` goes, from [`guard_users`].
+    pub homes: Option<&'a users::Homes>,
+}
+
 /// The steps apply runs on `target`, one per item of `expanded` in order: a
 /// package item as the step that installs and upgrades with the target's
 /// package manager (none when its script is empty), a file item copying its
@@ -1627,14 +1628,14 @@ impl From<TransportError> for Unresolved {
 /// match is a skip and resolves nothing. Runs nothing on the target, but each
 /// plugin on the controller, in order, `cancel` checked before each. `facts`,
 /// from [`probe`], is required when [`needs_facts`] says so; being one probe,
-/// no step can change what a later item sees. `secrets`, apply's loaded
-/// values, renders a file item with `secrets`; plan's `None` leaves it
-/// unrendered. A user item with `authorized_keys` is followed by the file
-/// step that writes them ([`users::keys_run`]) when `homes`, from
-/// [`guard_users`], says where; plan's `None` has no such step. A failure is
-/// `packages: <reason>`, `files…`, `services: <reason>`, `dirs…`,
-/// `links…`, `absent…` or `plugin <name>: <reason>`; the first one ends the
-/// list.
+/// no step can change what a later item sees. `apply`'s secrets, its
+/// loaded values, render a file item with `secrets`; plan's `None` leaves
+/// it unrendered. A user item with `authorized_keys` is followed by the
+/// file step that writes them ([`users::keys_run`]) when `apply`'s homes,
+/// from [`guard_users`], say where; plan's `None` has no such step. A
+/// failure is `packages: <reason>`, `files…`, `services: <reason>`,
+/// `dirs…`, `links…`, `absent…` or `plugin <name>: <reason>`; the first one
+/// ends the list.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one input of a target's steps, passed through"
@@ -1645,7 +1646,7 @@ pub fn resolve(
     config: &Config,
     expanded: &Expanded,
     sources: &Sources,
-    (secrets, homes): (Option<&Passwords>, Option<&users::Homes>),
+    apply: ApplyOnly<'_>,
     plugins: &dyn Plugins,
     cancel: &Cancel,
 ) -> Result<Vec<PlannedRun>, Unresolved> {
@@ -1659,16 +1660,22 @@ pub fn resolve(
                 .collect(),
             ItemKind::File { entry, ordinal } => {
                 let entry = (entry, *ordinal);
-                files::run(config, item, entry, sources, target, facts, secrets)?
+                files::run(config, item, entry, sources, target, facts, apply.secrets)?
             }
             ItemKind::Service(entry) => vec![services.run(item, entry)?],
             ItemKind::Group { entry, ordinal } => {
-                vec![groups::run(config, item, (entry, *ordinal), target, facts)?]
+                vec![accounts::run(
+                    config,
+                    item,
+                    (entry, *ordinal),
+                    target,
+                    facts,
+                )?]
             }
             ItemKind::User { entry, ordinal } => {
                 let entry = (entry, *ordinal);
-                let keys = users::keys_run(item, entry, target, facts, (homes, sources))?;
-                let user = users::run(config, item, entry, target, facts)?;
+                let keys = users::keys_run(item, entry, target, facts, (apply.homes, sources))?;
+                let user = accounts::run(config, item, entry, target, facts)?;
                 std::iter::once(user).chain(keys).collect()
             }
             ItemKind::Dir { entry, ordinal } => {
@@ -1716,13 +1723,18 @@ pub fn probe(transport: &dyn Transport, expanded: &Expanded) -> Result<Facts, Un
     } else {
         ("probe", "")
     };
-    let reason = |why: String| format!("{prefix}: {why}");
+    checked_output(&format!("{prefix}: {probe}"), &output)?;
+    Facts::parse(&output.stdout).map_err(|err| format!("{prefix}: {err}").into())
+}
+
+/// Fails a read-only script's `output` that did not exit 0: `lead`, as
+/// `users: the account query `, then `exited N` or `was killed by a signal`.
+fn checked_output(lead: &str, output: &Output) -> Result<(), String> {
     match output.code {
-        Some(0) => {}
-        Some(code) => return Err(reason(format!("{probe}exited {code}")).into()),
-        None => return Err(reason(format!("{probe}was killed by a signal")).into()),
+        Some(0) => Ok(()),
+        Some(code) => Err(format!("{lead}exited {code}")),
+        None => Err(format!("{lead}was killed by a signal")),
     }
-    Facts::parse(&output.stdout).map_err(|err| reason(err.to_string()).into())
 }
 
 /// The `[[users]]` lockout guards, after the probe and before any step on
@@ -1733,31 +1745,19 @@ pub fn probe(transport: &dyn Transport, expanded: &Expanded) -> Result<Facts, Un
 /// target's failure, or Cancelled when the transport was.
 pub fn guard_users(
     transport: &dyn Transport,
-    (expanded, sources): (&Expanded, &Sources),
+    expanded: &Expanded,
+    sources: &Sources,
     target: &Target,
     facts: &Facts,
 ) -> Result<users::Homes, Unresolved> {
-    users::check_config(expanded, target, facts)?;
-    let Some(query) = users::query(expanded, target, facts) else {
+    let matched = users::Matched::of(expanded, target, facts);
+    matched.check_config(facts)?;
+    let Some(query) = matched.query(facts, users::MOUNTS) else {
         return Ok(users::Homes::default());
     };
     let output = transport.run(&query, RUN_TIMEOUT)?;
-    match output.code {
-        Some(0) => {}
-        Some(code) => return Err(format!("users: the account query exited {code}").into()),
-        None => {
-            return Err("users: the account query was killed by a signal"
-                .to_owned()
-                .into());
-        }
-    }
-    Ok(users::check_state(
-        expanded,
-        target,
-        facts,
-        &output.stdout,
-        sources.keys(),
-    )?)
+    checked_output("users: the account query ", &output)?;
+    Ok(matched.check_state(facts, &output.stdout, sources.keys())?)
 }
 
 /// Whether `target` matches `item`, whose selector needs `facts` only when it
@@ -2108,7 +2108,10 @@ mod tests {
             &Config::default(),
             &expanded,
             &Sources::default(),
-            (Some(&Passwords::new()), None),
+            ApplyOnly {
+                secrets: Some(&Passwords::new()),
+                homes: None,
+            },
             &FakePlugins::none(),
             &Cancel::new(),
         )

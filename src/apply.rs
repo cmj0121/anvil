@@ -54,8 +54,8 @@ use std::sync::Arc;
 use crate::cancel::Cancel;
 use crate::config::{Config, MAX_HANDLER_NAME_BYTES, Plugin, is_handler_name};
 use crate::engine::{
-    Journal, Passwords, Reached, Recorder, Unresolved, cannot_undo, execute, guard_users,
-    open_record, probe, resolve, run_handlers, scrubbed,
+    ApplyOnly, Journal, Passwords, Reached, Recorder, Unresolved, cannot_undo, execute,
+    guard_users, open_record, probe, resolve, run_handlers, scrubbed,
 };
 use crate::error::Failure;
 use crate::fanout::{self, Event};
@@ -364,7 +364,7 @@ fn apply_target(
         journal.filter(|_| facts.is_some()),
     );
     let guarded = match &facts {
-        Some(facts) => guard_users(transport.as_ref(), (expanded, sources), target, facts),
+        Some(facts) => guard_users(transport.as_ref(), expanded, sources, target, facts),
         None => Ok(crate::users::Homes::default()),
     };
     let resolved = guarded.and_then(|homes| {
@@ -374,7 +374,10 @@ fn apply_target(
             config,
             expanded,
             sources,
-            (Some(passwords), Some(&homes)),
+            ApplyOnly {
+                secrets: Some(passwords),
+                homes: Some(&homes),
+            },
             plugins,
             cancel,
         )
@@ -492,7 +495,10 @@ mod tests {
             config,
             &legacy(config),
             sources,
-            (Some(&Passwords::new()), None),
+            ApplyOnly {
+                secrets: Some(&Passwords::new()),
+                homes: None,
+            },
             plugins,
             cancel,
         )
@@ -4753,7 +4759,10 @@ mod tests {
             &config,
             &expanded,
             &Sources::of(&sources),
-            (Some(&Passwords::new()), None),
+            ApplyOnly {
+                secrets: Some(&Passwords::new()),
+                homes: None,
+            },
             &FakePlugins::none(),
             &Cancel::new(),
         )

@@ -4,6 +4,7 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod absent;
+mod accounts;
 pub mod apply;
 mod bytes;
 pub mod cancel;

@@ -31,7 +31,7 @@ use crate::dirs::without_special;
 use crate::facts::Facts;
 use crate::files::{
     CONFLICT, capture_script, parse_capture, parse_ls, previous_of, restore_attrs,
-    restore_attrs_as, skip_run, staged, sudo_secret_for,
+    restore_attrs_as, skip_run, staged, sudo_for,
 };
 use crate::inventory::Target;
 use crate::links::{linked_check, read_link};
@@ -292,13 +292,7 @@ pub fn run(
         ));
     }
     let root = facts.is_root();
-    let secret =
-        sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
-    let sudo = match secret {
-        Some(_) => "sudo ",
-        None if root || !entry.sudo => "",
-        None => "sudo -n ",
-    };
+    let (sudo, secret) = sudo_for(config, target, facts, entry.sudo);
     let as_root = root || entry.sudo;
     log::info!("{}: {label} {path}", target.name);
     let write = AbsentWrite {
@@ -403,13 +397,7 @@ fn restore_runs_from(
             runs.push(skip_run(path, format!("cannot undo: {path} ({reason})")));
             continue;
         }
-        let secret =
-            sudo_secret_for(config, target).filter(|_| record.sudo && facts.sudo_asks_password());
-        let sudo = match secret {
-            Some(_) => "sudo ",
-            None if root || !record.sudo => "",
-            None => "sudo -n ",
-        };
+        let (sudo, secret) = sudo_for(config, target, facts, record.sudo);
         let as_root = root || record.sudo;
         let restore = Restore {
             path,

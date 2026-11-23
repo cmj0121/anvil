@@ -129,6 +129,11 @@ pub(crate) fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// `message` on stderr, then exit 1.
+pub(crate) fn fail(message: &str) -> String {
+    format!("{{ echo {} >&2; exit 1; }}", quote(message))
+}
+
 /// `env` as `KEY='value'` and `export KEY` lines, to run before a step's
 /// script on the same stdin; empty when `env` is. Keys are checked shell
 /// names, so only the values need quoting.

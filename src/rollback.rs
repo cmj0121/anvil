@@ -598,7 +598,7 @@ fn check_files(
             let parent = dest.strip_suffix("/authorized_keys");
             let keys = expanded.items.iter().any(|item| {
                 matches!(&item.kind, ItemKind::User { entry, .. }
-                    if &entry.name == user && entry.authorized_keys.is_some() && !entry.absent())
+                    if &entry.name == user && users::has_keys(entry))
                     && selected(item)
             });
             if !keys
@@ -692,7 +692,7 @@ fn check_keys(
                 format!("is the authorized_keys of user {user} but has sudo = true in the record"),
             ));
         }
-        let Some(config) = users::keys_entry(expanded, target, Some(facts), user) else {
+        let Some(config) = users::keys_entry(expanded, target, facts, user) else {
             return Err(refuse(
                 &file.dest,
                 format!("is not the authorized_keys of user {user}"),
@@ -729,8 +729,7 @@ fn check_keys(
     let mut sudo = BTreeMap::new();
     for (file, user, config) in found {
         let home = config.home.as_ref().or(homes.get(user));
-        let wanted =
-            home.map(|home| format!("{}/.ssh/authorized_keys", home.trim_end_matches('/')));
+        let wanted = home.map(|home| users::keys_dest(home));
         if wanted.as_deref() != Some(file.dest.as_str()) {
             return Err(refuse(
                 &file.dest,

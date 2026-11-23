@@ -313,3 +313,71 @@ pub(crate) fn target(name: &str) -> crate::inventory::Target {
         env: Default::default(),
     }
 }
+
+/// A stub `getent` over `group` and `passwd` files in a temp dir, and stub
+/// account tools in its `bin` that log their arguments to its `log`.
+#[cfg(test)]
+pub(crate) struct AccountStubs {
+    pub dir: PathBuf,
+}
+
+#[cfg(test)]
+impl AccountStubs {
+    pub(crate) fn new(tag: &str, group: &str, passwd: &str, tools: &[&str]) -> AccountStubs {
+        let dir = temp_dir(tag);
+        fs::create_dir(dir.join("bin")).unwrap();
+        fs::write(dir.join("group"), group).unwrap();
+        fs::write(dir.join("passwd"), passwd).unwrap();
+        let stubs = AccountStubs { dir };
+        let d = stubs.dir.display();
+        stubs.stub(
+            "getent",
+            &format!(
+                "#!/bin/sh\n[ $# -eq 1 ] && exec cat '{d}'/\"$1\"\n\
+                 awk -F: -v k=\"$2\" '$1 == k || $3 == k {{ print; f = 1 }} END {{ exit f ? 0 : 2 }}' \
+                 '{d}'/\"$1\"\n"
+            ),
+        );
+        for tool in tools {
+            stubs.stub(
+                &format!("bin/{tool}"),
+                &format!("#!/bin/sh\necho \"{tool} $*\" >>'{d}'/log\necho {tool} ran\n"),
+            );
+        }
+        stubs
+    }
+
+    /// An executable `name` under the dir holding `text`.
+    pub(crate) fn stub(&self, name: &str, text: &str) {
+        let path = self.dir.join(name);
+        fs::write(&path, text).unwrap();
+        chmod(&path, 0o755);
+    }
+
+    /// The dir of the stub account tools.
+    pub(crate) fn bin(&self) -> PathBuf {
+        self.dir.join("bin")
+    }
+
+    /// `script` run with the stubs first on `PATH`: its exit code, stdout,
+    /// stderr and the tools' log.
+    pub(crate) fn run(&self, script: &str) -> (Option<i32>, String, String, String) {
+        use crate::transport::{Local, RUN_TIMEOUT, Transport};
+        let script = format!("PATH='{}':$PATH\n{script}", self.dir.display());
+        let out = Local.run(&script, RUN_TIMEOUT).unwrap();
+        let log = fs::read_to_string(self.dir.join("log")).unwrap_or_default();
+        (
+            out.code,
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+            log,
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for AccountStubs {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
