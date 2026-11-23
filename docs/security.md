@@ -209,6 +209,19 @@ English | [繁體中文](security.zh-TW.md)
   from the request, so a 64-hex `item` can only be a real dest named like a hash. The exception is a bad pin: the
   `plugins.NAME.sha256: does not match PATH (its bytes hash to HEX)` row names the file's actual sha256 so you can
   re-pin it. That is the hash of the plugin file, which you own, not of anything on a target.
+- **Lockout guards.** [`[[users]]`](configuration.md#users) refuses, failing the target before any change on it,
+  to remove `root` or the login user, to give the login user a `nologin` or `false` shell, to let `exclusive_groups`
+  drop it from `wheel`, `sudo` or `admin`, to let `exclusive_keys` drop its login key, and to remove a user that owns
+  running processes unless `force = true`. A guard that cannot tell (no `pgrep` and no readable `/proc`, `hidepid` for
+  a non-root login, `id` failing) refuses rather than guess. The guards see the target as it was before the run, and
+  they protect only the login over which anvil runs: another admin's account, a sudoers rule or a PAM setup is not
+  checked.
+- **Keys are written as their user.** An `authorized_keys` file is written, and restored by rollback, as that user
+  (`sudo -n -u`, or `su` from a root login), never as root, so a symlink or directory the user controls in its own home
+  can point the write only where that user could write anyway. The file is 0600, in a `.ssh` created 0700 when missing;
+  rollback restores
+  only `HOME/.ssh/authorized_keys` of a user the config still lists with `authorized_keys`, and only a previous text
+  made of key, comment and blank lines, so an edited record cannot write other text or another file there.
 
 ## anvil update
 

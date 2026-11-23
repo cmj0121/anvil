@@ -177,6 +177,16 @@
   含 64 個以上連續十六進位數字，或 `item` 不是請求中的 dest 或 fact 鍵的 plugin 回覆，
   因此 64 位十六進位的 `item` 只可能是名稱像雜湊的真實 dest。例外是釘選不符：`plugins.NAME.sha256: does not match PATH (its bytes hash to HEX)`
   這一列會列出檔案實際的 sha256，方便你重新釘選。那是你自己的 plugin 檔案的雜湊，不是 target 上任何東西的雜湊。
+- **防止鎖在外面的保護。** [`[[users]]`](configuration.zh-TW.md#users) 會拒絕下列情況，並在該 target 上任何變更之前讓它失敗：
+  移除 `root` 或登入的 user、給登入的 user `nologin` 或 `false` shell、讓 `exclusive_groups` 使它離開 `wheel`、`sudo` 或 `admin`、
+  讓 `exclusive_keys` 丟掉它的登入 key，以及移除擁有執行中 process 的 user（除非 `force = true`）。
+  無法判斷的保護（沒有 `pgrep` 也沒有可讀的 `/proc`、非 root 登入時的 `hidepid`、`id` 失敗）會拒絕而不猜測。
+  保護看到的是 target 在執行之前的狀態，且只保護 anvil 所用的那個登入：其他管理者的帳號、sudoers 規則或 PAM 設定都不檢查。
+- **key 以其 user 的身分寫入。** `authorized_keys` 檔案以該 user 的身分寫入，rollback 也以該身分還原
+  （`sudo -n -u`，root 登入時為 `su`），絕不以 root 寫入，因此 user 在自己 home 中控制的 symlink 或目錄，
+  只能把寫入導向該 user 本來就能寫的地方。檔案為 0600，位於缺少時以 0700 建立的 `.ssh` 中；
+  rollback 只還原 config 仍以 `authorized_keys` 列出的 user 的 `HOME/.ssh/authorized_keys`，
+  且只還原由 key、註解與空白行組成的先前文字，因此被編輯過的紀錄無法在那裡寫入其他文字或其他檔案。
 
 ## anvil update
 

@@ -161,11 +161,12 @@ run = "hostname"
 
 `[anvil]` 一律完整顯示，包含 `workspace`（未設定時為解析後的預設值）。
 config 已有的每個區段都會補上有預設值的鍵：`[packages]` 的 `manager`、`install`、`remove`、`pin`、`upgrade` 與 `timeout`，
-`[secrets.keychain]` 的 `service`，每個 `[[files]]` 項目的 `sudo` 與 `rollback`，每個 `[[dirs]]`、`[[links]]` 與 `[[absent]]` 項目的 `sudo`，
-每個 `[plugins.NAME]` 的 `on`。
+`[secrets.keychain]` 的 `service`，每個 `[[files]]` 項目的 `sudo` 與 `rollback`，每個 `[[groups]]`、`[[dirs]]`、`[[links]]` 與
+`[[absent]]` 項目的 `sudo`，每個 `[[users]]` 項目的 `sudo` 與 `create_home`，每個 `[plugins.NAME]` 的 `on`。
 `[harden]` 一律顯示，未設定時為 `skip = []`（[`--harden`](#anvil-config---harden)）。
-config 沒用到的每個選用區段都以註解範例附在後面（`# [secrets]`、`# [packages]`、`# [[files]]`、`# [[dirs]]`、`# [[links]]`、
-`# [[absent]]`、`# [[services]]`、`# [[handlers]]` 與 `# [plugins.NAME]`；`[[tasks]]` config 不能有那五個項目區段，因此從不附上它們），
+config 沒用到的每個選用區段都以註解範例附在後面（`# [secrets]`、`# [packages]`、`# [[files]]`、`# [[groups]]`、`# [[users]]`、
+`# [[dirs]]`、`# [[links]]`、`# [[absent]]`、`# [[services]]`、`# [[handlers]]` 與 `# [plugins.NAME]`；`[[tasks]]` config
+不能有那七個項目區段，因此從不附上它們），
 以編輯格式呈現，所以 `--format yaml --full` 會以 YAML 寫出這些註解。
 `editor` 未設定時，其註解範例會放在 `[anvil]` 內。取消範例的註解即可使用。
 
@@ -190,6 +191,7 @@ anvil config --harden --write      # write the suggestions, then: anvil plan
 ```
 
 它只讀取 config、inventory，以及它檢查的 `[[files]]` 項目的 src（在 tasks config 上還有 include 與 file task 的 src），不讀其他東西：它從不連線任何 target，完全離線執行。
+它從不新增或變更 `[[groups]]` 或 `[[users]]` 項目，也不新增或變更 group 或 user task。
 規則、各規則寫入的內容與 `[harden] skip` 請見 [Harden](configuration.zh-TW.md#harden)。
 `--strict` 與 `--write` 需要 `--harden`；`--harden` 搭配 `--full` 或 `--format` 以 2 結束。
 `--target` 與 `--parallel` 會被忽略並發出警告，和 `config` 相同。
@@ -413,7 +415,9 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
 - 每個 target：facts 探測（一段 POSIX sh 腳本）透過 target 的傳輸執行。
   `connectable: true` 附上 facts，或 `connectable: false` 附上錯誤。
   facts：`hostname`、`os`、`kernel`、`arch`、`distro`、`distro_version`、`user`、`shell`、
-  `pkg`（brew、pacman、apt、dnf、apk 中存在的套件管理器）、`sudo`（`none`、`binary` = 需要密碼、`nopasswd`）。
+  `pkg`（brew、pacman、apt、dnf、apk 中存在的套件管理器）、`sudo`（`none`、`binary` = 需要密碼、`nopasswd`）、
+  `accounts`（`shadow`、`busybox` 或 `none`：[`[[groups]]`](configuration.zh-TW.md#groups) 與
+  [`[[users]]`](configuration.zh-TW.md#users) 使用的工具）與 `accounts_bin`（放這些工具的目錄，`none` 時為空）。
   當 `command -v brew` 找得到 brew，或 `/opt/homebrew/bin/brew`、`/usr/local/bin/brew`、
   `/home/linuxbrew/.linuxbrew/bin/brew` 可執行時，brew 即算存在，因為非登入的 ssh shell 可能沒把 Homebrew 放進 `PATH`。
 - `manager`，僅在 config 有 `[packages]` 區段時：每個可連線 target 的套件管理器，依 [套件](packages.zh-TW.md) 的方式解析，
@@ -666,7 +670,8 @@ tag 讓所有雜湊都不出現在請求與 doctor 的輸出中：任何雜湊�
 每個 target 上的每個 step 都以 0 結束時以 0 結束，否則為 1。
 apply 直接執行：不印出計畫，也不詢問確認；想先看它會執行什麼，請先執行 [`anvil plan`](#anvil-plan)。
 
-本節其餘部分說明舊版區段，其順序固定：套件、目錄、檔案、連結、absent、服務、step，最後是 handler。`[[tasks]]` config 依你寫的順序執行（[執行中的 task](#執行中的-task)）。
+本節其餘部分說明舊版區段，其順序固定：套件、group（`present`）、user、group（`absent`）、目錄、檔案、連結、absent、服務、step，
+最後是 handler。`[[tasks]]` config 依你寫的順序執行（[執行中的 task](#執行中的-task)）。
 
 當 `[packages]` 有事可做（`install`、`pin` 或 `remove` 非空，或 `upgrade = true`）時，每個 target 會先透過同一個傳輸執行
 facts 探測、解析其套件管理器，並將產生的腳本作為 step 1 執行，排在 `[[steps]]` 之前。
@@ -678,9 +683,14 @@ facts 探測、解析其套件管理器，並將產生的腳本作為 step 1 執
 當 target 的 sudo 要求密碼且它有 sudo secret 時，該 step 在終端機上執行，
 anvil 會在 sudo 的提示處輸入密碼（[輸入 sudo 密碼](packages.zh-TW.md#輸入-sudo-密碼)）；
 其 `$` 行仍是那行一行式腳本。沒有 `[packages]`，或沒有要安裝、升級、鎖定或移除的東西時，不會執行探測，apply 只執行 `[[steps]]`，
-除非有 step 指定 plugin（[Plugin steps](#plugin-steps)），或 config 含有 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]` 或 `[[services]]`。
+除非有 step 指定 plugin（[Plugin steps](#plugin-steps)），或 config 含有 `[[groups]]`、`[[users]]`、`[[dirs]]`、`[[files]]`、
+`[[links]]`、`[[absent]]` 或 `[[services]]`。
 
-在舊版 config 中，每個 `[[dirs]]` 項目在每個 target 上都是一個 step，排在套件 step 之後、file step 之前：
+在舊版 config 中，每個 `[[groups]]` 與 `[[users]]` 項目在每個 target 上都是一個 step，排在套件 step 之後：
+先是 present 的 group，再是 user，然後是 absent 的 group。target 的 tag 與 fact 符合時建立、修正或移除帳號，
+不符合時顯示為略過；user 的 `authorized_keys` 是緊接其後的 file step（[Group and user steps](#group-and-user-steps)）。
+
+在舊版 config 中，每個 `[[dirs]]` 項目在每個 target 上都是一個 step，排在 group 與 user step 之後、file step 之前：
 target 的 tag 與 fact 符合時建立或修正目錄，不符合時顯示為略過（[Dir steps](#dir-steps)）。
 
 在舊版 config 中，每個 `[[files]]` 項目在每個 target 上都是一個 step，排在 dir step 之後、link step 之前：
@@ -831,7 +841,7 @@ step 被訊號終止或逾時時 `code` 為 `null`；逾時的 step 是 `steps` 
 #### 執行中的 task
 
 [`[[tasks]]`](configuration.zh-TW.md#tasks) config 依所寫的順序執行，而非上述的固定順序：
-`packages`、`file`、`dir`、`link`、`absent`、`service`、`run` 或 `plugin` task 不論位置，行為都與該種 step 相同。
+`packages`、`file`、`dir`、`link`、`absent`、`service`、`group`、`user`、`run` 或 `plugin` task 不論位置，行為都與該種 step 相同。
 `plan` 與 `apply` 的順序相同。使用這份 config 時，在 `local` 上的 `anvil plan` 印出：
 
 ```toml
@@ -886,10 +896,11 @@ include = "$/roles/web.toml"   # Validate config, then Start nginx with tags = [
 
 - **失敗。** `✘ step N exited C` 依執行順序計算該 target 的 step，略過的也計入，因此 `N` 是在展開清單中的位置。
   失敗會停止該 target 其餘的 task。
-- **探測。** 清單中有 `packages`、`file`、`dir`、`link`、`absent`、`service` 或 `plugin` task，或有帶 `facts` 的 task，或 config 有 doctor plugin 時，
+- **探測。** 清單中有 `packages`、`file`、`dir`、`link`、`absent`、`service`、`group`、`user` 或 `plugin` task，或有帶 `facts` 的 task，或
+  config 有 doctor plugin 時，
   apply 會探測 target。探測在第一個 task 之前執行一次（[單次探測](configuration.zh-TW.md#tasks)）。
   任何 task 需要的 sudo 密碼都在執行開始前讀取。
-- **Rollback。** `cannot undo` 以路徑指名 `run`、`plugin`、`packages` 或 `service` task，`--dry-run` 也一樣：
+- **Rollback。** `cannot undo` 以路徑指名 `run`、`plugin`、`packages`、`service`、`group` 或 `user` task，`--dry-run` 也一樣：
 
 ```text
 ▶ local
@@ -1243,9 +1254,9 @@ rollback 只放回擁有者、群組與 mode。中途失敗的寫入在下一次
 
 列出 `anvil apply` 會在每個選定 target 上執行的 step，但一個都不執行。
 每個 target 都會透過其傳輸執行探測，即使 `[packages]` 沒有事可做也一樣，因此無法連線的 target 在這裡就會像在 apply 中一樣失敗。
-接著由 apply 使用的同一個解析函式列出 step：`[packages]` 有事可做時先是套件 step，再依序是每個 `[[dirs]]`、`[[files]]`、
-`[[links]]`、`[[absent]]`、`[[services]]` 與 `[[steps]]` 項目。
-不會執行任何套件指令、不會寫入任何檔案、不會變更任何目錄或連結、不會移除任何東西、不會執行任何服務指令，也不會執行任何 `[[steps]]` 腳本。
+接著由 apply 使用的同一個解析函式列出 step：`[packages]` 有事可做時先是套件 step，再依序是每個 present 的 `[[groups]]`、
+`[[users]]`、absent 的 `[[groups]]`、`[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]`、`[[services]]` 與 `[[steps]]` 項目。
+不會執行任何套件指令、不會變更任何帳號、不會寫入任何檔案、不會變更任何目錄或連結、不會移除任何東西、不會執行任何服務指令，也不會執行任何 `[[steps]]` 腳本。
 無法連線、探測或解析的 target 會以與 apply 相同的原因失敗（探測、套件管理器，以及在 brew、apt 或 apk 上的 `pin` 為
 `packages: REASON`，例如 `packages: pin is not one-shot on brew: vim`；`[packages]` 沒有事可做時，探測失敗為 `probe: REASON`），
 其他 target 仍會繼續規劃。plan 會像 apply 一樣，在控制端執行每個 plugin step 的 plugin，以列出它回傳的腳本
@@ -1851,6 +1862,92 @@ ERROR anvil: files[0].src `conf`: sub/link: is a symlink; a recursive copy refus
 
 拒絕條件、比對規則，以及寫到 target 上的結果（擁有者與群組、symlink、不存在的上層目錄）見 [Files](configuration.zh-TW.md#files)。
 
+### Group and user steps
+
+`[[groups]]` 或 `[[users]]` 項目在每個 tag 與 fact 符合的選定 target 上，把一個本機 group 或 user 帶到它的狀態
+（[Groups](configuration.zh-TW.md#groups)、[Users](configuration.zh-TW.md#users)）：
+
+```toml
+[[groups]]
+name = "app"
+gid = 2000
+
+[[users]]
+name = "deploy"
+group = "app"
+shell = "/bin/bash"
+authorized_keys = ["$/keys/deploy.pub"]
+
+[[users]]
+name = "olduser"
+state = "absent"
+```
+
+每個項目在每個 target 上都是一個 step，依 config 順序：present 的 group 在套件 step 之後，接著是 user，
+然後是 absent 的 group，全部在 dir step 之前；`group` 或 `user` task 是在它所在位置的同一種 step。
+step 顯示為 `$` 加上它的標籤，只看 config：`group NAME`，設定了時加上 `(gid N, system)`，或 `remove group NAME`；
+`user NAME`，設定了時加上 `(uid N, group G, groups A B, shell PATH, home PATH, system, no home, authorized_keys N)`
+（`exclusive_groups` 時為 `only groups A B`，空的 exclusive 清單為 `no groups`，`exclusive_keys` 時為
+`authorized_keys N, exclusive`），或 `remove user NAME`。它印出一行：
+`created group NAME`、`fixed group NAME: gid`、`removed group NAME` 或 `unchanged group NAME`；`created user NAME`、
+`fixed user NAME: shell, groups`（列出變更的部分）、`removed user NAME` 或 `unchanged user NAME`。
+在不符合的 target 上為 `$ skipped group NAME: no match`（或 `user`），不執行任何東西，計入 `✔ ok · N steps`。`-vv` 時：
+
+```text
+▶ linode1
+  $ group app (gid 2000)
+  created group app
+  $ user deploy (group app, shell /bin/bash, authorized_keys 1)
+  created user deploy
+  $ file /home/deploy/.ssh/authorized_keys
+  wrote /home/deploy/.ssh/authorized_keys
+  $ remove user olduser
+  unchanged user olduser
+  $ hostname
+  linode1
+  ✔ ok · 5 steps
+```
+
+step 的 stdout 只有那一行；`useradd` 等工具自己印出的東西進到 stderr。變更 `home` 的警告也在那裡。
+有 `authorized_keys` 的 user 會在自己的 step 之後緊接著加一個 file step，`$ file HOME/.ssh/authorized_keys`，
+與任何 [file step](#file-steps) 一樣印出 `wrote DEST` 或 `unchanged DEST`。建立、修正或移除的帳號算作變更，
+並通知該項目的 handler；寫入的 key 檔也一樣。
+
+失敗的情況見 [Groups](configuration.zh-TW.md#groups) 與 [Users](configuration.zh-TW.md#users)，每一種都像任何失敗的 step 一樣結束該 target：
+缺少 group 或 shell、uid 或 gid 已被占用、busybox 拒絕變更，以及 `groups: no account tools on this target (accounts = none)`
+（或 `users:`）。[防止鎖在外面的保護](configuration.zh-TW.md#users)則在 target 的第一個 step 之前讓它失敗：
+只看 config 的保護緊接在探測之後，其他的則在一次唯讀帳號查詢之後，而查詢只在符合的項目需要時才執行
+（需要讀取狀態的保護，或帶有 `authorized_keys` 的 present user）；查詢失敗也會讓 target 失敗
+（[帳號查詢](configuration.zh-TW.md#users)）。
+
+在 `--json` 中，`run` 是標籤，step 帶有一般的欄位：
+
+```json
+{ "run": "group app (gid 2000)", "code": 0, "stdout": "created group app\n", "stderr": "", "changed": true }
+{ "run": "user deploy (shell /bin/bash)", "code": 0, "stdout": "fixed user deploy: shell\n", "stderr": "", "changed": true }
+{ "run": "skipped user web: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true, "changed": false }
+```
+
+`anvil plan` 顯示 `would group app (gid 2000)`、
+`would user deploy (uid 2000, group app, groups docker, shell /bin/bash)`、`would remove user olduser` 與
+`would remove group old`，apply 會走密碼路徑時加上
+`(sudo password from secret NAME)`，以及 `would $ skipped group NAME: no match`（或 `user`）。
+這一行是 config 想要的狀態：plan 不讀取 target 上的帳號，因此分不出建立、修正或不變，
+也不顯示 authorized_keys 的 file step，只有 user 行中的 `authorized_keys N`。
+它會檢查不需要查詢的保護（移除 root 或登入的 user、給它 `nologin` shell），並與 apply 一樣讓 target 失敗。
+在 `plan --json` 中，`run` 是同樣的標籤，設定了時帶有 `sudo_secret` 與 `notify`：
+
+```json
+{ "run": "user deploy (uid 2000, group app, only groups app, authorized_keys 1, exclusive)" }
+{ "run": "remove user olduser" }
+```
+
+`-vv` 會記錄 `TARGET: users[I] NAME with Shadow in /usr/sbin`（`Busybox`）、`TARGET: users[I] NAME: no match` 與
+`TARGET: users[I] NAME: no account tools`，`groups[I]` 也一樣。
+
+**Rollback。** 帳號不會被記錄：[`anvil rollback`](#anvil-rollback) 把每個執行過的 group 或 user step 列為
+`cannot undo: group NAME` 或 `cannot undo: user NAME`。authorized_keys 檔案像檔案寫入一樣連同它的 user 被記錄，並會被還原。
+
 ### Dir steps
 
 `[[dirs]]` 項目或 `dir` [task](#執行中的-task) 在每個 tag 與 fact 都符合的選定 target 上建立一個目錄，或修正它的擁有者、群組與 mode
@@ -2276,9 +2373,20 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   以 `"not_restored":[{"target","dest","reason"}]` 列出，沒有時省略。結束碼仍為 0，所以重複 rollback 保持冪等。
   下面那些沒有指名檔案的註記不影響摘要。
 - **無法復原的部分。** 在檔案之後，apply 中有執行但無法復原的 step 會顯示為略過的 step：`cannot undo: packages`、
-  `cannot undo: service NAME` 與 `cannot undo: step N`（第 N 個 `[[steps]]` 項目），在 tasks config 上則為 `cannot undo: PATH`
+  `cannot undo: group NAME`、`cannot undo: user NAME`、`cannot undo: service NAME` 與 `cannot undo: step N`（第 N 個
+  `[[steps]]` 項目），在 tasks config 上則為 `cannot undo: PATH`
   （[執行中的 task](#執行中的-task)），執行過的 handler 則為 `cannot undo: handler NAME`。
-  rollback 絕不執行套件管理器、service 指令、step 或 handler。
+  rollback 絕不執行套件管理器、帳號工具、service 指令、step 或 handler：apply 建立、修正或移除的 group 或 user 維持原樣。
+- **authorized_keys。** user 的 `authorized_keys` 檔案記錄為同時指名其 user 的檔案寫入，並以該 user 的身分、
+  依 apply 寫入的方式、以該項目的 `sudo` 還原（apply 建立它時則移除）；apply 為它建立的 `.ssh` 在為空時會被移除。
+  會先檢查紀錄：該 user 必須是適用於該 target、帶有 `authorized_keys` 的 present `[[users]]` 項目，
+  dest 必須是它的 `HOME/.ssh/authorized_keys`（HOME 取自 `home`，否則讀取 target 的 passwd），先前的文字只能有 key、註解或空白行。
+  否則該 target 失敗且不執行任何東西，顯示
+  `rollback: DEST is not the authorized_keys of user NAME in [[files]]; refusing to restore it`、
+  `rollback: DEST is not the authorized_keys of user NAME; refusing to restore it`（探測之後沒有這樣的項目適用）、
+  `rollback: DEST is not in the home of user NAME; refusing to restore it`、
+  `rollback: cannot read the homes of the users` 或
+  `rollback: DEST has a previous text with a line that is not a key; refusing to restore it`。
 - **排入的 handler。** 對它放回的每個檔案、目錄、連結或被移除的路徑，rollback 把該路徑的項目中適用於該 target 者（以紀錄保存的 fact 比對，而不是探測的 fact）
   的 `notify` 名稱，依 `[[handlers]]` 順序、各一次地加入該 target 的 `pending_handlers`，讓下一次 apply 執行它們。
   每個排入的 handler 都是 target 區塊中的一則警告 `⚠ pending handler NAME queued for the next apply`，也在它的 `warnings` 中。
