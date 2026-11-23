@@ -8,10 +8,10 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::config::{
-    AbsentEntry, Config, DirEntry, FileEntry, LinkEntry, MAX_ABSENT, MAX_DIRS, MAX_FILES,
-    MAX_LINKS, MAX_SERVICES, ServiceEntry, Step, Task, TaskPackages, check_absent_entry,
-    check_absent_overlap, check_dir, check_file, check_link, check_selector, check_service,
-    check_tasks,
+    AbsentEntry, Config, DirEntry, FileEntry, GroupEntry, LinkEntry, MAX_ABSENT, MAX_DIRS,
+    MAX_FILES, MAX_GROUPS, MAX_LINKS, MAX_SERVICES, ServiceEntry, Step, Task, TaskPackages,
+    check_absent_entry, check_absent_overlap, check_dir, check_file, check_group, check_link,
+    check_selector, check_service, check_tasks,
 };
 use crate::document::{self, Format};
 use crate::error::Failure;
@@ -62,6 +62,11 @@ pub struct Item {
 pub enum ItemKind {
     /// The global `[packages]` with this task's lists.
     Packages(Packages),
+    /// `ordinal` is the index among the list's group items.
+    Group {
+        entry: GroupEntry,
+        ordinal: usize,
+    },
     /// `ordinal` is the index among the list's dir items.
     Dir {
         entry: DirEntry,
@@ -189,7 +194,7 @@ impl Expanded {
     }
 
     /// The sudo secrets a step may type on a target its tags reach: for a
-    /// package item, a `sudo = true` dir, file, link or absent item or a
+    /// package item, a `sudo = true` group, dir, file, link or absent item or a
     /// service item; and on
     /// any target for a service handler, deliberately broad: which handlers
     /// are due is known only after the steps. A secret that is not set
@@ -208,11 +213,13 @@ impl Expanded {
                 ItemKind::Packages(packages) => {
                     names.extend(tagged.filter_map(|target| packages.sudo_secret_for(target)));
                 }
+                ItemKind::Group { entry, .. } if !entry.sudo => {}
                 ItemKind::Dir { entry, .. } if !entry.sudo => {}
                 ItemKind::File { entry, .. } if !entry.sudo => {}
                 ItemKind::Link { entry, .. } if !entry.sudo => {}
                 ItemKind::Absent { entry, .. } if !entry.sudo => {}
-                ItemKind::Dir { .. }
+                ItemKind::Group { .. }
+                | ItemKind::Dir { .. }
                 | ItemKind::File { .. }
                 | ItemKind::Link { .. }
                 | ItemKind::Absent { .. }
@@ -281,8 +288,8 @@ struct IncludeFile {
     tasks: Vec<Task>,
 }
 
-/// Legacy sections in their fixed order: packages, dirs, files, links,
-/// absent, services, steps. Touches no filesystem.
+/// Legacy sections in their fixed order: packages, present groups, absent
+/// groups, dirs, files, links, absent, services, steps. Touches no filesystem.
 pub fn legacy(config: &Config) -> Expanded {
     fn item(
         tags: &[String],
@@ -305,6 +312,17 @@ pub fn legacy(config: &Config) -> Expanded {
         .iter()
         .filter(|p| p.has_work())
         .map(|p| item(&[], &none, &[], ItemKind::Packages(p.clone())));
+    let groups = |absent: bool| {
+        (config.groups.iter().enumerate())
+            .filter(move |(_, entry)| entry.absent() == absent)
+            .map(|(ordinal, entry)| {
+                let kind = ItemKind::Group {
+                    entry: entry.clone(),
+                    ordinal,
+                };
+                item(&entry.tags, &entry.facts, &entry.notify, kind)
+            })
+    };
     let dirs = config.dirs.iter().enumerate().map(|(ordinal, entry)| {
         let kind = ItemKind::Dir {
             entry: entry.clone(),
@@ -340,7 +358,10 @@ pub fn legacy(config: &Config) -> Expanded {
     let steps = (config.steps.iter())
         .map(|step| item(&[], &none, &step.notify, ItemKind::Step(step.clone())));
     Expanded {
-        items: (packages.chain(dirs).chain(files).chain(links))
+        items: (packages.chain(groups(false)).chain(groups(true)))
+            .chain(dirs)
+            .chain(files)
+            .chain(links)
             .chain(absent)
             .chain(services)
             .chain(steps)
@@ -376,6 +397,7 @@ pub fn expand(
         chain: Vec::new(),
         items: Vec::new(),
         visited: 0,
+        groups: 0,
         dirs: 0,
         files: 0,
         links: 0,
@@ -509,6 +531,7 @@ struct Walk<'a> {
     chain: Vec<String>,
     items: Vec<Item>,
     visited: usize,
+    groups: usize,
     dirs: usize,
     files: usize,
     links: usize,
@@ -571,6 +594,18 @@ impl Walk<'_> {
             ItemKind::File {
                 entry: entry.clone(),
                 ordinal: self.files - 1,
+            }
+        } else if let Some(entry) = &task.group {
+            check_group(&format!("{path}.group"), entry)?;
+            self.groups += 1;
+            if self.groups > MAX_GROUPS {
+                return Err(format!(
+                    "{path}: more than {MAX_GROUPS} group tasks after expansion"
+                ));
+            }
+            ItemKind::Group {
+                entry: entry.clone(),
+                ordinal: self.groups - 1,
             }
         } else if let Some(entry) = &task.dir {
             check_dir(&format!("{path}.dir"), entry)?;
@@ -819,13 +854,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_puts_dirs_before_files_and_links_and_absent_after_them() {
+    fn legacy_puts_groups_then_dirs_before_files_and_links_and_absent_after_them() {
         let config: Config = toml::from_str(
             r#"
             [packages]
             install = ["git"]
             [[steps]]
             run = "last"
+            [[groups]]
+            name = "app"
+            gid = 2000
+            [[groups]]
+            name = "old"
+            state = "absent"
+            [[groups]]
+            name = "web"
             [[absent]]
             path = "/gone"
             type = "link"
@@ -859,6 +902,7 @@ mod tests {
             .iter()
             .map(|item| match &item.kind {
                 ItemKind::Packages(_) => "packages".to_owned(),
+                ItemKind::Group { entry, ordinal } => format!("group {} {ordinal}", entry.name),
                 ItemKind::Dir { entry, ordinal } => format!("dir {} {ordinal}", entry.path),
                 ItemKind::File { entry, ordinal } => format!("file {} {ordinal}", entry.dest),
                 ItemKind::Link { entry, ordinal } => format!("link {} {ordinal}", entry.path),
@@ -871,6 +915,9 @@ mod tests {
             kinds,
             [
                 "packages",
+                "group app 0",
+                "group web 2",
+                "group old 1",
                 "dir /d0 0",
                 "dir /d1 1",
                 "file /a 0",
@@ -881,9 +928,10 @@ mod tests {
                 "step",
             ]
         );
-        assert_eq!(items[1].tags, ["web"]);
-        assert_eq!(items[2].notify, ["h"]);
-        assert_eq!(items[1].label("dirs", 0), "dirs[0]");
+        assert_eq!(items[4].tags, ["web"]);
+        assert_eq!(items[5].notify, ["h"]);
+        assert_eq!(items[4].label("dirs", 0), "dirs[0]");
+        assert_eq!(items[3].label("groups", 1), "groups[1]");
     }
 
     #[test]
@@ -1206,6 +1254,33 @@ mod tests {
             matches!(&items[2].kind, ItemKind::Link { entry, ordinal: 1 } if entry.target == "/d1")
         );
         assert!(matches!(&items[3].kind, ItemKind::Dir { ordinal: 1, .. }));
+    }
+
+    #[test]
+    fn group_tasks_run_where_they_stand_even_when_absent() {
+        let ws = Workspace::new();
+        let items = ws.items(
+            r#"
+            [[tasks]]
+            dir = { path = "/d0", mode = "0750", owner = "app" }
+            [[tasks]]
+            group = { name = "old", state = "absent" }
+            [[tasks]]
+            facts = { accounts = "shadow" }
+            group = { name = "app", gid = 2000 }
+            "#,
+        );
+        assert_eq!(paths(&items), ["tasks[0]", "tasks[1]", "tasks[2]"]);
+        assert!(matches!(&items[1].kind, ItemKind::Group { entry, ordinal: 0 } if entry.absent()));
+        assert!(
+            matches!(&items[2].kind, ItemKind::Group { entry, ordinal: 1 } if entry.gid == Some(2000))
+        );
+        assert_eq!(items[2].facts, facts(&[("accounts", "shadow")]));
+        assert_eq!(items[2].label("groups", 1), "tasks[2].group");
+        assert_refused(
+            &ws.refusal("[[tasks]]\ngroup = { name = \"App\" }\n"),
+            "tasks[0].group.name `App`: must match",
+        );
     }
 
     #[test]
@@ -2116,11 +2191,11 @@ mod tests {
             ),
             (
                 "tasks = []\nnotify = [\"a\"]",
-                ".notify: only on a run, plugin, file, service, dir, link or absent task",
+                ".notify: only on a run, plugin, file, service, group, dir, link or absent task",
             ),
             (
                 "include = \"$/other.toml\"\nnotify = [\"a\"]",
-                ".notify: only on a run, plugin, file, service, dir, link or absent task",
+                ".notify: only on a run, plugin, file, service, group, dir, link or absent task",
             ),
             (
                 "file = { src = \"f\", dest = \"/f\", mode = \"0644\", notify = [\"a\"] }",

@@ -54,6 +54,8 @@ pub enum RunKind {
     Absent { path: String, run: AbsentRun },
     /// A `[[services]]` step.
     Service { name: String, run: ServiceRun },
+    /// A `[[groups]]` step.
+    Group { name: String, run: GroupRun },
     /// A `[[steps]]` entry, 1-based among them, the plugin that returned it,
     /// its guards and, when any is set, the nonce of their skip line, which
     /// is never shown.
@@ -95,6 +97,7 @@ impl RunKind {
             RunKind::Link { path, .. } => Entry::Link { path: path.clone() },
             RunKind::Absent { path, .. } => Entry::Absent { path: path.clone() },
             RunKind::Service { name, .. } => Entry::Service { name: name.clone() },
+            RunKind::Group { name, .. } => Entry::Group { name: name.clone() },
             RunKind::Step { number, .. } => Entry::Step { number: *number },
             RunKind::Skip | RunKind::Script => Entry::Script,
         }
@@ -119,6 +122,9 @@ pub enum Entry {
         path: String,
     },
     Service {
+        name: String,
+    },
+    Group {
         name: String,
     },
     Step {
@@ -204,6 +210,12 @@ pub struct AbsentRun {
 /// A `[[services]]` step: whether the entry matched no tag or fact of the target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceRun {
+    pub skip: bool,
+}
+
+/// A `[[groups]]` step: whether the entry matched no tag or fact of the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRun {
     pub skip: bool,
 }
 
@@ -355,6 +367,13 @@ impl PlannedRun {
             RunKind::Absent { path, run } if !run.skip => {
                 Some((path, run.r#type.map(AbsentType::as_str)))
             }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn group(&self) -> Option<&GroupRun> {
+        match &self.kind {
+            RunKind::Group { run, .. } => Some(run),
             _ => None,
         }
     }

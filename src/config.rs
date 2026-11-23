@@ -1,5 +1,6 @@
 //! The config document: `[anvil]` preferences, the `[secrets]` backend, the
-//! `[packages]` to install, the pinned `[plugins]`, the `[[dirs]]` to make,
+//! `[packages]` to install, the pinned `[plugins]`, the `[[groups]]` to
+//! create or remove, the `[[dirs]]` to make,
 //! the `[[files]]` to copy, the `[[links]]` to point, the `[[services]]` to
 //! bring to a state, the `[[steps]]` that
 //! `anvil apply` runs, the `[harden]` rules `config --harden` skips and the
@@ -37,6 +38,12 @@ pub const MAX_FILES: usize = 64;
 
 /// Longest `[[files]]` dest, in bytes: Linux's `PATH_MAX`.
 pub(crate) const MAX_DEST_BYTES: usize = 4096;
+
+/// Most `[[groups]]` entries in one config.
+pub const MAX_GROUPS: usize = 64;
+
+/// The highest `[[groups]]` gid.
+const MAX_GID: i64 = 60000;
 
 /// Most `[[dirs]]` entries in one config.
 pub const MAX_DIRS: usize = 64;
@@ -76,6 +83,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub plugins: BTreeMap<String, Plugin>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GroupEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dirs: Vec<DirEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<FileEntry>,
@@ -107,6 +116,8 @@ struct RawConfig {
     packages: Option<Packages>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     plugins: BTreeMap<String, Plugin>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    groups: Vec<GroupEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     dirs: Vec<DirEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -144,6 +155,7 @@ impl TryFrom<RawConfig> for Config {
             let packages = raw.packages.as_ref();
             let mixed = [
                 (raw.steps.is_some(), "[[steps]]"),
+                (!raw.groups.is_empty(), "[[groups]]"),
                 (!raw.dirs.is_empty(), "[[dirs]]"),
                 (!raw.files.is_empty(), "[[files]]"),
                 (!raw.links.is_empty(), "[[links]]"),
@@ -179,6 +191,7 @@ impl TryFrom<RawConfig> for Config {
             secrets: raw.secrets,
             packages: raw.packages,
             plugins: raw.plugins,
+            groups: raw.groups,
             dirs: raw.dirs,
             files: raw.files,
             links: raw.links,
@@ -200,6 +213,7 @@ impl From<Config> for RawConfig {
             secrets: config.secrets,
             packages: config.packages,
             plugins: config.plugins,
+            groups: config.groups,
             dirs: config.dirs,
             files: config.files,
             links: config.links,
@@ -220,6 +234,7 @@ impl Default for Config {
             secrets: None,
             packages: None,
             plugins: BTreeMap::new(),
+            groups: Vec::new(),
             dirs: Vec::new(),
             files: Vec::new(),
             links: Vec::new(),
@@ -456,8 +471,8 @@ impl Guards {
     }
 }
 
-/// A `[[tasks]]` entry: exactly one kind (`run`, `plugin`, `packages`, `file`,
-/// `service`, `include` or `tasks`) on the targets its `tags` and `facts` match.
+/// A `[[tasks]]` entry: exactly one kind (`run`, `plugin`, `packages`, `group`,
+/// `dir`, `file`, `link`, `absent`, `service`, `include` or `tasks`) on the targets its `tags` and `facts` match.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Task {
@@ -489,6 +504,8 @@ pub struct Task {
     pub file: Option<FileEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<ServiceEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<GroupEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<DirEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -588,6 +605,39 @@ impl std::fmt::Debug for FileEntry {
             .field("recursive", &self.recursive)
             .field("dir_mode", &self.dir_mode)
             .finish()
+    }
+}
+
+/// A `[[groups]]` entry: the local group `name`, created or fixed with
+/// `state = "present"` (the default) or removed with `"absent"`, on each
+/// target whose tags and facts all match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupEntry {
+    pub name: String,
+    /// Unset: a new group gets the next free gid and an existing one keeps its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<i64>,
+    /// `true`: a new group is a system group.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub system: bool,
+    /// `present` or `absent`; `None` is `present`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facts: BTreeMap<String, String>,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub sudo: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<String>,
+}
+
+impl GroupEntry {
+    /// Whether the entry removes the group.
+    pub fn absent(&self) -> bool {
+        self.state.as_deref() == Some("absent")
     }
 }
 
@@ -869,6 +919,8 @@ remove = []
 pin = []
 upgrade = false
 timeout = 300
+[[groups]]
+sudo = true
 [[dirs]]
 sudo = true
 [[files]]
@@ -904,6 +956,9 @@ mode = "0644"
 owner = "root"
 group = "root"
 parents = false
+[[groups]]
+name = "app"
+gid = 2000
 [[dirs]]
 path = "/srv/app"
 mode = "0755"
@@ -1015,7 +1070,7 @@ impl Config {
             let refused = !self.tasks.is_empty()
                 && matches!(
                     key.as_str(),
-                    "dirs" | "files" | "links" | "absent" | "services"
+                    "groups" | "dirs" | "files" | "links" | "absent" | "services"
                 );
             if value.get(&key).is_none() && !refused {
                 let table = toml::Table::from_iter([(key, example)]);
@@ -1120,6 +1175,8 @@ impl Config {
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_handlers()
             .map_err(|message| DocumentError::invalid(path, message))?;
+        self.check_groups()
+            .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_dirs()
             .map_err(|message| DocumentError::invalid(path, message))?;
         self.check_files()
@@ -1170,6 +1227,29 @@ impl Config {
             let prefix = format!("files[{i}]");
             check_file(&prefix, entry)?;
             check_notify(&prefix, &entry.notify, &self.handlers)?;
+        }
+        Ok(())
+    }
+
+    /// The `[[groups]]` syntax rules, and no name written twice; whether a
+    /// target has the group is asked only when `apply` runs.
+    fn check_groups(&self) -> Result<(), String> {
+        if self.groups.len() > MAX_GROUPS {
+            return Err(format!(
+                "groups: {} entries exceeds the {MAX_GROUPS} entry limit",
+                self.groups.len()
+            ));
+        }
+        for (i, entry) in self.groups.iter().enumerate() {
+            let prefix = format!("groups[{i}]");
+            check_group(&prefix, entry)?;
+            check_notify(&prefix, &entry.notify, &self.handlers)?;
+            if let Some(j) = (self.groups[..i].iter()).position(|other| other.name == entry.name) {
+                return Err(format!(
+                    "{prefix}.name `{}`: same name as groups[{j}]",
+                    entry.name
+                ));
+            }
         }
         Ok(())
     }
@@ -1777,12 +1857,7 @@ fn check_account(prefix: &str, key: &str, value: Option<&str>) -> Result<(), Str
     let id = value.len() <= 10
         && value.bytes().all(|b| b.is_ascii_digit())
         && value.parse::<u32>().is_ok();
-    let mut bytes = value.bytes();
-    let name = value.len() <= 32
-        && bytes
-            .next()
-            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
-        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b));
+    let name = is_account_name(value);
     let what = if key == "owner" { "user" } else { "group" };
     if id || name {
         Ok(())
@@ -1792,6 +1867,49 @@ fn check_account(prefix: &str, key: &str, value: Option<&str>) -> Result<(), Str
             secret::shown_name(value)
         ))
     }
+}
+
+/// A user or group name: `[a-z_][a-z0-9_.-]*` of 1 to 32 bytes.
+pub(crate) fn is_account_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    value.len() <= 32
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b))
+}
+
+/// One group entry's rules; `prefix` names it, as `groups[0]`.
+pub(crate) fn check_group(prefix: &str, entry: &GroupEntry) -> Result<(), String> {
+    if !is_account_name(&entry.name) {
+        return Err(format!(
+            "{prefix}.name `{}`: must match [a-z_][a-z0-9_.-]*, at most 32 bytes",
+            secret::shown_name(&entry.name)
+        ));
+    }
+    if let Some(gid) = entry.gid
+        && !(1..=MAX_GID).contains(&gid)
+    {
+        return Err(format!("{prefix}.gid `{gid}`: must be 1 to {MAX_GID}"));
+    }
+    match entry.state.as_deref() {
+        None | Some("present" | "absent") => {}
+        Some(state) => {
+            return Err(format!(
+                "{prefix}.state `{}`: must be present or absent",
+                escape_controls(state)
+            ));
+        }
+    }
+    if entry.absent() {
+        if entry.gid.is_some() {
+            return Err(format!("{prefix}.gid: not with state = \"absent\""));
+        }
+        if entry.system {
+            return Err(format!("{prefix}.system: not with state = \"absent\""));
+        }
+    }
+    check_selector(prefix, &entry.tags, &entry.facts)
 }
 
 /// One service entry's rules; `prefix` names it, as `services[0]`. Only a
@@ -2116,6 +2234,7 @@ pub(crate) fn check_tasks(
             ("packages", task.packages.is_some()),
             ("file", task.file.is_some()),
             ("service", task.service.is_some()),
+            ("group", task.group.is_some()),
             ("dir", task.dir.is_some()),
             ("link", task.link.is_some()),
             ("absent", task.absent.is_some()),
@@ -2128,8 +2247,8 @@ pub(crate) fn check_tasks(
             [_] => {}
             [] => {
                 return Err(format!(
-                    "{path}: needs one of run, plugin, packages, file, service, dir, link, absent, \
-                     include, tasks"
+                    "{path}: needs one of run, plugin, packages, file, service, group, dir, link, \
+                     absent, include, tasks"
                 ));
             }
             many => return Err(format!("{path}: has {}; keep one", many.join(" and "))),
@@ -2155,7 +2274,8 @@ pub(crate) fn check_tasks(
             }
             if task.include.is_some() || task.tasks.is_some() {
                 return Err(format!(
-                    "{path}.notify: only on a run, plugin, file, service, dir, link or absent task"
+                    "{path}.notify: only on a run, plugin, file, service, group, dir, link or \
+                     absent task"
                 ));
             }
             check_notify(&path, &task.notify, handlers)?;
@@ -2177,6 +2297,18 @@ pub(crate) fn check_tasks(
             return Err(format!(
                 "{path}.service: notify belongs on the task, not the service"
             ));
+        }
+        if let Some(group) = &task.group {
+            if !group.notify.is_empty() {
+                return Err(format!(
+                    "{path}.group: notify belongs on the task, not the group"
+                ));
+            }
+            if !group.tags.is_empty() || !group.facts.is_empty() {
+                return Err(format!(
+                    "{path}.group: tags and facts belong on the task, not the group"
+                ));
+            }
         }
         if task.dir.as_ref().is_some_and(|dir| !dir.notify.is_empty()) {
             return Err(format!(
@@ -2803,7 +2935,7 @@ mod tests {
             (
                 format!("{ENTRY}\nfacts = {{ distribution = \"arch\" }}"),
                 "files[0].facts.distribution: unknown fact; must be one of hostname, os, kernel, \
-                 arch, distro, distro_version, user, shell, pkg, sudo"
+                 arch, distro, distro_version, user, shell, pkg, sudo, accounts, accounts_bin"
                     .to_string(),
             ),
             (
@@ -3454,6 +3586,153 @@ mod tests {
         }
     }
 
+    #[test]
+    fn groups_fixtures_are_refused_naming_the_entry_and_the_key() {
+        for (file, field) in [
+            (
+                "invalid/config-groups-bad-name.toml",
+                "groups[1].name `App`: must match [a-z_][a-z0-9_.-]*, at most 32 bytes",
+            ),
+            (
+                "invalid/config-groups-bad-gid.yaml",
+                "groups[0].gid `70000`: must be 1 to 60000",
+            ),
+            (
+                "invalid/config-groups-duplicate-name.toml",
+                "groups[1].name `app`: same name as groups[0]",
+            ),
+            (
+                "invalid/config-groups-bad-state.yaml",
+                "groups[0].state `gone`: must be present or absent",
+            ),
+            (
+                "invalid/config-groups-gid-on-absent.toml",
+                "groups[0].gid: not with state = \"absent\"",
+            ),
+        ] {
+            let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                matches!(err, DocumentError::Invalid { .. }),
+                "{file}: {message}"
+            );
+            assert!(message.contains(file), "{file}: {message}");
+            assert!(message.contains(field), "{file}: {message}");
+        }
+        for (file, key, line) in [
+            (
+                "invalid/config-groups-unknown-key.toml",
+                "members",
+                "line 4",
+            ),
+            (
+                "invalid/config-groups-system-not-bool.yaml",
+                "system",
+                "line 4",
+            ),
+        ] {
+            let err = Config::load(Some(&fixture_doc(file))).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                matches!(err, DocumentError::Parse { .. }),
+                "{file}: {message}"
+            );
+            assert!(message.contains(file), "{file}: {message}");
+            assert!(message.contains(key), "{file}: {message}");
+            assert!(message.contains(line), "{file}: {message}");
+        }
+    }
+
+    #[test]
+    fn group_entries_within_the_rules_pass_and_the_rest_name_the_key() {
+        let group = |keys: &str| parse(&format!("[[groups]]\n{keys}\n")).check_groups();
+        for keys in [
+            "name = \"app\"",
+            "name = \"_svc.x-1\"\ngid = 1\nsystem = true",
+            "name = \"app\"\ngid = 60000\nstate = \"present\"",
+            "name = \"old\"\nstate = \"absent\"\nsudo = false",
+            "name = \"app\"\ntags = [\"web\"]\nfacts = { accounts = \"shadow\" }",
+        ] {
+            assert_eq!(group(keys), Ok(()), "{keys}");
+        }
+        let long = "a".repeat(33);
+        for (keys, wanted) in [
+            (
+                format!("name = \"{long}\""),
+                format!("groups[0].name `{long}`: must match [a-z_][a-z0-9_.-]*, at most 32 bytes"),
+            ),
+            (
+                "name = \"1app\"".to_owned(),
+                "groups[0].name `1app`: must match [a-z_][a-z0-9_.-]*, at most 32 bytes".to_owned(),
+            ),
+            (
+                "name = \"app\"\ngid = 0".to_owned(),
+                "groups[0].gid `0`: must be 1 to 60000".to_owned(),
+            ),
+            (
+                "name = \"app\"\nstate = \"absent\"\nsystem = true".to_owned(),
+                "groups[0].system: not with state = \"absent\"".to_owned(),
+            ),
+            (
+                "name = \"app\"\nfacts = { account = \"shadow\" }".to_owned(),
+                format!(
+                    "groups[0].facts.account: unknown fact; must be one of {}",
+                    facts::KEYS.join(", ")
+                ),
+            ),
+        ] {
+            assert_eq!(group(&keys), Err(wanted), "{keys}");
+        }
+        let many: String = (0..=MAX_GROUPS)
+            .map(|i| format!("[[groups]]\nname = \"g{i}\"\n"))
+            .collect();
+        assert_eq!(
+            parse(&many).check_groups().unwrap_err(),
+            "groups: 65 entries exceeds the 64 entry limit"
+        );
+    }
+
+    #[test]
+    fn a_group_task_takes_no_notify_tags_or_facts_of_its_own_and_no_other_kind() {
+        let tasks = |text: &str| {
+            let config = parse(text);
+            check_tasks(&config.tasks, "tasks", &config.handlers)
+        };
+        assert_eq!(
+            tasks("[[tasks]]\ngroup = { name = \"app\", gid = 2000 }\n"),
+            Ok(())
+        );
+        for (task, wanted) in [
+            (
+                "group = { name = \"app\", notify = [\"h\"] }",
+                "tasks[0].group: notify belongs on the task, not the group",
+            ),
+            (
+                "group = { name = \"app\", tags = [\"web\"] }",
+                "tasks[0].group: tags and facts belong on the task, not the group",
+            ),
+            (
+                "group = { name = \"app\" }\nrun = \"true\"",
+                "tasks[0]: has run and group; keep one",
+            ),
+        ] {
+            assert_eq!(
+                tasks(&format!("[[tasks]]\n{task}\n")),
+                Err(wanted.to_owned()),
+                "{task}"
+            );
+        }
+        let mixed: Result<Config, String> = document::from_str(
+            "[[groups]]\nname = \"app\"\n\n[[tasks]]\nrun = \"true\"\n",
+            Format::Toml,
+        );
+        assert!(
+            mixed
+                .unwrap_err()
+                .contains("[[tasks]] cannot be mixed with [[groups]]"),
+        );
+    }
+
     fn service_entry(keys: &str) -> Config {
         parse(&format!("[[services]]\n{keys}\n"))
     }
@@ -3612,7 +3891,7 @@ mod tests {
             (
                 format!("{SERVICE}\nfacts = {{ distribution = \"arch\" }}"),
                 "services[0].facts.distribution: unknown fact; must be one of hostname, os, \
-                 kernel, arch, distro, distro_version, user, shell, pkg, sudo"
+                 kernel, arch, distro, distro_version, user, shell, pkg, sudo, accounts, accounts_bin"
                     .to_string(),
             ),
             (
@@ -4582,7 +4861,7 @@ facts = { os = "Linux" }
             ),
             (
                 "name = \"only\"",
-                "tasks[0]: needs one of run, plugin, packages, file, service, dir, link, absent, include, tasks",
+                "tasks[0]: needs one of run, plugin, packages, file, service, group, dir, link, absent, include, tasks",
             ),
         ] {
             let err = validated(&format!("[[tasks]]\n{task}\n")).unwrap_err();
@@ -5342,7 +5621,7 @@ removes = "/tmp/stale"
         for kind in ["include = \"$/a.toml\"", "tasks = []"] {
             assert_eq!(
                 refused(&format!("{kind}\nnotify = [\"reload sshd\"]")),
-                "tasks[0].notify: only on a run, plugin, file, service, dir, link or absent task"
+                "tasks[0].notify: only on a run, plugin, file, service, group, dir, link or absent task"
             );
         }
         assert_eq!(

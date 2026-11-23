@@ -1103,6 +1103,69 @@ else
 fi
 docker exec "$NAME" rm -rf /etc/anvil-e2e-ab-file /etc/anvil-e2e-ab-link /etc/anvil-e2e-ab-dir
 
+step "(y) [[groups]] on arch (shadow, NOPASSWD): created, then unchanged, a gid fixed, then removed; accounts is a facts key"
+GR_DIR="$TMP/groups"
+mkdir -p "$GR_DIR"
+gr_config() {
+  cat >"$GR_DIR/config.toml" <<CONF
+[[groups]]
+name = "anvil-e2e"
+$1
+
+[[groups]]
+name = "anvil-e2e-sys"
+system = true
+facts = { accounts = "shadow" }
+
+[[groups]]
+name = "anvil-e2e-bb"
+facts = { accounts = "busybox" }
+CONF
+}
+gr_anvil() {
+  run_env XDG_STATE_HOME="$TMP/state-groups" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$GR_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+gr_gid() { docker exec "$NAME" getent group "$1" | cut -d: -f3; }
+docker exec "$NAME" sh -c 'for g in anvil-e2e anvil-e2e-sys anvil-e2e-bb; do groupdel "$g" 2>/dev/null; done; :'
+gr_config 'gid = 2345'
+gr_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  created group anvil-e2e' "$TMP/out" \
+  && grep -qxF '  created group anvil-e2e-sys' "$TMP/out" \
+  && [ "$(gr_gid anvil-e2e)" = 2345 ] && [ -n "$(gr_gid anvil-e2e-sys)" ] \
+  && ! docker exec "$NAME" getent group anvil-e2e-bb >/dev/null; then
+  pass "apply created the groups, the busybox-only one skipped"
+else
+  fail "apply of groups: exit $code"
+fi
+gr_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged group anvil-e2e' "$TMP/out" \
+  && grep -qxF '  unchanged group anvil-e2e-sys' "$TMP/out" && ! grep -qE '(created|fixed) group' "$TMP/out"; then
+  pass "a second apply changes no group"
+else
+  fail "second apply of groups: exit $code"
+fi
+docker exec "$NAME" groupmod -g 2346 anvil-e2e
+gr_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  fixed group anvil-e2e: gid' "$TMP/out" && [ "$(gr_gid anvil-e2e)" = 2345 ]; then
+  pass "a changed gid is fixed"
+else
+  fail "gid fix: exit $code"
+fi
+gr_config 'state = "absent"'
+gr_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  removed group anvil-e2e' "$TMP/out" \
+  && ! docker exec "$NAME" getent group anvil-e2e >/dev/null; then
+  pass "an absent group is removed"
+else
+  fail "removal of a group: exit $code"
+fi
+docker exec "$NAME" sh -c 'for g in anvil-e2e anvil-e2e-sys; do groupdel "$g" 2>/dev/null; done; :'
+
 step "(x) a recursive [[files]] tree on arch (NOPASSWD): owner, group, mode and dir_mode on a nested tree into an existing dir; rollback removes what it created"
 TR_STATE="$TMP/state-tree"
 TR_DIR="$TMP/tree"
@@ -1498,6 +1561,36 @@ CONF
     pass "busybox: a changed file is changed, a group-writable parent is not root-only"
   else
     fail "doctor on alpine after the changes: exit $code"
+  fi
+  cat >"$ALP_DIR/groups.toml" <<CONF
+[[groups]]
+name = "anvil-e2e"
+gid = 2345
+
+[[groups]]
+name = "anvil-e2e-shadow"
+facts = { accounts = "shadow" }
+CONF
+  alp_groups() {
+    run_env XDG_STATE_HOME="$TMP/state-alpine" "$ANVIL" --ssh-program "$ALP_DIR/ssh" \
+      --inventory "$ALP_DIR/inventory.toml" --config "$ALP_DIR/groups.toml" "$@" \
+      </dev/null >"$TMP/out" 2>"$TMP/err"
+  }
+  alp_groups -vv apply --target alpine
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  created group anvil-e2e' "$TMP/out" \
+    && docker exec "$ALP_NAME" grep -qx 'anvil-e2e:x:2345:' /etc/group \
+    && ! docker exec "$ALP_NAME" grep -q '^anvil-e2e-shadow:' /etc/group; then
+    pass "busybox: addgroup created the group, the shadow-only one skipped"
+  else
+    fail "apply of groups on alpine: exit $code"
+  fi
+  alp_groups -vv apply --target alpine
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  unchanged group anvil-e2e' "$TMP/out" && ! grep -qF 'created group' "$TMP/out"; then
+    pass "busybox: a second apply changes no group"
+  else
+    fail "second apply of groups on alpine: exit $code"
   fi
   docker rm -f "$ALP_NAME" >/dev/null 2>&1
 else

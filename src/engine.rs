@@ -14,6 +14,7 @@ use crate::error::Failure;
 use crate::facts::{self, Facts};
 use crate::fanout;
 use crate::files::{self, SecretFile, Sources};
+use crate::groups;
 use crate::guard;
 use crate::inventory::Target;
 use crate::links;
@@ -564,7 +565,7 @@ fn write_end(output: &Result<Output, TransportError>, staged: bool) -> record::W
 }
 
 /// The steps that ran and that a rollback cannot undo: `packages`,
-/// `service NAME`, `step N` (1-based among `[[steps]]`) and `handler NAME`,
+/// `service NAME`, `group NAME`, `step N` (1-based among `[[steps]]`) and `handler NAME`,
 /// or a task's path; never a skip.
 pub(crate) fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
     steps
@@ -582,6 +583,7 @@ pub(crate) fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
             (_, Some(path)) => Some(path.clone()),
             (Entry::Packages, None) => Some("packages".to_owned()),
             (Entry::Service { name }, None) => Some(format!("service {name}")),
+            (Entry::Group { name }, None) => Some(format!("group {name}")),
             (Entry::Step { number }, None) => Some(format!("step {number}")),
             (Entry::Handler { name }, None) => Some(format!("handler {name}")),
         })
@@ -647,6 +649,7 @@ fn execute_inner(
             RunKind::Link { .. } => ("links", "links"),
             RunKind::Absent { .. } => ("absent", "absent"),
             RunKind::Service { .. } => ("services", "services"),
+            RunKind::Group { .. } => ("groups", "groups"),
             RunKind::Packages { .. } => ("packages", "packages"),
             RunKind::Step { .. } | RunKind::Skip | RunKind::Script => ("packages", "step"),
         };
@@ -658,6 +661,7 @@ fn execute_inner(
             || planned.link().is_some_and(|link| link.skip)
             || planned.absent().is_some_and(|absent| absent.skip)
             || planned.service().is_some_and(|service| service.skip)
+            || planned.group().is_some_and(|group| group.skip)
             || matches!(planned.kind, RunKind::Skip)
         {
             let report = StepReport::skipped(label, entry).of(planned);
@@ -1455,7 +1459,8 @@ pub(crate) enum Sent {
 /// guard, changed something, so that its `notify` fires: a file step that
 /// wrote or fixed DEST's owner, group or mode (`unchanged` when nothing
 /// differed), a dir step that created or fixed its directory, a link step
-/// that linked or relinked its path, a service step that
+/// that linked or relinked its path, a group step that created, fixed or
+/// removed its group, a service step that
 /// printed neither `unchanged service NAME` nor the `reloaded` no-op line, a
 /// run or plugin step that exited 0. Never the package step, a skip or a
 /// failure.
@@ -1483,6 +1488,18 @@ fn changed(planned: &PlannedRun, output: &Output) -> bool {
         RunKind::Absent { path, .. } => {
             let removed = format!("removed {path}");
             lines.any(|line| line == removed.as_bytes())
+        }
+        RunKind::Group { name, .. } => {
+            let (created, removed) = (
+                format!("created group {name}"),
+                format!("removed group {name}"),
+            );
+            let fixed = format!("fixed group {name}: ");
+            lines.any(|line| {
+                line == created.as_bytes()
+                    || line == removed.as_bytes()
+                    || line.starts_with(fixed.as_bytes())
+            })
         }
         RunKind::Service { name, .. } => {
             let unchanged = format!("unchanged service {name}");
@@ -1608,6 +1625,9 @@ pub fn resolve(
                 files::run(config, item, entry, sources, target, facts, secrets)?
             }
             ItemKind::Service(entry) => vec![services.run(item, entry)?],
+            ItemKind::Group { entry, ordinal } => {
+                vec![groups::run(config, item, (entry, *ordinal), target, facts)?]
+            }
             ItemKind::Dir { entry, ordinal } => {
                 vec![dirs::run(config, item, (entry, *ordinal), target, facts)?]
             }

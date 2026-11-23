@@ -900,7 +900,9 @@ pub fn render(report: &PlanReport, show: Show, sources: &Sources, hashes: &Hashe
 /// would type and the plugin that returned it, if any; unescaped but for a
 /// task's invisible characters, since its `run` is config text under review.
 /// A file entry with `secrets` is
-/// `would write DEST (secret: NAME, NAME; rendered at apply)` instead.
+/// `would write DEST (secret: NAME, NAME; rendered at apply)` instead, and a
+/// group step that runs is `would group NAME (gid N)` or `would remove group
+/// NAME`, from the config alone.
 pub fn would_text(step: &PlannedRun) -> String {
     let binary = if step.binary() { " (binary)" } else { "" };
     let secret = step
@@ -918,6 +920,9 @@ pub fn would_text(step: &PlannedRun) -> String {
             write.dest,
             file.names.join(", ")
         ),
+        None if step.group().is_some_and(|group| !group.skip) => {
+            format!("would {}{secret}", step.shown())
+        }
         None => format!(
             "would $ {}{binary}{secret}{from}",
             report::command(step.shown())
