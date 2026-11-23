@@ -4857,3 +4857,675 @@ fn a_symlink_to_the_same_bytes_at_a_tree_file_is_not_unchanged() {
             .is_symlink()
     );
 }
+
+/// Stand-in shadow-utils in `<root>/acct`, first on the returned `PATH`, so
+/// the probe reports `accounts=shadow` with that directory: `getent` reads
+/// `<root>/acct/group` and `passwd`, starting as `group`, and each tool
+/// appends its argv to `<root>/acct/log`, `groupadd` and `groupdel`
+/// changing `group`, and `useradd`, `usermod -s` and `userdel` changing
+/// `passwd`, as the real ones would.
+fn fake_accounts(sandbox: &Sandbox, group: &str) -> String {
+    let acct = sandbox.root().join("acct");
+    std::fs::create_dir(&acct).unwrap();
+    std::fs::write(acct.join("group"), group).unwrap();
+    std::fs::write(acct.join("passwd"), "root:x:0:0::/root:/bin/sh\n").unwrap();
+    let getent = "#!/bin/sh\nd=$(dirname \"$0\")\n[ $# -eq 1 ] && exec cat \"$d/$1\"\n\
+                  awk -F: -v k=\"$2\" '$1 == k || $3 == k { print; f = 1 } END { exit f ? 0 : 2 }' \"$d/$1\"\n";
+    let tool = "#!/bin/sh\nd=$(dirname \"$0\")\necho \"${0##*/} $*\" >>\"$d/log\"\n\
+                case ${0##*/} in\n\
+                groupadd) g=1234; [ \"$1\" = -g ] && { g=$2; shift 2; }; echo \"$1:x:$g:\" >>\"$d/group\" ;;\n\
+                groupdel) grep -v \"^$1:\" \"$d/group\" >\"$d/group.new\"; mv \"$d/group.new\" \"$d/group\" ;;\n\
+                useradd) u=1001; g=100; s=/bin/sh; h=\n\
+                  while [ $# -gt 1 ]; do case $1 in\n\
+                  -u) u=$2; shift ;; -s) s=$2; shift ;; -d) h=$2; shift ;;\n\
+                  -g) g=$(awk -F: -v k=\"$2\" '$1 == k { print $3 }' \"$d/group\"); shift ;;\n\
+                  esac; shift; done\n\
+                  echo \"$1:x:$u:$g::$h:$s\" >>\"$d/passwd\" ;;\n\
+                usermod) [ \"$1\" = -s ] && awk -F: -v OFS=: -v n=\"$3\" -v s=\"$2\" '$1 == n { $7 = s } { print }' \
+                  \"$d/passwd\" >\"$d/passwd.new\" && mv \"$d/passwd.new\" \"$d/passwd\" ;;\n\
+                userdel) for n; do :; done; grep -v \"^$n:\" \"$d/passwd\" >\"$d/passwd.new\"; \
+                  mv \"$d/passwd.new\" \"$d/passwd\" ;;\n\
+                esac\n";
+    let tools = [
+        "useradd", "usermod", "userdel", "groupadd", "groupmod", "groupdel",
+    ];
+    for (name, body) in std::iter::once(("getent", getent)).chain(tools.map(|name| (name, tool))) {
+        std::fs::write(acct.join(name), body).unwrap();
+        common::chmod(&acct.join(name), 0o755);
+    }
+    format!("{}:{}", acct.display(), std::env::var("PATH").unwrap())
+}
+
+#[test]
+fn groups_run_after_packages_before_dirs_and_a_second_apply_changes_nothing() {
+    let sandbox = Sandbox::new("ag");
+    let path = fake_accounts(&sandbox, "old:x:3000:\n");
+    let root = sandbox.root().display().to_string();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[dirs]]\npath = \"{root}/app\"\nmode = \"0750\"\nsudo = false\n\n\
+             [[groups]]\nname = \"old\"\nstate = \"absent\"\nsudo = false\n\n\
+             [[groups]]\nname = \"app\"\ngid = 2000\nsudo = false\nnotify = [\"log\"]\n\n\
+             [[handlers]]\nname = \"log\"\nrun = 'echo log >> {root}/handler.log'\n"
+        ),
+    );
+    let apply = || {
+        let out = sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+        json(&out)["targets"][0]["steps"].clone()
+    };
+    let steps = apply();
+    let shown = |i: usize| {
+        (
+            steps[i]["run"].clone(),
+            steps[i]["stdout"].clone(),
+            steps[i]["changed"].clone(),
+        )
+    };
+    assert_eq!(
+        shown(0),
+        (
+            "group app (gid 2000)".into(),
+            "created group app\n".into(),
+            true.into()
+        )
+    );
+    assert_eq!(
+        shown(1),
+        (
+            "remove group old".into(),
+            "removed group old\n".into(),
+            true.into()
+        )
+    );
+    assert_eq!(steps[2]["run"], format!("dir {root}/app"));
+    let acct = sandbox.root().join("acct");
+    let log = || std::fs::read_to_string(acct.join("log")).unwrap();
+    assert_eq!(log(), "groupadd -g 2000 app\ngroupdel old\n");
+    assert_eq!(
+        std::fs::read_to_string(acct.join("group")).unwrap(),
+        "app:x:2000:\n"
+    );
+    let handled = || std::fs::read_to_string(sandbox.root().join("handler.log")).unwrap();
+    assert_eq!(handled(), "log\n");
+    let record = sandbox.last_apply().unwrap();
+    let cannot_undo = &record["targets"]["local"]["cannot_undo"];
+    assert_eq!(cannot_undo[0], "group app", "{record}");
+    assert_eq!(cannot_undo[1], "group old", "{record}");
+
+    let steps = apply();
+    let shown = |i: usize| (steps[i]["stdout"].clone(), steps[i]["changed"].clone());
+    assert_eq!(shown(0), ("unchanged group app\n".into(), false.into()));
+    assert_eq!(shown(1), ("unchanged group old\n".into(), false.into()));
+    assert_eq!(
+        log(),
+        "groupadd -g 2000 app\ngroupdel old\n",
+        "nothing more ran"
+    );
+    assert_eq!(handled(), "log\n", "unchanged does not notify");
+}
+
+#[test]
+fn a_group_the_target_does_not_match_is_skipped() {
+    let sandbox = Sandbox::new("ag");
+    let path = fake_accounts(&sandbox, "");
+    sandbox.write_config(
+        "config.toml",
+        "[[groups]]\nname = \"app\"\ntags = [\"web\"]\n\n\
+         [[groups]]\nname = \"db\"\nsudo = false\nfacts = { accounts = \"busybox\" }\n",
+    );
+    let out = sandbox.anvil(
+        &["--json", "apply", "--target", "local"],
+        &[("PATH", &path)],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let value = json(&out);
+    let steps = &value["targets"][0]["steps"];
+    for (i, line) in ["skipped group app: no match", "skipped group db: no match"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(steps[i]["run"], line, "{value}");
+        assert_eq!(steps[i]["skipped"], true, "{value}");
+    }
+    assert!(!sandbox.root().join("acct/log").exists(), "no tool ran");
+}
+
+/// macOS has neither shadow-utils nor busybox: the group step fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_group_on_a_target_without_account_tools_fails_its_step() {
+    let sandbox = Sandbox::new("ag");
+    sandbox.write_config(
+        "config.toml",
+        "[[groups]]\nname = \"app\"\nsudo = false\n\n[[steps]]\nrun = \"true\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let value = json(&out);
+    let steps = value["targets"][0]["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1, "{value}");
+    assert_eq!(
+        steps[0]["stderr"],
+        "groups: no account tools on this target (accounts = none)\n"
+    );
+}
+
+#[test]
+fn users_run_after_present_groups_and_a_group_made_the_same_run_counts() {
+    let sandbox = Sandbox::new("au");
+    let path = fake_accounts(&sandbox, "");
+    let user = |shell: &str| {
+        sandbox.write_config(
+            "config.toml",
+            &format!(
+                "[[users]]\nname = \"deploy\"\nuid = 2000\ngroup = \"app\"\nshell = \"{shell}\"\n\
+                 sudo = false\nnotify = [\"log\"]\n\n\
+                 [[users]]\nname = \"web\"\ntags = [\"web\"]\n\n\
+                 [[groups]]\nname = \"app\"\ngid = 2000\nsudo = false\n\n\
+                 [[handlers]]\nname = \"log\"\nrun = 'echo log >> {}/handler.log'\n",
+                sandbox.root().display()
+            ),
+        );
+    };
+    let apply = || {
+        let out = sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+        json(&out)["targets"][0]["steps"].clone()
+    };
+    user("/bin/sh");
+    let steps = apply();
+    let shown = |i: usize| {
+        (
+            steps[i]["run"].clone(),
+            steps[i]["stdout"].clone(),
+            steps[i]["changed"].clone(),
+        )
+    };
+    assert_eq!(shown(0).1, "created group app\n");
+    assert_eq!(
+        shown(1),
+        (
+            "user deploy (uid 2000, group app, shell /bin/sh)".into(),
+            "created user deploy\n".into(),
+            true.into()
+        )
+    );
+    assert_eq!(steps[2]["run"], "skipped user web: no match");
+    assert_eq!(steps[2]["skipped"], true);
+    let acct = sandbox.root().join("acct");
+    let log = || std::fs::read_to_string(acct.join("log")).unwrap();
+    assert_eq!(
+        log(),
+        "groupadd -g 2000 app\nuseradd -u 2000 -g app -s /bin/sh -d /home/deploy -m deploy\n"
+    );
+    let handled = || std::fs::read_to_string(sandbox.root().join("handler.log")).unwrap();
+    assert_eq!(handled(), "log\n");
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["cannot_undo"][1], "user deploy",
+        "{record}"
+    );
+
+    user("/bin/bash");
+    let steps = apply();
+    assert_eq!(steps[1]["stdout"], "fixed user deploy: shell\n");
+    assert_eq!(steps[1]["changed"], true);
+    assert!(
+        log().ends_with("usermod -s /bin/bash deploy\n"),
+        "{}",
+        log()
+    );
+    assert_eq!(handled(), "log\nlog\n");
+
+    let before = log();
+    let steps = apply();
+    assert_eq!(steps[1]["stdout"], "unchanged user deploy\n");
+    assert_eq!(steps[1]["changed"], false);
+    assert_eq!(log(), before, "nothing more ran");
+    assert_eq!(handled(), "log\nlog\n", "unchanged does not notify");
+}
+
+#[test]
+fn a_user_whose_group_is_on_no_target_fails_its_step_before_any_change() {
+    let sandbox = Sandbox::new("au");
+    let path = fake_accounts(&sandbox, "");
+    sandbox.write_config(
+        "config.toml",
+        "[[users]]\nname = \"deploy\"\ngroups = [\"nope\"]\nsudo = false\n",
+    );
+    let out = sandbox.anvil(
+        &["--json", "apply", "--target", "local"],
+        &[("PATH", &path)],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let value = json(&out);
+    assert_eq!(
+        value["targets"][0]["steps"][0]["stderr"],
+        "users[0] deploy: group nope does not exist on this target\n"
+    );
+    assert!(!sandbox.root().join("acct/log").exists(), "no tool ran");
+}
+
+/// macOS has neither shadow-utils nor busybox: the user step fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_user_on_a_target_without_account_tools_fails_its_step() {
+    let sandbox = Sandbox::new("au");
+    sandbox.write_config(
+        "config.toml",
+        "[[users]]\nname = \"deploy\"\nsudo = false\n\n[[steps]]\nrun = \"true\"\n",
+    );
+    let out = sandbox.anvil(&["--json", "apply", "--target", "local"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let value = json(&out);
+    let steps = value["targets"][0]["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1, "{value}");
+    assert_eq!(
+        steps[0]["stderr"],
+        "users: no account tools on this target (accounts = none)\n"
+    );
+}
+
+/// The login user of the local target, from the record of an apply that
+/// changes nothing.
+fn login_user(sandbox: &Sandbox, path: &str) -> String {
+    sandbox.write_config(
+        "config.toml",
+        "[[users]]\nname = \"anvil_gone_x\"\nstate = \"absent\"\nsudo = false\n",
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[("PATH", path)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let record = sandbox.last_apply().unwrap();
+    record["targets"]["local"]["facts"]["user"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn an_absent_user_is_removed_and_a_second_apply_changes_nothing() {
+    let sandbox = Sandbox::new("ax");
+    let path = fake_accounts(&sandbox, "old:x:3000:\n");
+    let acct = sandbox.root().join("acct");
+    std::fs::write(
+        acct.join("passwd"),
+        "root:x:0:0::/root:/bin/sh\nold:x:3000:3000::/home/old:/bin/sh\n",
+    )
+    .unwrap();
+    let root = sandbox.root().display().to_string();
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[users]]\nname = \"old\"\nstate = \"absent\"\nremove_home = true\nsudo = false\n\
+             notify = [\"log\"]\n\n\
+             [[groups]]\nname = \"old\"\nstate = \"absent\"\nsudo = false\n\n\
+             [[handlers]]\nname = \"log\"\nrun = 'echo log >> {root}/handler.log'\n"
+        ),
+    );
+    let apply = || {
+        let out = sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+        json(&out)["targets"][0]["steps"].clone()
+    };
+    let steps = apply();
+    assert_eq!(steps[0]["run"], "remove user old");
+    assert_eq!(steps[0]["stdout"], "removed user old\n");
+    assert_eq!(steps[0]["changed"], true);
+    assert_eq!(steps[1]["stdout"], "removed group old\n", "users go first");
+    let log = || std::fs::read_to_string(acct.join("log")).unwrap();
+    assert_eq!(log(), "userdel -r old\ngroupdel old\n");
+    let handled = || std::fs::read_to_string(sandbox.root().join("handler.log")).unwrap();
+    assert_eq!(handled(), "log\n");
+
+    let steps = apply();
+    assert_eq!(steps[0]["stdout"], "unchanged user old\n");
+    assert_eq!(steps[0]["changed"], false);
+    assert_eq!(log(), "userdel -r old\ngroupdel old\n", "nothing more ran");
+    assert_eq!(handled(), "log\n");
+}
+
+/// Each refusal fails the target before any step, a group step before the
+/// user included; the local login user is whoever runs the tests.
+#[test]
+fn a_lockout_guard_fails_the_target_before_any_change() {
+    let sandbox = Sandbox::new("ax");
+    let path = fake_accounts(&sandbox, "");
+    let me = login_user(&sandbox, &path);
+    let group = "[[groups]]\nname = \"app\"\nsudo = false\n\n";
+    for (users, wanted) in [
+        (
+            format!("{group}[[users]]\nname = \"{me}\"\nstate = \"absent\"\nsudo = false\n"),
+            format!("users[0] {me}: is the login user"),
+        ),
+        (
+            format!(
+                "{group}[[users]]\nname = \"root\"\nstate = \"absent\"\nforce = true\nsudo = false\n"
+            ),
+            "users[0] root: refused".to_owned(),
+        ),
+        (
+            format!("{group}[[users]]\nname = \"{me}\"\nshell = \"/sbin/nologin\"\nsudo = false\n"),
+            format!("users[0] {me}: shell /sbin/nologin would lock out the login user"),
+        ),
+        (
+            format!(
+                "[[tasks]]\ngroup = {{ name = \"app\", sudo = false }}\n\n\
+                 [[tasks]]\nuser = {{ name = \"{me}\", state = \"absent\", sudo = false }}\n"
+            ),
+            format!("tasks[1].user {me}: is the login user"),
+        ),
+    ] {
+        sandbox.write_config("config.toml", &users);
+        let out = sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        );
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+        let value = json(&out);
+        assert_eq!(value["targets"][0]["error"], wanted.as_str(), "{value}");
+        assert!(value["targets"][0]["steps"].is_null(), "{value}");
+        assert!(!sandbox.root().join("acct/log").exists(), "no tool ran");
+
+        let out = sandbox.anvil(&["--json", "plan"], &[("PATH", &path)]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+        assert_eq!(json(&out)["targets"][0]["error"], wanted.as_str());
+    }
+}
+
+#[test]
+fn a_user_owning_processes_is_removed_only_with_force() {
+    let sandbox = Sandbox::new("ax");
+    let path = fake_accounts(&sandbox, "");
+    let acct = sandbox.root().join("acct");
+    std::fs::write(
+        acct.join("passwd"),
+        "root:x:0:0::/root:/bin/sh\nbusy:x:3000:3000::/home/busy:/bin/sh\n",
+    )
+    .unwrap();
+    let id = format!(
+        "#!/bin/sh\n[ \"$1 $2\" = \"-u busy\" ] && {{ echo 3000; exit 0; }}\nexec {} \"$@\"\n",
+        ["/usr/bin/id", "/bin/id"]
+            .into_iter()
+            .find(|id| std::path::Path::new(id).exists())
+            .unwrap()
+    );
+    for (name, body) in [
+        ("id", id.as_str()),
+        (
+            "pgrep",
+            "#!/bin/sh\necho \"pgrep $*\" >>\"$(dirname \"$0\")/pgrep.log\"\n[ \"$2\" = busy ]\n",
+        ),
+    ] {
+        std::fs::write(acct.join(name), body).unwrap();
+        common::chmod(&acct.join(name), 0o755);
+    }
+    let config = |force: &str| {
+        sandbox.write_config(
+            "config.toml",
+            &format!(
+                "[[groups]]\nname = \"app\"\nsudo = false\n\n\
+                 [[users]]\nname = \"busy\"\nstate = \"absent\"\nsudo = false\n{force}"
+            ),
+        );
+        sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        )
+    };
+    let out = config("");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let value = json(&out);
+    assert_eq!(
+        value["targets"][0]["error"],
+        "users[0] busy: owns running processes"
+    );
+    assert!(!acct.join("log").exists(), "no tool ran");
+    assert_eq!(
+        std::fs::read_to_string(acct.join("pgrep.log")).unwrap(),
+        "pgrep -u busy\n"
+    );
+
+    let out = config("force = true\n");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][1]["stdout"],
+        "removed user busy\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(acct.join("log")).unwrap(),
+        "groupadd app\nuserdel -f busy\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(acct.join("pgrep.log")).unwrap(),
+        "pgrep -u busy\n",
+        "force asks no query"
+    );
+}
+
+const KEY_A: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB a@host";
+const KEY_B: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC b@host";
+const KEY_C: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMD c@host";
+
+/// The login user, in the fake passwd with its home at `<root>/home`, and
+/// that home; [`fake_accounts`] first on the returned `PATH`.
+fn keys_user(sandbox: &Sandbox) -> (String, PathBuf, String) {
+    let path = fake_accounts(sandbox, "");
+    let me = login_user(sandbox, &path);
+    let home = sandbox.root().join("home");
+    std::fs::create_dir(&home).unwrap();
+    common::chmod(&home, 0o755);
+    // Never root's real home, when the tests run as root.
+    let root = if me == "root" {
+        ""
+    } else {
+        "root:x:0:0::/root:/bin/sh\n"
+    };
+    std::fs::write(
+        sandbox.root().join("acct/passwd"),
+        format!("{root}{me}:x:1500:100::{}:/bin/sh\n", home.display()),
+    )
+    .unwrap();
+    (me, home, path)
+}
+
+#[test]
+fn authorized_keys_are_added_or_set_exactly_and_rollback_restores_the_file() {
+    let sandbox = Sandbox::new("ak");
+    let (me, home, path) = keys_user(&sandbox);
+    let ssh = home.join(".ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    common::chmod(&ssh, 0o700);
+    let file = ssh.join("authorized_keys");
+    std::fs::write(&file, format!("{KEY_A}\n")).unwrap();
+    common::chmod(&file, 0o600);
+    store_file(&sandbox, "keys/c.pub", &format!("{KEY_C}\n"));
+    let dest = file.display().to_string();
+    let config = |exclusive: bool| {
+        sandbox.write_config(
+            "config.toml",
+            &format!(
+                "[[users]]\nname = \"{me}\"\nsudo = false\nnotify = [\"log\"]\n\
+                 authorized_keys = [\"{KEY_B}\", \"$/keys/c.pub\"]\nexclusive_keys = {exclusive}\n\n\
+                 [[handlers]]\nname = \"log\"\nrun = 'echo log >> {}/handler.log'\n",
+                sandbox.root().display()
+            ),
+        );
+    };
+    let apply = || {
+        let out = sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+        json(&out)["targets"][0]["steps"].clone()
+    };
+    config(false);
+    let out = sandbox.anvil(&["plan"], &[("PATH", &path)]);
+    assert!(
+        text(&out.stdout).contains(&format!("user {me} (authorized_keys 2)")),
+        "{}",
+        text(&out.stdout)
+    );
+    let steps = apply();
+    assert_eq!(steps[0]["stdout"], format!("unchanged user {me}\n"));
+    assert_eq!(steps[1]["run"], format!("file {dest}"));
+    assert_eq!(steps[1]["stdout"], format!("wrote {dest}\n"));
+    assert_eq!(steps[1]["changed"], true);
+    let keys = || std::fs::read_to_string(&file).unwrap();
+    assert_eq!(
+        keys(),
+        format!("{KEY_A}\n{KEY_B}\n{KEY_C}\n"),
+        "add-only keeps A"
+    );
+    assert_eq!(common::mode(&file) & 0o7777, 0o600);
+    let handled = || std::fs::read_to_string(sandbox.root().join("handler.log")).unwrap();
+    assert_eq!(handled(), "log\n");
+
+    let steps = apply();
+    assert_eq!(steps[1]["stdout"], format!("unchanged {dest}\n"));
+    assert_eq!(steps[1]["changed"], false);
+    assert_eq!(handled(), "log\n");
+
+    config(true);
+    let out = sandbox.anvil(&["plan"], &[("PATH", &path)]);
+    assert!(
+        text(&out.stdout).contains(&format!("user {me} (authorized_keys 2, exclusive)")),
+        "{}",
+        text(&out.stdout)
+    );
+    let steps = apply();
+    assert_eq!(steps[1]["stdout"], format!("wrote {dest}\n"));
+    assert_eq!(
+        keys(),
+        format!("{KEY_B}\n{KEY_C}\n"),
+        "exactly the listed keys"
+    );
+    let record = sandbox.last_apply().unwrap();
+    let recorded = &record["targets"]["local"]["files"][0];
+    assert_eq!(recorded["dest"], dest.as_str(), "{record}");
+    assert_eq!(recorded["user"], me.as_str(), "{record}");
+    assert_eq!(apply()[1]["stdout"], format!("unchanged {dest}\n"));
+
+    let out = sandbox.anvil(&["-vv", "rollback"], &[("PATH", &path)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains(&format!("restored {dest}")),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(
+        keys(),
+        format!("{KEY_A}\n{KEY_B}\n{KEY_C}\n"),
+        "the previous file"
+    );
+    assert_eq!(common::mode(&file) & 0o7777, 0o600);
+}
+
+#[test]
+fn a_missing_ssh_dir_is_made_private_and_rollback_removes_it() {
+    let sandbox = Sandbox::new("ak");
+    let (me, home, path) = keys_user(&sandbox);
+    sandbox.write_config(
+        "config.toml",
+        &format!("[[users]]\nname = \"{me}\"\nsudo = false\nauthorized_keys = [\"{KEY_A}\"]\n"),
+    );
+    let out = sandbox.anvil(&["apply", "--target", "local"], &[("PATH", &path)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let ssh = home.join(".ssh");
+    assert_eq!(common::mode(&ssh) & 0o7777, 0o700);
+    assert_eq!(
+        std::fs::read_to_string(ssh.join("authorized_keys")).unwrap(),
+        format!("{KEY_A}\n")
+    );
+    let record = sandbox.last_apply().unwrap();
+    assert_eq!(
+        record["targets"]["local"]["files"][0]["created_dirs"],
+        serde_json::json!([ssh.display().to_string()]),
+        "{record}"
+    );
+    let out = sandbox.anvil(&["rollback"], &[("PATH", &path)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(!ssh.exists(), "{}", text(&out.stdout));
+    assert!(home.exists());
+}
+
+/// The local login user is whoever runs the tests: a non-root login.
+#[test]
+fn exclusive_keys_that_drop_the_login_key_fail_the_target_before_any_change() {
+    let sandbox = Sandbox::new("ak");
+    let (me, home, path) = keys_user(&sandbox);
+    let config = |keys: &str| {
+        sandbox.write_config(
+            "config.toml",
+            &format!(
+                "[[groups]]\nname = \"app\"\nsudo = false\n\n\
+                 [[users]]\nname = \"{me}\"\nsudo = false\nauthorized_keys = [{keys}]\nexclusive_keys = true\n"
+            ),
+        );
+        sandbox.anvil(
+            &["--json", "apply", "--target", "local"],
+            &[("PATH", &path)],
+        )
+    };
+    let wanted = format!("users[0] {me}: would drop the login key");
+    let out = config("");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert_eq!(
+        json(&out)["targets"][0]["error"],
+        wanted.as_str(),
+        "no file: one key needed"
+    );
+    std::fs::create_dir(home.join(".ssh")).unwrap();
+    let file = home.join(".ssh/authorized_keys");
+    std::fs::write(&file, format!("# note\nno-pty {KEY_A}\n")).unwrap();
+    let out = config(&format!("\"{KEY_B}\""));
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let value = json(&out);
+    assert_eq!(value["targets"][0]["error"], wanted.as_str(), "{value}");
+    assert!(value["targets"][0]["steps"].is_null(), "{value}");
+    assert!(!sandbox.root().join("acct/log").exists(), "no tool ran");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("# note\nno-pty {KEY_A}\n")
+    );
+
+    let renamed = KEY_A.replace("a@host", "renamed");
+    let out = config(&format!("\"{KEY_B}\", \"{renamed}\""));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("{KEY_B}\n{renamed}\n")
+    );
+}
+
+#[test]
+fn a_store_key_that_is_not_one_key_line_is_a_usage_error() {
+    let sandbox = Sandbox::new("ak");
+    store_file(&sandbox, "keys/two.pub", &format!("{KEY_A}\n{KEY_B}\n"));
+    sandbox.write_config(
+        "config.toml",
+        "[[users]]\nname = \"deploy\"\nauthorized_keys = [\"$/keys/two.pub\"]\n",
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr)
+            .contains("users[0].authorized_keys[0] `$/keys/two.pub`: must be one line"),
+        "{}",
+        text(&out.stderr)
+    );
+}

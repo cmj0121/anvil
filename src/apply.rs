@@ -20,8 +20,10 @@
 //! of any kind. Facts come from one probe before the run, so a step cannot
 //! change which manager or facts a later task sees.
 //!
-//! The fixed order is packages, `[[dirs]]`, `[[files]]`, `[[links]]`,
-//! `[[absent]]`, `[[services]]`, `[[steps]]`, then the handlers.
+//! The fixed order is packages, the `[[groups]]` to create or fix, the
+//! `[[users]]`, the `[[groups]]` to remove, `[[dirs]]`, `[[files]]`,
+//! `[[links]]`, `[[absent]]`, `[[services]]`, `[[steps]]`, then the
+//! handlers. A group or user step is not recorded for rollback.
 //!
 //! Each `[[files]]` entry is one step after the package and `[[dirs]]`
 //! steps, before `[[links]]`: it copies its src when the target matches, else it is
@@ -52,8 +54,8 @@ use std::sync::Arc;
 use crate::cancel::Cancel;
 use crate::config::{Config, MAX_HANDLER_NAME_BYTES, Plugin, is_handler_name};
 use crate::engine::{
-    Journal, Passwords, Reached, Recorder, Unresolved, cannot_undo, execute, open_record, probe,
-    resolve, run_handlers, scrubbed,
+    ApplyOnly, Journal, Passwords, Reached, Recorder, Unresolved, cannot_undo, execute,
+    guard_users, open_record, probe, resolve, run_handlers, scrubbed,
 };
 use crate::error::Failure;
 use crate::fanout::{self, Event};
@@ -306,9 +308,10 @@ fn needs_facts(config: &Config, expanded: &Expanded) -> bool {
         })
 }
 
-/// Probes `target` when [`needs_facts`], then runs the steps [`resolve`]
-/// lists, then the handler phase ([`run_handlers`]); `passwords` holds the
-/// sudo passwords to type. A target the probe reached comes back with its
+/// Probes `target` when [`needs_facts`], checks the `[[users]]` lockout
+/// guards ([`guard_users`]), then runs the steps [`resolve`] lists, then
+/// the handler phase ([`run_handlers`]); `passwords` holds the sudo
+/// passwords to type. A target the probe reached comes back with its
 /// record: its facts, each file written with what DEST held before, the
 /// steps that ran but cannot be undone, and the handlers still pending. A
 /// pending name `[[handlers]]` no longer has is dropped with a warning.
@@ -360,16 +363,25 @@ fn apply_target(
         facts.as_ref(),
         journal.filter(|_| facts.is_some()),
     );
-    let resolved = resolve(
-        target,
-        facts.as_ref(),
-        config,
-        expanded,
-        sources,
-        Some(passwords),
-        plugins,
-        cancel,
-    );
+    let guarded = match &facts {
+        Some(facts) => guard_users(transport.as_ref(), expanded, sources, target, facts),
+        None => Ok(crate::users::Homes::default()),
+    };
+    let resolved = guarded.and_then(|homes| {
+        resolve(
+            target,
+            facts.as_ref(),
+            config,
+            expanded,
+            sources,
+            ApplyOnly {
+                secrets: Some(passwords),
+                homes: Some(&homes),
+            },
+            plugins,
+            cancel,
+        )
+    });
     let mut report = match resolved {
         Ok(runs) => {
             let report = execute(
@@ -483,7 +495,10 @@ mod tests {
             config,
             &legacy(config),
             sources,
-            Some(&Passwords::new()),
+            ApplyOnly {
+                secrets: Some(&Passwords::new()),
+                homes: None,
+            },
             plugins,
             cancel,
         )
@@ -3852,6 +3867,7 @@ mod tests {
         assert_eq!(
             record.files,
             [FileRecord {
+                user: None,
                 dest: "/etc/a.conf".to_owned(),
                 mode: "0644".to_owned(),
                 sudo: true,
@@ -4743,7 +4759,10 @@ mod tests {
             &config,
             &expanded,
             &Sources::of(&sources),
-            Some(&Passwords::new()),
+            ApplyOnly {
+                secrets: Some(&Passwords::new()),
+                homes: None,
+            },
             &FakePlugins::none(),
             &Cancel::new(),
         )

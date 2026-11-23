@@ -129,6 +129,11 @@ pub(crate) fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// `message` on stderr, then exit 1.
+pub(crate) fn fail(message: &str) -> String {
+    format!("{{ echo {} >&2; exit 1; }}", quote(message))
+}
+
 /// `env` as `KEY='value'` and `export KEY` lines, to run before a step's
 /// script on the same stdin; empty when `env` is. Keys are checked shell
 /// names, so only the values need quoting.
@@ -330,7 +335,8 @@ impl fmt::Debug for WalkNonce {
 
 /// The walk of DEST's directories just before the temp: each existing one
 /// passes the `owner` test of the checks and is no symlink, and a missing one
-/// fails the write, or with `parents = true` is created 0755 as the write's
+/// fails the write, or with `parents = true` is created 0755 (0700 when
+/// `private`) as the write's
 /// identity and must then pass the same test. Each created directory is
 /// announced at once on its own stdout line, marked with `create`. Its
 /// messages start with `kind`: `files`, `dirs`, `links` or `absent`.
@@ -344,6 +350,8 @@ pub struct Walk {
     pub owner: String,
     /// With `parents = true`, the nonce that marks a created directory's line.
     pub create: Option<WalkNonce>,
+    /// Whether a created directory is 0700 rather than 0755: a `.ssh`.
+    pub private: bool,
 }
 
 impl Walk {
@@ -369,6 +377,7 @@ impl Walk {
                 .collect(),
             owner: owner.to_owned(),
             create,
+            private: false,
         }
     }
 
@@ -376,6 +385,7 @@ impl Walk {
     /// DEST untouched.
     pub(crate) fn script(&self, sudo: &str) -> String {
         let (found, kind) = (root_only_find(&self.owner), self.kind);
+        let mode = if self.private { "0700" } else { "0755" };
         self.dirs
             .iter()
             .map(|dir| {
@@ -386,7 +396,7 @@ impl Walk {
                     Some(nonce) => {
                         let line = quote(&format!("{} created {dir}", nonce.as_str()));
                         format!(
-                            "{sudo}mkdir -m 0755 {d} || {{ \
+                            "{sudo}mkdir -m {mode} {d} || {{ \
                              if {sudo}test -d {d} && {sudo}test ! -L {d}; then printf '%s\\n' {line}; fi; \
                              echo {} >&2; exit {REFUSED}; }}\n\
                              printf '%s\\n' {line}\n",

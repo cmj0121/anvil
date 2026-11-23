@@ -26,7 +26,7 @@ use crate::config::{Config, DirEntry, ModeValue, is_mode};
 use crate::facts::Facts;
 use crate::files::{
     CONFLICT, Force, KEEP_SPECIAL, OCTAL, Ownership, TreeCheck, Wording, fix_script, parse_ls,
-    remove_dirs, restore_attrs, sudo_secret_for,
+    remove_dirs, restore_attrs, sudo_for,
 };
 use crate::inventory::Target;
 use crate::record::{Attrs, DirRecord, Write};
@@ -244,13 +244,7 @@ pub fn run(
         !root && !entry.sudo,
         facts,
     )?;
-    let secret =
-        sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
-    let sudo = match secret {
-        Some(_) => "sudo ",
-        None if root || !entry.sudo => "",
-        None => "sudo -n ",
-    };
+    let (sudo, secret) = sudo_for(config, target, facts, entry.sudo);
     let as_root = root || entry.sudo;
     let create = if entry.parents {
         Some(WalkNonce::generate()?)
@@ -364,13 +358,7 @@ fn restore_runs_from(
         .rev()
         .map(|dir| {
             let path = dir.path.as_str();
-            let secret =
-                sudo_secret_for(config, target).filter(|_| dir.sudo && facts.sudo_asks_password());
-            let sudo = match secret {
-                Some(_) => "sudo ",
-                None if root || !dir.sudo => "",
-                None => "sudo -n ",
-            };
+            let (sudo, secret) = sudo_for(config, target, facts, dir.sudo);
             let as_root = root || dir.sudo;
             let created = dir.dirs_deepest_first();
             let refused = dir.write == Write::Refused;

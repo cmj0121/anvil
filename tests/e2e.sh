@@ -1103,6 +1103,237 @@ else
 fi
 docker exec "$NAME" rm -rf /etc/anvil-e2e-ab-file /etc/anvil-e2e-ab-link /etc/anvil-e2e-ab-dir
 
+step "(y) [[groups]] on arch (shadow, NOPASSWD): created, then unchanged, a gid fixed, then removed; accounts is a facts key"
+GR_DIR="$TMP/groups"
+mkdir -p "$GR_DIR"
+gr_config() {
+  cat >"$GR_DIR/config.toml" <<CONF
+[[groups]]
+name = "anvil-e2e"
+$1
+
+[[groups]]
+name = "anvil-e2e-sys"
+system = true
+facts = { accounts = "shadow" }
+
+[[groups]]
+name = "anvil-e2e-bb"
+facts = { accounts = "busybox" }
+CONF
+}
+gr_anvil() {
+  run_env XDG_STATE_HOME="$TMP/state-groups" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$GR_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+gr_gid() { docker exec "$NAME" getent group "$1" | cut -d: -f3; }
+docker exec "$NAME" sh -c 'for g in anvil-e2e anvil-e2e-sys anvil-e2e-bb; do groupdel "$g" 2>/dev/null; done; :'
+gr_config 'gid = 2345'
+gr_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  created group anvil-e2e' "$TMP/out" \
+  && grep -qxF '  created group anvil-e2e-sys' "$TMP/out" \
+  && [ "$(gr_gid anvil-e2e)" = 2345 ] && [ -n "$(gr_gid anvil-e2e-sys)" ] \
+  && ! docker exec "$NAME" getent group anvil-e2e-bb >/dev/null; then
+  pass "apply created the groups, the busybox-only one skipped"
+else
+  fail "apply of groups: exit $code"
+fi
+gr_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged group anvil-e2e' "$TMP/out" \
+  && grep -qxF '  unchanged group anvil-e2e-sys' "$TMP/out" && ! grep -qE '(created|fixed) group' "$TMP/out"; then
+  pass "a second apply changes no group"
+else
+  fail "second apply of groups: exit $code"
+fi
+docker exec "$NAME" groupmod -g 2346 anvil-e2e
+gr_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  fixed group anvil-e2e: gid' "$TMP/out" && [ "$(gr_gid anvil-e2e)" = 2345 ]; then
+  pass "a changed gid is fixed"
+else
+  fail "gid fix: exit $code"
+fi
+gr_config 'state = "absent"'
+gr_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  removed group anvil-e2e' "$TMP/out" \
+  && ! docker exec "$NAME" getent group anvil-e2e >/dev/null; then
+  pass "an absent group is removed"
+else
+  fail "removal of a group: exit $code"
+fi
+docker exec "$NAME" sh -c 'for g in anvil-e2e anvil-e2e-sys; do groupdel "$g" 2>/dev/null; done; :'
+
+step "(z) [[users]] on arch (shadow, NOPASSWD): deploy created in a group made the same run, its shell fixed, then unchanged, then removed; removing the login user is refused"
+US_DIR="$TMP/users"
+mkdir -p "$US_DIR"
+us_config() {
+  cat >"$US_DIR/config.toml" <<CONF
+[[groups]]
+name = "anvil-e2e-users"
+
+[[users]]
+name = "deploy"
+groups = ["anvil-e2e-users"]
+shell = "$1"
+CONF
+}
+us_anvil() {
+  run_env XDG_STATE_HOME="$TMP/state-users" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$US_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+us_shell() { docker exec "$NAME" getent passwd deploy | cut -d: -f7; }
+docker exec "$NAME" sh -c 'userdel -r deploy 2>/dev/null; groupdel anvil-e2e-users 2>/dev/null; :'
+us_config /bin/sh
+us_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  created user deploy' "$TMP/out" \
+  && [ "$(us_shell)" = /bin/sh ] && docker exec "$NAME" id -Gn deploy | grep -qw anvil-e2e-users \
+  && docker exec "$NAME" test -d /home/deploy; then
+  pass "apply created deploy with its home, in the group created before it"
+else
+  fail "apply of users: exit $code"
+fi
+us_config /bin/bash
+us_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  fixed user deploy: shell' "$TMP/out" && [ "$(us_shell)" = /bin/bash ]; then
+  pass "a changed shell is fixed, naming only the shell"
+else
+  fail "shell fix: exit $code"
+fi
+us_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged user deploy' "$TMP/out" && ! grep -qE '(created|fixed) (user|group)' "$TMP/out"; then
+  pass "a third apply changes no user"
+else
+  fail "third apply of users: exit $code"
+fi
+cat >"$US_DIR/config.toml" <<CONF
+[[users]]
+name = "deploy"
+state = "absent"
+remove_home = true
+CONF
+us_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  removed user deploy' "$TMP/out" \
+  && ! docker exec "$NAME" getent passwd deploy >/dev/null && ! docker exec "$NAME" test -e /home/deploy; then
+  pass "state = absent removed deploy with userdel -r"
+else
+  fail "removal of deploy: exit $code"
+fi
+us_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  unchanged user deploy' "$TMP/out" && ! grep -qF 'removed user' "$TMP/out"; then
+  pass "a second removal apply changes no user"
+else
+  fail "second removal apply: exit $code"
+fi
+cat >"$US_DIR/config.toml" <<CONF
+[[groups]]
+name = "anvil-e2e-guard"
+
+[[users]]
+name = "key"
+state = "absent"
+force = true
+CONF
+us_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 1 ] && grep -qF 'users[0] key: is the login user' "$TMP/out" "$TMP/err" \
+  && docker exec "$NAME" getent passwd key >/dev/null && ! docker exec "$NAME" getent group anvil-e2e-guard >/dev/null; then
+  pass "removing the login user is refused before any change on the target"
+else
+  fail "login user guard: exit $code"
+fi
+docker exec "$NAME" sh -c 'userdel -r deploy 2>/dev/null; groupdel anvil-e2e-users 2>/dev/null; groupdel anvil-e2e-guard 2>/dev/null; :'
+
+step "(z2) [[users]] authorized_keys on arch (shadow, NOPASSWD): written as deploy, add-only keeps a key, exclusive leaves the listed ones, then unchanged; rollback restores the file; dropping the login key is refused"
+# Test keys: an ed25519 blob of 32 equal bytes each, never used to sign in.
+AK_A='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB a@e2e'
+AK_B='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC b@e2e'
+AK_FILE=/home/deploy/.ssh/authorized_keys
+ak_config() {
+  cat >"$US_DIR/config.toml" <<CONF
+[[users]]
+name = "deploy"
+authorized_keys = [$1]
+exclusive_keys = $2
+CONF
+}
+ak_anvil() {
+  run_env XDG_STATE_HOME="$TMP/state-keys" "$ANVIL" --ssh-config "$CFG" --inventory "$XDG/anvil/inventory.toml" --config "$US_DIR/config.toml" "$@" \
+    </dev/null >"$TMP/out" 2>"$TMP/err"
+}
+ak_keys() { docker exec "$NAME" cat "$AK_FILE"; }
+docker exec "$NAME" sh -c 'userdel -r deploy 2>/dev/null; :'
+ak_config "\"$AK_A\"" false
+ak_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF '  created user deploy' "$TMP/out" && grep -qxF "  wrote $AK_FILE" "$TMP/out" \
+  && [ "$(ak_keys)" = "$AK_A" ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U' /home/deploy/.ssh "$AK_FILE" | tr '\n' ' ')" = '700 deploy 600 deploy ' ]; then
+  pass "the user step created deploy, the keys step wrote its authorized_keys 0600 in a new 0700 .ssh, both deploy's"
+else
+  fail "first apply of authorized_keys: exit $code"
+fi
+ak_config "\"$AK_B\"" false
+ak_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF "  wrote $AK_FILE" "$TMP/out" \
+  && [ "$(ak_keys)" = "$(printf '%s\n%s' "$AK_A" "$AK_B")" ]; then
+  pass "add-only kept the existing key and added the listed one"
+else
+  fail "add-only apply of authorized_keys: exit $code"
+fi
+ak_config "\"$AK_B\"" true
+ak_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF "  wrote $AK_FILE" "$TMP/out" && [ "$(ak_keys)" = "$AK_B" ]; then
+  pass "exclusive_keys left exactly the listed key"
+else
+  fail "exclusive apply of authorized_keys: exit $code"
+fi
+ak_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF "  unchanged $AK_FILE" "$TMP/out" && ! grep -qF "wrote $AK_FILE" "$TMP/out"; then
+  pass "a second exclusive apply changes nothing"
+else
+  fail "second exclusive apply of authorized_keys: exit $code"
+fi
+ak_anvil -vv rollback --target arch
+code=$?
+if [ "$code" -eq 0 ] && grep -qxF "  restored $AK_FILE" "$TMP/out" \
+  && [ "$(ak_keys)" = "$(printf '%s\n%s' "$AK_A" "$AK_B")" ] \
+  && [ "$(docker exec "$NAME" stat -c '%a %U' "$AK_FILE")" = '600 deploy' ]; then
+  pass "rollback restored the previous authorized_keys as deploy"
+else
+  fail "rollback of authorized_keys: exit $code"
+fi
+cat >"$US_DIR/config.toml" <<CONF
+[[groups]]
+name = "anvil-e2e-guard"
+
+[[users]]
+name = "key"
+authorized_keys = ["$AK_B"]
+exclusive_keys = true
+CONF
+KEY_BEFORE=$(docker exec "$NAME" cat /home/key/.ssh/authorized_keys)
+ak_anvil -vv apply --target arch
+code=$?
+if [ "$code" -eq 1 ] && grep -qF 'users[0] key: would drop the login key' "$TMP/out" "$TMP/err" \
+  && [ "$(docker exec "$NAME" cat /home/key/.ssh/authorized_keys)" = "$KEY_BEFORE" ] \
+  && ! docker exec "$NAME" getent group anvil-e2e-guard >/dev/null; then
+  pass "exclusive_keys without the login key is refused before any change on the target"
+else
+  fail "login key guard: exit $code"
+fi
+docker exec "$NAME" sh -c 'userdel -r deploy 2>/dev/null; groupdel anvil-e2e-guard 2>/dev/null; :'
+
 step "(x) a recursive [[files]] tree on arch (NOPASSWD): owner, group, mode and dir_mode on a nested tree into an existing dir; rollback removes what it created"
 TR_STATE="$TMP/state-tree"
 TR_DIR="$TMP/tree"
@@ -1498,6 +1729,164 @@ CONF
     pass "busybox: a changed file is changed, a group-writable parent is not root-only"
   else
     fail "doctor on alpine after the changes: exit $code"
+  fi
+  cat >"$ALP_DIR/groups.toml" <<CONF
+[[groups]]
+name = "anvil-e2e"
+gid = 2345
+
+[[groups]]
+name = "anvil-e2e-shadow"
+facts = { accounts = "shadow" }
+CONF
+  alp_groups() {
+    run_env XDG_STATE_HOME="$TMP/state-alpine" "$ANVIL" --ssh-program "$ALP_DIR/ssh" \
+      --inventory "$ALP_DIR/inventory.toml" --config "$ALP_DIR/groups.toml" "$@" \
+      </dev/null >"$TMP/out" 2>"$TMP/err"
+  }
+  alp_groups -vv apply --target alpine
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  created group anvil-e2e' "$TMP/out" \
+    && docker exec "$ALP_NAME" grep -qx 'anvil-e2e:x:2345:' /etc/group \
+    && ! docker exec "$ALP_NAME" grep -q '^anvil-e2e-shadow:' /etc/group; then
+    pass "busybox: addgroup created the group, the shadow-only one skipped"
+  else
+    fail "apply of groups on alpine: exit $code"
+  fi
+  alp_groups -vv apply --target alpine
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  unchanged group anvil-e2e' "$TMP/out" && ! grep -qF 'created group' "$TMP/out"; then
+    pass "busybox: a second apply changes no group"
+  else
+    fail "second apply of groups on alpine: exit $code"
+  fi
+  # No CAP_CHOWN in this container: adduser could not hand a new home over.
+  alp_users() {
+    cat >"$ALP_DIR/users.toml" <<CONF
+[[groups]]
+name = "anvil-e2e-users"
+
+[[users]]
+name = "deploy"
+groups = ["anvil-e2e-users"]
+shell = "$1"
+create_home = false
+CONF
+    run_env XDG_STATE_HOME="$TMP/state-alpine" "$ANVIL" --ssh-program "$ALP_DIR/ssh" \
+      --inventory "$ALP_DIR/inventory.toml" --config "$ALP_DIR/users.toml" -vv apply --target alpine \
+      </dev/null >"$TMP/out" 2>"$TMP/err"
+  }
+  alp_users /bin/sh
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  created user deploy' "$TMP/out" \
+    && docker exec "$ALP_NAME" grep -q '^deploy:x:[0-9]*:[0-9]*:[^:]*:/home/deploy:/bin/sh$' /etc/passwd \
+    && docker exec "$ALP_NAME" grep -q '^anvil-e2e-users:x:[0-9]*:deploy$' /etc/group; then
+    pass "busybox: adduser created deploy, addgroup put it in the group made the same run"
+  else
+    fail "apply of users on alpine: exit $code"
+  fi
+  alp_users /bin/ash
+  code=$?
+  if [ "$code" -eq 1 ] && grep -qF 'users[0] deploy: busybox cannot change shell; install shadow' "$TMP/err" \
+    && docker exec "$ALP_NAME" grep -q '^deploy:.*:/bin/sh$' /etc/passwd; then
+    pass "busybox: a shell change is refused, naming the field, and nothing changes"
+  else
+    fail "busybox shell change on alpine: exit $code"
+  fi
+  alp_users /bin/sh
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  unchanged user deploy' "$TMP/out" && ! grep -qE '(created|fixed) (user|group)' "$TMP/out"; then
+    pass "busybox: a further apply changes no user"
+  else
+    fail "further apply of users on alpine: exit $code"
+  fi
+  cat >"$ALP_DIR/users.toml" <<CONF
+[[users]]
+name = "deploy"
+state = "absent"
+CONF
+  alp_remove() {
+    run_env XDG_STATE_HOME="$TMP/state-alpine" "$ANVIL" --ssh-program "$ALP_DIR/ssh" \
+      --inventory "$ALP_DIR/inventory.toml" --config "$ALP_DIR/users.toml" -vv apply --target alpine \
+      </dev/null >"$TMP/out" 2>"$TMP/err"
+  }
+  alp_remove
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  removed user deploy' "$TMP/out" \
+    && ! docker exec "$ALP_NAME" grep -q '^deploy:' /etc/passwd; then
+    pass "busybox: deluser removed deploy"
+  else
+    fail "removal of deploy on alpine: exit $code"
+  fi
+  alp_remove
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  unchanged user deploy' "$TMP/out" && ! grep -qF 'removed user' "$TMP/out"; then
+    pass "busybox: a second removal apply changes no user"
+  else
+    fail "second removal apply on alpine: exit $code"
+  fi
+  # The container drops every capability, so root cannot become another user:
+  # the keys step runs on root's own authorized_keys, written as the login.
+  AK_A='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB a@e2e'
+  AK_B='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC b@e2e'
+  AK_C='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMD c@e2e'
+  alp_keys() {
+    cat >"$ALP_DIR/keys.toml" <<CONF
+[[users]]
+name = "root"
+authorized_keys = ["$1"]
+exclusive_keys = $2
+CONF
+    run_env XDG_STATE_HOME="$TMP/state-alpine-keys" "$ANVIL" --ssh-program "$ALP_DIR/ssh" \
+      --inventory "$ALP_DIR/inventory.toml" --config "$ALP_DIR/keys.toml" -vv "${3:-apply}" --target alpine \
+      </dev/null >"$TMP/out" 2>"$TMP/err"
+  }
+  alp_key_file() { docker exec "$ALP_NAME" cat /root/.ssh/authorized_keys; }
+  docker exec "$ALP_NAME" rm -rf /root/.ssh
+  alp_keys "$AK_A" false
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  wrote /root/.ssh/authorized_keys' "$TMP/out" && [ "$(alp_key_file)" = "$AK_A" ] \
+    && [ "$(docker exec "$ALP_NAME" stat -c '%a' /root/.ssh /root/.ssh/authorized_keys | tr '\n' ' ')" = '700 600 ' ]; then
+    pass "busybox: authorized_keys written 0600 in a new 0700 .ssh"
+  else
+    fail "apply of authorized_keys on alpine: exit $code"
+  fi
+  alp_keys "$AK_B" false
+  code=$?
+  if [ "$code" -eq 0 ] && [ "$(alp_key_file)" = "$(printf '%s\n%s' "$AK_A" "$AK_B")" ]; then
+    pass "busybox: add-only kept the existing key"
+  else
+    fail "add-only apply of authorized_keys on alpine: exit $code"
+  fi
+  alp_keys "$AK_B" true
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  wrote /root/.ssh/authorized_keys' "$TMP/out" && [ "$(alp_key_file)" = "$AK_B" ]; then
+    pass "busybox: exclusive_keys left exactly the listed key"
+  else
+    fail "exclusive apply of authorized_keys on alpine: exit $code"
+  fi
+  alp_keys "$AK_B" true
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  unchanged /root/.ssh/authorized_keys' "$TMP/out"; then
+    pass "busybox: a second exclusive apply changes nothing"
+  else
+    fail "second exclusive apply of authorized_keys on alpine: exit $code"
+  fi
+  alp_keys "$AK_B" true rollback
+  code=$?
+  if [ "$code" -eq 0 ] && grep -qxF '  restored /root/.ssh/authorized_keys' "$TMP/out" \
+    && [ "$(alp_key_file)" = "$(printf '%s\n%s' "$AK_A" "$AK_B")" ]; then
+    pass "busybox: rollback restored the previous authorized_keys"
+  else
+    fail "rollback of authorized_keys on alpine: exit $code"
+  fi
+  alp_keys "$AK_C" true
+  code=$?
+  if [ "$code" -eq 1 ] && grep -qF 'users[0] root: would drop the login key' "$TMP/out" "$TMP/err" \
+    && [ "$(alp_key_file)" = "$(printf '%s\n%s' "$AK_A" "$AK_B")" ]; then
+    pass "busybox: exclusive_keys without one of root's keys is refused"
+  else
+    fail "login key guard on alpine: exit $code"
   fi
   docker rm -f "$ALP_NAME" >/dev/null 2>&1
 else

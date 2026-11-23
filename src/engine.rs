@@ -7,6 +7,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::absent;
+use crate::accounts;
 use crate::cancel::{AbortReason, Cancel};
 use crate::config::{Config, FileEntry, Handler, Step, StepKind};
 use crate::dirs;
@@ -31,6 +32,7 @@ use crate::transport::{
     Output, RUN_TIMEOUT, Transport, TransportError, has_control_bytes, into_string,
 };
 use crate::tree;
+use crate::users;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Sudo passwords and file secrets by secret name; a name that is not set
@@ -564,7 +566,7 @@ fn write_end(output: &Result<Output, TransportError>, staged: bool) -> record::W
 }
 
 /// The steps that ran and that a rollback cannot undo: `packages`,
-/// `service NAME`, `step N` (1-based among `[[steps]]`) and `handler NAME`,
+/// `service NAME`, `group NAME`, `user NAME`, `step N` (1-based among `[[steps]]`) and `handler NAME`,
 /// or a task's path; never a skip.
 pub(crate) fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
     steps
@@ -582,6 +584,8 @@ pub(crate) fn cannot_undo(steps: &[StepReport]) -> Vec<String> {
             (_, Some(path)) => Some(path.clone()),
             (Entry::Packages, None) => Some("packages".to_owned()),
             (Entry::Service { name }, None) => Some(format!("service {name}")),
+            (Entry::Group { name }, None) => Some(format!("group {name}")),
+            (Entry::User { name }, None) => Some(format!("user {name}")),
             (Entry::Step { number }, None) => Some(format!("step {number}")),
             (Entry::Handler { name }, None) => Some(format!("handler {name}")),
         })
@@ -647,6 +651,8 @@ fn execute_inner(
             RunKind::Link { .. } => ("links", "links"),
             RunKind::Absent { .. } => ("absent", "absent"),
             RunKind::Service { .. } => ("services", "services"),
+            RunKind::Group { .. } => ("groups", "groups"),
+            RunKind::User { .. } => ("users", "users"),
             RunKind::Packages { .. } => ("packages", "packages"),
             RunKind::Step { .. } | RunKind::Skip | RunKind::Script => ("packages", "step"),
         };
@@ -658,6 +664,8 @@ fn execute_inner(
             || planned.link().is_some_and(|link| link.skip)
             || planned.absent().is_some_and(|absent| absent.skip)
             || planned.service().is_some_and(|service| service.skip)
+            || planned.group().is_some_and(|group| group.skip)
+            || planned.user().is_some_and(|user| user.skip)
             || matches!(planned.kind, RunKind::Skip)
         {
             let report = StepReport::skipped(label, entry).of(planned);
@@ -767,13 +775,14 @@ fn execute_inner(
                 }
                 recorder.wrote = true;
                 let intents: Vec<FileRecord> =
-                    found.iter().map(|(_, intent, _)| intent.clone()).collect();
+                    found.iter().map(|(_, ahead)| ahead.0.clone()).collect();
                 if !recorder.snapshot(&intents, &reports) {
                     return cancelled(command, target, reports, cancel).at(planned);
                 }
-                (tree.ahead).extend(found.into_iter().map(|(m, intent, at)| (m, (intent, at))));
+                tree.ahead.extend(found);
             }
-            let (intent, expected) = tree.ahead.remove(&n).expect("captured above");
+            let (intent, expected, merged) = tree.ahead.remove(&n).expect("captured above");
+            let write = merged.as_deref().unwrap_or(write);
             rebuilt = match files::write_script(write, recorder.sources, &expected) {
                 Ok(rebuilt) => rebuilt,
                 Err(error) => return failed(command, target, reports, error).at(planned),
@@ -1228,9 +1237,14 @@ struct TreeRun {
     /// What the tree's check found; `None` without one.
     look: Option<files::TreeLook>,
     /// The captured intents of the file items still to run, by step index,
-    /// with what each write must find at DEST.
-    ahead: BTreeMap<usize, (FileRecord, files::Expected)>,
+    /// with what each write must find at DEST and, for authorized_keys, the
+    /// write with its merged bytes.
+    ahead: BTreeMap<usize, Ahead>,
 }
+
+/// One captured write still to run: its intent, what it must find at DEST,
+/// and an authorized_keys write rebuilt with its merged bytes.
+type Ahead = (FileRecord, files::Expected, Option<Box<files::FileWrite>>);
 
 impl TreeRun {
     /// The intents of `ahead`, which every save while they wait must keep:
@@ -1238,7 +1252,7 @@ impl TreeRun {
     fn intents(&self) -> Vec<FileRecord> {
         self.ahead
             .values()
-            .map(|(intent, _)| intent.clone())
+            .map(|(intent, ..)| intent.clone())
             .collect()
     }
 }
@@ -1266,7 +1280,7 @@ fn captures(
     look: Option<&files::TreeLook>,
     password: Option<&[u8]>,
     recorder: &Recorder<'_>,
-) -> Result<Vec<(usize, FileRecord, files::Expected)>, Uncaptured> {
+) -> Result<Vec<(usize, Ahead)>, Uncaptured> {
     let mut found = Vec::new();
     let mut kept = 0;
     let first = runs[n].file().and_then(|file| file.write.as_ref());
@@ -1303,14 +1317,25 @@ fn captures(
             kept += bytes.len() as u64;
         }
         let expected = captured.expected();
-        let intent = write.record(
+        let merged = match write.merged(&captured) {
+            None => None,
+            Some(Ok(merged)) => Some(Box::new(merged)),
+            Some(Err(error)) if m == n => {
+                return Err(Uncaptured::Step {
+                    code: Some(1),
+                    stderr: format!("{error}\n"),
+                });
+            }
+            Some(Err(_)) => break,
+        };
+        let intent = merged.as_deref().unwrap_or(write).record(
             recorder.expanded,
             recorder.sources,
             captured,
             record::Write::FailedMidway,
             recorder.is_hash_only(&write.dest),
         );
-        found.push((m, intent, expected));
+        found.push((m, (intent, expected, merged)));
         if tree.is_none() || found.len() >= JOURNAL_ITEMS || kept >= JOURNAL_KEPT {
             break;
         }
@@ -1370,7 +1395,8 @@ fn capture(
             stderr,
         });
     }
-    let found = files::parse_capture(&write.dest, &stdout).map_err(|error| Uncaptured::Step {
+    let found = files::parse_capture_any(&write.dest, &stdout, write.keys.is_some());
+    let found = found.map_err(|error| Uncaptured::Step {
         code: Some(1),
         stderr: format!("{error}\n"),
     })?;
@@ -1455,7 +1481,9 @@ pub(crate) enum Sent {
 /// guard, changed something, so that its `notify` fires: a file step that
 /// wrote or fixed DEST's owner, group or mode (`unchanged` when nothing
 /// differed), a dir step that created or fixed its directory, a link step
-/// that linked or relinked its path, a service step that
+/// that linked or relinked its path, a group step that created, fixed or
+/// removed its group, a user step that created or fixed its user, a service
+/// step that
 /// printed neither `unchanged service NAME` nor the `reloaded` no-op line, a
 /// run or plugin step that exited 0. Never the package step, a skip or a
 /// failure.
@@ -1483,6 +1511,22 @@ fn changed(planned: &PlannedRun, output: &Output) -> bool {
         RunKind::Absent { path, .. } => {
             let removed = format!("removed {path}");
             lines.any(|line| line == removed.as_bytes())
+        }
+        RunKind::Group { name, .. } | RunKind::User { name, .. } => {
+            let noun = match planned.kind {
+                RunKind::Group { .. } => "group",
+                _ => "user",
+            };
+            let (created, removed, fixed) = (
+                format!("created {noun} {name}"),
+                format!("removed {noun} {name}"),
+                format!("fixed {noun} {name}: "),
+            );
+            lines.any(|line| {
+                line == created.as_bytes()
+                    || line == removed.as_bytes()
+                    || line.starts_with(fixed.as_bytes())
+            })
         }
         RunKind::Service { name, .. } => {
             let unchanged = format!("unchanged service {name}");
@@ -1566,6 +1610,15 @@ impl From<TransportError> for Unresolved {
     }
 }
 
+/// What [`resolve`] has only when apply runs it; plan's is the default.
+#[derive(Default, Clone, Copy)]
+pub struct ApplyOnly<'a> {
+    /// The loaded sudo passwords and file secrets.
+    pub secrets: Option<&'a Passwords>,
+    /// Where each user's `authorized_keys` goes, from [`guard_users`].
+    pub homes: Option<&'a users::Homes>,
+}
+
 /// The steps apply runs on `target`, one per item of `expanded` in order: a
 /// package item as the step that installs and upgrades with the target's
 /// package manager (none when its script is empty), a file item copying its
@@ -1575,12 +1628,14 @@ impl From<TransportError> for Unresolved {
 /// match is a skip and resolves nothing. Runs nothing on the target, but each
 /// plugin on the controller, in order, `cancel` checked before each. `facts`,
 /// from [`probe`], is required when [`needs_facts`] says so; being one probe,
-/// no step can change what a later item sees. `secrets`, apply's loaded
-/// values, renders a file item with `secrets`; plan's `None` leaves it
-/// unrendered. A failure is
-/// `packages: <reason>`, `files…`, `services: <reason>`, `dirs…`,
-/// `links…`, `absent…` or `plugin <name>: <reason>`; the first one ends the
-/// list.
+/// no step can change what a later item sees. `apply`'s secrets, its
+/// loaded values, render a file item with `secrets`; plan's `None` leaves
+/// it unrendered. A user item with `authorized_keys` is followed by the
+/// file step that writes them ([`users::keys_run`]) when `apply`'s homes,
+/// from [`guard_users`], say where; plan's `None` has no such step. A
+/// failure is `packages: <reason>`, `files…`, `services: <reason>`,
+/// `dirs…`, `links…`, `absent…` or `plugin <name>: <reason>`; the first one
+/// ends the list.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one input of a target's steps, passed through"
@@ -1591,7 +1646,7 @@ pub fn resolve(
     config: &Config,
     expanded: &Expanded,
     sources: &Sources,
-    secrets: Option<&Passwords>,
+    apply: ApplyOnly<'_>,
     plugins: &dyn Plugins,
     cancel: &Cancel,
 ) -> Result<Vec<PlannedRun>, Unresolved> {
@@ -1605,9 +1660,24 @@ pub fn resolve(
                 .collect(),
             ItemKind::File { entry, ordinal } => {
                 let entry = (entry, *ordinal);
-                files::run(config, item, entry, sources, target, facts, secrets)?
+                files::run(config, item, entry, sources, target, facts, apply.secrets)?
             }
             ItemKind::Service(entry) => vec![services.run(item, entry)?],
+            ItemKind::Group { entry, ordinal } => {
+                vec![accounts::run(
+                    config,
+                    item,
+                    (entry, *ordinal),
+                    target,
+                    facts,
+                )?]
+            }
+            ItemKind::User { entry, ordinal } => {
+                let entry = (entry, *ordinal);
+                let keys = users::keys_run(item, entry, target, facts, (apply.homes, sources))?;
+                let user = accounts::run(config, item, entry, target, facts)?;
+                std::iter::once(user).chain(keys).collect()
+            }
             ItemKind::Dir { entry, ordinal } => {
                 vec![dirs::run(config, item, (entry, *ordinal), target, facts)?]
             }
@@ -1653,13 +1723,41 @@ pub fn probe(transport: &dyn Transport, expanded: &Expanded) -> Result<Facts, Un
     } else {
         ("probe", "")
     };
-    let reason = |why: String| format!("{prefix}: {why}");
+    checked_output(&format!("{prefix}: {probe}"), &output)?;
+    Facts::parse(&output.stdout).map_err(|err| format!("{prefix}: {err}").into())
+}
+
+/// Fails a read-only script's `output` that did not exit 0: `lead`, as
+/// `users: the account query `, then `exited N` or `was killed by a signal`.
+fn checked_output(lead: &str, output: &Output) -> Result<(), String> {
     match output.code {
-        Some(0) => {}
-        Some(code) => return Err(reason(format!("{probe}exited {code}")).into()),
-        None => return Err(reason(format!("{probe}was killed by a signal")).into()),
+        Some(0) => Ok(()),
+        Some(code) => Err(format!("{lead}exited {code}")),
+        None => Err(format!("{lead}was killed by a signal")),
     }
-    Facts::parse(&output.stdout).map_err(|err| reason(err.to_string()).into())
+}
+
+/// The `[[users]]` lockout guards, after the probe and before any step on
+/// `target`: those the config decides, then, when one needs the target's
+/// state, those [`users::query`] reads over `transport`, as the probe runs;
+/// `sources` holds the store's `authorized_keys`. It returns the homes of
+/// the users whose `authorized_keys` [`resolve`] writes. The error is the
+/// target's failure, or Cancelled when the transport was.
+pub fn guard_users(
+    transport: &dyn Transport,
+    expanded: &Expanded,
+    sources: &Sources,
+    target: &Target,
+    facts: &Facts,
+) -> Result<users::Homes, Unresolved> {
+    let matched = users::Matched::of(expanded, target, facts);
+    matched.check_config(facts)?;
+    let Some(query) = matched.query(facts, users::MOUNTS) else {
+        return Ok(users::Homes::default());
+    };
+    let output = transport.run(&query, RUN_TIMEOUT)?;
+    checked_output("users: the account query ", &output)?;
+    Ok(matched.check_state(facts, &output.stdout, sources.keys())?)
 }
 
 /// Whether `target` matches `item`, whose selector needs `facts` only when it
@@ -2010,7 +2108,10 @@ mod tests {
             &Config::default(),
             &expanded,
             &Sources::default(),
-            Some(&Passwords::new()),
+            ApplyOnly {
+                secrets: Some(&Passwords::new()),
+                homes: None,
+            },
             &FakePlugins::none(),
             &Cancel::new(),
         )

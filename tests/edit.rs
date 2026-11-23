@@ -1149,7 +1149,7 @@ fn config_save_keeps_file_owner_group_and_parents_in_either_format() {
 }
 
 #[test]
-fn a_bad_file_dir_link_or_absent_entry_exits_two_naming_it() {
+fn a_bad_file_dir_link_absent_group_or_user_entry_exits_two_naming_it() {
     for (file, args, key) in [
         (
             "invalid/config-files-bad-owner.toml",
@@ -1180,6 +1180,36 @@ fn a_bad_file_dir_link_or_absent_entry_exits_two_naming_it() {
             "invalid/config-absent-overlap.yaml",
             &["config", "--format", "yaml"][..],
             "absent[0].path `/srv/app/old`",
+        ),
+        (
+            "invalid/config-groups-bad-name.toml",
+            &["config"][..],
+            "groups[1].name `App`",
+        ),
+        (
+            "invalid/config-groups-bad-gid.yaml",
+            &["config", "--format", "yaml"][..],
+            "groups[0].gid `70000`",
+        ),
+        (
+            "invalid/config-groups-duplicate-name.toml",
+            &["config"][..],
+            "groups[1].name `app`: same name as groups[0]",
+        ),
+        (
+            "invalid/config-users-bad-uid.yaml",
+            &["config", "--format", "yaml"][..],
+            "users[0].uid `70000`",
+        ),
+        (
+            "invalid/config-users-duplicate-name.toml",
+            &["config"][..],
+            "users[1].name `deploy`: same name as users[0]",
+        ),
+        (
+            "invalid/config-users-shell-on-absent.toml",
+            &["config"][..],
+            "users[0].shell: not with state = \"absent\"",
         ),
     ] {
         let sb = sandbox();

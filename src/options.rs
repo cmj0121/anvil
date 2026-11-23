@@ -225,10 +225,22 @@ impl Options {
         })
     }
 
-    /// `config`'s `[[files]]` sources; the workspace is resolved only when
-    /// a relative or store src needs it.
+    /// `config`'s `[[files]]` sources and the `authorized_keys` its users
+    /// read from the store; the workspace is resolved only when a relative
+    /// or store path needs it, and then once.
     pub fn sources(&self, config: &Config, expanded: &Expanded) -> Result<Sources, Failure> {
-        files::load(expanded, || self.workspace(config))
+        let mut resolved = None;
+        let mut workspace = || -> Result<PathBuf, Failure> {
+            if let Some(path) = &resolved {
+                return Ok(PathBuf::clone(path));
+            }
+            let workspace = self.workspace(config)?;
+            resolved = Some(workspace.clone());
+            Ok(workspace)
+        };
+        let sources = files::load(expanded, &mut workspace)?;
+        let keys = crate::users::load_keys(expanded, workspace)?;
+        Ok(sources.with_keys(keys))
     }
 
     /// The targets `--target` selects from `config`'s inventory (all when none).

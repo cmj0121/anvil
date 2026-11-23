@@ -604,7 +604,8 @@ pub fn load_steps(opts: &Options) -> Result<Vec<StepRow>, String> {
         .map_err(|failure| failure.message)
 }
 
-/// The steps apply runs for `expanded`, in its order: `packages`, `dir <path>`,
+/// The steps apply runs for `expanded`, in its order: `packages`, `group
+/// <name>` or `remove group <name>`, `user <name>`, `dir <path>`,
 /// `file <dest>`, `link <path> -> <target>`, `absent <path>`, `service <name>`
 /// (each a step on every target, skipped where it does not match), each step's
 /// command as its `$` line shows it, or `plugin <name>` for a plugin step, whose
@@ -618,6 +619,8 @@ pub fn step_rows(expanded: &Expanded) -> Vec<StepRow> {
         .map(|item| {
             let label = match &item.kind {
                 ItemKind::Packages(_) => "packages".to_owned(),
+                ItemKind::Group { entry, .. } => anvil::groups::shown(entry),
+                ItemKind::User { entry, .. } => anvil::users::shown(entry),
                 ItemKind::Dir { entry, .. } => format!("dir {}", entry.path),
                 ItemKind::File { entry, .. } => format!("file {}", entry.dest),
                 ItemKind::Link { entry, .. } => format!("link {} -> {}", entry.path, entry.target),
@@ -2230,6 +2233,31 @@ pub mod tests {
                 file_row("file /etc/motd", 0),
                 row("service sshd"),
                 row("service cron"),
+                row("hostname"),
+            ])
+        );
+    }
+
+    #[test]
+    fn account_rows_follow_the_packages_in_their_fixed_order() {
+        let opts = config_opts(
+            "tui-steps-accounts",
+            "[[dirs]]\npath = \"/srv/app\"\nmode = \"0755\"\n\n\
+             [[users]]\nname = \"olduser\"\nstate = \"absent\"\n\n\
+             [[groups]]\nname = \"old\"\nstate = \"absent\"\n\n\
+             [[users]]\nname = \"deploy\"\nuid = 2000\ngroup = \"app\"\n\n\
+             [[groups]]\nname = \"app\"\ngid = 2000\n\n\
+             [packages]\ninstall = [\"git\"]\n",
+        );
+        assert_eq!(
+            load_steps(&opts),
+            Ok(vec![
+                row("packages"),
+                row("group app (gid 2000)"),
+                row("remove user olduser"),
+                row("user deploy (uid 2000, group app)"),
+                row("remove group old"),
+                row("dir /srv/app"),
                 row("hostname"),
             ])
         );

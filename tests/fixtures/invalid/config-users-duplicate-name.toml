@@ -1,0 +1,6 @@
+[[users]]
+name = "deploy"
+
+[[users]]
+name = "deploy"
+shell = "/bin/bash"

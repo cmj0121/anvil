@@ -49,7 +49,9 @@ Results 窗格每個 target 一個分頁。`↑↓` 移動 step 游標；在 app
   會出現在 `targets:` 之前。
   右側的 `✔ ok  ✘ failed` 計算顯示中結果的 target。放不下的文字以 `…` 截斷。
   inventory 載入失敗時，選擇的位置改以紅色顯示 `inventory error`，錯誤本身則顯示為通知。
-- **Steps。** apply 會執行的 step，附編號：`[packages]` 有工作時為 `packages`，接著是每個 `[[dirs]]` 項目的 `dir PATH`、
+- **Steps。** apply 會執行的 step，附編號：`[packages]` 有工作時為 `packages`，接著是每個 `[[groups]]` 與 `[[users]]` 項目，
+  如 plan 依 config 顯示的那樣（`group app (gid 2000)`、`user deploy (shell /bin/bash)`、`remove user olduser`、
+  `remove group old`；先是 present 的 group，再是 user，然後是 absent 的 group），每個 `[[dirs]]` 項目的 `dir PATH`、
   每個 `[[files]]` 項目的 `file DEST`、每個 `[[links]]` 項目的 `link PATH -> TARGET`、
   每個 `[[absent]]` 項目的 `absent PATH`，與每個 `[[services]]` 項目的 `service NAME`，然後是每個 `[[steps]]` 的指令
   （第一行，還有更多行時加上 `…`）；沒有 `[[steps]]` 的 config 執行預設的 `hostname` step。

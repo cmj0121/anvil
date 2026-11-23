@@ -1,0 +1,7 @@
+[[groups]]
+name = "app"
+gid = 2000
+
+[[groups]]
+name = "app"
+state = "absent"

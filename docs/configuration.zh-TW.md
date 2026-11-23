@@ -51,7 +51,15 @@ timeout = 300              # seconds the package step may run, 1..=3600; default
 apt = "fd-find"
 dnf = "fd-find"
 
-[[dirs]]                   # optional; after packages, before [[files]]; see Dirs
+[[groups]]                 # optional; present before [[users]], absent after; see Groups
+name = "app"               # the local group to create, fix or remove
+gid = 2000                 # optional
+
+[[users]]                  # optional; after [[groups]], before [[dirs]]; see Users
+name = "deploy"            # the local user to create, fix or remove
+shell = "/bin/bash"        # optional; only the keys set are changed
+
+[[dirs]]                   # optional; after [[users]], before [[files]]; see Dirs
 path = "/etc/app/conf.d"   # the directory to create or fix
 mode = "0755"              # required, quoted
 
@@ -326,6 +334,14 @@ facts = { distro = "arch" } # optional; each value equals that fact
 sudo = true                # optional; default true. false writes as the connecting user
 notify = ["reload sshd"]   # optional; [[handlers]] to run when this step changes the file; see Handlers
 
+[[groups]]                 # optional; one local group created, fixed or removed per matching target; see Groups
+name = "app"               # required: [a-z_][a-z0-9_.-]*, at most 32 bytes
+gid = 2000                 # optional; also system, state, tags, facts, sudo, notify
+
+[[users]]                  # optional; one local user created, fixed or removed per matching target; see Users
+name = "deploy"            # required: [a-z_][a-z0-9_.-]*, at most 32 bytes
+group = "app"              # optional; also uid, groups, shell, home, authorized_keys, state and more
+
 [[dirs]]                   # optional; one directory created or fixed per matching target; see Dirs
 path = "/etc/app/conf.d"   # required: absolute path on the target, the dest rules
 mode = "0755"              # required: a quoted string of 3 or 4 octal digits
@@ -410,7 +426,8 @@ symlink 視為存在，即使是懸空的。一個 step 可設定多個 guard；
 plugin step 的訊息改以 `skipped plugin NAME:` 開頭（`skipped plugin harden: /etc/x exists`）。
 被略過的 step 不會讓 target 失敗，下一個 step 照常執行；其輸出見 [Guarded steps](cli.zh-TW.md#guarded-steps)。
 
-guard 可寫在 `[[steps]]` 項目以及 `run` 與 `plugin` [task](#tasks) 上。`[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]`、`[[services]]` 與 `[packages]`
+guard 可寫在 `[[steps]]` 項目以及 `run` 與 `plugin` [task](#tasks) 上。`[[groups]]`、`[[users]]`、`[[dirs]]`、`[[files]]`、
+`[[links]]`、`[[absent]]`、`[[services]]` 與 `[packages]`
 沒有這些鍵，會以解析器的 `unknown field` 訊息拒絕；其他 task 上的 guard 也以 2 結束（[Tasks](#tasks)）。
 這些種類本身已會收斂，或沒有單一指令可守衛。
 
@@ -433,8 +450,9 @@ guard 隨 step 自己的腳本送出，因此有 guard 的 step 仍只需一次�
 每個名稱都必須是某個 `[[handlers]]` 項目的名稱，否則以 2 結束並顯示
 ``steps[0].notify[0] `reload ssh`: names no [[handlers]] entry``。
 
-上述區段依固定順序執行：套件、目錄、檔案、連結、absent、服務、step，最後是 handler。要自行決定順序，請改用 [`[[tasks]]`](#tasks)，
-取代 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]`、`[[services]]`、`[[steps]]` 與 `[packages]` 中的清單。
+上述區段依固定順序執行：套件、group（`present`）、user、group（`absent`）、目錄、檔案、連結、absent、服務、step，最後是 handler。
+要自行決定順序，請改用 [`[[tasks]]`](#tasks)，取代 `[[groups]]`、`[[users]]`、`[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]`、
+`[[services]]`、`[[steps]]` 與 `[packages]` 中的清單。
 
 沒有 `[secrets]` 時，backend（後端）在 macOS 上是 keychain（其他平台不支援）。
 只有被選中的 backend 的區段是必要的且會被檢查：缺少該區段、未知的 backend，或在非 macOS 上使用 `keychain`，
@@ -594,7 +612,8 @@ fact 的鍵必須是探測會回報的鍵。比對是精確且區分大小寫的
 `pkg = "pacman"` 符合 `pkg` fact 為 `brew pacman` 的 target；`pkg = "pacman brew"` 與 `pkg = "pac"` 則不符合。
 探測沒有回報的 fact 不符合。探測值會移除控制字元並截斷於 256 位元組，因此某些絕不可能被回報的值會被拒絕：空值、超過 256 位元組的值，或含 ASCII 控制位元組的值。以 2 結束：
 
-- `files[0].facts.x: unknown fact; must be one of hostname, os, kernel, arch, distro, distro_version, user, shell, pkg, sudo`
+- `files[0].facts.x: unknown fact; must be one of hostname, os, kernel, arch, distro, distro_version, user, shell, pkg,
+sudo, accounts, accounts_bin`
 - `files[0].facts.distro: is empty`
 - `files[0].facts.distro: 257 bytes exceeds the 256 byte limit`
 - `files[0].facts.distro: contains a control character`
@@ -616,6 +635,11 @@ fact 的鍵必須是探測會回報的鍵。比對是精確且區分大小寫的
   `/opt/homebrew/bin/brew`、`/usr/local/bin/brew`、`/home/linuxbrew/.linuxbrew/bin/brew` 可執行時為 `brew`
   （非登入的 ssh shell 可能沒把 Homebrew 放進 `PATH`），接著是 `command -v` 找得到的 `pacman`、`apt`、`dnf` 與 `apk`。
 - `sudo` — `none`（沒有 `sudo`）、`nopasswd`（`sudo -n true` 成功）或 `binary`（sudo 要求密碼）。
+- `accounts` — [Groups](#groups) 與 [Users](#users) 使用的帳號工具：`useradd`、`usermod`、`userdel`、`groupadd`、
+  `groupmod` 與 `groupdel` 都在同一個目錄時為 `shadow`，否則 `adduser`、`deluser`、`addgroup` 與 `delgroup` 都在時為
+  `busybox`，否則為 `none`。目錄是 `command -v` 找到第一個工具的位置，否則 `/usr/sbin`，否則 `/sbin`，
+  因為非登入的 ssh `PATH` 可能沒有 sbin。
+- `accounts_bin` — 該目錄（例如 `/usr/sbin`），`accounts = none` 時為空；step 以這個絕對路徑呼叫工具。
 
 **`sudo`。** 預設為 true，為 true 時 anvil 寫回的檔案會省略它。`false` 以連線使用者的身分寫入：
 不用 `sudo`、不用暫存檔、不用終端機，也不用 secret。適合用於該使用者 home 底下的 dest。
@@ -993,10 +1017,214 @@ PATH 是該項目在 src 之下的路徑。工作區的走訪在每一層都不�
 `anvil files cp` 只接受文字檔，因此儲存區樹中的二進位檔案必須以其他方式放進 `files/`。
 TUI 的 plan 檢視與 [`anvil plan`](cli.zh-TW.md#anvil-plan) 一樣顯示樹的標頭行與各個項目 step。
 
+## Groups
+
+`[[groups]]` 項目在每個 tag 與 fact 全部符合的選定 target 上，把一個本機 group 帶到 `present`（建立，或修正其 gid）或
+`absent`（移除）。present 的 group 排在套件 step 之後、user 之前；absent 的 group 排在 user 之後，
+因此一個 user 與它的主要 group 可以在同一次執行中一起移除。兩者都在 `[[dirs]]` 之前（`group` [task](#tasks) 則在它所在的位置執行）。
+不符合的項目仍是一個 step，回報為 `skipped group NAME: no match`，該 target 的其他 step 仍會執行
+（[Group and user steps](cli.zh-TW.md#group-and-user-steps)）。
+
+```toml
+[[groups]]
+name = "app"                     # required: [a-z_][a-z0-9_.-]*, at most 32 bytes
+gid = 2000                       # optional: 1..=60000. Unset: a new group gets the next free gid, an existing one keeps its own
+system = true                    # optional; default false. true: a new group is a system group
+state = "present"                # optional: present | absent; default present
+tags = ["linode"]                # optional; also facts, sudo and notify as on [[files]]
+```
+
+config 在任何 target 開始前檢查，第一個失敗就以 2 結束。最多 64 個項目：
+`groups: 65 entries exceeds the 64 entry limit`。未知的鍵以 2 結束並顯示解析器的訊息。接著檢查每個項目：
+
+- ``groups[0].name `App`: must match [a-z_][a-z0-9_.-]*, at most 32 bytes``
+- ``groups[0].gid `0`: must be 1 to 60000``
+- ``groups[0].state `gone`: must be present or absent``
+- `groups[0].gid: not with state = "absent"` 與 `groups[0].system: not with state = "absent"`
+- ``groups[1].name `app`: same name as groups[0]``
+- `tags`、`facts` 與 `notify` 套用 [Files](#files) 的規則與訊息，前綴為 `groups[I]`
+
+**target 上的結果。** step 以 `getent group` 讀取 group，沒有 `getent` 時（busybox 映像檔）以 awk 讀 `/etc/group`，
+只變更不同之處：
+
+- 不存在：建立它，step 印出 `created group NAME`。
+- 存在但 gid 與 `gid` 不同：變更 gid，`fixed group NAME: gid`。沒有 `gid` 時絕不重新編號。
+- 其他情況為 `unchanged group NAME`。
+- `state = "absent"`：存在的 group 被移除，`removed group NAME`；不存在的為 `unchanged group NAME`。
+
+下列情況在任何變更之前讓 step 失敗，以 1 結束：`groups[0] app: gid 2000 is held by group web`（建立或修正的 gid
+已屬於另一個 group）、`groups[0] old: cannot remove the primary group of user deploy`、
+`groups[0] app: busybox cannot change gid; install shadow` 與 `groups: cannot read group NAME`。
+
+**`notify`。** step 印出 `created`、`fixed` 或 `removed` 時要執行的 handler；`unchanged` 不通知任何 handler。
+
+## Users
+
+`[[users]]` 項目在每個 tag 與 fact 全部符合的選定 target 上建立一個本機 user、修正既有 user 上它所設定的鍵，
+或以 `state = "absent"` 移除它。user 排在 present 的 group 之後、absent 的 group 之前，
+因此同一次執行建立的 group 對 `group` 與 `groups` 有效；`user` [task](#tasks) 則在它所在的位置執行。
+不符合的項目仍是一個 step，回報為 `skipped user NAME: no match`。
+
+```toml
+[[users]]
+name = "deploy"                  # required: [a-z_][a-z0-9_.-]*, at most 32 bytes
+uid = 2000                       # optional: 1..=60000
+group = "app"                    # optional: the primary group, a name or a gid 0..=60000
+groups = ["docker"]              # optional: supplementary group names; added to, never removed from
+exclusive_groups = false         # optional; default false. true: the user is in exactly groups
+shell = "/bin/bash"              # optional: absolute, no `:`, listed in the target's /etc/shells
+home = "/srv/deploy"             # optional: absolute, no `:`. Unset: a new user gets /home/NAME
+create_home = true               # optional; default true. false: a new user gets no home directory
+system = false                   # optional; default false. true: a new user is a system user
+comment = "Deploy user"          # optional: the GECOS field, no `:` or control characters
+authorized_keys = ["ssh-ed25519 AAAA… me@laptop", "$/keys/ci.pub"] # optional; see authorized_keys below
+exclusive_keys = false           # optional; default false. true: the file holds exactly these keys
+tags = ["linode"]                # optional; also facts, sudo and notify as on [[files]]
+
+[[users]]
+name = "olduser"
+state = "absent"                 # optional: present | absent; default present
+remove_home = true               # optional, absent only; default false. true: also remove its home (shadow: and mail spool)
+force = false                    # optional, absent only; default false. true: remove it while it runs processes
+```
+
+沒有設定的鍵絕不比較也不變更。沒有密碼鍵：anvil 不管理密碼、sudoers、LDAP 或 macOS 帳號。
+
+config 在任何 target 開始前檢查，第一個失敗就以 2 結束。最多 64 個項目：
+`users: 65 entries exceeds the 64 entry limit`。未知的鍵以 2 結束並顯示解析器的訊息。接著檢查每個項目：
+
+- ``users[0].name `Deploy`: must match [a-z_][a-z0-9_.-]*, at most 32 bytes``（以及 ``users[0].groups[1] `X`: …``）
+- ``users[0].uid `0`: must be 1 to 60000``
+- ``users[0].group `App`: must be a group name or a gid of 0 to 60000``
+- ``users[0].groups[1] `app`: same group as groups[0]``
+- `users[0].exclusive_groups: needs groups` 與 `users[0].exclusive_keys: needs authorized_keys`
+- ``users[0].shell `bash`: must be an absolute path without `:` ``（或 `users[0].home`）
+- ``users[0].comment `a:b`: must not hold `:` or control characters``
+- ``users[0].state `gone`: must be present or absent``
+- `users[0].uid: not with state = "absent"`，適用於 `uid`、`group`、`groups`、`exclusive_groups`、`shell`、`home`、
+  `create_home = false`、`system`、`comment`、`authorized_keys` 與 `exclusive_keys`；以及
+  `users[0].remove_home: only with state = "absent"`（或 `force`）
+- ``users[0].authorized_keys[0] `# old laptop`: is a comment, not a key``，見下文
+- ``users[1].name `deploy`: same name as users[0]``
+- `tags`、`facts` 與 `notify` 套用 [Files](#files) 的規則與訊息，前綴為 `users[I]`
+
+**target 上的結果。** step 以 `getent passwd`（沒有時以 awk 讀 `/etc/passwd`）與 `id -Gn` 讀取 user。
+在任何變更之前，下列情況讓 step 失敗，以 1 結束：`group` 或某個 `groups` 項目不存在
+（`users[0] deploy: group app does not exist on this target`）、shell 不是 `/etc/shells` 中的一行
+（`users[0] deploy: shell /bin/zsh is not in /etc/shells`），或 uid 屬於另一個 user
+（`users[0] deploy: uid 2000 is held by user web`）。接著：
+
+- 不存在：以所有設定的鍵建立它，step 印出 `created user NAME`。
+- 存在：比較每個設定的鍵，修正不同之處，`fixed user NAME: shell, groups`，只列出變更的部分
+  （`uid`、`group`、`shell`、`home`、`comment`、`groups`）。否則為 `unchanged user NAME`。
+- `groups` 把 user 加入它尚未加入的每個列出的 group；`exclusive_groups = true` 時也讓它離開其他每個附加 group
+  （主要 group 不算）。`groups = []` 不改變任何東西，除非是 exclusive。
+- 變更 `home` 只設定 passwd 欄位，不搬移任何東西，step 在 stderr 上警告：
+  `warning: users[0] deploy: home set to /srv/deploy; nothing is moved from /home/deploy`。
+- `state = "absent"`：存在的 user 被移除（`userdel`，`remove_home` 時加 `-r`），`removed user NAME`；
+  已不存在的為 `unchanged user NAME`。
+
+`users: cannot read user NAME` 與 `users: cannot read the groups of user NAME` 也會讓 step 失敗。
+
+**Shadow 與 busybox。** `accounts` [fact](#files) 決定使用的工具，以 `accounts_bin` 的絕對路徑呼叫：
+`shadow` 使用 `useradd`、`usermod`、`userdel`、`groupadd`、`groupmod` 與 `groupdel`；`busybox` 使用 `adduser`、
+`deluser`、`addgroup` 與 `delgroup`。busybox 可以建立 user 與 group 並管理成員關係（`addgroup USER GROUP`、
+`delgroup USER GROUP`），但無法變更既有 user 的 uid、group、shell、home 或 comment，也無法變更 group 的 gid：
+step 在任何變更之前失敗，顯示 `users[0] deploy: busybox cannot change shell; install shadow`（指名該鍵）或
+`groups[0] app: busybox cannot change gid; install shadow`。
+
+**沒有帳號工具。** 兩種工具都沒有的 target（`accounts = none`，包括 macOS）讓每個符合的 group 或 user step 失敗，顯示
+`groups: no account tools on this target (accounts = none)` 或
+`users: no account tools on this target (accounts = none)`；與任何失敗的 step 一樣，該 target 在此結束。
+
+**由誰執行。** 每個變更都需要 root：與 [`[[services]]`](#services) 相同，root 登入直接執行工具，
+其他登入透過 `sudo -n`，或以 target 的 sudo secret 走密碼路徑。`sudo = false` 以連線使用者執行，只有 root 這樣做才有用。
+讀取不需要 root。
+
+**防止鎖在外面的保護。** 在 target 上任何 step 之前、因此在任何變更之前，下列情況讓整個 target 失敗，以 1 結束：
+
+- 移除 `root`：`users[0] root: refused`；
+- 移除登入的 user（探測的 `user` fact）：`users[0] admin: is the login user`；
+- 登入 user 的 `shell` 檔名為 `nologin` 或 `false`：
+  `users[0] admin: shell /sbin/nologin would lock out the login user`；
+- `exclusive_groups`，或移動登入 user 主要 group 的 `group`，會讓它離開 `wheel`、`sudo` 或 `admin`（以名稱或 gid 比對），
+  而它目前是成員，且該 group 既不是它新的主要 group，也不在 `groups` 中（沒有 `exclusive_groups` 時，也不是它保留的附加 group）：
+  `users[0] admin: would drop the login user from wheel`；
+- 移除擁有執行中 process 的 user，除非 `force = true`：`users[0] olduser: owns running processes`；
+- 登入 user 上的 `exclusive_keys` 會丟掉它的登入 key：`users[0] admin: would drop the login key`
+  （[authorized_keys](#authorized_keys)）。
+
+前三項只看 config 與探測結果，因此 `anvil plan` 也會檢查。其他幾項需要在探測之後對 target 做一次唯讀查詢
+（`id`、`pgrep -u`，沒有 pgrep 時讀 `/proc/*/status` 的 `Uid` 行），只有 apply 會執行。查詢無法判斷時，保護會拒絕而不猜測：
+`users[0] olduser: cannot tell whether it owns running processes; set force = true to remove it anyway`
+（沒有 pgrep 也沒有可讀的 `/proc`，或非 root 登入且 `/proc` 以 `hidepid` 掛載）、
+`users[0] admin: cannot tell whether the login user is in wheel, sudo or admin` 與
+`users[0] admin: cannot tell which keys the login user signs in with`。保護看到的是 target 在執行之前的狀態：
+同一次 apply 稍後才加入的 group 或套件不算。
+
+**帳號查詢。** 一段唯讀的 sh 腳本在探測之後、target 的第一個 step 之前執行，且只在符合的項目需要時執行：
+上述需要讀取狀態的保護，或帶有 `authorized_keys` 的 present user（為了讀取它的 passwd home）。
+它的失敗會在任何變更之前讓 target 失敗：`users: the account query exited N`、
+`users: the account query was killed by a signal`、`users: the account query output has no end marker`，
+以及對帶有 `authorized_keys` 但沒有 `home` 的 user，`users[0] deploy: cannot read the user`（passwd 查詢失敗）或
+`users[0] deploy: has no home for authorized_keys`（它的 passwd home 不是絕對路徑）。
+
+**uid 0。** 移除 uid 為 0 的 user（如 `toor` 這類 `root` 別名）會在任何變更之前讓該 step 失敗，shadow 與 busybox 皆然，
+不論是否設定 `remove_home` 或 `force`：`users[0] toor: has uid 0; refused`。
+
+**`remove_home`。** 在 shadow 與 busybox 上，不論是否設定 `force`，step 只移除該 user 擁有的 home，且絕不移除 `/` 這個 home；
+否則它失敗、不做任何變更，且只讓該 step 失敗，而不是 target：
+`users[0] olduser: home /srv/x is not owned by olduser; not removed` 或 `users[0] olduser: home / is not removed`。
+
+**`force`。** 略過 process 保護，並在 shadow 上執行 `userdel -f`（busybox 的 `deluser` 不檢查 process，與不設定時相同）。
+shadow 上仍有一項檢查，只讓該 step 失敗，而不是 target：
+`users[0] olduser: group olduser is the primary group of user web`。
+
+### authorized_keys
+
+present 項目上的 `authorized_keys` 管理 `HOME/.ssh/authorized_keys`，HOME 為設定的 `home`，否則為 user 的 passwd home，
+否則（本次執行才建立的 user）為 `/home/NAME`：
+
+```toml
+[[users]]
+name = "deploy"
+authorized_keys = [
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA… me@laptop",   # a key line as written
+  "$/keys/ci.pub",                                     # or a store file holding one key line
+]
+exclusive_keys = true                                  # default false: add the keys, keep the others
+```
+
+每一項是一行 OpenSSH 公鑰（可有選項與註解；不接受憑證），或一個 `$/` 儲存區路徑，讀法與 `[[files]]` 的儲存區 src 相同，
+內含一行這樣的公鑰，結尾的換行可有可無。不符合的行以 2 結束，key 顯示前 40 個字元：`must be one line`、
+`is a comment, not a key`、`is not an OpenSSH public key line`、`has no base64 key after its type`、
+`has a key that is not ssh-ed25519`（``users[0].authorized_keys[0] `# old laptop`: is a comment, not a key``；較長的值以 `...` 結尾）。
+
+預設下，列出的 key 加到檔案結尾，且只在沒有任何一行已含該 key 時才加（由類型與 base64 blob 判斷，不看選項或註解），
+其他每一行都保留。`exclusive_keys = true` 時，檔案只含列出的 key，每行一個。
+
+key 由緊接在 user 自己的 step 之後的 file step 寫入，`$ file HOME/.ssh/authorized_keys`，印出 `wrote DEST` 或
+`unchanged DEST`，並與 user step 一樣通知。它走 [`[[files]]`](#files) 的寫入路徑，mode 0600，寫進缺少時以 0700 建立的 `.ssh`（既有的保留其 mode，只檢查其他人不可寫入），
+但以該 user 的身分執行：是登入 user 時直接執行，root 登入時用 `su -s /bin/sh NAME`，否則用 `sudo -n -u NAME /bin/sh`。
+因此路徑上的每個目錄都必須屬於 root 或該 user，且其他人不可寫入，user 放置的 link 也無法把它變成 root 的寫入。
+home 不存在時 step 失敗，顯示 `users[0] deploy: home /home/deploy does not exist`；anvil 無法讀取或不是文字的檔案會在任何變更之前讓它失敗。
+寫入另一個 user 的 key 需要 `sudo = true` 以及不要求密碼的 sudo：否則 target 失敗，顯示
+`users[0] deploy: authorized_keys of another user needs sudo` 或
+`users[0] deploy: authorized_keys of another user needs sudo without a password`。
+
+登入 user 上的 `exclusive_keys` 必須保留它目前檔案中的至少一個 key，或在檔案不存在或為空時至少列出一個 key
+（anvil 無法得知這個 session 用的是哪個 key）；否則 target 在任何變更之前失敗，顯示
+`users[0] admin: would drop the login key`。查詢無法讀取或解析的檔案也以相同方式讓它失敗，顯示
+`users[0] admin: cannot tell which keys the login user signs in with`。
+
+**Rollback。** user 與 group 不會被復原：[`anvil rollback`](cli.zh-TW.md#anvil-rollback) 把每個執行過的 step 列為
+`cannot undo: user NAME` 或 `cannot undo: group NAME`。authorized_keys 檔案記錄為一次檔案寫入，含它先前的文字與它的 user，
+rollback 以該 user 的身分把它寫回；它建立的 `.ssh` 在為空時會被移除。
+
 ## Dirs
 
 `[[dirs]]` 項目在每個 tag 與 fact 全部符合的選定 target 上建立一個目錄，或修正它的擁有者、群組與 mode。
-符合的項目依 config 順序執行，排在套件 step 之後、`[[files]]` 之前，因此目錄會在放入它的檔案之前就存在
+符合的項目依 config 順序執行，排在套件、group 與 user step 之後、`[[files]]` 之前，因此目錄會在放入它的檔案之前就存在
 （`dir` [task](#tasks) 則在它所在的位置執行）。不符合的項目仍是一個 step，回報為 `skipped dir PATH: no match`，
 該 target 的其他 step 仍會執行（[Dir steps](cli.zh-TW.md#dir-steps)）。
 
@@ -1247,7 +1475,7 @@ config 依此順序檢查，第一個失敗就以 2 結束。最多 64 個項目
 
 - ``services[0].tags[1] `bad tag`: must match [A-Za-z0-9_-]+``
 - `services[0].facts.x: unknown fact; must be one of hostname, os, kernel, arch, distro, distro_version, user, shell,
-pkg, sudo`
+pkg, sudo, accounts, accounts_bin`
 - `services[0].facts.distro: is empty`、`services[0].facts.distro: 257 bytes exceeds the 256 byte limit` 與
   `services[0].facts.distro: contains a control character`
 
@@ -1304,7 +1532,7 @@ launchd 的變更是以替身工具測試的，而非實際的 launchd；只有 
 ## Tasks
 
 `[[tasks]]` 清單在每個 target 上由上而下，依你寫的順序執行。
-當設定需要舊版區段固定順序（套件、目錄、檔案、連結、absent、服務、step）以外的順序時就用它：
+當設定需要舊版區段固定順序（套件、group、user、目錄、檔案、連結、absent、服務、step）以外的順序時就用它：
 在兩個檔案之間執行一個 step，或在檔案與讀取它的服務之間執行 migration。
 task 可以巢狀，也可以 include [檔案儲存區](cli.zh-TW.md#anvil-files)中的 task 檔。沒有 `[[tasks]]` 的 config 行為完全不變。
 
@@ -1350,7 +1578,7 @@ facts = { os = "Linux" }           # ANDed with the parent's tags
 
 **種類。** 每個 task 恰有下列其中一種，另可設定 `name`、`tags` 與 `facts`。未知的鍵以 2 結束並顯示解析器的訊息。
 兩種以上以 2 結束並顯示 `tasks[0]: has run and include; keep one`，都沒有時為
-`tasks[0]: needs one of run, plugin, packages, file, service, dir, link, absent, include, tasks`。
+`tasks[0]: needs one of run, plugin, packages, file, service, group, user, dir, link, absent, include, tasks`。
 
 | 種類       | 作用                                                                             |
 | ---------- | -------------------------------------------------------------------------------- |
@@ -1359,31 +1587,36 @@ facts = { os = "Linux" }           # ANDed with the parent's tags
 | `packages` | 只有 `install`、`pin`、`remove` 與 `upgrade`，與 `[packages]` 相同               |
 | `file`     | [`[[files]]`](#files) 的鍵，但 `tags`、`facts` 與 `notify` 寫在 task 上          |
 | `service`  | `name`、`state` 與 `enabled`，與 [`[[services]]`](#services) 相同                |
+| `group`    | [`[[groups]]`](#groups) 的鍵，但 `tags`、`facts` 與 `notify` 寫在 task 上        |
+| `user`     | [`[[users]]`](#users) 的鍵，但 `tags`、`facts` 與 `notify` 寫在 task 上          |
 | `dir`      | [`[[dirs]]`](#dirs) 的鍵，但 `tags`、`facts` 與 `notify` 寫在 task 上            |
 | `link`     | [`[[links]]`](#links) 的鍵，但 `tags`、`facts` 與 `notify` 寫在 task 上          |
 | `absent`   | [`[[absent]]`](#absent) 的鍵，但 `tags`、`facts` 與 `notify` 寫在 task 上        |
 | `include`  | `$/…` task 檔，就地展開                                                          |
 | `tasks`    | 子 task，寫成 `[[tasks.tasks]]` 或 inline array                                  |
 
-`tags` 與 `facts` 寫在 task 上，不寫在 `file`、`service`、`dir`、`link` 或 `absent` 裡：否則以 2 結束並顯示
-`tasks[0].file: tags and facts belong on the task, not the file`（`… not the dir`、`… not the link`、`… not the absent entry`）。
+`tags` 與 `facts` 寫在 task 上，不寫在 `file`、`service`、`group`、`user`、`dir`、`link` 或 `absent` 裡：否則以 2 結束並顯示
+`tasks[0].file: tags and facts belong on the task, not the file`（`… not the group`、`… not the user`、`… not the dir`、
+`… not the link`、`… not the absent entry`）。
 selector 不符合的 task 仍是一個 step，回報為略過（`skipped run: no match`、`skipped packages: no match`），
 該 target 的其他 step 仍會執行。失敗的 task 會結束該 target；其他 target 繼續。
 沒有要做任何事的 `packages` task、空的 `tasks` 與沒有 task 的 include 都不產生 step。
-每個 file、dir、link、absent 與 service task 都是自己的 step，可以重複：[`[[services]]` 的重複規則](#services)不適用，
+每個 file、dir、link、absent、service、group 與 user task 都是自己的 step，可以重複：[`[[services]]` 的重複規則](#services)不適用，
 因為停止、migration、啟動就是這樣寫的。含 `[[tasks]]` 的 config 沒有預設的 `hostname` step。
 
 **Guard。** `run` 或 `plugin` task 也可設定 [guard](#config) `creates`、`removes`、`onlyif` 與 `unless`，
-規則與 `[[steps]]` 相同。在 `packages`、`file`、`service`、`dir`、`link`、`absent`、`include` 或 `tasks` task 上，guard 在任何深度都以 2 結束，
+規則與 `[[steps]]` 相同。在 `packages`、`file`、`service`、`group`、`user`、`dir`、`link`、`absent`、`include` 或 `tasks` task 上，guard
+在任何深度都以 2 結束，
 並依上述順序指名第一個設定的 guard：`tasks[0].creates: only on a run or plugin task`、
 `tasks[0].tasks[0].onlyif: only on a run or plugin task`。
 
-**`notify`。** `run`、`plugin`、`file`、`service`、`dir`、`link` 或 `absent` task 可以設定 [`notify`](#handlers)，寫在 task 上，
-而不是 `file`、`service`、`dir`、`link` 或 `absent` 裡面。
+**`notify`。** `run`、`plugin`、`file`、`service`、`group`、`user`、`dir`、`link` 或 `absent` task 可以設定
+[`notify`](#handlers)，寫在 task 上，而不是 `file`、`service`、`group`、`user`、`dir`、`link` 或 `absent` 裡面。
 以 2 結束：`tasks[0].notify: not on a packages task; packages give no change signal`、
-`tasks[0].notify: only on a run, plugin, file, service, dir, link or absent task`（`include` 或 `tasks` 群組）、
+`tasks[0].notify: only on a run, plugin, file, service, group, user, dir, link or absent task`（`include` 或 `tasks` 群組）、
 `tasks[0].file: notify belongs on the task, not the file`、
 `tasks[0].service: notify belongs on the task, not the service`、
+`tasks[0].group: notify belongs on the task, not the group`、`tasks[0].user: notify belongs on the task, not the user`、
 `tasks[0].dir: notify belongs on the task, not the dir`、`tasks[0].link: notify belongs on the task, not the link` 與
 `tasks[0].absent: notify belongs on the task, not the absent entry`。
 `[[handlers]]` 留在主檔案中：含有它的 include 以 2 結束並顯示解析器的訊息。
@@ -1419,12 +1652,14 @@ include 受儲存區的限制（不含 NUL 的一般 UTF-8 文字檔，最多 1 
 | 256 個 task                              | `PATH: more than 256 tasks after expansion`           |
 | 64 個 file task                          | `PATH: more than 64 file tasks after expansion`       |
 | 64 個 service task                       | `PATH: more than 64 service tasks after expansion`    |
+| 64 個 group task                         | `PATH: more than 64 group tasks after expansion`      |
+| 64 個 user task                          | `PATH: more than 64 user tasks after expansion`       |
 | 64 個 dir task                           | `PATH: more than 64 dir tasks after expansion`        |
 | 64 個 link task                          | `PATH: more than 64 link tasks after expansion`       |
 | 64 個 absent task                        | `PATH: more than 64 absent tasks after expansion`     |
 | 走訪 4096 個 task，群組與 include 也計入 | `PATH: more than 4096 tasks visited during expansion` |
 
-**混用。** `[[tasks]]` 與 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]`、`[[services]]`、`[[steps]]`，
+**混用。** `[[tasks]]` 與 `[[groups]]`、`[[users]]`、`[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]`、`[[services]]`、`[[steps]]`，
 或 `[packages]` 的 `install`、`pin`、`remove`、`upgrade` 並用時，以 2 結束並顯示 `[[tasks]] cannot be mixed with [[steps]]; move it into a task`。沒有自動遷移。
 `[packages.alias]` 與其他 `[packages]` 設定（`manager`、`local`、`local_sudo_secret`、`timeout`）維持全域，可與 `[[tasks]]` 並用，
 `[[handlers]]`、`[plugins]`、`[secrets]`、`[harden]` 與 `[anvil]` 也一樣。
@@ -1490,10 +1725,10 @@ run = "fc-cache -f"
 - handler 本身的 `tags`、`facts`、`notify`、guard、`plugin` 或任何其他鍵：解析器的 `unknown field` 訊息。
   handler 只在被通知的地方執行，且 handler 不會通知 handler。
 
-**`notify`。** 一串 handler 名稱，可寫在 `[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]`、`[[services]]` 與 `[[steps]]` 項目上，
-以及 `run`、`plugin`、`file`、`service`、`dir`、`link` 與 `absent` [task](#tasks) 上。列出兩次的名稱只算一次。
-沒有對應 handler 的名稱以 2 結束並指名該項目：
-``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry``（或 `dirs[I]`、`files[I]`、`links[I]`、`absent[I]`、`services[I]`、`tasks[I]`）。
+**`notify`。** 一串 handler 名稱，可寫在 `[[groups]]`、`[[users]]`、`[[dirs]]`、`[[files]]`、`[[links]]`、`[[absent]]`、
+`[[services]]` 與 `[[steps]]` 項目上，以及 `run`、`plugin`、`file`、`service`、`group`、`user`、`dir`、`link` 與 `absent`
+[task](#tasks) 上。列出兩次的名稱只算一次。沒有對應 handler 的名稱以 2 結束並指名該項目：
+``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry``（或 `groups[I]`、`users[I]`、`dirs[I]`、`files[I]`、`links[I]`、`absent[I]`、`services[I]`、`tasks[I]`）。
 
 **step 何時通知。** 只有在 target 上執行、以 0 結束且改變了東西的 step：
 
@@ -1504,6 +1739,8 @@ run = "fc-cache -f"
 | link          | 印出 `linked …` 或 `relinked …`      | 印出 `unchanged PATH`         |
 | absent        | 印出 `removed PATH`                  | 印出 `unchanged PATH`         |
 | service       | 印出任何變更行                       | 印出 `unchanged service NAME` |
+| group         | 印出 `created`、`fixed` 或 `removed` | 印出 `unchanged group NAME`   |
+| user          | 印出 `created`、`fixed` 或 `removed` | 印出 `unchanged user NAME`    |
 | run 或 plugin | 執行且以 0 結束                      | 被 [guard](#config) 略過      |
 | 任何          |                                      | 以 no match 略過，或失敗      |
 

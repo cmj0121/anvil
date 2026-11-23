@@ -1964,6 +1964,7 @@ mod tests {
         let files = files
             .iter()
             .map(|(dest, sudo)| record::FileRecord {
+                user: None,
                 dest: (*dest).to_owned(),
                 mode: "0644".to_owned(),
                 sudo: *sudo,

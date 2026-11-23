@@ -4,7 +4,9 @@
 # can block on the transport's stdin, which is closed once this script has been
 # sent; the shell reads the whole group from stdin before it runs any of it.
 # brew counts when on PATH or at a standard Homebrew prefix, which a
-# non-login ssh shell may leave off PATH.
+# non-login ssh shell may leave off PATH. accounts names the account tools,
+# shadow-utils before busybox, and accounts_bin the one directory that holds
+# every tool of that family (on PATH, else /usr/sbin or /sbin); none without.
 {
   printf '%s\n' "hostname=$(hostname 2>/dev/null)"
   printf '%s\n' "os=$(uname -s 2>/dev/null)"
@@ -44,6 +46,29 @@
   else
     echo "sudo=binary"
   fi
+  accounts=none
+  accounts_bin=
+  for family in "shadow useradd usermod userdel groupadd groupmod groupdel" \
+    "busybox adduser deluser addgroup delgroup"; do
+    set -- $family
+    found=$(command -v "$2" 2>/dev/null)
+    case $found in
+      /*) dirs="${found%/*} /usr/sbin /sbin" ;;
+      *) dirs="/usr/sbin /sbin" ;;
+    esac
+    for d in $dirs; do
+      all=1
+      for t in $family; do
+        [ "$t" = "$1" ] || [ -x "$d/$t" ] || all=
+      done
+      if [ -n "$all" ]; then
+        accounts=$1
+        accounts_bin=$d
+        break 2
+      fi
+    done
+  done
+  printf 'accounts=%s\naccounts_bin=%s\n' "$accounts" "$accounts_bin"
   echo "anvil-probe-end=1"
 } </dev/null
 exit 0

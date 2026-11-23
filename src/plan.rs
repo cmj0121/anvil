@@ -41,6 +41,7 @@ use crate::status;
 use crate::step::{PlannedRun, RunKind};
 use crate::tasks::Expanded;
 use crate::transport::{Transport, TransportError};
+use crate::users;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
@@ -737,13 +738,14 @@ fn plan_target(
         .map_err(|err| Unresolved::Failed(err.to_string()))
         .and_then(|transport| engine::probe(transport.as_ref(), expanded))
         .and_then(|facts| {
+            users::check_config(expanded, target, &facts)?;
             let steps = engine::resolve(
                 target,
                 Some(&facts),
                 config,
                 expanded,
                 sources,
-                None,
+                engine::ApplyOnly::default(),
                 plugins,
                 cancel,
             )?;
@@ -900,7 +902,10 @@ pub fn render(report: &PlanReport, show: Show, sources: &Sources, hashes: &Hashe
 /// would type and the plugin that returned it, if any; unescaped but for a
 /// task's invisible characters, since its `run` is config text under review.
 /// A file entry with `secrets` is
-/// `would write DEST (secret: NAME, NAME; rendered at apply)` instead.
+/// `would write DEST (secret: NAME, NAME; rendered at apply)` instead, and a
+/// group step that runs is `would group NAME (gid N)` or `would remove group
+/// NAME`, and a user step `would user NAME (uid N, shell PATH)`, from the
+/// config alone.
 pub fn would_text(step: &PlannedRun) -> String {
     let binary = if step.binary() { " (binary)" } else { "" };
     let secret = step
@@ -918,6 +923,11 @@ pub fn would_text(step: &PlannedRun) -> String {
             write.dest,
             file.names.join(", ")
         ),
+        None if step.group().is_some_and(|group| !group.skip)
+            || step.user().is_some_and(|user| !user.skip) =>
+        {
+            format!("would {}{secret}", step.shown())
+        }
         None => format!(
             "would $ {}{binary}{secret}{from}",
             report::command(step.shown())
@@ -1227,7 +1237,7 @@ mod tests {
             config,
             &legacy(config),
             &Sources::default(),
-            None,
+            engine::ApplyOnly::default(),
             &FakePlugins::none(),
             &cancel,
         )

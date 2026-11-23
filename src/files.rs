@@ -53,10 +53,12 @@ use crate::template;
 use crate::transport::{Output, RUN_TIMEOUT};
 use crate::tree::{self, Tree, TreeItem};
 use crate::trust::{self, TrustError};
+use crate::users::{KeysWrite, StoreKeys, wrapped};
 
-/// Each file item's src, by ordinal.
+/// Each file item's src, by ordinal, and the user items' `authorized_keys`
+/// read from the store.
 #[derive(Debug, Default)]
-pub struct Sources(Vec<Loaded>);
+pub struct Sources(Vec<Loaded>, StoreKeys);
 
 /// One file item's src: a file, or the tree of a `recursive = true` entry.
 #[derive(Debug)]
@@ -78,6 +80,16 @@ impl Loaded {
 }
 
 impl Sources {
+    /// These sources with `keys`, the store's `authorized_keys` lines.
+    pub(crate) fn with_keys(self, keys: StoreKeys) -> Sources {
+        Sources(self.0, keys)
+    }
+
+    /// The `authorized_keys` lines read from the store.
+    pub(crate) fn keys(&self) -> &StoreKeys {
+        &self.1
+    }
+
     /// The src of the single file entry with ordinal `i`.
     pub(crate) fn file(&self, i: usize) -> Option<&Source> {
         self.0.get(i).and_then(Loaded::file)
@@ -109,6 +121,7 @@ impl Sources {
                 .iter()
                 .map(|text| Loaded::File(Source::of(text.as_bytes().to_vec())))
                 .collect(),
+            StoreKeys::default(),
         )
     }
 }
@@ -241,7 +254,7 @@ fn load_where(
             ..err
         })?);
     }
-    Ok(Sources(sources))
+    Ok(Sources(sources, StoreKeys::default()))
 }
 
 /// The src of a single file `entry` from its `bytes`, a templated one
@@ -354,6 +367,24 @@ pub fn sudo_secret_for<'a>(config: &'a Config, target: &'a Target) -> Option<&'a
         .map_or(target.sudo_secret.as_deref(), |p| p.sudo_secret_for(target))
 }
 
+/// How a step whose entry says `sudo` runs on a target whose login has
+/// `facts`: `"sudo "` with the secret that holds the password sudo asks
+/// for, else `""` on a root login or without `sudo`, else `"sudo -n "`.
+pub(crate) fn sudo_for<'a>(
+    config: &'a Config,
+    target: &'a Target,
+    facts: &Facts,
+    sudo: bool,
+) -> (&'static str, Option<&'a str>) {
+    let secret = sudo_secret_for(config, target).filter(|_| sudo && facts.sudo_asks_password());
+    let prefix = match secret {
+        Some(_) => "sudo ",
+        None if facts.is_root() || !sudo => "",
+        None => "sudo -n ",
+    };
+    (prefix, secret)
+}
+
 /// The steps of file `item` for `target`: a skip when it does not match,
 /// else the tee script, or the password path's when sudo asks for a password
 /// and a secret holds it; a `recursive = true` entry has one per item of its
@@ -410,21 +441,15 @@ pub fn run(
         !root && !entry.sudo,
         facts,
     )?;
-    let secret =
-        sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
-    let (sudo, password) = match secret {
-        Some(name) => {
-            log::info!(
-                "{}: {label} {dest}, sudo password from secret {name}",
-                target.name
-            );
-            ("sudo ", true)
-        }
-        None => {
-            log::info!("{}: {label} {dest}", target.name);
-            (if root || !entry.sudo { "" } else { "sudo -n " }, false)
-        }
-    };
+    let (sudo, secret) = sudo_for(config, target, facts, entry.sudo);
+    match secret {
+        Some(name) => log::info!(
+            "{}: {label} {dest}, sudo password from secret {name}",
+            target.name
+        ),
+        None => log::info!("{}: {label} {dest}", target.name),
+    }
+    let password = secret.is_some();
     let base = FileWrite {
         ordinal: i,
         dest: String::new(),
@@ -441,6 +466,7 @@ pub fn run(
         binary: false,
         item: None,
         secret: secret_file,
+        keys: None,
     };
     if let Some(tree) = sources.tree(i) {
         return tree_runs((entry, &label), tree, base, secret, facts, sources);
@@ -631,12 +657,7 @@ fn render_entry(
             return Err("rendered output contains a NUL byte".to_owned());
         }
         if secrets.is_empty() {
-            let sha256 = hex(&Sha256::digest(text.as_bytes()));
-            return Ok(Box::new(Rendered {
-                text,
-                sha256,
-                scrub: Vec::new(),
-            }));
+            return Ok(Rendered::plain(text));
         }
         let mut scrub: Vec<Zeroizing<String>> = secrets.values().cloned().collect();
         scrub.extend(render.encoded);
@@ -672,6 +693,18 @@ pub struct Rendered {
 pub struct SecretFile {
     pub label: String,
     pub names: Vec<String>,
+}
+
+impl Rendered {
+    /// `text` with its hash and nothing to scrub: no secret is in it.
+    pub(crate) fn plain(text: Zeroizing<String>) -> Box<Rendered> {
+        let sha256 = hex(&Sha256::digest(text.as_bytes()));
+        Box::new(Rendered {
+            text,
+            sha256,
+            scrub: Vec::new(),
+        })
+    }
 }
 
 /// By hand: the length only, never the text or, since the file's mode may
@@ -724,6 +757,10 @@ pub struct FileWrite {
     /// render it, the record keeps no hash, and a failed write hides the
     /// target's output.
     pub secret: Option<Box<SecretFile>>,
+    /// For a user's `authorized_keys`, its keys and whom it is written as:
+    /// the bytes are [`KeysWrite::merged`] into `rendered` once the capture
+    /// read the file, and every run goes through [`wrapped`].
+    pub keys: Option<Box<KeysWrite>>,
 }
 
 /// A write's `owner` and `group`, each by name or numeric id, `None`
@@ -825,6 +862,9 @@ impl FileWrite {
         if self.secret.is_some() {
             return Err(format!("files[{}]: not rendered at plan", self.ordinal));
         }
+        if let Some(keys) = &self.keys {
+            return Err(format!("{}: authorized_keys not read yet", keys.label));
+        }
         let source = match self.item {
             Some(k) => (sources.tree(self.ordinal))
                 .and_then(|tree| tree.items.get(k))
@@ -839,9 +879,24 @@ impl FileWrite {
         })
     }
 
-    /// The run before the write that reports what DEST holds.
-    pub(crate) fn capture(&self) -> String {
-        capture_script(&self.dest, &self.sudo, &self.checks)
+    /// The run before the write that reports what DEST holds; an
+    /// authorized_keys file's bytes whatever its mode, as its user.
+    pub(crate) fn capture(&self) -> Zeroizing<String> {
+        let script = capture_any(&self.dest, &self.sudo, &self.checks, self.keys.is_some());
+        match &self.keys {
+            Some(keys) => wrapped(&keys.wrap, &script),
+            None => Zeroizing::new(script),
+        }
+    }
+
+    /// This write with the bytes of an authorized_keys file built from what
+    /// the capture found at DEST; `None` for any other write.
+    pub(crate) fn merged(&self, captured: &Captured) -> Option<Result<FileWrite, String>> {
+        let keys = self.keys.as_ref()?;
+        Some(keys.merged(&self.dest, captured).map(|text| FileWrite {
+            rendered: Some(Rendered::plain(Zeroizing::new(text))),
+            ..self.clone()
+        }))
     }
 
     /// The record of this write, from what the capture saw before it and
@@ -858,16 +913,22 @@ impl FileWrite {
         write: Write,
         hash_only: bool,
     ) -> FileRecord {
-        let entry = expanded
-            .file(self.ordinal)
-            .expect("a write comes from the list it is recorded against");
+        let (sudo, rollback) = match &self.keys {
+            Some(_) => (false, true),
+            None => {
+                let entry = expanded
+                    .file(self.ordinal)
+                    .expect("a write comes from the list it is recorded against");
+                (entry.sudo, entry.rollback)
+            }
+        };
         let written = self.payload(sources).map_or(&[][..], Payload::bytes);
         let secret = self.secret.is_some();
-        let previous = previous_of(captured, hash_only || !entry.rollback || secret);
+        let previous = previous_of(captured, hash_only || !rollback || secret);
         let mut record = FileRecord {
             dest: self.dest.clone(),
             mode: format!("{:0>4}", self.mode),
-            sudo: entry.sudo,
+            sudo,
             written_sha256: if secret {
                 String::new()
             } else {
@@ -879,6 +940,7 @@ impl FileWrite {
             created_dirs: Vec::new(),
             binary: false,
             secret,
+            user: self.keys.as_ref().map(|keys| keys.user.clone()),
         };
         if self.binary {
             record.drop_binary_previous();
@@ -988,7 +1050,12 @@ pub(crate) fn write_script(
         }
     };
     if !step.password {
-        return tee_script(bytes, step, expected).map(|script| (script, None));
+        let script = tee_script(bytes, step, expected)?;
+        let script = match &step.keys {
+            Some(keys) => wrapped(&keys.wrap, &script),
+            None => script,
+        };
+        return Ok((script, None));
     }
     let (temp, mut upload) = staged_bytes(&bytes)?;
     let expected = match expected {
@@ -1404,7 +1471,19 @@ const MARK: &str = "anvil-capture ";
 /// probes whose failure is an answer, not an error, send theirs to
 /// `/dev/null`: a stray sudo warning cannot break [`parse_capture`].
 pub(crate) fn capture_script(dest: &str, sudo: &str, checks: &str) -> String {
+    capture_any(dest, sudo, checks, false)
+}
+
+/// [`capture_script`], with `any_mode` sending the bytes of a file others
+/// may not read too: an authorized_keys file, whose public keys the record
+/// keeps.
+fn capture_any(dest: &str, sudo: &str, checks: &str, any_mode: bool) -> String {
     let d = quote(dest);
+    let private = if any_mode {
+        ""
+    } else {
+        "case $1 in -??????r*) ;; *) anvil_sent; exit 0 ;; esac\n"
+    };
     let ready = match sudo {
         "" => String::new(),
         _ => format!("{sudo}true || exit 1\n"),
@@ -1433,7 +1512,7 @@ pub(crate) fn capture_script(dest: &str, sudo: &str, checks: &str) -> String {
          case $anvil_line in -*) ;; *) echo {irregular} >&2; exit 1 ;; esac\n\
          printf '{MARK}file %s\\n' \"$anvil_line\"\n\
          set -- $anvil_line\n\
-         case $1 in -??????r*) ;; *) anvil_sent; exit 0 ;; esac\n\
+         {private}\
          if [ \"$5\" -gt {MAX_KEPT} ]; then anvil_sent\n\
          elif ! {has_od}; then echo '{MARK}no-od'; anvil_sent\n\
          else echo '{MARK}bytes'\n\
@@ -1499,6 +1578,16 @@ impl fmt::Debug for Captured {
 /// first marker on, anything but the exact shape the script prints, a
 /// missing `end` included, is an error.
 pub(crate) fn parse_capture(dest: &str, stdout: &[u8]) -> Result<Captured, String> {
+    parse_capture_any(dest, stdout, false)
+}
+
+/// [`parse_capture`] of a [`capture_any`] run that sent the bytes of a file
+/// others may not read when `any_mode`.
+pub(crate) fn parse_capture_any(
+    dest: &str,
+    stdout: &[u8],
+    any_mode: bool,
+) -> Result<Captured, String> {
     let unread = || format!("files: cannot read {dest} before writing it");
     let text = std::str::from_utf8(stdout).map_err(|_| unread())?;
     let mut lines = Vec::new();
@@ -1553,7 +1642,7 @@ pub(crate) fn parse_capture(dest: &str, stdout: &[u8]) -> Result<Captured, Strin
             _ => Err(unread()),
         }
     };
-    if !is_world_readable(&mode) {
+    if !any_mode && !is_world_readable(&mode) {
         return Ok(file(remote(&mut rest)?, None, Some(NOT_WORLD_READABLE)));
     }
     if size > MAX_KEPT {
@@ -2173,7 +2262,7 @@ pub(crate) fn restore_runs(
     config: &Config,
     target: &Target,
     facts: &Facts,
-    files: &[FileRecord],
+    files: (&[FileRecord], &BTreeMap<String, bool>),
     force: &Force,
     wording: Wording,
 ) -> Result<Vec<PlannedRun>, String> {
@@ -2186,7 +2275,7 @@ fn restore_runs_from(
     config: &Config,
     target: &Target,
     facts: &Facts,
-    files: &[FileRecord],
+    (files, keys_sudo): (&[FileRecord], &BTreeMap<String, bool>),
     force: &Force,
     wording: Wording,
 ) -> Result<Vec<PlannedRun>, String> {
@@ -2210,14 +2299,19 @@ fn restore_runs_from(
         {
             return Err(format!("files: {dest}: the record's mode is not octal"));
         }
-        let secret =
-            sudo_secret_for(config, target).filter(|_| file.sudo && facts.sudo_asks_password());
-        let sudo = match secret {
-            Some(_) => "sudo ",
-            None if root || !file.sudo => "",
-            None => "sudo -n ",
+        // An authorized_keys file goes back as the user it was written as,
+        // never with the record's sudo inside that wrap.
+        let file_sudo = file.sudo && file.user.is_none();
+        let (sudo, secret) = sudo_for(config, target, facts, file_sudo);
+        let wrap = match &file.user {
+            Some(user) => {
+                let sudo = (keys_sudo.get(user).copied())
+                    .ok_or_else(|| format!("files: {dest}: no [[users]] entry for {user}"))?;
+                crate::users::as_user(&format!("files: {dest}"), user, facts, sudo)?
+            }
+            None => String::new(),
         };
-        let as_root = root || file.sudo;
+        let as_root = (root || file_sudo) && file.user.is_none();
         let refused = file.write == Write::Refused;
         let dirs = file.dirs_deepest_first();
         // A refused write may have stopped at a created directory that fails
@@ -2290,7 +2384,7 @@ fn restore_runs_from(
         log::info!("{}: {label}", target.name);
         runs.push(file_run(
             dest,
-            run,
+            wrapped(&wrap, &run),
             label,
             secret.map(str::to_owned),
             FileRun {
@@ -2331,6 +2425,7 @@ pub(crate) fn restore_replaced(
         created_dirs: Vec::new(),
         binary: false,
         secret: false,
+        user: None,
     };
     let restore = Restore {
         dest,
@@ -2759,12 +2854,14 @@ mod tests {
     /// A plain [`FileWrite`] of the first src with no owner or group.
     fn plain(dest: &str, mode: &str, sudo: &str, checks: &str, as_root: bool) -> FileWrite {
         FileWrite {
+            keys: None,
             ordinal: 0,
             dest: dest.to_owned(),
             mode: mode.to_owned(),
             sudo: sudo.to_owned(),
             checks: checks.to_owned(),
             walk: Box::new(Walk {
+                private: false,
                 kind: "files",
                 dirs: Vec::new(),
                 owner: ROOT_OWNED.to_owned(),
@@ -2983,7 +3080,7 @@ mod tests {
         fs::set_permissions(root.join("real/src.txt"), fs::Permissions::from_mode(0o644)).unwrap();
         std::os::unix::fs::symlink("real/src.txt", root.join("link.txt")).unwrap();
         let config = config_in(&root, vec![entry("link.txt", "/etc/x")]);
-        let Sources(loaded) = load(&config, || Ok(root.clone())).unwrap();
+        let Sources(loaded, _) = load(&config, || Ok(root.clone())).unwrap();
         assert_eq!(loaded[0].file().and_then(Source::text), Some("text"));
         assert_src_refused(&root, "link.txt", &root.join("real"), 0o775, 0o755);
         assert_src_refused(&root, "link.txt", &root.join("real/src.txt"), 0o664, 0o644);
@@ -3087,7 +3184,7 @@ mod tests {
             &dir,
             vec![entry("sub/a.conf", "/etc/a"), entry("./sub/../b", "/etc/b")],
         );
-        let Sources(loaded) = load(&config, || Ok(dir.clone())).unwrap();
+        let Sources(loaded, _) = load(&config, || Ok(dir.clone())).unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].file().and_then(Source::text), Some(SECRET_TEXT));
         assert_eq!(loaded[1].file().and_then(Source::text), Some(""));
@@ -3096,7 +3193,7 @@ mod tests {
 
     #[test]
     fn load_without_files_reads_nothing_and_needs_no_path() {
-        let Sources(loaded) = load(&Config::default(), || {
+        let Sources(loaded, _) = load(&Config::default(), || {
             panic!("empty files must not resolve the workspace")
         })
         .unwrap();
@@ -3566,7 +3663,10 @@ mod tests {
         let config = config_in(Path::new("/c"), vec![entry("a", "/etc/a")]);
         let mut bytes: Vec<u8> = (0..=255).collect();
         bytes.extend_from_slice(b"hunter2\0");
-        let sources = Sources(vec![Loaded::File(Source::of(bytes.clone()))]);
+        let sources = Sources(
+            vec![Loaded::File(Source::of(bytes.clone()))],
+            StoreKeys::default(),
+        );
         let printf = Printf::new(&bytes);
         let plain = runs(
             &config,
@@ -3630,7 +3730,7 @@ mod tests {
         );
         let config = config_in(Path::new("/c"), vec![entry("a", "/etc/a")]);
         let bytes = vec![0xff; document::MAX_BYTES as usize];
-        let sources = Sources(vec![Loaded::File(Source::of(bytes))]);
+        let sources = Sources(vec![Loaded::File(Source::of(bytes))], StoreKeys::default());
         let run = runs(
             &config,
             &sources,
@@ -7247,6 +7347,7 @@ mod tests {
     /// `previous`.
     fn recorded(dest: &Path, written: &str, write: Write, previous: Previous) -> FileRecord {
         FileRecord {
+            user: None,
             dest: dest.to_str().unwrap().to_owned(),
             mode: "0644".to_owned(),
             sudo: false,
@@ -7283,7 +7384,7 @@ mod tests {
             &Config::default(),
             &host(&[], None),
             &user_facts("nopasswd"),
-            files,
+            (files, &BTreeMap::new()),
             force,
             Wording::Cli,
         )
@@ -7543,7 +7644,7 @@ mod tests {
                 &Config::default(),
                 &host(&[], None),
                 &user_facts("nopasswd"),
-                std::slice::from_ref(file),
+                (std::slice::from_ref(file), &BTreeMap::new()),
                 &Force::None,
                 Wording::Cli,
             )
@@ -7838,7 +7939,7 @@ mod tests {
                 &Config::default(),
                 &host(&[], None),
                 &user_facts("nopasswd"),
-                std::slice::from_ref(file),
+                (std::slice::from_ref(file), &BTreeMap::new()),
                 force,
                 Wording::Cli,
             )
@@ -7874,7 +7975,7 @@ mod tests {
             &Config::default(),
             &host(&[], None),
             &user_facts("nopasswd"),
-            &[file],
+            (&[file], &BTreeMap::new()),
             &Force::None,
             Wording::Tui,
         )
@@ -8029,7 +8130,7 @@ mod tests {
             &Config::default(),
             &host(&[], Some("WEB")),
             &user_facts("binary"),
-            std::slice::from_ref(&file),
+            (std::slice::from_ref(&file), &BTreeMap::new()),
             &Force::None,
             Wording::Cli,
         )
@@ -8126,7 +8227,7 @@ mod tests {
             &Config::default(),
             &host(&[], None),
             &user_facts("nopasswd"),
-            &files,
+            (&files, &BTreeMap::new()),
             &Force::All,
             Wording::Cli,
         )
@@ -8176,7 +8277,7 @@ mod tests {
                     &Config::default(),
                     &host(&[], secret),
                     &facts,
-                    &both,
+                    (&both, &BTreeMap::new()),
                     &Force::None,
                     Wording::Cli,
                 )
@@ -8717,7 +8818,7 @@ mod tests {
             &dir,
             vec![entry("bad.j2", "/etc/plain"), templated("ok.j2", "/etc/ok")],
         );
-        let Sources(loaded) = load(&config, || Ok(dir.clone())).unwrap();
+        let Sources(loaded, _) = load(&config, || Ok(dir.clone())).unwrap();
         assert_eq!(
             loaded[0].file().and_then(Source::text),
             Some("a\n{% if %}\n"),
@@ -9083,6 +9184,7 @@ mod tests {
             ),
         };
         let walk = Walk {
+            private: false,
             kind: "files",
             dirs: crate::remote::path_dirs(d, top)
                 .into_iter()
@@ -9122,6 +9224,7 @@ mod tests {
             let dest = b.join("conf");
             let nonce = WalkNonce::generate().unwrap();
             let walk = Walk {
+                private: false,
                 kind: "files",
                 dirs: Vec::new(),
                 owner: String::new(),
@@ -9213,6 +9316,7 @@ mod tests {
         let a = top.join("a");
         let nonce = WalkNonce::generate().unwrap();
         let walk = Walk {
+            private: false,
             kind: "files",
             dirs: Vec::new(),
             owner: String::new(),
@@ -9243,6 +9347,7 @@ mod tests {
         let a = top.join("a");
         let nonce = WalkNonce::generate().unwrap();
         let walk = Walk {
+            private: false,
             kind: "files",
             dirs: Vec::new(),
             owner: String::new(),

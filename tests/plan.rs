@@ -1405,3 +1405,118 @@ fn a_file_built_from_secrets_is_shown_unrendered_without_opening_the_store() {
         assert!(!text(&out.stderr).contains("missing-key.txt"));
     }
 }
+
+#[test]
+fn a_group_shows_its_desired_state_from_the_config_alone() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.write_config(
+        "config.toml",
+        "[[groups]]\nname = \"old\"\nstate = \"absent\"\nsudo = false\n\n\
+         [[groups]]\nname = \"app\"\ngid = 2000\nsystem = true\nsudo = false\nnotify = [\"h\"]\n\n\
+         [[groups]]\nname = \"web\"\ntags = [\"web\"]\n\n\
+         [[handlers]]\nname = \"h\"\nrun = \"true\"\n",
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert_eq!(
+        stdout,
+        "▶ local\n  would group app (gid 2000, system)\n    notifies h\n  \
+         would $ skipped group web: no match\n  would remove group old\n  \
+         would $ hostname\n  ✔ 4 steps\n\n1 target, nothing executed\n"
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    let steps = &json(&out)["targets"][0]["steps"];
+    assert_eq!(steps[0]["run"], "group app (gid 2000, system)");
+    assert_eq!(steps[2]["run"], "remove group old");
+}
+
+#[test]
+fn a_user_shows_its_desired_state_from_the_config_alone() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.write_config(
+        "config.toml",
+        "[[users]]\nname = \"deploy\"\nuid = 2000\ngroup = \"app\"\ngroups = [\"docker\"]\n\
+         shell = \"/bin/bash\"\nsudo = false\n\n\
+         [[users]]\nname = \"web\"\ntags = [\"web\"]\n\n\
+         [[groups]]\nname = \"app\"\nsudo = false\n",
+    );
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "▶ local\n  would group app\n  \
+         would user deploy (uid 2000, group app, groups docker, shell /bin/bash)\n  \
+         would $ skipped user web: no match\n  \
+         would $ hostname\n  ✔ 4 steps\n\n1 target, nothing executed\n"
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    let steps = &json(&out)["targets"][0]["steps"];
+    assert_eq!(
+        steps[1]["run"],
+        "user deploy (uid 2000, group app, groups docker, shell /bin/bash)"
+    );
+}
+
+#[test]
+fn a_user_to_remove_shows_from_the_config_alone() {
+    let sandbox = Sandbox::new("pl");
+    sandbox.write_config(
+        "config.toml",
+        "[[users]]\nname = \"olduser\"\nstate = \"absent\"\nsudo = false\n",
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"][0]["run"],
+        "remove user olduser"
+    );
+}
+
+#[test]
+fn each_account_step_shows_its_line_and_json_from_the_config() {
+    const KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB a@host";
+    let sandbox = Sandbox::new("pl");
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[groups]]\nname = \"app\"\ngid = 2000\nsudo = false\n\n\
+             [[groups]]\nname = \"old\"\nstate = \"absent\"\nsudo = false\n\n\
+             [[users]]\nname = \"deploy\"\nuid = 2000\ngroup = \"app\"\ngroups = [\"app\"]\n\
+             exclusive_groups = true\nshell = \"/bin/sh\"\nhome = \"/srv/deploy\"\n\
+             authorized_keys = [\"{KEY}\"]\nexclusive_keys = true\nsudo = false\n\n\
+             [[users]]\nname = \"ci\"\nsystem = true\ncreate_home = false\n\
+             authorized_keys = [\"{KEY}\"]\nsudo = false\n\n\
+             [[users]]\nname = \"olduser\"\nstate = \"absent\"\nsudo = false\n"
+        ),
+    );
+    let lines = [
+        "group app (gid 2000)",
+        "user deploy (uid 2000, group app, only groups app, shell /bin/sh, home /srv/deploy, \
+         authorized_keys 1, exclusive)",
+        "user ci (system, no home, authorized_keys 1)",
+        "remove user olduser",
+        "remove group old",
+    ];
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let would: String = lines
+        .iter()
+        .map(|line| format!("  would {line}\n"))
+        .collect();
+    assert_eq!(
+        text(&out.stdout),
+        format!("▶ local\n{would}  would $ hostname\n  ✔ 6 steps\n\n1 target, nothing executed\n")
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    let mut expected: Vec<_> = lines
+        .iter()
+        .map(|line| serde_json::json!({"run": line}))
+        .collect();
+    expected.push(serde_json::json!({"run": "hostname"}));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"],
+        serde_json::Value::from(expected)
+    );
+}

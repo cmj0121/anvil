@@ -51,7 +51,15 @@ timeout = 300              # seconds the package step may run, 1..=3600; default
 apt = "fd-find"
 dnf = "fd-find"
 
-[[dirs]]                   # optional; after packages, before [[files]]; see Dirs
+[[groups]]                 # optional; present before [[users]], absent after; see Groups
+name = "app"               # the local group to create, fix or remove
+gid = 2000                 # optional
+
+[[users]]                  # optional; after [[groups]], before [[dirs]]; see Users
+name = "deploy"            # the local user to create, fix or remove
+shell = "/bin/bash"        # optional; only the keys set are changed
+
+[[dirs]]                   # optional; after [[users]], before [[files]]; see Dirs
 path = "/etc/app/conf.d"   # the directory to create or fix
 mode = "0755"              # required, quoted
 
@@ -338,6 +346,14 @@ facts = { distro = "arch" } # optional; each value equals that fact
 sudo = true                # optional; default true. false writes as the connecting user
 notify = ["reload sshd"]   # optional; [[handlers]] to run when this step changes the file; see Handlers
 
+[[groups]]                 # optional; one local group created, fixed or removed per matching target; see Groups
+name = "app"               # required: [a-z_][a-z0-9_.-]*, at most 32 bytes
+gid = 2000                 # optional; also system, state, tags, facts, sudo, notify
+
+[[users]]                  # optional; one local user created, fixed or removed per matching target; see Users
+name = "deploy"            # required: [a-z_][a-z0-9_.-]*, at most 32 bytes
+group = "app"              # optional; also uid, groups, shell, home, authorized_keys, state and more
+
 [[dirs]]                   # optional; one directory created or fixed per matching target; see Dirs
 path = "/etc/app/conf.d"   # required: absolute path on the target, the dest rules
 mode = "0755"              # required: a quoted string of 3 or 4 octal digits
@@ -425,8 +441,9 @@ the guard commands after it do not run. A plugin step's message starts with `ski
 (`skipped plugin harden: /etc/x exists`). A skipped step does not fail the target, and the next step runs; its output
 is in [Guarded steps](cli.md#guarded-steps).
 
-Guards go on `[[steps]]` entries and on `run` and `plugin` [tasks](#tasks). `[[dirs]]`, `[[files]]`, `[[links]]`,
-`[[absent]]`, `[[services]]` and `[packages]` have no such keys and refuse them with the parser's `unknown field`
+Guards go on `[[steps]]` entries and on `run` and `plugin` [tasks](#tasks). `[[groups]]`, `[[users]]`, `[[dirs]]`,
+`[[files]]`, `[[links]]`, `[[absent]]`, `[[services]]` and `[packages]` have no such keys and refuse them with the
+parser's `unknown field`
 message; a guard on any other task is exit 2 too ([Tasks](#tasks)). Those kinds already converge, or have no single command to guard.
 
 `creates` and `removes` follow the [`dest` rules](#files): absolute, every character in `[A-Za-z0-9._/@+-]`, no `.` or
@@ -449,9 +466,10 @@ guards runs and prints exactly as before.
 skipped it notifies nothing. Each name must be a `[[handlers]]` entry's, else exit 2 with
 ``steps[0].notify[0] `reload ssh`: names no [[handlers]] entry``.
 
-The sections above run in a fixed order: packages, dirs, files, links, absent, services, steps, then the handlers.
-To choose the order, use [`[[tasks]]`](#tasks) instead of `[[dirs]]`, `[[files]]`, `[[links]]`, `[[absent]]`,
-`[[services]]`, `[[steps]]` and the lists in `[packages]`.
+The sections above run in a fixed order: packages, groups (`present`), users, groups (`absent`), dirs, files, links,
+absent, services, steps, then the handlers. To choose the order, use [`[[tasks]]`](#tasks) instead of `[[groups]]`,
+`[[users]]`, `[[dirs]]`, `[[files]]`, `[[links]]`, `[[absent]]`, `[[services]]`, `[[steps]]` and the lists in
+`[packages]`.
 
 Without `[secrets]` the backend is the keychain on macOS (and unsupported elsewhere). Only the selected backend's section
 is required and checked: a missing section, an unknown backend or `keychain` off macOS is a config error (exit 2). A
@@ -619,7 +637,8 @@ matches a target whose `pkg` fact is `brew pacman`; `pkg = "pacman brew"` and `p
 not report does not match. Probe values have their control characters removed and are cut at 256 bytes, so some values
 that could never be reported are refused: an empty one, one over 256 bytes, or one with an ASCII control byte. Exit 2:
 
-- `files[0].facts.x: unknown fact; must be one of hostname, os, kernel, arch, distro, distro_version, user, shell, pkg, sudo`
+- `files[0].facts.x: unknown fact; must be one of hostname, os, kernel, arch, distro, distro_version, user, shell, pkg,
+sudo, accounts, accounts_bin`
 - `files[0].facts.distro: is empty`
 - `files[0].facts.distro: 257 bytes exceeds the 256 byte limit`
 - `files[0].facts.distro: contains a control character`
@@ -641,6 +660,12 @@ The probe's values, as `anvil doctor` shows them:
   `/opt/homebrew/bin/brew`, `/usr/local/bin/brew` or `/home/linuxbrew/.linuxbrew/bin/brew` is executable (a non-login
   ssh shell may leave Homebrew off `PATH`), then whichever of `pacman`, `apt`, `dnf` and `apk` `command -v` finds.
 - `sudo` — `none` (no `sudo`), `nopasswd` (`sudo -n true` succeeds) or `binary` (sudo asks for a password).
+- `accounts` — the account tools for [Groups](#groups) and [Users](#users): `shadow` when `useradd`, `usermod`,
+  `userdel`, `groupadd`, `groupmod` and `groupdel` are all in one directory, else `busybox` when `adduser`, `deluser`,
+  `addgroup` and `delgroup` are, else `none`. The directory is the one `command -v` finds the first tool in, else
+  `/usr/sbin`, else `/sbin`, since a non-login ssh `PATH` may lack sbin.
+- `accounts_bin` — that directory (`/usr/sbin`, say), empty with `accounts = none`; the steps call the tools by that
+  absolute path.
 
 **`sudo`.** Defaults to true, and is omitted from the file anvil writes back when it is true. `false` writes as the
 connecting user: no `sudo`, no temp file, no terminal and no secret. Use it for a dest under that user's home. A login
@@ -1079,10 +1104,223 @@ tree, special files are refused, and a hard link is copied as a separate file. `
 so a binary file in a store tree must be put under `files/` another way. The TUI's plan view shows a tree's header line
 and item steps as [`anvil plan`](cli.md#anvil-plan) does.
 
+## Groups
+
+A `[[groups]]` entry brings one local group to `present` (created, or its gid fixed) or `absent` (removed) on each
+selected target whose tags and facts all match. Present groups run after the package step and before the users;
+absent groups run after the users, so a user and its primary group can both go in one run. Both come before
+`[[dirs]]` (a `group` [task](#tasks) runs where it stands instead). An entry that does not match is still a step,
+reported as `skipped group NAME: no match`, and the target's other steps still run ([Group and user
+steps](cli.md#group-and-user-steps)).
+
+```toml
+[[groups]]
+name = "app"                     # required: [a-z_][a-z0-9_.-]*, at most 32 bytes
+gid = 2000                       # optional: 1..=60000. Unset: a new group gets the next free gid, an existing one keeps its own
+system = true                    # optional; default false. true: a new group is a system group
+state = "present"                # optional: present | absent; default present
+tags = ["linode"]                # optional; also facts, sudo and notify as on [[files]]
+```
+
+The config is checked before any target starts, and the first failure is exit 2. At most 64 entries:
+`groups: 65 entries exceeds the 64 entry limit`. An unknown key is exit 2 with the parser's message. Then each entry:
+
+- ``groups[0].name `App`: must match [a-z_][a-z0-9_.-]*, at most 32 bytes``
+- ``groups[0].gid `0`: must be 1 to 60000``
+- ``groups[0].state `gone`: must be present or absent``
+- `groups[0].gid: not with state = "absent"` and `groups[0].system: not with state = "absent"`
+- ``groups[1].name `app`: same name as groups[0]``
+- `tags`, `facts` and `notify` with the [Files](#files) rules and messages, prefix `groups[I]`
+
+**What lands on the target.** The step reads the group with `getent group`, or from `/etc/group` with awk where there
+is no `getent` (busybox images), and changes only what differs:
+
+- Missing: it is created and the step prints `created group NAME`.
+- Present with another gid than `gid`: the gid is changed, `fixed group NAME: gid`. Without `gid` a group is never
+  renumbered.
+- Otherwise `unchanged group NAME`.
+- `state = "absent"`: a present group is removed, `removed group NAME`; a missing one is `unchanged group NAME`.
+
+These fail the step, before any change, with exit 1: `groups[0] app: gid 2000 is held by group web` (a create or fix
+whose gid another group has), `groups[0] old: cannot remove the primary group of user deploy`,
+`groups[0] app: busybox cannot change gid; install shadow` and `groups: cannot read group NAME`.
+
+**`notify`.** The handlers to run when the step prints `created`, `fixed` or `removed`; `unchanged` notifies nothing.
+
+## Users
+
+A `[[users]]` entry creates one local user, fixes the keys it sets on an existing one, or with `state = "absent"`
+removes it, on each selected target whose tags and facts all match. Users run after the present groups and before the
+absent ones, so a group created in the same run counts for `group` and `groups`; a `user` [task](#tasks) runs where
+it stands instead. An entry that does not match is still a step, reported as `skipped user NAME: no match`.
+
+```toml
+[[users]]
+name = "deploy"                  # required: [a-z_][a-z0-9_.-]*, at most 32 bytes
+uid = 2000                       # optional: 1..=60000
+group = "app"                    # optional: the primary group, a name or a gid 0..=60000
+groups = ["docker"]              # optional: supplementary group names; added to, never removed from
+exclusive_groups = false         # optional; default false. true: the user is in exactly groups
+shell = "/bin/bash"              # optional: absolute, no `:`, listed in the target's /etc/shells
+home = "/srv/deploy"             # optional: absolute, no `:`. Unset: a new user gets /home/NAME
+create_home = true               # optional; default true. false: a new user gets no home directory
+system = false                   # optional; default false. true: a new user is a system user
+comment = "Deploy user"          # optional: the GECOS field, no `:` or control characters
+authorized_keys = ["ssh-ed25519 AAAA… me@laptop", "$/keys/ci.pub"] # optional; see authorized_keys below
+exclusive_keys = false           # optional; default false. true: the file holds exactly these keys
+tags = ["linode"]                # optional; also facts, sudo and notify as on [[files]]
+
+[[users]]
+name = "olduser"
+state = "absent"                 # optional: present | absent; default present
+remove_home = true               # optional, absent only; default false. true: also remove its home (shadow: and mail spool)
+force = false                    # optional, absent only; default false. true: remove it while it runs processes
+```
+
+A key left unset is never compared or changed. There is no password key: anvil does not manage passwords, sudoers,
+LDAP or macOS accounts.
+
+The config is checked before any target starts, and the first failure is exit 2. At most 64 entries:
+`users: 65 entries exceeds the 64 entry limit`. An unknown key is exit 2 with the parser's message. Then each entry:
+
+- ``users[0].name `Deploy`: must match [a-z_][a-z0-9_.-]*, at most 32 bytes`` (and ``users[0].groups[1] `X`: …``)
+- ``users[0].uid `0`: must be 1 to 60000``
+- ``users[0].group `App`: must be a group name or a gid of 0 to 60000``
+- ``users[0].groups[1] `app`: same group as groups[0]``
+- `users[0].exclusive_groups: needs groups` and `users[0].exclusive_keys: needs authorized_keys`
+- ``users[0].shell `bash`: must be an absolute path without `:` `` (or `users[0].home`)
+- ``users[0].comment `a:b`: must not hold `:` or control characters``
+- ``users[0].state `gone`: must be present or absent``
+- `users[0].uid: not with state = "absent"`, for each of `uid`, `group`, `groups`, `exclusive_groups`, `shell`,
+  `home`, `create_home = false`, `system`, `comment`, `authorized_keys` and `exclusive_keys`; and
+  `users[0].remove_home: only with state = "absent"` (or `force`)
+- ``users[0].authorized_keys[0] `# old laptop`: is a comment, not a key``, below
+- ``users[1].name `deploy`: same name as users[0]``
+- `tags`, `facts` and `notify` with the [Files](#files) rules and messages, prefix `users[I]`
+
+**What lands on the target.** The step reads the user with `getent passwd` (awk over `/etc/passwd` without it) and
+`id -Gn`. Before any change it fails the step, exit 1, when `group` or a `groups` entry does not exist
+(`users[0] deploy: group app does not exist on this target`), the shell is not a line of `/etc/shells`
+(`users[0] deploy: shell /bin/zsh is not in /etc/shells`) or the uid is another user's
+(`users[0] deploy: uid 2000 is held by user web`). Then:
+
+- Missing: it is created with every key set, and the step prints `created user NAME`.
+- Present: each key set is compared, and what differs is fixed, `fixed user NAME: shell, groups`, naming only what
+  changed (`uid`, `group`, `shell`, `home`, `comment`, `groups`). Otherwise `unchanged user NAME`.
+- `groups` adds the user to each listed group it is not in; with `exclusive_groups = true` it also leaves every other
+  supplementary group (the primary group is not one). `groups = []` changes nothing, unless exclusive.
+- A changed `home` only sets the passwd field; nothing is moved, and the step warns on stderr:
+  `warning: users[0] deploy: home set to /srv/deploy; nothing is moved from /home/deploy`.
+- `state = "absent"`: a present user is removed (`userdel`, `-r` with `remove_home`), `removed user NAME`; one already
+  gone is `unchanged user NAME`.
+
+`users: cannot read user NAME` and `users: cannot read the groups of user NAME` fail the step too.
+
+**Shadow and busybox.** The `accounts` [fact](#files) picks the tools, called by absolute path from `accounts_bin`:
+`shadow` uses `useradd`, `usermod`, `userdel`, `groupadd`, `groupmod` and `groupdel`; `busybox` uses `adduser`,
+`deluser`, `addgroup` and `delgroup`. busybox creates users and groups and manages memberships (`addgroup USER GROUP`,
+`delgroup USER GROUP`), but cannot change an existing user's uid, group, shell, home or comment, nor a group's gid: the
+step fails before any change with `users[0] deploy: busybox cannot change shell; install shadow` (naming the key) or
+`groups[0] app: busybox cannot change gid; install shadow`.
+
+**No account tools.** A target with neither family (`accounts = none`, macOS included) fails each matching group or
+user step with `groups: no account tools on this target (accounts = none)` or
+`users: no account tools on this target (accounts = none)`; as with any failed step, the target ends there.
+
+**Who runs it.** Every change needs root: as on [`[[services]]`](#services), a root login runs the tools as they are,
+any other login through `sudo -n`, or with the target's sudo secret on the password path. `sudo = false` runs them as
+the connecting user, which only root can usefully do. Reads need no root.
+
+**Lockout guards.** Before any step on a target, so before any change there, these fail the whole target, exit 1:
+
+- removing `root`: `users[0] root: refused`;
+- removing the login user (the probe's `user` fact): `users[0] admin: is the login user`;
+- a login-user `shell` whose basename is `nologin` or `false`:
+  `users[0] admin: shell /sbin/nologin would lock out the login user`;
+- `exclusive_groups`, or a `group` that moves the login user's primary group, dropping it from `wheel`, `sudo` or
+  `admin` (matched by name or gid) while it is a member and the group is neither its new primary group nor in `groups`
+  (nor, without `exclusive_groups`, a supplementary group it keeps): `users[0] admin: would drop the login user from wheel`;
+- removing a user that owns running processes, unless `force = true`: `users[0] olduser: owns running processes`;
+- `exclusive_keys` on the login user that would drop its key: `users[0] admin: would drop the login key`
+  ([authorized_keys](#authorized_keys)).
+
+The first three come from the config and the probe alone, so `anvil plan` checks them too. The others need one
+read-only query on the target after the probe (`id`, `pgrep -u`, or the `Uid` lines of `/proc/*/status` without
+pgrep), which only apply runs. When the query cannot tell, the guard refuses instead of guessing:
+`users[0] olduser: cannot tell whether it owns running processes; set force = true to remove it anyway` (no pgrep and
+no readable `/proc`, or a non-root login with `/proc` mounted `hidepid`),
+`users[0] admin: cannot tell whether the login user is in wheel, sudo or admin` and
+`users[0] admin: cannot tell which keys the login user signs in with`. The guards see the target as it was before the
+run: a group or package that the same apply adds later does not count.
+
+**The account query.** One read-only sh script runs on the target after the probe and before its first step, only when a
+matching entry needs it: a guard above that reads state, or a present user with `authorized_keys` (to read its passwd
+home). Its failures fail the target before any change: `users: the account query exited N`,
+`users: the account query was killed by a signal`, `users: the account query output has no end marker`, and for a user
+with `authorized_keys` and no `home`, `users[0] deploy: cannot read the user` (the passwd lookup failed) or
+`users[0] deploy: has no home for authorized_keys` (its passwd home is not absolute).
+
+**uid 0.** Removing a user whose uid is 0 (a `root` alias such as `toor`) fails the step before any change, on shadow
+and busybox, with or without `remove_home` or `force`: `users[0] toor: has uid 0; refused`.
+
+**`remove_home`.** On shadow and busybox, with or without `force`, the step removes only a home the user owns, and never
+a home of `/`; otherwise it fails, nothing changed, and only the step, not the target:
+`users[0] olduser: home /srv/x is not owned by olduser; not removed` or `users[0] olduser: home / is not removed`.
+
+**`force`.** Skips the process guard and runs `userdel -f` on shadow (busybox `deluser`, which checks no processes,
+runs as without it). One more check holds on shadow, and fails only the step, not the target:
+`users[0] olduser: group olduser is the primary group of user web`.
+
+### authorized_keys
+
+`authorized_keys` on a present entry manages `HOME/.ssh/authorized_keys`, HOME being `home` when set, else the user's
+passwd home, else (a user this run creates) `/home/NAME`:
+
+```toml
+[[users]]
+name = "deploy"
+authorized_keys = [
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA… me@laptop",   # a key line as written
+  "$/keys/ci.pub",                                     # or a store file holding one key line
+]
+exclusive_keys = true                                  # default false: add the keys, keep the others
+```
+
+Each item is one OpenSSH public key line (options and comment allowed; certificates are not), or a `$/` store path
+read as a `[[files]]` store src is, holding one such line with a final newline allowed. A line that is not is exit 2,
+the key shown cut at 40 characters: `must be one line`, `is a comment, not a key`, `is not an OpenSSH public key line`,
+`has no base64 key after its type`, `has a key that is not ssh-ed25519`
+(``users[0].authorized_keys[0] `# old laptop`: is a comment, not a key``; a longer value ends in `...`).
+
+By default the listed keys are added at the end of the file, each only when no line already holds that key (the type
+and base64 blob decide, not the options or comment), and every other line is kept. With `exclusive_keys = true` the file
+holds exactly the listed keys, one per line.
+
+The keys are written in a file step right after the user's own, `$ file HOME/.ssh/authorized_keys`, which prints
+`wrote DEST` or `unchanged DEST` and notifies as the user step does. It goes through the [`[[files]]`](#files) write,
+mode 0600, into a `.ssh` that is created 0700 when missing (an existing one keeps its mode, checked writable by no one
+else), but run as that user: directly when it is the login user,
+`su -s /bin/sh NAME` from a root login, else `sudo -n -u NAME /bin/sh`. So every directory on the way must be owned by
+root or that user and writable by no one else, and a link the user planted cannot turn it into a root write. A missing
+home fails the step with `users[0] deploy: home /home/deploy does not exist`; a file anvil cannot read or that is not
+text fails it before any change. Writing another user's keys needs `sudo = true` and a sudo that asks no password:
+otherwise the target fails with `users[0] deploy: authorized_keys of another user needs sudo` or
+`users[0] deploy: authorized_keys of another user needs sudo without a password`.
+
+`exclusive_keys` on the login user must keep one of the keys its file holds now, or, when the file is missing or empty,
+list at least one key (anvil cannot tell which key this session used); else the target fails before any change with
+`users[0] admin: would drop the login key`. A file the query cannot read or parse fails it the same way, with
+`users[0] admin: cannot tell which keys the login user signs in with`.
+
+**Rollback.** Users and groups are not undone: [`anvil rollback`](cli.md#anvil-rollback) lists each step that ran as
+`cannot undo: user NAME` or `cannot undo: group NAME`. The authorized_keys file is recorded as a file write, with its
+previous text and its user, and rollback writes it back as that user; a `.ssh` it created is removed while empty.
+
 ## Dirs
 
 A `[[dirs]]` entry creates one directory, or fixes its owner, group and mode, on each selected target whose tags and
-facts all match. Matching entries run in config order, after the package step and before `[[files]]`, so a directory is
+facts all match. Matching entries run in config order, after the package, group and user steps and before `[[files]]`,
+so a directory is
 there before the file that goes in it (a `dir` [task](#tasks) runs where it stands instead). An entry that does not
 match is still a step, reported as `skipped dir PATH: no match`, and the target's other steps still run ([Dir
 steps](cli.md#dir-steps)).
@@ -1360,7 +1598,7 @@ matches nothing, so every target shows `skipped service NAME: no match`. Exit 2:
 
 - ``services[0].tags[1] `bad tag`: must match [A-Za-z0-9_-]+``
 - `services[0].facts.x: unknown fact; must be one of hostname, os, kernel, arch, distro, distro_version, user, shell,
-pkg, sudo`
+pkg, sudo, accounts, accounts_bin`
 - `services[0].facts.distro: is empty`, `services[0].facts.distro: 257 bytes exceeds the 256 byte limit` and
   `services[0].facts.distro: contains a control character`
 
@@ -1422,7 +1660,8 @@ What each init runs, and the messages of a service it cannot find, are in [Servi
 ## Tasks
 
 A `[[tasks]]` list runs top to bottom on each target, in the order you write. It replaces the legacy sections' fixed
-order (packages, dirs, files, links, absent, services, steps) when a setup needs another one: a step between two files, a
+order (packages, groups, users, dirs, files, links, absent, services, steps) when a setup needs another one: a step
+between two files, a
 migration between a file and the service that reads it. Tasks can nest, and can include task files from the [file
 store](cli.md#anvil-files). A config without `[[tasks]]` behaves exactly as before.
 
@@ -1468,7 +1707,7 @@ facts = { os = "Linux" }           # ANDed with the parent's tags
 
 **Kinds.** A task has exactly one of these, and may also set `name`, `tags` and `facts`. An unknown key is exit 2 with
 the parser's message. Two kinds are exit 2 with `tasks[0]: has run and include; keep one`, none with
-`tasks[0]: needs one of run, plugin, packages, file, service, dir, link, absent, include, tasks`.
+`tasks[0]: needs one of run, plugin, packages, file, service, group, user, dir, link, absent, include, tasks`.
 
 | Kind       | What it does                                                                               |
 | ---------- | ------------------------------------------------------------------------------------------ |
@@ -1477,32 +1716,39 @@ the parser's message. Two kinds are exit 2 with `tasks[0]: has run and include; 
 | `packages` | only `install`, `pin`, `remove` and `upgrade`, as in `[packages]`                          |
 | `file`     | the keys of [`[[files]]`](#files) but `tags`, `facts` and `notify`, which go on the task   |
 | `service`  | `name`, `state` and `enabled`, as in [`[[services]]`](#services)                           |
+| `group`    | the keys of [`[[groups]]`](#groups) but `tags`, `facts` and `notify`, which go on the task |
+| `user`     | the keys of [`[[users]]`](#users) but `tags`, `facts` and `notify`, which go on the task   |
 | `dir`      | the keys of [`[[dirs]]`](#dirs) but `tags`, `facts` and `notify`, which go on the task     |
 | `link`     | the keys of [`[[links]]`](#links) but `tags`, `facts` and `notify`, which go on the task   |
 | `absent`   | the keys of [`[[absent]]`](#absent) but `tags`, `facts` and `notify`, which go on the task |
 | `include`  | a `$/…` task file, expanded in place                                                       |
 | `tasks`    | child tasks, written as `[[tasks.tasks]]` or an inline array                               |
 
-`tags` and `facts` go on the task, not inside `file`, `service`, `dir`, `link` or `absent`: that is exit 2 with
-`tasks[0].file: tags and facts belong on the task, not the file` (`… not the dir`, `… not the link`,
-`… not the absent entry`). A task whose
+`tags` and `facts` go on the task, not inside `file`, `service`, `group`, `user`, `dir`, `link` or `absent`: that is
+exit 2 with `tasks[0].file: tags and facts belong on the task, not the file` (`… not the group`, `… not the user`,
+`… not the dir`, `… not the link`, `… not the absent entry`). A task whose
 selector does not match is still a step, reported as skipped (`skipped run: no match`, `skipped packages: no match`),
 and the target's other steps still run. A failed task ends that target; the other targets go on. A `packages` task that
-asks for nothing, an empty `tasks` and an include with no tasks add no step. Every file, dir, link, absent and service task is
+asks for nothing, an empty `tasks` and an include with no tasks add no step. Every file, dir, link, absent, service,
+group and user task is
 its own step, and repeats are allowed: the [`[[services]]` duplicate rule](#services) does not apply, because stop,
 migrate, start is how a migration is written. A config with `[[tasks]]` has no default `hostname` step.
 
 **Guards.** A `run` or `plugin` task may also set the [guards](#config) `creates`, `removes`, `onlyif` and `unless`,
-with the same rules as on `[[steps]]`. On a `packages`, `file`, `service`, `dir`, `link`, `absent`, `include` or `tasks` task a
+with the same rules as on `[[steps]]`. On a `packages`, `file`, `service`, `group`, `user`, `dir`, `link`, `absent`,
+`include` or `tasks` task a
 guard is exit 2 naming the first one set, in that order, at any depth: `tasks[0].creates: only on a run or plugin task`,
 `tasks[0].tasks[0].onlyif: only on a run or plugin task`.
 
-**`notify`.** A `run`, `plugin`, `file`, `service`, `dir`, `link` or `absent` task may set [`notify`](#handlers), on the
-task, not inside `file`, `service`, `dir`, `link` or `absent`. Exit 2:
+**`notify`.** A `run`, `plugin`, `file`, `service`, `group`, `user`, `dir`, `link` or `absent` task may set
+[`notify`](#handlers), on the
+task, not inside `file`, `service`, `group`, `user`, `dir`, `link` or `absent`. Exit 2:
 `tasks[0].notify: not on a packages task; packages give no change signal`,
-`tasks[0].notify: only on a run, plugin, file, service, dir, link or absent task` (an `include` or `tasks` group),
-`tasks[0].file: notify belongs on the task, not the file`,
-`tasks[0].service: notify belongs on the task, not the service`, `tasks[0].dir: notify belongs on the task, not the dir`,
+`tasks[0].notify: only on a run, plugin, file, service, group, user, dir, link or absent task` (an `include` or `tasks`
+group), `tasks[0].file: notify belongs on the task, not the file`,
+`tasks[0].service: notify belongs on the task, not the service`,
+`tasks[0].group: notify belongs on the task, not the group`, `tasks[0].user: notify belongs on the task, not the user`,
+`tasks[0].dir: notify belongs on the task, not the dir`,
 `tasks[0].link: notify belongs on the task, not the link` and
 `tasks[0].absent: notify belongs on the task, not the absent entry`. `[[handlers]]` stays in the main file: an include
 with it is exit 2 with the parser's message.
@@ -1540,12 +1786,15 @@ Including one file from two places, with no cycle, is allowed.
 | 256 tasks                                     | `PATH: more than 256 tasks after expansion`           |
 | 64 file tasks                                 | `PATH: more than 64 file tasks after expansion`       |
 | 64 service tasks                              | `PATH: more than 64 service tasks after expansion`    |
+| 64 group tasks                                | `PATH: more than 64 group tasks after expansion`      |
+| 64 user tasks                                 | `PATH: more than 64 user tasks after expansion`       |
 | 64 dir tasks                                  | `PATH: more than 64 dir tasks after expansion`        |
 | 64 link tasks                                 | `PATH: more than 64 link tasks after expansion`       |
 | 64 absent tasks                               | `PATH: more than 64 absent tasks after expansion`     |
 | 4096 tasks visited, groups and includes too   | `PATH: more than 4096 tasks visited during expansion` |
 
-**Mixing.** `[[tasks]]` with `[[dirs]]`, `[[files]]`, `[[links]]`, `[[absent]]`, `[[services]]`, `[[steps]]`, or `[packages]`
+**Mixing.** `[[tasks]]` with `[[groups]]`, `[[users]]`, `[[dirs]]`, `[[files]]`, `[[links]]`, `[[absent]]`,
+`[[services]]`, `[[steps]]`, or `[packages]`
 `install`, `pin`, `remove` or `upgrade` is exit 2 with `[[tasks]] cannot be mixed with [[steps]]; move it into a task`.
 There is no automatic migration. `[packages.alias]` and the other `[packages]` settings (`manager`, `local`,
 `local_sudo_secret`, `timeout`) stay global and work with `[[tasks]]`, as do `[[handlers]]`, `[plugins]`, `[secrets]`,
@@ -1615,11 +1864,11 @@ only, never in an [include](#tasks), and work with the legacy sections and with 
 - `tags`, `facts`, `notify`, a guard, `plugin` or any other key on the handler itself: the parser's `unknown field`
   message. A handler runs only where it was notified, and handlers do not notify handlers.
 
-**`notify`.** A list of handler names, on `[[dirs]]`, `[[files]]`, `[[links]]`, `[[absent]]`, `[[services]]` and
-`[[steps]]` entries and on `run`, `plugin`, `file`, `service`, `dir`, `link` and `absent` [tasks](#tasks). A name
-listed twice counts once. A name no handler has is exit 2, naming the entry:
-``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry`` (or `dirs[I]`, `files[I]`, `links[I]`, `absent[I]`,
-`services[I]`, `tasks[I]`).
+**`notify`.** A list of handler names, on `[[groups]]`, `[[users]]`, `[[dirs]]`, `[[files]]`, `[[links]]`,
+`[[absent]]`, `[[services]]` and `[[steps]]` entries and on `run`, `plugin`, `file`, `service`, `group`, `user`, `dir`,
+`link` and `absent` [tasks](#tasks). A name listed twice counts once. A name no handler has is exit 2, naming the entry:
+``steps[1].notify[0] `reload ssh`: names no [[handlers]] entry`` (or `groups[I]`, `users[I]`, `dirs[I]`, `files[I]`,
+`links[I]`, `absent[I]`, `services[I]`, `tasks[I]`).
 
 **When a step notifies.** Only a step that ran on the target, exited 0 and changed something:
 
@@ -1630,6 +1879,8 @@ listed twice counts once. A name no handler has is exit 2, naming the entry:
 | link          | prints `linked …` or `relinked …`      | prints `unchanged PATH`          |
 | absent        | prints `removed PATH`                  | prints `unchanged PATH`          |
 | service       | prints any change line                 | prints `unchanged service NAME`  |
+| group         | prints `created`, `fixed` or `removed` | prints `unchanged group NAME`    |
+| user          | prints `created`, `fixed` or `removed` | prints `unchanged user NAME`     |
 | run or plugin | runs and exits 0                       | is skipped by a [guard](#config) |
 | any           |                                        | is skipped as no match, or fails |
 

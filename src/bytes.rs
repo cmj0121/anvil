@@ -29,6 +29,39 @@ pub fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// The bytes of `text` in standard padded base64, the inverse of
+/// [`base64`]; `None` when it is not.
+pub fn unbase64(text: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for (k, chunk) in bytes.chunks(4).enumerate() {
+        let last = k == bytes.len() / 4 - 1;
+        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut n = 0u32;
+        for &c in &chunk[..4 - pad] {
+            n = (n << 6) | u32::from(value(c)?);
+        }
+        n <<= 6 * pad as u32;
+        let decoded = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        out.extend_from_slice(&decoded[..3 - pad]);
+    }
+    Some(out)
+}
+
 /// Fills `buf` from `/dev/urandom` in place, so a `Zeroizing` buffer leaves
 /// no copy; there is no weaker fallback.
 pub fn fill_random(buf: &mut [u8]) -> io::Result<()> {
@@ -83,6 +116,16 @@ mod tests {
     fn hex_is_lowercase_and_two_digits_a_byte() {
         assert_eq!(hex(&[0x00, 0x0a, 0xff, 0x5c]), "000aff5c");
         assert_eq!(hex(&[]), "");
+    }
+
+    #[test]
+    fn unbase64_inverts_base64_and_refuses_the_rest() {
+        for bytes in [&b"a"[..], b"ab", b"abc", b"abcd", &[0xff, 0x00, 0xfb]] {
+            assert_eq!(unbase64(&base64(bytes)).as_deref(), Some(bytes));
+        }
+        for text in ["", "YQ", "Y===", "YQ==YQ==", "YQ=!", "Y Q="] {
+            assert_eq!(unbase64(text), None, "{text}");
+        }
     }
 
     #[test]

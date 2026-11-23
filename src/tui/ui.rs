@@ -2718,12 +2718,14 @@ mod tests {
                     upload: None,
                     skip: false,
                     write: Some(FileWrite {
+                        keys: None,
                         ordinal: 0,
                         dest: "/etc/a".to_owned(),
                         mode: "0644".to_owned(),
                         sudo: String::new(),
                         checks: String::new(),
                         walk: Box::new(Walk {
+                            private: false,
                             kind: "files",
                             dirs: Vec::new(),
                             owner: String::new(),

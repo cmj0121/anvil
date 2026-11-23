@@ -165,11 +165,13 @@ run = "hostname"
 
 `[anvil]` is always shown in full, `workspace` included (the resolved default when unset). Every section the config
 already has gets its defaulted keys: `[packages]` `manager`, `install`, `remove`, `pin`, `upgrade` and `timeout`,
-`[secrets.keychain]` `service`, each `[[files]]` entry's `sudo` and `rollback`, each `[[dirs]]`, `[[links]]` and `[[absent]]`
-entry's `sudo`, each `[plugins.NAME]`'s `on`. `[harden]` is always shown, as `skip = []` when unset
+`[secrets.keychain]` `service`, each `[[files]]` entry's `sudo` and `rollback`, each `[[groups]]`, `[[dirs]]`, `[[links]]`
+and `[[absent]]` entry's `sudo`, each `[[users]]` entry's `sudo` and `create_home`, each `[plugins.NAME]`'s `on`.
+`[harden]` is always shown, as `skip = []` when unset
 ([`--harden`](#anvil-config---harden)). Each optional section the config does not use is appended as a commented example
-(`# [secrets]`, `# [packages]`, `# [[files]]`, `# [[dirs]]`, `# [[links]]`, `# [[absent]]`, `# [[services]]`,
-`# [[handlers]]` and `# [plugins.NAME]`; never the five entry sections on a `[[tasks]]` config, which cannot have them),
+(`# [secrets]`, `# [packages]`, `# [[files]]`, `# [[groups]]`, `# [[users]]`, `# [[dirs]]`, `# [[links]]`,
+`# [[absent]]`, `# [[services]]`, `# [[handlers]]` and `# [plugins.NAME]`; never the seven entry sections on a
+`[[tasks]]` config, which cannot have them),
 in the edit format, so `--format yaml --full` comments them as YAML. When `editor` is unset, its commented example
 appears inside `[anvil]`. Uncomment an example to use it.
 
@@ -197,7 +199,8 @@ anvil config --harden --write      # write the suggestions, then: anvil plan
 
 It reads the config, the inventory and the srcs of the `[[files]]` entries it checks (on a tasks config, its includes and
 the file tasks' srcs), and nothing else: it never
-contacts a target and runs offline. The rules, what each one writes and `[harden] skip` are in
+contacts a target and runs offline. It never adds or changes a `[[groups]]` or `[[users]]` entry, or a group or user
+task. The rules, what each one writes and `[harden] skip` are in
 [Harden](configuration.md#harden). `--strict` and `--write` require `--harden`; `--harden` with `--full` or
 `--format` is exit 2. `--target` and `--parallel` are ignored with a warning, as for `config`.
 
@@ -429,7 +432,9 @@ Local checks, then every selected target's facts:
 - each target: the facts probe (a POSIX sh script) runs over the target's transport. `connectable: true` with the facts,
   or `connectable: false` with the error. Facts: `hostname`, `os`, `kernel`, `arch`, `distro`, `distro_version`, `user`,
   `shell`, `pkg` (present managers among brew, pacman, apt, dnf, apk), `sudo` (`none`, `binary` = needs a password,
-  `nopasswd`). brew counts when `command -v brew` finds it or `/opt/homebrew/bin/brew`, `/usr/local/bin/brew` or
+  `nopasswd`), `accounts` (`shadow`, `busybox` or `none`: the tools [`[[groups]]`](configuration.md#groups) and
+  [`[[users]]`](configuration.md#users) use) and `accounts_bin` (the directory that holds them, empty with `none`). brew
+  counts when `command -v brew` finds it or `/opt/homebrew/bin/brew`, `/usr/local/bin/brew` or
   `/home/linuxbrew/.linuxbrew/bin/brew` is executable, since a non-login ssh shell may leave Homebrew off `PATH`.
 - `manager`, only when the config has a `[packages]` section: each connectable target's package manager as
   [Packages](packages.md) resolves it, as a row `manager         pacman` after the facts, or `manager         error: REASON`
@@ -690,8 +695,9 @@ wrapper on the target ([SSH behaviour](#ssh-behaviour); `/bin/sh -s` for `local`
 that target; the other targets still run. Exit 0 when every step on every target exited 0, else 1. apply runs directly:
 it prints no plan and asks for no confirmation; run [`anvil plan`](#anvil-plan) first to see what it would run.
 
-The rest of this section describes the legacy sections, whose order is fixed: packages, dirs, files, links, absent,
-services, steps, then the handlers. A `[[tasks]]` config runs in the order you write ([Tasks in a run](#tasks-in-a-run)).
+The rest of this section describes the legacy sections, whose order is fixed: packages, groups (`present`), users,
+groups (`absent`), dirs, files, links, absent, services, steps, then the handlers. A `[[tasks]]` config runs in the
+order you write ([Tasks in a run](#tasks-in-a-run)).
 
 With `[packages]` that has work to do (a non-empty `install`, `pin` or `remove`, or `upgrade = true`), each target first
 runs the facts probe over the same transport, resolves its package manager and runs the generated script as step 1,
@@ -703,10 +709,15 @@ steps (see [Packages](packages.md)). When the target's sudo asks for a password 
 on a terminal and anvil types the password at sudo's prompt ([Typing the sudo
 password](packages.md#typing-the-sudo-password)); its `$` line is still the one-line script. Without `[packages]`, or
 with nothing to install, upgrade, pin or remove, no probe runs and apply runs only the `[[steps]]`, unless a step names
-a plugin ([Plugin steps](#plugin-steps)) or the config has `[[dirs]]`, `[[files]]`, `[[links]]`, `[[absent]]` or
-`[[services]]`.
+a plugin ([Plugin steps](#plugin-steps)) or the config has `[[groups]]`, `[[users]]`, `[[dirs]]`, `[[files]]`,
+`[[links]]`, `[[absent]]` or `[[services]]`.
 
-In a legacy config, each `[[dirs]]` entry is one step on every target, after the package step and before the file steps:
+In a legacy config, each `[[groups]]` and `[[users]]` entry is one step on every target, after the package step: the
+present groups, then the users, then the absent groups. Each creates, fixes or removes the account when the target's
+tags and facts match and shows as skipped when they do not; a user's `authorized_keys` is a file step right after it
+([Group and user steps](#group-and-user-steps)).
+
+In a legacy config, each `[[dirs]]` entry is one step on every target, after the group and user steps and before the file steps:
 it creates or fixes the directory when the target's tags and facts match and shows as skipped when they do not ([Dir
 steps](#dir-steps)).
 
@@ -872,7 +883,8 @@ first reason counts: a SIGTERM after a failed save leaves `save_failed`.
 #### Tasks in a run
 
 A [`[[tasks]]`](configuration.md#tasks) config runs in the order written, not the fixed order above: a `packages`,
-`file`, `dir`, `link`, `absent`, `service`, `run` or `plugin` task behaves as that kind of step does, wherever it stands. `plan`
+`file`, `dir`, `link`, `absent`, `service`, `group`, `user`, `run` or `plugin` task behaves as that kind of step does,
+wherever it stands. `plan`
 and `apply` run the same order. With this config, `anvil plan` on `local` prints:
 
 ```toml
@@ -928,11 +940,12 @@ include = "$/roles/web.toml"   # Validate config, then Start nginx with tags = [
 
 - **Failure.** `✘ step N exited C` counts the target's steps in run order, skipped ones included, so `N` is the place in
   the expanded list. A failure stops that target's remaining tasks.
-- **Probe.** apply probes a target when the list has a `packages`, `file`, `dir`, `link`, `absent`, `service` or
-  `plugin` task, or
+- **Probe.** apply probes a target when the list has a `packages`, `file`, `dir`, `link`, `absent`, `service`, `group`,
+  `user` or `plugin` task, or
   a task with `facts`, or the config has a doctor plugin. The probe runs once, before the first task ([One
   probe](configuration.md#tasks)). A sudo password any task needs is read before the run starts.
-- **Rollback.** `cannot undo` names a `run`, `plugin`, `packages` or `service` task by its path, on `--dry-run` as well:
+- **Rollback.** `cannot undo` names a `run`, `plugin`, `packages`, `service`, `group` or `user` task by its path, on
+  `--dry-run` as well:
 
 ```text
 ▶ local
@@ -1333,9 +1346,10 @@ overwritten and the record holds what was read.
 
 Shows the steps `anvil apply` would run on every selected target, and runs none of them. Each target is probed over its
 transport, even without `[packages]` work, so a target that cannot be reached fails here as it would under apply. Its
-steps then come from the same resolver apply uses: the package step when `[packages]` has work, then each `[[dirs]]`,
-`[[files]]`, `[[links]]`, `[[absent]]`, `[[services]]` and `[[steps]]` entry, in that order. No package command, no
-file write, no directory or link change, no removal, no service command and no `[[steps]]` script runs. A target that
+steps then come from the same resolver apply uses: the package step when `[packages]` has work, then each present
+`[[groups]]`, `[[users]]`, absent `[[groups]]`, `[[dirs]]`, `[[files]]`, `[[links]]`, `[[absent]]`, `[[services]]` and
+`[[steps]]` entry, in that order. No package command, no account change, no file write, no directory or link change, no
+removal, no service command and no `[[steps]]` script runs. A target that
 cannot be reached, probed or resolved fails with the same reason apply gives (`packages: REASON` for the probe, the
 manager and a `pin` on brew, apt or apk, such as `packages: pin is not one-shot on brew: vim`; without `[packages]` work
 a failed probe reads `probe: REASON`), and the other targets are still planned. plan runs each plugin step's plugin on
@@ -1978,6 +1992,95 @@ ERROR anvil: files[0].src `conf`: sub/link: is a symlink; a recursive copy refus
 The refusals, the matching rules and what lands on the target (owner and group, symlinks, missing parent directories) are in
 [Files](configuration.md#files).
 
+### Group and user steps
+
+A `[[groups]]` or `[[users]]` entry brings one local group or user to its state on each selected target whose tags and
+facts match ([Groups](configuration.md#groups), [Users](configuration.md#users)):
+
+```toml
+[[groups]]
+name = "app"
+gid = 2000
+
+[[users]]
+name = "deploy"
+group = "app"
+shell = "/bin/bash"
+authorized_keys = ["$/keys/deploy.pub"]
+
+[[users]]
+name = "olduser"
+state = "absent"
+```
+
+Every entry is one step on every target, in config order: the present groups after the package step, then the users,
+then the absent groups, all before the dir steps; a `group` or `user` task is the same step where it stands. A step
+shows as `$` and its label, from the config alone: `group NAME`, with `(gid N, system)` for those set, or
+`remove group NAME`; `user NAME`, with `(uid N, group G, groups A B, shell PATH, home PATH, system, no home,
+authorized_keys N)` for those set (`only groups A B` under `exclusive_groups`, `no groups` for an empty exclusive list,
+`authorized_keys N, exclusive` under `exclusive_keys`), or `remove user NAME`. It prints one line:
+`created group NAME`, `fixed group NAME: gid`, `removed group NAME` or `unchanged group NAME`; `created user NAME`,
+`fixed user NAME: shell, groups` (naming what changed), `removed user NAME` or `unchanged user NAME`. On a target that
+does not match it is `$ skipped group NAME: no match` (or `user`), runs nothing and counts in `✔ ok · N steps`. With
+`-vv`:
+
+```text
+▶ linode1
+  $ group app (gid 2000)
+  created group app
+  $ user deploy (group app, shell /bin/bash, authorized_keys 1)
+  created user deploy
+  $ file /home/deploy/.ssh/authorized_keys
+  wrote /home/deploy/.ssh/authorized_keys
+  $ remove user olduser
+  unchanged user olduser
+  $ hostname
+  linode1
+  ✔ ok · 5 steps
+```
+
+The step's stdout holds only that line; what `useradd` and the other tools print goes to stderr. A changed `home`
+warns there too. A user with `authorized_keys` adds a file step right after its own, `$ file HOME/.ssh/authorized_keys`,
+which prints `wrote DEST` or `unchanged DEST` as any [file step](#file-steps) does. A created, fixed or removed account
+counts as changed and notifies the entry's handlers; so does a written key file.
+
+The failures, each ending the target like any failed step, are in [Groups](configuration.md#groups) and
+[Users](configuration.md#users): a missing group or shell, a held uid or gid, busybox refusing a change, and
+`groups: no account tools on this target (accounts = none)` (or `users:`). The [lockout
+guards](configuration.md#users) fail the target before its first step instead: those from the config right after the
+probe, the others after one read-only account query that runs only when a matching entry needs it (a guard that
+reads state, or a present user with `authorized_keys`); a query that fails fails the target too
+([The account query](configuration.md#users)).
+
+In `--json` the `run` is the label, and the step has the usual fields:
+
+```json
+{ "run": "group app (gid 2000)", "code": 0, "stdout": "created group app\n", "stderr": "", "changed": true }
+{ "run": "user deploy (shell /bin/bash)", "code": 0, "stdout": "fixed user deploy: shell\n", "stderr": "", "changed": true }
+{ "run": "skipped user web: no match", "code": 0, "stdout": "", "stderr": "", "skipped": true, "changed": false }
+```
+
+`anvil plan` shows `would group app (gid 2000)`,
+`would user deploy (uid 2000, group app, groups docker, shell /bin/bash)`, `would remove user olduser` and
+`would remove group old`, with `(sudo password from secret NAME)` when
+apply would take the password path, and `would $ skipped group NAME: no match` (or `user`). The line is the config's
+desired state: plan reads no account on the target, so it does not tell a create from a fix or a no-op, and it shows
+no authorized_keys file step, only the `authorized_keys N` in the user line. It checks the lockout guards that need no
+query (removing root or the login user, a `nologin` shell on it) and fails the target as apply would. In
+`plan --json` the `run` is the same label, with `sudo_secret` and `notify` when set:
+
+```json
+{ "run": "user deploy (uid 2000, group app, only groups app, authorized_keys 1, exclusive)" }
+{ "run": "remove user olduser" }
+```
+
+`-vv` logs `TARGET: users[I] NAME with Shadow in /usr/sbin` (`Busybox`), `TARGET: users[I] NAME: no match` and
+`TARGET: users[I] NAME: no account tools`, and the same for `groups[I]`.
+
+**Rollback.** Accounts are not recorded: [`anvil rollback`](#anvil-rollback) lists each group or user step that ran as
+`cannot undo: group NAME` or `cannot undo: user NAME`. The authorized_keys file is recorded like a file write, with its
+user, and restored.
+
 ### Dir steps
 
 A `[[dirs]]` entry, or a `dir` [task](#tasks-in-a-run), creates one directory or fixes its owner, group and mode on each
@@ -2439,9 +2542,25 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   there are none. The exit stays 0, so a repeat rollback stays idempotent. The notes below, which name no file, leave
   the summary clean.
 - **What cannot be undone.** After the files, the steps of the apply that ran but cannot be undone show as skipped
-  steps: `cannot undo: packages`, `cannot undo: service NAME` and `cannot undo: step N` (the Nth `[[steps]]` entry), or
+  steps: `cannot undo: packages`, `cannot undo: group NAME`, `cannot undo: user NAME`, `cannot undo: service NAME` and
+  `cannot undo: step N` (the Nth `[[steps]]` entry), or
   on a tasks config `cannot undo: PATH` ([Tasks in a run](#tasks-in-a-run)), and `cannot undo: handler NAME` for a
-  handler that ran. Rollback never runs a package manager, a service command, a step or a handler.
+  handler that ran. Rollback never runs a package manager, an account tool, a service command, a step or a handler: a
+  group or user apply created, fixed or removed stays as it is.
+- **authorized_keys.** A user's `authorized_keys` file is recorded as a file write that also names its user, and is
+  restored (or removed, when apply created it) as that user, as apply wrote it, with the entry's `sudo`; a `.ssh`
+  apply created for it is removed while empty. The record is checked first: the user must be a present `[[users]]`
+  entry with `authorized_keys` that applies to the target, the dest its `HOME/.ssh/authorized_keys` (HOME from `home`,
+  else read from the target's passwd), and the previous text only key, comment or blank lines. Otherwise the target
+  fails and nothing runs, with
+  `rollback: DEST is not the authorized_keys of user NAME in [[files]]; refusing to restore it`,
+  `rollback: DEST is not the authorized_keys of user NAME; refusing to restore it` (no such entry applies once the
+  target is probed),
+  `rollback: DEST is the authorized_keys of user NAME but has sudo = true in the record; refusing to restore it` (a
+  keys record is never restored with sudo inside its user's wrap),
+  `rollback: DEST is not in the home of user NAME; refusing to restore it`,
+  `rollback: cannot read the homes of the users` or
+  `rollback: DEST has a previous text with a line that is not a key; refusing to restore it`.
 - **Handlers queued.** For each file, directory, link or removed path it put back, rollback adds the `notify` names of
   the entries for that path that apply to the target, matched with the facts the record saved, not the probe's, to the
   target's `pending_handlers`, in `[[handlers]]` order and once each, so the next apply runs them. Each one queued is a

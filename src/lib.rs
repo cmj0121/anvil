@@ -4,6 +4,7 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod absent;
+mod accounts;
 pub mod apply;
 mod bytes;
 pub mod cancel;
@@ -21,6 +22,7 @@ pub mod facts;
 pub mod fanout;
 pub mod files;
 pub mod filestore;
+pub mod groups;
 mod guard;
 pub mod harden;
 mod interrupt;
@@ -54,3 +56,4 @@ pub mod transport;
 pub mod tree;
 mod trust;
 pub mod update;
+pub mod users;

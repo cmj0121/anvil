@@ -31,7 +31,7 @@ use crate::config::{Config, LinkEntry};
 use crate::facts::Facts;
 use crate::files::{
     self, CONFLICT, Force, Wording, capture_script, hash_fn, parse_capture, previous_of,
-    remove_dirs, sudo_secret_for,
+    remove_dirs, sudo_for,
 };
 use crate::inventory::Target;
 use crate::record::{LinkPrevious, LinkRecord, Previous, PreviousFile, Write};
@@ -393,13 +393,7 @@ pub fn run(
         ));
     }
     let root = facts.is_root();
-    let secret =
-        sudo_secret_for(config, target).filter(|_| entry.sudo && facts.sudo_asks_password());
-    let sudo = match secret {
-        Some(_) => "sudo ",
-        None if root || !entry.sudo => "",
-        None => "sudo -n ",
-    };
+    let (sudo, secret) = sudo_for(config, target, facts, entry.sudo);
     let as_root = root || entry.sudo;
     let create = if entry.parents {
         Some(WalkNonce::generate()?)
@@ -497,13 +491,7 @@ fn restore_runs_from(
             ));
             continue;
         }
-        let secret =
-            sudo_secret_for(config, target).filter(|_| link.sudo && facts.sudo_asks_password());
-        let sudo = match secret {
-            Some(_) => "sudo ",
-            None if root || !link.sudo => "",
-            None => "sudo -n ",
-        };
+        let (sudo, secret) = sudo_for(config, target, facts, link.sudo);
         let as_root = root || link.sudo;
         let created = link.dirs_deepest_first();
         let refused = link.write == Write::Refused;
