@@ -1147,7 +1147,8 @@ step 在任何變更之前失敗，顯示 `users[0] deploy: busybox cannot chang
 - 移除登入的 user（探測的 `user` fact）：`users[0] admin: is the login user`；
 - 登入 user 的 `shell` 檔名為 `nologin` 或 `false`：
   `users[0] admin: shell /sbin/nologin would lock out the login user`；
-- `exclusive_groups` 會讓登入 user 離開 `wheel`、`sudo` 或 `admin`（以名稱或 gid 比對），而它目前是成員且該 group 不是它的主要 group：
+- `exclusive_groups`，或移動登入 user 主要 group 的 `group`，會讓它離開 `wheel`、`sudo` 或 `admin`（以名稱或 gid 比對），
+  而它目前是成員，且該 group 既不是它新的主要 group，也不在 `groups` 中（沒有 `exclusive_groups` 時，也不是它保留的附加 group）：
   `users[0] admin: would drop the login user from wheel`；
 - 移除擁有執行中 process 的 user，除非 `force = true`：`users[0] olduser: owns running processes`；
 - 登入 user 上的 `exclusive_keys` 會丟掉它的登入 key：`users[0] admin: would drop the login key`
@@ -1168,9 +1169,15 @@ step 在任何變更之前失敗，顯示 `users[0] deploy: busybox cannot chang
 以及對帶有 `authorized_keys` 但沒有 `home` 的 user，`users[0] deploy: cannot read the user`（passwd 查詢失敗）或
 `users[0] deploy: has no home for authorized_keys`（它的 passwd home 不是絕對路徑）。
 
+**uid 0。** 移除 uid 為 0 的 user（如 `toor` 這類 `root` 別名）會在任何變更之前讓該 step 失敗，shadow 與 busybox 皆然，
+不論是否設定 `remove_home` 或 `force`：`users[0] toor: has uid 0; refused`。
+
+**`remove_home`。** 在 shadow 與 busybox 上，不論是否設定 `force`，step 只移除該 user 擁有的 home，且絕不移除 `/` 這個 home；
+否則它失敗、不做任何變更，且只讓該 step 失敗，而不是 target：
+`users[0] olduser: home /srv/x is not owned by olduser; not removed` 或 `users[0] olduser: home / is not removed`。
+
 **`force`。** 略過 process 保護，並在 shadow 上執行 `userdel -f`（busybox 的 `deluser` 不檢查 process，與不設定時相同）。
-shadow 上仍有兩項檢查，各自只讓該 step 失敗，而不是 target：
-`users[0] olduser: home /srv/x is not owned by olduser; not removed with force`（搭配 `remove_home`）與
+shadow 上仍有一項檢查，只讓該 step 失敗，而不是 target：
 `users[0] olduser: group olduser is the primary group of user web`。
 
 ### authorized_keys

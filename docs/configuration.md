@@ -1237,8 +1237,9 @@ the connecting user, which only root can usefully do. Reads need no root.
 - removing the login user (the probe's `user` fact): `users[0] admin: is the login user`;
 - a login-user `shell` whose basename is `nologin` or `false`:
   `users[0] admin: shell /sbin/nologin would lock out the login user`;
-- `exclusive_groups` dropping the login user from `wheel`, `sudo` or `admin` (matched by name or gid) while it is a
-  member and the group is not its primary group: `users[0] admin: would drop the login user from wheel`;
+- `exclusive_groups`, or a `group` that moves the login user's primary group, dropping it from `wheel`, `sudo` or
+  `admin` (matched by name or gid) while it is a member and the group is neither its new primary group nor in `groups`
+  (nor, without `exclusive_groups`, a supplementary group it keeps): `users[0] admin: would drop the login user from wheel`;
 - removing a user that owns running processes, unless `force = true`: `users[0] olduser: owns running processes`;
 - `exclusive_keys` on the login user that would drop its key: `users[0] admin: would drop the login key`
   ([authorized_keys](#authorized_keys)).
@@ -1259,9 +1260,15 @@ home). Its failures fail the target before any change: `users: the account query
 with `authorized_keys` and no `home`, `users[0] deploy: cannot read the user` (the passwd lookup failed) or
 `users[0] deploy: has no home for authorized_keys` (its passwd home is not absolute).
 
+**uid 0.** Removing a user whose uid is 0 (a `root` alias such as `toor`) fails the step before any change, on shadow
+and busybox, with or without `remove_home` or `force`: `users[0] toor: has uid 0; refused`.
+
+**`remove_home`.** On shadow and busybox, with or without `force`, the step removes only a home the user owns, and never
+a home of `/`; otherwise it fails, nothing changed, and only the step, not the target:
+`users[0] olduser: home /srv/x is not owned by olduser; not removed` or `users[0] olduser: home / is not removed`.
+
 **`force`.** Skips the process guard and runs `userdel -f` on shadow (busybox `deluser`, which checks no processes,
-runs as without it). Two checks still hold on shadow, and each fails only the step, not the target:
-`users[0] olduser: home /srv/x is not owned by olduser; not removed with force` (with `remove_home`) and
+runs as without it). One more check holds on shadow, and fails only the step, not the target:
 `users[0] olduser: group olduser is the primary group of user web`.
 
 ### authorized_keys

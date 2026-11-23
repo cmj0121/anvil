@@ -2281,9 +2281,11 @@ fn restore_runs_from(
         {
             return Err(format!("files: {dest}: the record's mode is not octal"));
         }
+        // An authorized_keys file goes back as the user it was written as,
+        // never with the record's sudo inside that wrap.
+        let file_sudo = file.sudo && file.user.is_none();
         let secret =
-            sudo_secret_for(config, target).filter(|_| file.sudo && facts.sudo_asks_password());
-        // An authorized_keys file goes back as the user it was written as.
+            sudo_secret_for(config, target).filter(|_| file_sudo && facts.sudo_asks_password());
         let wrap = match &file.user {
             Some(user) => {
                 let sudo = (keys_sudo.get(user).copied())
@@ -2294,10 +2296,10 @@ fn restore_runs_from(
         };
         let sudo = match secret {
             Some(_) => "sudo ",
-            None if root || !file.sudo => "",
+            None if root || !file_sudo => "",
             None => "sudo -n ",
         };
-        let as_root = (root || file.sudo) && file.user.is_none();
+        let as_root = (root || file_sudo) && file.user.is_none();
         let refused = file.write == Write::Refused;
         let dirs = file.dirs_deepest_first();
         // A refused write may have stopped at a created directory that fails

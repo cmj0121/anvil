@@ -2555,7 +2555,10 @@ anvil rollback --force /etc/app.conf      # restore that dest even though it cha
   fails and nothing runs, with
   `rollback: DEST is not the authorized_keys of user NAME in [[files]]; refusing to restore it`,
   `rollback: DEST is not the authorized_keys of user NAME; refusing to restore it` (no such entry applies once the
-  target is probed), `rollback: DEST is not in the home of user NAME; refusing to restore it`,
+  target is probed),
+  `rollback: DEST is the authorized_keys of user NAME but has sudo = true in the record; refusing to restore it` (a
+  keys record is never restored with sudo inside its user's wrap),
+  `rollback: DEST is not in the home of user NAME; refusing to restore it`,
   `rollback: cannot read the homes of the users` or
   `rollback: DEST has a previous text with a line that is not a key; refusing to restore it`.
 - **Handlers queued.** For each file, directory, link or removed path it put back, rollback adds the `notify` names of
