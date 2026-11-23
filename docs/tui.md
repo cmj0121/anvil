@@ -49,7 +49,9 @@ Its flags and exit behaviour are in [cli.md](cli.md#anvil-tui).
   started (`· ⠙ linode1, pi`), come before `targets:`. On the right, `✔ ok  ✘ failed` counts the shown result's
   targets. Text that does not fit is cut with `…`.
   An inventory that does not load shows `inventory error` in red instead of the selection, and its error as a notice.
-- **Steps.** The steps apply runs, numbered: `packages` when `[packages]` has work, then `dir PATH` for each
+- **Steps.** The steps apply runs, numbered: `packages` when `[packages]` has work, then each `[[groups]]` and
+  `[[users]]` entry as plan shows it from the config (`group app (gid 2000)`, `user deploy (shell /bin/bash)`,
+  `remove user olduser`, `remove group old`; present groups, users, then absent groups), `dir PATH` for each
   `[[dirs]]` entry, `file DEST` for each `[[files]]` entry, `link PATH -> TARGET` for each `[[links]]` entry,
   `absent PATH` for each `[[absent]]` entry and `service NAME` for each `[[services]]` entry, then each `[[steps]]`
   command (its first line,

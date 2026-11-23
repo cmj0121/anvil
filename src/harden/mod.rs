@@ -1338,6 +1338,20 @@ install = [\"telnet\", \"git\"] # trailing
     }
 
     #[test]
+    fn no_rule_adds_or_changes_users_or_groups() {
+        let mine = "[[groups]]\nname = \"app\"\n\n[[users]]\nname = \"deploy\"\ngroup = \"app\"\n";
+        for text in ["", mine] {
+            let ws = Workspace::new();
+            let out = ws.suggest(text, "[hosts.web1]\nhost = \"w\"\nuser = \"me\"\n", true);
+            assert!(!out.suggestions.is_empty());
+            let config: Config = toml::from_str(&ws.apply(&out)).unwrap();
+            let before: Config = toml::from_str(text).unwrap();
+            assert_eq!(config.users, before.users);
+            assert_eq!(config.groups, before.groups);
+        }
+    }
+
+    #[test]
     fn an_unreadable_tasks_src_shows_bidi_as_an_escape_and_a_legacy_one_as_it_is() {
         let ws = Workspace::new();
         let src = "a\u{202e}b.conf";

@@ -26,3 +26,30 @@
   age 與 sops 則依 #6 的要求先解密。
 - 明文只會在一個地方接觸磁碟：執行 `anvil secret NAME` 時編輯器的暫存檔案。
 - sops 取得的是清空的環境，因此它無法使用環境中的雲端 KMS 憑證；請改用 age 或 PGP 金鑰。
+
+## 與 #141 的差異
+
+- `force = true` 略過 process 保護並執行 `userdel -f`，但它在 shadow 上剩下的兩項檢查（`remove_home` 要移除的 home
+  不屬於該 user，以及與該 user 同名的 group 是另一個 user 的主要 group）只讓該 step 失敗，而不是 target，
+  因為它們是在 target 上由 step 自己的腳本讀取，而不是在帳號查詢中。
+
+## 與 #142 的差異
+
+- `authorized_keys` 以該 user 的身分寫入（`sudo -n -u NAME /bin/sh`，root 登入時為 `su -s /bin/sh NAME`），
+  而不是在只限 root 的路徑檢查之後由 root 寫入：路徑上的每個目錄可以屬於 root 或該 user，因此 user 自己 home 下的 key 檔可以運作，
+  user 放置的 symlink 也無法改變 root 寫入的位置。
+- 登入 key 規則：登入 user 上的 `exclusive_keys` 必須保留它目前檔案中的至少一個 key，或在檔案不存在或為空時至少列出一個 key。
+  anvil 無法得知目前執行的 session 是以哪個 key 登入。
+- sudo 要求密碼的 target 無法寫入另一個 user 的 key
+  （`users[0] deploy: authorized_keys of another user needs sudo without a password`）：寫入透過 `sudo -n -u` 執行它的腳本，
+  不會輸入密碼。
+- alpine e2e target 以 root 登入，因此它管理的是 root 自己的 key；登入 user 的保護由以非 root 登入的單元測試與整合測試涵蓋。
+
+## 與 #143 的差異
+
+- `plan` 不以 `getent` 讀取帳號：它只依 config 顯示每個項目想要的狀態
+  （`would group app (gid 2000)`、`would user deploy (uid 2000, group app, groups docker, shell /bin/bash)`、
+  `would remove user olduser`），因此分不出建立、修正或不變，也不顯示 `shell /bin/sh -> /bin/bash`。
+  它不會為此在 target 上讀取或變更任何東西。
+- `--json` 的 step 沒有 `kind` 欄位；與其他每種 step 一樣，由 `run` 標籤指出種類（`group …`、`user …`、
+  `remove group …`、`remove user …`）。

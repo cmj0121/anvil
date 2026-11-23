@@ -2239,6 +2239,31 @@ pub mod tests {
     }
 
     #[test]
+    fn account_rows_follow_the_packages_in_their_fixed_order() {
+        let opts = config_opts(
+            "tui-steps-accounts",
+            "[[dirs]]\npath = \"/srv/app\"\nmode = \"0755\"\n\n\
+             [[users]]\nname = \"olduser\"\nstate = \"absent\"\n\n\
+             [[groups]]\nname = \"old\"\nstate = \"absent\"\n\n\
+             [[users]]\nname = \"deploy\"\nuid = 2000\ngroup = \"app\"\n\n\
+             [[groups]]\nname = \"app\"\ngid = 2000\n\n\
+             [packages]\ninstall = [\"git\"]\n",
+        );
+        assert_eq!(
+            load_steps(&opts),
+            Ok(vec![
+                row("packages"),
+                row("group app (gid 2000)"),
+                row("remove user olduser"),
+                row("user deploy (uid 2000, group app)"),
+                row("remove group old"),
+                row("dir /srv/app"),
+                row("hostname"),
+            ])
+        );
+    }
+
+    #[test]
     fn dir_and_link_rows_frame_the_file_rows() {
         let opts = config_opts(
             "tui-steps-dirs-links",

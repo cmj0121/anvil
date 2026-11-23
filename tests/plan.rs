@@ -1472,3 +1472,51 @@ fn a_user_to_remove_shows_from_the_config_alone() {
         "remove user olduser"
     );
 }
+
+#[test]
+fn each_account_step_shows_its_line_and_json_from_the_config() {
+    const KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB a@host";
+    let sandbox = Sandbox::new("pl");
+    sandbox.write_config(
+        "config.toml",
+        &format!(
+            "[[groups]]\nname = \"app\"\ngid = 2000\nsudo = false\n\n\
+             [[groups]]\nname = \"old\"\nstate = \"absent\"\nsudo = false\n\n\
+             [[users]]\nname = \"deploy\"\nuid = 2000\ngroup = \"app\"\ngroups = [\"app\"]\n\
+             exclusive_groups = true\nshell = \"/bin/sh\"\nhome = \"/srv/deploy\"\n\
+             authorized_keys = [\"{KEY}\"]\nexclusive_keys = true\nsudo = false\n\n\
+             [[users]]\nname = \"ci\"\nsystem = true\ncreate_home = false\n\
+             authorized_keys = [\"{KEY}\"]\nsudo = false\n\n\
+             [[users]]\nname = \"olduser\"\nstate = \"absent\"\nsudo = false\n"
+        ),
+    );
+    let lines = [
+        "group app (gid 2000)",
+        "user deploy (uid 2000, group app, only groups app, shell /bin/sh, home /srv/deploy, \
+         authorized_keys 1, exclusive)",
+        "user ci (system, no home, authorized_keys 1)",
+        "remove user olduser",
+        "remove group old",
+    ];
+    let out = sandbox.anvil(&["plan"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let would: String = lines
+        .iter()
+        .map(|line| format!("  would {line}\n"))
+        .collect();
+    assert_eq!(
+        text(&out.stdout),
+        format!("▶ local\n{would}  would $ hostname\n  ✔ 6 steps\n\n1 target, nothing executed\n")
+    );
+    let out = sandbox.anvil(&["--json", "plan"], &[]);
+    let mut expected: Vec<_> = lines
+        .iter()
+        .map(|line| serde_json::json!({"run": line}))
+        .collect();
+    expected.push(serde_json::json!({"run": "hostname"}));
+    assert_eq!(
+        json(&out)["targets"][0]["steps"],
+        serde_json::Value::from(expected)
+    );
+}
