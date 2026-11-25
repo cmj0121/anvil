@@ -748,6 +748,132 @@ pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<Strin
     })
 }
 
+/// Longest installed version, in bytes.
+pub const MAX_VERSION_BYTES: usize = 128;
+/// The rule every installed version follows.
+pub const VERSION_RULE: &str =
+    "must match [A-Za-z0-9][A-Za-z0-9.+~:_-]*, with no `~` right after `:`";
+
+/// [`VERSION_RULE`] within [`MAX_VERSION_BYTES`]; a `~` right after a `:`
+/// is refused because bash may tilde-expand it in a word like `N=1:~v`.
+pub fn is_version(s: &str) -> bool {
+    let mut chars = s.chars();
+    s.len() <= MAX_VERSION_BYTES
+        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || ".+~:_-".contains(c))
+        && !s.contains(":~")
+}
+
+/// False for names holding `:` or `/` (apt arch qualifiers, brew taps,
+/// dnf/pacman repo prefixes); `@` stays lockable (brew `python@3.12`).
+pub fn lockable(name: &str) -> bool {
+    !name.contains([':', '/'])
+}
+
+/// The last line of a finished [`versions_script`].
+pub const VERSIONS_END: &str = "anvil-versions-end=1";
+
+/// The read-only line that prints the installed version of `names` with
+/// `manager`: no sudo, no refresh, brew under its PATH prefix. It ends by
+/// printing [`VERSIONS_END`] whatever the manager's exit (pacman, brew and
+/// dpkg exit non-zero when a name is missing; that is not a failure). Run it
+/// with [`Packages::timeout`]. The names go into the line unquoted, so each
+/// must pass [`Packages::validate`] and be [`lockable`]; panics otherwise, in
+/// every build.
+pub fn versions_script(manager: Manager, names: &[&str]) -> String {
+    assert!(
+        names
+            .iter()
+            .all(|name| check_name(name).is_ok() && lockable(name)),
+        "packages::versions_script: names must pass Packages::validate and lockable before they reach a shell line"
+    );
+    let names = names.join(" ");
+    let query = match manager {
+        Manager::Brew => format!("{BREW_ENV}brew list --versions --formula {names}"),
+        Manager::Pacman => format!("pacman -Q {names}"),
+        Manager::Apt => {
+            format!("dpkg-query -W -f='${{db:Status-Abbrev}} ${{Package}} ${{Version}}\\n' {names}")
+        }
+        Manager::Dnf => {
+            format!("rpm -q --qf '%{{NAME}} %{{EPOCH}}:%{{VERSION}}-%{{RELEASE}}\\n' {names}")
+        }
+        Manager::Apk => "apk info -v".to_owned(),
+    };
+    format!("{query}; printf '%s\\n' {VERSIONS_END}")
+}
+
+/// One `manager` output line as `(name, version)`; `None` for a line not of
+/// the query's shape.
+fn version_line(manager: Manager, line: &str) -> Option<(&str, String)> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    match (manager, fields.as_slice()) {
+        (Manager::Brew, [name, .., last]) => Some((name, (*last).to_owned())),
+        (Manager::Pacman, [name, version]) => Some((name, (*version).to_owned())),
+        (Manager::Apt, [status, name, version]) if status.chars().nth(1) == Some('i') => {
+            Some((name, (*version).to_owned()))
+        }
+        (Manager::Dnf, [name, version]) => {
+            let (epoch, rest) = version.split_once(':')?;
+            let version = if epoch == "(none)" || epoch == "0" {
+                rest
+            } else {
+                version
+            };
+            Some((name, version.to_owned()))
+        }
+        (Manager::Apk, [package]) => {
+            let mut parts = package.rsplitn(3, '-');
+            let (release, version, name) = (parts.next()?, parts.next()?, parts.next()?);
+            Some((name, format!("{version}-{release}")))
+        }
+        _ => None,
+    }
+}
+
+/// The installed version of each of `names` in the `stdout` of
+/// [`versions_script`]; a name not installed is absent. Err when the query
+/// did not finish (no [`VERSIONS_END`] line), a version breaks
+/// [`VERSION_RULE`], or one name has two different versions (multiarch,
+/// multilib).
+pub fn parse_versions(
+    manager: Manager,
+    names: &[&str],
+    stdout: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut versions = BTreeMap::new();
+    for line in stdout.lines().map(|line| line.trim_end_matches('\r')) {
+        if line == VERSIONS_END {
+            return Ok(versions);
+        }
+        let Some((name, version)) = version_line(manager, line) else {
+            continue;
+        };
+        if !names.contains(&name) {
+            continue;
+        }
+        if !is_version(&version) {
+            return Err(format!(
+                "packages: `{name}` version `{}`: {VERSION_RULE}",
+                secret::shown_name(&version)
+            ));
+        }
+        match versions.get(name) {
+            Some(seen) if *seen != version => {
+                return Err(format!(
+                    "packages: `{name}` is installed at two versions, {seen} and {version}"
+                ));
+            }
+            Some(_) => {}
+            None => {
+                versions.insert(name.to_owned(), version);
+            }
+        }
+    }
+    Err(format!(
+        "packages: the {manager} version query did not finish"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2666,5 +2792,239 @@ add) echo "install $*"; return "$FAIL";; esac; }
         };
         assert_eq!(p.sudo_secret_for(&with_secret), Some("BOX_SUDO"));
         assert_eq!(Packages::default().sudo_secret_for(&local), None);
+    }
+
+    fn versions(manager: Manager, names: &[&str], stdout: &str) -> Vec<(String, String)> {
+        parse_versions(manager, names, &format!("{stdout}{VERSIONS_END}\n"))
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
+    fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected
+            .iter()
+            .map(|(name, version)| ((*name).to_owned(), (*version).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn versions_parse_each_managers_output_and_leave_out_names_not_installed() {
+        /// Manager, requested names, stdout before the end line, the map.
+        type Case = (
+            Manager,
+            &'static [&'static str],
+            &'static str,
+            &'static [(&'static str, &'static str)],
+        );
+        let cases: [Case; 5] = [
+            (
+                Manager::Brew,
+                &["git", "python@3.12", "openssl@3", "missing"],
+                "git 2.47.0\npython@3.12 3.12.7_1\nopenssl@3 3.3.2 3.4.0\nwget 1.24.5\n",
+                &[
+                    ("git", "2.47.0"),
+                    ("openssl@3", "3.4.0"),
+                    ("python@3.12", "3.12.7_1"),
+                ],
+            ),
+            (
+                Manager::Pacman,
+                &["git", "vim", "missing"],
+                "git 2.47.0-1\nvim 9.1.0785-1\nerror: package 'missing' was not found\n",
+                &[("git", "2.47.0-1"), ("vim", "9.1.0785-1")],
+            ),
+            (
+                Manager::Apt,
+                &["git", "vim", "libc6", "curl", "gone", "nginx", "missing"],
+                "ii  git 1:2.39.5-0+deb12u1\nrc  vim 2:9.0.1378-2\nii  libc6 2.36-9+deb12u9\n\
+                 ii  libc6 2.36-9+deb12u9\nii  curl 7.88.1-10+deb12u8\nun  gone \n\
+                 hi  nginx 1.22.1-9+deb12u1\n",
+                &[
+                    ("curl", "7.88.1-10+deb12u8"),
+                    ("git", "1:2.39.5-0+deb12u1"),
+                    ("libc6", "2.36-9+deb12u9"),
+                    ("nginx", "1.22.1-9+deb12u1"),
+                ],
+            ),
+            (
+                Manager::Dnf,
+                &["git", "vim-enhanced", "glibc", "tmux", "curl"],
+                "git (none):2.47.0-1.fc41\nvim-enhanced 2:9.1.0-1.fc41\npackage tmux is not installed\n\
+                 glibc (none):2.40-9.fc41\nglibc (none):2.40-9.fc41\ncurl 0:8.9.1-2.fc41\n",
+                &[
+                    ("curl", "8.9.1-2.fc41"),
+                    ("git", "2.47.0-1.fc41"),
+                    ("glibc", "2.40-9.fc41"),
+                    ("vim-enhanced", "2:9.1.0-1.fc41"),
+                ],
+            ),
+            (
+                Manager::Apk,
+                &["git", "py3-foo", "musl", "missing"],
+                "musl-1.2.5-r0\npy3-foo-1.2-r0\ngit-2.45.2-r0\nbusybox-1.36.1-r29\nWARNING: not a package\n",
+                &[
+                    ("git", "2.45.2-r0"),
+                    ("musl", "1.2.5-r0"),
+                    ("py3-foo", "1.2-r0"),
+                ],
+            ),
+        ];
+        for (manager, names, stdout, expected) in cases {
+            assert_eq!(
+                versions(manager, names, stdout),
+                pairs(expected),
+                "{manager}"
+            );
+        }
+    }
+
+    #[test]
+    fn versions_refuse_an_unfinished_query_a_bad_version_or_two_versions() {
+        let err = parse_versions(Manager::Pacman, &["git"], "git 2.47.0-1\n").unwrap_err();
+        assert_eq!(err, "packages: the pacman version query did not finish");
+        let stdout = format!("git 2.47.0;rm\n{VERSIONS_END}\n");
+        let err = parse_versions(Manager::Pacman, &["git"], &stdout).unwrap_err();
+        assert_eq!(
+            err,
+            format!("packages: `git` version `2.47.0;rm`: {VERSION_RULE}")
+        );
+        // An unrequested name's line is not checked.
+        assert_eq!(versions(Manager::Pacman, &["git"], "other 1;2\n"), []);
+        let stdout =
+            format!("glibc (none):2.40-9.fc41\nglibc (none):2.40-10.fc41\n{VERSIONS_END}\n");
+        let err = parse_versions(Manager::Dnf, &["glibc"], &stdout).unwrap_err();
+        assert_eq!(
+            err,
+            "packages: `glibc` is installed at two versions, 2.40-9.fc41 and 2.40-10.fc41"
+        );
+        let stdout = format!("ii  libc6 2.36-9\nii  libc6 2.36-10\n{VERSIONS_END}\n");
+        assert!(parse_versions(Manager::Apt, &["libc6"], &stdout).is_err());
+    }
+
+    #[test]
+    fn versions_keep_apt_packages_on_hold() {
+        let stdout = "hi  nginx 1.22.1-9+deb12u1\nhiR curl 7.88.1-10\nhc  vim 2:9.0.1378-2\n";
+        assert_eq!(
+            versions(Manager::Apt, &["nginx", "curl", "vim"], stdout),
+            pairs(&[("curl", "7.88.1-10"), ("nginx", "1.22.1-9+deb12u1")])
+        );
+    }
+
+    #[test]
+    fn versions_refuse_a_tilde_right_after_a_colon() {
+        assert!(is_version("1:2.0~rc1"));
+        assert!(!is_version("1:~root"));
+        let stdout = format!("git 1:~root\n{VERSIONS_END}\n");
+        let err = parse_versions(Manager::Pacman, &["git"], &stdout).unwrap_err();
+        assert_eq!(
+            err,
+            format!("packages: `git` version `1:~root`: {VERSION_RULE}")
+        );
+        assert!(err.ends_with("with no `~` right after `:`"), "{err}");
+    }
+
+    #[test]
+    fn version_rule_and_lockable_names() {
+        for good in ["1:2.39.5-0+deb12u1", "3.12.7_1", "1.0~rc1", "2.40-9.fc41"] {
+            assert!(is_version(good), "{good}");
+        }
+        let long = "1".repeat(MAX_VERSION_BYTES + 1);
+        for bad in [
+            "",
+            "-1",
+            ".1",
+            "1 2",
+            "1;2",
+            "1/2",
+            "1:~root",
+            "1.0:~",
+            long.as_str(),
+        ] {
+            assert!(!is_version(bad), "{bad}");
+        }
+        assert!(is_version(&"1".repeat(MAX_VERSION_BYTES)));
+        for name in ["git", "python@3.12", "g++"] {
+            assert!(lockable(name), "{name}");
+        }
+        for name in ["libc6:i386", "homebrew/core/git", "extra/git"] {
+            assert!(!lockable(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn versions_scripts_read_only_and_always_end() {
+        let expected = [
+            (Manager::Brew, "brew list --versions --formula git vim"),
+            (Manager::Pacman, "pacman -Q git vim"),
+            (
+                Manager::Apt,
+                "dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\\n' git vim",
+            ),
+            (
+                Manager::Dnf,
+                "rpm -q --qf '%{NAME} %{EPOCH}:%{VERSION}-%{RELEASE}\\n' git vim",
+            ),
+            (Manager::Apk, "apk info -v"),
+        ];
+        for (manager, query) in expected {
+            let line = versions_script(manager, &["git", "vim"]);
+            let prefix = if manager == Manager::Brew {
+                BREW_ENV
+            } else {
+                ""
+            };
+            assert_eq!(
+                line,
+                format!("{prefix}{query}; printf '%s\\n' {VERSIONS_END}")
+            );
+            for word in ["sudo", "update", "upgrade", "-Sy", "refresh", "makecache"] {
+                assert!(!line.contains(word), "{manager}: {line}");
+            }
+            let out = run_with_stub_managers(&line, true);
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            assert!(
+                stdout.ends_with(&format!("{VERSIONS_END}\n")),
+                "{manager}: {stdout}"
+            );
+            assert!(parse_versions(manager, &["anvil-none"], &stdout).is_ok());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must pass Packages::validate and lockable")]
+    fn versions_script_refuses_unvalidated_names() {
+        versions_script(Manager::Pacman, &["git; rm -rf ~"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "must pass Packages::validate and lockable")]
+    fn versions_script_refuses_unlockable_names() {
+        versions_script(Manager::Apt, &["libc6:i386"]);
+    }
+
+    /// Reads `git`'s version in the e2e Arch container named by
+    /// `ANVIL_E2E_CONTAINER`, as its sudo-less user: tests/e2e.sh runs it.
+    #[test]
+    #[ignore = "needs the e2e container; tests/e2e.sh runs it"]
+    fn e2e_versions_on_arch() {
+        let container = std::env::var("ANVIL_E2E_CONTAINER").expect("ANVIL_E2E_CONTAINER");
+        let exec = |line: &str| {
+            let out = crate::exec::output(
+                std::process::Command::new("docker")
+                    .args(["exec", "-u", "key", &container, "sh", "-c", line]),
+            )
+            .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let names = ["git", "anvil-e2e-no-such-package"];
+        let stdout = exec(&versions_script(Manager::Pacman, &names));
+        let got = parse_versions(Manager::Pacman, &names, &stdout).unwrap();
+        let pacman = exec("pacman -Q git");
+        let expected = pacman.split_whitespace().nth(1).unwrap();
+        assert_eq!(
+            got,
+            BTreeMap::from([("git".to_owned(), expected.to_owned())])
+        );
     }
 }
