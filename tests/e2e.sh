@@ -7,7 +7,8 @@
 # holds last-apply.json, so no apply records into the real state directory.
 # The built anvil-audit is pinned as a doctor plugin for the drift checks, and
 # an alpine container, reached through a docker-exec stand-in for ssh, runs the
-# hash run under busybox.
+# hash run under busybox. tests/e2e/debian.sh runs `anvil lock` and
+# `apply --locked` on a Debian sshd container of its own.
 # The systemd container needs --privileged; when it cannot boot, the summary
 # says `SKIP systemd: <reason>` and the run still passes, unless
 # ANVIL_E2E_SYSTEMD=1, which turns that skip into a failure.
@@ -354,6 +355,15 @@ if [ "$code" -eq 0 ] && grep -qF "\"steps\":[{\"run\":\"{ anvil_db=1;" "$TMP/out
   pass "apply --json step 1 is the package step, the unknown name is a warning"
 else
   fail "apply --json with [packages]: exit $code"
+fi
+
+step "(l) the installed-version query reads git's version on arch without sudo"
+if ANVIL_E2E_CONTAINER="$NAME" cargo test --quiet -p anvil --lib packages::tests::e2e_versions_on_arch \
+  -- --ignored --exact >"$TMP/out" 2>&1; then
+  pass "git's version matches pacman -Q, the missing name is absent"
+else
+  cat "$TMP/out"
+  fail "version query on arch"
 fi
 
 step "(l) [[files]] on arch (NOPASSWD): a sudo rename writes, keeps the owner or sets owner and group, fixes them on the same bytes, parents creates missing directories, refuses a symlinked dest or a user-owned directory, an unmatched entry is skipped"
@@ -2402,6 +2412,13 @@ if [ "$code" -eq 2 ] && grep -q 'config.toml: mode 664 lets others write to it; 
   fi
 else
   fail "plan on a writable config: exit $code"
+fi
+
+step "(u) debian: anvil lock, then apply --locked installs the locked tzdata"
+if ANVIL="$ANVIL" sh tests/e2e/debian.sh >"$TMP/out" 2>"$TMP/err"; then
+  pass "$(grep -c '^ok ' "$TMP/out") debian checks"
+else
+  fail "tests/e2e/debian.sh"
 fi
 
 if [ -n "$sd_skip" ]; then

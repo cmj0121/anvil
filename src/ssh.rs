@@ -905,7 +905,10 @@ mod tests {
                 child.try_wait().unwrap().is_some() && !pid_alive(bg)
             });
             assert!(gone, "{shell:?}: the wrapper or sleep {bg} still runs");
-            assert!(dir.join("exit").exists(), "{shell:?}: no EXIT trap");
+            // TERM ends the wrapper and the background sleep at once, while
+            // the script's subshell still has its EXIT trap to run.
+            let trapped = within(Duration::from_secs(5), || dir.join("exit").exists());
+            assert!(trapped, "{shell:?}: no EXIT trap");
             fs::remove_dir_all(&dir).unwrap();
         }
     }

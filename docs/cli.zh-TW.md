@@ -18,9 +18,11 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
          [--strict] [--write]    with --harden: also the high-risk rules; write the suggestions
   files <ACTION>                 manage the file store that [[files]] src $/… reads: ls, cp, mv, rm, mkdir, cat, edit
   doctor                         local checks + every target's facts and reachability
-  apply                          run the config's steps on every target
+  apply [--locked]               run the config's steps on every target; --locked installs anvil.lock's versions
   plan                           show the steps apply would run on every target, running none
        [--show-content]          --show-content also prints the bytes apply would write per file step
+       [--locked]                --locked plans anvil.lock's versions, as apply --locked would
+  lock [--check] [--from HOST]   record the installed package versions in anvil.lock; --check compares it with the config
   rollback [--force DEST]...     restore the files the last apply wrote on every target
   run [--timeout SECS] <FILE|->  run a POSIX sh script on every target, read from FILE or stdin
   secret <NAME>                  edit one secret in the editor
@@ -425,6 +427,10 @@ anvil files cp '$/dotfiles/.tmux.conf' /tmp/  # copy out
   無法解析時則為 `manager         error: REASON`（例如 `` `pacman` needs root and sudo is not installed ``，
   或 [Root 與 sudo](packages.zh-TW.md#root-與-sudo) 中的 sudo 密碼拒絕訊息）。
   有 sudo secret 的 target 以 apply 的方式解析，因此對它而言 sudo `binary` 是可接受的。無法連線的 target 沒有 `manager` 列。
+- `lock`，僅在工作區有 [`anvil.lock`](packages.zh-TW.md#版本鎖) 時：每個有套件工作且 manager 解析成功的可連線 target
+  會多一列 `lock            ok`、`lock            WARNING: 2 packages differ (git, nodejs)`、
+  `lock            WARNING: no entry for apt/debian 12/x86_64` 或 `lock            WARNING: lock check failed: REASON`，
+  唯讀且不使用 sudo。它不改變 exit code。
 - `vars` 與 `env`：每個 target 解析後的 [vars 與 env](configuration.zh-TW.md#vars-與-env)，接在 facts 之後，
   每個鍵一列，並附上設定它的層級（`global`、`tag:NAME` 或 `host`）。var 以 JSON 文字顯示，因此看得出型別；env 值照寫的顯示。
   不可見字元與 bidi 字元會被跳脫。值原樣顯示：它們不是機密。沒有 vars 或 env 的 target 沒有這些列。
@@ -504,6 +510,7 @@ web1
 
 有 `[packages]` 且 manager 解析成功時，target 另有 `packages` 字串：`"ok"` 或
 `"WARNING: not found by MANAGER: a, b"`，也會顯示為 `packages` 列。
+有 `anvil.lock` 時另有 `lock` 字串，即 `lock` 列的文字；沒有該檔時省略。
 查詢不使用 sudo、不更新 db、不安裝；查詢執行失敗時顯示 `WARNING: package check failed: REASON`。
 dnf 使用 `-C`，只讀 cache；check 使用 `[packages].timeout`。這些警告不影響 doctor 的 exit code。
 
@@ -685,6 +692,18 @@ anvil 會在 sudo 的提示處輸入密碼（[輸入 sudo 密碼](packages.zh-TW
 其 `$` 行仍是那行一行式腳本。沒有 `[packages]`，或沒有要安裝、升級、鎖定或移除的東西時，不會執行探測，apply 只執行 `[[steps]]`，
 除非有 step 指定 plugin（[Plugin steps](#plugin-steps)），或 config 含有 `[[groups]]`、`[[users]]`、`[[dirs]]`、`[[files]]`、
 `[[links]]`、`[[absent]]` 或 `[[services]]`。
+
+`apply --locked` 會安裝 [`anvil.lock`](packages.zh-TW.md#版本鎖) 為每個 target 的平台記錄的版本。
+在任何 target 變更之前，以下情況為 exit 2：有套件項目設了 `upgrade = true`（`--locked: upgrade = true cannot be used with a lock`）、
+沒有該檔（`--locked: anvil.lock not found`）或它無法載入，以及有套件工作的可連線 target 沒有對應項目
+（`--locked: anvil.lock has no entry for some targets; run anvil lock`，
+接著每個 target 一行 `TARGET: no entry for apt/debian 12/x86_64`）。
+apt、dnf 與 apk 會安裝每個鎖定的確切版本（apt 加上 `--allow-downgrades`）；pacman 與 brew 照常安裝。
+套件 step 之後，每個管理器都會檢查已安裝的版本，偏離鎖定版本的名稱會使 target 失敗（exit 1），訊息為
+`packages: git 2.47.0 is locked, 2.48.1 is installed`、`packages: git 2.47.0 is locked, not installed` 或
+`packages: git 1:2.39.5-0+deb12u2 is no longer in the repositories`。
+沒有鎖定版本的名稱照常安裝，並顯示警告 `packages: NAME has no locked version in anvil.lock; run anvil lock`。
+只有頂層套件會被鎖定，其相依套件不會（[版本鎖](packages.zh-TW.md#版本鎖)）。
 
 在舊版 config 中，每個 `[[groups]]` 與 `[[users]]` 項目在每個 target 上都是一個 step，排在套件 step 之後：
 先是 present 的 group，再是 user，然後是 absent 的 group。target 的 tag 與 fact 符合時建立、修正或移除帳號，
@@ -1261,6 +1280,13 @@ rollback 只放回擁有者、群組與 mode。中途失敗的寫入在下一次
 `packages: REASON`，例如 `packages: pin is not one-shot on brew: vim`；`[packages]` 沒有事可做時，探測失敗為 `probe: REASON`），
 其他 target 仍會繼續規劃。plan 會像 apply 一樣，在控制端執行每個 plugin step 的 plugin，以列出它回傳的腳本
 （[Plugin steps](#plugin-steps)）。
+
+`plan --locked` 會做 `apply --locked` 的 exit 2 檢查，唯讀地讀取每個 target 已安裝的版本，
+並在 step 之後為每個不在鎖定版本的名稱加一行：`would install git 1:2.39.5-0+deb12u2`、
+`would change nodejs 18.19.0 -> 18.20.4`（apt、dnf、apk）、`would fail: git 2.47.0 is locked, 2.48.1 is installed`
+（pacman、brew）或 `would install curl (no locked version)`。這些行不改變 exit code。
+`--json` 中每個 target 有一個 `lock` 陣列，元素為 `{"name", "would", "installed", "locked"}`，
+`would` 為 `install`、`change` 或 `fail`，沒有的版本則省略（[Plan 與 doctor](packages.zh-TW.md#plan-與-doctor)）。
 
 plan 絕不開啟 secret store。會輸入 sudo 密碼的 step 會註明它要用哪個 secret；
 該 secret 是否已設定、是否不含控制字元則不檢查，因此 plan 可能通過，而 apply 接著以 `packages: secret NAME is not set` 失敗。
@@ -2265,6 +2291,33 @@ plist 本身的 `Disabled` 鍵為 true 時不會被偵測到（anvil 不讀取 p
 launchd 的 bootstrap 在 job 已停用時被拒絕，訊息為 `services: NAME is disabled; enable it to restart it`；
 `reloaded` handler 從不讀取停用覆寫。launchd 與 crashed OpenRC 的路徑是以替身工具測試的。
 
+### `anvil lock`
+
+把選定 target 上每個受管理套件的已安裝版本，依平台記錄到[工作區](configuration.zh-TW.md#工作區)中的 `anvil.lock`，
+供 [`apply --locked`](#anvil-apply) 使用。請把它與 config 一起 commit。
+
+```sh
+anvil lock                    # probe every selected target and write anvil.lock
+anvil lock --target web       # update only the platforms of the web targets; the others keep their entry
+anvil lock --from web2        # where web's platform disagrees, take web2's versions
+anvil lock --check            # compare anvil.lock with the config; contacts no target
+```
+
+每個 target 都會被探測、解析其管理器，並在不使用 sudo、不更新索引的情況下讀取版本。
+成功時印出 `wrote anvil.lock (N platforms)`；`--json` 印出寫入的文件（`{"version": 1, "platform": [...]}`）。
+沒有任何 target 安裝的名稱（記為 `missing`）或限定名稱（略過）的警告輸出到 stderr。
+某個 target 失敗，或同一平台的兩個 target 對某名稱有不同版本時，為 exit 1 且不寫入任何東西：
+
+```text
+lock: apt/debian 12/x86_64 git differs: web1 has 1:2.39.5-0+deb12u2, web2 has 1:2.39.4-0+deb12u1 (use --from HOST)
+```
+
+`--from HOST`（可重複，每個平台一個）在 HOST 的平台上採用 HOST 的版本；HOST 不是選定的 target，或同一平台有兩個時，為 exit 2。
+`--check` 忽略 `--target`、不能與 `--from` 併用，為平台缺少或仍列出的每個名稱印出一行
+（`anvil.lock: apt/debian 12/x86_64 lacks nodejs`），有任何一行或找不到檔案時為 exit 1；
+`--json` 印出 `{"stale": bool, "problems": [...]}`。無法載入的 `anvil.lock` 為 exit 2。
+檔案格式、平台鍵與記錄哪些名稱，見 [版本鎖](packages.zh-TW.md#版本鎖)。
+
 ### `anvil rollback`
 
 ```text
@@ -2741,6 +2794,9 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
   （[Doctor plugins](#doctor-plugins-drift-since-the-last-apply)）；漂移與無法連線的 target 共用這個結束碼。
   `plan`：某個 target 無法連線、探測或解析。
   `apply`/`plan`：某個 plugin step 的 plugin 在某個 target 上失敗（[Plugin steps](#plugin-steps)）。
+  `apply --locked`/`plan --locked`：某個 target 的探測結果有無效的平台欄位（[版本鎖](packages.zh-TW.md#版本鎖)）；
+  `apply --locked` 還有套件 step 之後有套件偏離鎖定版本（[`apply --locked`](#anvil-apply)）。
+  `lock`：某個 target 失敗（包括無效的平台欄位），或同一平台的 target 版本不一致；`lock --check`：`anvil.lock` 已過時或找不到。
   `run`：某個 target 失敗或無法連線。
   `rollback`：見 [anvil rollback](#anvil-rollback)；`apply` 還有紀錄無法讀取、被鎖住或無法儲存，或找不到狀態目錄時（[apply 紀錄](#apply-紀錄)）。
   `apply`/`plan`/`run`/`rollback`/`doctor`：第一次 Ctrl-C 取消了執行（[Ctrl-C](#ctrl-c)）；
@@ -2749,6 +2805,8 @@ release 金鑰是建置此執行檔的 anvil release 所帶的金鑰：目前的
 - **2**：錯誤的旗標或引數（包括不以 `.toml` 結尾的 `--inventory` 或 `--config` 路徑）、未知的 `--target`、
   無效、無法讀取或模稜兩可的檔案、沒有 `$HOME`（`apply` 與 `rollback` 的狀態目錄除外，為 1：[apply 紀錄](#apply-紀錄)）、找不到編輯器、三次嘗試後仍無效的緩衝區，或大於 1 MiB 的 secret。
   對 `apply` 與 `plan` 而言，還有釘選檢查失敗的 `[plugins]` 項目（[Plugin steps](#plugin-steps)）。
+  對 `apply --locked` 與 `plan --locked` 而言，還有 `upgrade = true`、沒有 `anvil.lock`，或沒有對應項目的 target。
+  對 `lock` 而言，還有錯誤的 `--from`。對這些指令，還有無法載入的 `anvil.lock`（`doctor` 則改以 `lock` 列顯示）。
   對 `run` 而言，還有空的、超過 1 MiB、不是 UTF-8 或無法讀取的腳本，以及超出 1..=3600 的 `--timeout`。
   `tui` 見下方。
 - **`update`**：已是最新、比最新 release 更新或已更新時為 0。

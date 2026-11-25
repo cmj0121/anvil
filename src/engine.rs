@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU8;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::absent;
@@ -18,6 +18,7 @@ use crate::files::{self, SecretFile, Sources};
 use crate::guard;
 use crate::inventory::Target;
 use crate::links;
+use crate::lock::{self, Lock, Locked, Platform};
 use crate::packages::{self, Packages};
 use crate::plugin::{Plugins, Request};
 use crate::record::{self, AbsentRecord, DirRecord, FileRecord, LinkRecord, Session, TargetRecord};
@@ -938,9 +939,41 @@ fn execute_inner(
             reports.push(noted(report, apply, false));
             continue;
         }
+        let gone = match &planned.kind {
+            RunKind::Packages { lock: Some(_), .. } => take_gone(&mut output),
+            _ => Vec::new(),
+        };
+        let verify = succeeded || (output.code == Some(1) && !gone.is_empty());
+        if !verify {
+            // The install failed for another reason too: the step's own
+            // output keeps why a version was not installed.
+            for line in packages::gone_failures(&gone) {
+                output
+                    .stderr
+                    .extend_from_slice(format!("{line}\n").as_bytes());
+            }
+        }
         let changed = changed(planned, &output);
         let report = StepReport::from_output(label, output, entry).of(planned);
         reports.push(noted(report, apply, changed));
+        if let RunKind::Packages {
+            manager,
+            lock: Some(lock),
+        } = &planned.kind
+            && verify
+        {
+            let failures = match verify_lock(transport, *manager, lock, &gone, planned.timeout) {
+                Ok(failures) => failures,
+                Err(TransportError::Cancelled) => {
+                    return cancelled(command, target, reports, cancel).at(planned);
+                }
+                Err(err) => vec![format!("packages: the version check: {err}")],
+            };
+            if !failures.is_empty() {
+                log::info!("{command} {}: packages differ from the lock", target.name);
+                return failed(command, target, reports, failures.join("\n")).at(planned);
+            }
+        }
         if !succeeded {
             ok = false;
             break;
@@ -962,6 +995,44 @@ fn execute_inner(
         steps: reports,
         ok,
     }
+}
+
+/// The [`packages::GONE_VERSION`] markers of a locked package step, taken
+/// out of both streams (a terminal run merges stderr into stdout).
+fn take_gone(output: &mut Output) -> Vec<(String, String)> {
+    let mut gone = Vec::new();
+    for stream in [&mut output.stdout, &mut output.stderr] {
+        let mut text = String::from_utf8_lossy(stream).into_owned();
+        for pair in packages::take_gone(&mut text) {
+            if !gone.contains(&pair) {
+                gone.push(pair);
+            }
+        }
+        *stream = text.into_bytes();
+    }
+    gone
+}
+
+/// Reads the installed versions of `lock`'s names with `manager`, read-only,
+/// and returns [`packages::lock_failures`]; a query that fails or does not
+/// finish is one failure line.
+fn verify_lock(
+    transport: &dyn Transport,
+    manager: packages::Manager,
+    lock: &lock::Versions,
+    gone: &[(String, String)],
+    timeout: Duration,
+) -> Result<Vec<String>, TransportError> {
+    let names: Vec<&str> = lock.keys().map(String::as_str).collect();
+    if names.is_empty() {
+        return Ok(packages::lock_failures(lock, &BTreeMap::new(), gone));
+    }
+    Ok(
+        match packages::installed_versions(transport, manager, &names, timeout)? {
+            Ok(installed) => packages::lock_failures(lock, &installed, gone),
+            Err(why) => vec![why],
+        },
+    )
 }
 
 /// The step of `handler`, the `i`th `[[handlers]]` entry, on `target`: a
@@ -1617,6 +1688,9 @@ pub struct ApplyOnly<'a> {
     pub secrets: Option<&'a Passwords>,
     /// Where each user's `authorized_keys` goes, from [`guard_users`].
     pub homes: Option<&'a users::Homes>,
+    /// `--locked`'s `anvil.lock` (apply and plan alike), checked to cover
+    /// every target's platform before any step.
+    pub lock: Option<&'a Lock>,
 }
 
 /// The steps apply runs on `target`, one per item of `expanded` in order: a
@@ -1655,7 +1729,7 @@ pub fn resolve(
     let mut number = 0;
     for item in &expanded.items {
         let steps = match &item.kind {
-            ItemKind::Packages(packages) => package_run(target, facts, item, packages)?
+            ItemKind::Packages(packages) => package_run(target, facts, item, packages, apply.lock)?
                 .into_iter()
                 .collect(),
             ItemKind::File { entry, ordinal } => {
@@ -1785,11 +1859,14 @@ fn skip_run(label: String) -> PlannedRun {
 }
 
 /// The step of package `item`; `None` when its script has nothing to do.
+/// With `lock`, the script installs the versions the entry of the target's
+/// platform holds, and the step carries those to verify.
 fn package_run(
     target: &Target,
     facts: Option<&Facts>,
     item: &Item,
     packages: &Packages,
+    lock: Option<&Lock>,
 ) -> Result<Option<PlannedRun>, String> {
     if !selected(item, target, facts)? {
         log::info!("{}: packages: no match", target.name);
@@ -1800,10 +1877,31 @@ fn package_run(
     let sudo = packages.sudo_secret_for(target);
     let manager =
         packages::resolve(packages.choice_for(target), facts, sudo.is_some()).map_err(reason)?;
-    packages::check_pin(manager, packages).map_err(reason)?;
-    let Some(run) = packages::script(manager, packages, facts.is_root()) else {
+    let versions = match lock {
+        None => None,
+        Some(lock) => {
+            let platform = Platform::of(manager, facts).map_err(reason)?;
+            let versions = lock
+                .get(&platform)
+                .ok_or_else(|| reason(format!("no entry for {platform} in {}", lock::FILE)))?;
+            Some(versions)
+        }
+    };
+    if versions.is_none() || !packages::installs_exact(manager) {
+        packages::check_pin(manager, packages).map_err(reason)?;
+    }
+    let Some(run) = packages::script(manager, packages, facts.is_root(), versions) else {
         return Ok(None);
     };
+    let verify = versions.map(|versions| {
+        let names = packages.wanted(manager);
+        let locked = packages::locked_versions(&names, versions);
+        Arc::new(
+            (locked.into_iter())
+                .map(|(name, version)| (name.to_owned(), Locked::Version(version.to_owned())))
+                .collect(),
+        )
+    });
     let sudo_secret = sudo.filter(|_| packages::uses_password(manager, facts));
     match sudo_secret {
         Some(name) => log::info!(
@@ -1817,7 +1915,10 @@ fn package_run(
         label: None,
         sudo_secret: sudo_secret.map(str::to_owned),
         timeout: packages.timeout(),
-        kind: RunKind::Packages { manager },
+        kind: RunKind::Packages {
+            manager,
+            lock: verify,
+        },
         task: None,
         name: None,
         notify: Vec::new(),
@@ -1936,6 +2037,92 @@ mod tests {
         fn run_tty(&self, _: &str, _: &[u8], _: Duration) -> Result<Output, TransportError> {
             unreachable!("no step types a password")
         }
+    }
+
+    /// Answers the package step with `code` and a gone marker for vim on
+    /// stderr, and the version query with git at 2.0; logs each run.
+    struct Gone {
+        code: i32,
+        runs: Mutex<Vec<String>>,
+    }
+
+    impl Transport for Gone {
+        fn name(&self) -> &str {
+            "gone"
+        }
+
+        fn run(&self, script: &str, _: Duration) -> Result<Output, TransportError> {
+            self.runs.lock().unwrap().push(script.to_owned());
+            Ok(if script.starts_with("pacman -Q") {
+                Output {
+                    code: Some(1),
+                    stdout: format!("git 2.0\n{}\n", packages::VERSIONS_END).into_bytes(),
+                    ..Output::default()
+                }
+            } else {
+                Output {
+                    code: Some(self.code),
+                    stderr: b"E: failed\nanvil-gone-version vim 9.0\n".to_vec(),
+                    ..Output::default()
+                }
+            })
+        }
+
+        fn run_tty(&self, _: &str, _: &[u8], _: Duration) -> Result<Output, TransportError> {
+            unreachable!("no step types a password")
+        }
+    }
+
+    #[test]
+    fn a_gone_version_is_named_whether_or_not_the_verify_runs() {
+        let lock = lock::Versions::from([
+            ("git".to_owned(), Locked::Version("2.0".to_owned())),
+            ("vim".to_owned(), Locked::Version("9.0".to_owned())),
+        ]);
+        let step = PlannedRun {
+            run: "install".to_owned().into(),
+            label: None,
+            sudo_secret: None,
+            timeout: RUN_TIMEOUT,
+            kind: RunKind::Packages {
+                manager: packages::Manager::Pacman,
+                lock: Some(Arc::new(lock)),
+            },
+            task: None,
+            name: None,
+            notify: Vec::new(),
+        };
+        let run = |code| {
+            let gone = Gone {
+                code,
+                runs: Mutex::new(Vec::new()),
+            };
+            let report = execute(
+                "apply",
+                &target("a"),
+                &gone,
+                std::slice::from_ref(&step),
+                &Passwords::new(),
+                &Cancel::new(),
+                None,
+            );
+            (report, gone.runs.into_inner().unwrap().len())
+        };
+        let (report, runs) = run(1);
+        assert_eq!((runs, report.ok()), (2, false));
+        assert_eq!(
+            report.failure().as_deref(),
+            Some("packages: vim 9.0 is no longer in the repositories")
+        );
+        assert_eq!(report.steps()[0].stderr, "E: failed\n");
+
+        let (report, runs) = run(100);
+        assert_eq!((runs, report.ok()), (1, false));
+        assert_eq!(
+            report.steps()[0].stderr,
+            "E: failed\npackages: vim 9.0 is no longer in the repositories\n"
+        );
+        assert_eq!(report.failure().as_deref(), Some("step 1 exited 100"));
     }
 
     #[test]
@@ -2111,6 +2298,7 @@ mod tests {
             ApplyOnly {
                 secrets: Some(&Passwords::new()),
                 homes: None,
+                lock: None,
             },
             &FakePlugins::none(),
             &Cancel::new(),
@@ -2225,7 +2413,10 @@ mod tests {
         assert!(!ended(step, Some(2), ""));
         let manager = packages::Manager::Brew;
         assert!(!ended(
-            RunKind::Packages { manager },
+            RunKind::Packages {
+                manager,
+                lock: None
+            },
             Some(0),
             "installed\n"
         ));
@@ -2275,7 +2466,7 @@ mod tests {
     fn a_package_item_the_target_does_not_match_is_a_skip() {
         let pkgs = packages(&["git"]);
         let web = item(ItemKind::Packages(pkgs.clone()), &["web"], &[]);
-        let run = package_run(&target("a"), Some(&mac()), &web, &pkgs).unwrap();
+        let run = package_run(&target("a"), Some(&mac()), &web, &pkgs, None).unwrap();
         assert_eq!(run, Some(skip_run("skipped packages: no match".to_owned())));
     }
 
@@ -2283,13 +2474,14 @@ mod tests {
     fn a_package_item_installs_with_the_targets_manager() {
         let pkgs = packages(&["git"]);
         let all = item(ItemKind::Packages(pkgs.clone()), &[], &[]);
-        let run = package_run(&target("a"), Some(&mac()), &all, &pkgs)
+        let run = package_run(&target("a"), Some(&mac()), &all, &pkgs, None)
             .unwrap()
             .unwrap();
         assert_eq!(
             run.kind,
             RunKind::Packages {
-                manager: packages::Manager::Brew
+                manager: packages::Manager::Brew,
+                lock: None,
             }
         );
         assert_eq!(run.kind.entry(), Entry::Packages);
@@ -2303,7 +2495,7 @@ mod tests {
         let pkgs = packages(&[]);
         let all = item(ItemKind::Packages(pkgs.clone()), &[], &[]);
         assert_eq!(
-            package_run(&target("a"), Some(&mac()), &all, &pkgs),
+            package_run(&target("a"), Some(&mac()), &all, &pkgs, None),
             Ok(None)
         );
     }
@@ -2313,8 +2505,45 @@ mod tests {
         let pkgs = packages(&["git"]);
         let all = item(ItemKind::Packages(pkgs.clone()), &[], &[]);
         assert_eq!(
-            package_run(&target("a"), None, &all, &pkgs),
+            package_run(&target("a"), None, &all, &pkgs, None),
             Err("packages: the probe has not run".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_locked_package_step_carries_its_platforms_versions() {
+        let pkgs = packages(&["git", "vim"]);
+        let all = item(ItemKind::Packages(pkgs.clone()), &[], &[]);
+        let platform = Platform::of(packages::Manager::Brew, &mac()).unwrap();
+        let lock = Lock {
+            platforms: BTreeMap::from([(
+                platform.clone(),
+                lock::Versions::from([
+                    ("git".to_owned(), Locked::Version("2.47.0".to_owned())),
+                    ("vim".to_owned(), Locked::Missing),
+                    ("tig".to_owned(), Locked::Version("2.5".to_owned())),
+                ]),
+            )]),
+        };
+        let run = package_run(&target("a"), Some(&mac()), &all, &pkgs, Some(&lock))
+            .unwrap()
+            .unwrap();
+        let only_git =
+            lock::Versions::from([("git".to_owned(), Locked::Version("2.47.0".to_owned()))]);
+        assert_eq!(
+            run.kind,
+            RunKind::Packages {
+                manager: packages::Manager::Brew,
+                lock: Some(Arc::new(only_git)),
+            }
+        );
+        let unlocked = package_run(&target("a"), Some(&mac()), &all, &pkgs, None);
+        assert_eq!(run.run, unlocked.unwrap().unwrap().run);
+
+        let other = Lock::default();
+        assert_eq!(
+            package_run(&target("a"), Some(&mac()), &all, &pkgs, Some(&other)),
+            Err(format!("packages: no entry for {platform} in anvil.lock"))
         );
     }
 

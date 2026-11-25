@@ -1,6 +1,7 @@
 //! The plain step types: what a step does, as files, services, packages,
 //! plugins and tasks build it and the engine runs it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -10,6 +11,7 @@ use crate::config::{AbsentType, Guards};
 use crate::dirs;
 use crate::files;
 use crate::links;
+use crate::lock;
 use crate::logger::{escape_invisible, escape_line};
 use crate::packages;
 use zeroize::Zeroizing;
@@ -39,8 +41,13 @@ pub struct PlannedRun {
 /// What a run does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunKind {
-    /// The package step; `manager` is for marker extraction.
-    Packages { manager: packages::Manager },
+    /// The package step; `manager` is for marker extraction. Under
+    /// `--locked`, `lock` holds the step's names that have a locked version,
+    /// which apply verifies once the step has run.
+    Packages {
+        manager: packages::Manager,
+        lock: Option<Arc<lock::Versions>>,
+    },
     /// A `[[files]]` step, whose `run` carries the file's bytes; also a
     /// rollback restore, and a rollback note, which is always a skip and has
     /// `dest` `""`.

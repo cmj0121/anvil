@@ -18,9 +18,11 @@ anvil [-v...] [--inventory PATH] [--config PATH] [--ssh-config PATH] [--json] [-
          [--strict] [--write]    with --harden: also the high-risk rules; write the suggestions
   files <ACTION>                 manage the file store that [[files]] src $/… reads: ls, cp, mv, rm, mkdir, cat, edit
   doctor                         local checks + every target's facts and reachability
-  apply                          run the config's steps on every target
+  apply [--locked]               run the config's steps on every target; --locked installs anvil.lock's versions
   plan                           show the steps apply would run on every target, running none
        [--show-content]          --show-content also prints the bytes apply would write per file step
+       [--locked]                --locked plans anvil.lock's versions, as apply --locked would
+  lock [--check] [--from HOST]   record the installed package versions in anvil.lock; --check compares it with the config
   rollback [--force DEST]...     restore the files the last apply wrote on every target
   run [--timeout SECS] <FILE|->  run a POSIX sh script on every target, read from FILE or stdin
   secret <NAME>                  edit one secret in the editor
@@ -441,6 +443,10 @@ Local checks, then every selected target's facts:
   when it cannot be resolved (`` `pacman` needs root and sudo is not installed ``, say, or the sudo password refusal in
   [Root and sudo](packages.md#root-and-sudo)). A target with a sudo secret resolves the way apply does, so sudo `binary` is
   accepted for it. An unreachable target gets no `manager` row.
+- `lock`, only when the workspace has an [`anvil.lock`](packages.md#lock): each connectable target with package work
+  and a resolved manager gets a row `lock            ok`, `lock            WARNING: 2 packages differ (git, nodejs)`,
+  `lock            WARNING: no entry for apt/debian 12/x86_64` or `lock            WARNING: lock check failed: REASON`,
+  read-only and without sudo. It does not change the exit.
 - `vars` and `env`: each target's resolved [vars and env](configuration.md#vars-and-env), after the facts, one row
   per key with the level that set it (`global`, `tag:NAME` or `host`). A var shows as JSON text, so its type shows; an
   env value shows as written. Invisible and bidi characters are escaped. Values are shown as is: they are not secrets.
@@ -522,7 +528,8 @@ pending handlers has `pending_handlers`, and the record's load warnings are `loc
 empty.
 
 With `[packages]` and a resolved manager, each target also has a `packages` string: `"ok"` or
-`"WARNING: not found by MANAGER: a, b"`, shown as a `packages` row in human output.
+`"WARNING: not found by MANAGER: a, b"`, shown as a `packages` row in human output. With an `anvil.lock` it also has
+a `lock` string, the `lock` row's text, left out when there is no file.
 The check uses no sudo, database refresh or installation. A failed check shows `WARNING: package check failed: REASON`.
 dnf uses `-C` for cache-only queries; the check uses `[packages].timeout`. These warnings do not affect doctor's exit code.
 
@@ -711,6 +718,18 @@ password](packages.md#typing-the-sudo-password)); its `$` line is still the one-
 with nothing to install, upgrade, pin or remove, no probe runs and apply runs only the `[[steps]]`, unless a step names
 a plugin ([Plugin steps](#plugin-steps)) or the config has `[[groups]]`, `[[users]]`, `[[dirs]]`, `[[files]]`,
 `[[links]]`, `[[absent]]` or `[[services]]`.
+
+`apply --locked` installs the versions [`anvil.lock`](packages.md#lock) holds for each target's platform. Before any
+target changes it is exit 2 when a package item has `upgrade = true` (`--locked: upgrade = true cannot be used with a
+lock`), when there is no file (`--locked: anvil.lock not found`) or it does not load, and when a reachable target with
+package work has no entry (`--locked: anvil.lock has no entry for some targets; run anvil lock`, then
+`TARGET: no entry for apt/debian 12/x86_64` per target). apt, dnf and apk install each locked version exactly (apt with
+`--allow-downgrades`); pacman and brew install as usual. After the package step every manager's installed versions
+are checked, and a name off its lock fails the target (exit 1) with `packages: git 2.47.0 is locked, 2.48.1 is
+installed`, `packages: git 2.47.0 is locked, not installed` or `packages: git 1:2.39.5-0+deb12u2 is no longer in the
+repositories`. A name with no locked version installs as usual, with the warning
+`packages: NAME has no locked version in anvil.lock; run anvil lock`. Only top-level packages are locked, not their
+dependencies ([Lock](packages.md#lock)).
 
 In a legacy config, each `[[groups]]` and `[[users]]` entry is one step on every target, after the package step: the
 present groups, then the users, then the absent groups. Each creates, fixes or removes the account when the target's
@@ -1354,6 +1373,13 @@ cannot be reached, probed or resolved fails with the same reason apply gives (`p
 manager and a `pin` on brew, apt or apk, such as `packages: pin is not one-shot on brew: vim`; without `[packages]` work
 a failed probe reads `probe: REASON`), and the other targets are still planned. plan runs each plugin step's plugin on
 the controller, as apply would, to list the script it returns ([Plugin steps](#plugin-steps)).
+
+`plan --locked` makes `apply --locked`'s exit 2 checks, reads each target's installed versions read-only, and after
+the steps adds one line per name not at its lock: `would install git 1:2.39.5-0+deb12u2`,
+`would change nodejs 18.19.0 -> 18.20.4` (apt, dnf, apk), `would fail: git 2.47.0 is locked, 2.48.1 is installed`
+(pacman, brew) or `would install curl (no locked version)`. They do not change the exit. In `--json` each target has
+a `lock` array of `{"name", "would", "installed", "locked"}`, `would` being `install`, `change` or `fail` and the
+versions left out when there is none ([Plan and doctor](packages.md#plan-and-doctor)).
 
 plan never opens the secret store. A step that would type a sudo password says which secret it would use; whether that
 secret is set and free of control characters is not checked, so plan can pass where apply then fails with
@@ -2419,6 +2445,33 @@ The launchd bootstrap is refused for a disabled job with
 `services: NAME is disabled; enable it to restart it`; a `reloaded` handler never reads the disabled overrides. The
 launchd and crashed OpenRC paths are tested against stand-in tools.
 
+### `anvil lock`
+
+Records the installed version of every managed package on the selected targets, per platform, in `anvil.lock` in
+the [workspace](configuration.md#the-workspace), for [`apply --locked`](#anvil-apply). Commit it beside the config.
+
+```sh
+anvil lock                    # probe every selected target and write anvil.lock
+anvil lock --target web       # update only the platforms of the web targets; the others keep their entry
+anvil lock --from web2        # where web's platform disagrees, take web2's versions
+anvil lock --check            # compare anvil.lock with the config; contacts no target
+```
+
+Each target is probed, its manager resolved and its versions read without sudo or a refresh. Success prints
+`wrote anvil.lock (N platforms)`; `--json` prints the written document (`{"version": 1, "platform": [...]}`). Warnings
+for a name installed on no target (recorded as `missing`) or a qualified name (skipped) go to stderr. A target that
+fails, or two targets of one platform with different versions of a name, is exit 1 and nothing is written:
+
+```text
+lock: apt/debian 12/x86_64 git differs: web1 has 1:2.39.5-0+deb12u2, web2 has 1:2.39.4-0+deb12u1 (use --from HOST)
+```
+
+`--from HOST` (repeatable, one per platform) takes HOST's versions on its platform; a HOST that is not a selected
+target, or two on one platform, is exit 2. `--check` ignores `--target`, cannot be combined with `--from`, prints one
+line per name a platform lacks or still lists (`anvil.lock: apt/debian 12/x86_64 lacks nodejs`) and exits 1 when
+there are any or the file is not found; `--json` prints `{"stale": bool, "problems": [...]}`. An `anvil.lock` that
+does not load is exit 2. The file format, the platform key and the names recorded are in [Lock](packages.md#lock).
+
 ### `anvil rollback`
 
 ```text
@@ -2939,6 +2992,10 @@ that exits non-zero aborts the command: nothing is written, exit 1.
   ([Doctor plugins](#doctor-plugins-drift-since-the-last-apply)); drift and an unreachable target share the code.
   `plan`: a target could not be reached, probed or resolved.
   `apply`/`plan`: a plugin step's plugin failed on a target ([Plugin steps](#plugin-steps)).
+  `apply --locked`/`plan --locked`: a target whose probe gives an invalid platform field ([Lock](packages.md#lock));
+  `apply --locked` also a package off its lock after the package step ([`apply --locked`](#anvil-apply)).
+  `lock`: a target failed (an invalid platform field included) or two targets of a platform disagree;
+  `lock --check`: `anvil.lock` is stale or not found.
   `run`: a target failed or could not be reached.
   `rollback`: see [anvil rollback](#anvil-rollback); `apply` also when the record cannot be read, locked or saved, or
   there is no state directory ([The apply record](#the-apply-record)).
@@ -2950,7 +3007,9 @@ that exits non-zero aborts the command: nothing is written, exit 1.
   `--target`, an invalid, unreadable or ambiguous file, no `$HOME` (except for the state directory of `apply` and
   `rollback`, which is 1: [The apply record](#the-apply-record)), editor not found, an invalid buffer after three
   attempts, or a secret larger than 1 MiB. For `apply` and `plan`, also a `[plugins]` entry that fails the pin checks
-  ([Plugin steps](#plugin-steps)). For `run`, also a script that is empty, over 1 MiB, not UTF-8 or
+  ([Plugin steps](#plugin-steps)). For `apply --locked` and `plan --locked`, also `upgrade = true`, no `anvil.lock`, or
+  a target without an entry. For `lock`, also a bad `--from`. For these, also an `anvil.lock` that does not load
+  (`doctor` shows that as its `lock` row instead). For `run`, also a script that is empty, over 1 MiB, not UTF-8 or
   unreadable, or a `--timeout` outside 1..=3600. For `tui`, see below.
 - **`update`**: 0 when up to date, ahead of the latest release, or updated. 1 with `--check` when an update is
   available, and for every failure: the query, a download, a check, or a refusal; the installed binary is then

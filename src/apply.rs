@@ -62,6 +62,7 @@ use crate::fanout::{self, Event};
 use crate::files::Sources;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
+use crate::lock::Lock;
 use crate::options::{Options, Output};
 use crate::plugin::Plugins;
 use crate::prepared::Prepared;
@@ -114,6 +115,7 @@ fn run_dropping(
         }
         _ => Default::default(),
     };
+    warnings.extend(prepared.lock_warnings.iter().cloned());
     let mut report = apply_targets(
         &prepared.targets,
         prepared.opts.parallel,
@@ -125,6 +127,7 @@ fn run_dropping(
         &prepared.passwords,
         &prepared.cancel,
         session,
+        prepared.lock.as_ref(),
         on,
     );
     warnings.append(&mut report.warnings);
@@ -196,6 +199,7 @@ fn apply_targets(
     passwords: &Passwords,
     cancel: &Cancel,
     session: Option<Session>,
+    lock: Option<&Lock>,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Report {
     let journal = session.map(|session| Journal::new(session, cancel));
@@ -225,6 +229,7 @@ fn apply_targets(
                 passwords,
                 cancel,
                 journal.as_ref(),
+                lock,
             )
         },
         |target| Applied::unrecorded(cancelled("apply", target, Vec::new(), cancel)),
@@ -267,7 +272,12 @@ impl Applied {
 /// per handler `drop_pending` took off, then each target's block in order
 /// (or one JSON document), then the summary. A name that cannot be a
 /// handler's is exit 2.
-pub fn run(out: Output, opts: &Options, drop_pending: &[String]) -> Result<(), Failure> {
+pub fn run(
+    out: Output,
+    opts: &Options,
+    drop_pending: &[String],
+    locked: bool,
+) -> Result<(), Failure> {
     if let Some(name) = drop_pending.iter().find(|name| !is_handler_name(name)) {
         return Err(Failure::usage(format!(
             "--drop-pending `{}`: must match [A-Za-z0-9 ._-]+, at most {MAX_HANDLER_NAME_BYTES} bytes",
@@ -278,7 +288,10 @@ pub fn run(out: Output, opts: &Options, drop_pending: &[String]) -> Result<(), F
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
     print_report(out, "apply", |on| {
-        let prepared = Prepared::apply(opts, config, expanded, cancel)?;
+        let mut prepared = Prepared::apply(opts, config, expanded, cancel)?;
+        if locked {
+            prepared.use_lock()?;
+        }
         let mut dropped = |drop: &DroppedPending| {
             if !out.json {
                 let line = format!(
@@ -329,6 +342,7 @@ fn apply_target(
     passwords: &Passwords,
     cancel: &Cancel,
     journal: Option<&Journal<'_>>,
+    lock: Option<&Lock>,
 ) -> Applied {
     log::info!("apply {}: start", target.name);
     let transport = match transport {
@@ -377,6 +391,7 @@ fn apply_target(
             ApplyOnly {
                 secrets: Some(passwords),
                 homes: Some(&homes),
+                lock,
             },
             plugins,
             cancel,
@@ -455,7 +470,7 @@ mod tests {
     ) -> Applied {
         let expanded = legacy(config);
         super::apply_target(
-            target, transport, config, &expanded, sources, plugins, passwords, cancel, None,
+            target, transport, config, &expanded, sources, plugins, passwords, cancel, None, None,
         )
     }
 
@@ -476,7 +491,7 @@ mod tests {
         let expanded = legacy(config);
         super::apply_targets(
             targets, parallel, transport, config, &expanded, sources, plugins, passwords, cancel,
-            session, on,
+            session, None, on,
         )
     }
 
@@ -498,6 +513,7 @@ mod tests {
             ApplyOnly {
                 secrets: Some(&Passwords::new()),
                 homes: None,
+                lock: None,
             },
             plugins,
             cancel,
@@ -1378,6 +1394,7 @@ mod tests {
         let mut package = planned("package", None, RUN_TIMEOUT);
         package.kind = RunKind::Packages {
             manager: packages::Manager::Pacman,
+            lock: None,
         };
         let runs = [package, planned("user", None, RUN_TIMEOUT)];
         let warning = "packages: not found by pacman: nvim, watch (add [packages.alias.NAME])";
@@ -1416,7 +1433,7 @@ mod tests {
     fn packages_probe_then_run_their_script_as_step_one() {
         let pkgs = packages(&["git", "curl"], false);
         let (report, runs) = apply_packages("local", &pkgs, MAC, &["one"]);
-        let brew = packages::script(packages::Manager::Brew, &pkgs, false).unwrap();
+        let brew = packages::script(packages::Manager::Brew, &pkgs, false, None).unwrap();
         assert_eq!(runs, [facts::PROBE, brew.as_str(), "one"]);
         assert!(report.ok());
         assert_eq!(report.steps().len(), 2);
@@ -2028,6 +2045,7 @@ mod tests {
         ] {
             step.kind = RunKind::Packages {
                 manager: packages::Manager::Pacman,
+                lock: None,
             };
             assert_eq!(
                 resolved(
@@ -3595,6 +3613,7 @@ mod tests {
                 "install",
                 RunKind::Packages {
                     manager: packages::Manager::Pacman,
+                    lock: None,
                 },
             ),
             kinded("one", step_kind(1)),
@@ -4762,6 +4781,7 @@ mod tests {
             ApplyOnly {
                 secrets: Some(&Passwords::new()),
                 homes: None,
+                lock: None,
             },
             &FakePlugins::none(),
             &Cancel::new(),
@@ -4790,6 +4810,7 @@ mod tests {
             &FakePlugins::new(|_, _| panic!("no plugin matches")),
             &Passwords::new(),
             &Cancel::new(),
+            None,
             None,
         )
     }
@@ -4918,7 +4939,8 @@ mod tests {
         assert_eq!(
             runs[2].kind,
             RunKind::Packages {
-                manager: packages::Manager::Pacman
+                manager: packages::Manager::Pacman,
+                lock: None,
             }
         );
     }
@@ -5095,6 +5117,7 @@ mod tests {
             &FakePlugins::none(),
             &Passwords::new(),
             &cancel,
+            None,
             None,
         )
     }

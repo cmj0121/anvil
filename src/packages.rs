@@ -9,8 +9,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::facts::Facts;
 use crate::inventory::{Target, TargetKind};
+use crate::lock::{Locked, Versions};
 use crate::secret;
-use crate::transport::{SUDO_OK, TTY_READY};
+use crate::transport::{SUDO_OK, TTY_READY, Transport, TransportError};
 
 /// Most `install`, `remove` or `pin` entries.
 pub const MAX_INSTALL: usize = 256;
@@ -36,7 +37,7 @@ const MANAGERS: &str = managers!();
 const BREW_ENV: &str = "export PATH=\"$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin\"; \
      export SUDO_ASKPASS=\"${SUDO_ASKPASS:-/usr/bin/false}\"; ";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Manager {
     Brew,
@@ -330,6 +331,14 @@ impl Packages {
             .collect()
     }
 
+    /// The resolved `install` then `pin` names for `manager`, each once.
+    pub(crate) fn wanted(&self, manager: Manager) -> Vec<&str> {
+        let mut names = self.names_for(self.install.iter().chain(&self.pin), manager);
+        let mut seen = BTreeSet::new();
+        names.retain(|name| seen.insert(*name));
+        names
+    }
+
     /// Whether there is anything to install, upgrade, remove or pin.
     pub fn has_work(&self) -> bool {
         self.upgrade || !self.install.is_empty() || !self.remove.is_empty() || !self.pin.is_empty()
@@ -386,7 +395,7 @@ fn check_names(field: &str, names: &[String]) -> Result<(), String> {
 
 /// `name` within the byte limit and [`NAME_RULE`]; the error is the rule it
 /// breaks, for the caller to prefix with the field.
-fn check_name(name: &str) -> Result<(), String> {
+pub(crate) fn check_name(name: &str) -> Result<(), String> {
     if name.len() > MAX_NAME_BYTES {
         return Err(format!(
             "{} bytes exceeds the {MAX_NAME_BYTES} byte limit",
@@ -607,18 +616,45 @@ pub fn take_unknown(output: &mut String) -> Vec<String> {
 /// nothing to do. `root`: run without `sudo -n`. The names go into the
 /// script unquoted, so `packages` must have passed [`Packages::validate`]
 /// and [`check_pin`]; panics otherwise, in every build.
-pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<String> {
+///
+/// With `lock` (`--locked`, never with `upgrade`), apt, dnf and apk treat
+/// pins as installs and install each name holding a locked version at that
+/// version ([`exact_install`]); the other names, and every name on pacman
+/// and brew, install as without a lock. `check_pin` then binds pacman and
+/// brew only.
+pub fn script(
+    manager: Manager,
+    packages: &Packages,
+    root: bool,
+    lock: Option<&Versions>,
+) -> Option<String> {
     assert!(
         packages.validate().is_ok(),
         "packages::script: package names must pass Packages::validate before they reach a shell line"
     );
+    let exact = lock.filter(|_| installs_exact(manager));
     assert!(
-        check_pin(manager, packages).is_ok(),
+        exact.is_some() || check_pin(manager, packages).is_ok(),
         "packages::script: pins must pass check_pin before they reach a shell line"
     );
+    assert!(
+        lock.is_none() || !packages.upgrade,
+        "packages::script: a lock is never used with upgrade"
+    );
     let s = if root { "" } else { "sudo -n " };
-    let pins = packages.names_for(&packages.pin, manager);
-    let mut p = packages.names_for(&packages.install, manager);
+    let (pins, mut p, versioned) = match exact {
+        None => (
+            packages.names_for(&packages.pin, manager),
+            packages.names_for(&packages.install, manager),
+            Vec::new(),
+        ),
+        Some(lock) => {
+            let mut names = packages.wanted(manager);
+            let versioned = locked_versions(&names, lock);
+            names.retain(|name| !versioned.iter().any(|(n, _)| n == name));
+            (Vec::new(), names, versioned)
+        }
+    };
     p.retain(|name| !pins.contains(name));
     let p = p.join(" ");
     let install = !p.is_empty();
@@ -666,13 +702,16 @@ pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<Strin
             }
         }
         Manager::Apt => {
-            if packages.upgrade || install {
+            if packages.upgrade || install || !versioned.is_empty() {
                 parts.push(format!("{s}apt-get update"));
             }
             if packages.upgrade {
                 parts.push(format!(
                     "{s}env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
                 ));
+            }
+            if !versioned.is_empty() {
+                parts.push(exact_install(manager, &versioned, s));
             }
             if install {
                 parts.push(known_db(manager, false));
@@ -692,6 +731,9 @@ pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<Strin
             if packages.upgrade {
                 parts.push(format!("{s}dnf -y upgrade{exclude}"));
             }
+            if !versioned.is_empty() {
+                parts.push(exact_install(manager, &versioned, s));
+            }
             if install || pin {
                 parts.push(known_db(manager, false));
             }
@@ -709,11 +751,14 @@ pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<Strin
             }
         }
         Manager::Apk => {
-            if packages.upgrade || install {
+            if packages.upgrade || install || !versioned.is_empty() {
                 parts.push(format!("{s}apk update"));
             }
             if packages.upgrade {
                 parts.push(format!("{s}apk upgrade"));
+            }
+            if !versioned.is_empty() {
+                parts.push(exact_install(manager, &versioned, s));
             }
             if install {
                 parts.push(known_db(manager, false));
@@ -741,11 +786,295 @@ pub fn script(manager: Manager, packages: &Packages, root: bool) -> Option<Strin
     if parts.is_empty() {
         return None;
     }
+    if !versioned.is_empty() {
+        parts.push("[ \"$g\" = 0 ]".to_owned());
+    }
     let line = parts.join(" && ");
     Some(match manager {
         Manager::Brew => format!("{BREW_ENV}{line}"),
         _ => line,
     })
+}
+
+/// Whether `manager` installs a locked version exactly (apt, dnf, apk);
+/// pacman and brew only verify it after their normal install.
+pub fn installs_exact(manager: Manager) -> bool {
+    matches!(manager, Manager::Apt | Manager::Dnf | Manager::Apk)
+}
+
+/// The `(name, version)` of each of `names` that `lock` holds a version of
+/// and that can be locked; a `missing` name or one the entry lacks is left
+/// out, so it installs unversioned.
+pub fn locked_versions<'a>(names: &[&'a str], lock: &'a Versions) -> Vec<(&'a str, &'a str)> {
+    names
+        .iter()
+        .filter(|name| lockable(name))
+        .filter_map(|name| match lock.get(*name) {
+            Some(Locked::Version(version)) => Some((*name, version.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Marker emitted on stderr for a locked version the repositories no longer
+/// offer: `anvil-gone-version NAME VERSION`.
+pub const GONE_VERSION: &str = "anvil-gone-version ";
+
+/// The brace group that, for each of `versioned`, does nothing when the name
+/// is installed at its version, collects the single-quoted versioned word
+/// (`N=v` on apt and apk, `N-v` on dnf) in `$b` when the repositories offer
+/// that version (apt's `show` exits 0 on a version it lacks, so its output
+/// decides), and else prints a [`GONE_VERSION`] marker and sets `$g` to
+/// 1; then one install of `$b`, which may downgrade. The script's last part
+/// checks `$g`.
+fn exact_install(manager: Manager, versioned: &[(&str, &str)], s: &str) -> String {
+    let mut checks = String::new();
+    for &(n, v) in versioned {
+        assert!(
+            is_version(v),
+            "packages::script: locked versions must pass is_version before they reach a shell line"
+        );
+        let (at, has, word) = match manager {
+            Manager::Apt => (
+                format!(
+                    "dpkg-query -W -f='${{db:Status-Abbrev}}${{Version}}\\n' {n} 2>/dev/null \
+                     | cut -c2- | grep -qxF 'i {v}'"
+                ),
+                format!("[ -n \"$(apt-cache show '{n}={v}' 2>/dev/null)\" ]"),
+                format!("'{n}={v}'"),
+            ),
+            Manager::Dnf => (
+                format!(
+                    "case \"$(rpm -q --qf '%{{EPOCH}}:%{{VERSION}}-%{{RELEASE}}\\n' {n} 2>/dev/null)\" \
+                     in ('{v}'|'(none):{v}'|'0:{v}') true;; (*) false;; esac"
+                ),
+                format!("[ -n \"$(dnf -q repoquery '{n}-{v}' 2>/dev/null)\" ]"),
+                format!("'{n}-{v}'"),
+            ),
+            Manager::Apk => (
+                format!("apk info -v 2>/dev/null | grep -qxF '{n}-{v}'"),
+                format!("apk policy {n} 2>/dev/null | grep -qxF '  {v}:'"),
+                format!("'{n}={v}'"),
+            ),
+            Manager::Pacman | Manager::Brew => unreachable!("{manager} installs no exact version"),
+        };
+        checks.push_str(&format!(
+            "if {at}; then :; elif {has}; then b=\"$b \"{word}; \
+             else printf '{GONE_VERSION}%s %s\\n' {n} '{v}' >&2; g=1; fi; "
+        ));
+    }
+    let install = match manager {
+        Manager::Apt => {
+            format!(
+                "{s}env DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades $b"
+            )
+        }
+        Manager::Dnf => format!("{s}dnf -y install $b"),
+        _ => format!("{s}apk add $b"),
+    };
+    format!("{{ b=; g=0; {checks}[ -z \"$b\" ] || {install}; }}")
+}
+
+/// Removes complete, well-formed [`GONE_VERSION`] lines, preserving other
+/// output; each `(name, version)` once.
+pub fn take_gone(output: &mut String) -> Vec<(String, String)> {
+    let mut gone = Vec::new();
+    let mut kept = String::new();
+    for line in output.split_inclusive('\n') {
+        let found = line
+            .trim_end_matches(['\r', '\n'])
+            .strip_prefix(GONE_VERSION)
+            .and_then(|rest| rest.split_once(' '))
+            .filter(|(name, version)| check_name(name).is_ok() && is_version(version));
+        match found {
+            Some((name, version)) => {
+                let pair = (name.to_owned(), version.to_owned());
+                if !gone.contains(&pair) {
+                    gone.push(pair);
+                }
+            }
+            None => kept.push_str(line),
+        }
+    }
+    *output = kept;
+    gone
+}
+
+/// One failure line per `(name, version)` gone from the repositories.
+pub fn gone_failures(gone: &[(String, String)]) -> Vec<String> {
+    gone.iter()
+        .map(|(name, version)| {
+            format!("packages: {name} {version} is no longer in the repositories")
+        })
+        .collect()
+}
+
+/// The verify of a locked package step: one line per name of `lock` gone
+/// from the repositories, then one per other locked name whose `installed`
+/// version differs. Empty when everything is at its lock.
+pub fn lock_failures(
+    lock: &Versions,
+    installed: &BTreeMap<String, String>,
+    gone: &[(String, String)],
+) -> Vec<String> {
+    let mut failures = gone_failures(gone);
+    for (name, locked) in lock {
+        let Locked::Version(version) = locked else {
+            continue;
+        };
+        if gone.iter().any(|(n, _)| n == name) {
+            continue;
+        }
+        match installed.get(name) {
+            Some(have) if have == version => {}
+            Some(have) => failures.push(format!(
+                "packages: {name} {version} is locked, {have} is installed"
+            )),
+            None => failures.push(format!(
+                "packages: {name} {version} is locked, not installed"
+            )),
+        }
+    }
+    failures
+}
+
+/// Longest installed version, in bytes.
+pub const MAX_VERSION_BYTES: usize = 128;
+/// The rule every installed version follows.
+pub const VERSION_RULE: &str =
+    "must match [A-Za-z0-9][A-Za-z0-9.+~:_-]*, with no `~` right after `:`";
+
+/// [`VERSION_RULE`] within [`MAX_VERSION_BYTES`]; a `~` right after a `:`
+/// is refused because bash may tilde-expand it in a word like `N=1:~v`.
+pub fn is_version(s: &str) -> bool {
+    let mut chars = s.chars();
+    s.len() <= MAX_VERSION_BYTES
+        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || ".+~:_-".contains(c))
+        && !s.contains(":~")
+}
+
+/// False for names holding `:` or `/` (apt arch qualifiers, brew taps,
+/// dnf/pacman repo prefixes); `@` stays lockable (brew `python@3.12`).
+pub fn lockable(name: &str) -> bool {
+    !name.contains([':', '/'])
+}
+
+/// The last line of a finished [`versions_script`].
+pub const VERSIONS_END: &str = "anvil-versions-end=1";
+
+/// The read-only line that prints the installed version of `names` with
+/// `manager`: no sudo, no refresh, brew under its PATH prefix. It ends by
+/// printing [`VERSIONS_END`] whatever the manager's exit (pacman, brew and
+/// dpkg exit non-zero when a name is missing; that is not a failure). Run it
+/// with [`Packages::timeout`]. The names go into the line unquoted, so each
+/// must pass [`Packages::validate`] and be [`lockable`]; panics otherwise, in
+/// every build.
+pub fn versions_script(manager: Manager, names: &[&str]) -> String {
+    assert!(
+        names
+            .iter()
+            .all(|name| check_name(name).is_ok() && lockable(name)),
+        "packages::versions_script: names must pass Packages::validate and lockable before they reach a shell line"
+    );
+    let names = names.join(" ");
+    let query = match manager {
+        Manager::Brew => format!("{BREW_ENV}brew list --versions --formula {names}"),
+        Manager::Pacman => format!("pacman -Q {names}"),
+        Manager::Apt => {
+            format!("dpkg-query -W -f='${{db:Status-Abbrev}} ${{Package}} ${{Version}}\\n' {names}")
+        }
+        Manager::Dnf => {
+            format!("rpm -q --qf '%{{NAME}} %{{EPOCH}}:%{{VERSION}}-%{{RELEASE}}\\n' {names}")
+        }
+        Manager::Apk => "apk info -v".to_owned(),
+    };
+    format!("{query}; printf '%s\\n' {VERSIONS_END}")
+}
+
+/// Runs [`versions_script`] for `names` on `transport` and returns
+/// [`parse_versions`] of its stdout; the outer Err is the transport's.
+pub fn installed_versions(
+    transport: &dyn Transport,
+    manager: Manager,
+    names: &[&str],
+    timeout: Duration,
+) -> Result<Result<BTreeMap<String, String>, String>, TransportError> {
+    let output = transport.run(&versions_script(manager, names), timeout)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_versions(manager, names, &stdout))
+}
+
+/// One `manager` output line as `(name, version)`; `None` for a line not of
+/// the query's shape.
+fn version_line(manager: Manager, line: &str) -> Option<(&str, String)> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    match (manager, fields.as_slice()) {
+        (Manager::Brew, [name, .., last]) => Some((name, (*last).to_owned())),
+        (Manager::Pacman, [name, version]) => Some((name, (*version).to_owned())),
+        (Manager::Apt, [status, name, version]) if status.chars().nth(1) == Some('i') => {
+            Some((name, (*version).to_owned()))
+        }
+        (Manager::Dnf, [name, version]) => {
+            let (epoch, rest) = version.split_once(':')?;
+            let version = if epoch == "(none)" || epoch == "0" {
+                rest
+            } else {
+                version
+            };
+            Some((name, version.to_owned()))
+        }
+        (Manager::Apk, [package]) => {
+            let mut parts = package.rsplitn(3, '-');
+            let (release, version, name) = (parts.next()?, parts.next()?, parts.next()?);
+            Some((name, format!("{version}-{release}")))
+        }
+        _ => None,
+    }
+}
+
+/// The installed version of each of `names` in the `stdout` of
+/// [`versions_script`]; a name not installed is absent. Err when the query
+/// did not finish (no [`VERSIONS_END`] line), a version breaks
+/// [`VERSION_RULE`], or one name has two different versions (multiarch,
+/// multilib).
+pub fn parse_versions(
+    manager: Manager,
+    names: &[&str],
+    stdout: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut versions = BTreeMap::new();
+    for line in stdout.lines().map(|line| line.trim_end_matches('\r')) {
+        if line == VERSIONS_END {
+            return Ok(versions);
+        }
+        let Some((name, version)) = version_line(manager, line) else {
+            continue;
+        };
+        if !names.contains(&name) {
+            continue;
+        }
+        if !is_version(&version) {
+            return Err(format!(
+                "packages: `{name}` version `{}`: {VERSION_RULE}",
+                secret::shown_name(&version)
+            ));
+        }
+        match versions.get(name) {
+            Some(seen) if *seen != version => {
+                return Err(format!(
+                    "packages: `{name}` is installed at two versions, {seen} and {version}"
+                ));
+            }
+            Some(_) => {}
+            None => {
+                versions.insert(name.to_owned(), version);
+            }
+        }
+    }
+    Err(format!(
+        "packages: the {manager} version query did not finish"
+    ))
 }
 
 #[cfg(test)]
@@ -773,7 +1102,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "must pass Packages::validate")]
     fn script_refuses_unvalidated_names() {
-        script(Manager::Apt, &packages(&["git; rm -rf ~"], false), true);
+        script(
+            Manager::Apt,
+            &packages(&["git; rm -rf ~"], false),
+            true,
+            None,
+        );
     }
 
     /// All lookups are local shell functions; no real manager is called.
@@ -850,7 +1184,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
     #[test]
     fn unknown_names_warn_while_known_names_install_and_failures_still_fail() {
         for manager in Manager::ALL {
-            let line = script(manager, &packages(&["git", "missing"], false), true).unwrap();
+            let line = script(manager, &packages(&["git", "missing"], false), true, None).unwrap();
             for fail in [false, true] {
                 let out = run_with_stub_managers(&line, fail);
                 assert_eq!(
@@ -875,7 +1209,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
                     );
                 }
             }
-            let line = script(manager, &packages(&["missing"], false), true).unwrap();
+            let line = script(manager, &packages(&["missing"], false), true, None).unwrap();
             let out = run_with_stub_managers(&line, true);
             assert!(out.status.success(), "{manager}: {out:?}");
             assert!(!String::from_utf8(out.stdout).unwrap().contains("install"));
@@ -890,7 +1224,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
                 pin: vec!["vim".into(), "missing".into()],
                 ..Packages::default()
             };
-            let out = run_with_stub_managers(&script(manager, &p, true).unwrap(), false);
+            let out = run_with_stub_managers(&script(manager, &p, true, None).unwrap(), false);
             assert!(out.status.success(), "{manager}: {out:?}");
             assert_eq!(out.stderr, b"anvil-unknown-package missing\n");
             let stdout = String::from_utf8(out.stdout).unwrap();
@@ -898,10 +1232,10 @@ add) echo "install $*"; return "$FAIL";; esac; }
                 stdout.contains("vim") && !stdout.contains("missing"),
                 "{stdout}"
             );
-            let out = run_with_stub_managers(&script(manager, &p, true).unwrap(), true);
+            let out = run_with_stub_managers(&script(manager, &p, true, None).unwrap(), true);
             assert_eq!(out.status.code(), Some(7));
         }
-        let line = script(Manager::Dnf, &packages(&["provided"], false), true).unwrap();
+        let line = script(Manager::Dnf, &packages(&["provided"], false), true, None).unwrap();
         let out = run_with_stub_managers(&line, false);
         assert!(out.status.success());
         assert!(out.stderr.is_empty());
@@ -910,17 +1244,23 @@ add) echo "install $*"; return "$FAIL";; esac; }
 
     #[test]
     fn pacman_groups_empty_databases_and_upgrade_order() {
-        let line = script(Manager::Pacman, &packages(&["group"], false), true).unwrap();
+        let line = script(Manager::Pacman, &packages(&["group"], false), true, None).unwrap();
         let out = run_with_stub_managers(&line, false);
         assert!(out.status.success());
         assert!(out.stderr.is_empty());
         assert!(String::from_utf8(out.stdout).unwrap().contains("group"));
-        let line = script(Manager::Pacman, &packages(&["missing"], false), true).unwrap();
+        let line = script(Manager::Pacman, &packages(&["missing"], false), true, None).unwrap();
         let out = run_with_stub_managers(&format!("export EMPTY_DB=1; {line}"), false);
         assert!(out.status.success());
         assert!(out.stderr.is_empty());
         assert!(String::from_utf8(out.stdout).unwrap().contains("missing"));
-        let line = script(Manager::Pacman, &packages(&["git", "missing"], true), true).unwrap();
+        let line = script(
+            Manager::Pacman,
+            &packages(&["git", "missing"], true),
+            true,
+            None,
+        )
+        .unwrap();
         let out = run_with_stub_managers(&line, false);
         assert!(
             String::from_utf8(out.stdout)
@@ -963,7 +1303,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
         for manager in Manager::ALL {
             let dir = crate::test_util::temp_dir("special-package-lookups");
             let log = dir.join("lookups");
-            let line = script(manager, &packages(&names, false), true).unwrap();
+            let line = script(manager, &packages(&names, false), true, None).unwrap();
             let out =
                 run_with_stub_managers(&format!("export LOOKUPS={}; {line}", log.display()), false);
             assert!(out.status.success(), "{manager}: {out:?}");
@@ -990,6 +1330,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
             Manager::Apt,
             &packages(&["virtual", "missing"], false),
             true,
+            None,
         )
         .unwrap();
         let out = run_with_stub_managers(&line, false);
@@ -1008,7 +1349,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
                 let line = if doctor {
                     known_script(manager, &p)
                 } else {
-                    script(manager, &p, true).unwrap()
+                    script(manager, &p, true, None).unwrap()
                 };
                 let out = run_with_stub_managers(
                     &format!("export EMPTY_DB=1 LOOKUPS={}; {line}", log.display()),
@@ -1096,7 +1437,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
                 pin: vec!["vim".into()],
                 ..packages(&["git", "missing"], false)
             };
-            let line = script(manager, &p, true).unwrap();
+            let line = script(manager, &p, true, None).unwrap();
             let out =
                 run_with_stub_managers(&format!("export LOOKUPS={}; {line}", log.display()), false);
             assert!(out.status.success(), "{manager}: {out:?}");
@@ -1118,7 +1459,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
     #[test]
     fn failed_queries_are_kept_for_the_manager_to_decide() {
         for manager in Manager::ALL {
-            let line = script(manager, &packages(&["broken"], false), true).unwrap();
+            let line = script(manager, &packages(&["broken"], false), true, None).unwrap();
             let out = run_with_stub_managers(&line, false);
             assert!(out.status.success(), "{manager}: {out:?}");
             assert!(out.stderr.is_empty());
@@ -1130,7 +1471,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
     fn nothing_to_do_is_no_script() {
         for manager in Manager::ALL {
             for root in [true, false] {
-                assert_eq!(script(manager, &packages(&[], false), root), None);
+                assert_eq!(script(manager, &packages(&[], false), root, None), None);
             }
         }
     }
@@ -1290,7 +1631,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
         ];
         for (manager, upgrade, install, want) in cases {
             let names: &[&str] = if install { &["git", "curl"] } else { &[] };
-            let got = script(manager, &packages(names, upgrade), false).unwrap();
+            let got = script(manager, &packages(names, upgrade), false, None).unwrap();
             assert_eq!(got, want, "{manager} upgrade={upgrade} install={install}");
             assert!(!got.contains('\n'), "{got}");
         }
@@ -1423,7 +1764,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
         for (manager, upgrade, want) in cases {
             let p = with_fd_alias(&["git", "fd"], upgrade);
             assert_eq!(
-                script(manager, &p, false).unwrap(),
+                script(manager, &p, false, None).unwrap(),
                 want,
                 "{manager} {upgrade}"
             );
@@ -1437,8 +1778,8 @@ add) echo "install $*"; return "$FAIL";; esac; }
                 let plain = packages(&["git", "curl"], upgrade);
                 let aliased = with_fd_alias(&["git", "curl"], upgrade);
                 assert_eq!(
-                    script(manager, &aliased, false),
-                    script(manager, &plain, false)
+                    script(manager, &aliased, false, None),
+                    script(manager, &plain, false, None)
                 );
             }
         }
@@ -1455,7 +1796,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
         p.alias.insert("fdfind".into(), p.alias["fd"].clone());
         assert_eq!(p.validate(), Ok(()));
         assert_eq!(
-            script(Manager::Dnf, &p, false).unwrap(),
+            script(Manager::Dnf, &p, false, None).unwrap(),
             "{ anvil_db=1; { v=$(dnf -q repoquery --whatprovides dnf 2>/dev/null) && [ -n \"$v\" ]; } || \
                  anvil_db=0; } && { a=$(for n in fd-find fd-find; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
                  \"$anvil_db\" = 0 ] || { v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ \
@@ -1463,7 +1804,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
                  >&2; fi; done); [ -z \"$a\" ] || sudo -n dnf -y install $a; }"
         );
         assert_eq!(
-            script(Manager::Brew, &p, false).unwrap(),
+            script(Manager::Brew, &p, false, None).unwrap(),
             format!(
                 "{BREW_ENV}{{ anvil_db=1; {{ brew info bash >/dev/null 2>&1; }} || anvil_db=0; }} && {{ a=$(for n in \
                  fd fdfind; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || {{ brew info \
@@ -1477,7 +1818,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
     fn root_drops_sudo_and_brew_never_uses_it() {
         let both = packages(&["git"], true);
         assert_eq!(
-            script(Manager::Pacman, &both, true).unwrap(),
+            script(Manager::Pacman, &both, true, None).unwrap(),
             "pacman -Syu --noconfirm && { anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && \
                  { a=$(for n in git; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman \
                  -Si \"$n\" >/dev/null 2>&1; c=$?; [ \"$c\" -ne 1 ] || pacman -Sg \"$n\" >/dev/null 2>&1; c=$?; [ \
@@ -1485,7 +1826,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
                  \"$n\" >&2; fi; done); [ -z \"$a\" ] || pacman -S --noconfirm --needed $a; }"
         );
         assert_eq!(
-            script(Manager::Apt, &both, true).unwrap(),
+            script(Manager::Apt, &both, true, None).unwrap(),
             "apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && { anvil_db=1; { \
                  apt-cache show apt >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git; do if case \"$n\" in \
                  (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { apt-cache show \"$n\" >/dev/null 2>&1 || { \
@@ -1495,7 +1836,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
                  || env DEBIAN_FRONTEND=noninteractive apt-get install -y $a; }"
         );
         assert_eq!(
-            script(Manager::Dnf, &both, true).unwrap(),
+            script(Manager::Dnf, &both, true, None).unwrap(),
             "dnf -y upgrade && { anvil_db=1; { v=$(dnf -q repoquery --whatprovides dnf 2>/dev/null) && [ -n \
                  \"$v\" ]; } || anvil_db=0; } && { a=$(for n in git; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
                  \"$anvil_db\" = 0 ] || { v=$(dnf -q repoquery --whatprovides \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ \
@@ -1503,7 +1844,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
                  >&2; fi; done); [ -z \"$a\" ] || dnf -y install $a; }"
         );
         assert_eq!(
-            script(Manager::Apk, &both, true).unwrap(),
+            script(Manager::Apk, &both, true, None).unwrap(),
             "apk update && apk upgrade && { anvil_db=1; { v=$(apk search -x -q apk-tools 2>/dev/null) && [ -n \
                  \"$v\" ]; } || anvil_db=0; } && { a=$(for n in git; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
                  \"$anvil_db\" = 0 ] || { v=$(apk search -x -q \"$n\" 2>/dev/null); [ $? -ne 0 ] || [ -n \"$v\" ]; \
@@ -1511,7 +1852,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
                  done); [ -z \"$a\" ] || apk add $a; }"
         );
         for root in [true, false] {
-            let brew = script(Manager::Brew, &both, root).unwrap();
+            let brew = script(Manager::Brew, &both, root, None).unwrap();
             assert_eq!(
                 brew,
                 "export PATH=\"$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin\"; export \
@@ -1524,7 +1865,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
             assert!(!brew.contains("sudo"), "{brew}");
         }
         for manager in Manager::ALL {
-            assert!(!script(manager, &both, true).unwrap().contains("sudo"));
+            assert!(!script(manager, &both, true, None).unwrap().contains("sudo"));
         }
     }
 
@@ -1848,11 +2189,11 @@ add) echo "install $*"; return "$FAIL";; esac; }
         ];
         for (manager, expected) in cases {
             assert_eq!(
-                script(manager, &removing(&[], false), false).as_deref(),
+                script(manager, &removing(&[], false), false, None).as_deref(),
                 Some(expected.as_str()),
                 "{manager}"
             );
-            let as_root = script(manager, &removing(&[], false), true).unwrap();
+            let as_root = script(manager, &removing(&[], false), true, None).unwrap();
             assert!(!as_root.contains("sudo"), "{as_root}");
             assert!(
                 !as_root.starts_with(" &&") && !as_root.contains("} &&"),
@@ -1860,7 +2201,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
             );
         }
         assert_eq!(
-            script(Manager::Pacman, &removing(&[], false), true).as_deref(),
+            script(Manager::Pacman, &removing(&[], false), true, None).as_deref(),
             Some(
                 "{ r=$(for n in nano fd; do pacman -Q \"$n\" >/dev/null 2>&1 && printf '%s ' \"$n\"; done); \
                  [ -z \"$r\" ] || pacman -R --noconfirm $r; }"
@@ -1871,7 +2212,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
     #[test]
     fn remove_runs_after_the_install_and_upgrade() {
         assert_eq!(
-            script(Manager::Apt, &removing(&["git", "curl"], true), false).as_deref(),
+            script(Manager::Apt, &removing(&["git", "curl"], true), false, None).as_deref(),
             Some(
                 "sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && { \
                  anvil_db=1; { apt-cache show apt >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git curl; do \
@@ -1886,12 +2227,13 @@ add) echo "install $*"; return "$FAIL";; esac; }
         );
         for manager in Manager::ALL {
             for root in [true, false] {
-                let alone = script(manager, &removing(&[], false), root).unwrap();
+                let alone = script(manager, &removing(&[], false), root, None).unwrap();
                 let group = alone.strip_prefix(BREW_ENV).unwrap_or(&alone);
                 for (install, upgrade) in [(&["git"][..], false), (&[], true), (&["git"], true)] {
-                    let before = script(manager, &with_fd_alias(install, upgrade), root).unwrap();
+                    let before =
+                        script(manager, &with_fd_alias(install, upgrade), root, None).unwrap();
                     assert_eq!(
-                        script(manager, &removing(install, upgrade), root).unwrap(),
+                        script(manager, &removing(install, upgrade), root, None).unwrap(),
                         format!("{before} && {group}"),
                         "{manager} {install:?} {upgrade}"
                     );
@@ -1903,12 +2245,12 @@ add) echo "install $*"; return "$FAIL";; esac; }
     #[test]
     fn remove_never_purges_or_autoremoves() {
         for manager in Manager::ALL {
-            let line = script(manager, &removing(&[], false), true).unwrap();
+            let line = script(manager, &removing(&[], false), true, None).unwrap();
             for flag in ["purge", "autoremove", "-Rs", "-Rc", "-Rn", "--zap", " -r "] {
                 assert!(!line.contains(flag), "{manager}: {line}");
             }
         }
-        let dnf = script(Manager::Dnf, &removing(&[], false), true).unwrap();
+        let dnf = script(Manager::Dnf, &removing(&[], false), true, None).unwrap();
         assert!(
             dnf.contains("--setopt=clean_requirements_on_remove=False"),
             "{dnf}"
@@ -1917,7 +2259,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
 
     #[test]
     fn a_wrapped_remove_runs_after_sudo_validates() {
-        let one_liner = script(Manager::Pacman, &removing(&[], false), false).unwrap();
+        let one_liner = script(Manager::Pacman, &removing(&[], false), false, None).unwrap();
         assert_eq!(
             with_password(&one_liner),
             "export TERM=dumb\n\
@@ -1958,7 +2300,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
 
     #[test]
     fn the_remove_group_keeps_the_chain_status_and_is_idempotent() {
-        let line = script(Manager::Pacman, &removing(&["git"], false), true).unwrap();
+        let line = script(Manager::Pacman, &removing(&["git"], false), true, None).unwrap();
         // A failed install fails the line, and nothing is removed.
         assert_eq!(
             run_with_stub_pacman(&line, 1, "nano fd", 0),
@@ -1981,7 +2323,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
         // A failed remove fails the line.
         assert_eq!(run_with_stub_pacman(&line, 0, "nano", 1).0, Some(1));
         // Remove alone, already removed: exit 0.
-        let alone = script(Manager::Pacman, &removing(&[], false), true).unwrap();
+        let alone = script(Manager::Pacman, &removing(&[], false), true, None).unwrap();
         assert_eq!(
             run_with_stub_pacman(&alone, 0, "", 0),
             (Some(0), String::new())
@@ -2026,7 +2368,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
         )
         .unwrap();
         assert_eq!(
-            script(Manager::Dnf, &p, true).as_deref(),
+            script(Manager::Dnf, &p, true, None).as_deref(),
             Some(
                 "{ anvil_db=1; { v=$(dnf -q repoquery --whatprovides dnf 2>/dev/null) && [ -n \"$v\" ]; } || \
                  anvil_db=0; } && { a=$(for n in fd-find; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
@@ -2041,7 +2383,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
             )
         );
         assert_eq!(
-            script(Manager::Pacman, &p, true).as_deref(),
+            script(Manager::Pacman, &p, true, None).as_deref(),
             Some(
                 "{ anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || anvil_db=0; } && { a=$(for n in git; do if \
                  case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" = 0 ] || { pacman -Si \"$n\" >/dev/null \
@@ -2093,13 +2435,13 @@ add) echo "install $*"; return "$FAIL";; esac; }
             (&[], false, group.clone()),
         ] {
             assert_eq!(
-                script(Manager::Pacman, &pinning(install, upgrade), false),
+                script(Manager::Pacman, &pinning(install, upgrade), false, None),
                 Some(with_db(Manager::Pacman, expected)),
                 "{install:?} {upgrade}"
             );
         }
         assert_eq!(
-            script(Manager::Pacman, &pinning(&[], true), true).as_deref(),
+            script(Manager::Pacman, &pinning(&[], true), true, None).as_deref(),
             Some(
                 "pacman -Syu --noconfirm --ignore vim,fd && { anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || \
                  anvil_db=0; } && { a=$(for n in vim fd; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \
@@ -2151,7 +2493,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
             (&["fd"], false, group.clone()),
         ] {
             assert_eq!(
-                script(Manager::Dnf, &pinning(install, upgrade), false),
+                script(Manager::Dnf, &pinning(install, upgrade), false, None),
                 Some(with_db(Manager::Dnf, expected)),
                 "{install:?} {upgrade}"
             );
@@ -2165,7 +2507,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
             ..pinning(&["git"], true)
         };
         assert_eq!(
-            script(Manager::Pacman, &p, true).as_deref(),
+            script(Manager::Pacman, &p, true, None).as_deref(),
             Some(
                 "pacman -Syu --noconfirm --ignore vim,fd && { anvil_db=1; { pacman -Si pacman >/dev/null 2>&1; } || \
                  anvil_db=0; } && { a=$(for n in git; do if case \"$n\" in (*@*|*:*|*/*) true;; (*) [ \"$anvil_db\" \
@@ -2182,7 +2524,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
             )
         );
         assert_eq!(
-            script(Manager::Dnf, &p, true).as_deref(),
+            script(Manager::Dnf, &p, true, None).as_deref(),
             Some(
                 "dnf -y upgrade --exclude=vim,fd-find && { anvil_db=1; { v=$(dnf -q repoquery --whatprovides dnf \
                  2>/dev/null) && [ -n \"$v\" ]; } || anvil_db=0; } && { a=$(for n in vim fd-find; do if case \"$n\" \
@@ -2202,7 +2544,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
 
     #[test]
     fn a_wrapped_pin_runs_after_sudo_validates() {
-        let one_liner = script(Manager::Dnf, &pinning(&["git"], true), false).unwrap();
+        let one_liner = script(Manager::Dnf, &pinning(&["git"], true), false, None).unwrap();
         assert_eq!(
             with_password(&one_liner),
             "export TERM=dumb\nmesg n </dev/tty 2>/dev/null; stty -echo </dev/tty; echo anvil-tty-ready\nIFS= \
@@ -2247,12 +2589,12 @@ add) echo "install $*"; return "$FAIL";; esac; }
     #[test]
     #[should_panic(expected = "must pass check_pin")]
     fn script_refuses_pins_on_brew() {
-        script(Manager::Brew, &pinning(&[], false), false);
+        script(Manager::Brew, &pinning(&[], false), false, None);
     }
 
     #[test]
     fn a_pin_is_installed_only_when_missing() {
-        let line = script(Manager::Pacman, &pinning(&["git"], true), true).unwrap();
+        let line = script(Manager::Pacman, &pinning(&["git"], true), true, None).unwrap();
         // Both pins installed: nothing is reinstalled.
         assert_eq!(
             run_with_stub_pacman(&line, 0, "vim fd", 0),
@@ -2540,7 +2882,7 @@ add) echo "install $*"; return "$FAIL";; esac; }
 
     #[test]
     fn the_password_wrapper_is_d4_exactly() {
-        let one_liner = script(Manager::Pacman, &packages(&["git"], false), false).unwrap();
+        let one_liner = script(Manager::Pacman, &packages(&["git"], false), false, None).unwrap();
         assert_eq!(
             with_password(&one_liner),
             "export TERM=dumb\nmesg n </dev/tty 2>/dev/null; stty -echo </dev/tty; echo anvil-tty-ready\nIFS= \
@@ -2666,5 +3008,485 @@ add) echo "install $*"; return "$FAIL";; esac; }
         };
         assert_eq!(p.sudo_secret_for(&with_secret), Some("BOX_SUDO"));
         assert_eq!(Packages::default().sudo_secret_for(&local), None);
+    }
+
+    fn versions(manager: Manager, names: &[&str], stdout: &str) -> Vec<(String, String)> {
+        parse_versions(manager, names, &format!("{stdout}{VERSIONS_END}\n"))
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
+    fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected
+            .iter()
+            .map(|(name, version)| ((*name).to_owned(), (*version).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn versions_parse_each_managers_output_and_leave_out_names_not_installed() {
+        /// Manager, requested names, stdout before the end line, the map.
+        type Case = (
+            Manager,
+            &'static [&'static str],
+            &'static str,
+            &'static [(&'static str, &'static str)],
+        );
+        let cases: [Case; 5] = [
+            (
+                Manager::Brew,
+                &["git", "python@3.12", "openssl@3", "missing"],
+                "git 2.47.0\npython@3.12 3.12.7_1\nopenssl@3 3.3.2 3.4.0\nwget 1.24.5\n",
+                &[
+                    ("git", "2.47.0"),
+                    ("openssl@3", "3.4.0"),
+                    ("python@3.12", "3.12.7_1"),
+                ],
+            ),
+            (
+                Manager::Pacman,
+                &["git", "vim", "missing"],
+                "git 2.47.0-1\nvim 9.1.0785-1\nerror: package 'missing' was not found\n",
+                &[("git", "2.47.0-1"), ("vim", "9.1.0785-1")],
+            ),
+            (
+                Manager::Apt,
+                &["git", "vim", "libc6", "curl", "gone", "nginx", "missing"],
+                "ii  git 1:2.39.5-0+deb12u1\nrc  vim 2:9.0.1378-2\nii  libc6 2.36-9+deb12u9\n\
+                 ii  libc6 2.36-9+deb12u9\nii  curl 7.88.1-10+deb12u8\nun  gone \n\
+                 hi  nginx 1.22.1-9+deb12u1\n",
+                &[
+                    ("curl", "7.88.1-10+deb12u8"),
+                    ("git", "1:2.39.5-0+deb12u1"),
+                    ("libc6", "2.36-9+deb12u9"),
+                    ("nginx", "1.22.1-9+deb12u1"),
+                ],
+            ),
+            (
+                Manager::Dnf,
+                &["git", "vim-enhanced", "glibc", "tmux", "curl"],
+                "git (none):2.47.0-1.fc41\nvim-enhanced 2:9.1.0-1.fc41\npackage tmux is not installed\n\
+                 glibc (none):2.40-9.fc41\nglibc (none):2.40-9.fc41\ncurl 0:8.9.1-2.fc41\n",
+                &[
+                    ("curl", "8.9.1-2.fc41"),
+                    ("git", "2.47.0-1.fc41"),
+                    ("glibc", "2.40-9.fc41"),
+                    ("vim-enhanced", "2:9.1.0-1.fc41"),
+                ],
+            ),
+            (
+                Manager::Apk,
+                &["git", "py3-foo", "musl", "missing"],
+                "musl-1.2.5-r0\npy3-foo-1.2-r0\ngit-2.45.2-r0\nbusybox-1.36.1-r29\nWARNING: not a package\n",
+                &[
+                    ("git", "2.45.2-r0"),
+                    ("musl", "1.2.5-r0"),
+                    ("py3-foo", "1.2-r0"),
+                ],
+            ),
+        ];
+        for (manager, names, stdout, expected) in cases {
+            assert_eq!(
+                versions(manager, names, stdout),
+                pairs(expected),
+                "{manager}"
+            );
+        }
+    }
+
+    #[test]
+    fn versions_refuse_an_unfinished_query_a_bad_version_or_two_versions() {
+        let err = parse_versions(Manager::Pacman, &["git"], "git 2.47.0-1\n").unwrap_err();
+        assert_eq!(err, "packages: the pacman version query did not finish");
+        let stdout = format!("git 2.47.0;rm\n{VERSIONS_END}\n");
+        let err = parse_versions(Manager::Pacman, &["git"], &stdout).unwrap_err();
+        assert_eq!(
+            err,
+            format!("packages: `git` version `2.47.0;rm`: {VERSION_RULE}")
+        );
+        // An unrequested name's line is not checked.
+        assert_eq!(versions(Manager::Pacman, &["git"], "other 1;2\n"), []);
+        let stdout =
+            format!("glibc (none):2.40-9.fc41\nglibc (none):2.40-10.fc41\n{VERSIONS_END}\n");
+        let err = parse_versions(Manager::Dnf, &["glibc"], &stdout).unwrap_err();
+        assert_eq!(
+            err,
+            "packages: `glibc` is installed at two versions, 2.40-9.fc41 and 2.40-10.fc41"
+        );
+        let stdout = format!("ii  libc6 2.36-9\nii  libc6 2.36-10\n{VERSIONS_END}\n");
+        assert!(parse_versions(Manager::Apt, &["libc6"], &stdout).is_err());
+    }
+
+    #[test]
+    fn versions_keep_apt_packages_on_hold() {
+        let stdout = "hi  nginx 1.22.1-9+deb12u1\nhiR curl 7.88.1-10\nhc  vim 2:9.0.1378-2\n";
+        assert_eq!(
+            versions(Manager::Apt, &["nginx", "curl", "vim"], stdout),
+            pairs(&[("curl", "7.88.1-10"), ("nginx", "1.22.1-9+deb12u1")])
+        );
+    }
+
+    #[test]
+    fn versions_refuse_a_tilde_right_after_a_colon() {
+        assert!(is_version("1:2.0~rc1"));
+        assert!(!is_version("1:~root"));
+        let stdout = format!("git 1:~root\n{VERSIONS_END}\n");
+        let err = parse_versions(Manager::Pacman, &["git"], &stdout).unwrap_err();
+        assert_eq!(
+            err,
+            format!("packages: `git` version `1:~root`: {VERSION_RULE}")
+        );
+        assert!(err.ends_with("with no `~` right after `:`"), "{err}");
+    }
+
+    #[test]
+    fn version_rule_and_lockable_names() {
+        for good in ["1:2.39.5-0+deb12u1", "3.12.7_1", "1.0~rc1", "2.40-9.fc41"] {
+            assert!(is_version(good), "{good}");
+        }
+        let long = "1".repeat(MAX_VERSION_BYTES + 1);
+        for bad in [
+            "",
+            "-1",
+            ".1",
+            "1 2",
+            "1;2",
+            "1/2",
+            "1:~root",
+            "1.0:~",
+            long.as_str(),
+        ] {
+            assert!(!is_version(bad), "{bad}");
+        }
+        assert!(is_version(&"1".repeat(MAX_VERSION_BYTES)));
+        for name in ["git", "python@3.12", "g++"] {
+            assert!(lockable(name), "{name}");
+        }
+        for name in ["libc6:i386", "homebrew/core/git", "extra/git"] {
+            assert!(!lockable(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn versions_scripts_read_only_and_always_end() {
+        let expected = [
+            (Manager::Brew, "brew list --versions --formula git vim"),
+            (Manager::Pacman, "pacman -Q git vim"),
+            (
+                Manager::Apt,
+                "dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\\n' git vim",
+            ),
+            (
+                Manager::Dnf,
+                "rpm -q --qf '%{NAME} %{EPOCH}:%{VERSION}-%{RELEASE}\\n' git vim",
+            ),
+            (Manager::Apk, "apk info -v"),
+        ];
+        for (manager, query) in expected {
+            let line = versions_script(manager, &["git", "vim"]);
+            let prefix = if manager == Manager::Brew {
+                BREW_ENV
+            } else {
+                ""
+            };
+            assert_eq!(
+                line,
+                format!("{prefix}{query}; printf '%s\\n' {VERSIONS_END}")
+            );
+            for word in ["sudo", "update", "upgrade", "-Sy", "refresh", "makecache"] {
+                assert!(!line.contains(word), "{manager}: {line}");
+            }
+            let out = run_with_stub_managers(&line, true);
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            assert!(
+                stdout.ends_with(&format!("{VERSIONS_END}\n")),
+                "{manager}: {stdout}"
+            );
+            assert!(parse_versions(manager, &["anvil-none"], &stdout).is_ok());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must pass Packages::validate and lockable")]
+    fn versions_script_refuses_unvalidated_names() {
+        versions_script(Manager::Pacman, &["git; rm -rf ~"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "must pass Packages::validate and lockable")]
+    fn versions_script_refuses_unlockable_names() {
+        versions_script(Manager::Apt, &["libc6:i386"]);
+    }
+
+    /// Reads `git`'s version in the e2e Arch container named by
+    /// `ANVIL_E2E_CONTAINER`, as its sudo-less user: tests/e2e.sh runs it.
+    #[test]
+    #[ignore = "needs the e2e container; tests/e2e.sh runs it"]
+    fn e2e_versions_on_arch() {
+        let container = std::env::var("ANVIL_E2E_CONTAINER").expect("ANVIL_E2E_CONTAINER");
+        let exec = |line: &str| {
+            let out = crate::exec::output(
+                std::process::Command::new("docker")
+                    .args(["exec", "-u", "key", &container, "sh", "-c", line]),
+            )
+            .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let names = ["git", "anvil-e2e-no-such-package"];
+        let stdout = exec(&versions_script(Manager::Pacman, &names));
+        let got = parse_versions(Manager::Pacman, &names, &stdout).unwrap();
+        let pacman = exec("pacman -Q git");
+        let expected = pacman.split_whitespace().nth(1).unwrap();
+        assert_eq!(
+            got,
+            BTreeMap::from([("git".to_owned(), expected.to_owned())])
+        );
+    }
+
+    fn locked(entries: &[(&str, Option<&str>)]) -> Versions {
+        entries
+            .iter()
+            .map(|(name, version)| {
+                let locked = version.map_or(Locked::Missing, |v| Locked::Version(v.to_owned()));
+                ((*name).to_owned(), locked)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_lock_installs_each_locked_version_single_quoted() {
+        let lock = locked(&[("git", Some("1:2.39.5-0+deb12u2")), ("curl", None)]);
+        let p = packages(&["git", "curl"], false);
+        let apt = script(Manager::Apt, &p, false, Some(&lock)).unwrap();
+        for part in [
+            "sudo -n apt-get update && { b=; g=0; ",
+            "if dpkg-query -W -f='${db:Status-Abbrev}${Version}\\n' git 2>/dev/null \
+             | cut -c2- | grep -qxF 'i 1:2.39.5-0+deb12u2'; then :; ",
+            "elif [ -n \"$(apt-cache show 'git=1:2.39.5-0+deb12u2' 2>/dev/null)\" ]; \
+             then b=\"$b \"'git=1:2.39.5-0+deb12u2'; ",
+            "else printf 'anvil-gone-version %s %s\\n' git '1:2.39.5-0+deb12u2' >&2; g=1; fi; ",
+            "[ -z \"$b\" ] || sudo -n env DEBIAN_FRONTEND=noninteractive \
+             apt-get install -y --allow-downgrades $b; }",
+            "apt-get install -y $a; }",
+        ] {
+            assert!(apt.contains(part), "lacks {part:?}:\n{apt}");
+        }
+        assert!(apt.ends_with(" && [ \"$g\" = 0 ]"), "{apt}");
+        assert!(!apt.contains("'curl"), "{apt}");
+
+        let lock = locked(&[("git", Some("2:2.47.0-1.fc41"))]);
+        let dnf = script(Manager::Dnf, &packages(&["git"], false), true, Some(&lock)).unwrap();
+        for part in [
+            "case \"$(rpm -q --qf '%{EPOCH}:%{VERSION}-%{RELEASE}\\n' git 2>/dev/null)\" \
+             in ('2:2.47.0-1.fc41'|'(none):2:2.47.0-1.fc41'|'0:2:2.47.0-1.fc41') true;;",
+            "elif [ -n \"$(dnf -q repoquery 'git-2:2.47.0-1.fc41' 2>/dev/null)\" ]; \
+             then b=\"$b \"'git-2:2.47.0-1.fc41'; ",
+            "[ -z \"$b\" ] || dnf -y install $b; }",
+        ] {
+            assert!(dnf.contains(part), "lacks {part:?}:\n{dnf}");
+        }
+
+        let lock = locked(&[("git", Some("2.45.2-r0"))]);
+        let apk = script(Manager::Apk, &packages(&["git"], false), true, Some(&lock)).unwrap();
+        for part in [
+            "apk update && { b=; g=0; if apk info -v 2>/dev/null | grep -qxF 'git-2.45.2-r0'; ",
+            "elif apk policy git 2>/dev/null | grep -qxF '  2.45.2-r0:'; \
+             then b=\"$b \"'git=2.45.2-r0'; ",
+            "[ -z \"$b\" ] || apk add $b; }",
+        ] {
+            assert!(apk.contains(part), "lacks {part:?}:\n{apk}");
+        }
+    }
+
+    #[test]
+    fn a_lock_leaves_pacman_and_brew_lines_as_they_are() {
+        let lock = locked(&[("git", Some("2.47.0-1"))]);
+        for manager in [Manager::Pacman, Manager::Brew] {
+            for root in [false, true] {
+                let p = packages(&["git", "vim"], false);
+                assert_eq!(
+                    script(manager, &p, root, Some(&lock)),
+                    script(manager, &p, root, None)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn under_a_lock_pins_install_like_names_and_follow_the_lock() {
+        let lock = locked(&[("git", Some("1.0"))]);
+        let p = Packages {
+            pin: vec!["git".to_owned()],
+            ..Packages::default()
+        };
+        assert!(check_pin(Manager::Apt, &p).is_err());
+        let apt = script(Manager::Apt, &p, true, Some(&lock)).unwrap();
+        assert!(apt.contains("b=\"$b \"'git=1.0'"), "{apt}");
+        assert!(!apt.contains("$a"), "{apt}");
+    }
+
+    #[test]
+    #[should_panic(expected = "never used with upgrade")]
+    fn a_lock_refuses_upgrade() {
+        script(
+            Manager::Apt,
+            &packages(&["git"], true),
+            true,
+            Some(&locked(&[])),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must pass is_version")]
+    fn a_lock_refuses_a_bad_version() {
+        let lock = locked(&[("git", Some("1;reboot"))]);
+        script(Manager::Apt, &packages(&["git"], false), true, Some(&lock));
+    }
+
+    /// Runs `line` over stub apt, dnf and apk tools: git is installed at
+    /// `1.0` (`2.0-r0` with `at`), on two arches for dpkg (status `ST`,
+    /// `ii` by default), the repositories offer git `2.0` (`2.0-r0` on apk)
+    /// and no `vim 9.0`.
+    fn run_exact(line: &str, at: bool) -> std::process::Output {
+        run_exact_held(line, at, "ii")
+    }
+
+    fn run_exact_held(line: &str, at: bool, status: &str) -> std::process::Output {
+        let stub = r#"
+v=1.0; [ "$AT" != 1 ] || v=2.0
+dpkg_query() { eval "n=\${$#}"; [ "$n" = git ] && printf '%s %s\n' "${ST:-ii}" "$v" "${ST:-ii}" "$v"; }
+apt_cache() { [ "$1 $2" != 'show git=2.0' ] || echo 'Package: git'; }
+apt_get() { case $1 in update) echo refresh;; install) echo "install $*";; esac; }
+rpm() { eval "n=\${$#}"; [ "$n" = git ] && echo "(none):$v"; }
+dnf() { case "$*" in '-q repoquery git-2.0') echo git-2.0;; '-y install '*) echo "install $*";; esac; }
+apk() { case $1 in
+update) echo refresh;;
+info) echo "git-$v-r0";;
+policy) echo "$2 policy:"; [ "$2" != git ] || printf '  2.0-r0:\n    repo\n';;
+add) echo "install $*";; esac; }
+"#;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_util::temp_dir("exact-packages");
+        for name in ["dpkg-query", "apt-cache", "apt-get", "rpm", "dnf", "apk"] {
+            let path = dir.join(name);
+            let function = name.replace('-', "_");
+            std::fs::write(&path, format!("#!/bin/sh\n{stub}\n{function} \"$@\"\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let out = crate::exec::output(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", line])
+                .env(
+                    "PATH",
+                    format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
+                )
+                .env("AT", if at { "1" } else { "0" })
+                .env("ST", status),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        out
+    }
+
+    #[test]
+    fn a_locked_version_installs_when_offered_and_a_gone_one_fails_after_the_install() {
+        for (manager, git, vim) in [
+            (Manager::Apt, "2.0", "9.0"),
+            (Manager::Dnf, "2.0", "9.0"),
+            (Manager::Apk, "2.0-r0", "9.0-r0"),
+        ] {
+            let word = if manager == Manager::Dnf { '-' } else { '=' };
+            let both = locked(&[("git", Some(git)), ("vim", Some(vim))]);
+            let line = script(
+                manager,
+                &packages(&["git", "vim"], false),
+                true,
+                Some(&both),
+            );
+            let out = run_exact(&line.unwrap(), false);
+            assert_eq!(out.status.code(), Some(1), "{manager}: {out:?}");
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            assert!(
+                stdout.ends_with(&format!(" git{word}{git}\n")),
+                "{manager}: {stdout}"
+            );
+            assert!(!stdout.contains("vim"), "{manager}: {stdout}");
+            assert_eq!(
+                String::from_utf8(out.stderr).unwrap(),
+                format!("anvil-gone-version vim {vim}\n")
+            );
+
+            let git_only = locked(&[("git", Some(git))]);
+            let line = script(manager, &packages(&["git"], false), true, Some(&git_only));
+            let line = line.unwrap();
+            let out = run_exact(&line, false);
+            assert!(out.status.success(), "{manager}: {out:?}");
+            assert!(String::from_utf8(out.stdout).unwrap().contains("install"));
+            let out = run_exact(&line, true);
+            assert!(out.status.success(), "{manager}: {out:?}");
+            assert!(
+                !String::from_utf8(out.stdout).unwrap().contains("install"),
+                "{manager}: installed again although at the lock"
+            );
+        }
+        let lock = locked(&[("git", Some("2.0"))]);
+        let line = script(Manager::Apt, &packages(&["git"], false), true, Some(&lock)).unwrap();
+        let held = run_exact_held(&line, true, "hi");
+        assert!(held.status.success(), "{held:?}");
+        assert!(!String::from_utf8(held.stdout).unwrap().contains("install"));
+        let removed = run_exact_held(&line, true, "rc");
+        assert!(
+            String::from_utf8(removed.stdout)
+                .unwrap()
+                .ends_with("--allow-downgrades git=2.0\n")
+        );
+    }
+
+    #[test]
+    fn take_gone_lifts_only_well_formed_marker_lines() {
+        let mut out = "E: x\nanvil-gone-version git 1:2.39.5-0+deb12u2\n\
+                       anvil-gone-version git 1:2.39.5-0+deb12u2\nanvil-gone-version bad\n"
+            .to_owned();
+        assert_eq!(
+            take_gone(&mut out),
+            [("git".to_owned(), "1:2.39.5-0+deb12u2".to_owned())]
+        );
+        assert_eq!(out, "E: x\nanvil-gone-version bad\n");
+    }
+
+    #[test]
+    fn lock_failures_name_each_gone_and_differing_package() {
+        let lock = locked(&[
+            ("curl", Some("8.0")),
+            ("git", Some("2.47.0")),
+            ("jq", Some("1.7")),
+            ("tig", None),
+            ("vim", Some("9.1")),
+        ]);
+        let installed = BTreeMap::from([
+            ("curl".to_owned(), "8.0".to_owned()),
+            ("git".to_owned(), "2.48.1".to_owned()),
+            ("vim".to_owned(), "9.0".to_owned()),
+        ]);
+        let gone = [("vim".to_owned(), "9.1".to_owned())];
+        assert_eq!(
+            lock_failures(&lock, &installed, &gone),
+            [
+                "packages: vim 9.1 is no longer in the repositories",
+                "packages: git 2.47.0 is locked, 2.48.1 is installed",
+                "packages: jq 1.7 is locked, not installed",
+            ]
+        );
+        assert_eq!(
+            lock_failures(&lock, &installed, &[]).last().unwrap(),
+            "packages: vim 9.1 is locked, 9.0 is installed"
+        );
+        let deb = locked(&[("git", Some("1:2.39.5-0+deb12u2"))]);
+        let gone = [("git".to_owned(), "1:2.39.5-0+deb12u2".to_owned())];
+        assert_eq!(
+            lock_failures(&deb, &BTreeMap::new(), &gone),
+            ["packages: git 1:2.39.5-0+deb12u2 is no longer in the repositories"]
+        );
     }
 }

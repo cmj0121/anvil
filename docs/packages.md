@@ -247,26 +247,27 @@ behaves per manager: `apt-get remove` and `dnf remove` also remove those package
 refuse, and the step fails; `apk del` keeps it, reports why (`World updated, but the following packages are not
 removed due to: libcurl: curl`) and the step still succeeds.
 
-**Pin.** A pinned name is skipped by this run's upgrade and installed only when it is missing; nothing is held after
-the run. pacman upgrades with `--ignore` and dnf with `--exclude`. A pinned name never goes in the install list, even
-when it is also in `install` (allowed: the pin wins): pacman's `--noconfirm` answers yes to "install the ignored
-package anyway?", and `dnf install` upgrades a name that is already installed. The match is by resolved name, so an
-`install` name that a manager's [alias](#aliases) maps to a pin's name is left to the pin too. So the step checks each pin
-(`pacman -T`, `rpm -q --whatprovides`, which also find a package that provides the name) and installs only the missing
-ones. On dnf the install part comes after that and gets `--exclude` too, so it cannot upgrade a pin as a dependency:
-when `P` needs a newer pin, that install fails, and so does the step.
+**Pin.** A pinned name is skipped by this run's upgrade and installed only when it is missing; nothing is held after the
+run (except under `--locked`: see [Lock](#lock)). pacman upgrades with `--ignore` and dnf with `--exclude`. A pinned
+name never goes in the install list, even when it is also in `install` (allowed: the pin wins): pacman's `--noconfirm`
+answers yes to "install the ignored package anyway?", and `dnf install` upgrades a name that is already installed. The
+match is by resolved name, so an `install` name that a manager's [alias](#aliases) maps to a pin's name is left to the
+pin too. So the step checks each pin (`pacman -T`, `rpm -q --whatprovides`, which also find a package that provides the
+name) and installs only the missing ones. On dnf the install part comes after that and gets `--exclude` too, so it
+cannot upgrade a pin as a dependency: when `P` needs a newer pin, that install fails, and so does the step.
 
-**Refused on brew, apt and apk.** They have no way to skip a package for one run: `brew install` and
-`apt-get install` upgrade an installed name, and `apk upgrade` has no exclude. Any `pin` fails such a target, with or
-without `upgrade`, before anything runs:
+**Refused on brew, apt and apk** (except apt and apk under `--locked`: see [Lock](#lock)). They have no way to skip a
+package for one run: `brew install` and `apt-get install` upgrade an installed name, and `apk upgrade` has no exclude.
+Any `pin` fails such a target, with or without `upgrade`, before anything runs:
 
 ```text
 packages: pin is not one-shot on brew: vim
 ```
 
 The names are the ones that manager would use ([aliases](#aliases) applied), in config order, comma-separated. anvil
-never writes a lasting hold (`brew pin`, `apt-mark hold`, an `/etc/apk/world` edit) instead. `anvil plan` fails the
-target with the same line; `anvil doctor`'s `manager` row does not check pins.
+never writes a lasting hold (`brew pin`, `apt-mark hold`, an `/etc/apk/world` edit) instead (except under `--locked`:
+see [Lock](#lock)). `anvil plan` fails the target with the same line; `anvil doctor`'s `manager` row does not check
+pins.
 
 **Rules.** `remove` and `pin` entries follow the `install` name rule and byte limit, at most 256 entries each; an empty
 list is not saved by `anvil config`. A violation is exit 2, with the name's control characters escaped and cut to 64
@@ -290,6 +291,192 @@ characters:
   fails.
 - `pacman -Q` does not resolve provides: removing a name that is only provided, not a package name, does nothing on
   pacman.
+
+## Lock
+
+`anvil lock` records the version of every managed package that the selected targets have installed, per platform, in
+`anvil.lock` in the [workspace](configuration.md#the-workspace). `anvil apply --locked` then installs those versions,
+or fails where it cannot, so a new host of the same platform gets the packages your others run. Commit `anvil.lock`
+beside the config.
+
+```sh
+anvil lock                 # probe the targets, write anvil.lock
+anvil lock --check         # is anvil.lock still in step with the config? contacts no target
+anvil plan --locked        # what apply --locked would install or change
+anvil apply --locked       # install the locked versions
+```
+
+**The file.** TOML, written whole by `anvil lock` in a fixed, sorted layout, so two runs on the same hosts write the
+same bytes; do not edit it. Hosts are not recorded:
+
+```toml
+# anvil.lock: written by `anvil lock`, do not edit
+version = 1
+
+[[platform]]
+manager = "brew"
+distro = "macos"
+distro_version = "14"
+arch = "arm64"
+
+[platform.packages]
+"python@3.12" = "3.12.7"
+
+[[platform]]
+manager = "apt"
+distro = "debian"
+distro_version = "12"
+arch = "x86_64"
+
+[platform.packages]
+git = "1:2.39.5-0+deb12u2"
+nodejs = "missing"
+```
+
+It loads with the same ownership and mode checks as the config (a group- or world-writable `anvil.lock` is exit 2).
+Any `version` but `1`, an unknown key, a name that breaks the `install` name rule, a value that is neither a version
+(`[A-Za-z0-9][A-Za-z0-9.+~:_-]*`, no `~` right after `:`, at most 128 bytes) nor `missing`, or one platform listed
+twice is exit 2.
+
+**The platform.** Each `[[platform]]` is the manager the target's package step resolves to plus three probe facts,
+shown in messages as `apt/debian 12/x86_64`:
+
+- `distro`: as is; empty is `unknown`.
+- `distro_version`: empty is `rolling` (Arch, Debian sid); `macos` keeps the major version (`14.6.1` is `14`), `alpine`
+  the first two parts (`3.20.3` is `3.20`); any other distro as is.
+- `arch`: `uname -m` as is, so `arm64` (macOS) and `aarch64` (Linux) are different platforms; empty is `unknown`.
+
+Each of the three must match `[A-Za-z0-9][A-Za-z0-9._+-]*` and be at most 64 bytes. In the messages below FIELD is
+`distro`, `distro_version` or `arch`, VALUE is shown escaped (`x86\u{200b}_64`) and RULE is
+`must match [A-Za-z0-9][A-Za-z0-9._+-]*, at most 64 bytes`. A target whose probe gives anything else fails
+`anvil lock` (exit 1) with ``TARGET: lock: FIELD `VALUE`: RULE``; under `plan --locked` and `apply --locked` only that
+target fails, with ``packages: FIELD `VALUE`: RULE``, and the others proceed (exit 1); doctor's `lock` row reads
+``WARNING: lock check failed: FIELD `VALUE`: RULE``. An `anvil.lock` holding such a field is refused when it loads,
+with ``PATH/anvil.lock: platform FIELD `VALUE`: RULE`` (exit 2).
+
+Platforms are sorted by manager in the order brew, pacman, apt, dnf, apk, then by distro, version and arch; names are
+sorted within each.
+
+**The names.** A platform lists the `install` and `pin` names, never `remove`, of every package item whose facts can
+hold on it (`distro`, `distro_version`, `arch` and `pkg` are checked; other fact keys and tags are not), each under its
+[alias](#aliases) for the platform's manager. A name no target of the platform has installed is `missing`, with
+`lock: NAME is not installed on any target of PLATFORM (virtual, group or not installed)` on stderr: a virtual name,
+a pacman group and a brew cask stay `missing`. A name holding `:` or `/` (an apt arch qualifier, a brew tap, a repo
+prefix) is left out, with `lock: skipped NAME on PLATFORM: a qualified name cannot be locked`; `@` is kept.
+
+### `anvil lock`
+
+It probes each selected target, resolves its manager and reads the installed versions read-only, with no sudo and no
+refresh (`brew list --versions --formula`, `pacman -Q`, `dpkg-query -W`, `rpm -q`, `apk info -v`). A target no package item
+applies to is skipped. Platforms no selected target covers keep their entry from the old file, so `--target` updates
+only the selected targets' platforms. Success prints `wrote anvil.lock (N platforms)`; `--json` prints the written
+document, with the warnings still on stderr. Nothing is written when any target fails to connect, probe, resolve or
+answer the query.
+
+When two targets of one platform have different versions of a name, nothing is written and `anvil lock` exits 1:
+
+```text
+lock: apt/debian 12/x86_64 git differs: web1 has 1:2.39.5-0+deb12u2, web2 has 1:2.39.4-0+deb12u1 (use --from HOST)
+```
+
+`--from web2` takes `web2`'s version wherever its platform's targets disagree. It is repeatable, one host per platform;
+a host that is not a selected target, or two on one platform, is exit 2, and so is `--from` with `--check`.
+
+`anvil lock --check` compares `anvil.lock` with the config and contacts no target (`--target` is ignored). Each name a
+platform should hold and lacks, and each it holds that the config no longer manages, is one line on stderr:
+
+```text
+anvil.lock: apt/debian 12/x86_64 lacks nodejs
+anvil.lock: apt/debian 12/x86_64 still lists curl, which the config no longer manages
+```
+
+It exits 1 when there are any (`anvil.lock: N problems found; run anvil lock`) or there is no file
+(`anvil.lock: not found`), else 0. `--json` prints `{"stale": true, "problems": [...]}`. It does not compare versions;
+that is `doctor`'s `lock` row.
+
+### `apply --locked`
+
+Before any target changes, `apply --locked` refuses with exit 2:
+
+- any package item with `upgrade = true`: `--locked: upgrade = true cannot be used with a lock`;
+- no file: `--locked: anvil.lock not found`;
+- a reachable target with package work whose platform has no entry:
+  `--locked: anvil.lock has no entry for some targets; run anvil lock`, then `TARGET: no entry for PLATFORM` per
+  target.
+
+Then each package step uses its platform's entry:
+
+| Manager | With a locked version                                                      |
+| ------- | -------------------------------------------------------------------------- |
+| apt     | `S apt-get update`, then `S apt-get install -y --allow-downgrades 'N=V' …` |
+| dnf     | `S dnf -y install 'N-V' …`                                                 |
+| apk     | `S apk update`, then `S apk add 'N=V' …`                                   |
+| pacman  | the usual install; the version is only verified                            |
+| brew    | the usual install; the version is only verified                            |
+
+`S` is `sudo -n` as in [What runs](#what-runs), and apt's install runs under `env DEBIAN_FRONTEND=noninteractive`.
+On apt, dnf and apk a name already at its version is left alone; the others, if the repositories still offer that
+version, go in one install command, which installs, upgrades or downgrades them. `apk add N=V` writes `N=V` into
+`/etc/apk/world`, so apk holds that version until the entry there is changed. pacman and brew cannot install an older
+version from their repositories, so they install as without a lock.
+
+After the step, on every manager, anvil reads the installed versions again and fails the target (exit 1) with one line
+per name that is off its lock:
+
+```text
+packages: git 2.47.0 is locked, 2.48.1 is installed
+packages: git 2.47.0 is locked, not installed
+packages: git 1:2.39.5-0+deb12u2 is no longer in the repositories
+```
+
+The last one is apt, dnf or apk when the repositories no longer offer that version, often once a newer one is
+published; the other names are still installed first. A lock reproduces an install only while its versions are still
+offered: true reproduction needs snapshot repositories (such as snapshot.debian.org), which anvil does not set up.
+Only the top-level names are locked; their dependencies are whatever the repositories resolve.
+
+A name whose entry is `missing`, or that the entry lacks, installs as without a lock, with the warning
+`packages: NAME has no locked version in anvil.lock; run anvil lock`; it does not fail the target.
+
+**Pins.** `upgrade` is refused, so under `--locked` a pin follows the lock: on apt, dnf and apk a pinned name installs
+at its locked version like an `install` name, and a pin is not refused there. pacman installs a missing pin as usual
+and verifies it; brew still refuses a pin.
+
+### Plan and doctor
+
+`anvil plan --locked` makes the same checks and exit 2 refusals, reads each target's installed versions read-only and
+adds one line per name that is not at its lock, after the steps:
+
+```text
+▶ web1
+  would $ …
+  would install git 1:2.39.5-0+deb12u2
+  would change nodejs 18.19.0 -> 18.20.4
+  would install curl (no locked version)
+  ✔ 1 step
+```
+
+`would change` is apt, dnf and apk (installed `->` locked). pacman and brew read
+`would fail: git 2.47.0 is locked, 2.48.1 is installed` instead, since apply's verify would fail there; it does not
+change plan's exit. `--json` has a `lock` array per target, each `{"name", "would": "install"|"change"|"fail",
+"installed", "locked"}`, `installed` and `locked` left out when there is none.
+
+With an `anvil.lock`, `anvil doctor` adds a `lock` row to each reachable target with package work and a resolved
+manager, read-only:
+
+```text
+  lock            ok
+  lock            WARNING: 2 packages differ (git, nodejs)
+  lock            WARNING: no entry for apt/debian 12/x86_64
+  lock            WARNING: lock check failed: REASON
+```
+
+A locked name that is not installed differs; a `missing` one never does. `--json` has the same string as `lock`. The
+TUI's doctor section shows the row too. These warnings do not change doctor's exit.
+
+**Exit codes.** `anvil lock`: 0 when written, 1 for a target that fails or a conflict, 2 for a bad `--from` or an
+`anvil.lock` that does not load. `anvil lock --check`: 0 when fresh, 1 when stale or not found, 2 when it does not
+load. `apply --locked` and `plan --locked`: 2 for the refusals above, before any change; otherwise as without
+`--locked`, a verify failure or a target with an invalid platform field being a target failure (1).
 
 ## What runs
 

@@ -2045,6 +2045,7 @@ pub mod tests {
             error: error.map(str::to_owned),
             manager: None,
             packages: None,
+            lock: None,
             manager_error: None,
             transport: format!("ssh {target}"),
             plugins: Vec::new(),
@@ -2576,6 +2577,7 @@ pub mod tests {
                 env: Default::default(),
                 steps: Vec::new(),
                 pending_handlers: Vec::new(),
+                lock: Vec::new(),
                 ok: true,
             },
         ));

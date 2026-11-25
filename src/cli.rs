@@ -157,6 +157,9 @@ pub enum Command {
         /// Take NAME off each selected target's pending handlers without running it (repeatable)
         #[arg(long = "drop-pending", value_name = "NAME")]
         drop_pending: Vec<String>,
+        /// Install the versions anvil.lock holds for each target's platform; exit 2 when it cannot
+        #[arg(long)]
+        locked: bool,
     },
     /// Show the steps apply would run on every target, running none
     Plan {
@@ -166,6 +169,18 @@ pub enum Command {
         /// Also print each templated file's rendered text, per target (kept for scripts)
         #[arg(long, hide = true)]
         show_rendered: bool,
+        /// Plan the versions anvil.lock holds, as apply --locked would
+        #[arg(long)]
+        locked: bool,
+    },
+    /// Record each target's installed package versions in anvil.lock
+    Lock {
+        /// Compare anvil.lock with the config, contacting no target; exit 1 when stale
+        #[arg(long, conflicts_with = "from")]
+        check: bool,
+        /// Take HOST's versions where its platform's targets disagree (repeatable)
+        #[arg(long, value_name = "HOST")]
+        from: Vec<String>,
     },
     /// Restore the files the last apply wrote, on every selected target
     Rollback {
@@ -278,6 +293,7 @@ impl Command {
             Command::Doctor => "doctor",
             Command::Apply { .. } => "apply",
             Command::Plan { .. } => "plan",
+            Command::Lock { .. } => "lock",
             Command::Rollback { .. } => "rollback",
             Command::Run { .. } => "run",
             Command::Secret { .. } => "secret",
@@ -323,10 +339,14 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
             let store = opts.secret_store(&config)?;
             anvil::doctor::run(out, &opts, &config, &expanded, store.as_ref())
         }
-        Command::Apply { drop_pending } => anvil::apply::run(out, &opts, drop_pending),
+        Command::Apply {
+            drop_pending,
+            locked,
+        } => anvil::apply::run(out, &opts, drop_pending, *locked),
         Command::Plan {
             show_content,
             show_rendered,
+            locked,
         } => anvil::plan::run(
             out,
             &opts,
@@ -334,7 +354,15 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
                 content: *show_content,
                 rendered: *show_rendered,
             },
+            *locked,
         ),
+        Command::Lock { check, from } => {
+            crate::commands::warn_parallel(cli);
+            if *check && !cli.target.is_empty() {
+                log::warn!("--target is ignored by `lock --check`");
+            }
+            anvil::lock::run(out, &opts, *check, from)
+        }
         Command::Rollback {
             force,
             force_all,
@@ -545,32 +573,48 @@ mod tests {
         assert!(matches!(command(&["doctor"]), Command::Doctor));
         assert!(matches!(
             command(&["apply"]),
-            Command::Apply { drop_pending } if drop_pending.is_empty()
+            Command::Apply { drop_pending, .. } if drop_pending.is_empty()
         ));
         assert!(matches!(
             command(&["apply", "--drop-pending", "reload sshd", "--drop-pending", "all"]),
-            Command::Apply { drop_pending } if drop_pending == ["reload sshd", "all"]
+            Command::Apply { drop_pending, .. } if drop_pending == ["reload sshd", "all"]
         ));
         assert!(Cli::try_parse_from(["anvil", "apply", "--drop-pending"]).is_err());
+        assert!(matches!(
+            command(&["lock"]),
+            Command::Lock { check: false, from } if from.is_empty()
+        ));
+        assert!(matches!(
+            command(&["lock", "--check", "--json"]),
+            Command::Lock { check: true, .. }
+        ));
+        assert!(matches!(
+            command(&["lock", "--from", "web1", "--from", "web2", "--target", "web"]),
+            Command::Lock { check: false, from } if from == ["web1", "web2"]
+        ));
+        assert!(Cli::try_parse_from(["anvil", "lock", "--check", "--from", "web1"]).is_err());
         assert!(matches!(
             command(&["plan"]),
             Command::Plan {
                 show_content: false,
-                show_rendered: false
+                show_rendered: false,
+                locked: false
             }
         ));
         assert!(matches!(
             command(&["plan", "--show-rendered"]),
             Command::Plan {
                 show_content: false,
-                show_rendered: true
+                show_rendered: true,
+                locked: false
             }
         ));
         assert!(matches!(
             command(&["plan", "--show-content", "--show-rendered"]),
             Command::Plan {
                 show_content: true,
-                show_rendered: true
+                show_rendered: true,
+                locked: false
             }
         ));
         match command(&["run", "-"]) {

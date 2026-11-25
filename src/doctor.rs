@@ -38,6 +38,7 @@ use crate::facts::{self, Facts, PROBE};
 use crate::files::{self, FileState, HashDest};
 use crate::interrupt::Interrupt;
 use crate::inventory::{Target, TargetKind};
+use crate::lock::{self, Lock, Platform};
 use crate::logger::{escape_controls, escape_invisible};
 use crate::options::{self, Options};
 use crate::packages::{self, Choice};
@@ -157,6 +158,10 @@ pub struct TargetReport {
     /// Read-only repository check: `ok` or a warning; does not affect exit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packages: Option<String>,
+    /// With `anvil.lock`, whether the managed names are at their locked
+    /// versions: `ok` or a warning; does not affect exit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock: Option<String>,
     /// Why the package manager cannot be resolved; only with `[packages]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manager_error: Option<String>,
@@ -341,6 +346,7 @@ pub fn check(
     }
     local.unused_tags = unused_tags;
     let record = load_record(config, &mut local);
+    let lock = load_lock(opts, config);
     let doctor = DoctorRun::prepare(config, &mut local, record.as_ref());
     let mut cancelled = false;
     on(Progress::Begin(&targets));
@@ -363,6 +369,13 @@ pub fn check(
                     if let (Some(manager), Ok(transport)) = (report.manager, &transport) {
                         status::phase(&target.name, Phase::Check("packages"));
                         report.packages = Some(package_rows(manager, &work, transport.as_ref()));
+                    }
+                    if let (Some(lock), Some(manager), Some(facts), Ok(transport)) =
+                        (&lock, report.manager, &report.facts, &transport)
+                    {
+                        status::phase(&target.name, Phase::Check("lock"));
+                        report.lock =
+                            Some(lock_row(lock, manager, facts, &work, transport.as_ref()));
                     }
                 }
                 if let (Some(doctor), Some(facts), Ok(transport)) =
@@ -437,6 +450,71 @@ fn pending_row(pending: &[String]) -> String {
     format!("WARNING: pending from last apply: {}", pending.join(", "))
 }
 
+/// `anvil.lock`, or why it cannot be read; `None` when there is none or the
+/// workspace cannot be resolved, which other checks report.
+fn load_lock(opts: &Options, config: &Config) -> Option<Result<Lock, String>> {
+    let workspace = match opts.workspace(config) {
+        Ok(workspace) => workspace,
+        Err(failure) => {
+            log::debug!("doctor: {}: {}", lock::FILE, failure.message);
+            return None;
+        }
+    };
+    Lock::load(&workspace).transpose()
+}
+
+/// Whether the names `work` manages with `manager` are at the versions
+/// `lock` holds for the target's platform: `ok`, `WARNING: N packages differ
+/// (NAMES)`, `WARNING: no entry for PLATFORM`, or `WARNING: lock check
+/// failed: WHY`. A name without a locked version does not count. Read-only,
+/// no sudo.
+fn lock_row(
+    lock: &Result<Lock, String>,
+    manager: packages::Manager,
+    facts: &Facts,
+    work: &[&packages::Packages],
+    transport: &dyn Transport,
+) -> String {
+    let failed = |why: &dyn std::fmt::Display| format!("WARNING: lock check failed: {why}");
+    let lock = match lock {
+        Ok(lock) => lock,
+        Err(why) => return failed(why),
+    };
+    let platform = match Platform::of(manager, facts) {
+        Ok(platform) => platform,
+        Err(why) => return failed(&why),
+    };
+    let Some(versions) = lock.get(&platform) else {
+        return format!("WARNING: no entry for {platform}");
+    };
+    let names: BTreeSet<&str> = work.iter().flat_map(|p| p.wanted(manager)).collect();
+    let names: Vec<&str> = names.into_iter().collect();
+    let locked = packages::locked_versions(&names, versions);
+    if locked.is_empty() {
+        return "ok".to_owned();
+    }
+    let query: Vec<&str> = locked.iter().map(|(name, _)| *name).collect();
+    let timeout = work
+        .iter()
+        .map(|p| p.timeout())
+        .max()
+        .unwrap_or(RUN_TIMEOUT);
+    let installed = match packages::installed_versions(transport, manager, &query, timeout) {
+        Ok(Ok(installed)) => installed,
+        Ok(Err(why)) => return failed(&why),
+        Err(err) => return failed(&err),
+    };
+    let differ: Vec<&str> = (locked.iter())
+        .filter(|(name, version)| installed.get(*name).map(String::as_str) != Some(*version))
+        .map(|(name, _)| *name)
+        .collect();
+    match differ.len() {
+        0 => "ok".to_owned(),
+        1 => format!("WARNING: 1 package differs ({})", differ[0]),
+        n => format!("WARNING: {n} packages differ ({})", differ.join(", ")),
+    }
+}
+
 /// A target a cancel skipped.
 fn cancelled_target(target: &Target, cancel: &Cancel) -> TargetReport {
     log::info!("doctor {}: cancelled", target.name);
@@ -449,6 +527,7 @@ fn cancelled_target(target: &Target, cancel: &Cancel) -> TargetReport {
         error: Some(skipped(cancel).to_owned()),
         manager: None,
         packages: None,
+        lock: None,
         manager_error: None,
         transport: describe(target),
         plugins: Vec::new(),
@@ -878,6 +957,7 @@ fn check_target(
         error,
         manager: None,
         packages: None,
+        lock: None,
         manager_error: None,
         transport: describe(target),
         plugins: Vec::new(),
@@ -1083,6 +1163,9 @@ fn render(report: &Report) -> String {
         }
         if let Some(packages) = &target.packages {
             let _ = writeln!(out, "  {:<15} {packages}", "packages");
+        }
+        if let Some(lock) = &target.lock {
+            let _ = writeln!(out, "  {:<15} {lock}", "lock");
         }
         if let Some(error) = &target.manager_error {
             let _ = writeln!(out, "  {:<15} error: {error}", "manager");
@@ -1405,6 +1488,100 @@ mod tests {
             )
             .starts_with("WARNING: package check failed:")
         );
+    }
+
+    #[test]
+    fn the_lock_row_is_ok_counts_what_differs_or_names_a_missing_entry() {
+        use crate::lock::Locked;
+        let arch = Facts::parse(b"distro=arch\narch=x86_64\nanvil-probe-end=1\n").unwrap();
+        let packages = packages::Packages {
+            install: ["git", "nodejs", "vim", "curl", "core/jq"]
+                .map(String::from)
+                .to_vec(),
+            ..packages::Packages::default()
+        };
+        let platform = Platform::of(packages::Manager::Pacman, &arch).unwrap();
+        let versions = |git: &str| {
+            lock::Versions::from([
+                ("git".to_owned(), Locked::Version(git.to_owned())),
+                ("nodejs".to_owned(), Locked::Version("20.1.0-1".to_owned())),
+                ("vim".to_owned(), Locked::Version("9.1-1".to_owned())),
+                ("curl".to_owned(), Locked::Missing),
+            ])
+        };
+        let lock = |git: &str| {
+            Ok(Lock {
+                platforms: BTreeMap::from([(platform.clone(), versions(git))]),
+            })
+        };
+        let row = |lock: &Result<Lock, String>, stdout: &'static str| {
+            let transport = Fake(Ok(stdout));
+            lock_row(
+                lock,
+                packages::Manager::Pacman,
+                &arch,
+                &[&packages],
+                &transport,
+            )
+        };
+        let all = "git 2.47.0-1\nnodejs 20.1.0-1\nvim 9.1-1\nanvil-versions-end=1\n";
+        assert_eq!(row(&lock("2.47.0-1"), all), "ok");
+        assert_eq!(
+            row(
+                &lock("2.46.0-1"),
+                "git 2.47.0-1\nvim 9.1-1\nanvil-versions-end=1\n"
+            ),
+            "WARNING: 2 packages differ (git, nodejs)"
+        );
+        assert_eq!(
+            row(&lock("2.46.0-1"), all),
+            "WARNING: 1 package differs (git)"
+        );
+        assert_eq!(
+            row(&lock("2.47.0-1"), "git 2.47.0-1\n"),
+            "WARNING: lock check failed: packages: the pacman version query did not finish"
+        );
+        assert_eq!(
+            row(
+                &Err("anvil.lock version 2: this anvil reads version 1".to_owned()),
+                all
+            ),
+            "WARNING: lock check failed: anvil.lock version 2: this anvil reads version 1"
+        );
+        let debian = Platform {
+            distro: "debian".to_owned(),
+            ..platform.clone()
+        };
+        let other = Ok(Lock {
+            platforms: BTreeMap::from([(debian, versions("2.47.0-1"))]),
+        });
+        assert_eq!(
+            row(&other, all),
+            "WARNING: no entry for pacman/arch rolling/x86_64"
+        );
+
+        let mut target = with_manager(
+            check_target(&host("box"), &fake(Ok(ROOT_FACTS))),
+            Choice::Is(packages::Manager::Pacman),
+        );
+        target.lock = Some("WARNING: 2 packages differ (git, nodejs)".to_owned());
+        let report = Report::new(healthy_local(&Memory::default(), &[]), vec![target]);
+        assert!(report.ok, "a warning keeps the exit");
+        assert!(
+            render(&report)
+                .contains("  lock            WARNING: 2 packages differ (git, nodejs)\n")
+        );
+        assert_eq!(
+            json(&report)["targets"][0]["lock"],
+            "WARNING: 2 packages differ (git, nodejs)"
+        );
+        let target = with_manager(
+            check_target(&host("box"), &fake(Ok(ROOT_FACTS))),
+            Choice::Is(packages::Manager::Pacman),
+        );
+        let report = Report::new(healthy_local(&Memory::default(), &[]), vec![target]);
+        assert!(!render(&report).contains("  lock "));
+        assert!(json(&report)["targets"][0].get("lock").is_none());
     }
 
     #[test]

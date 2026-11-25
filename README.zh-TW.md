@@ -52,7 +52,8 @@ anvil update               # replace the binary with the latest signed release
 
 ## 特色
 
-- 支援 brew、pacman、apt、dnf 與 apk 的套件，含各管理器別名、pin 與 remove（[套件](docs/packages.zh-TW.md)）。
+- 支援 brew、pacman、apt、dnf 與 apk 的套件，含各管理器別名、pin 與 remove（[套件](docs/packages.zh-TW.md)）；
+  `anvil lock` 依平台把它們的版本記錄在 `anvil.lock`，`apply --locked` 則安裝這些版本（[版本鎖](docs/packages.zh-TW.md#版本鎖)）。
 - 目錄、檔案、連結、移除、服務與步驟，各自依 tags 與 facts 比對每個 target（[設定](docs/configuration.zh-TW.md)）。
 - 本機的 user 與 group，ssh `authorized_keys` 以該 user 身分寫入，並有防止鎖在外面的保護，絕不移除登入的 user 或 root
   （[Users](docs/configuration.zh-TW.md#users)、[Groups](docs/configuration.zh-TW.md#groups)）。

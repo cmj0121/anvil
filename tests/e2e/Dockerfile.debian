@@ -1,0 +1,30 @@
+# sshd on Debian 12 for the `apply --locked` e2e (tests/e2e/debian.sh): `key`
+# signs in with the authorized key passed as AUTHORIZED_KEY at start and has
+# passwordless sudo, for the package step's `sudo -n`. tzdata, which the
+# base image ships, is the package whose locked version is installed: the
+# mirror offers it from bookworm, bookworm-updates and bookworm-security.
+# The apt lists are dropped; the package step runs `apt-get update` itself.
+# OpenSSH 9.2 has no PerSourcePenalties, so that line of the shared config goes.
+ARG BASE=debian@sha256:1d04200c2ece1d4d75a2a6f8e11ebce7d86a2ae28b34bb2c9cbb3ee9f4953e75
+FROM ${BASE}
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server sudo \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd \
+    && ssh-keygen -A \
+    && useradd -m -s /bin/bash -p '*' key \
+    && echo 'key ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/key \
+    && chmod 0440 /etc/sudoers.d/key \
+    && visudo -cf /etc/sudoers.d/key
+
+COPY sshd_config /etc/ssh/sshd_config
+RUN sed -i '/^PerSourcePenalties/d' /etc/ssh/sshd_config && sshd -t
+
+EXPOSE 22
+
+CMD ["sh", "-c", "install -d -m 700 -o key -g key /home/key/.ssh \
+  && printf '%s\\n' \"$AUTHORIZED_KEY\" > /home/key/.ssh/authorized_keys \
+  && chown key:key /home/key/.ssh/authorized_keys \
+  && chmod 600 /home/key/.ssh/authorized_keys \
+  && exec /usr/sbin/sshd -D -e"]
