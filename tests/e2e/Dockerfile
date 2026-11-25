@@ -2,6 +2,7 @@
 # passed as AUTHORIZED_KEY at start, `pw` only with the password `pw-secret`.
 # inetutils provides `hostname`, the config placeholder step `apply` runs;
 # diffutils provides `cmp`, which a `[[files]]` step uses to print `unchanged`.
+# git is the package whose installed version the version query reads.
 # sudo: `key` has passwordless sudo (the `[packages]` step's `sudo -n`), `pw`
 # needs its password (typed by anvil from a secret).
 # Two stages: `sshd` runs sshd as PID 1; `systemd` boots systemd as PID 1
@@ -18,7 +19,7 @@ FROM ${BASE} AS sshd
 # upgrade breaks when a new package needs a newer soname (openssl 4 did).
 RUN sed -i 's/^#\?DisableSandbox/DisableSandbox/' /etc/pacman.conf \
     && (grep -q '^DisableSandbox' /etc/pacman.conf || echo 'DisableSandbox' >> /etc/pacman.conf) \
-    && pacman -Syu --noconfirm --needed filesystem openssh inetutils diffutils sudo \
+    && pacman -Syu --noconfirm --needed filesystem openssh inetutils diffutils git sudo \
     && pacman -Scc --noconfirm \
     && ssh-keygen -A \
     && useradd -m -s /bin/bash -p '*' key \

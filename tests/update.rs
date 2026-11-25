@@ -10,6 +10,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use common::{FixtureServer, Route, Sandbox, json, keys, text};
 
@@ -392,6 +393,16 @@ fn serving_sized(files: &[(String, Vec<u8>)], sized: &[(String, u64)]) -> Fixtur
     server
 }
 
+/// Held while an update runs: macOS XProtect scans each new executable one
+/// at a time, so parallel first runs of the copied anvil queue the fixture
+/// binary's smoke run past its 10 s limit.
+static UPDATES: Mutex<()> = Mutex::new(());
+
+/// Takes [`UPDATES`]; a test that panicked holding it does not fail the rest.
+fn serial() -> MutexGuard<'static, ()> {
+    UPDATES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// A copy of the debug anvil at `<sandbox>/bin/anvil`, mode 0755.
 struct Install {
     sandbox: Sandbox,
@@ -427,6 +438,18 @@ impl Install {
     /// [`Install::update`], started as `program` under `umask 077`; the
     /// stage under `$TMPDIR` must be gone afterwards.
     fn update_via(
+        &self,
+        program: &Path,
+        server: &FixtureServer,
+        keys: &[&str],
+        extra: &[&str],
+    ) -> Output {
+        let _serial = serial();
+        self.run_update(program, server, keys, extra)
+    }
+
+    /// [`Install::update_via`] for a caller already holding [`serial`].
+    fn run_update(
         &self,
         program: &Path,
         server: &FixtureServer,
@@ -516,7 +539,10 @@ fn an_update_replaces_the_binary_keeps_the_old_at_prev_and_the_mode_under_umask_
     assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
     install.assert_updated();
     assert_eq!(install.names(), ["anvil", "anvil.prev"]);
-    let version = anvil::test_util::output(Command::new(&install.exe).arg("--version")).unwrap();
+    let version = {
+        let _serial = serial();
+        anvil::test_util::output(Command::new(&install.exe).arg("--version")).unwrap()
+    };
     assert_eq!(text(&version.stdout), "anvil 9.9.9\n");
     let paths: Vec<String> = server
         .requests()
@@ -739,8 +765,10 @@ fn a_binary_that_hangs_on_version_is_killed_after_10_s_and_not_installed() {
     let mut files = release_with(0, &sleeper);
     files[1].1 = fixture_bytes(&format!("{sleeper}.sha256"));
     files[2].1 = fixture_bytes(&format!("{sleeper}.minisig"));
+    let server = serving_files(&files);
+    let _serial = serial();
     let started = std::time::Instant::now();
-    let out = install.update(&serving_files(&files), &["a.pub"], &[]);
+    let out = install.run_update(&install.exe, &server, &["a.pub"], &[]);
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
     assert_refused(&install, &out, "downloaded binary did not exit in 10 s");
 }
