@@ -1045,6 +1045,7 @@ mod tests {
                 env: Default::default(),
                 steps: Vec::new(),
                 pending_handlers: Vec::new(),
+                lock: Vec::new(),
                 ok: true,
             },
         ));

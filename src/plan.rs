@@ -32,16 +32,17 @@ use crate::fanout::{self, Event};
 use crate::files::{FileWrite, Loaded, MAX_KEPT, Sources};
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
-use crate::lock::Lock;
+use crate::lock::{Lock, Platform};
 use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
 use crate::options::{Options, Output};
+use crate::packages;
 use crate::plugin::Plugins;
 use crate::prepared::Prepared;
 use crate::record;
 use crate::report::{self, Escape, Line, Shown, Style, print_lines};
 use crate::status;
 use crate::step::{PlannedRun, RunKind};
-use crate::tasks::Expanded;
+use crate::tasks::{Expanded, ItemKind};
 use crate::transport::{Transport, TransportError};
 use crate::users;
 
@@ -65,6 +66,9 @@ pub enum PlanReport {
         /// in config order.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         pending_handlers: Vec<String>,
+        /// Under `--locked`, each managed name not already at its lock.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        lock: Vec<LockChange>,
         ok: bool,
     },
     /// The target could not be reached, probed or resolved.
@@ -115,6 +119,52 @@ impl PlanReport {
             PlanReport::Planned { vars, env, .. }
             | PlanReport::Failed { vars, env, .. }
             | PlanReport::Cancelled { vars, env, .. } => (vars, env),
+        }
+    }
+}
+
+/// What `--locked` would do to one managed name not already at its lock:
+/// `installed` is its version on the target, `locked` its version in
+/// `anvil.lock`, absent when the entry has none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LockChange {
+    pub name: String,
+    pub would: Would,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locked: Option<String>,
+}
+
+/// What apply would do to a name: install it, change its version (apt,
+/// dnf, apk), or fail its verify (pacman and brew install no exact
+/// version).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Would {
+    Install,
+    Change,
+    Fail,
+}
+
+impl LockChange {
+    /// `would install git 1:2.39.5-0+deb12u2`, `would install git (no
+    /// locked version)`, `would change nodejs 18.19.0 -> 18.20.4` or
+    /// `would fail: git 2.47.0 is locked, 2.48.1 is installed`.
+    pub fn text(&self) -> String {
+        let name = &self.name;
+        let installed = self.installed.as_deref().unwrap_or_default();
+        match (self.would, self.locked.as_deref()) {
+            (Would::Install, Some(locked)) => format!("would install {name} {locked}"),
+            (Would::Install, None) => format!("would install {name} (no locked version)"),
+            (Would::Change, locked) => format!(
+                "would change {name} {installed} -> {}",
+                locked.unwrap_or_default()
+            ),
+            (Would::Fail, locked) => format!(
+                "would fail: {name} {} is locked, {installed} is installed",
+                locked.unwrap_or_default()
+            ),
         }
     }
 }
@@ -743,8 +793,8 @@ fn plan_target(
     status::phase(&target.name, status::Phase::Probe);
     let runs = transport
         .map_err(|err| Unresolved::Failed(err.to_string()))
-        .and_then(|transport| engine::probe(transport.as_ref(), expanded))
-        .and_then(|facts| {
+        .and_then(|transport| {
+            let facts = engine::probe(transport.as_ref(), expanded)?;
             users::check_config(expanded, target, &facts)?;
             let steps = engine::resolve(
                 target,
@@ -760,10 +810,14 @@ fn plan_target(
                 cancel,
             )?;
             let trees = trees_of(&steps, expanded, sources, target, &facts);
-            Ok((steps, trees))
+            let lock = match lock {
+                Some(lock) => lock_changes(target, &facts, expanded, lock, transport.as_ref())?,
+                None => Vec::new(),
+            };
+            Ok((steps, trees, lock))
         });
     match runs {
-        Ok((steps, trees)) => {
+        Ok((steps, trees, lock)) => {
             log::info!("plan {}: {} steps", target.name, steps.len());
             PlanReport::Planned {
                 target: target.name.clone(),
@@ -772,6 +826,7 @@ fn plan_target(
                 steps,
                 trees,
                 pending_handlers,
+                lock,
                 ok: true,
             }
         }
@@ -781,6 +836,69 @@ fn plan_target(
             failed(target, error)
         }
     }
+}
+
+/// Each lockable name the package items matching `target` manage that is
+/// not at its lock on the target, read with [`packages::versions_script`]
+/// (read-only, no sudo), in config order, each once. A name the platform's
+/// entry has no version of shows only when not installed. A query that
+/// fails or does not finish fails the target.
+fn lock_changes(
+    target: &Target,
+    facts: &Facts,
+    expanded: &Expanded,
+    lock: &Lock,
+    transport: &dyn Transport,
+) -> Result<Vec<LockChange>, Unresolved> {
+    let mut changes: Vec<LockChange> = Vec::new();
+    for item in (expanded.items.iter()).filter(|item| item.matches(target, facts)) {
+        let ItemKind::Packages(packages) = &item.kind else {
+            continue;
+        };
+        let sudo = packages.sudo_secret_for(target).is_some();
+        let Ok(manager) = packages::resolve(packages.choice_for(target), facts, sudo) else {
+            continue;
+        };
+        let Some(versions) = lock.get(&Platform::of(manager, facts)) else {
+            continue;
+        };
+        let names: Vec<&str> = (packages.wanted(manager).into_iter())
+            .filter(|name| packages::lockable(name))
+            .filter(|name| !changes.iter().any(|change| change.name == *name))
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
+        let output = transport.run(
+            &packages::versions_script(manager, &names),
+            packages.timeout(),
+        )?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let installed =
+            packages::parse_versions(manager, &names, &stdout).map_err(Unresolved::Failed)?;
+        let locked = packages::locked_versions(&names, versions);
+        for name in names {
+            let have = installed.get(name).cloned();
+            let want = locked
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| (*v).to_owned());
+            let would = match (&have, &want) {
+                (None, _) => Would::Install,
+                (Some(_), None) => continue,
+                (Some(have), Some(want)) if have == want => continue,
+                _ if packages::installs_exact(manager) => Would::Change,
+                _ => Would::Fail,
+            };
+            changes.push(LockChange {
+                name: name.to_owned(),
+                would,
+                installed: have,
+                locked: want,
+            });
+        }
+    }
+    Ok(changes)
 }
 
 /// `anvil plan`: prints each target's block once it and every earlier
@@ -846,7 +964,8 @@ pub fn run(out: Output, opts: &Options, show: Show, locked: bool) -> Result<(), 
 /// by its [`rendered_text`] and, with `show.rendered`, the text itself. With
 /// `show.content`, every file step's is followed by its
 /// [`ContentView::line`] and its text instead, if shown. A tree's first step
-/// is preceded by its [`TreeShown::text`] line.
+/// is preceded by its [`TreeShown::text`] line. Under `--locked`, each
+/// [`LockChange::text`] follows the steps.
 pub fn render(report: &PlanReport, show: Show, sources: &Sources, hashes: &Hashes) -> Vec<Line> {
     let mut lines = vec![Line::header(report.target())];
     let (vars, env) = report.values();
@@ -858,6 +977,7 @@ pub fn render(report: &PlanReport, show: Show, sources: &Sources, hashes: &Hashe
             steps,
             trees,
             pending_handlers,
+            lock,
             ..
         } => {
             for (i, step) in steps.iter().enumerate() {
@@ -889,6 +1009,9 @@ pub fn render(report: &PlanReport, show: Show, sources: &Sources, hashes: &Hashe
                 {
                     lines.extend(text_lines(&rendered.text));
                 }
+            }
+            for change in lock {
+                lines.push(Line::out(change.text(), Escape::Always, Some(DIM)));
             }
             if !pending_handlers.is_empty() {
                 let text = format!("pending from last apply: {}", pending_handlers.join(", "));
@@ -1900,6 +2023,7 @@ mod tests {
                 },
             ],
             pending_handlers: Vec::new(),
+            lock: Vec::new(),
             ok: true,
         };
         assert_eq!(plan.targets[0], local);
@@ -2357,5 +2481,221 @@ mod tests {
             warnings: Vec::new(),
         };
         assert_eq!(plan.abort(), None);
+    }
+
+    /// Answers the probe with `probe` and the version query with `versions`
+    /// then the query's end line.
+    struct Queried {
+        probe: &'static str,
+        versions: &'static str,
+    }
+
+    impl Transport for Queried {
+        fn name(&self) -> &str {
+            "queried"
+        }
+
+        fn run(
+            &self,
+            script: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Output, TransportError> {
+            let stdout = if script.contains(packages::VERSIONS_END) {
+                format!("{}{}\n", self.versions, packages::VERSIONS_END)
+            } else {
+                self.probe.to_owned()
+            };
+            Ok(Output {
+                stdout: stdout.into_bytes(),
+                code: Some(0),
+                ..Output::default()
+            })
+        }
+
+        fn run_tty(
+            &self,
+            _script: &str,
+            _password: &[u8],
+            _timeout: std::time::Duration,
+        ) -> Result<Output, TransportError> {
+            Ok(Output::default())
+        }
+    }
+
+    /// Plans `install` on `local` under `lock`, its probe `probe` and its
+    /// version query printing `versions`.
+    fn plan_locked(
+        install: &[&str],
+        probe: &'static str,
+        versions: &'static str,
+        lock: &Lock,
+    ) -> Plan {
+        let config = config(
+            Some(Packages {
+                install: install.iter().map(|name| (*name).to_owned()).collect(),
+                ..Packages::default()
+            }),
+            &[],
+        );
+        super::plan_targets(
+            &[target("local")],
+            NonZeroU8::MIN,
+            |_| Ok(Box::new(Queried { probe, versions })),
+            &config,
+            &legacy(&config),
+            &Sources::default(),
+            &FakePlugins::none(),
+            &Pending::new(),
+            Some(lock),
+            &Cancel::new(),
+            &mut |_| {},
+        )
+    }
+
+    fn lock_of(manager: Manager, distro: &str, version: &str, pairs: &[(&str, &str)]) -> Lock {
+        let platform = Platform {
+            manager,
+            distro: distro.to_owned(),
+            distro_version: version.to_owned(),
+            arch: "x86_64".to_owned(),
+        };
+        let versions = pairs
+            .iter()
+            .map(|(name, locked)| {
+                let locked = match *locked {
+                    crate::lock::MISSING => crate::lock::Locked::Missing,
+                    v => crate::lock::Locked::Version(v.to_owned()),
+                };
+                ((*name).to_owned(), locked)
+            })
+            .collect();
+        Lock {
+            platforms: BTreeMap::from([(platform, versions)]),
+        }
+    }
+
+    const DEBIAN: &str =
+        "distro=debian\ndistro_version=12\narch=x86_64\nuser=root\npkg=apt\nanvil-probe-end=1\n";
+    const ARCH_ROOT: &str =
+        "distro=arch\ndistro_version=\narch=x86_64\nuser=root\npkg=pacman\nanvil-probe-end=1\n";
+
+    #[test]
+    fn locked_plan_lists_each_name_off_its_lock_in_text_and_json() {
+        let lock = lock_of(
+            Manager::Apt,
+            "debian",
+            "12",
+            &[
+                ("git", "1:2.39.5-0+deb12u2"),
+                ("nodejs", "18.20.4"),
+                ("vim", "2:9.0.1378-2"),
+                ("curl", "missing"),
+            ],
+        );
+        let plan = plan_locked(
+            &["git", "nodejs", "vim", "curl", "jq"],
+            DEBIAN,
+            "ii  nodejs 18.19.0\nii  vim 2:9.0.1378-2\nii  jq 1.6-2.1\n",
+            &lock,
+        );
+        assert!(plan.ok, "{:?}", plan.targets[0]);
+        let shown = screen(&plan.targets[0]);
+        let lines: Vec<&str> = shown.lines().filter(|l| !l.contains("would $")).collect();
+        assert_eq!(
+            lines,
+            [
+                "▶ local",
+                "  would install git 1:2.39.5-0+deb12u2",
+                "  would change nodejs 18.19.0 -> 18.20.4",
+                "  would install curl (no locked version)",
+                "  ✔ 1 step",
+                "",
+            ],
+            "{shown}"
+        );
+        assert_eq!(
+            json(&plan.targets[0])["lock"],
+            serde_json::json!([
+                {"name": "git", "would": "install", "locked": "1:2.39.5-0+deb12u2"},
+                {"name": "nodejs", "would": "change", "installed": "18.19.0", "locked": "18.20.4"},
+                {"name": "curl", "would": "install"},
+            ])
+        );
+    }
+
+    #[test]
+    fn locked_plan_on_pacman_would_fail_a_version_it_cannot_install() {
+        let lock = lock_of(Manager::Pacman, "arch", "rolling", &[("git", "2.47.0-1")]);
+        let plan = plan_locked(&["git"], ARCH_ROOT, "git 2.48.1-1\n", &lock);
+        assert!(
+            screen(&plan.targets[0])
+                .contains("  would fail: git 2.47.0-1 is locked, 2.48.1-1 is installed\n")
+        );
+        assert_eq!(
+            json(&plan.targets[0])["lock"],
+            serde_json::json!([
+                {"name": "git", "would": "fail", "installed": "2.48.1-1", "locked": "2.47.0-1"},
+            ])
+        );
+        let plan = plan_locked(&["git"], ARCH_ROOT, "git 2.47.0-1\n", &lock);
+        assert!(json(&plan.targets[0]).get("lock").is_none(), "at its lock");
+    }
+
+    #[test]
+    fn a_locked_version_query_that_does_not_finish_fails_the_target() {
+        struct Unfinished;
+        impl Transport for Unfinished {
+            fn name(&self) -> &str {
+                "unfinished"
+            }
+            fn run(&self, script: &str, _: std::time::Duration) -> Result<Output, TransportError> {
+                let stdout = if script.contains(packages::VERSIONS_END) {
+                    ""
+                } else {
+                    ARCH_ROOT
+                };
+                Ok(Output {
+                    stdout: stdout.as_bytes().to_vec(),
+                    code: Some(0),
+                    ..Output::default()
+                })
+            }
+            fn run_tty(
+                &self,
+                _: &str,
+                _: &[u8],
+                _: std::time::Duration,
+            ) -> Result<Output, TransportError> {
+                Ok(Output::default())
+            }
+        }
+        let config = config(
+            Some(Packages {
+                install: vec!["git".to_owned()],
+                ..Packages::default()
+            }),
+            &[],
+        );
+        let lock = lock_of(Manager::Pacman, "arch", "rolling", &[("git", "2.47.0-1")]);
+        let plan = super::plan_targets(
+            &[target("local")],
+            NonZeroU8::MIN,
+            |_| Ok(Box::new(Unfinished)),
+            &config,
+            &legacy(&config),
+            &Sources::default(),
+            &FakePlugins::none(),
+            &Pending::new(),
+            Some(&lock),
+            &Cancel::new(),
+            &mut |_| {},
+        );
+        assert_eq!(
+            plan.targets[0],
+            failed(
+                &target("local"),
+                "packages: the pacman version query did not finish".to_owned()
+            )
+        );
     }
 }

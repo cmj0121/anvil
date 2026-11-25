@@ -1080,7 +1080,7 @@ fn local_block(local: &doctor::LocalReport) -> Vec<Line<'static>> {
 }
 
 /// One target: how it is reached, whether it is connectable, its facts,
-/// its package manager, its error, then each doctor plugin's rows (drift,
+/// its package manager, its package and lock rows, its error, then each doctor plugin's rows (drift,
 /// errors and the `sudo` warning failed, notices dim) and the files not
 /// compared.
 fn doctor_block(report: &doctor::TargetReport) -> Vec<Line<'static>> {
@@ -1098,6 +1098,14 @@ fn doctor_block(report: &doctor::TargetReport) -> Vec<Line<'static>> {
     if let Some(packages) = &report.packages {
         let line = row("packages", packages);
         lines.push(if packages.starts_with("WARNING:") {
+            line.style(Color::Yellow)
+        } else {
+            line
+        });
+    }
+    if let Some(lock) = &report.lock {
+        let line = row("lock", lock);
+        lines.push(if lock.starts_with("WARNING:") {
             line.style(Color::Yellow)
         } else {
             line
@@ -2689,6 +2697,7 @@ mod tests {
                 notify: Vec::new(),
             }],
             pending_handlers: Vec::new(),
+            lock: Vec::new(),
             ok: true,
         });
         for (lines, wanted) in [
@@ -2759,6 +2768,7 @@ mod tests {
             env: Default::default(),
             steps: vec![file(Some(rendered)), file(None)],
             pending_handlers: Vec::new(),
+            lock: Vec::new(),
             ok: true,
         });
         let shown: Vec<String> = plan.iter().map(ToString::to_string).collect();
@@ -2864,6 +2874,7 @@ mod tests {
                         notify: Vec::new(),
                     }],
                     pending_handlers: Vec::new(),
+                    lock: Vec::new(),
                     ok: true,
                 }]),
                 ok: Some(true),
@@ -2922,6 +2933,7 @@ mod tests {
                         planned(Some("tasks[1]"), "file /etc/app/a.conf"),
                     ],
                     pending_handlers: Vec::new(),
+                    lock: Vec::new(),
                     ok: true,
                 }]),
                 ok: Some(true),
@@ -2990,6 +3002,7 @@ mod tests {
                             },
                         ],
                         pending_handlers: Vec::new(),
+                        lock: Vec::new(),
                         ok: true,
                     },
                     PlanReport::Failed {
@@ -3197,6 +3210,33 @@ mod tests {
         assert!(results(&app, 12).iter().any(|row| row.contains("no route")));
         press(&mut app, KeyCode::Left);
         assert_eq!(results(&app, 8)[0], "✔ local checks  [✔ pi]  ✘ mac");
+    }
+
+    #[test]
+    fn the_doctor_view_shows_the_lock_row_after_the_packages_row() {
+        let mut app = app();
+        let mut pi = probed("pi", None);
+        pi.manager = Some(anvil::packages::Manager::Pacman);
+        pi.packages = Some("ok".to_owned());
+        pi.lock = Some("WARNING: 1 package differs (git)".to_owned());
+        show(
+            &mut app,
+            RunResult::Doctor {
+                local: Some(local_report()),
+                targets: vec![pi],
+                ok: Some(true),
+                error: None,
+            },
+        );
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            &results(&app, 16)[6..9],
+            [
+                "  manager         pacman",
+                "  packages        ok",
+                "  lock            WARNING: 1 package differs (git)",
+            ]
+        );
     }
 
     #[test]
