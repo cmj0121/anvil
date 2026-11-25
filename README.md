@@ -56,7 +56,9 @@ works on up to N targets at once ([Running in parallel](docs/cli.md#running-in-p
 
 ## Highlights
 
-- Packages on brew, pacman, apt, dnf and apk, with per-manager aliases, pin and remove ([Packages](docs/packages.md)).
+- Packages on brew, pacman, apt, dnf and apk, with per-manager aliases, pin and remove ([Packages](docs/packages.md));
+  `anvil lock` records their versions per platform in `anvil.lock` and `apply --locked` installs them
+  ([Lock](docs/packages.md#lock)).
 - Directories, files, links, removals, services and steps, each matched per target by tags and facts ([Configuration](docs/configuration.md)).
 - Local users and groups, with ssh `authorized_keys` written as the user, behind lockout guards that never remove the
   login user or root ([Users](docs/configuration.md#users), [Groups](docs/configuration.md#groups)).

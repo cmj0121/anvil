@@ -232,7 +232,7 @@ apt 使用 `apt-get remove` 而非 `purge`，因此設定檔會保留；dnf 預�
 `apt-get remove` 與 `dnf remove` 會連同那些套件一起移除；`pacman -R` 與 `brew uninstall` 會拒絕，step 因此失敗；
 `apk del` 會保留它並說明原因（`World updated, but the following packages are not removed due to: libcurl: curl`），step 仍然成功。
 
-**鎖定。** 被鎖定的名稱在這次執行的升級中會被跳過，只在缺少時才安裝；執行結束後不留下任何 hold。
+**鎖定。** 被鎖定的名稱在這次執行的升級中會被跳過，只在缺少時才安裝；執行結束後不留下任何 hold（`--locked` 下除外：見[版本鎖](#版本鎖)）。
 pacman 以 `--ignore` 升級，dnf 以 `--exclude` 升級。被鎖定的名稱從不放進安裝清單，即使它也在 `install` 中
 （這是允許的：以鎖定為準）：pacman 的 `--noconfirm` 會對「仍要安裝被忽略的套件嗎？」回答 yes，而 `dnf install` 會升級已安裝的名稱。
 比對的是解析後的名稱，因此某個管理器的[別名](#別名)對應到鎖定名稱的 `install` 名稱，也同樣交給鎖定處理。
@@ -240,7 +240,7 @@ pacman 以 `--ignore` 升級，dnf 以 `--exclude` 升級。被鎖定的名稱�
 在 dnf 上，安裝部分排在其後並同樣加上 `--exclude`，因此它無法以相依套件的身分升級被鎖定的套件：
 `P` 需要較新的鎖定套件時，該安裝會失敗，step 也隨之失敗。
 
-**brew、apt 與 apk 拒絕。** 它們無法只在一次執行中跳過某個套件：`brew install` 與 `apt-get install` 會升級已安裝的名稱，
+**brew、apt 與 apk 拒絕**（apt 與 apk 在 `--locked` 下除外：見[版本鎖](#版本鎖)）。它們無法只在一次執行中跳過某個套件：`brew install` 與 `apt-get install` 會升級已安裝的名稱，
 而 `apk upgrade` 沒有 exclude。只要有 `pin`，這類 target 就會失敗（不論是否設定 `upgrade`），而且在執行任何東西之前：
 
 ```text
@@ -248,7 +248,7 @@ packages: pin is not one-shot on brew: vim
 ```
 
 名稱是該管理器會使用的名稱（套用[別名](#別名)），依 config 的順序，以逗號分隔。
-anvil 從不改為寫入持久的 hold（`brew pin`、`apt-mark hold`、編輯 `/etc/apk/world`）。
+anvil 從不改為寫入持久的 hold（`brew pin`、`apt-mark hold`、編輯 `/etc/apk/world`）（`--locked` 下除外：見[版本鎖](#版本鎖)）。
 `anvil plan` 會以同一行使該 target 失敗；`anvil doctor` 的 `manager` 列不檢查鎖定。
 
 **規則。** `remove` 與 `pin` 的項目遵循 `install` 的名稱規則與位元組上限，各自最多 256 個項目；`anvil config` 不會儲存空的清單。
@@ -269,6 +269,179 @@ anvil 從不改為寫入持久的 hold（`brew pin`、`apt-mark hold`、編輯 `
   在 `--noconfirm` 下預設為 yes，被鎖定的套件仍會被升級。dnf 則改為跳過這類升級（或在 `best=True` 時失敗）。
 - 在 dnf 上，當某個 `install` 名稱需要較新版本的鎖定套件時，`dnf -y install --exclude=KC P` 會失敗，step 也隨之失敗。
 - `pacman -Q` 不解析 provides：在 pacman 上移除一個只是被提供、而非套件名稱的名稱，什麼都不會做。
+
+## 版本鎖
+
+`anvil lock` 會把選定 target 已安裝的每個受管理套件版本，依平台記錄到[工作區](configuration.zh-TW.md#工作區)中的 `anvil.lock`。
+之後 `anvil apply --locked` 會安裝這些版本，做不到時則失敗，讓同平台的新 host 取得與其他 host 相同的套件。
+請把 `anvil.lock` 與 config 一起 commit。
+
+```sh
+anvil lock                 # probe the targets, write anvil.lock
+anvil lock --check         # is anvil.lock still in step with the config? contacts no target
+anvil plan --locked        # what apply --locked would install or change
+anvil apply --locked       # install the locked versions
+```
+
+**檔案。** TOML，由 `anvil lock` 以固定、排序過的版面整份寫入，因此在相同 host 上執行兩次會寫出相同的位元組；請勿手動編輯。
+檔案不記錄 host：
+
+```toml
+# anvil.lock: written by `anvil lock`, do not edit
+version = 1
+
+[[platform]]
+manager = "brew"
+distro = "macos"
+distro_version = "14"
+arch = "arm64"
+
+[platform.packages]
+"python@3.12" = "3.12.7"
+
+[[platform]]
+manager = "apt"
+distro = "debian"
+distro_version = "12"
+arch = "x86_64"
+
+[platform.packages]
+git = "1:2.39.5-0+deb12u2"
+nodejs = "missing"
+```
+
+它以與 config 相同的擁有者與權限檢查載入（群組或其他人可寫入的 `anvil.lock` 為 exit 2）。
+`version` 不是 `1`、未知的鍵、違反 `install` 名稱規則的名稱、既不是版本
+（`[A-Za-z0-9][A-Za-z0-9.+~:_-]*`，`:` 之後不能緊接 `~`，最多 128 位元組）也不是 `missing` 的值，或同一平台列出兩次，皆為 exit 2。
+
+**平台。** 每個 `[[platform]]` 是 target 的套件 step 解析出的管理器，加上三個探測 fact，訊息中顯示為 `apt/debian 12/x86_64`：
+
+- `distro`：原樣；空值為 `unknown`。
+- `distro_version`：空值為 `rolling`（Arch、Debian sid）；`macos` 只保留主版本（`14.6.1` 為 `14`），
+  `alpine` 保留前兩段（`3.20.3` 為 `3.20`）；其他 distro 原樣。
+- `arch`：`uname -m` 原樣，因此 `arm64`（macOS）與 `aarch64`（Linux）是不同的平台；空值為 `unknown`。
+
+這三者都必須符合 `[A-Za-z0-9][A-Za-z0-9._+-]*`，且最多 64 位元組。以下訊息中的 FIELD 為 `distro`、`distro_version` 或 `arch`，
+VALUE 以跳脫後的形式顯示（`x86\u{200b}_64`），RULE 為 `must match [A-Za-z0-9][A-Za-z0-9._+-]*, at most 64 bytes`。
+探測結果不符的 target 會使 `anvil lock` 失敗（exit 1），訊息為 ``TARGET: lock: FIELD `VALUE`: RULE``；
+在 `plan --locked` 與 `apply --locked` 下只有該 target 失敗，訊息為 ``packages: FIELD `VALUE`: RULE``，其他 target 照常進行（exit 1）；
+doctor 的 `lock` 列則為 ``WARNING: lock check failed: FIELD `VALUE`: RULE``。
+含有這種欄位的 `anvil.lock` 在載入時會被拒絕，訊息為 ``PATH/anvil.lock: platform FIELD `VALUE`: RULE``（exit 2）。
+
+平台先依管理器排序，順序為 brew、pacman、apt、dnf、apk，再依 distro、版本與 arch；每個平台內的名稱也排序。
+
+**名稱。** 平台列出每個 fact 可能在其上成立的套件項目的 `install` 與 `pin` 名稱（從不含 `remove`），
+檢查的是 `distro`、`distro_version`、`arch` 與 `pkg`（其他 fact 鍵與 tag 不檢查），各自依該平台的管理器套用[別名](#別名)。
+該平台沒有任何 target 安裝的名稱記為 `missing`，並在 stderr 印出
+`lock: NAME is not installed on any target of PLATFORM (virtual, group or not installed)`：
+虛擬名稱、pacman group 與 brew cask 都會維持 `missing`。
+含有 `:` 或 `/` 的名稱（apt 架構限定、brew tap、repo 前綴）會被略過，並印出
+`lock: skipped NAME on PLATFORM: a qualified name cannot be locked`；`@` 則保留。
+
+### `anvil lock`
+
+它會探測每個選定的 target、解析其管理器，並以唯讀、不用 sudo、不更新索引的方式讀取已安裝版本
+（`brew list --versions --formula`、`pacman -Q`、`dpkg-query -W`、`rpm -q`、`apk info -v`）。沒有套件項目適用的 target 會被略過。
+沒有選定 target 涵蓋的平台保留舊檔中的項目，因此 `--target` 只更新選定 target 的平台。
+成功時印出 `wrote anvil.lock (N platforms)`；`--json` 印出寫入的文件，警告仍輸出到 stderr。
+任何 target 無法連線、探測、解析或回應查詢時，不寫入任何東西。
+
+同一平台的兩個 target 對某名稱有不同版本時，不寫入任何東西，`anvil lock` 以 1 結束：
+
+```text
+lock: apt/debian 12/x86_64 git differs: web1 has 1:2.39.5-0+deb12u2, web2 has 1:2.39.4-0+deb12u1 (use --from HOST)
+```
+
+`--from web2` 會在其平台的 target 不一致處採用 `web2` 的版本。可重複，每個平台一個 host；
+不是選定 target 的 host，或同一平台有兩個，為 exit 2，`--from` 搭配 `--check` 也是。
+
+`anvil lock --check` 比對 `anvil.lock` 與 config，不連線任何 target（忽略 `--target`）。
+平台應有卻缺少的每個名稱，以及它仍列出但 config 已不再管理的每個名稱，各在 stderr 印出一行：
+
+```text
+anvil.lock: apt/debian 12/x86_64 lacks nodejs
+anvil.lock: apt/debian 12/x86_64 still lists curl, which the config no longer manages
+```
+
+有任何一行（`anvil.lock: N problems found; run anvil lock`）或沒有檔案（`anvil.lock: not found`）時以 1 結束，否則為 0。
+`--json` 印出 `{"stale": true, "problems": [...]}`。它不比對版本；那是 `doctor` 的 `lock` 列的工作。
+
+### `apply --locked`
+
+在任何 target 變更之前，`apply --locked` 以 exit 2 拒絕：
+
+- 任何套件項目設了 `upgrade = true`：`--locked: upgrade = true cannot be used with a lock`；
+- 沒有該檔：`--locked: anvil.lock not found`；
+- 有套件工作的可連線 target，其平台沒有項目：
+  `--locked: anvil.lock has no entry for some targets; run anvil lock`，接著每個 target 一行 `TARGET: no entry for PLATFORM`。
+
+接著每個套件 step 使用其平台的項目：
+
+| 管理器 | 有鎖定版本時                                                               |
+| ------ | -------------------------------------------------------------------------- |
+| apt    | `S apt-get update`，接著 `S apt-get install -y --allow-downgrades 'N=V' …` |
+| dnf    | `S dnf -y install 'N-V' …`                                                 |
+| apk    | `S apk update`，接著 `S apk add 'N=V' …`                                   |
+| pacman | 照常安裝；版本只做驗證                                                     |
+| brew   | 照常安裝；版本只做驗證                                                     |
+
+`S` 是 `sudo -n`，同[執行的指令](#執行的指令)，apt 的安裝在 `env DEBIAN_FRONTEND=noninteractive` 下執行。
+在 apt、dnf 與 apk 上，已在該版本的名稱不會被動到；其他名稱若 repository 仍提供該版本，會放進同一道安裝指令，
+由它安裝、升級或降級。`apk add N=V` 會把 `N=V` 寫入 `/etc/apk/world`，因此 apk 會維持該版本，直到那裡的項目被修改為止。
+pacman 與 brew 無法從其 repository 安裝較舊的版本，因此照沒有版本鎖時的方式安裝。
+
+step 之後，每個管理器都會再讀取一次已安裝的版本，並為每個偏離鎖定版本的名稱印出一行，使 target 失敗（exit 1）：
+
+```text
+packages: git 2.47.0 is locked, 2.48.1 is installed
+packages: git 2.47.0 is locked, not installed
+packages: git 1:2.39.5-0+deb12u2 is no longer in the repositories
+```
+
+最後一種出現在 apt、dnf 或 apk 的 repository 不再提供該版本時，通常是較新的版本發布之後；其他名稱仍會先安裝。
+版本鎖只有在其版本仍被提供時才能重現安裝：真正的重現需要 snapshot repository（例如 snapshot.debian.org），anvil 不會替你設定。
+只有頂層名稱會被鎖定；它們的相依套件是 repository 解析出來的任何版本。
+
+項目為 `missing` 或項目中沒有的名稱，照沒有版本鎖時的方式安裝，並顯示警告
+`packages: NAME has no locked version in anvil.lock; run anvil lock`；它不會使 target 失敗。
+
+**鎖定（pin）。** `upgrade` 被拒絕，因此在 `--locked` 下 pin 跟隨版本鎖：在 apt、dnf 與 apk 上，被 pin 的名稱與 `install` 名稱一樣安裝為其鎖定版本，
+在那裡 pin 也不會被拒絕。pacman 照常安裝缺少的 pin 並驗證它；brew 仍拒絕 pin。
+
+### Plan 與 doctor
+
+`anvil plan --locked` 做相同的檢查與 exit 2 拒絕，唯讀地讀取每個 target 已安裝的版本，
+並在 step 之後為每個不在鎖定版本的名稱加一行：
+
+```text
+▶ web1
+  would $ …
+  would install git 1:2.39.5-0+deb12u2
+  would change nodejs 18.19.0 -> 18.20.4
+  would install curl (no locked version)
+  ✔ 1 step
+```
+
+`would change` 出現在 apt、dnf 與 apk（已安裝 `->` 鎖定）。pacman 與 brew 則顯示
+`would fail: git 2.47.0 is locked, 2.48.1 is installed`，因為 apply 的驗證會在那裡失敗；它不改變 plan 的 exit code。
+`--json` 中每個 target 有一個 `lock` 陣列，元素為 `{"name", "would": "install"|"change"|"fail", "installed", "locked"}`，
+沒有的 `installed` 與 `locked` 會省略。
+
+有 `anvil.lock` 時，`anvil doctor` 會為每個有套件工作且 manager 解析成功的可連線 target 唯讀地加上一列 `lock`：
+
+```text
+  lock            ok
+  lock            WARNING: 2 packages differ (git, nodejs)
+  lock            WARNING: no entry for apt/debian 12/x86_64
+  lock            WARNING: lock check failed: REASON
+```
+
+未安裝的鎖定名稱算作不同；`missing` 的名稱則從不算。`--json` 以 `lock` 帶有相同字串。TUI 的 doctor 區段也會顯示這一列。
+這些警告不改變 doctor 的 exit code。
+
+**結束碼。** `anvil lock`：寫入時為 0，target 失敗或版本衝突為 1，錯誤的 `--from` 或無法載入的 `anvil.lock` 為 2。
+`anvil lock --check`：未過時為 0，過時或找不到為 1，無法載入為 2。
+`apply --locked` 與 `plan --locked`：上述拒絕情形為 2，發生在任何變更之前；其他情況與不加 `--locked` 相同，驗證失敗或平台欄位無效的 target 屬於 target 失敗（1）。
 
 ## 執行的指令
 
