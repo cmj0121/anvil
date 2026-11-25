@@ -21,6 +21,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::apply;
 use crate::bytes::hex;
 use crate::cancel::{AbortReason, Cancel};
 use crate::config::Config;
@@ -31,6 +32,7 @@ use crate::fanout::{self, Event};
 use crate::files::{FileWrite, Loaded, MAX_KEPT, Sources};
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
+use crate::lock::Lock;
 use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
 use crate::options::{Options, Output};
 use crate::plugin::Plugins;
@@ -565,10 +567,12 @@ pub fn run_targets(prepared: &Prepared, on: &mut dyn FnMut(Progress<'_>)) -> Pla
         &prepared.sources,
         &prepared.pins,
         &pending,
+        prepared.lock.as_ref(),
         &prepared.cancel,
         on,
     );
     plan.warnings = warnings;
+    plan.warnings.extend(prepared.lock_warnings.iter().cloned());
     plan.warnings
         .extend(record_full_warnings(&prepared.expanded, &prepared.sources));
     plan
@@ -659,6 +663,7 @@ pub fn plan_targets(
     sources: &Sources,
     plugins: &dyn Plugins,
     pending: &Pending,
+    lock: Option<&Lock>,
     cancel: &Cancel,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Plan {
@@ -676,6 +681,7 @@ pub fn plan_targets(
                 sources,
                 plugins,
                 pending.get(&target.name).cloned().unwrap_or_default(),
+                lock,
                 cancel,
             )
         },
@@ -730,6 +736,7 @@ fn plan_target(
     sources: &Sources,
     plugins: &dyn Plugins,
     pending_handlers: Vec<String>,
+    lock: Option<&Lock>,
     cancel: &Cancel,
 ) -> PlanReport {
     log::info!("plan {}: start", target.name);
@@ -745,7 +752,10 @@ fn plan_target(
                 config,
                 expanded,
                 sources,
-                engine::ApplyOnly::default(),
+                engine::ApplyOnly {
+                    lock,
+                    ..engine::ApplyOnly::default()
+                },
                 plugins,
                 cancel,
             )?;
@@ -775,13 +785,17 @@ fn plan_target(
 
 /// `anvil plan`: prints each target's block once it and every earlier
 /// target have ended (or one JSON document), then the summary.
-pub fn run(out: Output, opts: &Options, show: Show) -> Result<(), Failure> {
+pub fn run(out: Output, opts: &Options, show: Show, locked: bool) -> Result<(), Failure> {
     let style = Style::detect();
     let (config, expanded) = opts.load_expanded()?;
     let cancel = Arc::new(Cancel::new());
     let _interrupt = Interrupt::install(&cancel)?;
     let mut follow = status::Follow::new("plan", status::enabled(out.no_progress));
-    let prepared = Prepared::plan(opts, config, expanded, cancel)?;
+    let mut prepared = Prepared::plan(opts, config, expanded, cancel)?;
+    if locked {
+        let (lock, warnings) = apply::check_locked(&prepared)?;
+        (prepared.lock, prepared.lock_warnings) = (Some(lock), warnings);
+    }
     let hashes = if show.content {
         hashes(&prepared.sources)
     } else {
@@ -1135,6 +1149,7 @@ mod tests {
             sources,
             plugins,
             &Pending::new(),
+            None,
             cancel,
             on,
         )
@@ -1847,6 +1862,7 @@ mod tests {
                     timeout: git().timeout(),
                     kind: RunKind::Packages {
                         manager: Manager::Pacman,
+                        lock: None,
                     },
                     task: None,
                     name: None,

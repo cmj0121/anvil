@@ -232,7 +232,7 @@ impl TargetReport {
             } => (steps, warnings),
         };
         for (step, run) in steps.iter_mut().zip(runs) {
-            if let RunKind::Packages { manager } = run.kind {
+            if let RunKind::Packages { manager, .. } = run.kind {
                 let mut names = packages::take_unknown(&mut step.stdout);
                 for name in packages::take_unknown(&mut step.stderr) {
                     if !names.contains(&name) {

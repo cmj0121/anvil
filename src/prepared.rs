@@ -11,6 +11,7 @@ use crate::engine::{self, Passwords};
 use crate::error::Failure;
 use crate::files::{self, Sources};
 use crate::inventory::Target;
+use crate::lock::Lock;
 use crate::options::Options;
 use crate::plugin::{self, Pins};
 use crate::record::Session;
@@ -29,6 +30,10 @@ pub struct Prepared {
     pub pins: Pins,
     /// Apply and rollback's; plan and run never open the secret store.
     pub(crate) passwords: Passwords,
+    /// `--locked`'s `anvil.lock`, once [`crate::apply::check_locked`] passed.
+    pub lock: Option<Lock>,
+    /// Its warnings, for the report: each name it holds no version of.
+    pub lock_warnings: Vec<String>,
     pub cancel: Arc<Cancel>,
 }
 
@@ -70,6 +75,8 @@ impl Prepared {
             sources,
             pins,
             passwords: Passwords::new(),
+            lock: None,
+            lock_warnings: Vec::new(),
             cancel,
         })
     }
@@ -84,6 +91,8 @@ impl Prepared {
             sources: Sources::default(),
             pins: Pins::default(),
             passwords: Passwords::new(),
+            lock: None,
+            lock_warnings: Vec::new(),
             cancel,
         })
     }
@@ -120,6 +129,8 @@ impl Prepared {
             sources: Sources::default(),
             pins: Pins::default(),
             passwords,
+            lock: None,
+            lock_warnings: Vec::new(),
             cancel,
         })
     }
