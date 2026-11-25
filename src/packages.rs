@@ -36,7 +36,7 @@ const MANAGERS: &str = managers!();
 const BREW_ENV: &str = "export PATH=\"$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin\"; \
      export SUDO_ASKPASS=\"${SUDO_ASKPASS:-/usr/bin/false}\"; ";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Manager {
     Brew,
@@ -386,7 +386,7 @@ fn check_names(field: &str, names: &[String]) -> Result<(), String> {
 
 /// `name` within the byte limit and [`NAME_RULE`]; the error is the rule it
 /// breaks, for the caller to prefix with the field.
-fn check_name(name: &str) -> Result<(), String> {
+pub(crate) fn check_name(name: &str) -> Result<(), String> {
     if name.len() > MAX_NAME_BYTES {
         return Err(format!(
             "{} bytes exceeds the {MAX_NAME_BYTES} byte limit",

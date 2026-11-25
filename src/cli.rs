@@ -167,6 +167,15 @@ pub enum Command {
         #[arg(long, hide = true)]
         show_rendered: bool,
     },
+    /// Record each target's installed package versions in anvil.lock
+    Lock {
+        /// Compare anvil.lock with the config, contacting no target; exit 1 when stale
+        #[arg(long, conflicts_with = "from")]
+        check: bool,
+        /// Take HOST's versions where its platform's targets disagree (repeatable)
+        #[arg(long, value_name = "HOST")]
+        from: Vec<String>,
+    },
     /// Restore the files the last apply wrote, on every selected target
     Rollback {
         /// Restore DEST even if it changed since the last apply (repeatable)
@@ -278,6 +287,7 @@ impl Command {
             Command::Doctor => "doctor",
             Command::Apply { .. } => "apply",
             Command::Plan { .. } => "plan",
+            Command::Lock { .. } => "lock",
             Command::Rollback { .. } => "rollback",
             Command::Run { .. } => "run",
             Command::Secret { .. } => "secret",
@@ -335,6 +345,13 @@ pub fn run(cli: &Cli, command: &Command) -> Result<(), Failure> {
                 rendered: *show_rendered,
             },
         ),
+        Command::Lock { check, from } => {
+            crate::commands::warn_parallel(cli);
+            if *check && !cli.target.is_empty() {
+                log::warn!("--target is ignored by `lock --check`");
+            }
+            anvil::lock::run(out, &opts, *check, from)
+        }
         Command::Rollback {
             force,
             force_all,
@@ -552,6 +569,19 @@ mod tests {
             Command::Apply { drop_pending } if drop_pending == ["reload sshd", "all"]
         ));
         assert!(Cli::try_parse_from(["anvil", "apply", "--drop-pending"]).is_err());
+        assert!(matches!(
+            command(&["lock"]),
+            Command::Lock { check: false, from } if from.is_empty()
+        ));
+        assert!(matches!(
+            command(&["lock", "--check", "--json"]),
+            Command::Lock { check: true, .. }
+        ));
+        assert!(matches!(
+            command(&["lock", "--from", "web1", "--from", "web2", "--target", "web"]),
+            Command::Lock { check: false, from } if from == ["web1", "web2"]
+        ));
+        assert!(Cli::try_parse_from(["anvil", "lock", "--check", "--from", "web1"]).is_err());
         assert!(matches!(
             command(&["plan"]),
             Command::Plan {
