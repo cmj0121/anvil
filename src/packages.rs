@@ -11,7 +11,7 @@ use crate::facts::Facts;
 use crate::inventory::{Target, TargetKind};
 use crate::lock::{Locked, Versions};
 use crate::secret;
-use crate::transport::{SUDO_OK, TTY_READY};
+use crate::transport::{SUDO_OK, TTY_READY, Transport, TransportError};
 
 /// Most `install`, `remove` or `pin` entries.
 pub const MAX_INSTALL: usize = 256;
@@ -900,6 +900,15 @@ pub fn take_gone(output: &mut String) -> Vec<(String, String)> {
     gone
 }
 
+/// One failure line per `(name, version)` gone from the repositories.
+pub fn gone_failures(gone: &[(String, String)]) -> Vec<String> {
+    gone.iter()
+        .map(|(name, version)| {
+            format!("packages: {name} {version} is no longer in the repositories")
+        })
+        .collect()
+}
+
 /// The verify of a locked package step: one line per name of `lock` gone
 /// from the repositories, then one per other locked name whose `installed`
 /// version differs. Empty when everything is at its lock.
@@ -908,12 +917,7 @@ pub fn lock_failures(
     installed: &BTreeMap<String, String>,
     gone: &[(String, String)],
 ) -> Vec<String> {
-    let mut failures: Vec<String> = gone
-        .iter()
-        .map(|(name, version)| {
-            format!("packages: {name} {version} is no longer in the repositories")
-        })
-        .collect();
+    let mut failures = gone_failures(gone);
     for (name, locked) in lock {
         let Locked::Version(version) = locked else {
             continue;
@@ -986,6 +990,19 @@ pub fn versions_script(manager: Manager, names: &[&str]) -> String {
         Manager::Apk => "apk info -v".to_owned(),
     };
     format!("{query}; printf '%s\\n' {VERSIONS_END}")
+}
+
+/// Runs [`versions_script`] for `names` on `transport` and returns
+/// [`parse_versions`] of its stdout; the outer Err is the transport's.
+pub fn installed_versions(
+    transport: &dyn Transport,
+    manager: Manager,
+    names: &[&str],
+    timeout: Duration,
+) -> Result<Result<BTreeMap<String, String>, String>, TransportError> {
+    let output = transport.run(&versions_script(manager, names), timeout)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_versions(manager, names, &stdout))
 }
 
 /// One `manager` output line as `(name, version)`; `None` for a line not of

@@ -294,8 +294,12 @@ fn managed(expanded: &Expanded, platform: &Platform) -> BTreeSet<String> {
             _ => true,
         });
         if holds {
-            let plains = packages.install.iter().chain(&packages.pin);
-            names.extend(plains.map(|plain| packages.name_for(plain, platform.manager).to_owned()));
+            names.extend(
+                packages
+                    .wanted(platform.manager)
+                    .into_iter()
+                    .map(str::to_owned),
+            );
         }
     }
     names
@@ -536,12 +540,9 @@ fn observe(
     let installed = if names.is_empty() {
         BTreeMap::new()
     } else {
-        let script = packages::versions_script(manager, &names);
-        let output = transport
-            .run(&script, packages.timeout())
-            .map_err(|err| unresolved(err.into()))?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        packages::parse_versions(manager, &names, &stdout).map_err(failed)?
+        packages::installed_versions(transport.as_ref(), manager, &names, packages.timeout())
+            .map_err(|err| unresolved(err.into()))?
+            .map_err(failed)?
     };
     log::info!("{name}: lock: {platform}, {} installed", installed.len());
     Ok(Some(Observed {

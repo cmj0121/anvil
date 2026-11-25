@@ -947,7 +947,7 @@ fn execute_inner(
         if !verify {
             // The install failed for another reason too: the step's own
             // output keeps why a version was not installed.
-            for line in packages::lock_failures(&lock::Versions::new(), &BTreeMap::new(), &gone) {
+            for line in packages::gone_failures(&gone) {
                 output
                     .stderr
                     .extend_from_slice(format!("{line}\n").as_bytes());
@@ -1027,12 +1027,12 @@ fn verify_lock(
     if names.is_empty() {
         return Ok(packages::lock_failures(lock, &BTreeMap::new(), gone));
     }
-    let output = transport.run(&packages::versions_script(manager, &names), timeout)?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(match packages::parse_versions(manager, &names, &stdout) {
-        Ok(installed) => packages::lock_failures(lock, &installed, gone),
-        Err(why) => vec![why],
-    })
+    Ok(
+        match packages::installed_versions(transport, manager, &names, timeout)? {
+            Ok(installed) => packages::lock_failures(lock, &installed, gone),
+            Err(why) => vec![why],
+        },
+    )
 }
 
 /// The step of `handler`, the `i`th `[[handlers]]` entry, on `target`: a

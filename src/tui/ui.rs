@@ -1096,20 +1096,10 @@ fn doctor_block(report: &doctor::TargetReport) -> Vec<Line<'static>> {
         lines.push(row("manager", manager.as_str()));
     }
     if let Some(packages) = &report.packages {
-        let line = row("packages", packages);
-        lines.push(if packages.starts_with("WARNING:") {
-            line.style(Color::Yellow)
-        } else {
-            line
-        });
+        lines.push(warning_row("packages", packages));
     }
     if let Some(lock) = &report.lock {
-        let line = row("lock", lock);
-        lines.push(if lock.starts_with("WARNING:") {
-            line.style(Color::Yellow)
-        } else {
-            line
-        });
+        lines.push(warning_row("lock", lock));
     }
     if let Some(error) = &report.manager_error {
         lines.push(row("manager", &format!("error: {error}")).style(Color::Red));
@@ -1138,6 +1128,16 @@ fn doctor_block(report: &doctor::TargetReport) -> Vec<Line<'static>> {
     }
     lines.push(Line::default());
     lines
+}
+
+/// [`row`], yellow when `value` is a doctor `WARNING:`.
+fn warning_row(key: &str, value: &str) -> Line<'static> {
+    let line = row(key, value);
+    if value.starts_with("WARNING:") {
+        line.style(Color::Yellow)
+    } else {
+        line
+    }
 }
 
 /// A failure that ended the whole run: config, inventory, or a panic.

@@ -499,14 +499,9 @@ fn lock_row(
         .map(|p| p.timeout())
         .max()
         .unwrap_or(RUN_TIMEOUT);
-    let installed = match transport.run(&packages::versions_script(manager, &query), timeout) {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            match packages::parse_versions(manager, &query, &stdout) {
-                Ok(installed) => installed,
-                Err(why) => return failed(&why),
-            }
-        }
+    let installed = match packages::installed_versions(transport, manager, &query, timeout) {
+        Ok(Ok(installed)) => installed,
+        Ok(Err(why)) => return failed(&why),
         Err(err) => return failed(&err),
     };
     let differ: Vec<&str> = (locked.iter())

@@ -21,7 +21,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::apply;
 use crate::bytes::hex;
 use crate::cancel::{AbortReason, Cancel};
 use crate::config::Config;
@@ -32,7 +31,7 @@ use crate::fanout::{self, Event};
 use crate::files::{FileWrite, Loaded, MAX_KEPT, Sources};
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
-use crate::lock::{Lock, Platform};
+use crate::lock::{Lock, Locked, Platform};
 use crate::logger::{DIM, GREEN, RED, YELLOW, escape_invisible, paint};
 use crate::options::{Options, Output};
 use crate::packages;
@@ -871,20 +870,15 @@ fn lock_changes(
         if names.is_empty() {
             continue;
         }
-        let output = transport.run(
-            &packages::versions_script(manager, &names),
-            packages.timeout(),
-        )?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let installed =
-            packages::parse_versions(manager, &names, &stdout).map_err(Unresolved::Failed)?;
-        let locked = packages::locked_versions(&names, versions);
+            packages::installed_versions(transport, manager, &names, packages.timeout())?
+                .map_err(Unresolved::Failed)?;
         for name in names {
             let have = installed.get(name).cloned();
-            let want = locked
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, v)| (*v).to_owned());
+            let want = match versions.get(name) {
+                Some(Locked::Version(version)) => Some(version.clone()),
+                _ => None,
+            };
             let would = match (&have, &want) {
                 (None, _) => Would::Install,
                 (Some(_), None) => continue,
@@ -913,8 +907,7 @@ pub fn run(out: Output, opts: &Options, show: Show, locked: bool) -> Result<(), 
     let mut follow = status::Follow::new("plan", status::enabled(out.no_progress));
     let mut prepared = Prepared::plan(opts, config, expanded, cancel)?;
     if locked {
-        let (lock, warnings) = apply::check_locked(&prepared)?;
-        (prepared.lock, prepared.lock_warnings) = (Some(lock), warnings);
+        prepared.use_lock()?;
     }
     let hashes = if show.content {
         hashes(&prepared.sources)

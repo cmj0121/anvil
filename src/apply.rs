@@ -48,7 +48,6 @@
 //! pending from an earlier apply or notified now runs once, in config order,
 //! and leaves the list only once it exited 0.
 
-use std::collections::BTreeSet;
 use std::num::NonZeroU8;
 use std::sync::Arc;
 
@@ -63,9 +62,8 @@ use crate::fanout::{self, Event};
 use crate::files::Sources;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
-use crate::lock::{self, Lock, Platform};
+use crate::lock::Lock;
 use crate::options::{Options, Output};
-use crate::packages;
 use crate::plugin::Plugins;
 use crate::prepared::Prepared;
 use crate::record::Session;
@@ -292,8 +290,7 @@ pub fn run(
     print_report(out, "apply", |on| {
         let mut prepared = Prepared::apply(opts, config, expanded, cancel)?;
         if locked {
-            let (lock, warnings) = check_locked(&prepared)?;
-            (prepared.lock, prepared.lock_warnings) = (Some(lock), warnings);
+            prepared.use_lock()?;
         }
         let mut dropped = |drop: &DroppedPending| {
             if !out.json {
@@ -306,85 +303,6 @@ pub fn run(
         };
         run_dropping(&prepared, drop_pending, &mut dropped, on)
     })
-}
-
-/// `--locked`'s check before any step, for apply and plan alike: a package
-/// item with `upgrade = true`, a missing `anvil.lock`, and a target whose
-/// package step has no entry for its platform are each a usage failure;
-/// the last lists every such target. Each target is probed for its
-/// platform; one that cannot be reached or resolved is left to fail as it
-/// would without `--locked`. It returns the lock and one warning per name
-/// the entry has no version of, for the report's warnings.
-pub(crate) fn check_locked(prepared: &Prepared) -> Result<(Lock, Vec<String>), Failure> {
-    let expanded = &prepared.expanded;
-    let items = || {
-        expanded.items.iter().filter_map(|item| match &item.kind {
-            ItemKind::Packages(packages) => Some((item, packages)),
-            _ => None,
-        })
-    };
-    if items().any(|(_, packages)| packages.upgrade) {
-        return Err(Failure::usage(
-            "--locked: upgrade = true cannot be used with a lock",
-        ));
-    }
-    let workspace = prepared.opts.workspace(&prepared.config)?;
-    let lock = Lock::load(&workspace)
-        .map_err(Failure::usage)?
-        .ok_or_else(|| Failure::usage(format!("--locked: {} not found", lock::FILE)))?;
-    if items().next().is_none() {
-        return Ok((lock, Vec::new()));
-    }
-    let mut missing = Vec::new();
-    let mut unlocked = BTreeSet::new();
-    for target in &prepared.targets {
-        if prepared.cancel.is_set() {
-            return Err(Failure::failed("--locked: cancelled"));
-        }
-        let Ok(transport) = prepared.transport(target) else {
-            continue;
-        };
-        let Ok(facts) = probe(transport.as_ref(), expanded) else {
-            continue;
-        };
-        for (_, packages) in items().filter(|(item, _)| item.matches(target, &facts)) {
-            let sudo = packages.sudo_secret_for(target).is_some();
-            let Ok(manager) = packages::resolve(packages.choice_for(target), &facts, sudo) else {
-                continue;
-            };
-            let Ok(platform) = Platform::of(manager, &facts) else {
-                continue;
-            };
-            let Some(versions) = lock.get(&platform) else {
-                missing.push(format!("{}: no entry for {platform}", target.name));
-                break;
-            };
-            let names = packages.wanted(manager);
-            let locked = packages::locked_versions(&names, versions);
-            unlocked.extend(
-                (names.into_iter())
-                    .filter(|name| packages::lockable(name))
-                    .filter(|name| !locked.iter().any(|(n, _)| n == name))
-                    .map(str::to_owned),
-            );
-        }
-    }
-    if !missing.is_empty() {
-        return Err(Failure::usage(format!(
-            "--locked: {} has no entry for some targets; run anvil lock\n{}",
-            lock::FILE,
-            missing.join("\n")
-        )));
-    }
-    let warnings = (unlocked.into_iter())
-        .map(|name| {
-            format!(
-                "packages: {name} has no locked version in {}; run anvil lock",
-                lock::FILE
-            )
-        })
-        .collect();
-    Ok((lock, warnings))
 }
 
 /// Whether apply probes each target: the list has package, file or service
