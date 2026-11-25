@@ -1880,7 +1880,7 @@ fn package_run(
     let versions = match lock {
         None => None,
         Some(lock) => {
-            let platform = Platform::of(manager, facts);
+            let platform = Platform::of(manager, facts).map_err(reason)?;
             let versions = lock
                 .get(&platform)
                 .ok_or_else(|| reason(format!("no entry for {platform} in {}", lock::FILE)))?;
@@ -2514,7 +2514,7 @@ mod tests {
     fn a_locked_package_step_carries_its_platforms_versions() {
         let pkgs = packages(&["git", "vim"]);
         let all = item(ItemKind::Packages(pkgs.clone()), &[], &[]);
-        let platform = Platform::of(packages::Manager::Brew, &mac());
+        let platform = Platform::of(packages::Manager::Brew, &mac()).unwrap();
         let lock = Lock {
             platforms: BTreeMap::from([(
                 platform.clone(),

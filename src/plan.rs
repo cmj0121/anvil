@@ -859,7 +859,9 @@ fn lock_changes(
         let Ok(manager) = packages::resolve(packages.choice_for(target), facts, sudo) else {
             continue;
         };
-        let Some(versions) = lock.get(&Platform::of(manager, facts)) else {
+        let platform = Platform::of(manager, facts)
+            .map_err(|why| Unresolved::Failed(format!("packages: {why}")))?;
+        let Some(versions) = lock.get(&platform) else {
             continue;
         };
         let names: Vec<&str> = (packages.wanted(manager).into_iter())

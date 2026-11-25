@@ -480,7 +480,10 @@ fn lock_row(
         Ok(lock) => lock,
         Err(why) => return failed(why),
     };
-    let platform = Platform::of(manager, facts);
+    let platform = match Platform::of(manager, facts) {
+        Ok(platform) => platform,
+        Err(why) => return failed(&why),
+    };
     let Some(versions) = lock.get(&platform) else {
         return format!("WARNING: no entry for {platform}");
     };
@@ -1502,7 +1505,7 @@ mod tests {
                 .to_vec(),
             ..packages::Packages::default()
         };
-        let platform = Platform::of(packages::Manager::Pacman, &arch);
+        let platform = Platform::of(packages::Manager::Pacman, &arch).unwrap();
         let versions = |git: &str| {
             lock::Versions::from([
                 ("git".to_owned(), Locked::Version(git.to_owned())),

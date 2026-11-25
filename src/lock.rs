@@ -21,7 +21,7 @@ use crate::error::{Failure, print_json};
 use crate::facts::Facts;
 use crate::interrupt::Interrupt;
 use crate::inventory::Target;
-use crate::logger::escape_controls;
+use crate::logger::{escape_controls, escape_invisible};
 use crate::options::{Options, Output};
 use crate::packages::{self, Manager};
 use crate::private;
@@ -38,6 +38,10 @@ pub const MISSING: &str = "missing";
 /// The format version this anvil reads and writes.
 const VERSION: i64 = 1;
 const HEADER: &str = "# anvil.lock: written by `anvil lock`, do not edit\n";
+/// Longest platform `distro`, `distro_version` or `arch`, in bytes.
+pub const MAX_FIELD_BYTES: usize = 64;
+/// The rule a platform's `distro`, `distro_version` and `arch` follow.
+pub const FIELD_RULE: &str = "must match [A-Za-z0-9][A-Za-z0-9._+-]*";
 
 /// What a lock entry is keyed by.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -52,14 +56,15 @@ impl Platform {
     /// The platform of a target whose package step resolves `manager` and
     /// whose probe gave `facts`: an empty distro is `unknown`, an empty
     /// version `rolling`, macOS keeps its major version and Alpine its first
-    /// two components; the arch is `uname -m` as is.
-    pub fn of(manager: Manager, facts: &Facts) -> Platform {
-        let fact = |key| facts.get(key).unwrap_or_default();
-        let distro = match fact("distro") {
+    /// two components; the arch is `uname -m` as is, `unknown` when empty.
+    /// A field breaking [`FIELD_RULE`] is an error.
+    pub fn of(manager: Manager, facts: &Facts) -> Result<Platform, String> {
+        let fact = |key| match facts.get(key).unwrap_or_default() {
             "" => "unknown",
-            distro => distro,
+            value => value,
         };
-        let version = fact("distro_version");
+        let distro = fact("distro");
+        let version = facts.get("distro_version").unwrap_or_default();
         let components = match distro {
             "macos" => Some(1),
             "alpine" => Some(2),
@@ -70,12 +75,37 @@ impl Platform {
             Some(n) => version.split('.').take(n).collect::<Vec<_>>().join("."),
             None => version.to_owned(),
         };
-        Platform {
+        let platform = Platform {
             manager,
             distro: distro.to_owned(),
             distro_version,
             arch: fact("arch").to_owned(),
+        };
+        platform.check()?;
+        Ok(platform)
+    }
+
+    /// Each of `distro`, `distro_version` and `arch` within
+    /// [`MAX_FIELD_BYTES`] and [`FIELD_RULE`]; the error names the field and
+    /// shows its value escaped.
+    fn check(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("distro", &self.distro),
+            ("distro_version", &self.distro_version),
+            ("arch", &self.arch),
+        ] {
+            let mut chars = value.chars();
+            let valid = value.len() <= MAX_FIELD_BYTES
+                && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+                && chars.all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c));
+            if !valid {
+                return Err(format!(
+                    "{field} `{}`: {FIELD_RULE}, at most {MAX_FIELD_BYTES} bytes",
+                    escape_invisible(&secret::shown_name(value))
+                ));
+            }
         }
+        Ok(())
     }
 
     /// The facts a package item's selector is checked against on this
@@ -157,8 +187,9 @@ struct Entry {
 impl Lock {
     /// `None` when the file does not exist. Loads through
     /// `trust::load(path, LIMIT)`; requires `version = 1`; unknown fields,
-    /// a name breaking the package name rule, a value that is neither a
-    /// version nor `missing`, and a platform listed twice are errors.
+    /// a platform field breaking [`FIELD_RULE`], a name breaking the package
+    /// name rule, a value that is neither a version nor `missing`, and a
+    /// platform listed twice are errors.
     pub fn load(workspace: &Path) -> Result<Option<Lock>, String> {
         let path = workspace.join(FILE);
         let shown = path.display();
@@ -187,6 +218,9 @@ impl Lock {
                 distro_version: entry.distro_version,
                 arch: entry.arch,
             };
+            platform
+                .check()
+                .map_err(|why| format!("{shown}: platform {why}"))?;
             for (name, locked) in &entry.packages {
                 packages::check_name(name).map_err(|why| {
                     format!("{shown}: {platform} `{}`: {why}", secret::shown_name(name))
@@ -496,7 +530,7 @@ fn observe(
     let sudo = packages.sudo_secret_for(target).is_some();
     let manager = packages::resolve(packages.choice_for(target), &facts, sudo)
         .map_err(|why| failed(format!("packages: {why}")))?;
-    let platform = Platform::of(manager, &facts);
+    let platform = Platform::of(manager, &facts).map_err(|why| failed(format!("lock: {why}")))?;
     let names = expected(expanded, &platform);
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let installed = if names.is_empty() {
@@ -599,7 +633,11 @@ mod tests {
 
     #[test]
     fn platform_of_normalises_the_facts() {
-        let of = |pairs: &[(&str, &str)]| Platform::of(Manager::Apt, &facts(pairs)).to_string();
+        let of = |pairs: &[(&str, &str)]| {
+            Platform::of(Manager::Apt, &facts(pairs))
+                .unwrap()
+                .to_string()
+        };
         assert_eq!(
             of(&[
                 ("distro", "debian"),
@@ -627,12 +665,58 @@ mod tests {
         );
         assert_eq!(
             of(&[("distro", "alpine"), ("distro_version", "3.20.3")]),
-            "apt/alpine 3.20/"
+            "apt/alpine 3.20/unknown"
         );
         assert_eq!(
             of(&[("distro", "ubuntu"), ("distro_version", "24.04")]),
-            "apt/ubuntu 24.04/"
+            "apt/ubuntu 24.04/unknown"
         );
+    }
+
+    #[test]
+    fn platform_of_accepts_real_values_and_refuses_an_invisible_character() {
+        for distro in [
+            "debian",
+            "arch",
+            "archarm",
+            "macos",
+            "unknown",
+            "opensuse-tumbleweed",
+        ] {
+            for version in ["12", "rolling", "14", "3.20", "24.04"] {
+                for arch in ["x86_64", "aarch64", "arm64"] {
+                    let pairs = [
+                        ("distro", distro),
+                        ("distro_version", version),
+                        ("arch", arch),
+                    ];
+                    assert!(
+                        Platform::of(Manager::Apt, &facts(&pairs)).is_ok(),
+                        "{pairs:?}"
+                    );
+                }
+            }
+        }
+        let why = Platform::of(
+            Manager::Apt,
+            &facts(&[("distro", "debian\u{202e}"), ("arch", "x86_64")]),
+        )
+        .unwrap_err();
+        assert!(
+            why.starts_with("distro `debian\\u{202e}`: must match "),
+            "{why}"
+        );
+        assert!(!why.contains('\u{202e}'), "{why}");
+        for (key, value) in [
+            ("distro_version", "12\u{2066}"),
+            ("arch", "x86\u{200b}_64"),
+            ("arch", "-m"),
+        ] {
+            let why = Platform::of(Manager::Apt, &facts(&[(key, value)])).unwrap_err();
+            assert!(why.starts_with(&format!("{key} `")), "{why}");
+        }
+        let long = "a".repeat(MAX_FIELD_BYTES + 1);
+        assert!(Platform::of(Manager::Apt, &facts(&[("distro", &long)])).is_err());
     }
 
     #[test]

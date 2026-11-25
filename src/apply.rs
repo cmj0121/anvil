@@ -352,7 +352,9 @@ pub(crate) fn check_locked(prepared: &Prepared) -> Result<(Lock, Vec<String>), F
             let Ok(manager) = packages::resolve(packages.choice_for(target), &facts, sudo) else {
                 continue;
             };
-            let platform = Platform::of(manager, &facts);
+            let Ok(platform) = Platform::of(manager, &facts) else {
+                continue;
+            };
             let Some(versions) = lock.get(&platform) else {
                 missing.push(format!("{}: no entry for {platform}", target.name));
                 break;
